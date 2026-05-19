@@ -5,30 +5,29 @@ WHAT ferrodb WILL HAVE + DESIGN CHOICES:
 
 Storage Engine:
 - Will be disk based (easier for storing since it's not volatile like memory and more interesting)
-- use memory for caching
 - will use row oriented db (just better)
 - probably heap organized data files (super fast point lookup + write, but has slow aggregate lookup)
-- will use secondary key (a column(s)) to point to primary key so pointer updating is ez (you only have to update the primary key)
-- b+ tree for indexing (has O(log N) lookup, where N is the number of items in the tree)
+- want to maximize sequential access (faster than random access)
 - page size will be 4kb (maybe change)
 - use slotted pages (has header that has info on page and cells), each page will have unique id
-- slotted pages arent contigious (cuz pointers show where records are stored) so if there are "holes", you can insert data there (if it fits), 
-or just add data to free space
+- slotted pages arent contigious (cuz pointers show where records are stored) so if there are "holes", you can insert data there (if it fits), or just add data to free space
 - if there is enough free holes to create a row inside a page, then compact/defragment the page to free up space
 - have to modify pointers to rows when shuffling stuff around too
-- if data is deleted, you can nullify its pointer or remove it
+- have page directory so it's easier to find pages/data files (synchronizing can be hard though)
+- if there is ever data that is larger than a page, put it inside an overflow storage page
 - serialize types using big-endian for fixed size
 - Pascal String to serialize variable size data
-- want to maximize sequential access (faster than random access)
-- have page directory so it's easier to find pages/data files (synchronizing can be hard though)
 - padding in tuples (easier for cpu to read, easier to modify values)
 - IEEE 754 for floating point arithmetic
 - for null data, you could store a bitmap in a header that says what is null (many different ways to do this)
-- if there is ever data that is larger than a page, put it inside an overflow storage page
 - to insert a new tuple, check page directory for a page with a free slot, fetch page from disk to memory, check slot array if there is enough space in page (if not find another page/create one), insert tuple into page
 - to update a tuple, find tuple using record id, if new value fits in the sapce space, just update, if not, then mark old value as deleted and insert new value like it's a new tuple
+- if data is deleted, you can nullify its pointer or remove it
+- will use secondary key (a column(s)) to point to primary key so pointer updating is ez (you only have to update the primary key)
+- b+ tree for indexing (has O(log N) lookup, where N is the number of items in the tree)
 
 Buffer Pool:
+- use memory for caching
 - buffer pool has frames (same size as page) to put pages from disk into
 - have a separate page table that has meta data about what pages are currently in memory
 - pin counter will let the buffer pool know if a page is currently being used so it won't be evicted
@@ -41,8 +40,14 @@ Buffer Pool:
 - once a dirty page is written, can evict or unset dirty flag on the page
 
 Disk Manager:
+- will use os functions since it's easier than using the raw disk
 - each page will have a page ID, which can also be the file offset. it will be unique per table
 - to read a page, it'll go to the offset which represents the pages id and writes the bytes into memory
 - to write a page, it'll take the dirty page from memory and overwrite it
-- you can also allocate a new page (a new page id will be created)/deallocate one 
-- will use os functions since it's easier than using the raw disk
+- you can also allocate a new page (a new page id will be created)/deallocate one
+
+Architecture layers:
+1. B+ trees and keys (does lookups)
+2. Page layout and serialization (tuples + how they're endoed, slotted pages)
+3. Buffer pool manager (frames, page table, pin/reference counters, ARC for eviction, ghost cache)
+4. Disk manager (uses os functions to read/write/allocate/deallocate memory, page directory)
