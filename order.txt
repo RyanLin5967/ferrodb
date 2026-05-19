@@ -1,0 +1,19 @@
+1. Database Internals chapters 1-3 (storage fundamentals)
+2. CMU 15-445 lectures 03-04 (disk storage, buffer pool)
+3. Build storage engine + buffer pool
+4. B+ tree visualizer, then CMU lecture 08
+5. Build B+ tree indexing
+6. Crafting Interpreters chapters 4-8 (scanning and parsing)
+7. Build SQL parser
+8. CMU lectures 11-13 (query execution)
+9. Build query execution engine
+10. CMU lectures 15-16 (query optimization)
+11. Build cost-based optimizer
+12. CMU lectures 21-22 (WAL and recovery)
+13. Build WAL and crash recovery
+14. CMU lectures 17-20 (concurrency control, MVCC)
+15. Build MVCC
+16. Postgres wire protocol docs
+17. Build wire protocol
+18. Benchmarks, fuzzing, stress tests
+
