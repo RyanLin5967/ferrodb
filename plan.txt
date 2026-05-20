@@ -9,6 +9,9 @@ Storage Engine:
 - probably heap organized data files (super fast point lookup + write, but has slow aggregate lookup)
 - want to maximize sequential access (faster than random access)
 - page size will be 4kb (maybe change)
+- will track allocated pages using a bitmap (page_id = 0)
+- once the bitmap page is full, then find a free page (make sure to either rewrite everything to 0s or only read up to the furthest allocated page), if not there, then allocate a new one specifically for that
+- store a header on each bitmap page to point to the next one
 - use slotted pages (has header that has info on page and cells), each page will have unique id
 - slotted pages arent contigious (cuz pointers show where records are stored) so if there are "holes", you can insert data there (if it fits), or just add data to free space
 - if there is enough free holes to create a row inside a page, then compact/defragment the page to free up space
