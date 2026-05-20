@@ -43,6 +43,7 @@ impl DiskManager{
             file
         })
     }
+    // need to set it to allocated too
     pub fn write(&self, page_id: u64, data: &[u8]) -> Result<(), FerroError>{
         if data.len() != PAGE_SIZE as usize{
             return Err(FerroError::Io(format!("Page length must be: {}", PAGE_SIZE)))
@@ -78,6 +79,39 @@ impl DiskManager{
             }
         }
         Ok(buffer)
+    }
+
+    // sets a page as free/unused
+    pub fn deallocate(&self, page_id: u64) -> Result<(), FerroError>{
+        let mut page_bitmap = self.read(0)?;
+        let byte_index = (page_id/8) as usize + 4;
+        let bit_index = page_id % 8;
+        page_bitmap[byte_index] &= !(1 << bit_index);
+        match self.write(0, &page_bitmap) {
+            Ok(_) => (),
+            Err(e) => return Err(e)
+        };
+        Ok(())
+    }
+
+    //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
+    pub fn allocate(&self) -> Result<u64, FerroError>{
+        let mut page_bitmap = self.read(0)?;
+        for byte_index in 4..PAGE_SIZE as usize {
+            for bit_index in 0..8 {
+                if page_bitmap[byte_index] & (1<<bit_index) == 0 {
+                    let page_id = (byte_index - 4) * 8 + bit_index;
+                    page_bitmap[byte_index] |= 1 << bit_index;
+                    self.write(0, &page_bitmap)?;
+                    return Ok(page_id as u64)
+                }
+            }
+        }
+        let byte_index = (self.next_page_id.load(Ordering::Relaxed)/8) as usize + 4;
+        let bit_index = self.next_page_id.load(Ordering::Relaxed) % 8;
+        page_bitmap[byte_index] |= 1 << bit_index;
+        self.write(0, &page_bitmap)?;
+        return Ok(self.next_page_id.fetch_add(1, Ordering::SeqCst) as u64)
     }
 }
 
