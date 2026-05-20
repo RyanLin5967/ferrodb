@@ -107,8 +107,9 @@ impl DiskManager{
                 }
             }
         }
-        let byte_index = (self.next_page_id.load(Ordering::Relaxed)/8) as usize + 4;
-        let bit_index = self.next_page_id.load(Ordering::Relaxed) % 8;
+        let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
+        let byte_index = (page_id/8) as usize + 4;
+        let bit_index = (page_id % 8) as usize;
         page_bitmap[byte_index] |= 1 << bit_index;
         self.write(0, &page_bitmap)?;
         return Ok(self.next_page_id.fetch_add(1, Ordering::SeqCst) as u64)
