@@ -1,17 +1,48 @@
 use std::io::{Read, Write, Seek};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use crate::error::FerroError;
 use std::os::windows::fs::FileExt;
 
 const PAGE_SIZE: u64 = 4096;
-
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
     pub file: File,
 }
 
 impl DiskManager{
+
+    // writes page 0 if it isn't already written with data. bytes 0-3 are header(pointer to next bitmap page), 4 is 1, rest is 0
+    pub fn new(file: File) -> Result<Self, FerroError>{
+        let metadata = match file.metadata().map_err(|e| FerroError::Io(e.to_string())){
+            Ok(me) => me,
+            Err(e) => return Err(FerroError::Io(e.to_string()))
+        };
+        let next_page_id: u32;
+        if metadata.len() == 0{
+            let mut first_page_bitmap = [0u8; PAGE_SIZE as usize];
+            first_page_bitmap[4] = 1;
+            let mut total_written = 0;
+            while total_written < PAGE_SIZE as usize {
+                let written = match file.seek_write(&first_page_bitmap[total_written..], total_written as u64) {
+                    Ok(w) => w,
+                    Err(e) => return Err(FerroError::Io(e.to_string()))
+                };
+                total_written += written;
+                if written == 0 {
+                    return Err(FerroError::Io(format!("couldn't write all {} bytes", PAGE_SIZE)))
+                }
+            }
+            next_page_id = 1;
+        }else {
+            next_page_id = (metadata.len()/PAGE_SIZE as u64) as u32;
+        }
+        Ok(DiskManager {
+            next_page_id: AtomicU32::new(next_page_id),
+            file
+        })
+    }
     pub fn write(&self, page_id: u64, data: &[u8]) -> Result<(), FerroError>{
         if data.len() != PAGE_SIZE as usize{
             return Err(FerroError::Io(format!("Page length must be: {}", PAGE_SIZE)))
