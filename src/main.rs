@@ -4,5 +4,4 @@ use std::fs::File;
 use std::sync::{Mutex, atomic::AtomicU32};
 mod error;
 fn main() {
-
 }

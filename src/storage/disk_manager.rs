@@ -2,10 +2,12 @@ use std::io::{Read, Write, Seek};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::thread::current;
 use crate::error::FerroError;
 use std::os::windows::fs::FileExt;
 
 const PAGE_SIZE: usize = 4096;
+const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
     pub file: File,
@@ -43,7 +45,7 @@ impl DiskManager{
             file
         })
     }
-    // need to set it to allocated too
+    
     pub fn write(&self, page_id: u32, data: &[u8]) -> Result<(), FerroError>{
         if data.len() != PAGE_SIZE{
             return Err(FerroError::Io(format!("Page length must be: {}", PAGE_SIZE)))
@@ -63,6 +65,7 @@ impl DiskManager{
         
         Ok(())
     }
+    
     pub fn read(&self, page_id: u32) -> Result<[u8; PAGE_SIZE], FerroError>{
         let mut buffer = [0u8; PAGE_SIZE];
         let offset = page_id as u64 * PAGE_SIZE as u64;
@@ -83,11 +86,25 @@ impl DiskManager{
 
     // sets a page as free/unused
     pub fn deallocate(&self, page_id: u32) -> Result<(), FerroError>{
-        let mut page_bitmap = self.read(0)?;
-        let byte_index = (page_id/8) as usize + 4;
-        let bit_index = page_id % 8;
+        let mut current_bitmap_id = 0;
+        let mut jumps_needed = page_id/BITS_PER_BITMAP;
+        let mut page_bitmap = self.read(current_bitmap_id)?;
+
+        while jumps_needed > 0 {
+            let next_bitmap_id = u32::from_le_bytes(page_bitmap[0..4].try_into().unwrap());
+            if next_bitmap_id == 0 {
+                return Err(FerroError::Io(String::from("can't deallocate an unmapped page")))
+            }
+            current_bitmap_id = next_bitmap_id;
+            page_bitmap = self.read(current_bitmap_id)?;
+            jumps_needed -=1;
+        }
+
+        let local_page_id = page_id % BITS_PER_BITMAP;
+        let byte_index = (local_page_id/8) as usize + 4;
+        let bit_index = local_page_id % 8;
         page_bitmap[byte_index] &= !(1 << bit_index);
-        match self.write(0, &page_bitmap) {
+        match self.write(current_bitmap_id, &page_bitmap) {
             Ok(_) => (),
             Err(e) => return Err(e)
         };
@@ -96,23 +113,49 @@ impl DiskManager{
 
     //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
     pub fn allocate(&self) -> Result<u32, FerroError>{
-        let mut page_bitmap = self.read(0)?;
-        for byte_index in 4..PAGE_SIZE {
-            for bit_index in 0..8 {
-                if page_bitmap[byte_index] & (1<<bit_index) == 0 {
-                    let page_id = (byte_index - 4) * 8 + bit_index;
-                    page_bitmap[byte_index] |= 1 << bit_index;
-                    self.write(0, &page_bitmap)?;
-                    return Ok(page_id as u32)
+        let mut current_bitmap_id = 0;
+        let mut global_offset = 0;
+        loop {
+            let mut page_bitmap = self.read(current_bitmap_id)?;
+
+            for byte_index in 4..PAGE_SIZE {
+                if page_bitmap[byte_index] != 0xFF {
+                    for bit_index in 0..8 {
+                        if page_bitmap[byte_index] & (1<<bit_index) == 0 {
+                            page_bitmap[byte_index] |= 1 << bit_index;
+                            self.write(current_bitmap_id, &page_bitmap)?;
+                            let page_id: usize = (byte_index - 4) * 8 + bit_index;
+                            return Ok(global_offset + page_id as u32);
+                        }
+                    }
                 }
             }
+            let next_bitmap_id = u32::from_le_bytes(page_bitmap[0..4].try_into().unwrap());
+            
+            if next_bitmap_id != 0 {
+                current_bitmap_id = next_bitmap_id;
+                global_offset += BITS_PER_BITMAP;
+                continue;
+            }
+            let new_bitmap_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
+            let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
+            page_bitmap[0..4].copy_from_slice(&new_bitmap_id.to_le_bytes());
+            self.write(current_bitmap_id, &page_bitmap)?;
+            let mut new_bitmap = [0u8; PAGE_SIZE];
+
+            let bm_local_id = new_bitmap_id % BITS_PER_BITMAP;
+            let byte_index = (bm_local_id/8) as usize + 4;
+            let bit_index = (bm_local_id % 8) as usize;
+            new_bitmap[byte_index] |= 1 << bit_index;
+
+            let local_id = page_id% BITS_PER_BITMAP;
+            let byte_ind = (local_id/8)as usize + 4;
+            let bit_ind = local_id % 8;
+            new_bitmap[byte_ind] |= 1 << bit_ind;
+
+            self.write(new_bitmap_id, &new_bitmap)?;
+            return Ok(page_id)
         }
-        let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
-        let byte_index = (page_id/8) as usize + 4;
-        let bit_index = (page_id % 8) as usize;
-        page_bitmap[byte_index] |= 1 << bit_index;
-        self.write(0, &page_bitmap)?;
-        return Ok(page_id as u32)
     }
 }
 
