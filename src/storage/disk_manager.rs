@@ -163,5 +163,43 @@ impl DiskManager{
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use crate::DiskManager;
+    use std::fs::OpenOptions;
+    #[test]
+    pub fn test_rw() -> Result<(), Box<dyn std::error::Error>>{
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().join("test.db");
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+                                                .open(&temp_path)?;
+        let dm = DiskManager::new(temp_file).unwrap();
+        let data1 = [8u8; 4096];
+        let data2 = [2u8; 4096];
+        let _ = dm.write(1, &data1);
+        let _ = dm.write(3, &data2);
+        let read1 = dm.read(1)?;
+        let read2 = dm.read(3)?;
+        assert_eq!(read1, data1);
+        assert_eq!(read2, data2);
+        Ok(())
+    }
 
+    #[test]
+    pub fn test_freelist() -> Result<(), Box<dyn std::error::Error>>{
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().join("test.db");
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+                                                .open(&temp_path)?;
+        let dm = DiskManager::new(temp_file).unwrap();
+        let page1 = dm.allocate().unwrap();
+        let _page2 = dm.allocate().unwrap();
+        let _page3 = dm.allocate().unwrap();
+        let _ = dm.deallocate(page1);
+        let page4 = dm.allocate().unwrap();
+        assert_eq!(page1, page4);
+        Ok(())
+    }
+}
 
