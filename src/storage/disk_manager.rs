@@ -11,6 +11,7 @@ const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
     pub file: File,
+    bitmap_lock: Mutex<()>
 }
 
 impl DiskManager{
@@ -42,7 +43,8 @@ impl DiskManager{
         }
         Ok(DiskManager {
             next_page_id: AtomicU32::new(next_page_id),
-            file
+            file,
+            bitmap_lock: Mutex::new(())
         })
     }
     
@@ -65,7 +67,7 @@ impl DiskManager{
         
         Ok(())
     }
-    
+
     pub fn read(&self, page_id: u32) -> Result<[u8; PAGE_SIZE], FerroError>{
         let mut buffer = [0u8; PAGE_SIZE];
         let offset = page_id as u64 * PAGE_SIZE as u64;
@@ -86,6 +88,7 @@ impl DiskManager{
 
     // sets a page as free/unused
     pub fn deallocate(&self, page_id: u32) -> Result<(), FerroError>{
+        let _guard = self.bitmap_lock.lock().unwrap();
         let mut current_bitmap_id = 0;
         let mut jumps_needed = page_id/BITS_PER_BITMAP;
         let mut page_bitmap = self.read(current_bitmap_id)?;
@@ -113,6 +116,7 @@ impl DiskManager{
 
     //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
     pub fn allocate(&self) -> Result<u32, FerroError>{
+        let _guard = self.bitmap_lock.lock().unwrap();
         let mut current_bitmap_id = 0;
         let mut global_offset = 0;
         loop {
