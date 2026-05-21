@@ -166,7 +166,7 @@ impl DiskManager{
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
-    use crate::DiskManager;
+    use crate::storage::disk_manager::DiskManager;
     use std::fs::OpenOptions;
     #[test]
     pub fn test_rw() -> Result<(), Box<dyn std::error::Error>>{
