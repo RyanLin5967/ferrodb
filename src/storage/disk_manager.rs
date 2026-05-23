@@ -6,7 +6,7 @@ use std::thread::current;
 use crate::error::FerroError;
 use std::os::windows::fs::FileExt;
 
-const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 4096;
 const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
