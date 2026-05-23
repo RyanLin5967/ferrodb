@@ -90,11 +90,70 @@ impl Tuple {
         Ok(bytes)
     }
 
-    // have to make sure byte order is same as schema
     pub fn deserialize(&self, bytes: &[u8], schema: &Schema) -> Result<Vec<Value>, FerroError>  {
-        let values: Vec<Value> = Vec::new();
-        
+        let mut values: Vec<Value> = Vec::new();
+        let mut offset: usize = 0;
 
+        let bitmap_len = (schema.columns.len() + 7)/8;
+        let bitmap = &bytes[offset..bitmap_len];
+        
+        offset += bitmap_len;
+
+        for (i, column) in schema.columns.iter().enumerate() {
+            let data_ty = &column.data_type;
+            match data_ty {
+                DataType::Boolean => {
+                    let padding = get_padding(1, offset);
+                    offset += padding;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += 1;
+                        continue;
+                    }
+                    values.push(Value::Boolean(bytes[offset] != 0));
+                    offset += 1;
+                },
+                DataType::Float => {
+                    let padding = get_padding(8, offset);
+                    offset += padding;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += 8;
+                        continue;
+                    }
+                    let float_bytes = &bytes[offset..offset+8];
+                    let float = f64::from_be_bytes(float_bytes.try_into().unwrap());
+                    values.push(Value::Float(float));
+                    offset += 8;
+                },
+                DataType::Integer => {
+                    let padding = get_padding(4, offset);
+                    offset += padding;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += 4;
+                        continue;
+                    }
+                    let int_bytes = &bytes[offset..offset+4];
+                    let int = i32::from_be_bytes(int_bytes.try_into().unwrap());
+                    values.push(Value::Integer(int));
+                    offset += 4;
+                },
+                DataType::Varchar(_) => {
+                    let len_bytes = &bytes[offset..offset + 1];
+                    let len = u8::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+                    offset += 1;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += len;
+                        continue;
+                    }
+                    let str_bytes = &bytes[offset..offset + len];
+                    values.push(Value::Varchar(std::str::from_utf8(str_bytes).map(|s| s.to_string()).unwrap()));
+                    offset += len;
+                },
+            }
+        }
         Ok(values)
     }
 
