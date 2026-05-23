@@ -19,7 +19,9 @@ pub struct Page {
 }
 
 impl Tuple {
-
+    pub fn new(null_bitmap: Vec<u8>, data: Vec<u8>) -> Self{
+        Tuple {null_bitmap, data}
+    }
     pub fn serialize(&self, values: &[Value], schema: &Schema) -> Result<Vec<u8>, FerroError>{
         if values.len() != schema.columns.len() {
             return Err(FerroError::Parse(String::from("values is not the same length as columns")))
@@ -160,4 +162,52 @@ impl Tuple {
 }
 pub fn get_padding(align: usize, buff_size: usize) -> usize {
     return (align - (buff_size & (align - 1))) & (align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::catalog::schema::Schema;
+    use crate::catalog::column::{Column, DataType, Value};
+    use crate::storage::heap_page::Tuple;
+    #[test]
+    pub fn test_se_and_deserialize() { 
+        let columns = vec![
+            Column::new(String::from("test1"), DataType::Integer, false),
+            Column::new(String::from("test2"), DataType::Float, true),
+            Column::new(String::from("test3"), DataType::Varchar(2), false),
+            Column::new(String::from("test4"), DataType::Boolean, true)
+            ];
+        let values = vec![Value::Integer(67), Value::Float(6.7), Value::Varchar(String::from("67")), Value::Boolean(false)];
+        let schema = Schema::new(columns);
+        let tuple = Tuple::new(Vec::new(), Vec::new());
+        let tuple_bytes = tuple.serialize(&values, &schema).unwrap();
+        let de_values = tuple.deserialize(&tuple_bytes, &schema).unwrap();
+        assert_eq!(values, de_values);
+    }
+
+    #[test]
+    fn test_null(){
+        let columns = vec![
+            Column::new(String::from("test1"), DataType::Integer, false),
+            Column::new(String::from("test2"), DataType::Float, true),
+            Column::new(String::from("test3"), DataType::Varchar(10), false),
+            Column::new(String::from("test4"), DataType::Boolean, true)
+        ];
+        
+        let values = vec![
+            Value::Integer(42), 
+            Value::Null,
+            Value::Varchar(String::from("short")),
+            Value::Null
+        ];
+        
+        let schema = Schema::new(columns);
+        let tuple = Tuple::new(Vec::new(), Vec::new());
+        
+        let tuple_bytes = tuple.serialize(&values, &schema).unwrap();
+        let de_values = tuple.deserialize(&tuple_bytes, &schema).unwrap();
+        
+        assert_eq!(values, de_values);
+    }
 }

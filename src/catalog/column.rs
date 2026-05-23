@@ -12,7 +12,7 @@ pub enum DataType {
     Boolean,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum Value {
     Integer(i32),
     Float(f64),
