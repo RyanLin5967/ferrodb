@@ -41,21 +41,18 @@ impl Tuple {
         for (i , value) in values.iter().enumerate() {
             match value {
                 Value::Boolean(b) => {
-                    let align = 1;
-                    let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                    let padding = get_padding(1, bytes.len());
                     bytes.resize(bytes.len() + padding, 0);
                     bytes.push(*b as u8);
 
                 },
                 Value::Float(f) => {
-                    let align = 8;
-                    let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                    let padding = get_padding(8, bytes.len());
                     bytes.resize(bytes.len() + padding, 0);
                     bytes.extend_from_slice(&f.to_be_bytes());
                 },
                 Value::Integer(i) => {
-                    let align = 4;
-                    let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                    let padding = get_padding(4, bytes.len());
                     bytes.resize(bytes.len() + padding, 0);
                     bytes.extend_from_slice(&i.to_be_bytes());
                 },
@@ -69,20 +66,17 @@ impl Tuple {
                     let data_type = &schema.columns[i].data_type;
                     match data_type {
                         DataType::Boolean => {
-                            let align = 1;
-                            let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                            let padding = get_padding(1, bytes.len());
                             bytes.resize(bytes.len() + padding, 0);
                             bytes.push(0u8);
                         },
                         DataType::Float => {
-                            let align = 8;
-                            let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                            let padding = get_padding(8, bytes.len());
                             bytes.resize(bytes.len() + padding, 0);
                             bytes.extend_from_slice(&[0u8; 8]);
                         },
                         DataType::Integer => {
-                            let align = 4;
-                            let padding = (align - (bytes.len() & (align - 1))) & (align - 1);
+                            let padding = get_padding(4, bytes.len());
                             bytes.resize(bytes.len() + padding, 0);
                             bytes.extend_from_slice(&[0u8; 4]);
                         },
@@ -103,4 +97,8 @@ impl Tuple {
 
         Ok(values)
     }
+
+}
+pub fn get_padding(align: usize, buff_size: usize) -> usize {
+    return (align - (buff_size & (align - 1))) & (align - 1)
 }
