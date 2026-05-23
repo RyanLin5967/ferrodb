@@ -20,3 +20,9 @@ pub enum Value {
     Boolean(bool),
     Null
 }
+
+impl Column {
+    pub fn new(name: String, data_type: DataType, nullable: bool) -> Self {
+        Column {name, data_type, nullable}
+    }
+}
