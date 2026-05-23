@@ -3,15 +3,14 @@ use crate::catalog::column::{DataType, Value};
 use crate::error::FerroError;
 
 pub struct Tuple {
-    null_bitmap: Vec<u8>,
     data: Vec<u8>
 }
 
 impl Tuple {
-    pub fn new(null_bitmap: Vec<u8>, data: Vec<u8>) -> Self{
-        Tuple {null_bitmap, data}
+    pub fn new(data: Vec<u8>) -> Self{
+        Tuple {data}
     }
-    pub fn serialize(&self, values: &[Value], schema: &Schema) -> Result<Vec<u8>, FerroError>{
+    pub fn serialize(values: &[Value], schema: &Schema) -> Result<Self, FerroError>{
         if values.len() != schema.columns.len() {
             return Err(FerroError::Parse(String::from("values is not the same length as columns")))
         }
@@ -78,15 +77,15 @@ impl Tuple {
                 }
             }
         }
-        Ok(bytes)
+        Ok(Tuple {data: bytes})
     }
 
-    pub fn deserialize(&self, bytes: &[u8], schema: &Schema) -> Result<Vec<Value>, FerroError>  {
+    pub fn deserialize(&self, schema: &Schema) -> Result<Vec<Value>, FerroError>  {
         let mut values: Vec<Value> = Vec::new();
         let mut offset: usize = 0;
 
         let bitmap_len = (schema.columns.len() + 7)/8;
-        let bitmap = &bytes[offset..bitmap_len];
+        let bitmap = &self.data[offset..bitmap_len + offset];
         
         offset += bitmap_len;
 
@@ -101,7 +100,7 @@ impl Tuple {
                         offset += 1;
                         continue;
                     }
-                    values.push(Value::Boolean(bytes[offset] != 0));
+                    values.push(Value::Boolean(self.data[offset] != 0));
                     offset += 1;
                 },
                 DataType::Float => {
@@ -112,7 +111,7 @@ impl Tuple {
                         offset += 8;
                         continue;
                     }
-                    let float_bytes = &bytes[offset..offset+8];
+                    let float_bytes = &self.data[offset..offset+8];
                     let float = f64::from_be_bytes(float_bytes.try_into().unwrap());
                     values.push(Value::Float(float));
                     offset += 8;
@@ -125,13 +124,13 @@ impl Tuple {
                         offset += 4;
                         continue;
                     }
-                    let int_bytes = &bytes[offset..offset+4];
+                    let int_bytes = &self.data[offset..offset+4];
                     let int = i32::from_be_bytes(int_bytes.try_into().unwrap());
                     values.push(Value::Integer(int));
                     offset += 4;
                 },
                 DataType::Varchar(_) => {
-                    let len_bytes = &bytes[offset..offset + 1];
+                    let len_bytes = &self.data[offset..offset + 1];
                     let len = u8::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
                     offset += 1;
                     if (bitmap[i/8] & (1 << i % 8)) != 0 {
@@ -139,7 +138,7 @@ impl Tuple {
                         offset += len;
                         continue;
                     }
-                    let str_bytes = &bytes[offset..offset + len];
+                    let str_bytes = &self.data[offset..offset + len];
                     values.push(Value::Varchar(std::str::from_utf8(str_bytes).map(|s| s.to_string()).unwrap()));
                     offset += len;
                 },
@@ -170,9 +169,8 @@ mod tests {
             ];
         let values = vec![Value::Integer(67), Value::Float(6.7), Value::Varchar(String::from("67")), Value::Boolean(false)];
         let schema = Schema::new(columns);
-        let tuple = Tuple::new(Vec::new(), Vec::new());
-        let tuple_bytes = tuple.serialize(&values, &schema).unwrap();
-        let de_values = tuple.deserialize(&tuple_bytes, &schema).unwrap();
+        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let de_values = Tuple::deserialize(&tuple, &schema).unwrap();
         assert_eq!(values, de_values);
     }
 
@@ -192,11 +190,9 @@ mod tests {
             Value::Null
         ];
         
-        let schema = Schema::new(columns);
-        let tuple = Tuple::new(Vec::new(), Vec::new());
-        
-        let tuple_bytes = tuple.serialize(&values, &schema).unwrap();
-        let de_values = tuple.deserialize(&tuple_bytes, &schema).unwrap();
+        let schema = Schema::new(columns);        
+        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let de_values = Tuple::deserialize(&tuple, &schema).unwrap();
         
         assert_eq!(values, de_values);
     }
