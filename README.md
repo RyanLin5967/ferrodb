@@ -20,7 +20,7 @@ Under active development.
 ## Current progress
 
 - [x] Disk Manager (page-level IO, bitmap-based page allocation)
-- [ ] Page layout and tuple serialization
+- [x] Page layout and tuple serialization
 - [ ] Buffer pool manager
 - [ ] B+ tree indexing
 - [ ] SQL parser
