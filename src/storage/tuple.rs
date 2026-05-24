@@ -17,7 +17,7 @@ impl Tuple {
         let mut null_bitmap = vec![0u8; (schema.columns.len() + 7)/8];
         let mut bytes: Vec<u8> = Vec::new();
         // fill bitmap
-        for (i, value) in values.iter().enumerate() {
+        for (i, _) in values.iter().enumerate() {
             if values[i] == Value::Null {
                 let byte_index = i/8;
                 let bit_index = i%8;
@@ -70,7 +70,7 @@ impl Tuple {
                             bytes.resize(bytes.len() + padding, 0);
                             bytes.extend_from_slice(&[0u8; 4]);
                         },
-                        DataType::Varchar(c) => {
+                        DataType::Varchar(_) => {
                             bytes.resize(bytes.len() + 1, 0);
                         },
                     }
