@@ -1,19 +1,19 @@
-use crate::{error::FerroError, storage::disk_manager::PAGE_SIZE};
+use crate::{error::FerroError, storage::{disk_manager::PAGE_SIZE, tuple::Tuple}};
 
 #[derive(Debug, PartialEq)]
 pub struct SlotEntry {
-    offset: u16,
-    length: u16
+    pub offset: u16,
+    pub length: u16
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Page {
-    page_type: u8,
-    page_id: u32,
-    lsn: u64,
-    checksum: u32,
-    slot_arr: Vec<SlotEntry>,
-    tuples: Vec<u8>
+    pub page_type: u8,
+    pub page_id: u32,
+    pub lsn: u64,
+    pub checksum: u32,
+    pub slot_arr: Vec<SlotEntry>,
+    pub tuples: Vec<u8>
 }
 
 const HEADER_SIZE: usize = 23;
@@ -28,24 +28,12 @@ impl Page {
     // header has num slots, slot array, free space pointer start and end, page id, lsn, checksum, 
     pub fn serialize(&self) -> Result<[u8; PAGE_SIZE], FerroError> {
         let mut buffer = [0u8; PAGE_SIZE];
-        let mut min_offset: u16;
-
-        if self.slot_arr.len() == 0 {
-            min_offset = PAGE_SIZE as u16;
-        }else {
-            min_offset = self.slot_arr[0].offset;
-            for slot_entry in &self.slot_arr {
-                if slot_entry.offset < min_offset {
-                    min_offset = slot_entry.offset;
-                }
-            }
-        }
         // header
         buffer[0..1].copy_from_slice(&self.page_type.to_be_bytes()); //page type
         buffer[1..5].copy_from_slice(&self.page_id.to_be_bytes()); // page id
         buffer[5..7].copy_from_slice(&(self.slot_arr.len() as u16).to_be_bytes()); // num slots
-        buffer[7..9].copy_from_slice(&((23+self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16).to_be_bytes());// free space start
-        buffer[9..11].copy_from_slice(&min_offset.to_be_bytes()); // free space end
+        buffer[7..9].copy_from_slice(&((HEADER_SIZE+self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16).to_be_bytes());// free space start
+        buffer[9..11].copy_from_slice(&self.get_free_space_end().to_be_bytes()); // free space end
         buffer[11..19].copy_from_slice(&self.lsn.to_be_bytes()); // lsn
         buffer[19..23].copy_from_slice(&self.checksum.to_be_bytes()); // checksum
         
@@ -80,6 +68,82 @@ impl Page {
         
         let tuples = bytes[free_space_end as usize..PAGE_SIZE].to_vec();
         Ok (Page { page_type, page_id, lsn, checksum, slot_arr, tuples })
+    }
+
+    // finds space in page, writes tuple bytes, add slot entry
+    pub fn insert(&mut self, tuple: Tuple) -> Result<(), FerroError>{
+        let free_space_start = self.get_free_space_start();      
+        let free_space_end = self.get_free_space_end();
+        
+        if (free_space_end as usize - free_space_start as usize) < tuple.data.len() + SLOT_ENTRY_SIZE{
+            return Err(FerroError::NotEnoughSpace);
+        } 
+        self.tuples.splice(0..0, tuple.data.clone());
+        self.slot_arr.push(SlotEntry::new(PAGE_SIZE as u16 -self.tuples.len() as u16, tuple.data.len() as u16));
+        Ok(())
+    }
+
+    // deserialze tuple from slot number
+    pub fn read(&self, slot_num: usize) -> Result<Tuple, FerroError>{
+        if slot_num >= self.slot_arr.len() {
+            return Err(FerroError::Io(String::from("slot num out of bounds")));
+        }
+        let slot = &self.slot_arr[slot_num];
+        if slot.length == 0 && slot.offset == 0 { // marked as deleted
+            return Err(FerroError::SlotDeleted);
+        }
+        let local_offset = slot.offset as usize - self.get_free_space_end() as usize;
+        let raw_tuple = &self.tuples[local_offset..local_offset + slot.length as usize];
+        Ok(Tuple::new(raw_tuple.to_vec()))
+    }
+
+    // update in place if fits, else delete and reinsert
+    pub fn update(&mut self, slot_num: usize, new_tuple: Tuple) -> Result<(), FerroError>{
+        let old_tuple = self.read(slot_num).unwrap();
+        let slot = &self.slot_arr[slot_num];
+        let free_space_start = self.get_free_space_start();
+        let free_space_end = self.get_free_space_end();
+        let local_offset: usize = slot.offset as usize - free_space_end as usize;
+        if new_tuple.data.len() <= old_tuple.data.len() {
+            self.tuples[local_offset..local_offset + new_tuple.data.len()].copy_from_slice(&new_tuple.data);
+            self.slot_arr[slot_num].length = new_tuple.data.len() as u16;
+        } else if free_space_end as usize - free_space_start as usize>= new_tuple.data.len(){
+            self.slot_arr[slot_num].offset = free_space_end - new_tuple.data.len() as u16;
+            self.slot_arr[slot_num].length = new_tuple.data.len() as u16;
+            self.tuples.splice(0..0, new_tuple.data);
+        } else {
+            return Err(FerroError::NotEnoughSpace);
+        }
+        Ok(())
+    }   
+
+    // nullify slot entry
+    pub fn delete(&mut self, slot_num: usize) -> Result<(), FerroError>{
+        if slot_num >= self.slot_arr.len() {
+            return Err(FerroError::Io(String::from("slot num out of bounds")));
+        }
+        self.slot_arr[slot_num].offset = 0;
+        self.slot_arr[slot_num].length = 0;
+        Ok(())
+    }
+    
+    fn get_free_space_start(&self) -> u16{
+        return (HEADER_SIZE + self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16;
+    }
+    fn get_free_space_end(&self) -> u16{
+        let mut min_offset: u16;
+        
+        if self.slot_arr.len() == 0 {
+            min_offset = PAGE_SIZE as u16;
+        }else {
+            min_offset = self.slot_arr[0].offset;
+            for slot_entry in &self.slot_arr {
+                if slot_entry.offset < min_offset {
+                    min_offset = slot_entry.offset;
+                }
+            }
+        }
+        return min_offset;
     }
 }
 

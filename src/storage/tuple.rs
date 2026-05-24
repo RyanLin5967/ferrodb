@@ -3,7 +3,7 @@ use crate::catalog::column::{DataType, Value};
 use crate::error::FerroError;
 
 pub struct Tuple {
-    data: Vec<u8>
+    pub data: Vec<u8>
 }
 
 impl Tuple {
