@@ -1,9 +1,12 @@
 use crate::{error::FerroError, storage::disk_manager::PAGE_SIZE};
+
+#[derive(Debug, PartialEq)]
 pub struct SlotEntry {
     offset: u16,
     length: u16
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Page {
     page_type: u8,
     page_id: u32,
@@ -18,6 +21,10 @@ const SLOT_ENTRY_SIZE: usize = 4;
 // HEADER LAYOUT: |page_type (u8, 1)|page_id (u32, 4)|num_slots (u16, 2)|
 // free_space_start (u16, 2)|free_space_end (u16, 2)|lsn (u64, 8)|checksum (u32, 4)
 impl Page {
+
+    pub fn new(page_type: u8, page_id: u32, lsn: u64, checksum: u32, slot_arr: Vec<SlotEntry>, tuples: Vec<u8>) -> Self{
+        Page { page_type, page_id, lsn, checksum, slot_arr, tuples }
+    }
     // header has num slots, slot array, free space pointer start and end, page id, lsn, checksum, 
     pub fn serialize(&self) -> Result<[u8; PAGE_SIZE], FerroError> {
         let mut buffer = [0u8; PAGE_SIZE];
@@ -79,5 +86,48 @@ impl Page {
 impl SlotEntry {
     pub fn new(offset: u16, length: u16) -> Self{
         SlotEntry {offset, length}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::storage::heap_page::Page;
+    use crate::storage::heap_page::SlotEntry;
+
+    #[test]
+    fn test_basic() {
+        let page = Page::new(1,2,3,4,Vec::new(), Vec::new());
+        let bytes = page.serialize().unwrap();
+        let de_page = Page::deserialize(bytes).unwrap();
+
+        assert_eq!(page, de_page);
+        assert_eq!(de_page.slot_arr.len(), 0);
+        assert_eq!(de_page.tuples.len(), 0);
+    }
+
+    #[test]
+    fn test_exact_bytes() {
+        let mut slots = Vec::new();
+        slots.push(SlotEntry::new(4000, 10));
+
+        let page = Page::new(
+            7,
+            0x12345678,
+            0x1122334455667788,
+            0xAABBCCDD,
+            slots,
+            vec![0; 10]
+        );
+
+        let bytes = page.serialize().unwrap();
+        assert_eq!(bytes[0], 7); //page type
+        assert_eq!(&bytes[1..5], &[0x12, 0x34, 0x56, 0x78]); // page_id
+        assert_eq!(&bytes[5..7], &[0x00, 0x01]); //num_slots
+        assert_eq!(&bytes[7..9], &[0x00, 27]); //free_space_start
+        assert_eq!(&bytes[9..11], &[0x0F, 0xA0]); // free_space_end
+        assert_eq!(&bytes[11..19], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]); // lsn
+        assert_eq!(&bytes[19..23], &[0xAA, 0xBB, 0xCC, 0xDD]); // checksum
+        assert_eq!(&bytes[23..27], &[0x0F, 0xA0, 0x00, 0x0A]); // slot entry
     }
 }
