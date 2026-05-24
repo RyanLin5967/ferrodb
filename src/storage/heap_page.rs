@@ -127,6 +127,22 @@ impl Page {
         Ok(())
     }
     
+    pub fn compact(&mut self) {
+        let mut buffer =[0u8; PAGE_SIZE];
+        let mut offset: usize = PAGE_SIZE;
+        let current_free_space_end = PAGE_SIZE - self.tuples.len();
+        for i in 0..self.slot_arr.len() {
+            if self.slot_arr[i].offset != 0 && self.slot_arr[i].length != 0 {
+                let local_source = self.slot_arr[i].offset as usize - current_free_space_end;
+                let length = self.slot_arr[i].length as usize;
+                let raw_tuple = &self.tuples[local_source..local_source + length];
+                offset -= raw_tuple.len();
+                self.slot_arr[i].offset = offset as u16;
+                buffer[offset..offset + raw_tuple.len()].copy_from_slice(&raw_tuple);
+            }
+        }
+        self.tuples = buffer[offset..PAGE_SIZE].to_vec();
+    }
     fn get_free_space_start(&self) -> u16{
         return (HEADER_SIZE + self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16;
     }
