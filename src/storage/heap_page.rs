@@ -52,7 +52,6 @@ impl Page {
     pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Result<Self, FerroError> {
         let page_type = u8::from_be_bytes(bytes[0..1].try_into().unwrap());
         let page_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-        let num_slots = u16::from_be_bytes(bytes[5..7].try_into().unwrap());
         let free_space_start = u16::from_be_bytes(bytes[7..9].try_into().unwrap());
         let free_space_end = u16::from_be_bytes(bytes[9..11].try_into().unwrap());
         let lsn = u64::from_be_bytes(bytes[11..19].try_into().unwrap());

@@ -1,8 +1,6 @@
-use std::io::{Read, Write, Seek};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::thread::current;
 use crate::error::FerroError;
 use std::os::windows::fs::FileExt;
 

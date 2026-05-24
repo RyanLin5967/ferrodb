@@ -1,4 +1,3 @@
-use std::io;
 use std::fmt::{ Display, Formatter, Result };
 use std::error;
 
