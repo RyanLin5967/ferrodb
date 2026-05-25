@@ -28,6 +28,8 @@ Storage Engine:
 - to insert a new tuple, check page directory for a page with a free slot, fetch page from disk to memory, check slot array if there is enough space in page (if not find another page/create one), insert tuple into page
 - to update a tuple, find tuple using record id, if new value fits in the space, just update, if not, then mark old value as deleted and insert new value like it's a new tuple
 - if data is deleted, you can nullify its pointer or remove it
+- page directories will be stored on disk simlar to bitmap pages
+- when a heap page is deallocated, num_entries decreases by 1, and everything is shifted left (ensures everything is contigious)
 - will use secondary key (a column(s)) to point to primary key so pointer updating is ez (you only have to update the primary key)
 - b+ tree for indexing (has O(log N) lookup, where N is the number of items in the tree)
 
