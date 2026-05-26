@@ -59,6 +59,8 @@ ARC cache:
 - B1: pages that have been evicted from T1
 - B2: pages pages evicted from T2
 - p: target size for T1, starts at 0, adapts over time, changes if some pages are accessed more than others
+- if a page is already pinned, start from tail to head (from chosen list), if the first one is full, go to other one (O(n))
+- if both are pinned, return None cuz buffer pool is full, just return an error (could add ability to retry later)
 
 Architecture layers:
 1. B+ trees and keys (does lookups)
