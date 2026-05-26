@@ -61,14 +61,16 @@ impl LinkedHashSet {
             None => return Err(FerroError::KeyNotFound)
         };
 
-        match self.nodes[i].prev {
-            Some(p) => self.nodes[p].next = self.nodes[i].next,
-            None => self.head = self.nodes[i].next
+        let prev = self.nodes[i].prev;
+        let next = self.nodes[i].next;
+        match prev {
+            Some(p) => self.nodes[p].next = next,
+            None => self.head = next
         }
 
-        match self.nodes[i].next {
-            Some(n) => self.nodes[n].prev = self.nodes[i].prev,
-            None => self.tail = self.nodes[i].prev
+        match next {
+            Some(n) => self.nodes[n].prev = prev,
+            None => self.tail = prev
         }
 
         self.free_slots.push(i);
@@ -81,11 +83,12 @@ impl LinkedHashSet {
             None => return Err(FerroError::EmptyList)
         };
 
-        match self.nodes[i].prev {
+        let prev = self.nodes[i].prev;
+        match prev {
             Some(p) => self.nodes[p].next = None,
             None => self.head = None
         }
-        self.tail = self.nodes[i].prev;
+        self.tail = prev;
         self.map.remove(&self.nodes[i].key);
         self.free_slots.push(i);
         Ok(self.nodes[i].key)
