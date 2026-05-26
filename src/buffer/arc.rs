@@ -12,7 +12,8 @@ pub struct ArcCache {
 pub enum ArcResult {
     Hit, 
     MissEvict(u32), // page id is evicted, have to load new page into that frame
-    MissNoEvict // not full, just load into empty frame
+    MissNoEvict, // not full, just load into empty frame
+    PoolFull,
 }
 
 impl ArcCache {
@@ -38,6 +39,10 @@ impl ArcCache {
             let delta = std::cmp::max(1, self.b2.len()/std::cmp::max(self.b1.len(),1));
             self.p = std::cmp::min(self.p + delta, self.capacity);
             let evicted = self.replace(page_id, &is_pinned);
+
+            if self.t1.len() + self.t2.len() == self.capacity && evicted.is_none() {
+                return ArcResult::PoolFull;
+            }
             self.b1.remove(page_id).unwrap();
             self.t2.insert(page_id).unwrap();
 
@@ -51,6 +56,10 @@ impl ArcCache {
             let delta = std::cmp::max(1, self.b1.len() /std::cmp::max(1, self.b2.len()));
             self.p = self.p.saturating_sub(delta);
             let evicted = self.replace(page_id, &is_pinned);
+
+            if self.t1.len() + self.t2.len() == self.capacity && evicted.is_none() {
+                return ArcResult::PoolFull;
+            }
             self.b2.remove(page_id).unwrap();
             self.t2.insert(page_id).unwrap();
 
@@ -76,7 +85,11 @@ impl ArcCache {
         } else {
             None
         };
-
+        
+        if evicted.is_none() && self.t1.len() + self.t2.len() == self.capacity{
+            return ArcResult::PoolFull;
+        }
+        
         self.t1.insert(page_id).unwrap();
 
         return match evicted {
