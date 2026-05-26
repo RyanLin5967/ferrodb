@@ -15,8 +15,8 @@ pub struct LinkedHashSet {
 
 impl LinkedHashSet {
 
-    pub fn new(map: HashMap<u32, usize>, nodes: Vec<Node>, tail: Option<usize>, head: Option<usize>, free_slots: Vec<usize>) -> Self {
-        LinkedHashSet { map, nodes, tail, head, free_slots }
+    pub fn new() -> Self {
+        LinkedHashSet { map: HashMap::new(), nodes: Vec::new(), tail: None, head: None, free_slots: Vec::new()}
     }
 
     // inserts to front
