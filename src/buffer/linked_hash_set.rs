@@ -21,7 +21,10 @@ impl LinkedHashSet {
 
     // inserts to front
     pub fn insert(&mut self, key: u32) -> Result<(), FerroError>{
-
+        if self.map.contains_key(&key) {
+            self.move_to_front(key)?;
+            return Ok(());
+        }
         let i;
 
         match self.free_slots.pop() {
@@ -88,7 +91,36 @@ impl LinkedHashSet {
         Ok(self.nodes[i].key)
     }
 
+    pub fn move_to_front(&mut self, key: u32) -> Result<(), FerroError>{
+        let i = match self.map.get(&key) {
+            Some(&i) => i,
+            None => return Err(FerroError::KeyNotFound),
+        };
 
+        let prev = self.nodes[i].prev;
+        let next = self.nodes[i].next;
+
+        match prev {
+            Some(p) => self.nodes[p].next = next,
+            None => self.head = next
+        }
+
+        match next  {
+            Some(n) => self.nodes[n].prev = prev,
+            None => self.tail = prev
+        }
+
+        self.nodes[i].prev = None;
+        self.nodes[i].next = self.head;
+
+        match self.head {
+            Some(old_head) => self.nodes[old_head].prev = Some(i),
+            None => self.tail = Some(i)
+        }
+
+        self.head = Some(i);
+        Ok(())
+    }
 }
 
 impl Node {
