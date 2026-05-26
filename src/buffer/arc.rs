@@ -1,4 +1,4 @@
-use crate::buffer::linked_hash_set::LinkedHashSet;
+use crate::buffer::{buffer_pool::Frame, linked_hash_set::LinkedHashSet};
 
 pub struct ArcCache {
     pub capacity: usize,
@@ -20,7 +20,7 @@ impl ArcCache {
         ArcCache {t1: LinkedHashSet::new(), t2: LinkedHashSet::new(), b1: LinkedHashSet::new(), b2: LinkedHashSet::new(), p:0, capacity}
     }
 
-    pub fn request(&mut self, page_id: u32) -> ArcResult {
+    pub fn request(&mut self, page_id: u32, is_pinned:&dyn Fn(u32) -> bool) -> ArcResult {
         // case 1: hit in t1 or t2
         if self.t1.contains(page_id) {
             self.t1.remove(page_id).unwrap();
@@ -37,7 +37,7 @@ impl ArcCache {
         if self.b1.contains(page_id) {
             let delta = std::cmp::max(1, self.b2.len()/std::cmp::max(self.b1.len(),1));
             self.p = std::cmp::min(self.p + delta, self.capacity);
-            let evicted = self.replace(page_id);
+            let evicted = self.replace(page_id, &is_pinned);
             self.b1.remove(page_id).unwrap();
             self.t2.insert(page_id).unwrap();
 
@@ -50,7 +50,7 @@ impl ArcCache {
         if self.b2.contains(page_id) {
             let delta = std::cmp::max(1, self.b1.len() /std::cmp::max(1, self.b2.len()));
             self.p = self.p.saturating_sub(delta);
-            let evicted = self.replace(page_id);
+            let evicted = self.replace(page_id, &is_pinned);
             self.b2.remove(page_id).unwrap();
             self.t2.insert(page_id).unwrap();
 
@@ -64,16 +64,15 @@ impl ArcCache {
         let evicted = if self.b1.len() + self.t1.len() == self.capacity {
             if self.t1.len() < self.capacity {
                 self.b1.pop_back().ok();
-                self.replace(page_id)
-            } else { // t1 is full, so no ghost entries, thus evict directly from t1
-                let victim = self.t1.pop_back().ok();
-                victim
+                self.replace(page_id, &is_pinned)
+            } else { // t1 is full, so no ghost entries, thus evict directly from t1 (if not pinned)
+                self.t1.check_unpinned(&is_pinned)
             }
         } else if self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len() >= self.capacity {
             if self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len() == 2*self.capacity {
                 self.b2.pop_back().ok();
             }
-            self.replace(page_id)
+            self.replace(page_id, &is_pinned)
         } else {
             None
         };
@@ -86,22 +85,31 @@ impl ArcCache {
         }
     }   
 
-    pub fn replace(&mut self, incoming: u32) -> Option<u32> {
+    // have to handle case where the page returned is pinned already, and if all pages are currently pinned
+    // probably shouldn't immediately mutate the t1/t2 lists
+    pub fn replace(&mut self, incoming: u32, is_pinned:&dyn Fn(u32) -> bool) -> Option<u32> {
         if self.t1.len() + self.t2.len() == 0 {
             return None;
         }
         if self.t1.len() > 0 && (self.t1.len() > self.p || (self.b2.contains(incoming) && self.t1.len() == self.p)){
-            let victim = self.t1.pop_back().unwrap();
-            self.b1.insert(victim).unwrap();
-            Some(victim)
-        } else if self.t2.len() > 0 {
-            let victim = self.t2.pop_back().unwrap();
-            self.b2.insert(victim).unwrap();
-            Some(victim)
+            if let Some(victim) = self.t1.check_unpinned(&is_pinned) { // first try t1
+                self.b1.insert(victim).unwrap();
+                return Some(victim);
+            }
+            if let Some(victim) = self.t2.check_unpinned(&is_pinned) { // then try t2
+                self.b2.insert(victim).unwrap();
+                return Some(victim);
+            }
         } else {
-            let victim = self.t1.pop_back().unwrap();
-            self.b1.insert(victim).unwrap();
-            Some(victim)
+            if let Some(victim) = self.t2.check_unpinned(&is_pinned) { // first try t2
+                self.b2.insert(victim).unwrap();
+                return Some(victim);
+            }
+            if let Some(victim) = self.t1.check_unpinned(&is_pinned) { // then try t1
+                self.b1.insert(victim).unwrap();
+                return Some(victim);
+            }
         }
+        None // whole cache is full (very rare so should be fine)
     }   
 }
