@@ -124,6 +124,10 @@ impl LinkedHashSet {
         self.head = Some(i);
         Ok(())
     }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl Node {
