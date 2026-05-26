@@ -125,6 +125,22 @@ impl LinkedHashSet {
         Ok(())
     }
 
+    pub fn check_unpinned(&mut self, is_pinned: &dyn Fn(u32) -> bool) -> Option<u32>{
+        let mut curr = self.tail;
+
+        while let Some(i) = curr {
+            let key = self.nodes[i].key;
+
+            if !is_pinned(key) {
+                self.remove(key).unwrap();
+                return Some(key);
+            }
+
+            curr = self.nodes[i].prev;
+        }
+        None
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
