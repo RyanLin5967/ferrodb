@@ -8,6 +8,8 @@ pub enum FerroError {
     Io(String),
     NotEnoughSpace,
     SlotDeleted,
+    KeyNotFound,
+    EmptyList,
 }
 
 impl Display for FerroError {
@@ -17,7 +19,8 @@ impl Display for FerroError {
             FerroError::Io(e) => write!(f, "io error: {}", e),
             FerroError::NotEnoughSpace => write!(f, "not enough space in page"),
             FerroError::SlotDeleted => write!(f, "the slot is delted"),
-            
+            FerroError::KeyNotFound => write!(f, "key wasn't found"),
+            FerroError::EmptyList => write!(f, "linked hash set is empty"),
         }
     }
 }
