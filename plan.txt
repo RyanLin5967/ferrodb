@@ -53,6 +53,13 @@ Disk Manager:
 - to write a page, it'll take the dirty page from memory and overwrite it
 - you can also allocate a new page (a new page id will be created)/deallocate one
 
+ARC cache:
+- T1: pages accessed exactly once recently (recency)
+- T2: pages accessed at least twice recently (frequency)
+- B1: pages that have been evicted from T1
+- B2: pages pages evicted from T2
+- p: target size for T1, starts at 0, adapts over time, changes if some pages are accessed more than others
+
 Architecture layers:
 1. B+ trees and keys (does lookups)
 2. Page layout and serialization (tuples + how they're endoed, slotted pages)
