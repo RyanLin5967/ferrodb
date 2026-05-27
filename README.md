@@ -21,7 +21,7 @@ Under active development.
 
 - [x] Disk Manager (page-level IO, bitmap-based page allocation)
 - [x] Page layout and tuple serialization
-- [ ] Buffer pool manager
+- [x] Buffer pool manager
 - [ ] B+ tree indexing
 - [ ] SQL parser
 - [ ] Query execution engine
