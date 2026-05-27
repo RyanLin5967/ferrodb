@@ -18,7 +18,7 @@ pub struct Frame {
 }
 
 pub struct BufferPool {
-    frames: Vec<Frame>,
+    frames: Vec<RwLock<Frame>>,
     page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
     disk_manager: Arc<DiskManager>,
     arc_cache: Mutex<ArcCache>,
@@ -27,44 +27,59 @@ pub struct BufferPool {
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
 impl BufferPool {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
-        let frames: Vec<Frame> = (0..MAX_BUFFER_POOL_PAGES).map(|_| Frame::new()).collect();
+        let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
         BufferPool {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES))}
     }
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
-    pub fn fetch_page(&mut self, page_id: u32) -> Result<&Frame, FerroError>{
+    pub fn fetch_page(&mut self, page_id: u32) -> Result<usize, FerroError>{
         let result = self.arc_cache.lock().unwrap().request(page_id, &|id| {
+            let pt = self.page_table.read().unwrap();
             let frame_i = self.page_table.read().unwrap()[&id];
-            self.frames[frame_i].pin_counter.load(Ordering::Relaxed) > 0
+            let frame = self.frames[frame_i].read().unwrap();
+            frame.pin_counter.load(Ordering::Relaxed) > 0
         });
 
         match result {
             ArcResult::Hit => { // page was already cached 
+                let pt = self.page_table.read().unwrap();
                 let frame_i = self.page_table.read().unwrap()[&page_id];
-                self.frames[frame_i].pin_counter.fetch_add(1, Ordering::Relaxed);
-                return Ok(&self.frames[frame_i])
+                let frame = self.frames[frame_i].read().unwrap();
+                frame.pin_counter.fetch_add(1, Ordering::Relaxed);
+                return Ok(frame_i)
             }
             ArcResult::MissEvict(evicted_id) => { // page not cached and pool is full (victim eviction)
-                let frame_i = self.page_table.read().unwrap()[&evicted_id];
-                let frame = &self.frames[frame_i];
-                if frame.dirty_flag.load(Ordering::Relaxed) {
-                    self.flush_page(evicted_id);
-                    self.frames[frame_i].dirty_flag.store(false, Ordering::Relaxed);
-                }
+                let pt = self.page_table.read().unwrap();
+                let frame_i = pt[&evicted_id];
+                drop(pt);
 
+                self.flush_page(evicted_id)?;
                 let new_page_data = self.disk_manager.read(page_id)?;
-                self.frames[frame_i] = Frame {data: new_page_data, page_id: Some(page_id), pin_counter: AtomicU16::from(1), dirty_flag: AtomicBool::from(false), frame_latch: RwLock::new(())};
-                self.page_table.write().unwrap().remove(&evicted_id);
-                self.page_table.write().unwrap().insert(page_id, frame_i);
-                return Ok(&self.frames[frame_i])
+                let mut frame = self.frames[frame_i].write().unwrap();
+                frame.data = new_page_data;
+                frame.page_id = Some(page_id);
+                frame.pin_counter = AtomicU16::new(1);
+                frame.dirty_flag = AtomicBool::new(false);
+                drop(frame);
+
+                let mut pt = self.page_table.write().unwrap();
+                pt.remove(&evicted_id);
+                pt.insert(page_id, frame_i);
+                return Ok(frame_i)
             }
             ArcResult::MissNoEvict => { // page not cached, pool not full 
                 let data = self.disk_manager.read(page_id)?;
                 for i in 0..self.frames.len() {
-                    if self.frames[i].page_id.is_none() {
-                        self.frames[i] = Frame {data, page_id: Some(page_id), pin_counter:AtomicU16::new(1), dirty_flag: AtomicBool::from(false), frame_latch: RwLock::new(())};
+                    let frame = self.frames[i].read().unwrap();
+                    if frame.page_id.is_none() {
+                        drop(frame);
+                        let mut frame = self.frames[i].write().unwrap();
+                        frame.data = data;
+                        frame.page_id = Some(page_id);
+                        frame.pin_counter = AtomicU16::new(1);
+                        frame.dirty_flag = AtomicBool::new(false);
                         self.page_table.write().unwrap().insert(page_id, i);
-                        return Ok(&self.frames[i]);
+                        return Ok(i);
                     }
                 }
                 unreachable!()
@@ -86,8 +101,8 @@ impl BufferPool {
     }
 
     // writes a dirty page to disk
-    pub fn flush_page(&self, page_id: u32) {
-
+    pub fn flush_page(&self, page_id: u32) -> Result<(), FerroError>{
+        Ok(())
     }
 
     // write all dirty pages to disk
