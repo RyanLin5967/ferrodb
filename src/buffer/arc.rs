@@ -1,4 +1,4 @@
-use crate::buffer::{buffer_pool::Frame, linked_hash_set::LinkedHashSet};
+use crate::{buffer::{buffer_pool::Frame, linked_hash_set::LinkedHashSet}, error::FerroError};
 
 pub struct ArcCache {
     pub capacity: usize,
@@ -89,7 +89,7 @@ impl ArcCache {
         if evicted.is_none() && self.t1.len() + self.t2.len() == self.capacity{
             return ArcResult::PoolFull;
         }
-        
+
         self.t1.insert(page_id).unwrap();
 
         return match evicted {
@@ -125,4 +125,17 @@ impl ArcCache {
         }
         None // whole cache is full (very rare so should be fine)
     }   
+
+    pub fn remove(&mut self, page_id: u32) -> Result<(), FerroError>{
+        if self.t1.contains(page_id) {
+            self.t1.remove(page_id)?;
+        } else if self.t2.contains(page_id) {
+            self.t2.remove(page_id)?;
+        } else if self.b1.contains(page_id) {
+            self.b1.remove(page_id)?;
+        } else if self.b2.contains(page_id) {
+            self.b2.remove(page_id)?;
+        }
+        Ok(())
+    }
 }
