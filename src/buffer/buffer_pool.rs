@@ -102,6 +102,16 @@ impl BufferPool {
 
     // writes a dirty page to disk
     pub fn flush_page(&self, page_id: u32) -> Result<(), FerroError>{
+        let pt = self.page_table.read().unwrap();
+        let frame_i = pt[&page_id];
+        drop(pt);
+
+        let frame = self.frames[frame_i].read().unwrap();
+        if frame.dirty_flag.load(Ordering::Relaxed) {
+            self.disk_manager.write(page_id, &frame.data)?;
+            frame.dirty_flag.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         Ok(())
     }
 
