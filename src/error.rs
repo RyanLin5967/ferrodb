@@ -10,6 +10,7 @@ pub enum FerroError {
     SlotDeleted,
     KeyNotFound,
     EmptyList,
+    PagePinned,
 }
 
 impl Display for FerroError {
@@ -21,6 +22,7 @@ impl Display for FerroError {
             FerroError::SlotDeleted => write!(f, "the slot is delted"),
             FerroError::KeyNotFound => write!(f, "key wasn't found"),
             FerroError::EmptyList => write!(f, "linked hash set is empty"),
+            FerroError::PagePinned => write!(f, "page is pinned"),
         }
     }
 }
