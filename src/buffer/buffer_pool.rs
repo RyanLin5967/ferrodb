@@ -16,7 +16,7 @@ pub struct Frame {
     dirty_flag: AtomicBool,
 }
 
-pub struct BufferPool {
+pub struct BufferPoolManager {
     frames: Vec<RwLock<Frame>>,
     page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
     disk_manager: Arc<DiskManager>,
@@ -24,10 +24,10 @@ pub struct BufferPool {
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
-impl BufferPool {
+impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
-        BufferPool {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES))}
+        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES))}
     }
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
