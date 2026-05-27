@@ -43,7 +43,7 @@ impl BufferPool {
         match result {
             ArcResult::Hit => { // page was already cached 
                 let pt = self.page_table.read().unwrap();
-                let frame_i = self.page_table.read().unwrap()[&page_id];
+                let frame_i = pt[&page_id];
                 let frame = self.frames[frame_i].read().unwrap();
                 frame.pin_counter.fetch_add(1, Ordering::Relaxed);
                 return Ok(frame_i)
