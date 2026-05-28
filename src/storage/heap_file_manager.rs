@@ -44,6 +44,7 @@ impl HeapFileManager {
             Some(id) => id,
             None => {
                 let new_page_id = self.buffer_pool_manager.new_page()?;
+                self.buffer_pool_manager.unpin_page(new_page_id, false);
                 let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
                 let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
                 let empty_page = Page::empty(new_page_id);
