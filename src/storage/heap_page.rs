@@ -150,20 +150,17 @@ impl Page {
     pub fn get_free_space_start(&self) -> u16{
         return (HEADER_SIZE + self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16;
     }
-    pub fn get_free_space_end(&self) -> u16{
-        let mut min_offset: u16;
-        
-        if self.slot_arr.len() == 0 {
-            min_offset = PAGE_SIZE as u16;
-        }else {
-            min_offset = self.slot_arr[0].offset;
-            for slot_entry in &self.slot_arr {
-                if slot_entry.offset < min_offset {
-                    min_offset = slot_entry.offset;
-                }
+    pub fn get_free_space_end(&self) -> u16 {
+        let mut min_offset = PAGE_SIZE as u16;
+        for slot_entry in &self.slot_arr {
+            if slot_entry.offset == 0 && slot_entry.length == 0 {
+                continue;
+            }
+            if slot_entry.offset < min_offset {
+                min_offset = slot_entry.offset;
             }
         }
-        return min_offset;
+        min_offset
     }
 }
 
