@@ -1,4 +1,4 @@
-use crate::{buffer::{buffer_pool::Frame, linked_hash_set::LinkedHashSet}, error::FerroError};
+use crate::{buffer::{linked_hash_set::LinkedHashSet}, error::FerroError};
 
 pub struct ArcCache {
     pub capacity: usize,
