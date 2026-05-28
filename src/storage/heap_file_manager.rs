@@ -3,6 +3,8 @@ use std::sync::Arc;
 use crate::{buffer::buffer_pool::{BufferPoolManager, Frame}, error::FerroError, storage::{disk_manager::DiskManager, heap_page::Page, page_directory::PageDirectory, tuple::Tuple}};
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
+
+#[derive(Clone, Copy)]
 pub struct RecordId {
     pub page_id: u32,
     pub slot_num: u16,
@@ -241,4 +243,118 @@ impl RecordId {
     pub fn new(page_id: u32, slot_num: u16) -> Self{
         RecordId { page_id, slot_num }
     }
+}
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::fs::OpenOptions;
+use std::thread::yield_now;
+    use crate::storage::disk_manager::DiskManager;
+    use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::storage::tuple::Tuple;
+    use crate::catalog::column::{Column, DataType, Value};
+    use crate::catalog::schema::Schema;
+
+    fn setup() -> HeapFileManager {
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open("test.db").unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bpm = Arc::new(BufferPoolManager::new(dm));
+        HeapFileManager::new(bpm).unwrap()
+    }
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![Column::new("id".into(), DataType::Integer, false), Column::new("name".into(), DataType::Varchar(50), false)])
+    }
+
+    #[test]
+    fn test_insert_and_read() {
+        let hfm = setup();
+        let schema = test_schema();
+        let values = vec![Value::Integer(1), Value::Varchar("hello".into())];
+        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let rid = hfm.insert(tuple).unwrap();
+        let result = hfm.read(rid).unwrap();
+        let decoded = result.deserialize(&schema).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    // #[test]
+    // fn test_delete() {
+    //     let hfm = setup();
+    //     let schema = test_schema();
+    //     let values = vec![Value::Integer(2), Value::Varchar("world".into())];
+    //     let tuple = Tuple::serialize(&values, &schema).unwrap();
+    //     let rid = hfm.insert(tuple).unwrap();
+    //     hfm.delete(rid).unwrap();
+    //     // should fail
+    // }
+
+    #[test]
+    fn test_update_in_place() {
+        let hfm = setup();
+        let schema = test_schema();
+        let values = vec![Value::Integer(3), Value::Varchar("old".into())];
+        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let rid = hfm.insert(tuple).unwrap();
+
+        let new_values = vec![Value::Integer(3), Value::Varchar("new".into())];
+        let new_tuple = Tuple::serialize(&new_values, &schema).unwrap();
+        let new_rid = hfm.update(rid, new_tuple).unwrap();
+        let result = hfm.read(new_rid).unwrap();
+        let decoded = result.deserialize(&schema).unwrap();
+        assert_eq!(decoded, new_values);
+    }
+
+    #[test]
+    fn test_scan() {
+        let hfm = setup();
+        let schema = test_schema();
+        for i in 0..10 {
+            let values = vec![Value::Integer(i), Value::Varchar(format!("row{}", i)) ];
+            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            hfm.insert(tuple).unwrap();
+        }
+        let tuples = hfm.scan().unwrap();
+        assert_eq!(tuples.len(), 10);
+    }
+
+    #[test]
+    fn test_multiple_pages() {
+        let hfm = setup();
+        let schema = Schema::new(vec![
+            Column::new("data".into(), DataType::Varchar(200), false),
+        ]);
+        for i in 0..100 {
+            let values = vec![Value::Varchar("x".repeat(200))];
+            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            hfm.insert(tuple).unwrap();
+        }
+        
+        let tuples = hfm.scan().unwrap();
+        assert_eq!(tuples.len(), 100);
+    }
+
+    #[test]
+    fn test_insert_delete_scan() {
+        let hfm = setup();
+        let schema = test_schema();
+        let mut rids = Vec::new();
+        for i in 0..10 {
+            let values = vec![Value::Integer(i), Value::Varchar(format!("row{}", i))];
+            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            rids.push(hfm.insert(tuple).unwrap());
+        }
+        // delete every other row
+        for i in (0..10).step_by(2) {
+            hfm.delete(rids.remove(i / 2)).unwrap(); // adjust index since we're removing
+        }
+        let tuples = hfm.scan().unwrap();
+        assert_eq!(tuples.len(), 5);
+    }
+
 }
