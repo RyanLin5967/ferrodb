@@ -30,8 +30,6 @@ Storage Engine:
 - if data is deleted, you can nullify its pointer or remove it
 - page directories will be stored on disk simlar to bitmap pages
 - when a heap page is deallocated, num_entries decreases by 1, and everything is shifted left (ensures everything is contigious)
-- will use secondary key (a column(s)) to point to primary key so pointer updating is ez (you only have to update the primary key)
-- b+ tree for indexing (has O(log N) lookup, where N is the number of items in the tree)
 
 Buffer Pool:
 - use memory for caching
@@ -61,6 +59,42 @@ ARC cache:
 - p: target size for T1, starts at 0, adapts over time, changes if some pages are accessed more than others
 - if a page is already pinned, start from tail to head (from chosen list), if the first one is full, go to other one (O(n))
 - if both are pinned, return None cuz buffer pool is full, just return an error (could add ability to retry later)
+
+B+ Tree indexing:
+- will use secondary key (a column(s)) to point to primary key so pointer updating is ez (you only have to update the primary key)
+- b+ tree for indexing (has O(log N) lookup, where N is the number of items in the tree)
+- traverse it by starting from root to leaf
+- for the parent page id, instead of storing in header, i'll keep a path stack as i'm traversing down then using it to traverse back up
+- root node page id will be stored in catalog (created later)
+- Root node header: page_id, page_type, lsn, num_keys
+- leaf node header have next and prev page ids for the sibling pointers
+- Root node & internal nodes: |HEADER|<node1*>|key1|<node2*>|key2|...|keyn|<noden*>|(N keys and N+1 pointers), where node1 points to a child node where the key is less than k1,
+node 2 points to a child node where the key is >= key1 and < key2 ... node n points to the child node who's key is >= key N
+- Leaf nodes: |key|value|key|value| ... where the key is what we're searching for and the value is a pointer to the RecordId
+- |HEADER|node array|key array| is better cuz they are loaded into memory contigiously and you can also just do binary search on the sorted keys
+- the arrays will be fixed length (length should fit the page length perfectly so no wasted space, so depends on header, key, pointer size)
+- leaf nodes will have sibling pointers from node to node, so you don't have to backtrack when searching and doing range scans (doubly linked list structure)
+- index keys must be sorted (low -> high or high -> low)
+- null keys will either be stored at start or end of each node
+- Inserting: 
+    1. find correct node, L 
+    2. insert data entry into L in sorted order
+    If L has enough space, we're done
+    Else, we have to split the keys from L evenly to L and a new node, L2, copy middle key up to parent node (if leaf, if internal no copy) so it can point to the new page
+    recursively do this process until the tree is balanced
+    splitting root node can get complicated
+- Deleting:
+    1. find correct node, L where entry is
+    2. remove entry
+    If L is at least half full, done
+    If L has m/2 -1 entries,
+    try to redistribute, borrowing from sibling, then update the pointer in the parent at sibling to account for redistribution
+    if that fails (sibling not more than half full), merge L and sibling
+    recursively merge until tree is balanced
+- for concurrency, use latch crabbing
+- for duplicate keys, use composite keys: make the index key (indexed_value, primary key), making them unique since primary keys are unique
+- for variable length keys, we can store it in a slotted page format
+- Some optimizations are delaying merges to reduce disk io and then do them in a batch (log the changes to store them), maybe do these after
 
 Architecture layers:
 1. B+ trees and keys (does lookups)
