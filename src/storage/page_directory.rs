@@ -43,7 +43,7 @@ impl PageDirectory {
     }
 
     pub fn add_entry(&mut self, page_id: u32, free_space: u16) -> Result<(), FerroError>{
-        if HEADER_SIZE - (self.entries.len() + 1)*ENTRY_SIZE <= PAGE_SIZE {
+        if HEADER_SIZE + (self.entries.len() + 1)*ENTRY_SIZE <= PAGE_SIZE {
             self.entries.push(PageDirectoryEntry::new(page_id, free_space));
             self.num_entries += 1;
             return Ok(());
