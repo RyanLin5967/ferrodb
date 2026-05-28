@@ -26,6 +26,6 @@ Under active development.
 - [ ] SQL parser
 - [ ] Query execution engine
 - [ ] Cost-based query optimizer
-- [ ] Write-ahead logging
+- [ ] Write-ahead logging with crash recovery
 - [ ] MVCC 
 - [ ] Postgres wire protocol
