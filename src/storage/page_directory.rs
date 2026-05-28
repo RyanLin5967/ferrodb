@@ -19,8 +19,8 @@ const PAGE_TYPE_DIRECTORY: u8 = 1;
 // HEADER FORMAT: |page_type (u8, 1)|page_id (u32, 4)|next_page_directory (u32, 4)|num_entries (u16, 2)|
 impl PageDirectory {
 
-    pub fn new(page_id: u32, next_page_directory: u32, num_entries: u16, entries: Vec<PageDirectoryEntry>) -> Self{
-        PageDirectory {page_id, next_page_directory, num_entries, entries}
+    pub fn new(page_id: u32) -> Self{
+        PageDirectory {page_id, next_page_directory:0, num_entries:0, entries: Vec::new()}
     }
     // heap file manager will loop through all pages if first one doesn't have
     pub fn find_page_with_space(&self, needed: u16) -> Option<u32>{
@@ -85,7 +85,7 @@ impl PageDirectory {
         buffer
     }
 
-    pub fn deserialize(&self, bytes: [u8; PAGE_SIZE]) -> Self{
+    pub fn deserialize(bytes: [u8; PAGE_SIZE]) -> Self{
         let page_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
         let next_page_directory = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
         let num_entries = u16::from_be_bytes(bytes[9..11].try_into().unwrap()) as usize;

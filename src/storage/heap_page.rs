@@ -16,14 +16,19 @@ pub struct Page {
     pub tuples: Vec<u8>
 }
 
-const HEADER_SIZE: usize = 23;
-const SLOT_ENTRY_SIZE: usize = 4;
+pub const HEADER_SIZE: usize = 23;
+pub const SLOT_ENTRY_SIZE: usize = 4;
+const HEAP_PAGE_TYPE:u8 = 0;
 // HEADER LAYOUT: |page_type (u8, 1)|page_id (u32, 4)|num_slots (u16, 2)|
 // free_space_start (u16, 2)|free_space_end (u16, 2)|lsn (u64, 8)|checksum (u32, 4)
 impl Page {
 
     pub fn new(page_type: u8, page_id: u32, lsn: u64, checksum: u32, slot_arr: Vec<SlotEntry>, tuples: Vec<u8>) -> Self{
         Page { page_type, page_id, lsn, checksum, slot_arr, tuples }
+    }
+
+    pub fn empty(page_id: u32) -> Self{
+        Page {page_type: HEAP_PAGE_TYPE, page_id, lsn: 0, checksum: 0, slot_arr: Vec::new(), tuples: Vec::new()}
     }
     // header has num slots, slot array, free space pointer start and end, page id, lsn, checksum, 
     pub fn serialize(&self) -> Result<[u8; PAGE_SIZE], FerroError> {
@@ -70,7 +75,7 @@ impl Page {
     }
 
     // finds space in page, writes tuple bytes, add slot entry
-    pub fn insert(&mut self, tuple: Tuple) -> Result<(), FerroError>{
+    pub fn insert(&mut self, tuple: Tuple) -> Result<u16, FerroError>{
         let free_space_start = self.get_free_space_start();      
         let free_space_end = self.get_free_space_end();
         
@@ -79,7 +84,7 @@ impl Page {
         } 
         self.tuples.splice(0..0, tuple.data.clone());
         self.slot_arr.push(SlotEntry::new(PAGE_SIZE as u16 -self.tuples.len() as u16, tuple.data.len() as u16));
-        Ok(())
+        Ok((self.slot_arr.len() -1) as u16)
     }
 
     // deserialze tuple from slot number
@@ -142,10 +147,10 @@ impl Page {
         }
         self.tuples = buffer[offset..PAGE_SIZE].to_vec();
     }
-    fn get_free_space_start(&self) -> u16{
+    pub fn get_free_space_start(&self) -> u16{
         return (HEADER_SIZE + self.slot_arr.len()*SLOT_ENTRY_SIZE) as u16;
     }
-    fn get_free_space_end(&self) -> u16{
+    pub fn get_free_space_end(&self) -> u16{
         let mut min_offset: u16;
         
         if self.slot_arr.len() == 0 {

@@ -10,17 +10,17 @@ use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
 
 pub struct Frame {
-    data: [u8; PAGE_SIZE],
-    page_id: Option<u32>,
-    pin_counter: AtomicU16,
-    dirty_flag: AtomicBool,
+    pub data: [u8; PAGE_SIZE],
+    pub page_id: Option<u32>,
+    pub pin_counter: AtomicU16,
+    pub dirty_flag: AtomicBool,
 }
 
 pub struct BufferPoolManager {
-    frames: Vec<RwLock<Frame>>,
-    page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
-    disk_manager: Arc<DiskManager>,
-    arc_cache: Mutex<ArcCache>,
+    pub frames: Vec<RwLock<Frame>>,
+    pub page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
+    pub disk_manager: Arc<DiskManager>,
+    pub arc_cache: Mutex<ArcCache>,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
