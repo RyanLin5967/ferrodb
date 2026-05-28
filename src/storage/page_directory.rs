@@ -74,7 +74,7 @@ impl PageDirectory {
         buffer[0] = PAGE_TYPE_DIRECTORY;
         buffer[1..5].copy_from_slice(&self.page_id.to_be_bytes());
         buffer[5..9].copy_from_slice(&self.next_page_directory.to_be_bytes());
-        buffer[9..11].copy_from_slice(&(self.entries.len()).to_be_bytes());
+        buffer[9..11].copy_from_slice(&(self.entries.len() as u16).to_be_bytes());
 
         for (i, entry) in self.entries.iter().enumerate() {
             let offset = HEADER_SIZE + i*ENTRY_SIZE;
