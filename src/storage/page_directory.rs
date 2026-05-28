@@ -1,6 +1,5 @@
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::error::FerroError;
-use crate::storage::tuple::Tuple;
 
 pub struct PageDirectory {
     pub page_id: u32,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{buffer::buffer_pool::{BufferPoolManager, Frame}, error::FerroError, storage::{disk_manager::DiskManager, heap_page::Page, page_directory::PageDirectory, tuple::Tuple}};
+use crate::{buffer::buffer_pool::{BufferPoolManager}, error::FerroError, storage::{heap_page::Page, page_directory::PageDirectory, tuple::Tuple}};
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
@@ -251,7 +251,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::fs::OpenOptions;
-use std::thread::yield_now;
     use crate::storage::disk_manager::DiskManager;
     use crate::buffer::buffer_pool::BufferPoolManager;
     use crate::storage::tuple::Tuple;
@@ -329,7 +328,7 @@ use std::thread::yield_now;
         let schema = Schema::new(vec![
             Column::new("data".into(), DataType::Varchar(200), false),
         ]);
-        for i in 0..100 {
+        for _ in 0..100 {
             let values = vec![Value::Varchar("x".repeat(200))];
             let tuple = Tuple::serialize(&values, &schema).unwrap();
             hfm.insert(tuple).unwrap();
