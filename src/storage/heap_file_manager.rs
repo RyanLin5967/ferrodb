@@ -4,7 +4,7 @@ use crate::{buffer::buffer_pool::{BufferPoolManager}, error::FerroError, storage
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecordId {
     pub page_id: u32,
     pub slot_num: u16,
