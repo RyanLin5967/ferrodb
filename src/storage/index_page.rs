@@ -257,3 +257,71 @@ impl <K: BTreeSerialize, V: BTreeSerialize> BPlusTreePage<K, V> {
         }
     }
 }
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+
+    #[test]
+fn test_roundtrip_i_p() -> Result<(), FerroError> {
+    let mut internal = BPlusTreeInternalPage::<Value>::new(1);
+    internal.key_arr = vec![Value::Integer(10), Value::Integer(20)];
+    internal.child_ptrs = vec![100, 200, 300]; // N keys -> N+1 ptrs
+    internal.num_keys = 2;
+
+    let bytes = internal.serialize()?;
+    let de = BPlusTreeInternalPage::<Value>::deserialize(bytes)?;
+    assert_eq!(internal, de);
+    Ok(())
+}
+
+#[test]
+fn test_roundtrip_i_s() -> Result<(), FerroError> {
+    let mut internal = BPlusTreeInternalPage::<(Value, Value)>::new(1);
+    internal.key_arr = vec![
+        (Value::Integer(10), Value::Integer(1)),
+        (Value::Integer(20), Value::Integer(2)),
+    ];
+    internal.child_ptrs = vec![100, 200, 300];
+    internal.num_keys = 2;
+
+    let bytes = internal.serialize()?;
+    let de = BPlusTreeInternalPage::<(Value, Value)>::deserialize(bytes)?;
+    assert_eq!(internal, de);
+    Ok(())
+}
+
+#[test]
+fn test_roundtrip_l_p() -> Result<(), FerroError> {
+    let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(2);
+    leaf.key_arr = vec![Value::Integer(5), Value::Integer(15)];
+    leaf.vals = vec![RecordId::new(7, 3), RecordId::new(8, 4)];
+    leaf.num_keys = 2;
+    leaf.next = Some(3);
+    leaf.prev = None;
+
+    let bytes = leaf.serialize()?;
+    let de = BPlusTreeLeafPage::<Value, RecordId>::deserialize(bytes)?;
+    assert_eq!(leaf, de);
+    Ok(())
+}
+
+#[test]
+fn test_roundtrip_l_s() -> Result<(), FerroError> {
+    let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(2);
+    leaf.key_arr = vec![
+        (Value::Varchar("toronto".into()), Value::Integer(1)),
+        (Value::Varchar("toronto".into()), Value::Integer(2)),
+    ];
+    leaf.vals = vec![(), ()];
+    leaf.num_keys = 2;
+    leaf.next = Some(5);
+    leaf.prev = Some(1);
+
+    let bytes = leaf.serialize()?;
+    let de = BPlusTreeLeafPage::<(Value, Value), ()>::deserialize(bytes)?;
+    assert_eq!(leaf, de);
+    Ok(())
+}
+}
