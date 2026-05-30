@@ -31,7 +31,7 @@ pub const BPLUS_INTERNAL_TYPE: u8 = 2;
 pub const BPLUS_LEAF_TYPE: u8 = 3;
 const INTERNAL_HEADER_SIZE: usize = 19;
 const LEAF_HEADER_SIZE: usize = 27;
-const CHILD_POINTER_SIZE: usize = 4;
+// const CHILD_POINTER_SIZE: usize = 4;
 // HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (2)|
 impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
 
@@ -227,13 +227,8 @@ impl BTreeSerialize for RecordId {
 }
 
 impl BTreeSerialize for () {
-    fn serialize(&self, buf: &mut Vec<u8>) {
-        
-    }
-
-    fn deserialize(bytes: &[u8]) -> Result<(Self, usize), FerroError> where Self: Sized {
-        Ok(((), 0))
-    }
+    fn serialize(&self, _: &mut Vec<u8>) {}
+    fn deserialize(_: &[u8]) -> Result<(Self, usize), FerroError> where Self: Sized { Ok(((), 0)) }
 }
 impl BTreeSerialize for (Value, Value) { // secondary
     fn serialize(&self, buf: &mut Vec<u8>) {
@@ -258,70 +253,214 @@ impl <K: BTreeSerialize, V: BTreeSerialize> BPlusTreePage<K, V> {
     }
 }
 
-#[cfg(test)]
+// |      K1       |       K2       |       K3       |
+// |    k < K1  |K1 <= k < K2 | K2 <= k < K3 |k >= K4|
+impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
 
+    // find position of a key (or where it should go) returns index (search and insert use)
+    pub fn binary_search(&self, key: &K) -> usize {
+        match self.key_arr.binary_search(key) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        }
+    }
+
+    // binary search the separator keys, retrn matching child ptr index
+    pub fn find_child(&self, key: &K) -> u32{
+        match self.key_arr.binary_search(key) {
+            Ok(pos) => pos as u32+ 1,
+            Err(pos) => pos as u32,
+        }
+    }
+    // insert a separator key and its chidl pointer at a position (for child splits and pushes key up)
+    pub fn insert_key_child(&mut self, index: usize, key: K, child_ptr: u32){
+        self.key_arr.insert(index, key);
+        self.child_ptrs.insert(index+1, child_ptr);
+        self.num_keys += 1;
+    }
+    // divide keys/children between current and new node, return middle key to push up, new node
+    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
+        let mid = self.key_arr.len() /2;
+        let mid_key = self.key_arr.remove(mid);
+
+        let mut new_node = Self {
+            page_id: new_page_id,
+            page_type: BPLUS_INTERNAL_TYPE,
+            lsn: 0,
+            checksum: 0,
+            num_keys: 0,
+            key_arr: self.key_arr.split_off(mid),
+            child_ptrs: self.child_ptrs.split_off(mid + 1)
+        };
+        new_node.num_keys = new_node.key_arr.len() as u16;
+        self.num_keys = mid as u16;
+        (mid_key, new_node)
+    }
+    // does adding one more entry exceed capacity? triggers splits
+    pub fn is_full(&self) -> bool { 
+        let mut buf = Vec::new();
+        for k in &self.key_arr {
+            k.serialize(&mut buf);
+        }
+        let len = buf.len();
+        let child_ptrs_size = self.child_ptrs.len() * 4;
+        return INTERNAL_HEADER_SIZE + len + child_ptrs_size>= PAGE_SIZE;
+    }
+    // fewer than min entries (capacity/2) triggers merge/redistribute
+    pub fn is_underfull(&self) -> bool {
+        let mut buf = Vec::new();
+        for k in &self.key_arr {
+            k.serialize(&mut buf);
+        }
+        let child_ptrs_size = self.child_ptrs.len() * 4;
+        INTERNAL_HEADER_SIZE + buf.len() + child_ptrs_size < (PAGE_SIZE - INTERNAL_HEADER_SIZE)/2
+    }
+}
+
+impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTreeLeafPage<K,V> {
+    pub fn is_full(&self) -> bool {
+        let mut buf = Vec::new();
+        for k in &self.key_arr {
+            k.serialize(&mut buf);
+        }
+        for val in &self.vals {
+            val.serialize(&mut buf);
+        }
+        return buf.len() + LEAF_HEADER_SIZE >= PAGE_SIZE;
+    } 
+    pub fn is_underfull(&self) -> bool{
+        let mut buf = Vec::new();
+        for k in &self.key_arr {
+            k.serialize(&mut buf);
+        }
+        for val in &self.vals {
+            val.serialize(&mut buf);
+        }
+        LEAF_HEADER_SIZE + buf.len() < (PAGE_SIZE - LEAF_HEADER_SIZE)/2
+    }
+    pub fn binary_search(&self, key: &K) -> usize {
+        match self.key_arr.binary_search(key) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        }
+    }
+
+    // insert a key,value at the correct sorted position
+    pub fn insert_entry(&mut self, key: K, value: V){ 
+        let index = self.binary_search(&key);
+        self.key_arr.insert(index, key);
+        self.vals.insert(index, value);
+        self.num_keys += 1;
+    }
+
+    // find and remove a key/value
+    pub fn remove_entry(&mut self, key: &K) -> Result<(), FerroError>{ 
+        let index = match self.key_arr.binary_search(key) {
+            Ok(i) => i,
+            Err(_) => return Err(FerroError::KeyNotFound)
+        };
+        
+        self.key_arr.remove(index);
+        self.vals.remove(index);
+        self.num_keys -= 1;
+        Ok(())
+    }
+
+    // return value for a key, or None
+    pub fn get(&self, key: &K) -> Result<Option<&V>, FerroError> { 
+        let index = match self.key_arr.binary_search(key) {
+            Ok(i) => i,
+            Err(_) => return Ok(None)
+        };
+        return Ok(Some(&self.vals[index]));
+    }
+
+    // divide entries between this leaf and a new leaf, copy the middle key up (stays in leaf), fix sibling pointers
+    pub fn split(&mut self, new_page_id: u32) -> (K, Self) {
+        let mid = self.key_arr.len() /2;
+        let mid_key = self.key_arr[mid].clone();
+
+        let mut new_node = Self {
+            page_id: new_page_id,
+            page_type: BPLUS_LEAF_TYPE,
+            lsn: 0,
+            checksum: 0,
+            num_keys: 0,
+            key_arr: self.key_arr.split_off(mid),
+            vals: self.vals.split_off(mid),
+            next: self.next, // new node points to old next
+            prev: Some(self.page_id) // new node points back to self
+        };
+        self.next = Some(new_node.page_id); // self now points to new node
+        new_node.num_keys = new_node.key_arr.len() as u16;
+        self.num_keys = self.key_arr.len() as u16;
+        // ALSO NEED TO UPDATE OLD SIBLING POINTER POINTING TO new_node INSTEAD OF SELF
+        (mid_key, new_node)
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-fn test_roundtrip_i_p() -> Result<(), FerroError> {
-    let mut internal = BPlusTreeInternalPage::<Value>::new(1);
-    internal.key_arr = vec![Value::Integer(10), Value::Integer(20)];
-    internal.child_ptrs = vec![100, 200, 300]; // N keys -> N+1 ptrs
-    internal.num_keys = 2;
+    fn test_roundtrip_i_p() -> Result<(), FerroError> {
+        let mut internal = BPlusTreeInternalPage::<Value>::new(1);
+        internal.key_arr = vec![Value::Integer(10), Value::Integer(20)];
+        internal.child_ptrs = vec![100, 200, 300]; // N keys -> N+1 ptrs
+        internal.num_keys = 2;
 
-    let bytes = internal.serialize()?;
-    let de = BPlusTreeInternalPage::<Value>::deserialize(bytes)?;
-    assert_eq!(internal, de);
-    Ok(())
-}
+        let bytes = internal.serialize()?;
+        let de = BPlusTreeInternalPage::<Value>::deserialize(bytes)?;
+        assert_eq!(internal, de);
+        Ok(())
+    }
 
-#[test]
-fn test_roundtrip_i_s() -> Result<(), FerroError> {
-    let mut internal = BPlusTreeInternalPage::<(Value, Value)>::new(1);
-    internal.key_arr = vec![
-        (Value::Integer(10), Value::Integer(1)),
-        (Value::Integer(20), Value::Integer(2)),
-    ];
-    internal.child_ptrs = vec![100, 200, 300];
-    internal.num_keys = 2;
+    #[test]
+    fn test_roundtrip_i_s() -> Result<(), FerroError> {
+        let mut internal = BPlusTreeInternalPage::<(Value, Value)>::new(1);
+        internal.key_arr = vec![
+            (Value::Integer(10), Value::Integer(1)),
+            (Value::Integer(20), Value::Integer(2)),
+        ];
+        internal.child_ptrs = vec![100, 200, 300];
+        internal.num_keys = 2;
 
-    let bytes = internal.serialize()?;
-    let de = BPlusTreeInternalPage::<(Value, Value)>::deserialize(bytes)?;
-    assert_eq!(internal, de);
-    Ok(())
-}
+        let bytes = internal.serialize()?;
+        let de = BPlusTreeInternalPage::<(Value, Value)>::deserialize(bytes)?;
+        assert_eq!(internal, de);
+        Ok(())
+    }
 
-#[test]
-fn test_roundtrip_l_p() -> Result<(), FerroError> {
-    let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(2);
-    leaf.key_arr = vec![Value::Integer(5), Value::Integer(15)];
-    leaf.vals = vec![RecordId::new(7, 3), RecordId::new(8, 4)];
-    leaf.num_keys = 2;
-    leaf.next = Some(3);
-    leaf.prev = None;
+    #[test]
+    fn test_roundtrip_l_p() -> Result<(), FerroError> {
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(2);
+        leaf.key_arr = vec![Value::Integer(5), Value::Integer(15)];
+        leaf.vals = vec![RecordId::new(7, 3), RecordId::new(8, 4)];
+        leaf.num_keys = 2;
+        leaf.next = Some(3);
+        leaf.prev = None;
 
-    let bytes = leaf.serialize()?;
-    let de = BPlusTreeLeafPage::<Value, RecordId>::deserialize(bytes)?;
-    assert_eq!(leaf, de);
-    Ok(())
-}
+        let bytes = leaf.serialize()?;
+        let de = BPlusTreeLeafPage::<Value, RecordId>::deserialize(bytes)?;
+        assert_eq!(leaf, de);
+        Ok(())
+    }
 
-#[test]
-fn test_roundtrip_l_s() -> Result<(), FerroError> {
-    let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(2);
-    leaf.key_arr = vec![
-        (Value::Varchar("toronto".into()), Value::Integer(1)),
-        (Value::Varchar("toronto".into()), Value::Integer(2)),
-    ];
-    leaf.vals = vec![(), ()];
-    leaf.num_keys = 2;
-    leaf.next = Some(5);
-    leaf.prev = Some(1);
+    #[test]
+    fn test_roundtrip_l_s() -> Result<(), FerroError> {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(2);
+        leaf.key_arr = vec![
+            (Value::Varchar("toronto".into()), Value::Integer(1)),
+            (Value::Varchar("toronto".into()), Value::Integer(2)),
+        ];
+        leaf.vals = vec![(), ()];
+        leaf.num_keys = 2;
+        leaf.next = Some(5);
+        leaf.prev = Some(1);
 
-    let bytes = leaf.serialize()?;
-    let de = BPlusTreeLeafPage::<(Value, Value), ()>::deserialize(bytes)?;
-    assert_eq!(leaf, de);
-    Ok(())
-}
+        let bytes = leaf.serialize()?;
+        let de = BPlusTreeLeafPage::<(Value, Value), ()>::deserialize(bytes)?;
+        assert_eq!(leaf, de);
+        Ok(())
+    }
 }
