@@ -464,4 +464,50 @@ mod tests {
         assert_eq!(leaf, de);
         Ok(())
     }
+
+    #[test]
+    fn test_internal_find_child() {
+        let mut node = BPlusTreeInternalPage::<Value>::new(1);
+        node.key_arr = vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)];
+        node.child_ptrs = vec![100, 200, 300, 400];
+        node.num_keys = 3;
+
+        assert_eq!(node.find_child(&Value::Integer(5)), 100);
+        assert_eq!(node.find_child(&Value::Integer(10)), 200);
+        assert_eq!(node.find_child(&Value::Integer(15)), 200);
+        assert_eq!(node.find_child(&Value::Integer(30)), 400);
+        assert_eq!(node.find_child(&Value::Integer(99)), 400);
+    }
+
+    #[test]
+    fn test_internal_insert_key_child() {
+        let mut node = BPlusTreeInternalPage::<Value>::new(1);
+        node.key_arr = vec![Value::Integer(10), Value::Integer(30)];
+        node.child_ptrs = vec![100, 200, 300];
+        node.num_keys = 2;
+
+        node.insert_key_child(1, Value::Integer(20), 250);
+        assert_eq!(node.key_arr, vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)]);
+        assert_eq!(node.child_ptrs, vec![100, 200, 250, 300]);
+        assert_eq!(node.num_keys, 3);
+    }
+
+    #[test]
+    fn test_internal_split() {
+        let mut node = BPlusTreeInternalPage::<Value>::new(1);
+        node.key_arr = vec![Value::Integer(10), Value::Integer(20), Value::Integer(30), Value::Integer(40)];
+        node.child_ptrs = vec![1,2,3,4,5];
+        node.num_keys = 4;
+
+        let (mid_key, new_node) = node.split(2);
+        assert_eq!(mid_key, Value::Integer(30));
+        assert_eq!(node.key_arr, vec![Value::Integer(10), Value::Integer(20)]);
+        assert_eq!(node.child_ptrs, vec![1,2,3]);
+        assert_eq!(node.num_keys, 2);
+        assert_eq!(new_node.key_arr, vec![Value::Integer(40)]);
+        assert_eq!(new_node.child_ptrs, vec![4,5]);
+        assert_eq!(new_node.num_keys, 1);
+        assert_eq!(node.child_ptrs.len(), node.key_arr.len() + 1);
+        assert_eq!(new_node.child_ptrs.len(), new_node.key_arr.len() + 1);
+    }
 }
