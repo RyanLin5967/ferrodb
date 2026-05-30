@@ -96,9 +96,3 @@ node 2 points to a child node where the key is >= key1 and < key2 ... node n poi
 - for variable length keys, we can store it in a slotted page format
 - for now it only supports fixed length keys *** (add variable length later)
 - Some optimizations are delaying merges to reduce disk io and then do them in a batch (log the changes to store them), maybe do these after
-
-Architecture layers:
-1. B+ trees and keys (does lookups)
-2. Page layout and serialization (tuples + how they're endoed, slotted pages)
-3. Buffer pool manager (frames, page table, pin/reference counters, ARC for eviction, ghost cache)
-4. Disk manager (uses os functions to read/write/allocate/deallocate memory, page directory)
