@@ -82,7 +82,7 @@ impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
     }
 }
 
-// HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (4)|next (4)|prev (4)|
+// HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (2)|next (4)|prev (4)|
 impl<K: BTreeSerialize, V: BTreeSerialize> BPlusTreeLeafPage<K, V> {
 
     pub fn new(page_id: u32) -> Self {
