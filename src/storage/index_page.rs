@@ -510,4 +510,69 @@ mod tests {
         assert_eq!(node.child_ptrs.len(), node.key_arr.len() + 1);
         assert_eq!(new_node.child_ptrs.len(), new_node.key_arr.len() + 1);
     }
+
+    #[test]
+    fn test_leaf_insert_sorted() {
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(1);
+        leaf.insert_entry(Value::Integer(20), RecordId::new(1, 0));
+        leaf.insert_entry(Value::Integer(10), RecordId::new(2, 0));
+        leaf.insert_entry(Value::Integer(30), RecordId::new(3, 0));
+
+        assert_eq!(leaf.key_arr, vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)]);
+        assert_eq!(leaf.vals[0], RecordId::new(2,0));
+        assert_eq!(leaf.num_keys, 3);
+    }
+
+    #[test]
+    fn test_leaf_get() {
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(1);
+        leaf.insert_entry(Value::Integer(10), RecordId::new(5,2));
+        leaf.insert_entry(Value::Integer(20), RecordId::new(6,7));
+
+        assert_eq!(leaf.get(&Value::Integer(10)).unwrap(), Some(&RecordId::new(5,2)));
+        assert_eq!(leaf.get(&Value::Integer(99)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_leaf_remove() {
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(1);
+        leaf.insert_entry(Value::Integer(10), RecordId::new(5,2));
+        leaf.insert_entry(Value::Integer(20), RecordId::new(6,7));
+        leaf.remove_entry(&Value::Integer(10)).unwrap();
+        assert_eq!(leaf.key_arr, vec![Value::Integer(20)]);
+        assert_eq!(leaf.num_keys, 1);
+        assert!(leaf.remove_entry(&Value::Integer(99)).is_err());
+    }
+
+    #[test]
+    fn test_leaf_split() {
+        let mut leaf = BPlusTreeLeafPage::<Value, RecordId>::new(1);
+        for i in 0..4 {
+            leaf.insert_entry(Value::Integer(i*10), RecordId::new(i as u32, 0));
+        }
+        leaf.next = Some(99);
+        let (mid_key, new_node) = leaf.split(2);
+
+        assert_eq!(mid_key, Value::Integer(20));
+        assert_eq!(leaf.key_arr, vec![Value::Integer(0), Value::Integer(10)]);
+        assert_eq!(new_node.key_arr, vec![Value::Integer(20), Value::Integer(30)]);
+        assert_eq!(new_node.key_arr[0], mid_key);
+        assert_eq!(leaf.next, Some(new_node.page_id));
+        assert_eq!(new_node.next, Some(99));
+        assert_eq!(new_node.prev, Some(leaf.page_id));
+        assert_eq!(leaf.num_keys, 2);
+        assert_eq!(new_node.num_keys, 2);
+    }
+
+    #[test]
+    fn test_leaf_composite_keys() {
+        let mut leaf = BPlusTreeLeafPage::<(Value, Value), ()>::new(1);
+        leaf.insert_entry((Value::Varchar("toronto".into()), Value::Integer(2)), ());
+        leaf.insert_entry((Value::Varchar("toronto".into()), Value::Integer(1)), ());
+        leaf.insert_entry((Value::Varchar("ottawa".into()), Value::Integer(5)), ());
+
+        assert_eq!(leaf.key_arr[0], (Value::Varchar("ottawa".into()), Value::Integer(5)));
+        assert_eq!(leaf.key_arr[1], (Value::Varchar("toronto".into()), Value::Integer(1)));
+        assert_eq!(leaf.key_arr[2], (Value::Varchar("toronto".into()), Value::Integer(2)));
+    }
 }
