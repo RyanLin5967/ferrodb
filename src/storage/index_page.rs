@@ -1,3 +1,5 @@
+use std::io::Chain;
+
 use crate::{catalog::column::Value, error::FerroError, storage::{disk_manager::PAGE_SIZE, heap_file_manager::RecordId}};
 #[derive(PartialEq, Debug)]
 pub struct BPlusTreeInternalPage<K> {
@@ -31,7 +33,7 @@ pub const BPLUS_INTERNAL_TYPE: u8 = 2;
 pub const BPLUS_LEAF_TYPE: u8 = 3;
 const INTERNAL_HEADER_SIZE: usize = 19;
 const LEAF_HEADER_SIZE: usize = 27;
-// const CHILD_POINTER_SIZE: usize = 4;
+const CHILD_POINTER_SIZE: usize = 4;
 // HEADER: |page_type (1)|page_id (4)|lsn (8)|checksum (4)|num_keys (2)|
 impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
 
@@ -53,7 +55,7 @@ impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
         }
         bytes[INTERNAL_HEADER_SIZE..INTERNAL_HEADER_SIZE + buf.len()].copy_from_slice(&buf);
         for (i, child_ptr) in self.child_ptrs.iter().enumerate() {
-            bytes[INTERNAL_HEADER_SIZE + buf.len() + i*4..INTERNAL_HEADER_SIZE + buf.len() + i*4 +4].copy_from_slice(&child_ptr.to_be_bytes());
+            bytes[INTERNAL_HEADER_SIZE + buf.len() + i*CHILD_POINTER_SIZE..INTERNAL_HEADER_SIZE + buf.len() + i*CHILD_POINTER_SIZE + CHILD_POINTER_SIZE].copy_from_slice(&child_ptr.to_be_bytes());
         }
         
         Ok(bytes)
@@ -75,7 +77,7 @@ impl<K: BTreeSerialize> BPlusTreeInternalPage<K> {
         }
         let mut child_ptrs = Vec::new();
         for i  in 0..num_keys + 1 {
-            child_ptrs.push(u32::from_be_bytes(bytes[offset+ i as usize*4..offset+i as usize*4+ 4].try_into().unwrap()));
+            child_ptrs.push(u32::from_be_bytes(bytes[offset+ i as usize*CHILD_POINTER_SIZE..offset+i as usize*CHILD_POINTER_SIZE+ CHILD_POINTER_SIZE].try_into().unwrap()));
         }
 
         Ok(Self { page_type, page_id, lsn, checksum, num_keys, key_arr, child_ptrs })
@@ -304,7 +306,7 @@ impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
             k.serialize(&mut buf);
         }
         let len = buf.len();
-        let child_ptrs_size = self.child_ptrs.len() * 4;
+        let child_ptrs_size = self.child_ptrs.len() * CHILD_POINTER_SIZE;
         return INTERNAL_HEADER_SIZE + len + child_ptrs_size>= PAGE_SIZE;
     }
     // fewer than min entries (capacity/2) triggers merge/redistribute
@@ -313,7 +315,7 @@ impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
         for k in &self.key_arr {
             k.serialize(&mut buf);
         }
-        let child_ptrs_size = self.child_ptrs.len() * 4;
+        let child_ptrs_size = self.child_ptrs.len() * CHILD_POINTER_SIZE;
         INTERNAL_HEADER_SIZE + buf.len() + child_ptrs_size < (PAGE_SIZE - INTERNAL_HEADER_SIZE)/2
     }
 }
