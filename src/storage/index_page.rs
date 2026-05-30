@@ -267,10 +267,11 @@ impl <K: Ord + Clone + BTreeSerialize> BPlusTreeInternalPage<K> {
 
     // binary search the separator keys, retrn matching child ptr index
     pub fn find_child(&self, key: &K) -> u32{
-        match self.key_arr.binary_search(key) {
-            Ok(pos) => pos as u32+ 1,
-            Err(pos) => pos as u32,
-        }
+        let index = match self.key_arr.binary_search(key) {
+            Ok(pos) => pos+ 1,
+            Err(pos) => pos,
+        };
+        self.child_ptrs[index]
     }
     // insert a separator key and its chidl pointer at a position (for child splits and pushes key up)
     pub fn insert_key_child(&mut self, index: usize, key: K, child_ptr: u32){
