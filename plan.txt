@@ -94,6 +94,7 @@ node 2 points to a child node where the key is >= key1 and < key2 ... node n poi
 - for concurrency, use latch crabbing
 - for duplicate keys, use composite keys: make the index key (indexed_value, primary key), making them unique since primary keys are unique
 - for variable length keys, we can store it in a slotted page format
+- for now it only supports fixed length keys *** (add variable length later)
 - Some optimizations are delaying merges to reduce disk io and then do them in a batch (log the changes to store them), maybe do these after
 
 Architecture layers:
