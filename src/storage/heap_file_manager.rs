@@ -18,6 +18,7 @@ impl HeapFileManager {
     
     pub fn new(buffer_pool_manager: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let dir_page_id = buffer_pool_manager.new_page()?;
+        buffer_pool_manager.unpin_page(dir_page_id, false);
         let frame_i = buffer_pool_manager.fetch_page(dir_page_id)?;
         let mut frame = buffer_pool_manager.frames[frame_i].write().unwrap();
         let empty_dir = PageDirectory::new(dir_page_id);
