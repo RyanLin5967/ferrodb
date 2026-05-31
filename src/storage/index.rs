@@ -224,7 +224,7 @@ mod tests {
 
     use super::*;
     use std::fs::OpenOptions;
-    use crate::{buffer, catalog::column::Value};
+    use crate::{catalog::column::Value};
     
     fn setup() -> BPlusTreeManager::<Value, Value>{
         let _ = std::fs::remove_file("test_index.db");
@@ -280,5 +280,44 @@ mod tests {
         let bad_result = tree.search(&Value::Integer(76)).unwrap();
         assert_eq!(result, Some(val));
         assert_eq!(bad_result, None);
+    }
+
+    #[test]
+    fn test_simple_insert() {
+        let tree = setup();
+        let result = tree.insert(Value::Integer(67), Value::Integer(69));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_internal_node_split_a_lot() {
+        let tree = setup();
+        for i in 0..400 {
+            let result = tree.insert(Value::Integer(i), Value::Integer(i));
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_many_level_insert_and_search() {
+        let tree = setup();
+        for i in 0..2000 {
+            let res = tree.insert(Value::Integer(i), Value::Integer(i *2)).unwrap_or_else(|e| panic!("insert {} failed: {:?}", i, e));
+        }
+        for i in 0..2000 {
+            let res = tree.search(&Value::Integer(i)).unwrap();
+            assert_eq!(res, Some(Value::Integer(i*2)));
+        }
+    }
+
+    #[test]
+    fn test_many_level_reverse() {
+        let tree = setup();
+        for i in (0..2000).rev() {
+            tree.insert(Value::Integer(i), Value::Integer(i)).unwrap();
+        }
+        for i in 0..2000 {
+            assert_eq!(tree.search(&Value::Integer(i)).unwrap(), Some(Value::Integer(i)));
+        }
     }
 }
