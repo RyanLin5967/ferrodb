@@ -22,7 +22,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize> BPlusTreeManager
 
     // allocates empty root leaf
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
-        let root_page_id = buffer_pool.disk_manager.allocate()?;
+        let root_page_id = buffer_pool.new_page()?;
         let root_node = BPlusTreeLeafPage::<K, V>::new(root_page_id);
         let frame_i = buffer_pool.fetch_page(root_page_id)?;
         let mut frame = buffer_pool.frames[frame_i].write().unwrap();
