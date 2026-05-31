@@ -91,7 +91,7 @@ node 2 points to a child node where the key is >= key1 and < key2 ... node n poi
     try to redistribute, borrowing from sibling, then update the pointer in the parent at sibling to account for redistribution
     if that fails (sibling not more than half full), merge L and sibling
     recursively merge until tree is balanced
-- for concurrency, use latch crabbing
+- for concurrency, use latch crabbing. ADD LATER ** (single threaded for now, add concurrency later)
 - for duplicate keys, use composite keys: make the index key (indexed_value, primary key), making them unique since primary keys are unique
 - for variable length keys, we can store it in a slotted page format
 - for now it only supports fixed length keys *** (add variable length later)
