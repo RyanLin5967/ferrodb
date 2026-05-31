@@ -14,7 +14,7 @@ pub struct BPlusTreeManager<K, V> {
     marker: PhantomData<(K, V)>
 }
 
-impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize> BPlusTreeManager<K,V> {
+impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeManager<K,V> {
 
     pub fn new(root_page_id: AtomicU32, buffer_pool: Arc<BufferPoolManager>) -> Self{
         BPlusTreeManager {root_page_id, buffer_pool, marker: PhantomData}
@@ -34,9 +34,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize> BPlusTreeManager
 
     // calls find_leaf, read it, call leaf.get and return value or None
     pub fn search(&self, key: &K) -> Result<Option<V>, FerroError> {
-        let (page_id, stack) = self.find_leaf(key.clone())?;
-
-        todo!()
+        let (page_id, _) = self.find_leaf(key.clone())?;
+        let frame_i = self.buffer_pool.fetch_page(page_id)?;
+        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+        let leaf: BPlusTreeLeafPage<K, V> = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        self.buffer_pool.unpin_page(page_id, false);
+        match leaf.get(key) {
+            Ok(Some(v)) => Ok(Some(v.clone())),
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(FerroError::KeyNotFound)
+        }
     }
 
     // find leaf then remove entry, if underfull, call handle_underfull
