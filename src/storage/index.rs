@@ -47,12 +47,12 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     }
 
     // find leaf then remove entry, if underfull, call handle_underfull
-    pub fn delete(&mut self, key: &K) -> Result<(), FerroError> {
+    pub fn delete(&self, key: &K) -> Result<(), FerroError> {
         Ok(())
     }
 
     // find_leaf to get the leaf, deserialize, try to insert, if not full, done. else, have to split and do stuff
-    pub fn insert(&mut self, key: K, value: V) -> Result<(), FerroError> {
+    pub fn insert(&self, key: K, value: V) -> Result<(), FerroError> {
         let (page_id, mut stack) = self.find_leaf(key.clone())?;
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
@@ -139,7 +139,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     }
 
     // prob have to use recursion, too complex to write here
-    pub fn insert_into_parent(&mut self, stack: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
+    pub fn insert_into_parent(&self, stack: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
         // root was split, so need to allocate new root, make an internal node with one key (mid_key) and two children (left, right id)
         // update root_page_id, tree height grew
         if stack.is_empty() { 
