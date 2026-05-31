@@ -56,22 +56,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         let (page_id, mut stack) = self.find_leaf(key.clone())?;
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
-        let mut leaf: BPlusTreeLeafPage<K, V> = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
-        if !leaf.is_full() {
-            leaf.insert_entry(key, value);
+        let mut leaf = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        leaf.insert_entry(key, value);
+        if !leaf.is_full() { 
             frame.data = leaf.serialize()?;
             drop(frame);
             self.buffer_pool.unpin_page(page_id, true);
             return Ok(())
         }
         let new_page_id = self.buffer_pool.new_page()?;
-        let (split_key, mut new_leaf) = leaf.split(new_page_id);
-
-        if key >= split_key {
-            new_leaf.insert_entry(key, value);
-        } else {
-            leaf.insert_entry(key, value);
-        }
+        let (split_key, new_leaf) = leaf.split(new_page_id);
 
         frame.data = leaf.serialize()?;
         drop(frame);
