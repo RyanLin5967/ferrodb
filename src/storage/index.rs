@@ -67,6 +67,15 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         let new_page_id = self.buffer_pool.new_page()?;
         let (split_key, new_leaf) = leaf.split(new_page_id);
 
+        if let Some(old_next_id) = new_leaf.next {
+            let next_frame_i = self.buffer_pool.fetch_page(old_next_id)?;
+            let mut next_frame = self.buffer_pool.frames[next_frame_i].write().unwrap();
+            let mut next_leaf = BPlusTreeLeafPage::<K, V>::deserialize(next_frame.data)?;
+            next_leaf.prev = Some(new_page_id);
+            next_frame.data = next_leaf.serialize()?;
+            drop(next_frame);
+            self.buffer_pool.unpin_page(old_next_id, true);
+        }
         frame.data = leaf.serialize()?;
         drop(frame);
 
