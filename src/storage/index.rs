@@ -118,7 +118,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             match node {
                 BPlusTreePage::Internal(n) => {
                     stack.push(curr);
-                    curr = n.child_ptrs[n.find_child(&key) as usize];
+                    curr = n.find_child(&key);
                 }
                 BPlusTreePage::Leaf(_) => return Ok((curr, stack))
             }
