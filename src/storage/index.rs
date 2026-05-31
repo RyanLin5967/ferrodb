@@ -38,6 +38,8 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let frame = self.buffer_pool.frames[frame_i].read().unwrap();
         let leaf: BPlusTreeLeafPage<K, V> = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        drop(frame);
+
         self.buffer_pool.unpin_page(page_id, false);
         match leaf.get(key) {
             Ok(Some(v)) => Ok(Some(v.clone())),
@@ -55,10 +57,12 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     pub fn insert(&self, key: K, value: V) -> Result<(), FerroError> {
         let (page_id, mut stack) = self.find_leaf(key.clone())?;
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
-        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+        let frame = self.buffer_pool.frames[frame_i].write().unwrap();
         let mut leaf = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        drop(frame);
         leaf.insert_entry(key, value);
         if !leaf.is_full() { 
+            let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
             frame.data = leaf.serialize()?;
             drop(frame);
             self.buffer_pool.unpin_page(page_id, true);
@@ -69,13 +73,16 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
         if let Some(old_next_id) = new_leaf.next {
             let next_frame_i = self.buffer_pool.fetch_page(old_next_id)?;
-            let mut next_frame = self.buffer_pool.frames[next_frame_i].write().unwrap();
+            let next_frame = self.buffer_pool.frames[next_frame_i].write().unwrap();
             let mut next_leaf = BPlusTreeLeafPage::<K, V>::deserialize(next_frame.data)?;
+            drop(next_frame);
+            let mut next_frame = self.buffer_pool.frames[next_frame_i].write().unwrap();
             next_leaf.prev = Some(new_page_id);
             next_frame.data = next_leaf.serialize()?;
             drop(next_frame);
             self.buffer_pool.unpin_page(old_next_id, true);
         }
+        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
         frame.data = leaf.serialize()?;
         drop(frame);
 
@@ -161,51 +168,47 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         }
         // else, have to pop parent id from stack, read it, insert_key_child at right position, if parent not full, done, if it's full,
         // have to do internal split (where middle key moves up), write back both, recurse  with parent's middle key
-        let parent_id: u32 = stack.pop().expect("");
+        let parent_id = stack.pop().expect("non-empty");
         let frame_i = self.buffer_pool.fetch_page(parent_id)?;
-        let mut parent_frame = self.buffer_pool.frames[frame_i].write().unwrap();
-        let mut parent_node = BPlusTreeInternalPage::<K>::deserialize(parent_frame.data)?;
+        let mut parent_node = {
+            let pf = self.buffer_pool.frames[frame_i].read().unwrap();
+            BPlusTreeInternalPage::<K>::deserialize(pf.data)?
+        }; // lock dropped
+
         if parent_node.is_full() {
-            let new_parent_id = self.buffer_pool.new_page()?;
-            let frame_i = self.buffer_pool.fetch_page(new_parent_id)?;
-            let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+            let new_parent_id = self.buffer_pool.new_page()?;   // no lock held
             let (up_key, mut new_parent) = parent_node.split(new_parent_id);
 
             if mid_key >= up_key {
-                let index = match new_parent.key_arr.binary_search(&mid_key) {
-                    Ok(i) => i,
-                    Err(i) => i
-                };
+                let index = new_parent.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
                 new_parent.insert_key_child(index, mid_key, right_id);
-            }else {
-                let index = match parent_node.key_arr.binary_search(&mid_key) {
-                    Ok(i) => i,
-                    Err(i) => i,
-                };
+            } else {
+                let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
                 parent_node.insert_key_child(index, mid_key, right_id);
             }
-            frame.data = new_parent.serialize()?;
-            drop(frame);
-            
-            parent_frame.data = parent_node.serialize()?;
-            drop(parent_frame);
 
+            {
+                let mut pf = self.buffer_pool.frames[frame_i].write().unwrap();
+                pf.data = parent_node.serialize()?;
+            }
+            {
+                let nf_i = self.buffer_pool.fetch_page(new_parent_id)?;
+                let mut nf = self.buffer_pool.frames[nf_i].write().unwrap();
+                nf.data = new_parent.serialize()?;
+            }
             self.buffer_pool.unpin_page(new_parent_id, true);
             self.buffer_pool.unpin_page(parent_id, true);
             self.insert_into_parent(stack, parent_id, up_key, new_parent_id)?;
-            return Ok(())
         } else {
-            let index = match parent_node.key_arr.binary_search(&mid_key) {
-                Ok(i) => i,
-                Err(i) => i
-            };
+            let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
             parent_node.insert_key_child(index, mid_key, right_id);
-            parent_frame.data = parent_node.serialize()?;
-            drop(parent_frame);
-
+            {
+                let mut pf = self.buffer_pool.frames[frame_i].write().unwrap();
+                pf.data = parent_node.serialize()?;
+            }
             self.buffer_pool.unpin_page(parent_id, true);
-            return Ok(())
         }
+        Ok(())
     }
 
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
