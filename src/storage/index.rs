@@ -118,4 +118,63 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 #[cfg(test)]
 mod tests {
 
+    use super::*;
+    use std::fs::OpenOptions;
+    use crate::{buffer, catalog::column::Value};
+    
+    fn setup() -> BPlusTreeManager::<Value, Value>{
+        let _ = std::fs::remove_file("test_index.db");
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open("test_index.db").unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        BPlusTreeManager::<Value, Value>::create(bp.clone()).unwrap()
+    }
+
+    #[test]
+    fn test_create_init_empty_leaf() {
+        let tree = setup();
+        let root_id = tree.root_page_id.load(Ordering::Relaxed);
+        let root_node = tree.read_node(root_id).unwrap();
+        match root_node {
+            BPlusTreePage::Leaf(leaf) => {
+                assert_eq!(leaf.page_id, root_id);
+                assert_eq!(leaf.num_keys, 0);
+                assert_eq!(leaf.key_arr.len(), 0);
+                assert_eq!(leaf.vals.len(), 0);
+            }
+            BPlusTreePage::Internal(_) => unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_search_empty_tree_returns_none() {
+        let tree = setup();
+        let search_key = Value::Integer(67);
+        let result = tree.search(&search_key).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_search_finds_key() {
+        let tree = setup();
+        let root_id = tree.root_page_id.load(Ordering::Relaxed);
+
+        let frame_i = tree.buffer_pool.fetch_page(root_id).unwrap();
+        let mut frame = tree.buffer_pool.frames[frame_i].write().unwrap();
+        let mut leaf = BPlusTreeLeafPage::<Value, Value>::deserialize(frame.data).unwrap();
+        let key = Value::Integer(69);
+        let val = Value::Integer(6767);
+        leaf.insert_entry(key.clone(), val.clone());
+        leaf.insert_entry(Value::Integer(67), Value::Integer(6969));
+
+        frame.data = leaf.serialize().unwrap();
+        drop(frame);
+        tree.buffer_pool.unpin_page(root_id, true);
+        let result = tree.search(&key).unwrap();
+        let bad_result = tree.search(&Value::Integer(76)).unwrap();
+        assert_eq!(result, Some(val));
+        assert_eq!(bad_result, None);
+    }
 }
