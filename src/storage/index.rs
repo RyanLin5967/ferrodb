@@ -60,6 +60,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         if !leaf.is_full() {
             leaf.insert_entry(key, value);
             frame.data = leaf.serialize()?;
+            drop(frame);
             self.buffer_pool.unpin_page(page_id, true);
             return Ok(())
         }
