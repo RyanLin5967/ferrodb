@@ -188,18 +188,22 @@ impl HeapFileManager {
                 }
                 Err(FerroError::NotEnoughSpace) => {
                     if dir.next_page_directory == 0 {
+                        drop(frame);                                            // release before allocating
                         let new_dir_id = self.buffer_pool_manager.new_page()?;
-                        dir.next_page_directory = new_dir_id;
-                        frame.data = dir.serialize();
-                        drop(frame);
+
+                        dir.next_page_directory = new_dir_id;                   // dir is a local copy, still valid
+                        {
+                            let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+                            frame.data = dir.serialize();
+                        }
                         self.buffer_pool_manager.unpin_page(dir_page_id, true);
-                        // add entry to new dir page
                         let new_frame_i = self.buffer_pool_manager.fetch_page(new_dir_id)?;
-                        let mut new_frame = self.buffer_pool_manager.frames[new_frame_i].write().unwrap();
                         let mut new_dir = PageDirectory::new(new_dir_id);
                         new_dir.add_entry(new_page_id, free_space)?;
-                        new_frame.data = new_dir.serialize();
-                        drop(new_frame);
+                        {
+                            let mut new_frame = self.buffer_pool_manager.frames[new_frame_i].write().unwrap();
+                            new_frame.data = new_dir.serialize();
+                        }
                         self.buffer_pool_manager.unpin_page(new_dir_id, true);
                         return Ok(());
                     }
