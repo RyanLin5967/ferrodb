@@ -53,6 +53,36 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     // find_leaf to get the leaf, deserialize, try to insert, if not full, done. else, have to split and do stuff
     pub fn insert(&mut self, key: K, value: V) -> Result<(), FerroError> {
+        let (page_id, mut stack) = self.find_leaf(key.clone())?;
+        let frame_i = self.buffer_pool.fetch_page(page_id)?;
+        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+        let mut leaf: BPlusTreeLeafPage<K, V> = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        if !leaf.is_full() {
+            leaf.insert_entry(key, value);
+            frame.data = leaf.serialize()?;
+            self.buffer_pool.unpin_page(page_id, true);
+            return Ok(())
+        }
+        let new_page_id = self.buffer_pool.new_page()?;
+        let (split_key, mut new_leaf) = leaf.split(new_page_id);
+
+        if key >= split_key {
+            new_leaf.insert_entry(key, value);
+        } else {
+            leaf.insert_entry(key, value);
+        }
+
+        frame.data = leaf.serialize()?;
+        drop(frame);
+
+        let new_frame_i = self.buffer_pool.fetch_page(new_page_id)?;
+        let mut new_frame = self.buffer_pool.frames[new_frame_i].write().unwrap();
+        new_frame.data = new_leaf.serialize()?;
+        drop(new_frame);
+
+        self.buffer_pool.unpin_page(new_page_id, true);
+        self.buffer_pool.unpin_page(page_id, true);
+        self.insert_into_parent(&mut stack, page_id, split_key, new_page_id)?;
         Ok(())
     }
 
@@ -62,6 +92,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     }
 
     // HELPERS
+    
     // traverse tree to leaf, remember to push to path stack if it's internal
     pub fn find_leaf(&self, key: K) -> Result<(u32, Vec<u32>), FerroError> { // (leaf_page_id, path_stack)
         let mut curr = self.root_page_id.load(Ordering::Relaxed);
@@ -104,8 +135,73 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     }
 
     // prob have to use recursion, too complex to write here
-    pub fn insert_into_parent(&mut self, path: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
-        todo!()
+    pub fn insert_into_parent(&mut self, stack: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
+        // root was split, so need to allocate new root, make an internal node with one key (mid_key) and two children (left, right id)
+        // update root_page_id, tree height grew
+        if stack.is_empty() { 
+            let new_page_id = self.buffer_pool.new_page()?;
+            let mut new_root = BPlusTreeInternalPage::<K>::new(new_page_id);
+            new_root.key_arr.push(mid_key);
+            new_root.child_ptrs.push(left_id);
+            new_root.child_ptrs.push(right_id);
+
+            let frame_i = self.buffer_pool.fetch_page(new_page_id)?;
+            let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+            frame.data = new_root.serialize()?;
+            drop(frame);
+
+            self.buffer_pool.unpin_page(new_page_id, true);
+            self.root_page_id.store(new_page_id, Ordering::Relaxed);
+            return Ok(())
+            // later store the page id in catalog
+        }
+        // else, have to pop parent id from stack, read it, insert_key_child at right position, if parent not full, done, if it's full,
+        // have to do internal split (where middle key moves up), write back both, recurse  with parent's middle key
+        let parent_id: u32 = stack.pop().expect("");
+        let frame_i = self.buffer_pool.fetch_page(parent_id)?;
+        let mut parent_frame = self.buffer_pool.frames[frame_i].write().unwrap();
+        let mut parent_node = BPlusTreeInternalPage::<K>::deserialize(parent_frame.data)?;
+        if parent_node.is_full() {
+            let new_parent_id = self.buffer_pool.new_page()?;
+            let frame_i = self.buffer_pool.fetch_page(new_parent_id)?;
+            let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+            let (up_key, mut new_parent) = parent_node.split(new_parent_id);
+
+            if mid_key >= up_key {
+                let index = match new_parent.key_arr.binary_search(&mid_key) {
+                    Ok(i) => i,
+                    Err(i) => i
+                };
+                new_parent.insert_key_child(index, mid_key, right_id);
+            }else {
+                let index = match parent_node.key_arr.binary_search(&mid_key) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+                parent_node.insert_key_child(index, mid_key, right_id);
+            }
+            frame.data = new_parent.serialize()?;
+            drop(frame);
+            
+            parent_frame.data = parent_node.serialize()?;
+            drop(parent_frame);
+
+            self.buffer_pool.unpin_page(new_parent_id, true);
+            self.buffer_pool.unpin_page(parent_id, true);
+            self.insert_into_parent(stack, parent_id, up_key, new_parent_id)?;
+            return Ok(())
+        } else {
+            let index = match parent_node.key_arr.binary_search(&mid_key) {
+                Ok(i) => i,
+                Err(i) => i
+            };
+            parent_node.insert_key_child(index, mid_key, right_id);
+            parent_frame.data = parent_node.serialize()?;
+            drop(parent_frame);
+
+            self.buffer_pool.unpin_page(parent_id, true);
+            return Ok(())
+        }
     }
 
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
