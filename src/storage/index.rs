@@ -35,7 +35,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize> BPlusTreeManager
     // calls find_leaf, read it, call leaf.get and return value or None
     pub fn search(&self, key: &K) -> Result<Option<V>, FerroError> {
         let (page_id, stack) = self.find_leaf(key.clone())?;
-        
+
         todo!()
     }
 
@@ -69,7 +69,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize> BPlusTreeManager
             match node {
                 BPlusTreePage::Internal(n) => {
                     stack.push(curr);
-                    curr = n.find_child(&key);
+                    curr = n.child_ptrs[n.find_child(&key) as usize];
                 }
                 BPlusTreePage::Leaf(_) => return Ok((curr, stack))
             }
