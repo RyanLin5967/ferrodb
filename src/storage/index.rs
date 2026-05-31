@@ -155,6 +155,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             new_root.key_arr.push(mid_key);
             new_root.child_ptrs.push(left_id);
             new_root.child_ptrs.push(right_id);
+            new_root.num_keys = 1;
 
             let frame_i = self.buffer_pool.fetch_page(new_page_id)?;
             let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
