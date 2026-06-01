@@ -1,13 +1,9 @@
-use std::{fs::File, marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
+use std::{marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{disk_manager::DiskManager, index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}}};
 use crate::storage::index_page::BPlusTreePage;
 use std::sync::atomic::Ordering;
-pub enum OperationType {
-    Search,
-    Insert,
-    Delete,
-}
+
 pub struct BPlusTreeManager<K, V> {
     root_page_id: AtomicU32,
     buffer_pool: Arc<BufferPoolManager>,
@@ -252,7 +248,7 @@ mod tests {
 
     use super::*;
     use std::fs::OpenOptions;
-    use crate::{catalog::column::Value, storage::heap_file_manager::RecordId};
+    use crate::{catalog::column::Value, storage::{disk_manager::DiskManager, heap_file_manager::RecordId}};
     
     fn setup() -> BPlusTreeManager::<Value, Value>{
         let _ = std::fs::remove_file("test_index.db");
