@@ -363,7 +363,9 @@ impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTree
         
         self.key_arr.remove(index);
         self.vals.remove(index);
-        self.num_keys -= 1;
+        if self.num_keys > 0 {
+            self.num_keys -= 1;
+        }
         Ok(())
     }
 
