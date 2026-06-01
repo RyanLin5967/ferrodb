@@ -96,3 +96,30 @@ node 2 points to a child node where the key is >= key1 and < key2 ... node n poi
 - for variable length keys, we can store it in a slotted page format
 - for now it only supports fixed length keys *** (add variable length later)
 - Some optimizations are delaying merges to reduce disk io and then do them in a batch (log the changes to store them), maybe do these after
+
+SQL parsing:
+- will use recursive descent since sql is recursive
+- store token types in an enum
+- separate error generating and error reporting code
+- it will loop from the users input and return tokens until it reaches the end
+- tokenizer is basically a switch case for all characters
+- have tokens for string literals, comparison operators, punctuation (all in token enum)
+- for keyword recognition, look up a sequence of characters in a table, if matches return keyword token, else return an identifier token
+- keep scanning even if there is an error so the user knows about all of them
+- for expressions like age > 2 AND name = 'bob' OR id < 3, this is the hierarchy (lowest binding to highest):
+- OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
+- parser will create an AST as it goes through the tokens
+- abstract syntax tree is an enum of syntax types like Select { columns, table, where_clause}, Insert {table, values}, and expression enum 
+BinaryOp {left, op, right}, Column(String), Literal (Value)
+- when parser encounters an error, it will have to get to a state where the next token matches the rule being parsed (discard prev tokens)
+- it will propagate an error through the recursive descent calls, then synchronize to discard tokens until a statement boundary
+- Null is Value::Null, varchar(n) needs special handling cuz of length argument
+- for now it'll support grammar like (case insensitive):
+CREATE TABLE name (col type, ....)
+INSERT INTO name VALUES (...)
+SELECT cols FROM table WHERE expr
+UPDATE table SET col = val WHERE expr
+DELETE FROM table WHERE expr
+CREATE INDEX index_name ON table (col)
+- no:
+JOIN, subqueries, aggregates, GROUP BY, ORDER BY, yet
