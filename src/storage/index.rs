@@ -378,4 +378,38 @@ mod tests {
         let tree = setup();
         assert!(tree.delete(&Value::Integer(934857)).is_err());
     }
+
+    #[test]
+    fn test_range_scan_basic() {
+        let tree = setup();
+
+        tree.insert(Value::Integer(50), Value::Integer(5)).unwrap();
+        tree.insert(Value::Integer(10), Value::Integer(1)).unwrap();
+        tree.insert(Value::Integer(30), Value::Integer(3)).unwrap();
+        tree.insert(Value::Integer(20), Value::Integer(2)).unwrap();
+        tree.insert(Value::Integer(40), Value::Integer(4)).unwrap();
+
+        let result = tree.range_scan(&Value::Integer(20), &Value::Integer(40)).unwrap();
+
+        assert_eq!(result.len(), 3);
+        
+        assert_eq!(result[0], (Value::Integer(20), Value::Integer(2)));
+        assert_eq!(result[1], (Value::Integer(30), Value::Integer(3)));
+        assert_eq!(result[2], (Value::Integer(40), Value::Integer(4)));
+    }
+
+    #[test]
+    fn test_range_scan_many_pages(){ 
+        let tree = setup();
+        for i in 0..1000 {
+            tree.insert(Value::Integer(i), Value::Integer(i*10)).unwrap();
+        }
+
+        let result = tree.range_scan(&Value::Integer(450), &Value::Integer(550)).unwrap();
+        for (i, (k,v)) in result.iter().enumerate() {
+            let expected_val = 450+ i as i32;
+            assert_eq!(*k, Value::Integer(expected_val));
+            assert_eq!(*v, Value::Integer(expected_val * 10));
+        }
+    }
 }
