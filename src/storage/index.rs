@@ -252,7 +252,7 @@ mod tests {
 
     use super::*;
     use std::fs::OpenOptions;
-    use crate::{catalog::column::Value};
+    use crate::{catalog::column::Value, storage::heap_file_manager::RecordId};
     
     fn setup() -> BPlusTreeManager::<Value, Value>{
         let _ = std::fs::remove_file("test_index.db");
@@ -262,6 +262,16 @@ mod tests {
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let bp = Arc::new(BufferPoolManager::new(dm));
         BPlusTreeManager::<Value, Value>::create(bp.clone()).unwrap()
+    }
+
+    fn setup_leaf() -> BPlusTreeManager<Value, RecordId> {
+        let _ = std::fs::remove_file("test_leaf.db");
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open("test_leaf.db").unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap()
     }
 
     #[test]
@@ -330,7 +340,7 @@ mod tests {
     fn test_many_level_insert_and_search() {
         let tree = setup();
         for i in 0..2000 {
-            let res = tree.insert(Value::Integer(i), Value::Integer(i *2)).unwrap_or_else(|e| panic!("insert {} failed: {:?}", i, e));
+            let _ = tree.insert(Value::Integer(i), Value::Integer(i *2)).unwrap_or_else(|e| panic!("insert {} failed: {:?}", i, e));
         }
         for i in 0..2000 {
             let res = tree.search(&Value::Integer(i)).unwrap();
@@ -347,5 +357,29 @@ mod tests {
         for i in 0..2000 {
             assert_eq!(tree.search(&Value::Integer(i)).unwrap(), Some(Value::Integer(i)));
         }
+    }
+
+    #[test]
+    fn test_delete_basic() {
+        let tree: BPlusTreeManager<Value, Value> = setup();
+        let leaf = setup_leaf();
+        tree.insert(Value::Integer(67),Value::Integer(6)).unwrap();
+        tree.insert(Value::Integer(20), Value::Integer(7)).unwrap();
+
+        leaf.insert(Value::Integer(67),RecordId::new(6, 1)).unwrap();
+        leaf.insert(Value::Integer(20), RecordId::new(7, 2)).unwrap();
+        tree.delete(&Value::Integer(67)).unwrap();
+        leaf.delete(&Value::Integer(67)).unwrap();
+
+        assert!(tree.search(&Value::Integer(67)).unwrap().is_none());
+        assert!(leaf.search(&Value::Integer(67)).unwrap().is_none());
+        assert_eq!(tree.search(&Value::Integer(20)).unwrap(), Some(Value::Integer(7)));
+        assert_eq!(leaf.search(&Value::Integer(20)).unwrap(), Some(RecordId::new(7, 2)));
+    }
+
+    #[test]
+    fn test_delete_not_real_key() {
+        let tree = setup();
+        assert!(tree.delete(&Value::Integer(934857)).is_err());
     }
 }
