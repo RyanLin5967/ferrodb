@@ -50,6 +50,23 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     // find leaf then remove entry, if underfull, call handle_underfull
     pub fn delete(&self, key: &K) -> Result<(), FerroError> {
+        let (page_id, _) = self.find_leaf(key.clone())?;
+        let frame_i = self.buffer_pool.fetch_page(page_id)?;
+        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+        let mut leaf = BPlusTreeLeafPage::<K, V>::deserialize(frame.data)?;
+        match leaf.remove_entry(key) {
+            Ok(_) => {
+                frame.data = leaf.serialize()?;
+                drop(frame);
+                self.buffer_pool.unpin_page(page_id, true);
+            }
+            Err(e) => {
+                drop(frame);
+                self.buffer_pool.unpin_page(page_id, false);
+                return Err(e)
+            }
+        };
+        // if underfull: handle_underflow() ... later
         Ok(())
     }
 
@@ -97,14 +114,35 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(())
     }
 
-    // uses sibling pointers to traverse leaves and does range scan from start -> end
+    // uses sibling pointers to traverse leaves and does range scan from start -> end (inclusive)
+    // should later return an iterator to load results lazily cuz memory could overflow
     pub fn range_scan(&self, start: &K, end: &K) -> Result<Vec<(K, V)>, FerroError> {
-        todo!()
+        let mut keys = Vec::new();
+        let (mut leaf_page_id, _) = self.find_leaf(start.clone())?;
+        loop {
+            let frame_i = self.buffer_pool.fetch_page(leaf_page_id)?;
+            let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+            let curr_leaf_page = BPlusTreeLeafPage::<K,V>::deserialize(frame.data)?;
+            drop(frame);
+            self.buffer_pool.unpin_page(leaf_page_id, false);
+            for i in 0..curr_leaf_page.key_arr.len() {
+                if &curr_leaf_page.key_arr[i] > end {
+                    return Ok(keys)
+                }
+                if &curr_leaf_page.key_arr[i] >= start {
+                    keys.push((curr_leaf_page.key_arr[i].clone(), curr_leaf_page.vals[i].clone()));
+                }
+            }
+            match curr_leaf_page.next {
+                Some(next_id) => leaf_page_id = next_id,
+                None => return Ok(keys)
+            }
+        }
     }
 
     // HELPERS
     
-    // traverse tree to leaf, remember to push to path stack if it's internal
+    // traverse tree to leaf, push to path stack if it's internal
     pub fn find_leaf(&self, key: K) -> Result<(u32, Vec<u32>), FerroError> { // (leaf_page_id, path_stack)
         let mut curr = self.root_page_id.load(Ordering::Relaxed);
         let mut stack: Vec<u32> = Vec::new();
@@ -135,17 +173,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(node)
     }
 
-    //
-    pub fn write_node_internal(&self, page_id: u32, node: &BPlusTreeInternalPage<K>) -> Result<(), FerroError> {
-        todo!()
-    }
-
-    //
-    pub fn write_node_leaf(&self, page_id: u32, node: &BPlusTreeLeafPage<K, V>) -> Result<(), FerroError> {
-        todo!()
-    }
-
-    // prob have to use recursion, too complex to write here
+    // have to use recursion
     pub fn insert_into_parent(&self, stack: &mut Vec<u32>, left_id: u32, mid_key: K, right_id: u32) -> Result<(), FerroError> {
         // root was split, so need to allocate new root, make an internal node with one key (mid_key) and two children (left, right id)
         // update root_page_id, tree height grew
