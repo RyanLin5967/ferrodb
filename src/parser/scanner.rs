@@ -71,6 +71,7 @@ impl Scanner {
                 }
                 
             },
+            '/' => self.add_token(TokenType::Slash),
             '+' => self.add_token(TokenType::Plus),
             ';' => self.add_token(TokenType::Semicolon),
             '*' => self.add_token(TokenType::Star),
