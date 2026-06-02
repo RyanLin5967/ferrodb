@@ -1,3 +1,5 @@
+#[derive(Debug, Clone)]
+
 pub struct Column {
     pub name: String,
     pub data_type: DataType,
@@ -5,6 +7,7 @@ pub struct Column {
 }
 
 // add support for more later
+#[derive(Debug, Clone)]
 pub enum DataType {
     Integer,
     Float, 
@@ -20,6 +23,7 @@ pub enum Value {
     Boolean(bool),
     Null
 }
+
 
 impl Column {
     pub fn new(name: String, data_type: DataType, nullable: bool) -> Self {

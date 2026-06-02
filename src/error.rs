@@ -1,6 +1,5 @@
 use std::fmt::{ Display, Formatter, Result };
 use std::error;
-
 //add more types
 #[derive(Debug)]
 pub enum FerroError {
@@ -11,6 +10,7 @@ pub enum FerroError {
     KeyNotFound,
     EmptyList,
     PagePinned,
+    SqlParseError(String),
 }
 
 impl Display for FerroError {
@@ -23,6 +23,7 @@ impl Display for FerroError {
             FerroError::KeyNotFound => write!(f, "key wasn't found"),
             FerroError::EmptyList => write!(f, "linked hash set is empty"),
             FerroError::PagePinned => write!(f, "page is pinned"),
+            FerroError::SqlParseError(s) => write!(f, "sql parsing error: {}", s),
         }
     }
 }
