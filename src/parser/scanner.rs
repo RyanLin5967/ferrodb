@@ -1,3 +1,4 @@
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum TokenType {
     LeftParen, RightParen, Comma, Dot, Minus, Plus, Semicolon, Slash, Star, 
 
@@ -12,6 +13,7 @@ pub enum TokenType {
     Eof,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     pub token_type: TokenType,
     pub lexeme: String,
