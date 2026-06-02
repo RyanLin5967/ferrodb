@@ -105,11 +105,11 @@ impl Parser {
     }
 
     pub fn is_at_end(&self) -> bool {
-        return self.peek().token_type == TokenType::Eof
+        return self.peek().token_type == TokenType::Eof || self.current >= self.tokens.len()
     }
 
     pub fn peek(&self) -> Token{
-        self.tokens[self.current].clone()
+        self.tokens.get(self.current).cloned().unwrap_or_else(|| Token::new(TokenType::Eof, "".to_string(), 0))
     }
 
     pub fn previous(&self) -> Token{
