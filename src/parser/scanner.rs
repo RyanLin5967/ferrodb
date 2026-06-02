@@ -1,3 +1,5 @@
+use crate::error::FerroError;
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum TokenType {
     LeftParen, RightParen, Comma, Dot, Minus, Plus, Semicolon, Slash, Star, 
@@ -26,6 +28,7 @@ pub struct Scanner {
     pub start: usize,
     pub current: usize,
     pub line: usize,
+    pub errors: Vec<FerroError>
 }
 
 impl Token {
@@ -36,16 +39,19 @@ impl Token {
 
 impl Scanner {
     pub fn new(source: Vec<char>, tokens: Vec<Token>) -> Self{
-        Self {source, tokens, start: 0, current: 0, line: 1}
+        Self {source, tokens, start: 0, current: 0, line: 1, errors: Vec::new()}
     }
 
-    pub fn scan_tokens(mut self) -> Vec<Token>{
+    pub fn scan_tokens(mut self) -> Result<Vec<Token>, FerroError>{
         while !self.is_at_end() {
             self.start = self.current;
             self.scan_token();
         }
-        self.tokens.push(Token::new(TokenType::Eof, "".to_string(), self.line));
-        self.tokens
+        if self.errors.is_empty() {
+            self.tokens.push(Token::new(TokenType::Eof, "".to_string(), self.line));
+            return Ok(self.tokens)
+        }
+        return Err(FerroError::SqlParseError(self.errors.iter().map(|e| e.to_string()).collect::<Vec<String>>().join("\n")))
     }
     pub fn scan_token(&mut self){
         
@@ -94,7 +100,7 @@ impl Scanner {
                 } else if c.is_ascii_alphabetic() || c == '_' {
                     self.identifier();
                 } else {
-                    // handle error
+                    self.errors.push(Scanner::error(self.line, format!("unexpected character: {}", c)))
                 }
             }
         }
@@ -130,8 +136,7 @@ impl Scanner {
             self.advance();
         }
         if self.is_at_end() {
-            // handle error
-            return
+            self.errors.push(Scanner::error(self.line, "no closing quote".to_string()));
         }
         self.advance();
 
@@ -186,5 +191,8 @@ impl Scanner {
         if self.is_at_end() {return '\0'}
         return self.source[self.current];
     }
-}
 
+    pub fn error(line: usize, message: String) -> FerroError{
+        FerroError::SqlParseError(format!("Line {}: {}", line, message))
+    }
+}
