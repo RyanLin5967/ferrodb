@@ -80,9 +80,9 @@ impl Parser {
     pub fn parse_statement(&mut self) -> Result<Stmt, FerroError>{
         todo!()
     }
-    pub fn match_token(&mut self, types: Vec<TokenType>) -> bool{
+    pub fn match_token(&mut self, types: &[TokenType]) -> bool{
         for token_type in types {
-            if self.check(token_type) {
+            if self.check(*token_type) {
                 self.advance();
                 return true;
             }
@@ -129,7 +129,7 @@ impl Parser {
 
     pub fn or(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.and()?;
-        while self.match_token(vec![TokenType::Or]) {
+        while self.match_token(&[TokenType::Or]) {
             let operator = self.previous().token_type;
             let right = self.and()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -139,7 +139,7 @@ impl Parser {
 
     pub fn and(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.not()?;
-        while self.match_token(vec![TokenType::And]) {
+        while self.match_token(&[TokenType::And]) {
             let operator = self.previous().token_type;
             let right = self.not()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -148,7 +148,7 @@ impl Parser {
     }
 
     pub fn not(&mut self) -> Result<Expr, FerroError>{
-        if self.match_token(vec![TokenType::Not]) {
+        if self.match_token(&[TokenType::Not]) {
             let operator = self.previous().token_type;
             let right = self.not()?;
             return Ok(Expr::UnaryOp { operator, right: Box::new(right) });
@@ -158,7 +158,7 @@ impl Parser {
 
     pub fn equality(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.comparison()?;
-        while self.match_token(vec![TokenType::BangEqual, TokenType::Equal]){
+        while self.match_token(&[TokenType::BangEqual, TokenType::Equal]){
             let operator = self.previous().token_type;
             let right = self.comparison()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -168,7 +168,7 @@ impl Parser {
 
     pub fn comparison(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.term()?;
-        while self.match_token(vec![TokenType::Greater, TokenType::GreaterEqual, TokenType::Less, TokenType::LessEqual]) {
+        while self.match_token(&[TokenType::Greater, TokenType::GreaterEqual, TokenType::Less, TokenType::LessEqual]) {
             let operator = self.previous().token_type;
             let right = self.term()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -178,7 +178,7 @@ impl Parser {
     
     pub fn term(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.factor()?;
-        while self.match_token(vec![TokenType::Minus, TokenType::Plus]) {
+        while self.match_token(&[TokenType::Minus, TokenType::Plus]) {
             let operator = self.previous().token_type;
             let right = self.factor()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -188,7 +188,7 @@ impl Parser {
 
     pub fn factor(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.unary()?;
-        while self.match_token(vec![TokenType::Slash, TokenType::Star]) {
+        while self.match_token(&[TokenType::Slash, TokenType::Star]) {
             let operator = self.previous().token_type;
             let right = self.unary()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -197,7 +197,7 @@ impl Parser {
     }
 
     pub fn unary(&mut self) -> Result<Expr, FerroError>{
-        if self.match_token(vec![TokenType::Bang, TokenType::Minus]) {
+        if self.match_token(&[TokenType::Bang, TokenType::Minus]) {
             let operator = self.previous().token_type;
             let right = self.unary()?;
             return  Ok(Expr::UnaryOp { operator, right: Box::new(right) });
@@ -207,19 +207,19 @@ impl Parser {
     }
 
     pub fn primary(&mut self) -> Result<Expr, FerroError>{
-        if self.match_token(vec![TokenType::False]) {return Ok(Expr::Literal { value_type: TokenType::False, value: String::from("false") })}
-        if self.match_token(vec![TokenType::True]) {return Ok(Expr::Literal { value_type: TokenType::True, value: String::from("true") })}
-        if self.match_token(vec![TokenType::Null]) {return Ok(Expr::Literal { value_type: TokenType::Null, value: String::from("null") })}
-        if self.match_token(vec![TokenType::Number, TokenType::String]) {
+        if self.match_token(&[TokenType::False]) {return Ok(Expr::Literal { value_type: TokenType::False, value: String::from("false") })}
+        if self.match_token(&[TokenType::True]) {return Ok(Expr::Literal { value_type: TokenType::True, value: String::from("true") })}
+        if self.match_token(&[TokenType::Null]) {return Ok(Expr::Literal { value_type: TokenType::Null, value: String::from("null") })}
+        if self.match_token(&[TokenType::Number, TokenType::String]) {
             let prev = self.previous();
             return Ok(Expr::Literal { value_type: prev.token_type, value: prev.lexeme })
         }
 
-        if self.match_token(vec![TokenType::Identifier]) {
+        if self.match_token(&[TokenType::Identifier]) {
             return Ok(Expr::ColumnRef(self.previous().lexeme));
         }
 
-        if self.match_token(vec![TokenType::LeftParen]) {
+        if self.match_token(&[TokenType::LeftParen]) {
             let expr = self.expression()?;
             self.consume(TokenType::RightParen, "expected right parentheses")?;
             return Ok(Expr::Grouping(Box::new(expr)))
