@@ -93,6 +93,7 @@ impl Scanner {
                 self.add_token(if matches {TokenType::GreaterEqual} else {TokenType::Greater})
             }
             '\n' => self.line += 1,
+            ' ' | '\r' | '\t' => {},
             '\'' => self.string(),
             _ => {
                 if c.is_ascii_digit() {
