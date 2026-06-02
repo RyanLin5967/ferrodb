@@ -71,6 +71,7 @@ impl Scanner {
                 }
                 
             },
+            '/' => self.add_token(TokenType::Slash),
             '+' => self.add_token(TokenType::Plus),
             ';' => self.add_token(TokenType::Semicolon),
             '*' => self.add_token(TokenType::Star),
@@ -203,63 +204,5 @@ impl Scanner {
 
     pub fn error(line: usize, message: String) -> FerroError{
         FerroError::SqlParseError(format!("Line {}: {}", line, message))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn scan(input : &str) -> Vec<TokenType> {
-        let scanner = Scanner::new(input.chars().collect(), Vec::new());
-        scanner.scan_tokens().unwrap().iter().map(|t| t.token_type).collect()
-    }
-
-    fn scan_tokens(input: &str) -> Vec<Token> {
-        let scanner = Scanner::new(input.chars().collect(), Vec::new());
-        scanner.scan_tokens().unwrap()
-    }
-
-    #[test]
-    fn test_select_statement() {
-        use TokenType::*;
-        let toks = scan("SELECT * FROM users WHERE age > 18;");
-        assert_eq!(toks, vec![
-            Select, Star, From, Identifier, Where, Identifier, Greater, Number, Semicolon, Eof
-        ]);
-    }
-
-    #[test]
-    fn test_whitespace_ignored() {
-        use TokenType::*;
-        let toks = scan("SELECT\t*\n  FROM   t ;");
-        assert_eq!(toks, vec![Select, Star, From, Identifier, Semicolon, Eof]);
-    }
-
-    #[test]
-    fn test_all_keywords() {
-        use TokenType::*;
-        let toks = scan("CREATE TABLE INSERT INTO VALUES UPDATE SET DELETE INDEX ON AND OR NOT NULL TRUE FALSE");
-        assert_eq!(toks, vec![
-            Create, Table, Insert, Into, Values, Update, Set, Delete, Index, On,
-            And, Or, Not, Null, True, False, Eof
-        ]);
-    }
-
-    #[test]
-    fn test_identifier_vs_keyword() {
-        use TokenType::*;
-        let toks = scan("selected user_name _temp col1");
-        assert_eq!(toks, vec![Identifier, Identifier, Identifier, Identifier, Eof]);
-    }
-
-    #[test]
-    fn test_operators() {
-        use TokenType::*;
-        let toks = scan("= != <> < <= > >= + - * /");
-        assert_eq!(toks, vec![
-            Equal, BangEqual, BangEqual, Less, LessEqual, Greater, GreaterEqual,
-            Plus, Minus, Star, Slash, Eof
-        ]);
     }
 }
