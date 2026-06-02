@@ -8,7 +8,7 @@ pub enum TokenType {
 
     Identifier, String, Number, 
 
-    And, Not, Class, Else, False, Null, Or, True, 
+    And, Not, False, Null, Or, True, 
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
