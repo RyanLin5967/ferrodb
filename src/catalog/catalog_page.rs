@@ -8,6 +8,7 @@ use crate::storage::disk_manager::PAGE_SIZE;
 use crate::catalog::column::DataType;
 use crate::catalog::column::Column;
 
+#[derive(PartialEq, Debug)]
 pub struct CatalogPage {
     pub page_type: u8,
     pub page_id: u32,
@@ -18,6 +19,7 @@ pub struct CatalogPage {
     pub entries: Vec<TableEntry>
 }
 
+#[derive(Debug, PartialEq)]
 pub struct TableEntry {
     pub name: String,
     pub first_directory_page_id: u32,
@@ -26,6 +28,7 @@ pub struct TableEntry {
     pub indexes: Vec<IndexInfo>,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct IndexInfo {
     pub column_name: String,
     pub root_page_id: u32,
@@ -185,15 +188,49 @@ impl CatalogPage {
     }
 
     pub fn add_entry(&mut self, entry: TableEntry) -> Result<(), FerroError> {
-        todo!()
+        if !self.has_space(&entry) {
+            return Err(FerroError::NotEnoughSpace);
+        }
+        self.entries.push(entry);
+        self.num_entries += 1;
+        Ok(())
     }
 
     pub fn remove_entry(&mut self, name: &str) -> Result<(), FerroError> {
-        todo!()
+        for i in 0..self.entries.len() {
+            if self.entries[i as usize].name == name {
+                self.entries.remove(i.into());
+                self.num_entries -= 1;
+                return Ok(())
+            }
+        }
+        Err(FerroError::KeyNotFound)
     }
 
     pub fn has_space(&self, entry: &TableEntry) -> bool {
-        todo!()
+        let entries_len: usize = self.entries.iter().map(|e| e.length()).sum();
+        HEADER_SIZE + entry.length() + entries_len <= PAGE_SIZE
     }
     
+}
+
+impl TableEntry {
+    pub fn length(&self)  -> usize{
+        let mut length = 8;
+        length += 1 + self.name.len();
+
+        length += 1;
+        for index in &self.indexes {
+            length += 5 + index.column_name.len()
+        }
+
+        length += 2;
+        for column in &self.schema.columns {
+            length += 3 + column.name.len();
+            if let DataType::Varchar(_) = column.data_type {
+                length += 2;
+            }
+        }
+        length
+    }
 }
