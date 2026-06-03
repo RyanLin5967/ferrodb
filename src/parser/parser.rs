@@ -414,3 +414,175 @@ impl Parser {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(token_type: TokenType, lexeme: &str) -> Token {
+        Token::new(token_type, lexeme.to_string(), 1)
+    }
+
+    #[test]
+    fn test_parse_select_str() {
+        let tokens = vec![
+            t(TokenType::Select, "SELECT"),
+            t(TokenType::Star, "*"),
+            t(TokenType::From, "FROM"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, ""),
+        ];
+
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+        assert!(parser.errors.is_empty());
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Select {table, columns, where_clause} => {
+                assert_eq!(table, "users");
+                assert!(where_clause.is_none());
+                assert_eq!(columns.len(), 1);
+                assert!(matches!(columns[0], Expr::ColumnRef(ref name) if name == "*"))
+            }
+            _ => panic!("bruh")
+        }
+    }
+
+    #[test]
+    fn test_parse_insert() {
+        let tokens = vec![
+            t(TokenType::Insert, "INSERT"),
+            t(TokenType::Into, "INTO"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Values, "VALUES"), 
+            t(TokenType::LeftParen, "("),
+            t(TokenType::Number, "67"),
+            t(TokenType::Comma, ","),
+            t(TokenType::String, "\"idk\""),
+            t(TokenType::RightParen, ")"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, "")
+        ];
+
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+
+        assert!(parser.errors.is_empty());
+        match &stmts[0] {
+            Stmt::Insert { table, values } => {
+                assert_eq!(table, "users");
+                assert_eq!(values.len(), 2);
+                assert!(matches!(values[0], Expr::Literal { value_type: TokenType::Number, ref value } if value == "67"));
+                assert!(matches!(values[1], Expr::Literal { value_type: TokenType::String, ref value } if value == "\"idk\""))
+            }
+            _ => panic!("bruh")
+        }
+    }
+
+    #[test]
+    fn test_update_with_where() {
+        let tokens = vec![
+            t(TokenType::Update, "UPDATE"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Set, "SET"),
+            t(TokenType::Identifier, "age"), 
+            t(TokenType::Equal, "="),
+            t(TokenType::Number, "67"),
+            t(TokenType::Where, "WHERE"),
+            t(TokenType::Identifier, "id"),
+            t(TokenType::Equal, "="),
+            t(TokenType::Number, "1"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, ""),
+        ];
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+        assert!(parser.errors.is_empty());
+
+        match &stmts[0] {
+            Stmt::Update { table, assignments, where_clause } => {
+                assert_eq!(table, "users");
+                assert_eq!(assignments.len(),1);
+                assert_eq!(assignments[0].0, "age");
+                assert!(matches!(assignments[0].1, Expr::Literal { value_type: TokenType::Number, ref value } if value == "67"));
+                assert!(matches!(where_clause.as_ref().unwrap(), Expr::BinaryOp { operator: TokenType::Equal, .. }))
+            }
+            _ => panic!("bruh")
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table() {
+        let tokens = vec![
+            t(TokenType::Create, "CREATE"),
+            t(TokenType::Table, "TABLE"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::LeftParen, "("),
+            t(TokenType::Identifier, "id"),
+            t(TokenType::TypeInt, "INTEGER"),
+            t(TokenType::Comma, ","),
+            t(TokenType::Identifier, "username"),
+            t(TokenType::TypeVarchar, "VARCHAR"),
+            t(TokenType::LeftParen, "("),
+            t(TokenType::Number, "2"),
+            t(TokenType::RightParen, ")"),
+            t(TokenType::Not, "NOT"),
+            t(TokenType::Null, "NULL"),
+            t(TokenType::RightParen, ")"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, ""),
+        ];
+
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+
+        assert!(parser.errors.is_empty());
+        
+        match &stmts[0] {
+            Stmt::CreateTable { table, columns } => {
+                assert_eq!(table, "users");
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].name, "id");
+                assert!(matches!(columns[0].data_type, DataType::Integer));
+                assert!(columns[0].nullable);
+                assert_eq!(columns[1].name, "username");
+                assert!(matches!(columns[1].data_type, DataType::Varchar(2)));
+                assert!(!columns[1].nullable);
+            }
+            _ => panic!("bruh")
+        }
+    }
+
+    #[test]
+    fn test_panic_mode_synchronization() {
+        let tokens = vec![
+            //invalid
+            t(TokenType::Select, "SELECT"),
+            t(TokenType::Star, "*"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Semicolon, ";"),
+
+            // valid
+            t(TokenType::Delete, "DELETE"), 
+            t(TokenType::From, "FROM"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, ""),
+        ];
+
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+
+        assert_eq!(parser.errors.len(), 1);
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Delete { table, .. } => {
+                assert_eq!(table, "users");
+            }
+            _ => panic!("bruh")
+        }
+    }
+}
