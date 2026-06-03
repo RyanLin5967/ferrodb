@@ -97,6 +97,15 @@ node 2 points to a child node where the key is >= key1 and < key2 ... node n poi
 - for now it only supports fixed length keys *** (add variable length later)
 - Some optimizations are delaying merges to reduce disk io and then do them in a batch (log the changes to store them), maybe do these after
 
+Catalog:
+- basically the databases metadata layer that has mapping of table names to schemas and storage locations
+- reserved for page 1
+- will track which columns are indexed, and where those structures are on disk
+- stores schema info like column types, constraints, primary key, 
+- when one catalog page gets full, it'll point to the next one like for bitmap pages
+- when a root split happens, have to update it in catalog and write it to disk
+- header: |page_type (1)|page_id (4)|next_catalog_page (4)|num_entries (2)|lsn (8)|checksum (4)|
+
 SQL parsing:
 - will use recursive descent since sql is recursive
 - store token types in an enum
@@ -123,3 +132,6 @@ DELETE FROM table WHERE expr
 CREATE INDEX index_name ON table (col)
 - no:
 JOIN, subqueries, aggregates, GROUP BY, ORDER BY, yet
+
+Query execution engine:
+- Iterator (Volcano) model
