@@ -23,7 +23,7 @@ Under active development.
 - [x] Page layout and tuple serialization
 - [x] Buffer pool manager
 - [x] B+ tree indexing
-- [ ] SQL parser
+- [x] SQL parser
 - [ ] Query execution engine
 - [ ] Cost-based query optimizer
 - [ ] Write-ahead logging with crash recovery
