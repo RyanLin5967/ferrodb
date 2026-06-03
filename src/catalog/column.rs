@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 
 pub struct Column {
     pub name: String,
@@ -7,7 +7,7 @@ pub struct Column {
 }
 
 // add support for more later
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     Integer,
     Float, 
