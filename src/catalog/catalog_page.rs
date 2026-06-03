@@ -19,7 +19,7 @@ pub struct CatalogPage {
     pub entries: Vec<TableEntry>
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct TableEntry {
     pub name: String,
     pub first_directory_page_id: u32,
@@ -28,7 +28,7 @@ pub struct TableEntry {
     pub indexes: Vec<IndexInfo>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct IndexInfo {
     pub column_name: String,
     pub root_page_id: u32,
@@ -232,5 +232,69 @@ impl TableEntry {
             }
         }
         length
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+use super::*;
+
+    fn mock_entry(name: &str) -> TableEntry {
+        TableEntry { name: name.to_string(), first_directory_page_id: 1, primary_index_root: 2, 
+            schema: Schema {
+                columns: vec![
+                    Column::new("id".to_string(), DataType::Integer, false),
+                    Column::new("name".to_string(), DataType::Varchar(255), true),
+                    Column::new("active".to_string(), DataType::Boolean, false),
+                ],
+            },
+            indexes: vec![
+                IndexInfo { column_name: "id".to_string(), root_page_id: 20 },
+                IndexInfo { column_name: "name".to_string(), root_page_id: 21 },
+            ],  
+        }
+    }
+    #[test]
+    fn test_basic_roundtrip() {
+        let mut catalog_page = CatalogPage::new(1);
+        let table_entry = vec![TableEntry {name: "s".into(), first_directory_page_id: 1, primary_index_root: 2, schema: Schema { columns: Vec::new() }, indexes: Vec::new()}];
+        catalog_page.entries = table_entry;
+        catalog_page.num_entries = 1;
+
+        let serialized = catalog_page.serialize().unwrap();
+        let deserialized = CatalogPage::deserialize(serialized).unwrap();
+        assert_eq!(deserialized, catalog_page);
+    }
+
+    #[test]
+    fn test_remove_entry() {
+        let mut page = CatalogPage::new(1);
+        page.add_entry(mock_entry("users")).unwrap();
+        page.add_entry(mock_entry("orders")).unwrap();
+
+        assert!(page.remove_entry("users").is_ok());
+        assert_eq!(page.num_entries, 1);
+        assert_eq!(page.entries[0].name, "orders");
+        let err = page.remove_entry("invalid").unwrap_err();
+        assert!(matches!(err, FerroError::KeyNotFound));
+        assert_eq!(page.num_entries, 1);
+    }
+
+    #[test]
+    fn test_add_space_management() {
+        let mut page = CatalogPage::new(1);
+        let entry = mock_entry("users");
+        let entry_len = entry.length();
+        assert!(page.add_entry(entry.clone()).is_ok());
+        assert_eq!(page.num_entries, 1);
+        let max_entries = (PAGE_SIZE - HEADER_SIZE) / entry_len;
+
+        for _ in 1..max_entries {
+            assert!(page.add_entry(entry.clone()).is_ok())
+        }
+
+        let result = page.add_entry(mock_entry("overflow pls"));
+        assert!(matches!(result, Err(FerroError::NotEnoughSpace)));
     }
 }
