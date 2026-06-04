@@ -174,8 +174,6 @@ impl Catalog {
             curr_page_id = next;
         }
         Ok(())
-
-        // TODO: page reclamation
     }
 
     // traverses catalog pages and loads into hashmap
