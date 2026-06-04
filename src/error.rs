@@ -11,6 +11,7 @@ pub enum FerroError {
     EmptyList,
     PagePinned,
     SqlParseError(String),
+    IndexAlreadyExists,
 }
 
 impl Display for FerroError {
@@ -24,6 +25,7 @@ impl Display for FerroError {
             FerroError::EmptyList => write!(f, "linked hash set is empty"),
             FerroError::PagePinned => write!(f, "page is pinned"),
             FerroError::SqlParseError(s) => write!(f, "sql parsing error: {}", s),
+            FerroError::IndexAlreadyExists => write!(f, "index already exists"),
         }
     }
 }

@@ -5,9 +5,9 @@ use crate::storage::index_page::BPlusTreePage;
 use std::sync::atomic::Ordering;
 
 pub struct BPlusTreeManager<K, V> {
-    root_page_id: AtomicU32,
-    buffer_pool: Arc<BufferPoolManager>,
-    marker: PhantomData<(K, V)>
+    pub root_page_id: AtomicU32,
+    pub buffer_pool: Arc<BufferPoolManager>,
+    pub marker: PhantomData<(K, V)>
 }
 
 impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeManager<K,V> {
