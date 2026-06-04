@@ -137,12 +137,14 @@ impl Catalog {
             }
 
             let has_more = iter.peek().is_some();
+            let mut orphan_head = 0;
             if has_more {
                 if page.next_catalog_page == 0 {
                     let new_id = self.buffer_pool.new_page()?;
                     page.next_catalog_page = new_id;
                 }
             } else {
+                orphan_head = page.next_catalog_page;
                 page.next_catalog_page = 0;
             }
 
@@ -155,6 +157,18 @@ impl Catalog {
             self.buffer_pool.unpin_page(curr_page_id, true);
 
             if !has_more {
+                let mut free_id = orphan_head;
+                while free_id != 0 {
+                    let frame_i = self.buffer_pool.fetch_page(free_id)?;
+                    let next_orphan = {
+                        let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+                        CatalogPage::deserialize(frame.data)?.next_catalog_page
+                    };
+
+                    self.buffer_pool.unpin_page(free_id, false);
+                    self.buffer_pool.delete_page(free_id)?;
+                    free_id = next_orphan;
+                }
                 break;
             }
             curr_page_id = next;
