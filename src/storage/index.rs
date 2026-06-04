@@ -238,6 +238,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
     // and drops to one child, make that child the new root
+    #[allow(warnings)]
     pub fn handle_underflow(&self, path: &mut Vec<u32>, node_id: u32) -> Result<(), FerroError> {
         todo!()
     }

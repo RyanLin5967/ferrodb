@@ -1,4 +1,4 @@
-use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::scanner::{Scanner, Token, TokenType::{self}}};
+use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::scanner::{Token, TokenType::{self}}};
 
 pub struct Parser {
     pub tokens: Vec<Token>,
@@ -539,7 +539,7 @@ mod tests {
         let stmts = parser.parse();
 
         assert!(parser.errors.is_empty());
-        
+
         match &stmts[0] {
             Stmt::CreateTable { table, columns } => {
                 assert_eq!(table, "users");
