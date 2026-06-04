@@ -1,9 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
-use crate::storage::heap_page::Page;
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::catalog::column::DataType;
 use crate::catalog::column::Column;

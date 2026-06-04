@@ -216,11 +216,6 @@ mod tests {
         scanner.scan_tokens().unwrap().iter().map(|t| t.token_type).collect()
     }
 
-    fn scan_tokens(input: &str) -> Vec<Token> {
-        let scanner = Scanner::new(input.chars().collect(), Vec::new());
-        scanner.scan_tokens().unwrap()
-    }
-
     #[test]
     fn test_select_statement() {
         use TokenType::*;
