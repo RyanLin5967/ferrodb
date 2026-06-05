@@ -75,7 +75,8 @@ impl Catalog {
         let new_root_id = sec_tree.root_page_id.load(Ordering::Relaxed);
 
         let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
-        for tuple in hfm.scan()? {
+        for item in hfm.scan() {
+            let (_, tuple) = item?;
             let values = tuple.deserialize(&schema)?;
             let sec_value = values[col_index].clone();
             let primary_key = values[0].clone();   // first column = primary key

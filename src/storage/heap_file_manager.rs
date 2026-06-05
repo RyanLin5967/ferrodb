@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{buffer::buffer_pool::{BufferPoolManager}, error::FerroError, storage::{heap_page::Page, page_directory::PageDirectory, tuple::Tuple}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}};
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
@@ -97,42 +97,15 @@ impl HeapFileManager {
     }
 
     // iterate all dir entries, fetch page, collect tuples
-    pub fn scan(&self) -> Result<Vec<Tuple>, FerroError> {
-        let mut dir_page_id = self.first_directory_page_id;
-        let mut tuples: Vec<Tuple> = Vec::new();
-
-        loop {
-            let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
-            let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
-            let dir = PageDirectory::deserialize(frame.data);
-            drop(frame);
-
-            self.buffer_pool_manager.unpin_page(dir_page_id, false);
-
-            for entry in &dir.entries {
-                let data_frame_i = self.buffer_pool_manager.fetch_page(entry.page_id)?;
-                let data_frame = self.buffer_pool_manager.frames[data_frame_i].read().unwrap();
-                let page = Page::deserialize(data_frame.data)?;
-                drop(data_frame);
-
-                for slot_num in 0..page.slot_arr.len() {
-                    match page.read(slot_num) {
-                        Ok(tuple) => tuples.push(tuple),
-                        Err(FerroError::SlotDeleted) => continue,
-                        Err(e) => {
-                            self.buffer_pool_manager.unpin_page(entry.page_id, false);
-                            return Err(e)
-                        }
-                    }
-                }
-                self.buffer_pool_manager.unpin_page(entry.page_id, false);
-            }
-            if dir.next_page_directory == 0 {
-                break;
-            }
-            dir_page_id = dir.next_page_directory;
+    pub fn scan(&self) -> HeapScanner {
+        HeapScanner{
+            buffer_pool: self.buffer_pool_manager.clone(),
+            dir_page_id: self.first_directory_page_id,
+            data_page_ids: Vec::new(),
+            data_idx: 0,
+            current_page: None,
+            slot_idx: 0,
         }
-        Ok(tuples)
     }
 
     // fetches page, mark slot dead, unpin
@@ -343,8 +316,8 @@ mod tests {
             let tuple = Tuple::serialize(&values, &schema).unwrap();
             hfm.insert(tuple).unwrap();
         }
-        let tuples = hfm.scan().unwrap();
-        assert_eq!(tuples.len(), 10);
+        let tuples: Result<Vec<_>, _> = hfm.scan().collect();
+        assert_eq!(tuples.unwrap().len(), 10);
     }
 
     #[test]
@@ -359,8 +332,8 @@ mod tests {
             hfm.insert(tuple).unwrap();
         }
         
-        let tuples = hfm.scan().unwrap();
-        assert_eq!(tuples.len(), 100);
+        let tuples: Result<Vec<_>, _> = hfm.scan().collect();
+        assert_eq!(tuples.unwrap().len(), 100);
     }
 
     #[test]
@@ -377,8 +350,8 @@ mod tests {
         for i in (0..10).step_by(2) {
             hfm.delete(rids.remove(i / 2)).unwrap(); // adjust index since we're removing
         }
-        let tuples = hfm.scan().unwrap();
-        assert_eq!(tuples.len(), 5);
+        let tuples: Result<Vec<_>, _> = hfm.scan().collect();
+        assert_eq!(tuples.unwrap().len(), 5);
     }
 
 }
