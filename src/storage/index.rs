@@ -1,8 +1,9 @@
 use std::{marker::PhantomData, sync::{Arc, atomic::AtomicU32}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage, BTreeSerialize}, range_scan::RangeScanner}};
 use crate::storage::index_page::BPlusTreePage;
 use std::sync::atomic::Ordering;
+use std::ops::Bound;
 
 pub struct BPlusTreeManager<K, V> {
     pub root_page_id: AtomicU32,
@@ -115,28 +116,18 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     // uses sibling pointers to traverse leaves and does range scan from start -> end (inclusive)
     // should later return an iterator to load results lazily cuz memory could overflow
-    pub fn range_scan(&self, start: &K, end: &K) -> Result<Vec<(K, V)>, FerroError> {
-        let mut keys = Vec::new();
-        let (mut leaf_page_id, _) = self.find_leaf(start.clone())?;
-        loop {
-            let frame_i = self.buffer_pool.fetch_page(leaf_page_id)?;
-            let frame = self.buffer_pool.frames[frame_i].read().unwrap();
-            let curr_leaf_page = BPlusTreeLeafPage::<K,V>::deserialize(frame.data)?;
-            drop(frame);
-            self.buffer_pool.unpin_page(leaf_page_id, false);
-            for i in 0..curr_leaf_page.key_arr.len() {
-                if &curr_leaf_page.key_arr[i] > end {
-                    return Ok(keys)
-                }
-                if &curr_leaf_page.key_arr[i] >= start {
-                    keys.push((curr_leaf_page.key_arr[i].clone(), curr_leaf_page.vals[i].clone()));
-                }
-            }
-            match curr_leaf_page.next {
-                Some(next_id) => leaf_page_id = next_id,
-                None => return Ok(keys)
-            }
-        }
+    pub fn range_scan(&self, lower: Bound<K>, upper: Bound<K>) -> Result<RangeScanner<K, V>, FerroError> {
+        let leaf = match &lower {
+            Bound::Included(k) | Bound::Excluded(k) => self.read_leaf(self.find_leaf(k.clone())?.0)?,
+            Bound::Unbounded => self.leftmost_leaf()?,
+        };
+
+        let idx = match &lower {
+            Bound::Included(k) => leaf.binary_search(k), //first >= k
+            Bound::Excluded(k) => leaf.upper_bound(k), //first > k
+            Bound::Unbounded => 0
+        };
+        Ok(RangeScanner {buffer_pool: self.buffer_pool.clone(), leaf: Some(leaf), idx, upper})
     }
 
     // HELPERS
@@ -250,6 +241,23 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
 
     pub fn free_all(&self) -> Result<(), FerroError> {
         self.free_subtree(self.root_page_id.load(Ordering::Relaxed))
+    }
+
+    pub fn read_leaf(&self, page_id: u32) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
+        match self.read_node(page_id)? {
+            BPlusTreePage::Leaf(leaf) => Ok(leaf),
+            _ => Err(FerroError::Io(String::from("expected leaf"))),
+        }
+    }
+
+    pub fn leftmost_leaf(&self) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
+        let mut page_id = self.root_page_id.load(Ordering::Relaxed);
+        loop {
+            match self.read_node(page_id)? {
+                BPlusTreePage::Internal(internal) => page_id = internal.child_ptrs[0],
+                BPlusTreePage::Leaf(leaf) => return Ok(leaf),
+            }
+        }
     }
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
     // and drops to one child, make that child the new root
@@ -405,25 +413,34 @@ mod tests {
         tree.insert(Value::Integer(20), Value::Integer(2)).unwrap();
         tree.insert(Value::Integer(40), Value::Integer(4)).unwrap();
 
-        let result = tree.range_scan(&Value::Integer(20), &Value::Integer(40)).unwrap();
+        let result: Vec<(Value, Value)> = tree
+            .range_scan(Bound::Included(Value::Integer(20)), Bound::Included(Value::Integer(40)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(result.len(), 3);
-        
         assert_eq!(result[0], (Value::Integer(20), Value::Integer(2)));
         assert_eq!(result[1], (Value::Integer(30), Value::Integer(3)));
         assert_eq!(result[2], (Value::Integer(40), Value::Integer(4)));
     }
 
     #[test]
-    fn test_range_scan_many_pages(){ 
+    fn test_range_scan_many_pages() {
         let tree = setup();
         for i in 0..1000 {
-            tree.insert(Value::Integer(i), Value::Integer(i*10)).unwrap();
+            tree.insert(Value::Integer(i), Value::Integer(i * 10)).unwrap();
         }
 
-        let result = tree.range_scan(&Value::Integer(450), &Value::Integer(550)).unwrap();
-        for (i, (k,v)) in result.iter().enumerate() {
-            let expected_val = 450+ i as i32;
+        let result: Vec<(Value, Value)> = tree
+            .range_scan(Bound::Included(Value::Integer(450)), Bound::Included(Value::Integer(550)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(result.len(), 101);
+        for (i, (k, v)) in result.iter().enumerate() {
+            let expected_val = 450 + i as i32;
             assert_eq!(*k, Value::Integer(expected_val));
             assert_eq!(*v, Value::Integer(expected_val * 10));
         }
