@@ -243,6 +243,25 @@ impl HeapFileManager {
             }
         }
     }
+
+    pub fn free_all(&self) -> Result<(), FerroError> {
+        let mut dir_page_id = self.first_directory_page_id;
+        while dir_page_id != 0 {
+            let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
+            let dir = {
+                let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
+                PageDirectory::deserialize(frame.data)
+            };
+            self.buffer_pool_manager.unpin_page(dir_page_id, false);
+            for entry in &dir.entries {
+                self.buffer_pool_manager.free_page(entry.page_id)?;
+            }
+            let next = dir.next_page_directory;
+            self.buffer_pool_manager.free_page(dir_page_id)?;
+            dir_page_id = next;
+        }
+        Ok(())
+    }
 }
 
 impl RecordId {

@@ -90,11 +90,17 @@ impl Catalog {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
-        if self.tables.remove(name).is_none() {
-            return Err(FerroError::KeyNotFound);
+        let (heap_dir, primary_root, sec_roots) = {
+            let entry = self.tables.get(name).ok_or(FerroError::KeyNotFound)?;
+            (entry.first_directory_page_id, entry.primary_index_root, entry.indexes.iter().map(|i| i.root_page_id).collect::<Vec<_>>())
+        };
+        HeapFileManager::open(heap_dir, self.buffer_pool.clone()).free_all()?;
+        BPlusTreeManager::<Value, RecordId>::open(primary_root, self.buffer_pool.clone()).free_all()?;
+        for root in sec_roots {
+            BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).free_all()?;
         }
+        self.tables.remove(name);
         self.persist()?;
-        // TODO: page reclamation
         Ok(())
     }
 
