@@ -13,7 +13,7 @@ Under active development.
 - B+ tree indexing
 - Recursive descent SQL parser
 - Cost-based query optimizer
-- MVCC concurrency controll with snapshot isolation
+- MVCC concurrency control with snapshot isolation
 - Write-ahead logging with crash recovery
 - Postgres wire protocol compatibility
 
