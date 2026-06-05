@@ -109,6 +109,7 @@ impl BufferPoolManager {
         let page_id = self.disk_manager.allocate()?;
         self.disk_manager.write(page_id, &[0u8; PAGE_SIZE])?;
         self.fetch_page(page_id)?;
+        self.unpin_page(page_id, false);
         Ok(page_id)
     }
 
