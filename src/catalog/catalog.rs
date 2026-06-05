@@ -203,3 +203,119 @@ impl Catalog {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempfile;
+    use std::sync::Arc;
+    use crate::storage::disk_manager::DiskManager;
+    use crate::catalog::column::Column;
+    use crate::catalog::column::DataType;
+
+    fn setup_catalog() -> Catalog {
+        let file = tempfile().expect("Failed to create temporary test file");
+        let disk_manager = Arc::new(DiskManager::new(file).expect("Failed to create DiskManager"));
+        let bp = Arc::new(BufferPoolManager::new(disk_manager));
+        Catalog::create(bp).unwrap()
+    }
+    fn create_test_schema() -> Schema {
+        Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Integer, // Adjust to match your exact DataType enum variant
+                nullable: false,
+            },
+            Column {
+                name: "age".to_string(),
+                data_type: DataType::Integer, // Adjust to match your exact DataType enum variant
+                nullable: false,
+            },
+        ])
+    }
+
+    #[test]
+    fn test_catalog_create_open() {
+        let mut catalog = setup_catalog();
+        assert_eq!(catalog.first_catalog_page_id, 1);
+        
+        catalog.tables.insert("test_table".to_string(), TableEntry { name: "test_table".to_string(), first_directory_page_id: 2, primary_index_root: 3, schema: create_test_schema(), indexes: vec![] });
+        catalog.persist().unwrap();
+        let opened_catalog = Catalog::open(catalog.buffer_pool, catalog.first_catalog_page_id).unwrap();
+        assert_eq!(opened_catalog.tables.len(), 1);
+        assert!(opened_catalog.tables.get("test_table").is_some());
+    }
+
+    #[test]
+    fn test_get_table() {
+        let mut catalog = setup_catalog();
+        let schema = create_test_schema();
+        catalog.create_table("users".to_string(), schema).unwrap();
+
+        let table = catalog.get_table("users").expect("");
+        assert_eq!(table.name, "users");
+        assert!(table.first_directory_page_id > 0);
+        assert!(table.primary_index_root > 0);
+        assert!(table.indexes.is_empty());
+        let duplicate_res = catalog.create_table("users".to_string(), create_test_schema());
+        assert!(matches!(duplicate_res, Err(FerroError::KeyNotFound)));
+    }
+
+    #[test]
+    fn test_drop_table(){
+        let mut catalog = setup_catalog();
+        catalog.create_table("users".to_string(), create_test_schema()).unwrap();
+        catalog.drop_table("users").unwrap();
+        assert!(catalog.get_table("users").is_none());
+    }
+
+    #[test]
+    fn test_create_index() {
+        let mut catalog = setup_catalog();
+        catalog.create_table("users".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("users", "age").expect("");
+        let table = catalog.get_table("users").unwrap();
+        assert_eq!(table.indexes.len(), 1);
+        assert_eq!(table.indexes[0].column_name, "age");
+        assert!(table.indexes[0].root_page_id > 0);
+
+        let dup_res = catalog.create_index("users", "age");
+        assert!(matches!(dup_res, Err(FerroError::IndexAlreadyExists)));
+    }
+
+    #[test]
+    fn test_update_roots() {
+        let mut catalog = setup_catalog();
+        catalog.create_table("users".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("users", "age").expect("");
+        catalog.update_primary_root("users", 999).unwrap();
+        assert_eq!(catalog.get_table("users").unwrap().primary_index_root, 999);
+
+        catalog.update_index_root("users", "age", 888).unwrap();
+        let index_info = catalog.get_table("users").unwrap().indexes.iter().find(|i| i.column_name == "age").unwrap();
+        assert_eq!(index_info.root_page_id, 888);
+    }
+
+    #[test]
+    fn test_persist_orphan_removal() {
+        let mut catalog = setup_catalog();
+        
+        for i in 0..200 {
+            catalog.tables.insert(
+                format!("table_{}", i),
+                TableEntry { name: format!("table_{}", i), first_directory_page_id: i, primary_index_root: i + 1, schema: create_test_schema(), indexes: vec![] }
+            );
+        }
+        catalog.persist().unwrap();
+        let mut loaded_catalog = Catalog::open(catalog.buffer_pool.clone(), 1).unwrap();
+        assert_eq!(loaded_catalog.tables.len(), 200);
+
+        for i in 10..200 {
+            loaded_catalog.tables.remove(&format!("table_{}", i));
+        }
+        loaded_catalog.persist().unwrap();
+        let final_catalog = Catalog::open(catalog.buffer_pool.clone(), 1).unwrap();
+        assert_eq!(final_catalog.tables.len(), 10);
+    }
+}
+
