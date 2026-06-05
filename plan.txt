@@ -134,4 +134,21 @@ CREATE INDEX index_name ON table (col)
 JOIN, subqueries, aggregates, GROUP BY, ORDER BY, yet
 
 Query execution engine:
-- Iterator (Volcano) model
+- iterator (volcano) model (most space efficient, simple)
+- everything wrapped in a driver loop (runs the whole tree)
+- tuple stream is basically "open, next, close" (Exceutor trait)
+- pull based (much simpler than push)
+- can seqscan + filter & index scan (optimizer chooses which later)
+- sequential scan uses heapscanner
+- have to construct plan on the statement tree before doing operations
+- also have to fetch heap, schema, and indexes using get_table(name)
+- for secondary indexes, lookups take two jumps
+- insert gets tuples from VALUES expressions -> Vec<Value> -> serialize tuple -> heap insert (with checking said below)
+- expression evaluation used for filter, projections output columns, values for insert/update
+- modification operators have to maintain indexes (and update secondary indexes), and check constaints
+- to solve halloween problem, keep track of modified record ids for each query
+    future optimizations:
+    - compile to optimize it (like JIT in postgres)
+    - multi index scans to find overlap in AND statements 
+    - zone map: pre compute aggregations for tuples. then db decides if it wants to access page, so it can skip irrelevant tuples
+    - zone map will store values like: min, max, avg, sum, count, num nulls, etc ...
