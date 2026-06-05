@@ -167,6 +167,28 @@ impl BufferPoolManager {
         self.disk_manager.deallocate(page_id)?;
         Ok(())
     }
+
+    pub fn free_page(&self, page_id: u32) -> Result<(), FerroError> {
+        let mut pt = self.page_table.write().unwrap();
+        if let Some(&frame_i) = pt.get(&page_id) {
+            if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                return Err(FerroError::PagePinned)
+            }
+            pt.remove(&page_id);
+            drop(pt);
+            let mut frame = self.frames[frame_i].write().unwrap();
+            frame.page_id = None;
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+            drop(frame);
+            self.arc_cache.lock().unwrap().remove(page_id)?;
+        } else {
+            drop(pt);
+        }
+        self.disk_manager.deallocate(page_id)?;
+        Ok(())
+    }
 }
 
 impl Frame {

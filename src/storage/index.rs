@@ -28,6 +28,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(Self {root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData})
     }
 
+    pub fn open(root_page_id: u32, buffer_pool: Arc<BufferPoolManager>) -> Self{
+        Self { root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData }
+    }
     // calls find_leaf, read it, call leaf.get and return value or None
     pub fn search(&self, key: &K) -> Result<Option<V>, FerroError> {
         let (page_id, _) = self.find_leaf(key.clone())?;
@@ -236,6 +239,18 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         Ok(())
     }
 
+    pub fn free_subtree(&self, page_id: u32) -> Result<(), FerroError> {
+        if let BPlusTreePage::Internal(internal) = self.read_node(page_id)? {
+            for child in &internal.child_ptrs {
+                self.free_subtree(*child)?;
+            }
+        }
+        self.buffer_pool.free_page(page_id)
+    }
+
+    pub fn free_all(&self) -> Result<(), FerroError> {
+        self.free_subtree(self.root_page_id.load(Ordering::Relaxed))
+    }
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
     // and drops to one child, make that child the new root
     #[allow(warnings)]
