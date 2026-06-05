@@ -400,6 +400,13 @@ impl<K: BTreeSerialize + Ord + Clone, V: Clone + BTreeSerialize + Ord> BPlusTree
         // ALSO NEED TO UPDATE OLD SIBLING POINTER POINTING TO new_node INSTEAD OF SELF
         (mid_key, new_node)
     }
+
+    pub fn upper_bound(&self, key: &K) -> usize {
+        match self.key_arr.binary_search(key) {
+            Ok(pos) => pos + 1,  // skip the equal key (keys are unique)
+            Err(pos) => pos,
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

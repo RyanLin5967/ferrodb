@@ -6,3 +6,4 @@ pub mod page_directory;
 pub mod index;
 pub mod index_page;
 pub mod heap_scanner;
+pub mod range_scan;
