@@ -5,3 +5,4 @@ pub mod heap_file_manager;
 pub mod page_directory;
 pub mod index;
 pub mod index_page;
+pub mod heap_scanner;
