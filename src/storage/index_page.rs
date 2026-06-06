@@ -165,7 +165,7 @@ impl BTreeSerialize for Value { // primary
             }
             Value::Varchar(s) => { // tag 1, etc...
                 buf.push(1);
-                buf.push(s.len() as u8);
+                buf.extend_from_slice(&(s.as_bytes().len() as u16).to_be_bytes());
                 buf.extend_from_slice(s.as_bytes());
             }
             Value::Float(f) => {
@@ -190,9 +190,9 @@ impl BTreeSerialize for Value { // primary
                 Ok((Value::Integer(i), 5))
             }
             1 => {
-                let len = bytes[1] as usize;
-                let s = String::from_utf8(bytes[2..2+len].try_into().unwrap()).unwrap();
-                Ok((Value::Varchar(s), 2 + len))
+                let len = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
+                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Parse("bad utf8".into()))?;
+                Ok((Value::Varchar(s), 3 + len))
             }
             2 => {
                 let f = f64::from_be_bytes(bytes[1..9].try_into().unwrap());
