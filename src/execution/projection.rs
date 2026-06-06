@@ -17,7 +17,7 @@ impl Executor for Projection {
             Ok((r, v)) => (r, v),
             Err(e) => return Some(Err(e))
         };
-        let mut eval_values = Vec::new();
+        let mut eval_values = Vec::with_capacity(self.columns.len());
         for expr in &self.columns {
             eval_values.push( match evaluate(expr, &values, &self.schema) {
                 Ok(v) => v,
