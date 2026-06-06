@@ -1,12 +1,12 @@
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::parser::parser::Expr;
-use crate::{error::FerroError, storage::tuple::Tuple};
+use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
 use crate::parser::scanner::TokenType;
 
 pub trait Executor {
-    fn next(&mut self) -> Option<Result<(RecordId, Tuple), FerroError>>;
+    fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>>;
 }
 
 pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {

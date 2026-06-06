@@ -11,18 +11,14 @@ pub struct Filter {
 
 // operator that applies predicate. gets rows from child, emits ones where predicate is true
 impl Executor for Filter {
-    fn next(&mut self) -> Option<Result<(RecordId, Tuple), FerroError>> {
+    fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>> {
         loop {
-            let (rid, tuple) = match self.child.next()? {
+            let (rid, values) = match self.child.next()? {
                 Ok((r, t)) => (r, t),
                 Err(e) => return Some(Err(e))
             };
-            let values = match tuple.deserialize(&self.schema) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e))
-            };
             match evaluate(&self.predicate, &values, &self.schema) {
-                Ok(Value::Boolean(true)) => return Some(Ok((rid, tuple))),
+                Ok(Value::Boolean(true)) => return Some(Ok((rid, values))),
                 Ok(_) => continue,
                 Err(e) => return Some(Err(e))
             }
