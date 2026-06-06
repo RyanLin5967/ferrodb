@@ -23,6 +23,17 @@ impl Insert {
         for expr in &self.values {
             vals.push(evaluate(expr, &[], &self.schema)?);
         }
+        if vals.len() != self.schema.columns.len() {
+            return Err(FerroError::Contraint("value count != column count".into()))
+        }
+        for (i, col) in self.schema.columns.iter().enumerate() {
+            if !col.nullable && matches!(vals[i], Value::Null) {
+                return Err(FerroError::Contraint(format!("column {} can't be null", col.name)))
+            }
+        }
+        if self.primary_index.search(&vals[0])?.is_some() {
+            return Err(FerroError::Contraint("duplicate primary key".into()))
+        }
         let tuple = Tuple::serialize(&vals, &self.schema)?;
         let rid = self.heap.insert(tuple)?;
         self.primary_index.insert(vals[0].clone(), rid)?;
