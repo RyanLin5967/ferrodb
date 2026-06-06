@@ -138,3 +138,107 @@ fn as_bool_opt(v: &Value) -> Result<Option<bool>, FerroError> {
         _ => Err(FerroError::Parse("expected bool".into()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::column::Column;
+    use crate::catalog::column::DataType;
+
+    fn mock_schema() -> Schema {
+        Schema{ columns: vec![
+            Column::new("id".into(), DataType::Integer, false),
+            Column::new("name".into(), DataType::Varchar(255), false),
+            Column::new("is_active".into(), DataType::Boolean, false),
+        ]}
+    }
+
+    fn mock_row() -> Vec<Value>{
+        vec![
+            Value::Integer(1),
+            Value::Varchar("Alice".into()),
+            Value::Boolean(true),
+        ]
+    }
+
+    #[test]
+    fn test_literal() {
+        let schema = mock_schema();
+        let row = mock_row();
+
+        let cases = vec![
+            (TokenType::TypeInt, "42", Value::Integer(42)),
+            (TokenType::TypeFloat, "3.14", Value::Float(3.14)),
+            (TokenType::TypeBoolean, "true", Value::Boolean(true)),
+            (TokenType::TypeBoolean, "FALSE", Value::Boolean(false)),
+            (TokenType::TypeNull, "null", Value::Null),
+            (TokenType::TypeVarchar, "hello", Value::Varchar("hello".into())),
+        ];
+
+        for (t_type, val_str, expected) in cases {
+            let expr = Expr::Literal { value_type: t_type, value: val_str.into() };
+            assert_eq!(evaluate(&expr, &row, &schema).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        let int4 = Value::Integer(4);
+        let int2 = Value::Integer(2);
+        let float2 = Value::Float(2.0);
+        let null = Value::Null;
+
+        assert_eq!(arithmetic(&int4, &int2, &TokenType::Plus).unwrap(), Value::Integer(6));
+        assert_eq!(arithmetic(&int4, &int2, &TokenType::Minus).unwrap(), Value::Integer(2));
+        assert_eq!(arithmetic(&int4, &int2, &TokenType::Star).unwrap(), Value::Integer(8));
+        assert_eq!(arithmetic(&int4, &int2, &TokenType::Slash).unwrap(), Value::Integer(2));    
+        assert_eq!(arithmetic(&int4, &float2, &TokenType::Plus).unwrap(), Value::Float(6.0));
+        assert_eq!(arithmetic(&float2, &int4, &TokenType::Star).unwrap(), Value::Float(8.0));
+        assert_eq!(arithmetic(&int4, &null, &TokenType::Plus).unwrap(), Value::Null);
+        assert!(arithmetic(&int4, &Value::Integer(0), &TokenType::Slash).is_err());
+    }
+
+    #[test]
+    fn test_comparison() {
+        let int5 = Value::Integer(5);
+        let int10 = Value::Integer(10);
+
+        assert_eq!(compare(&int5, &int10, &TokenType::Less).unwrap(), Value::Boolean(true));
+        assert_eq!(compare(&int5, &int5, &TokenType::Equal).unwrap(), Value::Boolean(true));
+        assert_eq!(compare(&int5, &int10, &TokenType::BangEqual).unwrap(), Value::Boolean(true));
+        assert_eq!(compare(&int5, &Value::Null, &TokenType::Greater).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_logical() {
+        let t = Value::Boolean(true);
+        let f = Value::Boolean(false);
+        let n = Value::Null;
+
+        assert_eq!(logical(&t, &t, &TokenType::And).unwrap(), Value::Boolean(true));
+        assert_eq!(logical(&t, &f, &TokenType::And).unwrap(), Value::Boolean(false));
+        assert_eq!(logical(&t, &n, &TokenType::And).unwrap(), Value::Null);
+        assert_eq!(logical(&f, &n, &TokenType::And).unwrap(), Value::Boolean(false));
+        assert_eq!(logical(&t, &f, &TokenType::Or).unwrap(), Value::Boolean(true));
+        assert_eq!(logical(&f, &f, &TokenType::Or).unwrap(), Value::Boolean(false));
+        assert_eq!(logical(&t, &n, &TokenType::Or).unwrap(), Value::Boolean(true));
+        assert_eq!(logical(&f, &n, &TokenType::Or).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_unary() {
+        let schema = mock_schema();
+        let row = mock_row();
+
+        let e_minus = Expr::UnaryOp {
+            operator: TokenType::Minus,
+            right: Box::new(Expr::Literal { value_type: TokenType::TypeInt, value: "5".into() })
+        };
+        assert_eq!(evaluate(&e_minus, &row, &schema).unwrap(), Value::Integer(-5));
+        let e_not = Expr::UnaryOp {
+            operator: TokenType::Not,
+            right: Box::new(Expr::Literal { value_type: TokenType::TypeBoolean, value: "true".into() })
+        };
+        assert_eq!(evaluate(&e_not, &row, &schema).unwrap(), Value::Boolean(false));
+    }
+}
