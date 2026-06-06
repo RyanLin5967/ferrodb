@@ -49,7 +49,12 @@ impl Tuple {
                 // use pascal string, doesn't need padding
                 Value::Varchar(c) => {
                     let str_bytes = c.as_bytes();
-                    bytes.push(str_bytes.len() as u8);
+                    if let DataType::Varchar(max) = &schema.columns[i].data_type {
+                        if str_bytes.len() > *max as usize {
+                            return Err(FerroError::Parse(format!("varchar exceeds declared len: {}", max)))
+                        }
+                    }
+                    bytes.extend_from_slice(&(str_bytes.len() as u16).to_be_bytes());
                     bytes.extend_from_slice(str_bytes);
                 },
                 Value::Null => {
@@ -71,7 +76,7 @@ impl Tuple {
                             bytes.extend_from_slice(&[0u8; 4]);
                         },
                         DataType::Varchar(_) => {
-                            bytes.resize(bytes.len() + 1, 0);
+                            bytes.extend_from_slice(&[0u8; 2]);
                         },
                     }
                 }
@@ -130,9 +135,9 @@ impl Tuple {
                     offset += 4;
                 },
                 DataType::Varchar(_) => {
-                    let len_bytes = &self.data[offset..offset + 1];
-                    let len = u8::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
-                    offset += 1;
+                    let len_bytes = &self.data[offset..offset + 2];
+                    let len = u16::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+                    offset += 2;
                     if (bitmap[i/8] & (1 << i % 8)) != 0 {
                         values.push(Value::Null);
                         offset += len;
