@@ -2,7 +2,11 @@ use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::error::FerroError;
+
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 pub const PAGE_SIZE: usize = 4096;
 const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
@@ -26,7 +30,7 @@ impl DiskManager{
             first_page_bitmap[4] = 1;
             let mut total_written = 0;
             while total_written < PAGE_SIZE{
-                let written = match file.seek_write(&first_page_bitmap[total_written..], total_written as u64) {
+                let written = match pwrite(&file, &first_page_bitmap[total_written..], total_written as u64) {
                     Ok(w) => w,
                     Err(e) => return Err(FerroError::Io(e.to_string()))
                 };
@@ -53,7 +57,7 @@ impl DiskManager{
         let offset:u64 = page_id as u64* PAGE_SIZE as u64;
         let mut total_wrote = 0;
         while total_wrote < PAGE_SIZE {
-            let written = match self.file.seek_write(&data[total_wrote..], offset + total_wrote as u64) {
+            let written = match pwrite(&self.file, &data[total_wrote..] , offset + total_wrote as u64){
                 Ok(w) => w,
                 Err(e) => return Err(FerroError::Io(e.to_string()))
             };
@@ -71,7 +75,7 @@ impl DiskManager{
         let offset = page_id as u64 * PAGE_SIZE as u64;
         let mut total_read = 0;
         while total_read < PAGE_SIZE {
-            let size = match self.file.seek_read(&mut buffer[total_read..], offset + total_read as u64) {
+            let size = match pread(&self.file, &mut buffer[total_read..], offset + total_read as u64) {
                 Ok(s) => s,
                 Err(e) => return Err(FerroError::Io(e.to_string()))
             };
@@ -161,6 +165,19 @@ impl DiskManager{
     }
 }
 
+pub fn pwrite(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    { file.seek_write(buf, offset)}
+    #[cfg(unix)]
+    { file.write_at(buf, offset)}
+}
+
+pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    { file.seek_read(buf, offset)}
+    #[cfg(unix)]
+    { file.read_at(buf, offset)}
+}
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
