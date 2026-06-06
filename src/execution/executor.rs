@@ -9,7 +9,7 @@ pub trait Executor {
     fn next(&mut self) -> Option<Result<(RecordId, Tuple), FerroError>>;
 }
 
-fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {
+pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {
     return match expr {
         Expr::Literal { value_type, value } => match value_type {
             TokenType::TypeBoolean => match value.to_lowercase().as_str(){
