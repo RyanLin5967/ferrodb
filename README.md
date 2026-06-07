@@ -24,7 +24,7 @@ Under active development.
 - [x] Buffer pool manager
 - [x] B+ tree indexing
 - [x] SQL parser
-- [ ] Query execution engine
+- [x] Query execution engine
 - [ ] Cost-based query optimizer
 - [ ] Write-ahead logging with crash recovery
 - [ ] MVCC 
