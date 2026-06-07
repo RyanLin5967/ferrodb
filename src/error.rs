@@ -12,7 +12,8 @@ pub enum FerroError {
     PagePinned,
     SqlParseError(String),
     IndexAlreadyExists,
-    Contraint(String)
+    Contraint(String),
+    OnlyDML,
 }
 
 impl Display for FerroError {
@@ -27,7 +28,8 @@ impl Display for FerroError {
             FerroError::PagePinned => write!(f, "page is pinned"),
             FerroError::SqlParseError(s) => write!(f, "sql parsing error: {}", s),
             FerroError::IndexAlreadyExists => write!(f, "index already exists"),
-            FerroError::Contraint(s) => write!(f, "contraint error: {}", s)
+            FerroError::Contraint(s) => write!(f, "contraint error: {}", s),
+            FerroError::OnlyDML => write!(f, "only supports dml"),
         }
     }
 }
