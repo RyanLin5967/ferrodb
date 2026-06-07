@@ -1,5 +1,6 @@
+use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
-use crate::execution::executor::evaluate;
+use crate::execution::executor::{Modify, evaluate, sync_roots};
 use crate::storage::tuple::Tuple;
 use crate::{parser::parser::Expr};
 use crate::storage::heap_file_manager::HeapFileManager;
@@ -10,6 +11,7 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::IndexHandle;
 
 pub struct Insert {
+    pub table: String,
     pub values: Vec<Expr>,
     pub heap: HeapFileManager,
     pub schema: Schema,
@@ -17,8 +19,8 @@ pub struct Insert {
     pub secondary_indexes: Vec<IndexHandle>,
 }
 
-impl Insert {
-    pub fn execute(&mut self) -> Result<usize, FerroError>{
+impl Modify for Insert {
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
         let mut vals = Vec::with_capacity(self.values.len());
         for expr in &self.values {
             vals.push(evaluate(expr, &[], &self.schema)?);
@@ -40,6 +42,7 @@ impl Insert {
         for sec_idx in &self.secondary_indexes {
             sec_idx.tree.insert((vals[sec_idx.col_index].clone(), vals[0].clone()), ())?;
         }
+        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
         Ok(1)
     }
 }

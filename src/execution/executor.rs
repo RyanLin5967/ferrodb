@@ -1,6 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use crate::buffer::buffer_pool::BufferPoolManager;
+use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
-use crate::parser::parser::Expr;
+use crate::execution::index_handle::IndexHandle;
+use crate::parser::parser::{Expr, Stmt};
+use crate::planner::plan::Outcome;
+use crate::storage::index::BPlusTreeManager;
 use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
 use crate::parser::scanner::TokenType;
@@ -9,6 +17,31 @@ pub trait Executor {
     fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>>;
 }
 
+pub trait Modify {
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>;
+}
+
+pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
+
+    todo!()
+}
+
+pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value, RecordId>, secondaries: &[IndexHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
+    let cur_primary = primary.root_page_id.load(Ordering::Relaxed);
+    let stored_primary = catalog.get_table(table).ok_or(FerroError::KeyNotFound)?.primary_index_root;
+    if cur_primary != stored_primary {
+        catalog.update_primary_root(table, cur_primary)?;
+    }
+    for handle in secondaries {
+        let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
+        let col_name = schema.columns[handle.col_index].name.clone();
+        let stored = catalog.get_table(table).and_then(|e| e.indexes.iter().find(|i| i.column_name == col_name).map(|i| i.root_page_id));
+        if stored != Some(cur) {
+            catalog.update_index_root(table, &col_name, cur)?;
+        }
+    }
+    Ok(())
+}
 pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {
     return match expr {
         Expr::Literal { value_type, value } => match value_type {

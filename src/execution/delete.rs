@@ -1,3 +1,5 @@
+use crate::catalog::catalog::Catalog;
+use crate::execution::executor::{Modify, sync_roots};
 use crate::{error::FerroError, execution::executor::Executor, storage::heap_file_manager::HeapFileManager};
 use crate::catalog::schema::Schema;
 use crate::storage::index::BPlusTreeManager;
@@ -6,6 +8,7 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::IndexHandle;
 
 pub struct Delete {
+    pub table: String,
     pub child: Box<dyn Executor>,
     pub heap: HeapFileManager,
     pub schema: Schema,
@@ -13,8 +16,8 @@ pub struct Delete {
     pub secondary_indexes: Vec<IndexHandle>,
 }
 
-impl Delete {
-    pub fn execute(&mut self) -> Result<usize, FerroError> {
+impl Modify for Delete {
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
         let mut res = Vec::new();
         let mut count = 0;
         loop {
@@ -33,7 +36,7 @@ impl Delete {
             }
             count += 1;
         }
-        
+        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
         Ok(count)
     }
 }
