@@ -4,3 +4,4 @@ pub mod storage;
 pub mod buffer;
 pub mod parser;
 pub mod execution;
+pub mod planner;
