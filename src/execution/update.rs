@@ -1,5 +1,6 @@
+use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
-use crate::execution::executor::evaluate;
+use crate::execution::executor::{Modify, evaluate, sync_roots};
 use crate::storage::tuple::Tuple;
 use crate::{catalog::schema::Schema, execution::executor::Executor, parser::parser::Expr, storage::heap_file_manager::HeapFileManager};
 use crate::storage::index::BPlusTreeManager;
@@ -8,6 +9,7 @@ use crate::catalog::column::Value;
 use crate::execution::index_handle::IndexHandle;
 
 pub struct Update {
+    pub table: String,
     pub child: Box<dyn Executor>,
     pub schema: Schema,
     pub assignments: Vec<(usize, Expr)>, // col idx -> new value expr
@@ -16,8 +18,8 @@ pub struct Update {
     pub secondary_indexes: Vec<IndexHandle>,
 }
 
-impl Update {
-    pub fn execute(&mut self) -> Result<usize, FerroError>{
+impl Modify for Update {
+    fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
         if self.assignments.iter().any(|(col, _)| *col == 0) {
             return Err(FerroError::Parse("can't update primary key".into()));
         }
@@ -60,6 +62,7 @@ impl Update {
             }
             count += 1;
         }
+        sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
         Ok(count)
     }
 }
