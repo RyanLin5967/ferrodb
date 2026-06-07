@@ -7,12 +7,6 @@ pub enum Plan {
     Write(Box<dyn Modify>),
 }
 
-pub enum Outcome {
-    Rows(Vec<Vec<Value>>),
-    Affected(usize),
-    Ok,
-}
-
 // for dml
 pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Plan, FerroError> {
     

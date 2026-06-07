@@ -7,7 +7,7 @@ use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
 use crate::parser::parser::{Expr, Stmt};
-use crate::planner::plan::Outcome;
+use crate::planner::plan::{Plan, plan};
 use crate::storage::index::BPlusTreeManager;
 use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
@@ -21,9 +21,41 @@ pub trait Modify {
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>;
 }
 
-pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
+pub enum Outcome {
+    Rows(Vec<Vec<Value>>),
+    Affected(usize),
+    Ok,
+}
 
-    todo!()
+pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
+    match stmt {
+        Stmt::CreateIndex { table, column_name , ..} => {
+            catalog.create_index(&table, &column_name)?;
+            return Ok(Outcome::Ok)
+        }
+        Stmt::CreateTable { table, columns } => {
+            catalog.create_table(table, Schema{columns})?;
+            return Ok(Outcome::Ok)
+        }
+        dml => match plan(dml, catalog, bp.clone())? {
+            Plan::Read(mut root) => {
+                let mut res = Vec::new();
+                loop {
+                    let (_, values) = match root.next() {
+                        Some(Ok((r, v))) => (r, v),
+                        Some(Err(e)) => return Err(e),
+                        None =>{break;}
+                    };
+                    res.push(values);
+                }
+                return Ok(Outcome::Rows(res))
+            }
+            Plan::Write(mut op) => {
+                let count = op.execute(catalog)?;
+                return Ok(Outcome::Affected(count))
+            }
+        }
+    }
 }
 
 pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value, RecordId>, secondaries: &[IndexHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
