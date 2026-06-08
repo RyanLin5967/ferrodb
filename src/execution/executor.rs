@@ -234,12 +234,12 @@ mod tests {
         let row = mock_row();
 
         let cases = vec![
-            (TokenType::TypeInt, "42", Value::Integer(42)),
-            (TokenType::TypeFloat, "3.14", Value::Float(3.14)),
-            (TokenType::TypeBoolean, "true", Value::Boolean(true)),
-            (TokenType::TypeBoolean, "FALSE", Value::Boolean(false)),
-            (TokenType::TypeNull, "null", Value::Null),
-            (TokenType::TypeVarchar, "hello", Value::Varchar("hello".into())),
+            (TokenType::Number, "42", Value::Integer(42)),
+            (TokenType::Number, "3.14", Value::Float(3.14)),
+            (TokenType::True, "true", Value::Boolean(true)),
+            (TokenType::False, "FALSE", Value::Boolean(false)),
+            (TokenType::Null, "null", Value::Null),
+            (TokenType::String, "hello", Value::Varchar("hello".into())),
         ];
 
         for (t_type, val_str, expected) in cases {
@@ -299,12 +299,12 @@ mod tests {
 
         let e_minus = Expr::UnaryOp {
             operator: TokenType::Minus,
-            right: Box::new(Expr::Literal { value_type: TokenType::TypeInt, value: "5".into() })
+            right: Box::new(Expr::Literal { value_type: TokenType::Number, value: "5".into() })
         };
         assert_eq!(evaluate(&e_minus, &row, &schema).unwrap(), Value::Integer(-5));
         let e_not = Expr::UnaryOp {
             operator: TokenType::Not,
-            right: Box::new(Expr::Literal { value_type: TokenType::TypeBoolean, value: "true".into() })
+            right: Box::new(Expr::Literal { value_type: TokenType::True, value: "true".into() })
         };
         assert_eq!(evaluate(&e_not, &row, &schema).unwrap(), Value::Boolean(false));
     }
