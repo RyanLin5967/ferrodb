@@ -5,7 +5,6 @@ use crate::catalog::catalog_page::{CatalogPage, IndexInfo, TableEntry};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::storage::index::BPlusTreeManager;
-use crate::storage::index_page::{BPlusTreeInternalPage, BPlusTreeLeafPage};
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use std::sync::atomic::Ordering;

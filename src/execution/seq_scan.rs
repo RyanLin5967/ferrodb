@@ -1,4 +1,4 @@
-use crate::{error::FerroError, execution::executor::Executor, storage::{heap_scanner::HeapScanner, tuple::Tuple}};
+use crate::{error::FerroError, execution::executor::Executor, storage::{heap_scanner::HeapScanner}};
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
