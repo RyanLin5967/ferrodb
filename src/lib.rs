@@ -5,3 +5,4 @@ pub mod buffer;
 pub mod parser;
 pub mod execution;
 pub mod planner;
+pub mod cli;
