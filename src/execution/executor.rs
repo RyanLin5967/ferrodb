@@ -208,9 +208,73 @@ fn as_bool_opt(v: &Value) -> Result<Option<bool>, FerroError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::ops::Bound;
     use super::*;
     use crate::catalog::column::Column;
     use crate::catalog::column::DataType;
+    use crate::parser::scanner::Scanner;
+    use crate::parser::parser::Parser;
+    use crate::storage::disk_manager::DiskManager;
+    use tempfile::tempdir;
+
+    fn parse_one(sql: &str) -> Result<Stmt, FerroError> {
+        let chars: Vec<char> = sql.chars().collect();
+        let tokens = Scanner::new(chars, Vec::new()).scan_tokens()?;
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+        if !parser.errors.is_empty() {
+            return Err(parser.errors.remove(0))
+        }
+        stmts.into_iter().next().ok_or(FerroError::SqlParseError("no statement found".into()))
+    }
+
+    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
+        run(parse_one(sql)?, catalog, bp)
+    }
+
+    fn setup() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("exec.db");
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        (catalog, bp, dir)
+    } 
+
+    fn seed() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
+        let (mut c, bp, dir) = setup();
+        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone()).unwrap();
+        for s in [
+            "INSERT INTO users VALUES (1, 'alice');",
+            "INSERT INTO users VALUES (2, 'bob');",
+            "INSERT INTO users VALUES (3, 'carol');",
+        ] {
+            exec(s, &mut c, bp.clone()).unwrap();
+        }
+        (c, bp, dir)
+    }
+
+    fn rows(out: Outcome) -> Vec<Vec<Value>> {
+        match out {
+            Outcome::Rows(r) => r,
+            _ => panic!("expected rows")
+        }
+    }
+
+    fn affected(out: Outcome) -> usize {
+        match out {
+            Outcome::Affected(a) => a,
+            _ => panic!("expected affected")
+        }
+    }
+
+    fn sorted_ids(rs: &[Vec<Value>]) -> Vec<i32> {
+        let mut v: Vec<i32> = rs.iter().map(|r| match &r[0] {Value::Integer(i) => *i, _ => panic!()}).collect();
+        v.sort();
+        v
+    }
 
     fn mock_schema() -> Schema {
         Schema{ columns: vec![
@@ -226,6 +290,98 @@ mod tests {
             Value::Varchar("Alice".into()),
             Value::Boolean(true),
         ]
+    }
+
+    #[test]
+    fn test_select_all() {
+        let (mut c, bp, _d) = seed();
+        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 3);
+        assert_eq!(sorted_ids(&r), vec![1,2,3]);
+    }
+
+    #[test]
+    fn test_filter() {
+        let (mut c, bp, _d) = seed();
+        let r = rows(exec("SELECT * FROM users WHERE id = 2;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0][0], Value::Integer(2));
+        assert_eq!(r[0][1], Value::Varchar("bob".into()));
+    }
+
+    #[test]
+    fn test_comparison_filter() {
+        let (mut c, bp, _d) = seed();
+        let r = rows(exec("SELECT * FROM users WHERE id > 1;", &mut c, bp.clone()).unwrap());
+        assert_eq!(sorted_ids(&r), vec![2, 3]);
+    }
+
+    #[test]
+    fn test_projection(){ 
+        let (mut c, bp, _d) = seed();
+        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].len(), 1);
+        assert_eq!(r[0][0], Value::Varchar("alice".into()));
+    }
+
+    #[test]
+    fn test_update_then_select() {
+        let (mut c, bp, _d) = seed();
+        assert_eq!(affected(exec("UPDATE users SET name = 'ALICE' WHERE id = 1;", &mut c, bp.clone()).unwrap()), 1);
+        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r[0][0], Value::Varchar("ALICE".into()));
+    }
+
+    #[test]
+    fn test_delete_then_select() {
+        let (mut c, bp, _d) = seed();
+        assert_eq!(affected(exec("DELETE FROM users WHERE id = 2;", &mut c, bp.clone()).unwrap()), 1);
+        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone()).unwrap());
+        assert_eq!(sorted_ids(&r), vec![1,3]);
+    }
+
+    #[test]
+    fn test_duplicate_primary_key_errors() {
+        let (mut c, bp, _d) = seed();
+        assert!(exec("INSERT INTO users VALUES (1, 'dup');", &mut c, bp.clone()).is_err());
+    }
+
+    #[test]
+    fn not_null_violation_errors() {
+        let (mut c, bp, _d) = seed();
+        assert!(exec("INSERT INTO users VALUES (NULL, 'x');", &mut c, bp.clone()).is_err())
+    }
+ 
+    #[test]
+    fn root_split_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reopen.db");
+        let n = 1000;
+
+        {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+            let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+            let mut c = Catalog::create(bp.clone()).unwrap();
+            exec("CREATE TABLE nums (id INTEGER NOT NULL);", &mut c, bp.clone()).unwrap();
+            for i in 0..n {
+                exec(&format!("INSERT INTO nums VALUES ({});", i), &mut c, bp.clone()).unwrap();
+            }
+            bp.flush_all().unwrap();
+        }
+
+        {
+            let file = OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+            let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+            let c = Catalog::open(bp.clone(), 1).unwrap();
+            let entry = c.get_table("nums").unwrap();
+            let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+            let all = tree.range_scan(Bound::Unbounded, Bound::Unbounded)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(all.len(), n as usize);
+        }
     }
 
     #[test]
