@@ -77,16 +77,18 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
 pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {
     return match expr {
         Expr::Literal { value_type, value } => match value_type {
-            TokenType::TypeBoolean => match value.to_lowercase().as_str(){
-                "true" => Ok(Value::Boolean(true)),
-                "false" => Ok(Value::Boolean(false)),
-                _ => Err(FerroError::Parse(format!("bad bool literal: {}", value)))
+            TokenType::Number => {
+                if value.contains('.') {
+                    Ok(Value::Float(value.parse::<f64>().map_err(|e| FerroError::Parse(format!("float parse fail: {}", e)))?))
+                } else {
+                    Ok(Value::Integer(value.parse::<i32>().map_err(|e| FerroError::Parse(format!("int parse fail: {}", e)))?))
+                }
             }
-            TokenType::TypeFloat => Ok(Value::Float(value.parse::<f64>().map_err(|e| FerroError::Parse(format!("float parse fail: {}", e)))?)),
-            TokenType::TypeInt => Ok(Value::Integer(value.parse::<i32>().map_err(|e|FerroError::Parse(format!("integer parse fail: {}", e)))?)),
-            TokenType::TypeNull => Ok(Value::Null),
-            TokenType::TypeVarchar => Ok(Value::Varchar(value.clone())),
-            _ => return Err(FerroError::Parse("invalid value type".into()))
+            TokenType::String => Ok(Value::Varchar(value.clone())),
+            TokenType::True  => Ok(Value::Boolean(true)),
+            TokenType::False => Ok(Value::Boolean(false)),
+            TokenType::Null  => Ok(Value::Null),
+            _ => Err(FerroError::Parse("invalid literal type".into())),
         }
         Expr::BinaryOp { left, operator, right } => {
             let l = evaluate(left, row, schema)?;
