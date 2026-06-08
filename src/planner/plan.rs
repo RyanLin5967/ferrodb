@@ -1,4 +1,4 @@
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, index_scan::IndexScan, insert::Insert, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{Expr, Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_scanner::HeapScanner, index::BPlusTreeManager}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{Expr, Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::sync::Arc;
 use crate::execution::executor::Modify;
 
@@ -52,6 +52,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
     }
 }   
 
+// opens heapfilemanager twice (could cause errors)
 fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>), FerroError> {
     let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
     let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
