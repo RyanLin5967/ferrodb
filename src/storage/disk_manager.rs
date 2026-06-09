@@ -3,11 +3,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::error::FerroError;
 
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-
 pub const PAGE_SIZE: usize = 4096;
 const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
@@ -176,7 +171,7 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize>
     #[cfg(windows)]
     { use std::os::windows::fs::FileExt; file.seek_read(buf, offset)}
     #[cfg(unix)]
-    { use std::os::windows::fs::FileExt; file.read_at(buf, offset)}
+    { use std::os::unix::fs::FileExt; file.read_at(buf, offset)}
 }
 #[cfg(test)]
 mod tests {
