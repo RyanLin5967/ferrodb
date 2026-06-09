@@ -708,4 +708,73 @@ mod tests {
             _ => panic!("bruh")
         }
     }
+
+    #[test]
+    fn test_select_with_join() {
+        // SELECT u.name, p.title FROM users u INNER JOIN posts p ON u.id = p.user_id;
+        let tokens = vec![
+            t(TokenType::Select, "SELECT"),
+            t(TokenType::Identifier, "u"),
+            t(TokenType::Dot, "."),
+            t(TokenType::Identifier, "name"),
+            t(TokenType::Comma, ","),
+            t(TokenType::Identifier, "p"),
+            t(TokenType::Dot, "."),
+            t(TokenType::Identifier, "title"),
+            t(TokenType::From, "FROM"),
+            t(TokenType::Identifier, "users"),
+            t(TokenType::Identifier, "u"),
+            t(TokenType::Identifier, "INNER"),
+            t(TokenType::Join, "JOIN"),
+            t(TokenType::Identifier, "posts"),
+            t(TokenType::Identifier, "p"),
+            t(TokenType::On, "ON"),
+            t(TokenType::Identifier, "u"),
+            t(TokenType::Dot, "."),
+            t(TokenType::Identifier, "id"),
+            t(TokenType::Equal, "="),
+            t(TokenType::Identifier, "p"),
+            t(TokenType::Dot, "."),
+            t(TokenType::Identifier, "user_id"),
+            t(TokenType::Semicolon, ";"),
+            t(TokenType::Eof, ""),
+        ];
+
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+        assert!(parser.errors.is_empty());
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Select { from, columns, where_clause, joins } => {
+                assert_eq!(from.name, "users");
+                assert_eq!(from.alias, Some("u".to_string()));
+
+                assert_eq!(joins.len(), 1);
+                assert!(matches!(&joins[0].join_type, JoinType::Inner));
+                assert_eq!(&joins[0].table.name, "posts");
+                assert_eq!(joins[0].table.alias, Some("p".to_string()));
+
+                match &joins[0].on {
+                    Expr::BinaryOp { left, operator, right } => {
+                        assert_eq!(*operator, TokenType::Equal);
+                        if let Expr::ColumnRef { table, column } = &**left {
+                            assert_eq!(table, &Some("u".to_string()));
+                            assert_eq!(column, "id");
+                        } else {
+                            panic!("bruh");
+                        }
+                        if let Expr::ColumnRef { table, column } = &**right {
+                            assert_eq!(table, &Some("p".to_string()));
+                            assert_eq!(column, "user_id");
+                        } else {
+                            panic!("bruh");
+                        }
+                    }
+                    _ => panic!("bruh")
+                }
+            }
+            _ => panic!("bruh")
+        }
+    }
 }
