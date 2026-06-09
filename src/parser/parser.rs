@@ -153,23 +153,17 @@ impl Parser {
                     }
                     "LEFT" => {
                         self.advance();
-                        if self.match_token(&[TokenType::Outer]) {
-                            self.advance(); // do more later
-                        }
+                        self.match_token(&[TokenType::Outer]);
                         join_type = Some(JoinType::Left);
                     }
                     "RIGHT" => {
                         self.advance();
-                        if self.match_token(&[TokenType::Outer]) {
-                            self.advance();
-                        }
+                        self.match_token(&[TokenType::Outer]);
                         join_type = Some(JoinType::Right);
                     }
                     "FULL" => {
                         self.advance();
-                        if self.match_token(&[TokenType::Outer]) {
-                            self.advance();
-                        }
+                        self.match_token(&[TokenType::Outer]);
                         join_type = Some(JoinType::Full);
                     }
                     _ => {}
