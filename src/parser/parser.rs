@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(stmts.len(), 1);
 
         match &stmts[0] {
-            Stmt::Select { from, columns, where_clause, joins } => {
+            Stmt::Select { from, columns: _, where_clause: _, joins } => {
                 assert_eq!(from.name, "users");
                 assert_eq!(from.alias, Some("u".to_string()));
 
