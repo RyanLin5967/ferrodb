@@ -12,10 +12,13 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
     
     match stmt {
         // for now always use seq scan
-        Stmt::Select { table, columns, where_clause } => {
-            let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
+        Stmt::Select { from, columns, where_clause , joins} => { // JOIN
+            if !joins.is_empty() {
+                return Err(FerroError::SqlParseError("joins not supported yet".into()));
+            }
+            let entry = catalog.get_table(&from.name).ok_or(FerroError::Parse("table not found".into()))?;
             let scan = build_scan(entry, where_clause, bp)?;
-            let is_star = columns.len() == 1 && matches!(&columns[0], Expr::ColumnRef(name) if name == "*");
+            let is_star = columns.len() == 1 && matches!(&columns[0], Expr::ColumnRef {column, ..} if column == "*");
             let node: Box<dyn Executor> = if is_star {
                 scan
             } else {

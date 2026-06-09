@@ -1,9 +1,30 @@
-use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::scanner::{Token, TokenType::{self}}};
+use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::{scanner::{Token, TokenType::{self}}}};
 
 pub struct Parser {
     pub tokens: Vec<Token>,
     pub current: usize,
     pub errors: Vec<FerroError>
+}
+
+#[derive(Debug, Clone)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum JoinType { 
+    Inner, 
+    Left, 
+    Right, 
+    Full
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: TableRef,
+    pub on: Expr
 }
 
 #[derive(Debug, Clone)]
@@ -21,7 +42,10 @@ pub enum Expr {
         value_type: TokenType,
         value: String,
     },
-    ColumnRef(String),
+    ColumnRef{
+        table: Option<String>,
+        column: String,
+    },
     // for parentheses overriding precedence
     Grouping(Box<Expr>),
 }
@@ -29,9 +53,10 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Select {
-        table: String,
+        from: TableRef,
         columns: Vec<Expr>,
-        where_clause: Option<Expr>
+        where_clause: Option<Expr>,
+        joins: Vec<JoinClause>
     },
     Insert {
         table: String,
@@ -54,6 +79,10 @@ pub enum Stmt {
         index_name: String,
         table: String,
         column_name: String
+    },
+    Join {
+        table: String,
+        on: Expr,
     }
 }
 
@@ -99,26 +128,74 @@ impl Parser {
         }
     }
 
-    // SELECT vals FROM table WHERE expr (optional)
+    // SELECT vals FROM table1 AS t INNER JOIN table2 AS s ON t.x = s.y WHERE expr
     pub fn parse_select(&mut self) -> Result<Stmt, FerroError>{
         let mut columns = Vec::new();
-        if self.match_token(&[TokenType::Star]) {
-            columns.push(Expr::ColumnRef("*".to_string()));
-        }else {
-            loop {
+        loop {
+            if self.match_token(&[TokenType::Star]) {
+                columns.push(Expr::ColumnRef { table: None, column: "*".to_string() });
+            }else {
                 columns.push(self.expression()?);
-                if !self.match_token(&[TokenType::Comma]) {break;}
             }
+            if !self.match_token(&[TokenType::Comma]) {break;}
         }
         self.consume(TokenType::From, "expected FROM")?;
-        let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+        let main_table = self.parse_table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let mut join_type = None;
+            if self.check(TokenType::Identifier) {
+                let lexeme_upper = self.peek().lexeme.to_uppercase();
+                match lexeme_upper.as_str() {
+                    "INNER" => {
+                        self.advance();
+                        join_type = Some(JoinType::Inner);
+                    }
+                    "LEFT" => {
+                        self.advance();
+                        if self.match_token(&[TokenType::Outer]) {
+                            self.advance(); // do more later
+                        }
+                        join_type = Some(JoinType::Left);
+                    }
+                    "RIGHT" => {
+                        self.advance();
+                        if self.match_token(&[TokenType::Outer]) {
+                            self.advance();
+                        }
+                        join_type = Some(JoinType::Right);
+                    }
+                    "FULL" => {
+                        self.advance();
+                        if self.match_token(&[TokenType::Outer]) {
+                            self.advance();
+                        }
+                        join_type = Some(JoinType::Full);
+                    }
+                    _ => {}
+                }
+            }
+
+            let has_join = self.match_token(&[TokenType::Join]);
+            if join_type.is_some() && !has_join {
+                return Err(Parser::error(self.peek(), "expected join".to_string()))
+            }
+            if join_type.is_none() && !has_join { break; }
+            let actual_join_type = join_type.unwrap_or(JoinType::Inner); // default to inner
+            let join_table = self.parse_table_ref()?;
+            self.consume(TokenType::On, "expected on".into())?;
+            let on = self.expression()?;
+
+            joins.push(JoinClause {join_type: actual_join_type, table: join_table, on});
+        }
+
         let where_clause = if self.match_token(&[TokenType::Where]) {
             Some(self.expression()?)
         } else {
             None
         };
         self.consume(TokenType::Semicolon, "expected ;")?;
-        Ok(Stmt::Select { table, columns, where_clause})
+        Ok(Stmt::Select { from: main_table, columns, where_clause, joins})
     }
 
     // INSERT INTO table VALUES vals
@@ -244,6 +321,20 @@ impl Parser {
         Ok(Stmt::CreateIndex { index_name, table, column_name })
     }
 
+    pub fn parse_table_ref(&mut self) -> Result<TableRef, FerroError> {
+        let name = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+        let mut alias = None;
+
+        if self.match_token(&[TokenType::As]) {
+            alias = Some(self.consume(TokenType::Identifier, "expected alias")?.lexeme);
+        } else if self.check(TokenType::Identifier) {
+            let lexeme_upper = self.peek().lexeme.to_uppercase();
+            if !["JOIN", "WHERE", "ON", "INNER", "LEFT", "RIGHT", "FULL", "OUTER"].contains(&lexeme_upper.as_str()) {
+                alias = Some(self.advance().lexeme);
+            }
+        }
+        Ok(TableRef{name, alias})
+    }
     pub fn match_token(&mut self, types: &[TokenType]) -> bool{
         for token_type in types {
             if self.check(*token_type) {
@@ -380,7 +471,16 @@ impl Parser {
         }
 
         if self.match_token(&[TokenType::Identifier]) {
-            return Ok(Expr::ColumnRef(self.previous().lexeme));
+            let first_part = self.previous().lexeme;
+            if self.match_token(&[TokenType::Dot]) {
+
+                if self.match_token(&[TokenType::Star]) {
+                    return Ok(Expr::ColumnRef { table: Some(first_part), column: "*".into() })
+                }
+                let second_part = self.consume(TokenType::Identifier, "expected column name after '.'")?.lexeme;
+                return Ok(Expr::ColumnRef { table: Some(first_part), column: second_part });
+            }
+            return Ok(Expr::ColumnRef { table: None, column: first_part });
         }
 
         if self.match_token(&[TokenType::LeftParen]) {
@@ -427,9 +527,16 @@ mod tests {
     fn test_parse_select_str() {
         let tokens = vec![
             t(TokenType::Select, "SELECT"),
+            t(TokenType::Identifier, "u"),
+            t(TokenType::Dot, "."),
             t(TokenType::Star, "*"),
+            t(TokenType::Comma, ","),
+            t(TokenType::Identifier, "p"),
+            t(TokenType::Dot, "."),
+            t(TokenType::Identifier, "id"),
             t(TokenType::From, "FROM"),
             t(TokenType::Identifier, "users"),
+            t(TokenType::Identifier, "u"),
             t(TokenType::Semicolon, ";"),
             t(TokenType::Eof, ""),
         ];
@@ -440,11 +547,27 @@ mod tests {
         assert_eq!(stmts.len(), 1);
 
         match &stmts[0] {
-            Stmt::Select {table, columns, where_clause} => {
-                assert_eq!(table, "users");
+            Stmt::Select {from, columns, where_clause, ..} => {
+                assert_eq!(from.name, "users");
                 assert!(where_clause.is_none());
-                assert_eq!(columns.len(), 1);
-                assert!(matches!(columns[0], Expr::ColumnRef(ref name) if name == "*"))
+                assert_eq!(from.alias, Some("u".to_string()));
+                assert_eq!(columns.len(), 2);
+
+                match &columns[0] {
+                    Expr::ColumnRef { table, column } => {
+                        assert_eq!(table, &Some("u".to_string()));
+                        assert_eq!(column, "*");
+                    }
+                    _ => panic!("bruh")
+                }
+
+                match &columns[1] {
+                    Expr::ColumnRef { table, column } => {
+                        assert_eq!(table, &Some("p".to_string()));
+                        assert_eq!(column, "id");
+                    }
+                    _ => panic!("bruh")
+                }
             }
             _ => panic!("bruh")
         }
