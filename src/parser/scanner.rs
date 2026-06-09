@@ -9,7 +9,7 @@ pub enum TokenType {
     Identifier, String, Number, 
 
     And, Not, False, Null, Or, True, 
-    Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On,
+    Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     Eof,
@@ -193,6 +193,9 @@ impl Scanner {
             "BOOLEAN" => TokenType::TypeBoolean,
             "VARCHAR" => TokenType::TypeVarchar,
             "NULL" => TokenType::Null,
+            "AS" => TokenType::As,
+            "JOIN" => TokenType::Join,
+            "OUTER" => TokenType::Outer,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);
