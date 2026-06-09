@@ -167,16 +167,16 @@ impl DiskManager{
 
 pub fn pwrite(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(windows)]
-    { file.seek_write(buf, offset)}
+    { use std::os::windows::fs::FileExt; file.seek_write(buf, offset)}
     #[cfg(unix)]
-    { file.write_at(buf, offset)}
+    { use std::os::unix::fs::FileExt; file.write_at(buf, offset)}
 }
 
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(windows)]
-    { file.seek_read(buf, offset)}
+    { use std::os::windows::fs::FileExt; file.seek_read(buf, offset)}
     #[cfg(unix)]
-    { file.read_at(buf, offset)}
+    { use std::os::windows::fs::FileExt; file.read_at(buf, offset)}
 }
 #[cfg(test)]
 mod tests {
