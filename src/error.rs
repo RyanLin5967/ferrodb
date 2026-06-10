@@ -14,6 +14,7 @@ pub enum FerroError {
     IndexAlreadyExists,
     Contraint(String),
     OnlyDML,
+    Bind(String),
 }
 
 impl Display for FerroError {
@@ -30,6 +31,7 @@ impl Display for FerroError {
             FerroError::IndexAlreadyExists => write!(f, "index already exists"),
             FerroError::Contraint(s) => write!(f, "contraint error: {}", s),
             FerroError::OnlyDML => write!(f, "only supports dml"),
+            FerroError::Bind(s) => write!(f, "binding error: {}", s),
         }
     }
 }

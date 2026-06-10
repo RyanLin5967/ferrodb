@@ -6,3 +6,4 @@ pub mod parser;
 pub mod execution;
 pub mod planner;
 pub mod cli;
+pub mod binder;
