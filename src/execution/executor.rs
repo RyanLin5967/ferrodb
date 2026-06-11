@@ -119,7 +119,7 @@ pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, Fe
                 _ => Err(FerroError::Parse("invalid unary op".into()))
             }
         }
-        Expr::ColumnRef{table: t, column: s} => {
+        Expr::ColumnRef{table: _, column: s} => {
             let idx = schema.columns.iter().position(|c|c.name == *s).ok_or(FerroError::Parse(format!("unknonwn column: {}", s)))?;
             row.get(idx).cloned().ok_or(FerroError::Parse(format!("row missing column: {}", s)))
         }
