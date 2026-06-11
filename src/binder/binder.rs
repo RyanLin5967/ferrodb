@@ -146,7 +146,7 @@ impl<'a> Binder<'a> {
     pub fn bind(&self, stmt: Stmt) -> Result<LogicalPlan, FerroError> {
         match stmt {
             Stmt::Select { from, columns, where_clause, joins } => {
-                self.bind_select(from, joins, columns, where_clause)?;
+                self.bind_select(from, joins, columns, where_clause)
             }
             Stmt::Insert { .. } => {
                 todo!()
@@ -165,7 +165,6 @@ impl<'a> Binder<'a> {
             }
             Stmt::Join {..} => todo!()
         }
-        todo!()
     }
 
     // SELECT: build scope from FROM/JOIN -> filter -> projection
