@@ -1,14 +1,12 @@
-use crate::catalog::schema::Schema;
+use crate::binder::binder::BoundExpr;
 use crate::execution::executor::{Executor, evaluate};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
-use crate::parser::parser::Expr;
 
 pub struct Projection {
     pub child: Box<dyn Executor>,
-    pub columns: Vec<Expr>,
-    pub schema: Schema
+    pub exprs: Vec<BoundExpr>,
 }
 
 impl Executor for Projection {
@@ -17,9 +15,9 @@ impl Executor for Projection {
             Ok((r, v)) => (r, v),
             Err(e) => return Some(Err(e))
         };
-        let mut eval_values = Vec::with_capacity(self.columns.len());
-        for expr in &self.columns {
-            eval_values.push( match evaluate(expr, &values, &self.schema) {
+        let mut eval_values = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            eval_values.push( match evaluate(expr, &values) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e))
             })

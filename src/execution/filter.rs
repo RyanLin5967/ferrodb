@@ -1,12 +1,12 @@
-use crate::{catalog::schema::Schema, error::FerroError, execution::executor::Executor, parser::parser::Expr};
+use crate::binder::binder::BoundExpr;
+use crate::{error::FerroError, execution::executor::Executor};
 use crate::storage::heap_file_manager::RecordId;
 use crate::execution::executor::evaluate;
 use crate::catalog::column::Value;
 
 pub struct Filter {
     pub child: Box<dyn Executor>,
-    pub predicate: Expr,
-    pub schema: Schema,
+    pub predicate: BoundExpr,
 }
 
 // operator that applies predicate. gets rows from child, emits ones where predicate is true
@@ -17,7 +17,7 @@ impl Executor for Filter {
                 Ok((r, t)) => (r, t),
                 Err(e) => return Some(Err(e))
             };
-            match evaluate(&self.predicate, &values, &self.schema) {
+            match evaluate(&self.predicate, &values) {
                 Ok(Value::Boolean(true)) => return Some(Ok((rid, values))),
                 Ok(_) => continue,
                 Err(e) => return Some(Err(e))
