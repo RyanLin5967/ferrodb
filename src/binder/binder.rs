@@ -276,7 +276,7 @@ impl<'a> Binder<'a> {
             }
             TokenType::String => Value::Varchar(value),
             TokenType::True => Value::Boolean(true),
-            TokenType::False => Value::Boolean(true),
+            TokenType::False => Value::Boolean(false),
             TokenType::Null => Value::Null,
             _ => return Err(FerroError::Bind(format!("invalid literal: {}", value)))
         };
