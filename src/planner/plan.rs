@@ -1,4 +1,4 @@
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{Expr, Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, LogicalPlan, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::sync::Arc;
 use crate::execution::executor::Modify;
 
@@ -12,42 +12,52 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
     
     match stmt {
         // for now always use seq scan
-        Stmt::Select { from, columns, where_clause , joins} => { // JOIN
-            if !joins.is_empty() {
-                return Err(FerroError::SqlParseError("joins not supported yet".into()));
-            }
-            let entry = catalog.get_table(&from.name).ok_or(FerroError::Parse("table not found".into()))?;
-            let scan = build_scan(entry, where_clause, bp)?;
-            let is_star = columns.len() == 1 && matches!(&columns[0], Expr::ColumnRef {column, ..} if column == "*");
-            let node: Box<dyn Executor> = if is_star {
-                scan
-            } else {
-                Box::new(Projection { child: scan, columns, schema: entry.schema.clone()})
-            };
-            return Ok(Plan::Read(node))
+        Stmt::Select { .. } => { // JOIN
+            let logical = Binder::new(catalog).bind(stmt)?;
+            Ok(Plan::Read(lower(logical, catalog, bp)?))
         }
         Stmt::Delete { table, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
             let (heap, tree, handles) = open_table(entry, bp.clone())?;
-            let scan = build_scan(entry, where_clause, bp)?;
+            let bound_where = match where_clause {
+                Some(w) => {
+                    let binder = Binder::new(catalog);
+                    let scope = single_table_scope(catalog, &table)?;
+                    Some(binder.bind_expr(w, &scope)?)
+                }
+                None => None
+            };
+            let scan = build_scan(entry, bound_where, bp)?;
             let delete = Delete {table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(delete)))
         }
         Stmt::Insert { table, values } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
             let (heap, tree, handles) = open_table(entry, bp)?;
-            let insert = Insert {table, values, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
+            let binder = Binder::new(catalog);
+            let empty = Scope::new();
+            let mut bound_vals = Vec::with_capacity(values.len());
+            for v in values {
+                bound_vals.push(binder.bind_expr(v, &empty)?);
+            }
+            let insert = Insert {table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
             let (heap, tree, handles) = open_table(entry, bp.clone())?;
-            let child = build_scan(entry, where_clause, bp)?;
+            let binder = Binder::new(catalog);
+            let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
             for (name, expr) in assignments {
-                let idx = entry.schema.columns.iter().position(|c| c.name == name).ok_or(FerroError::Parse(format!("unkonwn column: {}", name)))?;
-                resolved.push((idx, expr));
+                let idx = entry.schema.columns.iter().position(|c| c.name == name).ok_or(FerroError::Parse(format!("unknown column: {}", name)))?;
+                resolved.push((idx, binder.bind_expr(expr, &scope)?));
             }
+            let bound_where = match where_clause {
+                Some(w) => Some(binder.bind_expr(w, &scope)?),
+                None => None
+            };
+            let child = build_scan(entry, bound_where, bp)?;
             let update = Update {table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(update)))
         }
@@ -68,14 +78,41 @@ fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>) -> Result<(HeapFil
     Ok((heap, tree, handles))
 }
 
-fn build_scan(entry: &TableEntry, where_clause: Option<Expr>, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
+fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
     let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
     let scanner = heap.scan();
     let mut node: Box<dyn Executor> = Box::new(SeqScan {
         scanner, schema: entry.schema.clone(),
     });
-    if let Some(pred) = where_clause {
-        node = Box::new(Filter { child: node, predicate: pred, schema: entry.schema.clone()})
+    if let Some(pred) = predicate {
+        node = Box::new(Filter { child: node, predicate: pred})
     }
     Ok(node)
+}
+
+fn lower(plan: LogicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let child = lower(*input, catalog, bp)?;
+            Ok(Box::new(Filter{child, predicate}))
+        }
+        LogicalPlan::Join { .. } => todo!(),
+        LogicalPlan::Projection { input, exprs, .. } => {
+            let child = lower(*input, catalog, bp)?;
+            Ok(Box::new(Projection {child, exprs}))
+        }
+        LogicalPlan::Scan { table, .. } => {
+            let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
+            let heap = HeapFileManager::open(entry.first_directory_page_id, bp);
+            let scanner = heap.scan();
+            Ok(Box::new(SeqScan {scanner, schema: entry.schema.clone()}))
+        }
+    }
+}
+
+fn single_table_scope(catalog: &Catalog, table: &str) -> Result<Scope, FerroError> {
+    let entry = catalog.get_table(table).ok_or(FerroError::Parse(format!("unknown table: {}", table)))?;
+    let mut scope = Scope::new();
+    scope.add_table(table, &entry.schema)?;
+    Ok(scope)
 }

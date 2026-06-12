@@ -1,8 +1,9 @@
+use crate::binder::binder::BoundExpr;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
 use crate::execution::executor::{Modify, evaluate, sync_roots};
 use crate::storage::tuple::Tuple;
-use crate::{catalog::schema::Schema, execution::executor::Executor, parser::parser::Expr, storage::heap_file_manager::HeapFileManager};
+use crate::{catalog::schema::Schema, execution::executor::Executor, storage::heap_file_manager::HeapFileManager};
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
@@ -12,7 +13,7 @@ pub struct Update {
     pub table: String,
     pub child: Box<dyn Executor>,
     pub schema: Schema,
-    pub assignments: Vec<(usize, Expr)>, // col idx -> new value expr
+    pub assignments: Vec<(usize, BoundExpr)>, // col idx -> new value expr
     pub heap: HeapFileManager,
     pub primary_index: BPlusTreeManager<Value, RecordId>,
     pub secondary_indexes: Vec<IndexHandle>,
@@ -36,7 +37,7 @@ impl Modify for Update {
         for (rid, old_values) in res {
             let mut new_values = old_values.clone();
             for (col_idx, expr) in &self.assignments {
-                new_values[*col_idx] = evaluate(expr, &old_values, &self.schema)?;
+                new_values[*col_idx] = evaluate(expr, &old_values)?;
             }
             
             for (i, col) in self.schema.columns.iter().enumerate() {

@@ -1,8 +1,8 @@
+use crate::binder::binder::BoundExpr;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
 use crate::execution::executor::{Modify, evaluate, sync_roots};
 use crate::storage::tuple::Tuple;
-use crate::{parser::parser::Expr};
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::catalog::schema::Schema;
 use crate::catalog::column::Value;
@@ -12,7 +12,7 @@ use crate::execution::index_handle::IndexHandle;
 
 pub struct Insert {
     pub table: String,
-    pub values: Vec<Expr>,
+    pub values: Vec<BoundExpr>,
     pub heap: HeapFileManager,
     pub schema: Schema,
     pub primary_index: BPlusTreeManager<Value, RecordId>,
@@ -23,7 +23,7 @@ impl Modify for Insert {
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
         let mut vals = Vec::with_capacity(self.values.len());
         for expr in &self.values {
-            vals.push(evaluate(expr, &[], &self.schema)?);
+            vals.push(evaluate(expr, &[])?);
         }
         if vals.len() != self.schema.columns.len() {
             return Err(FerroError::Contraint("value count != column count".into()))

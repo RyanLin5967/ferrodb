@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
-use crate::parser::parser::{Expr, Stmt};
+use crate::parser::parser::{Stmt};
 use crate::planner::plan::{Plan, plan};
 use crate::storage::index::BPlusTreeManager;
 use crate::{error::FerroError};
@@ -74,25 +75,12 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
     }
     Ok(())
 }
-pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, FerroError> {
+pub fn evaluate(expr: &BoundExpr, row: &[Value]) -> Result<Value, FerroError> {
     return match expr {
-        Expr::Literal { value_type, value } => match value_type {
-            TokenType::Number => {
-                if value.contains('.') {
-                    Ok(Value::Float(value.parse::<f64>().map_err(|e| FerroError::Parse(format!("float parse fail: {}", e)))?))
-                } else {
-                    Ok(Value::Integer(value.parse::<i32>().map_err(|e| FerroError::Parse(format!("int parse fail: {}", e)))?))
-                }
-            }
-            TokenType::String => Ok(Value::Varchar(value.clone())),
-            TokenType::True  => Ok(Value::Boolean(true)),
-            TokenType::False => Ok(Value::Boolean(false)),
-            TokenType::Null  => Ok(Value::Null),
-            _ => Err(FerroError::Parse("invalid literal type".into())),
-        }
-        Expr::BinaryOp { left, operator, right } => {
-            let l = evaluate(left, row, schema)?;
-            let r = evaluate(right ,row, schema)?;
+        BoundExpr::Literal(v) => Ok(v.clone()),
+        BoundExpr::BinaryOp { left, operator, right } => {
+            let l = evaluate(left, row)?;
+            let r = evaluate(right ,row)?;
 
             match operator {
                 TokenType::Plus | TokenType::Minus | TokenType::Star | TokenType::Slash => arithmetic(&l, &r, operator),
@@ -102,8 +90,8 @@ pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, Fe
                 _ => Err(FerroError::Parse("invalid binary op".into()))
             }
         }
-        Expr::UnaryOp { operator, right } => {
-            let v = evaluate(right, row, schema)?;
+        BoundExpr::UnaryOp { operator, right } => {
+            let v = evaluate(right, row)?;
             match operator {
                 TokenType::Minus => match v {
                     Value::Integer(i) => Ok(Value::Integer(-i)),
@@ -119,11 +107,7 @@ pub fn evaluate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value, Fe
                 _ => Err(FerroError::Parse("invalid unary op".into()))
             }
         }
-        Expr::ColumnRef{table: _, column: s} => {
-            let idx = schema.columns.iter().position(|c|c.name == *s).ok_or(FerroError::Parse(format!("unknonwn column: {}", s)))?;
-            row.get(idx).cloned().ok_or(FerroError::Parse(format!("row missing column: {}", s)))
-        }
-        Expr::Grouping(e) => evaluate(e, row, schema)
+        BoundExpr::Column(idx) => row.get(*idx).cloned().ok_or_else(|| FerroError::Parse(format!("row missing column at {}", idx)))
     }
 }
 
@@ -211,8 +195,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::ops::Bound;
     use super::*;
-    use crate::catalog::column::Column;
-    use crate::catalog::column::DataType;
     use crate::parser::scanner::Scanner;
     use crate::parser::parser::Parser;
     use crate::storage::disk_manager::DiskManager;
@@ -274,22 +256,6 @@ mod tests {
         let mut v: Vec<i32> = rs.iter().map(|r| match &r[0] {Value::Integer(i) => *i, _ => panic!()}).collect();
         v.sort();
         v
-    }
-
-    fn mock_schema() -> Schema {
-        Schema{ columns: vec![
-            Column::new("id".into(), DataType::Integer, false),
-            Column::new("name".into(), DataType::Varchar(255), false),
-            Column::new("is_active".into(), DataType::Boolean, false),
-        ]}
-    }
-
-    fn mock_row() -> Vec<Value>{
-        vec![
-            Value::Integer(1),
-            Value::Varchar("Alice".into()),
-            Value::Boolean(true),
-        ]
     }
 
     #[test]
@@ -385,26 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn test_literal() {
-        let schema = mock_schema();
-        let row = mock_row();
-
-        let cases = vec![
-            (TokenType::Number, "42", Value::Integer(42)),
-            (TokenType::Number, "3.14", Value::Float(3.14)),
-            (TokenType::True, "true", Value::Boolean(true)),
-            (TokenType::False, "FALSE", Value::Boolean(false)),
-            (TokenType::Null, "null", Value::Null),
-            (TokenType::String, "hello", Value::Varchar("hello".into())),
-        ];
-
-        for (t_type, val_str, expected) in cases {
-            let expr = Expr::Literal { value_type: t_type, value: val_str.into() };
-            assert_eq!(evaluate(&expr, &row, &schema).unwrap(), expected);
-        }
-    }
-
-    #[test]
     fn test_arithmetic() {
         let int4 = Value::Integer(4);
         let int2 = Value::Integer(2);
@@ -450,18 +396,15 @@ mod tests {
 
     #[test]
     fn test_unary() {
-        let schema = mock_schema();
-        let row = mock_row();
-
-        let e_minus = Expr::UnaryOp {
+        let e_minus = BoundExpr::UnaryOp {
             operator: TokenType::Minus,
-            right: Box::new(Expr::Literal { value_type: TokenType::Number, value: "5".into() })
+            right: Box::new(BoundExpr::Literal (Value::Integer(5)))
         };
-        assert_eq!(evaluate(&e_minus, &row, &schema).unwrap(), Value::Integer(-5));
-        let e_not = Expr::UnaryOp {
+        assert_eq!(evaluate(&e_minus, &[]).unwrap(), Value::Integer(-5));
+        let e_not = BoundExpr::UnaryOp {
             operator: TokenType::Not,
-            right: Box::new(Expr::Literal { value_type: TokenType::True, value: "true".into() })
+            right: Box::new(BoundExpr::Literal(Value::Boolean(true)))
         };
-        assert_eq!(evaluate(&e_not, &row, &schema).unwrap(), Value::Boolean(false));
+        assert_eq!(evaluate(&e_not, &[]).unwrap(), Value::Boolean(false));
     }
 }
