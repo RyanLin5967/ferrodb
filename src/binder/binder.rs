@@ -1,7 +1,6 @@
 use crate::{catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{Expr, JoinClause, JoinType, Stmt, TableRef}, scanner::TokenType}};
 
-#[derive(Debug, Clone)]
-
+#[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     BinaryOp {
         left: Box<BoundExpr>,
@@ -16,7 +15,7 @@ pub enum BoundExpr {
     Column(usize),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundColumn {
     pub qualifier: String, 
     pub name: String,
@@ -281,5 +280,186 @@ impl<'a> Binder<'a> {
             _ => return Err(FerroError::Bind(format!("invalid literal: {}", value)))
         };
         Ok(BoundExpr::Literal(v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::catalog::column::Column;
+    use crate::parser::parser::Parser;
+    use crate::parser::scanner::Scanner;
+    use crate::{buffer::buffer_pool::BufferPoolManager, storage::disk_manager::DiskManager};
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::sync::Arc;
+
+    fn setup() -> Catalog {
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open("test.db").unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut c = Catalog::create(bp).unwrap();
+        c.create_table("users".into(), Schema::new(vec![col("id", DataType::Integer, false), col("name", DataType::Varchar(255), true)])).unwrap();
+        c.create_table("posts".into(), Schema::new(vec![col("id", DataType::Integer, false), col("user_id", DataType::Integer, false), col("title", DataType::Varchar(255), true)])).unwrap();
+        c
+    }
+
+    fn col(name: &str, data_type: DataType, nullable: bool) -> Column {
+        Column { name: name.to_string(), data_type, nullable }
+    }
+
+    fn scope() -> Scope {
+        let mut s = Scope::new();
+        s.add_table("u", &Schema::new(vec![col("id", DataType::Integer, false), col("name", DataType::Varchar(255), true)])).unwrap();
+        s.add_table("p", &Schema::new(vec![col("id", DataType::Integer, false), col("user_id", DataType::Integer, false)])).unwrap();
+        s
+    }
+
+    fn parse_one(sql: &str) -> Stmt {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut parser = Parser::new(tokens);
+        let mut stmts = parser.parse();
+        assert_eq!(stmts.len(), 1);
+        stmts.remove(0)
+    }
+
+    #[test]
+    fn test_literal() {
+        let catalog = setup();
+        let binder = Binder::new(&catalog);
+        assert_eq!(binder.bind_literal(TokenType::String, "users".into()).unwrap(), BoundExpr::Literal(Value::Varchar("users".to_string())));
+        assert_eq!(binder.bind_literal(TokenType::Number, "1".into()).unwrap(), BoundExpr::Literal(Value::Integer(1)));
+        assert_eq!(binder.bind_literal(TokenType::True, "true".into()).unwrap(), BoundExpr::Literal(Value::Boolean(true)));
+        assert_eq!(binder.bind_literal(TokenType::False, "false".into()).unwrap(), BoundExpr::Literal(Value::Boolean(false)));
+        assert_eq!(binder.bind_literal(TokenType::Number, "1.1".into()).unwrap(), BoundExpr::Literal(Value::Float(1.1)));
+        assert_eq!(binder.bind_literal(TokenType::Null, "null".into()).unwrap(), BoundExpr::Literal(Value::Null));
+    }
+
+    #[test]
+    fn test_resolve_qualified_unique() {
+        let s = scope();
+        assert_eq!(s.resolve(Some("u"), "id").unwrap(), 0);
+        assert_eq!(s.resolve(Some("u"), "name").unwrap(), 1);
+        assert_eq!(s.resolve(Some("p"), "user_id").unwrap(), 3);
+        assert_eq!(s.resolve(None, "name").unwrap(), 1);
+        assert_eq!(s.resolve(None, "user_id").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_resolve_ambiguous() {
+        let s = scope();
+        assert!(matches!(s.resolve(None, "id"), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_resolve_unknown_table() {
+        let s = scope();
+        assert!(matches!(s.resolve(None, "idk"), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_resolve_unknown_column() {
+        let s = scope();
+        assert!(matches!(s.resolve(Some("u"), "idk"), Err(FerroError::Bind(_))));
+        assert!(matches!(s.resolve(None, "idk"), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_duplicate_qualifier() {
+        let mut s = scope();
+        let dup = s.add_table("u", &Schema::new(vec![col("x", DataType::Integer, false)]));
+        assert!(matches!(dup, Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_expand_star() {
+        let s = scope();
+        assert_eq!(s.expand_star(None).unwrap(), vec![0,1,2,3]);
+        assert_eq!(s.expand_star(Some("u")).unwrap(), vec![0, 1]);
+        assert_eq!(s.expand_star(Some("p")).unwrap(), vec![2,3]);
+        assert!(matches!(s.expand_star(Some("idk")), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_simple_select() {
+        let catalog = setup();
+        let plan = Binder::new(&catalog).bind(parse_one("SELECT * FROM users;")).unwrap();
+        match plan {
+            LogicalPlan::Projection { exprs, output, .. } => {
+                assert_eq!(exprs, vec![BoundExpr::Column(0), BoundExpr::Column(1)]);
+                assert_eq!(output.len(), 2);
+                assert_eq!(output[0].name, "id");
+                assert_eq!(output[1].name, "name");
+            }
+            _ => panic!("expected projection")
+        }
+    }
+
+    #[test]
+    fn test_select_star() {
+        let catalog = setup();
+        let plan = Binder::new(&catalog).bind(parse_one("SELECT name FROM users WHERE id > 5;")).unwrap();
+        match plan {
+            LogicalPlan::Projection { input, .. } => match *input{
+                LogicalPlan::Filter { input, predicate} => {
+                    assert_eq!(predicate, BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Greater, right: Box::new(BoundExpr::Literal(Value::Integer(5))) });
+                    assert!(matches!(*input, LogicalPlan::Scan { .. }))
+                }
+                _ => panic!("expected filter"),
+            }
+            _ => panic!("expected projection")
+        }
+    }
+
+    #[test]
+    fn test_join() {
+        let catalog = setup();
+        let plan = Binder::new(&catalog).bind(parse_one("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;")).unwrap();
+        match plan {
+            LogicalPlan::Projection { input, exprs, .. } => {
+                assert_eq!(exprs, vec![BoundExpr::Column(1), BoundExpr::Column(4)]);
+                match *input {
+                    LogicalPlan::Join { left, right, join_type, on } => {
+                        assert!(matches!(join_type, JoinType::Inner));
+                        assert_eq!(on, BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Equal, right: Box::new(BoundExpr::Column(3)) });
+                        assert!(matches!(*left, LogicalPlan::Scan { .. }));
+                        assert!(matches!(*right, LogicalPlan::Scan { .. }));
+                    }
+                    _ => panic!("expected join")
+                }
+            }
+            _ => panic!("expected projection")
+        }
+    }
+
+    #[test]
+    fn test_self_join() {
+        let catalog = setup();
+        let plan = Binder::new(&catalog).bind(parse_one("SELECT e.name, m.name FROM users e JOIN users m ON e.id = m.id;")).unwrap();
+        match plan {
+            LogicalPlan::Projection { exprs, .. } => {
+                assert_eq!(exprs, vec![BoundExpr::Column(1), BoundExpr::Column(3)]);
+            }
+            _ => panic!("expected projection")
+        }
+    }
+
+    #[test]
+    fn test_ambiguous_column() {
+        let catalog = setup();
+        assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT id FROM users u JOIN posts p ON u.id = p.user_id;")), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_unkown_table() {
+        let catalog = setup();
+        assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT name FROM idk;")), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn test_duplicate_qualifier_bind() {
+        let catalog = setup();
+        assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT name FROM users JOIN users ON users.id = users.id;")), Err(FerroError::Bind(_))));
     }
 }
