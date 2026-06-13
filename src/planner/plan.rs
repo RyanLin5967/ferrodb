@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, LogicalPlan, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, LogicalPlan, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, nested_loop_join::NestedLoopJoin, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{JoinType, Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::sync::Arc;
 use crate::execution::executor::Modify;
 
@@ -96,7 +96,17 @@ fn lower(plan: LogicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Re
             let child = lower(*input, catalog, bp)?;
             Ok(Box::new(Filter{child, predicate}))
         }
-        LogicalPlan::Join { .. } => todo!(),
+        LogicalPlan::Join { left, right, join_type, on } => {
+            let right_width = right.output_schema().len();
+            match join_type {
+                JoinType::Inner | JoinType::Left => {
+                    let left_exec = lower(*left, catalog, bp.clone())?;
+                    let right_exec = lower(*right, catalog, bp)?;
+                    Ok(Box::new(NestedLoopJoin::new(left_exec, right_exec, on, join_type, right_width)))
+                }
+                _ => Err(FerroError::Bind("right/full not implemented yet".into()))
+            }
+        }
         LogicalPlan::Projection { input, exprs, .. } => {
             let child = lower(*input, catalog, bp)?;
             Ok(Box::new(Projection {child, exprs}))
