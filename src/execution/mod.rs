@@ -8,3 +8,4 @@ pub mod insert;
 pub mod index_handle;
 pub mod projection;
 pub mod sec_index_scan;
+pub mod nested_loop_join;
