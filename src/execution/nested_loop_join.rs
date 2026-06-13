@@ -28,6 +28,7 @@ impl Executor for NestedLoopJoin {
                     Err(e) => return Some(Err(e)),
                 }
             }
+            self.right_rows = Some(right_rows);
         }
         loop {
             if self.cur_left.is_none() {
