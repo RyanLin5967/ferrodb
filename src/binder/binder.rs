@@ -294,15 +294,17 @@ mod tests {
     use std::fs::OpenOptions;
     use std::sync::Arc;
 
-    fn setup() -> Catalog {
+    fn setup() -> (Catalog, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binder.db");
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
-            .open("test.db").unwrap();
+            .open(&path).unwrap();
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let mut c = Catalog::create(bp).unwrap();
         c.create_table("users".into(), Schema::new(vec![col("id", DataType::Integer, false), col("name", DataType::Varchar(255), true)])).unwrap();
         c.create_table("posts".into(), Schema::new(vec![col("id", DataType::Integer, false), col("user_id", DataType::Integer, false), col("title", DataType::Varchar(255), true)])).unwrap();
-        c
+        (c, dir)
     }
 
     fn col(name: &str, data_type: DataType, nullable: bool) -> Column {
@@ -326,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_literal() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         let binder = Binder::new(&catalog);
         assert_eq!(binder.bind_literal(TokenType::String, "users".into()).unwrap(), BoundExpr::Literal(Value::Varchar("users".to_string())));
         assert_eq!(binder.bind_literal(TokenType::Number, "1".into()).unwrap(), BoundExpr::Literal(Value::Integer(1)));
@@ -383,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_simple_select() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         let plan = Binder::new(&catalog).bind(parse_one("SELECT * FROM users;")).unwrap();
         match plan {
             LogicalPlan::Projection { exprs, output, .. } => {
@@ -398,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_select_star() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         let plan = Binder::new(&catalog).bind(parse_one("SELECT name FROM users WHERE id > 5;")).unwrap();
         match plan {
             LogicalPlan::Projection { input, .. } => match *input{
@@ -414,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_join() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         let plan = Binder::new(&catalog).bind(parse_one("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;")).unwrap();
         match plan {
             LogicalPlan::Projection { input, exprs, .. } => {
@@ -435,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_self_join() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         let plan = Binder::new(&catalog).bind(parse_one("SELECT e.name, m.name FROM users e JOIN users m ON e.id = m.id;")).unwrap();
         match plan {
             LogicalPlan::Projection { exprs, .. } => {
@@ -447,19 +449,19 @@ mod tests {
 
     #[test]
     fn test_ambiguous_column() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT id FROM users u JOIN posts p ON u.id = p.user_id;")), Err(FerroError::Bind(_))));
     }
 
     #[test]
     fn test_unkown_table() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT name FROM idk;")), Err(FerroError::Bind(_))));
     }
 
     #[test]
     fn test_duplicate_qualifier_bind() {
-        let catalog = setup();
+        let (catalog, _dir) = setup();
         assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT name FROM users JOIN users ON users.id = users.id;")), Err(FerroError::Bind(_))));
     }
 }

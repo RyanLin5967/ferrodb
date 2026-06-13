@@ -255,13 +255,15 @@ mod tests {
     use crate::catalog::column::{Column, DataType, Value};
     use crate::catalog::schema::Schema;
 
-    fn setup() -> HeapFileManager {
+    fn setup() -> (HeapFileManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heap.db");
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
-            .open("test.db").unwrap();
+            .open(&path).unwrap();
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let bpm = Arc::new(BufferPoolManager::new(dm));
-        HeapFileManager::new(bpm).unwrap()
+        (HeapFileManager::new(bpm).unwrap(), dir)
     }
 
     fn test_schema() -> Schema {
@@ -270,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_read() {
-        let hfm = setup();
+        let (hfm, _dir) = setup();
         let schema = test_schema();
         let values = vec![Value::Integer(1), Value::Varchar("hello".into())];
         let tuple = Tuple::serialize(&values, &schema).unwrap();
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_update_in_place() {
-        let hfm = setup();
+        let (hfm, _dir) = setup();
         let schema = test_schema();
         let values = vec![Value::Integer(3), Value::Varchar("old".into())];
         let tuple = Tuple::serialize(&values, &schema).unwrap();
@@ -309,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_scan() {
-        let hfm = setup();
+        let (hfm, _dir) = setup();
         let schema = test_schema();
         for i in 0..10 {
             let values = vec![Value::Integer(i), Value::Varchar(format!("row{}", i)) ];
@@ -322,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_multiple_pages() {
-        let hfm = setup();
+        let (hfm, _dir) = setup();
         let schema = Schema::new(vec![
             Column::new("data".into(), DataType::Varchar(200), false),
         ]);
@@ -338,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_insert_delete_scan() {
-        let hfm = setup();
+        let (hfm, _dir) = setup();
         let schema = test_schema();
         let mut rids = Vec::new();
         for i in 0..10 {

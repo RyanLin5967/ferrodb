@@ -274,29 +274,31 @@ mod tests {
     use std::fs::OpenOptions;
     use crate::{catalog::column::Value, storage::{disk_manager::DiskManager, heap_file_manager::RecordId}};
     
-    fn setup() -> BPlusTreeManager::<Value, Value>{
-        let _ = std::fs::remove_file("test_index.db");
+    fn setup() -> (BPlusTreeManager::<Value, Value>, tempfile::TempDir){
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_index.db");
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
-            .open("test_index.db").unwrap();
+            .open(&path).unwrap();
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let bp = Arc::new(BufferPoolManager::new(dm));
-        BPlusTreeManager::<Value, Value>::create(bp.clone()).unwrap()
+        (BPlusTreeManager::<Value, Value>::create(bp.clone()).unwrap(), dir)
     }
 
-    fn setup_leaf() -> BPlusTreeManager<Value, RecordId> {
-        let _ = std::fs::remove_file("test_leaf.db");
+    fn setup_leaf() -> (BPlusTreeManager<Value, RecordId>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_leaf.db");
         let file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(true)
-            .open("test_leaf.db").unwrap();
+            .open(&path).unwrap();
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let bp = Arc::new(BufferPoolManager::new(dm));
-        BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap()
+        (BPlusTreeManager::<Value, RecordId>::create(bp.clone()).unwrap(), dir)
     }
 
     #[test]
     fn test_create_init_empty_leaf() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         let root_id = tree.root_page_id.load(Ordering::Relaxed);
         let root_node = tree.read_node(root_id).unwrap();
         match root_node {
@@ -312,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_search_empty_tree_returns_none() {
-        let tree = setup();
+        let (tree, _dir)= setup();
         let search_key = Value::Integer(67);
         let result = tree.search(&search_key).unwrap();
         assert_eq!(result, None);
@@ -320,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_search_finds_key() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         let root_id = tree.root_page_id.load(Ordering::Relaxed);
 
         let frame_i = tree.buffer_pool.fetch_page(root_id).unwrap();
@@ -342,14 +344,14 @@ mod tests {
 
     #[test]
     fn test_simple_insert() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         let result = tree.insert(Value::Integer(67), Value::Integer(69));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_internal_node_split_a_lot() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         for i in 0..400 {
             let result = tree.insert(Value::Integer(i), Value::Integer(i));
             assert!(result.is_ok());
@@ -358,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_many_level_insert_and_search() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         for i in 0..2000 {
             let _ = tree.insert(Value::Integer(i), Value::Integer(i *2)).unwrap_or_else(|e| panic!("insert {} failed: {:?}", i, e));
         }
@@ -370,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_many_level_reverse() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         for i in (0..2000).rev() {
             tree.insert(Value::Integer(i), Value::Integer(i)).unwrap();
         }
@@ -381,8 +383,8 @@ mod tests {
 
     #[test]
     fn test_delete_basic() {
-        let tree: BPlusTreeManager<Value, Value> = setup();
-        let leaf = setup_leaf();
+        let (tree, _dir) = setup();
+        let (leaf, _dir) = setup_leaf();
         tree.insert(Value::Integer(67),Value::Integer(6)).unwrap();
         tree.insert(Value::Integer(20), Value::Integer(7)).unwrap();
 
@@ -399,13 +401,13 @@ mod tests {
 
     #[test]
     fn test_delete_not_real_key() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         assert!(tree.delete(&Value::Integer(934857)).is_err());
     }
 
     #[test]
     fn test_range_scan_basic() {
-        let tree = setup();
+        let (tree, _dir) = setup();
 
         tree.insert(Value::Integer(50), Value::Integer(5)).unwrap();
         tree.insert(Value::Integer(10), Value::Integer(1)).unwrap();
@@ -427,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_range_scan_many_pages() {
-        let tree = setup();
+        let (tree, _dir) = setup();
         for i in 0..1000 {
             tree.insert(Value::Integer(i), Value::Integer(i * 10)).unwrap();
         }
