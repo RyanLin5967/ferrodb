@@ -17,8 +17,9 @@ impl NestedLoopJoin {
     pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, on: BoundExpr, join_type: JoinType, right_width: usize) -> Self {
         Self { left, right, on, right_rows: None, join_type, cur_left: None, right_idx: 0, left_matched: false, right_width }
     }
-
-    pub fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>>{
+}
+impl Executor for NestedLoopJoin {
+    fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>>{
         if self.right_rows.is_none() {
             let mut right_rows: Vec<(RecordId, Vec<Value>)> = Vec::new();
             while let Some(r) = self.right.next() {
