@@ -238,6 +238,48 @@ mod tests {
         (c, bp, dir)
     }
 
+    fn seed_join() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
+        let (mut c, bp, dir) = setup();
+        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone()).unwrap();
+        exec("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(50));", &mut c, bp.clone()).unwrap();
+        for s in [
+            "INSERT INTO users VALUES (1, 'alice');",
+            "INSERT INTO users VALUES (2, 'bob');",
+            "INSERT INTO users VALUES (3, 'carol');",
+            "INSERT INTO posts VALUES (10, 1, 'hi');",
+            "INSERT INTO posts VALUES (11, 1, 'yo');",
+            "INSERT INTO posts VALUES (12, 2, 'sup');",
+            "INSERT INTO posts VALUES (13, 99, 'orphan');",
+        ] {
+            exec(s, &mut c, bp.clone()).unwrap();
+        }
+        (c, bp, dir)
+    }
+
+    fn name_title(rs: &[Vec<Value>]) -> Vec<(String, Option<String>)> {
+        let mut v: Vec<(String, Option<String>)> = rs.iter().map(|r| {
+            let name = match &r[0] { Value::Varchar(s) => s.clone(), _ => panic!() };
+            let title = match &r[1] {
+                Value::Varchar(s) => Some(s.clone()),
+                Value::Null => None,
+                _ => panic!()
+            };
+            (name, title)
+        }).collect();
+        v.sort();
+        v
+    }
+
+    fn two_names(rs: &[Vec<Value>]) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = rs.iter().map(|r| {
+            let a = match &r[0] {Value::Varchar(s) => s.clone(), _ => panic!()};
+            let b = match &r[1] {Value::Varchar(s) => s.clone(), _ => panic!()};
+            (a, b)
+        }).collect();
+        v.sort();
+        v
+    }
+
     fn rows(out: Outcome) -> Vec<Vec<Value>> {
         match out {
             Outcome::Rows(r) => r,
@@ -256,6 +298,80 @@ mod tests {
         let mut v: Vec<i32> = rs.iter().map(|r| match &r[0] {Value::Integer(i) => *i, _ => panic!()}).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn test_inner_join() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into())), ("bob".into(), Some("sup".into()))]);
+    }
+
+    #[test]
+    fn test_inner_join_with_keyword() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn test_join_select_star() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT * FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 3);
+        assert!(r.iter().all(|row| row.len() == 5));
+        assert!(r.iter().any(|row| row == &vec![
+            Value::Integer(1), Value::Varchar("alice".into()),
+            Value::Integer(10), Value::Integer(1), Value::Varchar("hi".into())
+        ]));
+    }
+
+    #[test]
+    fn test_join_with_where() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id WHERE u.id = 1;", &mut c, bp.clone()).unwrap());
+        assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into()))]);
+    }
+
+    #[test]
+    fn test_join_no_match() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.id;", &mut c, bp.clone()).unwrap());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_left_join() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into())), ("bob".into(), Some("sup".into())), ("carol".into(), None)]);
+    }
+    
+    #[test]
+    fn test_left_outer_keyword() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT OUTER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn test_left_no_match() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(name_title(&r), vec![("alice".into(), None), ("bob".into(), None), ("carol".into(), None)]);
+    }
+
+    #[test]
+    fn test_self_join() {
+        let (mut c, bp, _d) = seed_join();
+        let r = rows(exec("SELECT a.name, b.name FROM users a JOIN users b ON a.id = b.id;", &mut c, bp.clone()).unwrap());
+        assert_eq!(two_names(&r), vec![("alice".into(), "alice".into()), ("bob".into(), "bob".into()), ("carol".into(), "carol".into())]);
+    }
+
+    #[test]
+    fn test_unsupported_join_type_error() {
+        let (mut c, bp, _d) = seed_join();
+        assert!(exec("SELECT u.name, p.title FROM users u RIGHT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).is_err());
     }
 
     #[test]
