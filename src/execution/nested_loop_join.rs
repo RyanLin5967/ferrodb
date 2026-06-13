@@ -9,14 +9,13 @@ pub struct NestedLoopJoin {
     pub cur_left: Option<(RecordId, Vec<Value>)>,
     pub right_idx: usize,
     pub left_matched: bool, // for left/full 
-    pub left_width: usize, // future null padding
-    pub right_width: usize,
+    pub right_width: usize, // future null padding
 }
 
 impl NestedLoopJoin {
 
-    pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, on: BoundExpr, join_type: JoinType, left_width: usize, right_width: usize) -> Self {
-        Self { left, right, on, right_rows: None, join_type, cur_left: None, right_idx: 0, left_matched: false, left_width, right_width }
+    pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, on: BoundExpr, join_type: JoinType, right_width: usize) -> Self {
+        Self { left, right, on, right_rows: None, join_type, cur_left: None, right_idx: 0, left_matched: false, right_width }
     }
 
     pub fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>>{
@@ -58,7 +57,7 @@ impl NestedLoopJoin {
                     Err(e) => return Some(Err(e))
                 }
             }
-            
+
             self.cur_left = None;
             if matches!(self.join_type, JoinType::Left) && !self.left_matched {
                 let mut combined = left_vals;
