@@ -162,3 +162,38 @@ Binder:
 - emits bound tree where names are replaced with indexes
 - will use global column index to catch column naming errors
 - will emit a logical plan for the optimizer to turn into physical operators + a bound output schema for row layout, column names
+
+Query optimization:
+- logical plan goes into optimizer, which uses catalog to get schema info + statistics 
+- optimizer also consults cost model which has stuff like magic constants to determine best path
+- then optimizer creates physical plan (which tells executor how to execute query)
+- no matter how "weird" a query might be the optimizer should still output a reasonable plan
+- optimizer can kep track of things like whether a col has an index, or if the data is sorted (for ORDER BY, merge join), etc. so 
+- top down optimization approach (DFS like, DP + memoization)
+- as you traverse down you keep track of best plan you've seen so far, if one path has higher cost, eliminate
+- will only take a single query and create a physical pan for that (not multiple)
+- rule and cost based aren't mutually exclusive, both 
+- Rule based (easy but relies on magic constants and impossible to give good plans for complex queries):
+    - optimizer will be able to permute operators in the logical plan , then determine wether one is better than the other (must be equivalent)
+    - also have transformations: logical op -> physical op or  logical -> logical that we think will lead to a better result
+    - generate alternatives via transformation that follow relational algebra equivalences
+    - can switch around filter (one is more selective than other), break down predicates into conjunctive clauses, then move around
+    commutative/associative joins (only INNER). never do cross joins unless forced
+    - push down predicate/limit/projection
+    - many many many possible rules to apply
+    - search algorithm to look over possible enumerations, what transformations to apply/not apply, when to terminate (exhausted, time/cost threshold/transformation count (best)), 
+- Cost based:
+    - cost model makes an educated guess on the "cost" of a query plan 
+    - predict cpu cycles, how much i/o (and seq vs random), ram consumption. depends heavily on hardware & magic constants
+    - estimate output size per operator (relies on statistics on db)
+    - column and table stats
+    - statistics will be stored in memory for simplicity
+    - they're emited by every operator (output cardinality + (V and min/max) per column)
+    - if no statists, fallback to magic constants
+    - store: N_R (number of tuples in R), V(A,R) (num distinct values for attribute A), min/max
+    - selection cardinality is used to determine the number of tuples that will be selected for a given output (too many to put here)
+    - use selectivity formulas for computing estimated cost for different operations 
+    - clamp selectivity to [0, 1], floor cardinality at 1
+    - equi-depth histograms so buckets have roughly same amount of elements
+    - cardinality estimations need to be good cuz errors compound
+    - selectivity assumes: uniform data, independent predicates, containment principle (join keys will overlap)
