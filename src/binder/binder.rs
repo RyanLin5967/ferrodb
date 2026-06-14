@@ -1,4 +1,4 @@
-use crate::{catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{Expr, JoinClause, JoinType, Stmt, TableRef}, scanner::TokenType}};
+use crate::{catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{Expr, JoinClause, Stmt, TableRef}, scanner::TokenType}, planner::logical_plan::LogicalPlan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
@@ -88,50 +88,6 @@ impl Scope {
     }
 }
 
-pub enum LogicalPlan {
-    Scan {
-        table: String,
-        alias: Option<String>,
-        output: Vec<BoundColumn>,
-    },
-    Join {
-        left: Box<LogicalPlan>,
-        right: Box<LogicalPlan>,
-        join_type: JoinType,
-        on: BoundExpr,
-    },
-    Filter {
-        input: Box<LogicalPlan>,
-        predicate: BoundExpr,
-    },
-    Projection {
-        input: Box<LogicalPlan>,
-        exprs: Vec<BoundExpr>,
-        output: Vec<BoundColumn>,
-    }
-}
-
-impl LogicalPlan {
-    // combine columns 
-    pub fn output_schema(&self) -> Vec<BoundColumn> {
-        match self {
-            LogicalPlan::Filter { input, .. } => {
-                input.output_schema()
-            }
-            LogicalPlan::Join { left, right, .. } => {
-                let mut cols = left.output_schema();
-                cols.extend(right.output_schema());
-                cols
-            }
-            LogicalPlan::Projection {  output, .. } => {
-                output.clone()
-            }  
-            LogicalPlan::Scan { output, .. } => {
-                output.clone()
-            }
-        }
-    }
-}
 pub struct Binder<'a> {
     catalog: &'a Catalog,
 }
@@ -287,7 +243,7 @@ impl<'a> Binder<'a> {
 mod tests {
 
     use crate::catalog::column::Column;
-    use crate::parser::parser::Parser;
+    use crate::parser::parser::{JoinType, Parser};
     use crate::parser::scanner::Scanner;
     use crate::{buffer::buffer_pool::BufferPoolManager, storage::disk_manager::DiskManager};
     use super::*;
