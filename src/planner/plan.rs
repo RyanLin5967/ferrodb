@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, LogicalPlan, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, nested_loop_join::NestedLoopJoin, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{JoinType, Stmt}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, nested_loop_join::NestedLoopJoin, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{JoinType, Stmt}, planner::logical_plan::LogicalPlan, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::sync::Arc;
 use crate::execution::executor::Modify;
 
