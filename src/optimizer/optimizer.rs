@@ -1,6 +1,6 @@
 use std::{ops::Bound, sync::Arc};
 
-use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, parser::{parser::JoinType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 
 // 1:1 for now
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
@@ -65,34 +65,5 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) 
             let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
             Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper}))
         }
-    }
-}
-
-pub fn predicate_to_bounds(pred: &BoundExpr) -> Option<(usize, Bound<Value>, Bound<Value>)> {
-    let BoundExpr::BinaryOp { left, operator, right } = pred else { return None; };
-    let (col, op, val) = match (&**left, &**right) {
-        (BoundExpr::Column(c), BoundExpr::Literal(v)) => (*c, *operator, v.clone()),
-        (BoundExpr::Literal(v), BoundExpr::Column(c)) => (*c, flip(*operator)?, v.clone()),
-        _ => return None
-    };
-    let (lower, upper) = match op {
-        TokenType::Equal => (Bound::Included(val.clone()), Bound::Included(val)),
-        TokenType::Less => (Bound::Unbounded, Bound::Excluded(val)),
-        TokenType::LessEqual => (Bound::Unbounded, Bound::Included(val)),
-        TokenType::Greater => (Bound::Excluded(val), Bound::Unbounded),
-        TokenType::GreaterEqual => (Bound::Included(val), Bound::Unbounded),
-        _ => return None
-    };
-    Some((col, lower, upper))
-}
-
-fn flip(op: TokenType) -> Option<TokenType> {
-    match op {
-        TokenType::Less => Some(TokenType::Greater),
-        TokenType::LessEqual => Some(TokenType::GreaterEqual),
-        TokenType::Greater => Some(TokenType::Less),
-        TokenType::GreaterEqual => Some(TokenType::LessEqual),
-        TokenType::Equal => Some(TokenType::Equal),
-        _ => return None
     }
 }

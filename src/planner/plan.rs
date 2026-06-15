@@ -1,5 +1,5 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize}, parser::parser::Stmt, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
-use std::sync::Arc;
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
 pub enum Plan {
@@ -96,4 +96,149 @@ fn single_table_scope(catalog: &Catalog, table: &str) -> Result<Scope, FerroErro
     let mut scope = Scope::new();
     scope.add_table(table, &entry.schema)?;
     Ok(scope)
+}
+
+pub fn predicate_to_bounds(pred: &BoundExpr) -> Option<(usize, Bound<Value>, Bound<Value>)> {
+    let BoundExpr::BinaryOp { left, operator, right } = pred else { return None; };
+    let (col, op, val) = match (&**left, &**right) {
+        (BoundExpr::Column(c), BoundExpr::Literal(v)) => (*c, *operator, v.clone()),
+        (BoundExpr::Literal(v), BoundExpr::Column(c)) => (*c, flip(*operator)?, v.clone()),
+        _ => return None
+    };
+    let (lower, upper) = match op {
+        TokenType::Equal => (Bound::Included(val.clone()), Bound::Included(val)),
+        TokenType::Less => (Bound::Unbounded, Bound::Excluded(val)),
+        TokenType::LessEqual => (Bound::Unbounded, Bound::Included(val)),
+        TokenType::Greater => (Bound::Excluded(val), Bound::Unbounded),
+        TokenType::GreaterEqual => (Bound::Included(val), Bound::Unbounded),
+        _ => return None
+    };
+    Some((col, lower, upper))
+}
+
+fn flip(op: TokenType) -> Option<TokenType> {
+    match op {
+        TokenType::Less => Some(TokenType::Greater),
+        TokenType::LessEqual => Some(TokenType::GreaterEqual),
+        TokenType::Greater => Some(TokenType::Less),
+        TokenType::GreaterEqual => Some(TokenType::LessEqual),
+        TokenType::Equal => Some(TokenType::Equal),
+        _ => return None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+
+use tempfile::tempdir;
+
+use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager};
+    use super::*;
+
+    fn run_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let stmts = p.parse();
+        for stmt in stmts {
+            run(stmt, catalog, bp.clone()).unwrap();
+        }
+    }
+
+    fn setup() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plan.db");
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        run_sql("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut catalog, bp.clone());
+        for s in [
+            "INSERT INTO users VALUES (1, 'a');",
+            "INSERT INTO users VALUES (2, 'b');",
+            "INSERT INTO users VALUES (3, 'c');",
+            "INSERT INTO users VALUES (4, 'd');",
+            "INSERT INTO users VALUES (5, 'e');",
+        ] {
+            run_sql(s, &mut catalog, bp.clone());
+        }
+        (catalog, bp, dir)
+    }
+
+    fn col_op_lit(c: usize, op: TokenType, v: Value) -> BoundExpr {
+        BoundExpr::BinaryOp{ left:Box::new(BoundExpr::Column(c)), operator: op, right: Box::new(BoundExpr::Literal(v))}
+    }
+
+    fn drain(mut exec: Box<dyn Executor>) -> Vec<Vec<Value>> {
+        let mut output = Vec::new();
+        while let Some(r) = exec.next() {
+            output.push(r.unwrap().1);
+        }
+        output
+    }
+
+    #[test]
+    fn test_bounds_basic() {
+        assert_eq!(predicate_to_bounds(&col_op_lit(0, TokenType::Equal, Value::Integer(5))), Some((0, Bound::Included(Value::Integer(5)), Bound::Included(Value::Integer(5)))));
+        assert_eq!(predicate_to_bounds(&col_op_lit(2, TokenType::Less, Value::Integer(10))), Some((2, Bound::Unbounded, Bound::Excluded(Value::Integer(10)))));
+        assert_eq!(predicate_to_bounds(&col_op_lit(1, TokenType::GreaterEqual, Value::Integer(3))), Some((1, Bound::Included(Value::Integer(3)), Bound::Unbounded)));
+    }
+
+    #[test]
+    fn test_bounds_flipped() {
+        let pred = BoundExpr::BinaryOp { left: Box::new(BoundExpr::Literal(Value::Integer(5))), operator: TokenType::Less, right: Box::new(BoundExpr::Column(0)) };
+        assert_eq!(predicate_to_bounds(&pred), Some((0, Bound::Excluded(Value::Integer(5)), Bound::Unbounded)));
+    }
+
+    #[test]
+    fn test_bounds_invalid() {
+        assert_eq!(predicate_to_bounds(&col_op_lit(0, TokenType::BangEqual, Value::Integer(0))), None);
+        let pred = BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::Less, right: Box::new(BoundExpr::Column(0)) };
+        assert_eq!(predicate_to_bounds(&pred), None);
+        assert_eq!(predicate_to_bounds(&BoundExpr::Literal(Value::Integer(1))), None);
+    }
+
+    #[test]
+    fn test_index_scan_point() {
+        let (c, bp, _d) = setup();
+        let plan= PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(2)) };
+        let rows = drain(lower(plan, &c, bp).unwrap());
+        assert_eq!(rows, vec![vec![Value::Integer(2), Value::Varchar("b".into())]]);
+    }
+
+    #[test]
+    fn test_index_scan_range() {
+        let (c, bp, _d) = setup();
+        let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(4)) };
+        let rows = drain(lower(plan, &c, bp).unwrap());
+        assert_eq!(rows, vec![
+            vec![Value::Integer(2), Value::Varchar("b".into())], 
+            vec![Value::Integer(3), Value::Varchar("c".into())], 
+            vec![Value::Integer(4), Value::Varchar("d".into())]]);
+    }
+
+    #[test]
+    fn test_index_scan_unbounded() {
+        let (c, bp, _d) = setup();
+        let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(3)), upper: Bound::Unbounded };
+        let rows = drain(lower(plan, &c, bp).unwrap());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_index_scan_secondary_equality() {
+        let (mut c, bp, _d) = setup();
+        run_sql("CREATE INDEX idk ON users (name);", &mut c, bp.clone());
+        let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Included(Value::Varchar("c".into())), upper: Bound::Included(Value::Varchar("c".into())) };
+        let rows = drain(lower(plan, &c, bp).unwrap());
+        assert_eq!(rows, vec![vec![Value::Integer(3), Value::Varchar("c".into())]])
+    }
+
+    #[test]
+    fn test_index_scan_secondary_rejects_strict_lower() {
+        let (mut c, bp, _d) = setup();
+        run_sql("CREATE INDEX idk ON users (name);", &mut c, bp.clone());
+        let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
+        assert!(lower(plan, &c, bp).is_err()); // todo: composite bound handling 
+    }
 }
