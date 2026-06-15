@@ -1,4 +1,6 @@
-use crate::{binder::binder::BoundExpr, parser::parser::JoinType};
+use std::ops::Bound;
+
+use crate::{binder::binder::BoundExpr, catalog::column::Value, parser::parser::JoinType};
 
 pub enum PhysicalPlan {
     SeqScan {table: String},
@@ -14,5 +16,11 @@ pub enum PhysicalPlan {
         predicate: BoundExpr,
     },
     Projection { input: Box<PhysicalPlan>, exprs: Vec<BoundExpr>},
+    IndexScan {
+        table: String,
+        column: usize,
+        lower: Bound<Value>,
+        upper: Bound<Value>
+    }
 }
 
