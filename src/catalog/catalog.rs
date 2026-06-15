@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog_page::{CatalogPage, IndexInfo, TableEntry};
+use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::storage::index::BPlusTreeManager;
@@ -14,6 +15,7 @@ pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
     pub buffer_pool: Arc<BufferPoolManager>,
     pub first_catalog_page_id: u32,
+    pub stats: HashMap<String, TableStats>,
 }
 
 impl Catalog {
@@ -25,11 +27,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new()})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new()};
         catalog.load()?;
         Ok(catalog)
     }
@@ -200,6 +202,38 @@ impl Catalog {
             }
             curr_page_id = cat_page.next_catalog_page;
         }
+        Ok(())
+    }
+
+    pub fn analyse(&mut self, table: &str) -> Result<(), FerroError> {
+        let entry = self.tables.get(table).ok_or(FerroError::KeyNotFound)?;
+        let num_cols = entry.schema.columns.len();
+        let hfm = HeapFileManager::open(entry.first_directory_page_id, self.buffer_pool.clone());
+        let mut row_count: usize = 0;
+        let mut per_col: Vec<Vec<Value>> = vec![Vec::new(); num_cols];
+        let mut nulls = vec![0usize; num_cols];
+
+        for item in hfm.scan() {
+            let (_, tuple) = item?;
+            let vals = tuple.deserialize(&entry.schema)?;
+            row_count += 1;
+            for (i, v) in vals.into_iter().enumerate() {
+                if matches!(v, Value::Null) {
+                    nulls[i] += 1;
+                } else {
+                    per_col[i].push(v);
+                }
+            }
+        }
+
+        let columns: Vec<ColumnStats> = per_col.into_iter().enumerate().map(|(i, mut vals)| {
+            vals.sort();
+            let min = vals.first().cloned();
+            let max = vals.first().cloned();
+            vals.dedup();
+            ColumnStats {distinct: vals.len(), nulls: nulls[i], min, max}
+        }).collect();
+        self.stats.insert(table.to_string(), TableStats { row_count, columns});
         Ok(())
     }
 }
