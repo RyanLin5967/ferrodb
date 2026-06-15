@@ -7,3 +7,4 @@ pub mod execution;
 pub mod planner;
 pub mod cli;
 pub mod binder;
+pub mod optimizer;
