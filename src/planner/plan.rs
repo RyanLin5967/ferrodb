@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, nested_loop_join::NestedLoopJoin, projection::Projection, seq_scan::SeqScan, update::Update}, parser::parser::{JoinType, Stmt}, planner::logical_plan::LogicalPlan, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize}, parser::parser::Stmt, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::sync::Arc;
 use crate::execution::executor::Modify;
 
@@ -14,7 +14,8 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
         // for now always use seq scan
         Stmt::Select { .. } => { // JOIN
             let logical = Binder::new(catalog).bind(stmt)?;
-            Ok(Plan::Read(lower(logical, catalog, bp)?))
+            let physical = optimize(logical, catalog)?;
+            Ok(Plan::Read(lower(physical, catalog, bp)?))
         }
         Stmt::Delete { table, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
@@ -88,36 +89,6 @@ fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPo
         node = Box::new(Filter { child: node, predicate: pred})
     }
     Ok(node)
-}
-
-fn lower(plan: LogicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
-    match plan {
-        LogicalPlan::Filter { input, predicate } => {
-            let child = lower(*input, catalog, bp)?;
-            Ok(Box::new(Filter{child, predicate}))
-        }
-        LogicalPlan::Join { left, right, join_type, on } => {
-            let right_width = right.output_schema().len();
-            match join_type {
-                JoinType::Inner | JoinType::Left => {
-                    let left_exec = lower(*left, catalog, bp.clone())?;
-                    let right_exec = lower(*right, catalog, bp)?;
-                    Ok(Box::new(NestedLoopJoin::new(left_exec, right_exec, on, join_type, right_width)))
-                }
-                _ => Err(FerroError::Bind("right/full not implemented yet".into()))
-            }
-        }
-        LogicalPlan::Projection { input, exprs, .. } => {
-            let child = lower(*input, catalog, bp)?;
-            Ok(Box::new(Projection {child, exprs}))
-        }
-        LogicalPlan::Scan { table, .. } => {
-            let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
-            let heap = HeapFileManager::open(entry.first_directory_page_id, bp);
-            let scanner = heap.scan();
-            Ok(Box::new(SeqScan {scanner, schema: entry.schema.clone()}))
-        }
-    }
 }
 
 fn single_table_scope(catalog: &Catalog, table: &str) -> Result<Scope, FerroError> {
