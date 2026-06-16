@@ -301,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn test_analyse_basic() {
+    fn test_analyze_basic() {
         let (mut c, _bp, _d) = seed();
-        c.analyse("users").unwrap();
+        c.analyze("users").unwrap();
         let stats = c.stats.get("users").unwrap();
         assert_eq!(stats.row_count, 3);
         assert_eq!(stats.columns[0].distinct, 3);
@@ -318,13 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn test_analyse_nulls_duplicates() {
+    fn test_analyze_nulls_duplicates() {
         let (mut c, bp, _d) = setup();
         exec("CREATE TABLE t (id INTEGER NOT NULL, val INTEGER);", &mut c, bp.clone()).unwrap();
         exec("INSERT INTO t VALUES (1, 10);", &mut c, bp.clone()).unwrap();
         exec("INSERT INTO t VALUES (2, 10);", &mut c, bp.clone()).unwrap();
         exec("INSERT INTO t VALUES (3, NULL);", &mut c, bp.clone()).unwrap();
-        c.analyse("t").unwrap();
+        c.analyze("t").unwrap();
         let stats = c.stats.get("t").unwrap();
 
         assert_eq!(stats.row_count, 3);
@@ -335,10 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn test_analyse_empty_table() {
+    fn test_analyze_empty_table() {
         let (mut c, bp, _d) = setup();
         exec("CREATE TABLE a (id INTEGER NOT NULL);", &mut c, bp.clone()).unwrap();
-        c.analyse("a").unwrap();
+        c.analyze("a").unwrap();
         let stats = c.stats.get("a").unwrap();
 
         assert_eq!(stats.row_count, 0);
@@ -349,9 +349,9 @@ mod tests {
     }
 
     #[test]
-    fn test_analyse_unknown_table_error() {
+    fn test_analyze_unknown_table_error() {
         let (mut c, _bp, _d) = setup();
-        assert!(c.analyse("idk").is_err());
+        assert!(c.analyze("idk").is_err());
     }
     #[test]
     fn test_inner_join() {

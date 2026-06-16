@@ -205,7 +205,7 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn analyse(&mut self, table: &str) -> Result<(), FerroError> {
+    pub fn analyze(&mut self, table: &str) -> Result<(), FerroError> {
         let entry = self.tables.get(table).ok_or(FerroError::KeyNotFound)?;
         let num_cols = entry.schema.columns.len();
         let hfm = HeapFileManager::open(entry.first_directory_page_id, self.buffer_pool.clone());
