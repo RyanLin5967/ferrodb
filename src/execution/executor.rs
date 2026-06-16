@@ -301,6 +301,59 @@ mod tests {
     }
 
     #[test]
+    fn test_analyse_basic() {
+        let (mut c, _bp, _d) = seed();
+        c.analyse("users").unwrap();
+        let stats = c.stats.get("users").unwrap();
+        assert_eq!(stats.row_count, 3);
+        assert_eq!(stats.columns[0].distinct, 3);
+        assert_eq!(stats.columns[0].nulls, 0);
+        assert_eq!(stats.columns[0].min, Some(Value::Integer(1)));
+        assert_eq!(stats.columns[0].max, Some(Value::Integer(3)));
+
+        assert_eq!(stats.columns[1].distinct, 3);
+        assert_eq!(stats.columns[1].nulls, 0);
+        assert_eq!(stats.columns[1].min, Some(Value::Varchar("alice".into())));
+        assert_eq!(stats.columns[1].max, Some(Value::Varchar("carol".into())));
+    }
+
+    #[test]
+    fn test_analyse_nulls_duplicates() {
+        let (mut c, bp, _d) = setup();
+        exec("CREATE TABLE t (id INTEGER NOT NULL, val INTEGER);", &mut c, bp.clone()).unwrap();
+        exec("INSERT INTO t VALUES (1, 10);", &mut c, bp.clone()).unwrap();
+        exec("INSERT INTO t VALUES (2, 10);", &mut c, bp.clone()).unwrap();
+        exec("INSERT INTO t VALUES (3, NULL);", &mut c, bp.clone()).unwrap();
+        c.analyse("t").unwrap();
+        let stats = c.stats.get("t").unwrap();
+
+        assert_eq!(stats.row_count, 3);
+        assert_eq!(stats.columns[1].distinct, 1);
+        assert_eq!(stats.columns[1].nulls, 1);
+        assert_eq!(stats.columns[1].min, Some(Value::Integer(10)));
+        assert_eq!(stats.columns[1].max, Some(Value::Integer(10)));
+    }
+
+    #[test]
+    fn test_analyse_empty_table() {
+        let (mut c, bp, _d) = setup();
+        exec("CREATE TABLE a (id INTEGER NOT NULL);", &mut c, bp.clone()).unwrap();
+        c.analyse("a").unwrap();
+        let stats = c.stats.get("a").unwrap();
+
+        assert_eq!(stats.row_count, 0);
+        assert_eq!(stats.columns[0].distinct, 0);
+        assert_eq!(stats.columns[0].nulls, 0);
+        assert_eq!(stats.columns[0].min, None);
+        assert_eq!(stats.columns[0].max, None);
+    }
+
+    #[test]
+    fn test_analyse_unknown_table_error() {
+        let (mut c, _bp, _d) = setup();
+        assert!(c.analyse("idk").is_err());
+    }
+    #[test]
     fn test_inner_join() {
         let (mut c, bp, _d) = seed_join();
         let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
