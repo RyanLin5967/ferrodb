@@ -115,10 +115,11 @@ impl<'a> Binder<'a> {
             Stmt::CreateIndex { .. } => {
                 todo!()
             }
-            Stmt::CreateTable {.. } => {
+            Stmt::CreateTable { .. } => {
                 todo!()
             }
-            Stmt::Join {..} => todo!()
+            Stmt::Analyze { .. } => { unreachable!() }
+            Stmt::Join { .. } => todo!()
         }
     }
 

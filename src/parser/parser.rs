@@ -83,6 +83,9 @@ pub enum Stmt {
     Join {
         table: String,
         on: Expr,
+    },
+    Analyze {
+        table: String,
     }
 }
 
@@ -115,6 +118,8 @@ impl Parser {
             return self.parse_update()
         } else if self.match_token(&[TokenType::Delete]) { 
             return self.parse_delete()
+        } else if self.match_token(&[TokenType::Analyze]) {
+            return self.parse_analyze()
         } else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
@@ -315,6 +320,12 @@ impl Parser {
         Ok(Stmt::CreateIndex { index_name, table, column_name })
     }
 
+    pub fn parse_analyze(&mut self) -> Result<Stmt, FerroError> {
+        let name = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::Analyze { table: name })
+    }
+
     pub fn parse_table_ref(&mut self) -> Result<TableRef, FerroError> {
         let name = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
         let mut alias = None;
@@ -329,6 +340,7 @@ impl Parser {
         }
         Ok(TableRef{name, alias})
     }
+
     pub fn match_token(&mut self, types: &[TokenType]) -> bool{
         for token_type in types {
             if self.check(*token_type) {
