@@ -38,6 +38,10 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Res
             catalog.create_table(table, Schema{columns})?;
             return Ok(Outcome::Ok)
         }
+        Stmt::Analyze { table } => {
+            catalog.analyze(&table)?;
+            return Ok(Outcome::Ok)
+        }
         dml => match plan(dml, catalog, bp.clone())? {
             Plan::Read(mut root) => {
                 let mut res = Vec::new();
