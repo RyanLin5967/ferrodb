@@ -229,7 +229,7 @@ impl Catalog {
         let columns: Vec<ColumnStats> = per_col.into_iter().enumerate().map(|(i, mut vals)| {
             vals.sort();
             let min = vals.first().cloned();
-            let max = vals.first().cloned();
+            let max = vals.last().cloned();
             vals.dedup();
             ColumnStats {distinct: vals.len(), nulls: nulls[i], min, max}
         }).collect();
