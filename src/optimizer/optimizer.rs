@@ -103,7 +103,7 @@ pub fn collect_columns(expr: &BoundExpr, output: &mut HashSet<usize>) {
 pub fn remap(expr: BoundExpr, offset: usize) -> BoundExpr {
     match expr {
         BoundExpr::BinaryOp { left, operator, right } => { BoundExpr::BinaryOp { left: Box::new(remap(*left, offset)), operator, right: Box::new(remap(*right, offset))} }
-        BoundExpr::UnaryOp { operator, right } => { BoundExpr::UnaryOp { operator, right: Box::new(*right) } }
+        BoundExpr::UnaryOp { operator, right } => { BoundExpr::UnaryOp { operator, right: Box::new(remap(*right, offset)) } }
         BoundExpr::Literal(v) => BoundExpr::Literal(v),
         BoundExpr::Column(i) => BoundExpr::Column(i-offset)
     }
