@@ -135,7 +135,7 @@ pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
                 } else if cols.iter().all(|&c| c < left_width) {
                     go_left.push(expr);
                 } else if cols.iter().all(|&c| c >= left_width) {
-                    go_right.push(expr);
+                    go_right.push(remap(expr, left_width));
                 } else {
                     stay.push(expr);
                 }
