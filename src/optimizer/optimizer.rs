@@ -152,3 +152,7 @@ pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
         LogicalPlan::Scan { .. } => wrap_filter(plan, carried)
     }
 }
+
+pub fn pushdown(plan: LogicalPlan) -> LogicalPlan {
+    push(plan, Vec::new())
+}
