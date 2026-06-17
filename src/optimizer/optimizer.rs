@@ -1,4 +1,4 @@
-use std::{ops::Bound, sync::Arc};
+use std::{collections::HashSet, ops::Bound, sync::Arc};
 
 use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 
@@ -78,3 +78,77 @@ pub fn split_and(expr: BoundExpr, output: &mut Vec<BoundExpr>) {
     }
 }
 
+pub fn combine_and(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
+    let mut combined = conjuncts.remove(0);
+    for conjunct in conjuncts {
+        combined = BoundExpr::BinaryOp { left: Box::new(combined), operator: TokenType::And, right: Box::new(conjunct)
+        }
+    }
+    combined
+}
+
+pub fn collect_columns(expr: &BoundExpr, output: &mut HashSet<usize>) {
+    match expr {
+        BoundExpr::BinaryOp { left, right, .. } => {
+            collect_columns(left, output);
+            collect_columns(right, output);
+        }
+        BoundExpr::UnaryOp { right, .. } => collect_columns(right, output),
+        
+        BoundExpr::Column(i) => {output.insert(*i);}
+        BoundExpr::Literal(_) => {}
+    }
+}
+
+pub fn remap(expr: BoundExpr, offset: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::BinaryOp { left, operator, right } => { BoundExpr::BinaryOp { left: Box::new(remap(*left, offset)), operator, right: Box::new(remap(*right, offset))} }
+        BoundExpr::UnaryOp { operator, right } => { BoundExpr::UnaryOp { operator, right: Box::new(*right) } }
+        BoundExpr::Literal(v) => BoundExpr::Literal(v),
+        BoundExpr::Column(i) => BoundExpr::Column(i-offset)
+    }
+}
+
+pub fn wrap_filter(plan: LogicalPlan, conjuncts: Vec<BoundExpr>) -> LogicalPlan {
+    if conjuncts.is_empty() {
+        plan
+    } else {
+        LogicalPlan::Filter { input: Box::new(plan), predicate: combine_and(conjuncts) }
+    }
+}
+
+pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let mut c = carried;
+            split_and(predicate, &mut c);
+            push(*input, c)
+        }
+        LogicalPlan::Join { left, right, join_type, on } => {
+            let left_width = left.output_schema().len();
+            let (mut go_left, mut go_right, mut stay) = (Vec::new(), Vec::new(), Vec::new());
+            for expr in carried {
+                let mut cols = HashSet::new();
+                collect_columns(&expr, &mut cols);
+                if cols.is_empty() {
+                    stay.push(expr);
+                } else if cols.iter().all(|&c| c < left_width) {
+                    go_left.push(expr);
+                } else if cols.iter().all(|&c| c >= left_width) {
+                    go_right.push(expr);
+                } else {
+                    stay.push(expr);
+                }
+            }
+
+            let joined = LogicalPlan::Join { left: Box::new(push(*left, go_left)), right: Box::new(push(*right, go_right)), join_type, on };
+            wrap_filter(joined, stay)
+        }
+        LogicalPlan::Projection { input, exprs, output } => {
+            let inner = push(*input, Vec::new());
+            let proj = LogicalPlan::Projection { input: Box::new(inner), exprs, output };
+            wrap_filter(proj, carried)
+        }
+        LogicalPlan::Scan { .. } => wrap_filter(plan, carried)
+    }
+}
