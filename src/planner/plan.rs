@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -12,8 +12,9 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
     
     match stmt {
         // for now always use seq scan
-        Stmt::Select { .. } => { // JOIN
+        Stmt::Select { .. } => {
             let logical = Binder::new(catalog).bind(stmt)?;
+            let logical = pushdown(logical);
             let physical = optimize(logical, catalog)?;
             Ok(Plan::Read(lower(physical, catalog, bp)?))
         }
