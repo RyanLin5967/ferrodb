@@ -12,7 +12,7 @@ pub struct TableRef {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JoinType { 
     Inner, 
     Left, 

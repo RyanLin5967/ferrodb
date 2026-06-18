@@ -156,3 +156,135 @@ pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
 pub fn pushdown(plan: LogicalPlan) -> LogicalPlan {
     push(plan, Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{binder::binder::BoundColumn, catalog::column::DataType};
+    use super::*;
+
+    #[test]
+    fn test_split_and_roundtrip() {
+        let expr = BoundExpr::BinaryOp { left: Box::new(
+            BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::And, right: Box::new(BoundExpr::Column(3)) }
+        ), operator: TokenType::And, right: Box::new(BoundExpr::Column(2)) };
+        let mut output: Vec<BoundExpr> = Vec::new();
+        split_and(expr, &mut output);
+        assert_eq!(output, vec![BoundExpr::Column(1), BoundExpr::Column(3), BoundExpr::Column(2) ]);
+    }
+
+    #[test]
+    fn test_combine_column() {
+        let conjuncts = vec![BoundExpr::Column(1), BoundExpr::Column(3), BoundExpr::Column(2)];
+        let expr = BoundExpr::BinaryOp { left: Box::new(
+            BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::And, right: Box::new(BoundExpr::Column(3)) }
+        ), operator: TokenType::And, right: Box::new(BoundExpr::Column(2)) };
+        let combined = combine_and(conjuncts);
+        assert_eq!(combined, expr);
+    }
+
+    #[test]
+    fn test_collect_columns() {
+        let mut output = HashSet::new();
+        let expr = BoundExpr::BinaryOp { 
+            left: Box::new(BoundExpr::UnaryOp { 
+                operator: TokenType::Not, 
+                right: Box::new(BoundExpr::Literal(Value::Varchar("idk".into()))) 
+            }), 
+            operator: TokenType::Or, 
+            right: Box::new(BoundExpr::BinaryOp { 
+                left: Box::new(BoundExpr::Column(1)), 
+                operator: TokenType::And, 
+                right: Box::new(BoundExpr::Column(3)), 
+            }), 
+        };
+        collect_columns(&expr, &mut output);
+        assert_eq!(output, HashSet::from([1, 3]))
+    }
+
+    #[test]
+    fn test_remap() {
+        let expr = BoundExpr::UnaryOp { operator: TokenType::Not, right: Box::new(BoundExpr::Column(3)) };
+        assert_eq!(remap(expr, 2), BoundExpr::UnaryOp { operator: TokenType::Not, right: Box::new(BoundExpr::Column(1)) });
+        let nested = BoundExpr::BinaryOp { 
+            left: Box::new(BoundExpr::UnaryOp { operator: TokenType::Not, right: Box::new(BoundExpr::Column(5))}), 
+            operator: TokenType::Not, 
+            right: Box::new(BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(4)), operator: TokenType::And, right: Box::new(BoundExpr::Column(3)) })
+        };
+        assert_eq!(remap(nested, 2), BoundExpr::BinaryOp { 
+            left: Box::new(BoundExpr::UnaryOp { operator: TokenType::Not, right: Box::new(BoundExpr::Column(3))}), 
+            operator: TokenType::Not, 
+            right: Box::new(BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(2)), operator: TokenType::And, right: Box::new(BoundExpr::Column(1)) })
+        })
+    }
+
+    #[test]
+    fn test_wrap_filter_empty_conjuncts() {
+        let plan = LogicalPlan::Projection { input: 
+            Box::new(LogicalPlan::Scan { table: "users".into(), alias: Some("u".into()), output: vec![]}), 
+            exprs: vec![BoundExpr::Column(1)], 
+            output: vec![BoundColumn {qualifier: "p".into(), name: "p".into(), data_type: DataType::Integer, nullable: true}]
+        };
+        let res = wrap_filter(plan.clone(), vec![]);
+        assert_eq!(res, plan);
+    }
+
+    #[test]
+    fn test_wrap_filter_non_empty_conjuncts() {
+        let plan = LogicalPlan::Projection { input: 
+            Box::new(LogicalPlan::Scan { table: "users".into(), alias: Some("u".into()), output: vec![]}), 
+            exprs: vec![BoundExpr::Column(1)], 
+            output: vec![BoundColumn {qualifier: "p".into(), name: "p".into(), data_type: DataType::Integer, nullable: true}]
+        };
+        let res = wrap_filter(plan.clone(), vec![BoundExpr::Column(1), BoundExpr::Column(2)]);
+        assert_eq!(res, LogicalPlan::Filter { input: Box::new(plan), predicate: BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::And, right: Box::new(BoundExpr::Column(2)) } })
+    }
+
+    #[test]
+    fn test_push_split_remap() {
+        let c = BoundColumn { qualifier: "t".into(), name: "x".into(), data_type: DataType::Integer, nullable: true};
+        let plan = LogicalPlan::Filter { 
+            input: Box::new(LogicalPlan::Join { 
+                left: Box::new(LogicalPlan::Scan { table: "users".into(), alias: None, output: vec![c.clone(), c.clone()]}),  
+                right: Box::new(LogicalPlan::Scan { table: "posts".into(), alias: None, output: vec![c.clone(), c.clone(), c.clone()] }), 
+                join_type: JoinType::Inner, 
+                on: BoundExpr::Literal(Value::Boolean(true))
+            }), 
+            predicate: BoundExpr::BinaryOp { 
+                left: Box::new(BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(5))) }), 
+                operator: TokenType::And, 
+                right: Box::new(BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(3)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(7))) })
+            }
+        };
+        match pushdown(plan) {
+            LogicalPlan::Join { left, right, .. } => match (*left, *right) {
+                (LogicalPlan::Filter { input: li, predicate: lp }, LogicalPlan::Filter { input: ri, predicate: rp }) => {
+                    assert_eq!(lp, BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(5))) });
+                    assert!(matches!(*li, LogicalPlan::Scan { table, .. } if table == "users"));
+                    assert_eq!(rp, BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(7))) });
+                    assert!(matches!(*ri, LogicalPlan::Scan { table, ..} if table == "posts"));
+                }   
+                _ => panic!()
+            }
+            _ => panic!()
+        }
+    }
+
+    #[test]
+    fn test_push_spanning_predicate_stays() {
+        let c = BoundColumn { qualifier: "t".into(), name: "x".into(), data_type: DataType::Integer, nullable: true};
+        let spanning = BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Greater, right: Box::new(BoundExpr::Column(3)) };
+        let plan = LogicalPlan::Join { 
+            left: Box::new(LogicalPlan::Scan { table: "users".into(), alias: None, output: vec![c.clone(), c.clone()] }), 
+            right: Box::new(LogicalPlan::Scan { table: "posts".into(), alias: None, output: vec![c.clone(), c.clone(), c.clone()] }), 
+            join_type: JoinType::Inner, 
+            on: BoundExpr::Literal(Value::Boolean(true)) 
+        };
+        match push(plan, vec![spanning.clone()]) {
+            LogicalPlan::Filter { input, predicate } => {
+                assert_eq!(predicate, spanning);
+                assert!(matches!(*input, LogicalPlan::Join{..}));
+            }
+            _ => panic!()
+        }
+    }
+}
