@@ -1,5 +1,6 @@
 use crate::{binder::binder::{BoundColumn, BoundExpr}, parser::parser::JoinType};
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum LogicalPlan {
     Scan {
         table: String,
