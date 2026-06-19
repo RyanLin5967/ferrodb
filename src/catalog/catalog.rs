@@ -236,6 +236,10 @@ impl Catalog {
         self.stats.insert(table.to_string(), TableStats { row_count, columns});
         Ok(())
     }
+
+    pub fn table_stats(&self, table: &str) -> Option<&TableStats> {
+        self.stats.get(table)
+    }
 }
 
 #[cfg(test)]
