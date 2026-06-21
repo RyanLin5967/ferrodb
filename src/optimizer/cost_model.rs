@@ -1,4 +1,4 @@
-use crate::{binder::binder::BoundExpr, catalog::{column::Value, stats::{ColumnStats, TableStats}}, parser::scanner::TokenType};
+use crate::{binder::binder::BoundExpr, catalog::{column::{DataType, Value}, schema::Schema, stats::{ColumnStats, TableStats}}, parser::scanner::TokenType, storage::disk_manager::PAGE_SIZE};
 
 // magic constants
 pub const DEFAULT_SEQ_PAGE_COST: f64 = 1.0;
@@ -81,4 +81,18 @@ fn get_val(v: &Value) -> Option<f64> {
         Value::Float(f) => Some(*f),
         _ => None
     }
+}
+
+fn row_width(schema: &Schema) -> usize {
+    schema.columns.iter().map(|c| match c.data_type {
+        DataType::Boolean => 1,
+        DataType::Float => 8,
+        DataType::Integer => 4,
+        DataType::Varchar(n) => n as usize,
+    }).sum()
+}
+
+fn num_pages(row_count: usize, schema: &Schema) -> usize {
+    let per_row = (PAGE_SIZE/row_width(schema).max(1)).max(1);
+    row_count.div_ceil(per_row)
 }
