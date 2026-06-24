@@ -123,9 +123,9 @@ pub fn cost(plan: &PhysicalPlan, catalog: &Catalog) -> Costed {
                     continue;
                 };
                 let vl = l.stats.columns.get(li).map(|cs| cs.distinct.max(1)).unwrap_or(1);
-                let vr = l.stats.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
+                let vr = r.stats.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
                 divisor *= vl.max(vr) as f64;
-                keys.push((vl, vr));
+                keys.push((li, ri));
             }
             let mut rows = (l.stats.rows * r.stats.rows/divisor).max(1.0);
             if matches!(join_type, JoinType::Left) {
