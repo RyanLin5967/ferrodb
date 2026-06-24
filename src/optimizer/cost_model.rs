@@ -294,3 +294,103 @@ fn num_pages(row_count: usize, schema: &Schema) -> usize {
     let per_row = (PAGE_SIZE/row_width(schema).max(1)).max(1);
     row_count.div_ceil(per_row)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use crate::{buffer::buffer_pool::BufferPoolManager, execution::executor::run, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
+    use super::*;
+
+    fn setup() -> (Catalog, Arc<BufferPoolManager>) {
+        let file = tempfile::tempfile().unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        (catalog, bp)
+    }
+
+    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut parser = Parser::new(tokens);
+        let stmts = parser.parse();
+        assert!(parser.errors.is_empty(), "parse errors: {:?}", parser.errors);
+        for stmt in stmts {
+            run(stmt, catalog, bp.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_cost_index_vs_seq() {
+        let (mut catalog, bp) = setup();
+        let mut sql = String::from("CREATE TABLE t (id INTEGER NOT NULL);");
+        for i in 0..2000 {
+            sql.push_str(&format!("INSERT INTO t VALUES ({});", i));
+        }
+        exec(&sql, &mut catalog, bp.clone());
+        exec("ANALYZE t;", &mut catalog, bp);
+        catalog.analyze("t").unwrap();
+        let seq = cost(&PhysicalPlan::SeqScan { table: "t".into() }, &catalog);
+        let point = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(2)) }, &catalog);
+        let big = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(67)), upper: Bound::Unbounded }, &catalog);
+        assert_eq!(point.stats.rows, 1.0);
+        assert!(point.cost < seq.cost);
+        assert!(big.cost > seq.cost);
+    }
+
+    #[test]
+    fn test_cost_secondary_over_primary() {
+        let (mut catalog, bp) = setup();
+        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone());
+        let primary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
+        let secondary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 1, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
+        assert_eq!(primary.stats.rows, secondary.stats.rows);
+        assert!(secondary.cost > primary.cost);
+    }
+
+    #[test]
+    fn test_cardinality() {
+        let (mut catalog, bp) = setup();
+        let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, age INTEGER);");
+        for i in 0..50 {
+            sql.push_str(&format!("INSERT INTO users VALUES ({}, {});", i, i%10));
+        }
+        sql.push_str("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER);");
+        for i in 0..150 {
+            sql.push_str(&format!("INSERT INTO posts VALUES ({}, {});", i, i%50));
+        }
+        exec(&sql, &mut catalog, bp.clone());
+        exec("ANALYZE users;", &mut catalog, bp.clone());
+        exec("ANALYZE posts;", &mut catalog, bp);
+        // sel = 1/10 -> 5 rows
+        let filtered = cost(&PhysicalPlan::Filter { 
+            input: Box::new(PhysicalPlan::SeqScan { table: "users".into() }), 
+            predicate: BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(1)), operator: TokenType::Equal, right: Box::new(BoundExpr::Literal(Value::Integer(0))) }
+        }, &catalog);
+        assert_eq!(filtered.stats.columns[1].distinct, 1);
+        assert!((filtered.stats.rows - 5.0).abs() < 0.0001, "{}", filtered.stats.rows);
+        assert!((filtered.stats.columns[0].distinct as f64) <= filtered.stats.rows.ceil());
+
+        let joined = cost(&PhysicalPlan::NestedLoopJoin { 
+            left: Box::new(PhysicalPlan::SeqScan { table: "users".into() }), 
+            right: Box::new(PhysicalPlan::SeqScan { table: "posts".into() }), 
+            on: BoundExpr::BinaryOp { left: Box::new(BoundExpr::Column(0)), operator: TokenType::Equal, right: Box::new(BoundExpr::Column(3)) }, 
+            join_type: JoinType::Inner, 
+            right_width: 2 
+        }, &catalog);
+
+        assert!((joined.stats.rows - 150.0).abs() < 1.0, "{}", joined.stats.rows);
+    }   
+
+    #[test]
+    fn test_fallback() {
+        let varchar_col = ColumnStats { distinct: 20, nulls: 0, min: Some(Value::Varchar("a".into())), max: Some(Value::Varchar("z".into()))};
+        let sel = bound_selectivity(&varchar_col, &Bound::Included(Value::Varchar("n".into())), &Bound::Unbounded);
+        assert_eq!(sel, DEFAULT_RANGE_SELECTIVITY);
+
+        let no_bounds = ColumnStats { distinct: 100, nulls: 0, min: None, max: None};
+        let sel = bound_selectivity(&no_bounds, &Bound::Included(Value::Integer(5)), &Bound::Unbounded);
+        assert_eq!(sel, DEFAULT_RANGE_SELECTIVITY);
+
+        let eq = bound_selectivity(&no_bounds, &Bound::Included(Value::Integer(1)), &Bound::Included(Value::Integer(1)));
+        assert!((eq - 1.0/100.0).abs() < 1e-12);
+    }
+}
