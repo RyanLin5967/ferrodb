@@ -14,10 +14,17 @@ pub const DEFAULT_SELECTIVITY: f64 = 1.0/3.0;
 pub const DEFAULT_RANGE_SELECTIVITY: f64 = 0.25;
 pub const DEFAULT_TABLE_ROWS: usize = 1000;
 pub const DEFAULT_DISTINCT: usize = 100;
+pub const DEFAULT_INDEX_FANOUT: f64 = 100.0;
+pub const DEFAULT_ENTRIES_PER_LEAF: f64 = 100.0;
 
 pub struct RelStats {
     pub rows: f64,
     pub columns: Vec<ColumnStats>,
+}
+
+pub struct Costed {
+    pub stats: RelStats,
+    pub cost: f64,
 }
 // Column(i) op Literal(v):
 // = -> 1/V(i)
@@ -64,15 +71,17 @@ pub fn selectivity(predicate: &BoundExpr, cols: &[ColumnStats]) -> f64 {
     }
 }
 
-pub fn cardinality(plan: &PhysicalPlan, catalog: &Catalog) -> RelStats {
+// cardinality + cost in one pass
+pub fn cost(plan: &PhysicalPlan, catalog: &Catalog) -> Costed {
     match plan {
         PhysicalPlan::Filter { input, predicate } => {
-            let mut in_stats = cardinality(input, catalog);
-            let sel = selectivity(predicate, &in_stats.columns);
-            let rows = (in_stats.rows * sel).max(1.0);
-            apply_equalities(&mut in_stats.columns, predicate);
-            cap_distinct(&mut in_stats.columns, rows);
-            RelStats { rows, columns: in_stats.columns }
+            let mut child = cost(input, catalog);
+            let sel = selectivity(predicate, &child.stats.columns);
+            let rows = (child.stats.rows * sel).max(1.0);
+            apply_equalities(&mut child.stats.columns, predicate);
+            cap_distinct(&mut child.stats.columns, rows);
+            let cost = child.cost + child.stats.rows * DEFAULT_CPU_TUPLE_COST;
+            Costed {stats: RelStats { rows, columns: child.stats.columns }, cost}
         }
         PhysicalPlan::IndexScan { table, column, lower, upper } => {
             let mut base = base_stats(table, catalog);
@@ -88,15 +97,21 @@ pub fn cardinality(plan: &PhysicalPlan, catalog: &Catalog) -> RelStats {
                 }
             }
             cap_distinct(&mut base.columns, rows);
-            RelStats {rows, columns: base.columns}
+            let height = tree_height(base.rows);
+            let leaf_pages = (rows/DEFAULT_ENTRIES_PER_LEAF).ceil().max(1.0);
+            let mut cost = height * DEFAULT_RANDOM_PAGE_COST + leaf_pages * DEFAULT_SEQ_PAGE_COST + rows * DEFAULT_RANDOM_PAGE_COST;
+            if *column != 0 {
+                cost += rows * DEFAULT_RANDOM_PAGE_COST;
+            }
+            Costed {stats: RelStats {rows, columns: base.columns}, cost}
         }
         PhysicalPlan::NestedLoopJoin { left, right, on, join_type, .. } => {
-            let l = cardinality(left, catalog);
-            let r = cardinality(right, catalog);
+            let l = cost(left, catalog);
+            let r = cost(right, catalog);
             let mut pairs: Vec<(usize, usize)> = Vec::new();
             equi_pairs(on, &mut pairs);
             
-            let l_width = l.columns.len();
+            let l_width = l.stats.columns.len();
             let mut divisor = 1.0;
             let mut keys: Vec<(usize, usize)> = Vec::new();
             for (a, b) in &pairs {
@@ -107,37 +122,44 @@ pub fn cardinality(plan: &PhysicalPlan, catalog: &Catalog) -> RelStats {
                 } else {
                     continue;
                 };
-                let vl = l.columns.get(li).map(|cs| cs.distinct.max(1)).unwrap_or(1);
-                let vr = l.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
+                let vl = l.stats.columns.get(li).map(|cs| cs.distinct.max(1)).unwrap_or(1);
+                let vr = l.stats.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
                 divisor *= vl.max(vr) as f64;
                 keys.push((vl, vr));
             }
-            let mut rows = (l.rows * r.rows/divisor).max(1.0);
+            let mut rows = (l.stats.rows * r.stats.rows/divisor).max(1.0);
             if matches!(join_type, JoinType::Left) {
-                rows = rows.max(l.rows);
+                rows = rows.max(l.stats.rows);
             }
-            let mut columns = l.columns.clone();
-            columns.extend(r.columns.iter().cloned());
+            let mut columns = l.stats.columns.clone();
+            columns.extend(r.stats.columns.iter().cloned());
             for (li, ri) in keys {
-                let v = l.columns[li].distinct.min(r.columns[ri].distinct).max(1);
+                let v = l.stats.columns[li].distinct.min(r.stats.columns[ri].distinct).max(1);
                 columns[li].distinct = v;
                 columns[l_width + ri].distinct = v;
             }
             cap_distinct(&mut columns, rows);
-            RelStats { rows, columns }
+            let cost = l.cost + r.cost + l.stats.rows * r.stats.rows * DEFAULT_CPU_TUPLE_COST;
+            Costed {stats: RelStats { rows, columns }, cost}
         },
         PhysicalPlan::Projection { input, exprs } => {
-            let in_stats = cardinality(input, catalog);
+            let child = cost(input, catalog);
             let columns: Vec<ColumnStats> = exprs.iter().map(|e| match e {
-                BoundExpr::Column(i) => in_stats.columns.get(*i).cloned().unwrap_or(ColumnStats { distinct: 1, nulls: 0, min: None, max: None }),
-                _ => ColumnStats { distinct: in_stats.rows.ceil().max(1.0) as usize, nulls: 0, min: None, max: None }
+                BoundExpr::Column(i) => child.stats.columns.get(*i).cloned().unwrap_or(ColumnStats { distinct: 1, nulls: 0, min: None, max: None }),
+                _ => ColumnStats { distinct: child.stats.rows.ceil().max(1.0) as usize, nulls: 0, min: None, max: None }
             }).collect();
-            RelStats { rows: in_stats.rows, columns}
+            let cost = child.cost + child.stats.rows * DEFAULT_CPU_TUPLE_COST;
+            Costed { stats: RelStats { rows: child.stats.rows, columns }, cost}
         },
-        PhysicalPlan::SeqScan { table } => base_stats(table, catalog)
-        
+        PhysicalPlan::SeqScan { table } => {
+            let stats = base_stats(table, catalog);
+            let cost = table_pages(table, catalog)*DEFAULT_SEQ_PAGE_COST + stats.rows * DEFAULT_CPU_TUPLE_COST;
+            Costed { stats, cost }
+        }
     }
 }
+
+// helpers
 
 fn range_selectivity(cs: &ColumnStats, val: &Value, less_than: bool) -> f64 {
     let (Some(min), Some(max), Some(v)) = (cs.min.as_ref().and_then(get_val), cs.max.as_ref().and_then(get_val), get_val(val)) else {
@@ -215,6 +237,23 @@ fn base_stats(table: &String, catalog: &Catalog) -> RelStats {
             RelStats {rows: DEFAULT_TABLE_ROWS as f64, columns: vec![ColumnStats {distinct: DEFAULT_DISTINCT, nulls: 0, min: None, max: None}; n]}
         }
     }
+}
+
+fn table_pages(table: &str, catalog: &Catalog) -> f64 {
+    match catalog.get_table(table) {
+        Some(e) => {
+            let row_count = catalog.table_stats(table).map(|s| s.row_count).unwrap_or(DEFAULT_TABLE_ROWS);
+            num_pages(row_count, &e.schema) as f64
+        }
+        None => (DEFAULT_TABLE_ROWS/50).max(1) as f64
+    }
+}
+
+fn tree_height(rows: f64) -> f64 {
+    if rows <= 1.0 {
+        return 1.0;
+    }
+    (rows.ln()/DEFAULT_INDEX_FANOUT.ln()).ceil().max(1.0)
 }
 
 fn cap_distinct(cols: &mut [ColumnStats], rows: f64) {
