@@ -1,11 +1,18 @@
 use std::{collections::HashSet, ops::Bound, sync::Arc};
 
-use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::cost_model::cost, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 
 // 1:1 for now
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     match lp {
-        LogicalPlan::Filter { input, predicate } => Ok(PhysicalPlan::Filter { input: Box::new(optimize(*input, catalog)?), predicate }),
+        LogicalPlan::Filter { input, predicate } => {
+            if let LogicalPlan::Scan { table, .. } = input.as_ref() {
+                if let Some(physical) = build_index_scan(table, &predicate, catalog) {
+                    return Ok(physical)
+                }
+            }
+            Ok(PhysicalPlan::Filter { input: Box::new(optimize(*input, catalog)?), predicate })
+        }
         LogicalPlan::Join { left, right, join_type, on } => match join_type {
             JoinType::Inner | JoinType::Left => {
                 let right_width = right.output_schema().len();
@@ -66,6 +73,31 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) 
             Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper}))
         }
     }
+}
+
+fn build_index_scan(table: &str, predicate: &BoundExpr, catalog: &Catalog) -> Option<PhysicalPlan> {
+    let mut conjuncts = Vec::new();
+    let entry = catalog.get_table(table)?;
+    split_and(predicate.clone(), &mut conjuncts);
+    let chosen = conjuncts.iter().position(|c| predicate_to_bounds(c).is_some_and(|(col, _, _)| has_index(entry, col)))?;
+    let index_conjunct = conjuncts.remove(chosen);
+    let (column, lower, upper) = predicate_to_bounds(&index_conjunct)?;
+    let scan = PhysicalPlan::IndexScan { table: table.into(), column, lower, upper };
+    let candidate = if conjuncts.is_empty() {
+        scan
+    } else {
+        PhysicalPlan::Filter { input: Box::new(scan), predicate: combine_and(conjuncts) }
+    };
+
+    let seq = PhysicalPlan::Filter { input: Box::new(PhysicalPlan::SeqScan { table: table.into() }), predicate: predicate.clone() };
+    if cost(&candidate, catalog).cost < cost(&seq, catalog).cost {
+        return Some(candidate)
+    }
+    Some(seq)
+}
+
+fn has_index(entry: &TableEntry, col: usize) -> bool {
+    col == 0 || entry.schema.columns.get(col).is_some_and(|c| entry.indexes.iter().any(|i| i.column_name == c.name))
 }
 
 pub fn split_and(expr: BoundExpr, output: &mut Vec<BoundExpr>) {
