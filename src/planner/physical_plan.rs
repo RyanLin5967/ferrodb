@@ -2,6 +2,7 @@ use std::ops::Bound;
 
 use crate::{binder::binder::BoundExpr, catalog::column::Value, parser::parser::JoinType};
 
+#[derive(Clone, Debug)]
 pub enum PhysicalPlan {
     SeqScan {table: String},
     NestedLoopJoin {
