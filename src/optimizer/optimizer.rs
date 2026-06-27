@@ -2,7 +2,6 @@ use std::{collections::HashSet, ops::Bound, sync::Arc};
 
 use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::cost_model::cost, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 
-// 1:1 for now
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     match lp {
         LogicalPlan::Filter { input, predicate } => {
@@ -187,6 +186,90 @@ pub fn push(plan: LogicalPlan, carried: Vec<BoundExpr>) -> LogicalPlan {
 
 pub fn pushdown(plan: LogicalPlan) -> LogicalPlan {
     push(plan, Vec::new())
+}
+
+pub fn explain_plan(plan: &PhysicalPlan, catalog: &Catalog) -> String {
+    let mut out = String::new();
+    format_node(plan, catalog, 0, &mut out);
+    out
+}    
+
+fn format_node(plan: &PhysicalPlan, catalog: &Catalog, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    let text = match plan {
+        PhysicalPlan::Filter { predicate, .. } => format!("Filter ({})", format_expr(predicate)),
+        PhysicalPlan::IndexScan { table, column, lower, upper } => format!("Index scan on {} (col {}, {})", table, column, format_bounds(lower,upper)),
+        PhysicalPlan::NestedLoopJoin {  on, join_type, .. } => format!("Nested loop join {:?} (on {})", join_type, format_expr(on)),
+        PhysicalPlan::Projection { exprs, .. } => format!("Projection [{}]", exprs.iter().map(|e| format_expr(e)).collect::<Vec<_>>().join(", ")),
+        PhysicalPlan::SeqScan { table } => format!("Sequential scan on {}", table)
+    };
+    let costed = cost(plan, catalog);
+    out.push_str(&format!("{}{} (rows={:.0} cost={:.2})\n", pad, text, costed.stats.rows, costed.cost));
+    match plan {
+        PhysicalPlan::Filter { input, .. } => format_node(input, catalog, indent + 1, out),
+        PhysicalPlan::IndexScan { .. } => {}
+        PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+            format_node(left, catalog, indent + 1, out);
+            format_node(right, catalog, indent + 1, out);
+        }
+        PhysicalPlan::Projection { input, .. } => format_node(input, catalog, indent + 1, out),
+        PhysicalPlan::SeqScan { .. } => {}
+    }
+}
+
+fn format_expr(e: &BoundExpr) -> String {
+    match e {
+        BoundExpr::BinaryOp { left, operator, right } => {
+            format!("{} {} {}", format_expr(left), op_symbol(*operator), format_expr(right))
+        }
+        BoundExpr::Column(i) => format!("#{}", i),
+        BoundExpr::UnaryOp { operator, right } => {
+            format!("{} {}", op_symbol(*operator), format_expr(right))
+        }
+        BoundExpr::Literal(v) => format_value(v)
+    }
+}
+
+fn op_symbol(op: TokenType) -> &'static str {
+    match op {
+        TokenType::Equal => "=",
+        TokenType::BangEqual => "!=",
+        TokenType::Less => "<",
+        TokenType::LessEqual => "<=",
+        TokenType::Greater => ">",
+        TokenType::GreaterEqual => ">=",
+        TokenType::And => "AND",
+        TokenType::Or => "OR",
+        TokenType::Not => "NOT",
+        _ => "?"
+    }
+}
+
+fn format_value(v: &Value) -> String {
+    match v {
+        Value::Boolean(b) => b.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Null => "NULL".into(),
+        Value::Varchar(s) => format!("'{}'", s)
+    }
+}
+
+fn format_bounds(lower: &Bound<Value>, upper: &Bound<Value>) -> String {
+    if let (Bound::Included(l), Bound::Excluded(h)) = (lower, upper) {
+        if l == h { return format!("= {}", format_value(l));}
+    }
+    let l = match lower {
+        Bound::Excluded(v) => format!("({}", format_value(v)),
+        Bound::Included(v) => format!("[{}", format_value(v)),
+        Bound::Unbounded => "(-inf".into()
+    };
+    let u = match upper {
+        Bound::Excluded(v) => format!("{})", format_value(v)),
+        Bound::Included(v) => format!("{}]", format_value(v)),
+        Bound::Unbounded => "inf)".into()
+    };
+    format!("{}, {}", l, u)
 }
 
 #[cfg(test)]

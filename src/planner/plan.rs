@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -66,6 +66,16 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
         _ => return Err(FerroError::OnlyDML)
     }
 }   
+
+pub fn explain(stmt: Stmt, catalog: &Catalog) -> Result<String, FerroError> {
+    if !matches!(stmt, Stmt::Select { .. }) {
+        return Err(FerroError::Bind("EXPLAIN only suports SELECT".into()));
+    }
+    let logical = Binder::new(catalog).bind(stmt)?;
+    let logical = pushdown(logical);
+    let physical = optimize(logical, catalog)?;
+    Ok(explain_plan(&physical, catalog))
+}
 
 // opens heapfilemanager twice (could cause errors)
 fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>), FerroError> {

@@ -86,7 +86,8 @@ pub enum Stmt {
     },
     Analyze {
         table: String,
-    }
+    },
+    Explain(Box<Stmt>)
 }
 
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
@@ -120,7 +121,9 @@ impl Parser {
             return self.parse_delete()
         } else if self.match_token(&[TokenType::Analyze]) {
             return self.parse_analyze()
-        } else if self.match_token(&[TokenType::Create]){
+        } else if self.match_token(&[TokenType::Explain]){
+            return self.parse_explain()
+        }else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
             } else if self.match_token(&[TokenType::Table]) {
@@ -324,6 +327,11 @@ impl Parser {
         let name = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
         self.consume(TokenType::Semicolon, "expected ;")?;
         Ok(Stmt::Analyze { table: name })
+    }
+
+    pub fn parse_explain(&mut self) -> Result<Stmt, FerroError> {
+        let right = self.parse_statement()?;
+        Ok(Stmt::Explain(Box::new(right)))
     }
 
     pub fn parse_table_ref(&mut self) -> Result<TableRef, FerroError> {
