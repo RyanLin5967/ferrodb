@@ -298,7 +298,7 @@ fn num_pages(row_count: usize, schema: &Schema) -> usize {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use crate::{buffer::buffer_pool::BufferPoolManager, execution::executor::run, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
+    use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::optimizer::{optimize, pushdown}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
     use super::*;
 
     fn setup() -> (Catalog, Arc<BufferPoolManager>) {
@@ -392,5 +392,31 @@ mod tests {
 
         let eq = bound_selectivity(&no_bounds, &Bound::Included(Value::Integer(1)), &Bound::Included(Value::Integer(1)));
         assert!((eq - 1.0/100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn explain_index_flip_at_volume() {
+        let (mut catalog, bp) = setup();
+        let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));");
+        for i in 0..2000 {
+            sql.push_str(&format!("INSERT INTO users VALUES ({}, 'user{}');", i, i));
+        }
+        exec(&sql, &mut catalog, bp.clone());
+        catalog.analyze("users").unwrap();
+
+        let optimize_sql = |sql: &str, catalog: &Catalog| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let stmt = Parser::new(tokens).parse().remove(0);
+            let logical = Binder::new(catalog).bind(stmt).unwrap();
+            optimize(pushdown(logical), catalog).unwrap()
+        };
+
+        let point = optimize_sql("SELECT name FROM users WHERE id = 5;", &catalog);
+        assert!(matches!(point, PhysicalPlan::Projection { input, .. }
+            if matches!(*input, PhysicalPlan::IndexScan { .. })));
+
+        let broad = optimize_sql("SELECT name FROM users WHERE id > 0;", &catalog);
+        assert!(matches!(broad, PhysicalPlan::Projection { input, .. }
+            if matches!(*input, PhysicalPlan::Filter { .. })));
     }
 }

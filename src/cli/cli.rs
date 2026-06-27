@@ -79,7 +79,8 @@ fn print_outcome(out: &Outcome) {
             println!("({} row{})", rows.len(), if rows.len() == 1 {""} else{"s"});
         }
         Outcome::Affected(n) => println!("({} row{} affected)", n, if *n == 1 {""} else {"s"}),
-        Outcome::Ok => println!("ok")
+        Outcome::Explain(s) => println!("{}", s.trim_end()),
+        Outcome::Ok => println!("ok"),
     }
 }
 

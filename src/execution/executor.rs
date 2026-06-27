@@ -8,7 +8,7 @@ use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
 use crate::parser::parser::{Stmt};
-use crate::planner::plan::{Plan, plan};
+use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
 use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
@@ -25,6 +25,7 @@ pub trait Modify {
 pub enum Outcome {
     Rows(Vec<Vec<Value>>),
     Affected(usize),
+    Explain(String),
     Ok,
 }
 
@@ -41,6 +42,10 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Res
         Stmt::Analyze { table } => {
             catalog.analyze(&table)?;
             return Ok(Outcome::Ok)
+        }
+        Stmt::Explain(s) => {
+            let text = explain(*s, catalog)?;
+            return Ok(Outcome::Explain(text));
         }
         dml => match plan(dml, catalog, bp.clone())? {
             Plan::Read(mut root) => {
