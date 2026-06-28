@@ -169,7 +169,7 @@ Query optimization:
 - then optimizer creates physical plan (which tells executor how to execute query)
 - no matter how "weird" a query might be the optimizer should still output a reasonable plan
 - optimizer can kep track of things like whether a col has an index, or if the data is sorted (for ORDER BY, merge join), etc. so 
-- top down optimization approach (DFS like, DP + memoization)
+- Selinger bottom up DP for join ordering
 - as you traverse down you keep track of best plan you've seen so far, if one path has higher cost, eliminate
 - will only take a single query and create a physical pan for that (not multiple)
 - rule and cost based aren't mutually exclusive, both 
