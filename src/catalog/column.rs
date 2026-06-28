@@ -40,10 +40,18 @@ impl Ord for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
             (Value::Null, Value::Null) => Ordering::Equal, 
-            (Value::Null, _) => Ordering::Less, // so nulls are first
-            (_, Value::Null) => Ordering::Greater,
-            _ => Ordering::Equal,
+            (a, b) => type_rank(a).cmp(&type_rank(b))
         }
+    }
+}
+
+fn type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Boolean(_) => 1,
+        Value::Integer(_) => 2,
+        Value::Float(_) => 3,
+        Value::Varchar(_) => 4,
     }
 }
 
