@@ -108,39 +108,9 @@ pub fn cost(plan: &PhysicalPlan, catalog: &Catalog) -> Costed {
         PhysicalPlan::NestedLoopJoin { left, right, on, join_type, .. } => {
             let l = cost(left, catalog);
             let r = cost(right, catalog);
-            let mut pairs: Vec<(usize, usize)> = Vec::new();
-            equi_pairs(on, &mut pairs);
-            
-            let l_width = l.stats.columns.len();
-            let mut divisor = 1.0;
-            let mut keys: Vec<(usize, usize)> = Vec::new();
-            for (a, b) in &pairs {
-                let (li, ri) = if *a < l_width && *b >= l_width{
-                    (*a, *b - l_width)
-                } else if *b < l_width && *a >= l_width {
-                    (*b, *a - l_width)
-                } else {
-                    continue;
-                };
-                let vl = l.stats.columns.get(li).map(|cs| cs.distinct.max(1)).unwrap_or(1);
-                let vr = r.stats.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
-                divisor *= vl.max(vr) as f64;
-                keys.push((li, ri));
-            }
-            let mut rows = (l.stats.rows * r.stats.rows/divisor).max(1.0);
-            if matches!(join_type, JoinType::Left) {
-                rows = rows.max(l.stats.rows);
-            }
-            let mut columns = l.stats.columns.clone();
-            columns.extend(r.stats.columns.iter().cloned());
-            for (li, ri) in keys {
-                let v = l.stats.columns[li].distinct.min(r.stats.columns[ri].distinct).max(1);
-                columns[li].distinct = v;
-                columns[l_width + ri].distinct = v;
-            }
-            cap_distinct(&mut columns, rows);
+            let stats = join_cardinality(&l.stats, &r.stats, on, join_type);
             let cost = l.cost + r.cost + l.stats.rows * r.stats.rows * DEFAULT_CPU_TUPLE_COST;
-            Costed {stats: RelStats { rows, columns }, cost}
+            Costed {stats, cost}
         },
         PhysicalPlan::Projection { input, exprs } => {
             let child = cost(input, catalog);
@@ -155,12 +125,53 @@ pub fn cost(plan: &PhysicalPlan, catalog: &Catalog) -> Costed {
             let stats = base_stats(table, catalog);
             let cost = table_pages(table, catalog)*DEFAULT_SEQ_PAGE_COST + stats.rows * DEFAULT_CPU_TUPLE_COST;
             Costed { stats, cost }
+        },
+        PhysicalPlan::HashJoin { left, right, on, join_type, .. } => {
+            let l = cost(left, catalog);
+            let r = cost(right, catalog);
+            let stats = join_cardinality(&l.stats, &r.stats, on, join_type);
+            let cost = l.cost + r.cost + (r.stats.rows + l.stats.rows + stats.rows) * DEFAULT_CPU_TUPLE_COST;
+            Costed { stats, cost }
         }
     }
 }
 
 // helpers
 
+pub fn join_cardinality(l: &RelStats, r: &RelStats, on: &BoundExpr, join_type: &JoinType) -> RelStats {
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    equi_pairs(on, &mut pairs);
+    
+    let l_width = l.columns.len();
+    let mut divisor = 1.0;
+    let mut keys: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in &pairs {
+        let (li, ri) = if *a < l_width && *b >= l_width{
+            (*a, *b - l_width)
+        } else if *b < l_width && *a >= l_width {
+            (*b, *a - l_width)
+        } else {
+            continue;
+        };
+        let vl = l.columns.get(li).map(|cs| cs.distinct.max(1)).unwrap_or(1);
+        let vr = r.columns.get(ri).map(|cs| cs.distinct.max(1)).unwrap_or(1);
+        divisor *= vl.max(vr) as f64;
+        keys.push((li, ri));
+    }
+    let mut rows = (l.rows * r.rows/divisor).max(1.0);
+    if matches!(join_type, JoinType::Left) {
+        rows = rows.max(l.rows);
+    }
+    let mut columns = l.columns.clone();
+    columns.extend(r.columns.iter().cloned());
+    for (li, ri) in keys {
+        let v = l.columns[li].distinct.min(r.columns[ri].distinct).max(1);
+        columns[li].distinct = v;
+        columns[l_width + ri].distinct = v;
+    }
+    cap_distinct(&mut columns, rows);
+    RelStats { rows, columns}
+}
 fn range_selectivity(cs: &ColumnStats, val: &Value, less_than: bool) -> f64 {
     let (Some(min), Some(max), Some(v)) = (cs.min.as_ref().and_then(get_val), cs.max.as_ref().and_then(get_val), get_val(val)) else {
         return DEFAULT_RANGE_SELECTIVITY;
@@ -189,7 +200,7 @@ fn bound_selectivity(cs: &ColumnStats, lower: &Bound<Value>, upper: &Bound<Value
     ((hi.min(max) - lo.max(min))/(max-min)).clamp(0.0, 1.0)
 }
 
-fn equi_pairs(on: &BoundExpr, out: &mut Vec<(usize, usize)>) {
+pub fn equi_pairs(on: &BoundExpr, out: &mut Vec<(usize, usize)>) {
     match on {
         BoundExpr::BinaryOp { left, operator: TokenType::And, right } => {
             equi_pairs(left, out);

@@ -22,6 +22,15 @@ pub enum PhysicalPlan {
         column: usize,
         lower: Bound<Value>,
         upper: Bound<Value>
+    },
+    HashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        on: BoundExpr,
+        join_type: JoinType,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        right_width: usize,
     }
 }
 

@@ -1,6 +1,6 @@
 use std::{collections::HashSet, ops::Bound, sync::Arc};
 
-use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::cost_model::cost, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
 
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     match lp {
@@ -15,7 +15,33 @@ pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, Ferr
         LogicalPlan::Join { left, right, join_type, on } => match join_type {
             JoinType::Inner | JoinType::Left => {
                 let right_width = right.output_schema().len();
-                Ok(PhysicalPlan::NestedLoopJoin { left: Box::new(optimize(*left, catalog)?), right: Box::new(optimize(*right, catalog)?), on, join_type, right_width })
+                let left_width = left.output_schema().len();
+                let pl = optimize(*left, catalog)?;
+                let pr = optimize(*right, catalog)?;
+                let mut pairs = Vec::new();
+                equi_pairs(&on, &mut pairs);
+                let mut left_keys = Vec::new();
+                let mut right_keys = Vec::new();
+                for (a, b) in &pairs {
+                    if *a < left_width && *b >= left_width {
+                        left_keys.push(*a);
+                        right_keys.push(*b - left_width);
+                    } else if *b < left_width && *a >= left_width {
+                        left_keys.push(*b);
+                        right_keys.push(*a - left_width);
+                    }
+                }
+
+                let lc = cost(&pl, catalog);
+                let rc = cost(&pr, catalog);
+                let jstats = join_cardinality(&lc.stats, &rc.stats, &on, &join_type);
+                let nlj_marginal = lc.stats.rows * rc.stats.rows * DEFAULT_CPU_TUPLE_COST;
+                let hash_marginal = (lc.stats.rows + rc.stats.rows + jstats.rows) * DEFAULT_CPU_TUPLE_COST;
+                if hash_marginal < nlj_marginal {
+                    Ok(PhysicalPlan::HashJoin { left: Box::new(pl), right: Box::new(pr), on, join_type, left_keys, right_keys, right_width })
+                } else {
+                    Ok(PhysicalPlan::NestedLoopJoin { left: Box::new(pl), right: Box::new(pr), on, join_type, right_width })
+                }
             }
             _ => Err(FerroError::Bind("right/full not implemented".into()))
         }
@@ -70,6 +96,11 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) 
             };
             let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
             Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper}))
+        }
+        PhysicalPlan::HashJoin { left, right, on, join_type, left_keys, right_keys, right_width } => {
+            let left_exec = lower(*left, catalog, bp.clone())?;
+            let right_exec = lower(*right, catalog, bp)?;
+            Ok(Box::new(HashJoin::new(left_exec, right_exec, on, join_type, left_keys, right_keys, right_width)))
         }
     }
 }
@@ -201,19 +232,20 @@ fn format_node(plan: &PhysicalPlan, catalog: &Catalog, indent: usize, out: &mut 
         PhysicalPlan::IndexScan { table, column, lower, upper } => format!("Index scan on {} (col {}, {})", table, column, format_bounds(lower,upper)),
         PhysicalPlan::NestedLoopJoin {  on, join_type, .. } => format!("Nested loop join {:?} (on {})", join_type, format_expr(on)),
         PhysicalPlan::Projection { exprs, .. } => format!("Projection [{}]", exprs.iter().map(|e| format_expr(e)).collect::<Vec<_>>().join(", ")),
-        PhysicalPlan::SeqScan { table } => format!("Sequential scan on {}", table)
+        PhysicalPlan::SeqScan { table } => format!("Sequential scan on {}", table),
+        PhysicalPlan::HashJoin { join_type, on, .. } => format!("Hash join {:?} (on {})", join_type, format_expr(on)),
     };
     let costed = cost(plan, catalog);
     out.push_str(&format!("{}{} (rows={:.0} cost={:.2})\n", pad, text, costed.stats.rows, costed.cost));
     match plan {
         PhysicalPlan::Filter { input, .. } => format_node(input, catalog, indent + 1, out),
         PhysicalPlan::IndexScan { .. } => {}
-        PhysicalPlan::NestedLoopJoin { left, right, .. } => {
+        PhysicalPlan::NestedLoopJoin { left, right, .. }  | PhysicalPlan::HashJoin { left, right,.. } => {
             format_node(left, catalog, indent + 1, out);
             format_node(right, catalog, indent + 1, out);
         }
         PhysicalPlan::Projection { input, .. } => format_node(input, catalog, indent + 1, out),
-        PhysicalPlan::SeqScan { .. } => {}
+        PhysicalPlan::SeqScan { .. } => {},
     }
 }
 
