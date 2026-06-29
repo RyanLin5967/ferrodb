@@ -171,7 +171,7 @@ Query optimization:
 - optimizer can kep track of things like whether a col has an index, or if the data is sorted (for ORDER BY, merge join), etc. so 
 - Selinger bottom up DP for join ordering
 - as you traverse down you keep track of best plan you've seen so far, if one path has higher cost, eliminate
-- will only take a single query and create a physical pan for that (not multiple)
+- will only take a single query and create a physical plan for that (not multiple)
 - rule and cost based aren't mutually exclusive, both 
 - Rule based (easy but relies on magic constants and impossible to give good plans for complex queries):
     - optimizer will be able to permute operators in the logical plan , then determine wether one is better than the other (must be equivalent)
