@@ -430,4 +430,33 @@ mod tests {
         assert!(matches!(broad, PhysicalPlan::Projection { input, .. }
             if matches!(*input, PhysicalPlan::Filter { .. })));
     }
+
+    #[test]
+    fn test_join_picks_hash() {
+        let (mut catalog, bp) = setup();
+        let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(255));");
+        sql.push_str("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(255));");
+        for i in 0..300 {
+            sql.push_str(&format!("INSERT INTO users VALUES ({}, 'u{}');", i, i));
+        }
+        for i in 0..600 {
+            sql.push_str(&format!("INSERT INTO posts VALUES ({}, {}, 't{}');", i, i%30, i));
+        }
+        exec(&sql, &mut catalog, bp.clone());
+        catalog.analyze("users").unwrap();
+        catalog.analyze("posts").unwrap();
+
+        let optimize_sql = |sql: &str, catalog: &Catalog| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let stmt = Parser::new(tokens).parse().remove(0);
+            let logical = Binder::new(catalog).bind(stmt).unwrap();
+            optimize(pushdown(logical), catalog).unwrap()
+        };
+        let equi = optimize_sql("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &catalog);
+        assert!(matches!(&equi, PhysicalPlan::Projection { input, .. } if matches!(**input, PhysicalPlan::HashJoin { .. })));
+
+        let non_equi = optimize_sql("SELECT u.name, p.title FROM users u JOIN posts p ON u.id > p.user_id;", &catalog);
+        assert!(matches!(&non_equi, PhysicalPlan::Projection { input, .. } if matches!(**input, PhysicalPlan::NestedLoopJoin { .. })));
+
+    }
 }

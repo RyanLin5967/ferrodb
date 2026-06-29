@@ -262,6 +262,8 @@ mod tests {
         ] {
             exec(s, &mut c, bp.clone()).unwrap();
         }
+        exec("ANALYZE users;", &mut c, bp.clone()).unwrap();
+        exec("ANALYZE posts;", &mut c, bp.clone()).unwrap();
         (c, bp, dir)
     }
 
