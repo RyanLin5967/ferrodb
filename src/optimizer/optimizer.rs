@@ -37,7 +37,7 @@ pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, Ferr
                 let jstats = join_cardinality(&lc.stats, &rc.stats, &on, &join_type);
                 let nlj_marginal = lc.stats.rows * rc.stats.rows * DEFAULT_CPU_TUPLE_COST;
                 let hash_marginal = (lc.stats.rows + rc.stats.rows + jstats.rows) * DEFAULT_CPU_TUPLE_COST;
-                if hash_marginal < nlj_marginal {
+                if !left_keys.is_empty() && hash_marginal < nlj_marginal {
                     Ok(PhysicalPlan::HashJoin { left: Box::new(pl), right: Box::new(pr), on, join_type, left_keys, right_keys, right_width })
                 } else {
                     Ok(PhysicalPlan::NestedLoopJoin { left: Box::new(pl), right: Box::new(pr), on, join_type, right_width })
