@@ -111,7 +111,7 @@ Executor
 - [x] B+ tree indexing
 - [x] SQL parser
 - [x] Query execution engine
-- [ ] Cost-based query optimizer
+- [x] Cost-based query optimizer
 - [ ] Write-ahead logging with crash recovery
 - [ ] MVCC 
 - [ ] Postgres wire protocol
