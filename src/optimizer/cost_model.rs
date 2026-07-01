@@ -306,10 +306,28 @@ fn num_pages(row_count: usize, schema: &Schema) -> usize {
     row_count.div_ceil(per_row)
 }
 
+pub fn contains_hash_join(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::HashJoin { .. } => true,
+        PhysicalPlan::NestedLoopJoin { left, right, .. } => contains_hash_join(left) | contains_hash_join(right),
+        PhysicalPlan::Projection { input, .. } | PhysicalPlan::Filter { input, .. } => contains_hash_join(input),
+        _ => false
+    }
+}
+
+pub fn contains_nlj(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::NestedLoopJoin { .. } => true,
+        PhysicalPlan::HashJoin { left, right, .. } => contains_nlj(left) | contains_nlj(right),
+        PhysicalPlan::Projection { input, .. } | PhysicalPlan::Filter { input, .. } => contains_nlj(input),
+        _ => false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::optimizer::{optimize, pushdown}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
+    use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::{optimizer::{optimize, pushdown}}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
     use super::*;
 
     fn setup() -> (Catalog, Arc<BufferPoolManager>) {
@@ -453,10 +471,9 @@ mod tests {
             optimize(pushdown(logical), catalog).unwrap()
         };
         let equi = optimize_sql("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &catalog);
-        assert!(matches!(&equi, PhysicalPlan::Projection { input, .. } if matches!(**input, PhysicalPlan::HashJoin { .. })));
+        assert!(contains_hash_join(&equi));
 
         let non_equi = optimize_sql("SELECT u.name, p.title FROM users u JOIN posts p ON u.id > p.user_id;", &catalog);
-        assert!(matches!(&non_equi, PhysicalPlan::Projection { input, .. } if matches!(**input, PhysicalPlan::NestedLoopJoin { .. })));
-
+        assert!(contains_nlj(&non_equi));
     }
 }
