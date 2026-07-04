@@ -197,3 +197,66 @@ Query optimization:
     - equi-depth histograms so buckets have roughly same amount of elements
     - cardinality estimations need to be good cuz errors compound
     - selectivity assumes: uniform data, independent predicates, containment principle (join keys will overlap)
+
+WAL + crash recovery:
+- use steal + no force policies for better runtime performance
+- ARIES protocol for crash recovery
+- write to a log (in memory) before writing log to disk
+- log must be written to disk before dirty pages are written to disk
+- <BEGIN> to mark starting point 
+- will record: transaction id, object id, before value, after value, checksum
+- when transaction is done, dbms appends <COMMIT> to the log
+- if db crashes, we have the WAL on disk so we can just follow that to restore
+- group commit optimization to batch multiple log flushes together (use a timeout)
+- also flush when log buffer is full
+- use physiological logging (log has page id and slot number)
+- redo all txns, then undo ones that didn't commit
+- will write checkpoints every 512mb of data written to the log
+- can also delete logs before a checkpoint
+- each data page contains a pageLSN (updated when txn modifies page), the system keeps track of a flushedLSN, the max LSN flushed so far
+- flushedLSN acts as a boundary where disk buffer stops and in memory log continues (updated in memory every time we write the WAL buffer to disk)
+- before a page is flushed to disk, its pageLSN <= flushedLSN. if not, the flushedLSN hasn't "caught up" to that page yet
+- if the buffer pool wants to evict a certain page but the pageLSN hasn't caught up, we can flush the other logs to disk and then evict that page
+- recLSN to record the last update to a page since it was last flushed (stored on dirty page table)
+- lastLSN to record teh latest record of a txn (stored in active transaction table)
+- master record (global LSN) is stored on disk and stores the LSN of latest checkpoint
+- when a txn commits, we write a <COMMIT> record to log and guarantees all log records up to <COMMIT> are flushed to disk
+- when commit succeeds, write TXN-END to log, indicating that no new log record that that txn will appear in the log ever again, does not need to be immediately flushed either,
+but once flushed, we can "trim" the log until the TXN-END record
+- if a txn ever aborts, we use the CLR to undo the changes 
+- CLR contains fields of a normal log + undo_nextLSN pointer (next to be undone LSN)
+- we don't need to wait for CLR to be flushed before notifying the application that the txn aborted
+- abort algorithm: 
+    - write ABORT log
+    - go through the txn's updates in reverse order. for each one:
+        - write a CLR entry to the log
+        - restore old Value
+    write TXN-END log and release locks
+- ATT (active transaction table):
+    - one entry per currently active txn (txn_id, status (running, commit, undo entry), lastLSN)
+    - once TXN-END, can remove its entry
+- DPT (dirty page table):
+    - tracks dirty pages in the bp once the checkpoint starts
+    - each page has a rec_LSN (oldest record since it was last written to disk so we know whether the page was modified before or after checkpoint)
+- use fuzzy checkpointing: we allow dbms to keep running while the system writes records for a checkpoint, now we don't have to flush dirty pages
+- ARIES recovery algorithm:
+    - 1. analysis
+        - start from last checkpoint
+        - if TXN-END, remove its transaction from ATT
+        - for all other transactions, add entry to ATT with status UNDO and on commit, change to COMMIT
+        - for update records, if a page P isn't in the DPT, then add to DPT and set P's recLSN to log records's LSN
+        - at the end, ATT identifies which txns were active at time of crash and DPT identifies dirty pages that might've not been flushed to disk
+    - 2. redo
+        - scan foward starting from smallest recLSN in DPT
+        - for each record or CLR with a LSN:
+            - redo action unless one of the following is true:
+            - target page isn't in DPT
+            - if target page is in DPT, but the record's LSN < page's recLSN. dbms doesn't need to retrive page from disk for this check
+            - if target page is in DPT, but the log record's LSN <= pageLSN. need to retrive page from disk for this check
+            - reapply logged update, set pageLSN to log record's LSN
+    - 3. undo txns that were active at time of crash 
+        - for each txn in reverse LSN order (using lastLSN):
+            - pick largest lastLSN across all transactions in the ATT
+            - traverse lastLSN's in the same order, but in reverse for how the updates happened originally
+            - write a CLR for the modification
+- add multi statement transactions later
