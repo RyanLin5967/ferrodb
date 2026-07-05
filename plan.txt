@@ -233,7 +233,7 @@ but once flushed, we can "trim" the log until the TXN-END record
         - restore old Value
     write TXN-END log and release locks
 - ATT (active transaction table):
-    - one entry per currently active txn (txn_id, status (running, commit, undo entry), lastLSN)
+    - one entry per currently active txn (txn_id, status (running, committing, aborting), lastLSN)
     - once TXN-END, can remove its entry
 - DPT (dirty page table):
     - tracks dirty pages in the bp once the checkpoint starts
