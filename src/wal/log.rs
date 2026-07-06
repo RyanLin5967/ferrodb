@@ -108,6 +108,11 @@ impl WalManager {
         Self { file, buffer, next_lsn, flushed_lsn, path }
     }
 
+    pub fn read_record(&self, lsn: u64) -> Result<RecKind, FerroError> {
+
+        todo!()
+    }
+
     // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
     pub fn append(&self, txn_id: u64, prev_lsn: u64, kind: &RecKind) -> Result<u64, FerroError> {
         let mut buffer = self.buffer.lock().unwrap();
@@ -124,6 +129,16 @@ impl WalManager {
         buffer.bytes.extend_from_slice(&crc.to_be_bytes());
         self.next_lsn.fetch_add(total_len as u64, Ordering::SeqCst);
         Ok(lsn)
+    }
+
+    pub fn flush(&self) -> Result<(), FerroError> {
+
+        Ok(())
+    }
+
+    pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
+
+        Ok(())
     }
 }
 
