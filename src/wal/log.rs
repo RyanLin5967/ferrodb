@@ -8,6 +8,7 @@ pub struct WalManager {
     pub next_lsn: AtomicU64,
     pub flushed_lsn: AtomicU64,
     pub path: PathBuf,
+    pub base_lsn: u64,
 }
 
 pub struct WalBuffer {
