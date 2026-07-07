@@ -162,6 +162,9 @@ impl WalManager {
             let mut len_buf = [0u8; 4];
             pread_all(&file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
+            if total < MIN_FRAME {
+                return Err(FerroError::Wal("incorrect record length".into()));
+            }
             let mut buf = vec![0u8; total];
             pread_all(&file, &mut buf, offset)?;
             buf
@@ -171,6 +174,10 @@ impl WalManager {
             return Err(FerroError::Wal("record too short".into()));
         }
         let rec_lsn = u64::from_be_bytes(frame[4..12].try_into().unwrap());
+        let stored = u32::from_be_bytes(frame[total - 4..total].try_into().unwrap());
+        if crc32(&frame[..total - 4]) != stored {
+            return Err(FerroError::Wal("crc doesn't match".into()));
+        }
         let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
         let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
         let kind = RecKind::deserialize(&frame[28..total-4])?;
