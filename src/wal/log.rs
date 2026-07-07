@@ -6,6 +6,7 @@ const HEADER_SIZE: usize = 16;
 const MAGIC: u32 = 0xF3_EE_DB_01;
 const VERSION: u32 = 1;
 const INITIAL_LSN: u64 = 1;
+const MIN_FRAME: usize = 33;
 
 pub struct WalManager {
     pub file: Mutex<File>,
@@ -147,7 +148,13 @@ impl WalManager {
         let frame = if lsn >= self.flushed_lsn.load(Ordering::SeqCst) {
             let buffer = self.buffer.lock().unwrap();
             let rel = (lsn - buffer.start_lsn) as usize;
+            if rel + 4 > buffer.bytes.len() {
+                return Err(FerroError::Wal("lsn past end of buffer".into()));
+            }
             let total = u32::from_be_bytes(buffer.bytes[rel..rel+4].try_into().unwrap()) as usize;
+            if total < MIN_FRAME || rel + total > buffer.bytes.len() {
+                return Err(FerroError::Wal("record goes past buffer".into()));
+            }
             buffer.bytes[rel..rel+total].to_vec()
         } else {
             let file = self.file.lock().unwrap();
@@ -160,6 +167,9 @@ impl WalManager {
             buf
         };
         let total = frame.len();
+        if total < MIN_FRAME {
+            return Err(FerroError::Wal("record too short".into()));
+        }
         let rec_lsn = u64::from_be_bytes(frame[4..12].try_into().unwrap());
         let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
         let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
