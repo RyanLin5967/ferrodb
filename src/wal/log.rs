@@ -82,6 +82,9 @@ impl RecKind {
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, FerroError> {
+        if bytes.is_empty() {
+            return Err(FerroError::Wal("empty log record".into()))
+        }
         match bytes[0] {
             0 => Ok(RecKind::Begin),
             1 => Ok(RecKind::Commit),
