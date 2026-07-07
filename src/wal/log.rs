@@ -22,6 +22,7 @@ pub struct WalBuffer {
     pub start_lsn: u64,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum RecKind {
     Begin, Commit, Abort, TxnEnd, 
     HeapInsert { dir_root: u32, page_id: u32, slot: u16, tuple: Vec<u8> },
@@ -303,5 +304,124 @@ pub fn pread_all(file: &File, buf: &mut [u8], mut offset: u64) -> Result<(), Fer
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
+    fn setup() -> (WalManager, tempfile::TempDir){
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        (WalManager::new(path).unwrap(), dir)
+    }
+
+    #[test]
+    fn test_crc32_val() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_ne!(crc32(b"123456789"), crc32(b"123456780"));
+    }
+
+    #[test]
+    fn test_reckind_roundtrip() {
+        let cases = vec![
+            RecKind::Begin, 
+            RecKind::Commit, 
+            RecKind::Abort,
+            RecKind::TxnEnd,
+            RecKind::Checkpoint,
+            RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 3, tuple: vec![4, 5, 6] },
+            RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 4, old: vec![7, 8, 9] },
+            RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![1], new: vec![4,5] },
+            RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) }
+        ];
+
+        for case in cases {
+            let mut buf = Vec::new();
+            case.serialize(&mut buf);
+            assert_eq!(RecKind::deserialize(&buf).unwrap(), case);
+        }
+    }
+
+    #[test]
+    fn test_survives_flush_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.wal");
+        let (l0, l1, l2);
+        {
+            let wal = WalManager::new(path.clone()).unwrap();
+            l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+            l1 = wal.append(1, l0, &RecKind::HeapInsert {
+                dir_root: 5, page_id: 10, slot: 2, tuple: vec![0xAA, 0xBB],
+            }).unwrap();
+            l2 = wal.append(1, l1, &RecKind::Commit).unwrap();
+            wal.flush().unwrap();
+        }
+        let wal = WalManager::new(path).unwrap();
+        let (r0, _) = wal.read_record(l0).unwrap();
+        let (r1, _) = wal.read_record(l1).unwrap();
+        let (r2, _) = wal.read_record(l2).unwrap();
+
+        assert_eq!(&r0.kind, &RecKind::Begin);
+        assert_eq!(&r1.kind, &RecKind::HeapInsert {
+            dir_root: 5, page_id: 10, slot: 2, tuple: vec![0xAA, 0xBB],
+        });
+        assert_eq!(&r2.kind, &RecKind::Commit);
+        assert_eq!(r1.prev_lsn, l0);
+        assert_eq!(r2.prev_lsn, l1);
+        assert_eq!(r1.txn_id, 1);
+    }
+
+    #[test]
+    fn test_corrupted_last_record_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.wal");
+
+        let l1;
+        {
+            let wal = WalManager::new(path.clone()).unwrap();
+            let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6] }).unwrap();
+            wal.flush().unwrap();
+        }
+
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.set_len(len - 3).unwrap();
+        drop(f);
+
+        let wal = WalManager::new(path).unwrap();
+        assert!(wal.read_record(l1).is_err());
+    }
+
+    #[test]
+    fn test_flush_up_to_stops_when_durable() {
+        let (wal, _dir) = setup();
+        let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+        wal.flush().unwrap();
+        let flushed = wal.flushed_lsn.load(Ordering::SeqCst);
+        wal.flush_up_to(l0).unwrap();
+        assert_eq!(wal.flushed_lsn.load(Ordering::SeqCst), flushed);
+    }
+
+    #[test]
+    fn test_read_buffer_before_flush() {
+        let (wal, _dir) = setup();
+        let l0 = wal.append(3, 0, &RecKind::Begin).unwrap();
+        let l1 = wal.append(3, l0, &RecKind::Abort).unwrap();
+        assert_eq!(wal.read_record(l0).unwrap().0.kind, RecKind::Begin);
+        assert_eq!(wal.read_record(l1).unwrap().0.kind, RecKind::Abort);
+    }
+
+    #[test]
+    fn test_lsns_are_monotonic() {
+        let (wal, _dir) = setup();
+        let l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+        let l1 = wal.append(1, l0, &RecKind::Abort).unwrap();
+        assert_eq!(l0, INITIAL_LSN);
+        assert!(l1 > l0);
+        assert_eq!(l1, wal.read_record(l0).unwrap().1);
+    }
+
+    #[test]
+    fn deserialize_rejects_empty_and_unknown_tag() {
+        assert!(RecKind::deserialize(&[]).is_err());
+        assert!(RecKind::deserialize(&[99]).is_err());
+    }
 }
