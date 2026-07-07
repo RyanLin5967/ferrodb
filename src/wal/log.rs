@@ -30,6 +30,13 @@ pub enum RecKind {
     Checkpoint
 }
 
+pub struct LogRecord {
+    pub lsn: u64,
+    pub prev_lsn: u64,
+    pub txn_id: u64,
+    pub kind: RecKind
+}
+
 impl RecKind {
     pub fn serialize(&self, buffer: &mut Vec<u8>) {
         match self {
@@ -136,9 +143,28 @@ impl WalManager {
         Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn, path})
     }
 
-    pub fn read_record(&self, lsn: u64) -> Result<RecKind, FerroError> {
-
-        todo!()
+    pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
+        let frame = if lsn >= self.flushed_lsn.load(Ordering::SeqCst) {
+            let buffer = self.buffer.lock().unwrap();
+            let rel = (lsn - buffer.start_lsn) as usize;
+            let total = u32::from_be_bytes(buffer.bytes[rel..rel+4].try_into().unwrap()) as usize;
+            buffer.bytes[rel..rel+total].to_vec()
+        } else {
+            let file = self.file.lock().unwrap();
+            let offset = HEADER_SIZE as u64 + (lsn - self.base_lsn);
+            let mut len_buf = [0u8; 4];
+            pread_all(&file, &mut len_buf, offset)?;
+            let total = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; total];
+            pread_all(&file, &mut buf, offset)?;
+            buf
+        };
+        let total = frame.len();
+        let rec_lsn = u64::from_be_bytes(frame[4..12].try_into().unwrap());
+        let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
+        let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
+        let kind = RecKind::deserialize(&frame[28..total-4])?;
+        Ok((LogRecord {lsn: rec_lsn, prev_lsn, txn_id, kind}, lsn + total as u64))
     }
 
     // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
