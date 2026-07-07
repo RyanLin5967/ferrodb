@@ -1,4 +1,4 @@
-use std::{fs::{File, OpenOptions}, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
 use crate::{error::FerroError, storage::disk_manager::{pread, pwrite}};
 
@@ -160,13 +160,31 @@ impl WalManager {
     }
 
     pub fn flush(&self) -> Result<(), FerroError> {
-
+        let (bytes, start_lsn) = {
+            let mut buffer = self.buffer.lock().unwrap();
+            if buffer.bytes.is_empty() {
+                return Ok(());
+            }
+            let start = buffer.start_lsn;
+            let bytes = take(&mut buffer.bytes);
+            buffer.start_lsn = bytes.len() as u64 + start;
+            (bytes, start)
+        };
+        let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn);
+        {
+            let file = self.file.lock().unwrap();
+            pwrite_all(&file, &bytes, offset)?;
+            file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
+        }
+        self.flushed_lsn.fetch_max(start_lsn + bytes.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn flush_up_to(&self, lsn: u64) -> Result<(), FerroError> {
-
-        Ok(())
+        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
+            return Ok(());
+        }
+        self.flush()
     }
 }
 
