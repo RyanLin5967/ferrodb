@@ -194,9 +194,11 @@ impl WalManager {
         body.extend_from_slice(&txn_id.to_be_bytes());
         kind.serialize(&mut body);
         let total_len = (4 + body.len() + 4) as u32;
+
+        let start = buffer.bytes.len();
         buffer.bytes.extend_from_slice(&total_len.to_be_bytes());
         buffer.bytes.extend_from_slice(&body);
-        let crc = crc32(&buffer.bytes[buffer.bytes.len()..]);
+        let crc = crc32(&buffer.bytes[start..]);
         buffer.bytes.extend_from_slice(&crc.to_be_bytes());
         self.next_lsn.fetch_add(total_len as u64, Ordering::SeqCst);
         Ok(lsn)
