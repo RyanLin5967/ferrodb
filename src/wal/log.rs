@@ -1,6 +1,11 @@
-use std::{fs::File, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::{File, OpenOptions}, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::error::FerroError;
+use crate::{error::FerroError, storage::disk_manager::{pread, pwrite}};
+
+const HEADER_SIZE: usize = 16;
+const MAGIC: u32 = 0xF3_EE_DB_01;
+const VERSION: u32 = 1;
+const INITIAL_LSN: u64 = 1;
 
 pub struct WalManager {
     pub file: Mutex<File>,
@@ -26,7 +31,6 @@ pub enum RecKind {
 }
 
 impl RecKind {
-    // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
     pub fn serialize(&self, buffer: &mut Vec<u8>) {
         match self {
             RecKind::Begin => buffer.push(0),
@@ -105,8 +109,31 @@ impl RecKind {
 }
 
 impl WalManager {
-    pub fn new(file: Mutex<File>, buffer: Mutex<WalBuffer>, path: PathBuf, next_lsn: AtomicU64, flushed_lsn: AtomicU64) -> Self {
-        Self { file, buffer, next_lsn, flushed_lsn, path }
+    pub fn new(path: PathBuf) -> Result<Self, FerroError> {
+        let file = OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| FerroError::Wal(e.to_string()))?;
+        let len = file.metadata().map_err(|e| FerroError::Wal(e.to_string()))?.len();
+
+        let base_lsn = if len == 0 {
+            let mut header = [0u8; HEADER_SIZE];
+            header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+            header[4..8].copy_from_slice(&VERSION.to_be_bytes());
+            header[8..16].copy_from_slice(&INITIAL_LSN.to_be_bytes());
+            pwrite_all(&file, &header, 0)?;
+            file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
+            INITIAL_LSN
+        } else {
+            let mut header = [0u8; HEADER_SIZE];
+            pread_all(&file, &mut header, 0)?;
+            if u32::from_be_bytes(header[0..4].try_into().unwrap()) != MAGIC {
+                return Err(FerroError::Wal("incorrect magic".into()));
+            }
+            if u32::from_be_bytes(header[4..8].try_into().unwrap()) != VERSION {
+                return Err(FerroError::Wal("incorrect wal version".into()));
+            }
+            u64::from_be_bytes(header[8..16].try_into().unwrap())
+        };
+        let next_lsn = base_lsn + len.saturating_sub(HEADER_SIZE as u64);
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn, path})
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<RecKind, FerroError> {
@@ -177,4 +204,38 @@ pub fn crc32(data: &[u8]) -> u32 {
         crc = (crc >> 8) ^ table[idx];
     }
     crc ^ 0xFFFF_FFFF
+}
+
+pub fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> Result<(), FerroError> {
+    while !buf.is_empty() {
+        match pwrite(file, buf, offset) {
+            Ok(0) => return Err(FerroError::Wal("wrote 0 bytes".into())),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) => return Err(FerroError::Wal(e.to_string()))
+        }
+    }
+    Ok(())
+}
+
+pub fn pread_all(file: &File, buf: &mut [u8], mut offset: u64) -> Result<(), FerroError>{
+    let mut total_read = 0;
+    while total_read < buf.len() {
+        match pread(file, &mut buf[total_read..], offset) {
+            Ok(0) => return Err(FerroError::Wal("eof before finished record".into())),
+            Ok(n) => {
+                total_read += n;
+                offset += n as u64;
+            }
+            Err(e) => return Err(FerroError::Wal(e.to_string()))
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
 }
