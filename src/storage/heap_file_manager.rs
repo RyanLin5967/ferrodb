@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}, wal::txn::TxnManager};
 use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
@@ -12,6 +12,8 @@ pub struct RecordId {
 pub struct HeapFileManager {
     pub buffer_pool_manager: Arc<BufferPoolManager>,
     pub first_directory_page_id: u32,
+    pub txn: Option<Arc<TxnManager>>,
+    pub txn_id: u64,
 }
 
 impl HeapFileManager {
@@ -25,7 +27,7 @@ impl HeapFileManager {
         frame.data = empty_dir.serialize();
         drop(frame);
         buffer_pool_manager.unpin_page(dir_page_id, true);
-        Ok(HeapFileManager { buffer_pool_manager, first_directory_page_id: dir_page_id})
+        Ok(HeapFileManager { buffer_pool_manager, first_directory_page_id: dir_page_id, txn: None, txn_id: 0})
     }
 
     // fetches page, reads slot, unpins
@@ -61,7 +63,12 @@ impl HeapFileManager {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
         let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
         let mut page = Page::deserialize(frame.data)?;
+        let tuple_bytes = tuple.data.clone();
         let slot_num = page.insert(tuple)?;
+        if let Some(txn) = &self.txn {
+            let lsn = txn.log_insert(self.txn_id, self.first_directory_page_id, page_id, slot_num, &tuple_bytes)?;
+            page.lsn = lsn;
+        }
         frame.data = page.serialize()?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(page_id, true);
@@ -74,9 +81,15 @@ impl HeapFileManager {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
         let mut page = Page::deserialize(frame.data)?;
+        let old_bytes = page.read(record_id.slot_num as usize)?.data;
+        let new_bytes = new_tuple.data.clone();
         let clone = Tuple::new(new_tuple.data.clone());
         match page.update(record_id.slot_num as usize, new_tuple){
             Ok(_) => {
+                if let Some(txn) = &self.txn {
+                    let lsn = txn.log_update(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes, &new_bytes)?;
+                    page.lsn = lsn;
+                }
                 frame.data = page.serialize()?;
                 drop(frame);
                 self.buffer_pool_manager.unpin_page(record_id.page_id, true);
@@ -85,6 +98,10 @@ impl HeapFileManager {
             },
             Err(FerroError::NotEnoughSpace) => {
                 page.delete(record_id.slot_num as usize)?;
+                if let Some(txn) = &self.txn {
+                    let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
+                    page.lsn = lsn;
+                }
                 frame.data = page.serialize()?;
                 drop(frame);
                 self.buffer_pool_manager.unpin_page(record_id.page_id, true);
@@ -113,7 +130,12 @@ impl HeapFileManager {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
         let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
         let mut page = Page::deserialize(frame.data)?;
+        let old_bytes = page.read(record_id.slot_num as usize)?.data;
         page.delete(record_id.slot_num as usize)?;
+        if let Some(txn) = &self.txn {
+            let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
+            page.lsn = lsn;
+        }
         frame.data = page.serialize()?;
         drop(frame);
         self.buffer_pool_manager.unpin_page(record_id.page_id, true);
@@ -143,7 +165,7 @@ impl HeapFileManager {
     }
 
     pub fn open(first_directory_page_id: u32, buffer_pool_manager: Arc<BufferPoolManager>) -> Self{
-        HeapFileManager { buffer_pool_manager, first_directory_page_id }
+        HeapFileManager { buffer_pool_manager, first_directory_page_id, txn: None, txn_id: 0 }
     }
 
     pub fn add_to_directory(&self, new_page_id: u32, free_space: u16) -> Result<(), FerroError> {
