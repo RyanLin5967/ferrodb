@@ -3,6 +3,8 @@ use std::io::Write;
 use crate::execution::executor::run;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
+use crate::wal::log::WalManager;
+use crate::wal::txn::TxnManager;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
@@ -12,6 +14,9 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
     let dm = Arc::new(DiskManager::new(file)?);
     let bp = Arc::new(BufferPoolManager::new(dm));
+    let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    // recover
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
     } else {
@@ -38,16 +43,16 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         if let Some(pos) = buffer.rfind(';') {
             let complete = buffer[..=pos].to_string();
             buffer = buffer[pos + 1..].to_string();
-            execute_sql(&complete, &mut catalog, bp.clone());
+            execute_sql(&complete, &mut catalog, bp.clone(), txn.clone());
         }
     }
-
+    wal.flush()?;
     bp.flush_all()?;
     println!("bye bye");
     Ok(())
 }
 
-fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
+fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
     let tokens = match Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens() {
         Ok(t) => t,
         Err(e) => { 
@@ -62,7 +67,7 @@ fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
         return;
     }
     for stmt in stmts {
-        match run(stmt, catalog, bp.clone()) {
+        match run(stmt, catalog, bp.clone(), txn.clone()) {
             Ok(out) => print_outcome(&out),
             Err(e) => eprintln!("error: {}", e),
         }

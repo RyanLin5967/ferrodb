@@ -327,35 +327,40 @@ pub fn contains_nlj(plan: &PhysicalPlan) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::{optimizer::{optimize, pushdown}}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager};
+    use tempfile::tempdir;
+
+use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::optimizer::{optimize, pushdown}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager, wal::{log::WalManager, txn::TxnManager}};
     use super::*;
 
-    fn setup() -> (Catalog, Arc<BufferPoolManager>) {
+    fn setup() -> (Catalog, Arc<BufferPoolManager>, Arc<TxnManager>) {
         let file = tempfile::tempfile().unwrap();
+        let dir = tempdir().unwrap();
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let catalog = Catalog::create(bp.clone()).unwrap();
-        (catalog, bp)
+        let wal = Arc::new(WalManager::new(dir.path().join("wal.test")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal, bp.clone()));
+        (catalog, bp, txn)
     }
 
-    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
+    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut parser = Parser::new(tokens);
         let stmts = parser.parse();
         assert!(parser.errors.is_empty(), "parse errors: {:?}", parser.errors);
         for stmt in stmts {
-            run(stmt, catalog, bp.clone()).unwrap();
+            run(stmt, catalog, bp.clone(), txn.clone()).unwrap();
         }
     }
 
     #[test]
     fn test_cost_index_vs_seq() {
-        let (mut catalog, bp) = setup();
+        let (mut catalog, bp, txn) = setup();
         let mut sql = String::from("CREATE TABLE t (id INTEGER NOT NULL);");
         for i in 0..2000 {
             sql.push_str(&format!("INSERT INTO t VALUES ({});", i));
         }
-        exec(&sql, &mut catalog, bp.clone());
-        exec("ANALYZE t;", &mut catalog, bp);
+        exec(&sql, &mut catalog, bp.clone(), txn.clone());
+        exec("ANALYZE t;", &mut catalog, bp, txn);
         catalog.analyze("t").unwrap();
         let seq = cost(&PhysicalPlan::SeqScan { table: "t".into() }, &catalog);
         let point = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(2)) }, &catalog);
@@ -367,8 +372,8 @@ mod tests {
 
     #[test]
     fn test_cost_secondary_over_primary() {
-        let (mut catalog, bp) = setup();
-        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone());
+        let (mut catalog, bp, txn) = setup();
+        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone(), txn);
         let primary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
         let secondary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 1, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
         assert_eq!(primary.stats.rows, secondary.stats.rows);
@@ -377,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_cardinality() {
-        let (mut catalog, bp) = setup();
+        let (mut catalog, bp, txn) = setup();
         let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, age INTEGER);");
         for i in 0..50 {
             sql.push_str(&format!("INSERT INTO users VALUES ({}, {});", i, i%10));
@@ -386,9 +391,9 @@ mod tests {
         for i in 0..150 {
             sql.push_str(&format!("INSERT INTO posts VALUES ({}, {});", i, i%50));
         }
-        exec(&sql, &mut catalog, bp.clone());
-        exec("ANALYZE users;", &mut catalog, bp.clone());
-        exec("ANALYZE posts;", &mut catalog, bp);
+        exec(&sql, &mut catalog, bp.clone(), txn.clone());
+        exec("ANALYZE users;", &mut catalog, bp.clone(), txn.clone());
+        exec("ANALYZE posts;", &mut catalog, bp, txn);
         // sel = 1/10 -> 5 rows
         let filtered = cost(&PhysicalPlan::Filter { 
             input: Box::new(PhysicalPlan::SeqScan { table: "users".into() }), 
@@ -425,12 +430,12 @@ mod tests {
 
     #[test]
     fn explain_index_flip_at_volume() {
-        let (mut catalog, bp) = setup();
+        let (mut catalog, bp, txn) = setup();
         let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));");
         for i in 0..2000 {
             sql.push_str(&format!("INSERT INTO users VALUES ({}, 'user{}');", i, i));
         }
-        exec(&sql, &mut catalog, bp.clone());
+        exec(&sql, &mut catalog, bp.clone(), txn);
         catalog.analyze("users").unwrap();
 
         let optimize_sql = |sql: &str, catalog: &Catalog| {
@@ -451,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_join_picks_hash() {
-        let (mut catalog, bp) = setup();
+        let (mut catalog, bp, txn) = setup();
         let mut sql = String::from("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(255));");
         sql.push_str("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(255));");
         for i in 0..300 {
@@ -460,7 +465,7 @@ mod tests {
         for i in 0..600 {
             sql.push_str(&format!("INSERT INTO posts VALUES ({}, {}, 't{}');", i, i%30, i));
         }
-        exec(&sql, &mut catalog, bp.clone());
+        exec(&sql, &mut catalog, bp.clone(), txn);
         catalog.analyze("users").unwrap();
         catalog.analyze("posts").unwrap();
 

@@ -257,6 +257,11 @@ impl HeapFileManager {
         }
         Ok(())
     }
+
+    pub fn set_transaction(&mut self, txn: Arc<TxnManager>, txn_id: u64) {
+        self.txn = Some(txn);
+        self.txn_id = txn_id;
+    }
 }
 
 impl RecordId {

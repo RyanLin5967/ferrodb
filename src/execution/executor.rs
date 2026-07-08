@@ -10,6 +10,7 @@ use crate::execution::index_handle::IndexHandle;
 use crate::parser::parser::{Stmt};
 use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
+use crate::wal::txn::TxnManager;
 use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
 use crate::parser::scanner::TokenType;
@@ -29,7 +30,7 @@ pub enum Outcome {
     Ok,
 }
 
-pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
+pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) -> Result<Outcome, FerroError> {
     match stmt {
         Stmt::CreateIndex { table, column_name , ..} => {
             catalog.create_index(&table, &column_name)?;
@@ -47,22 +48,45 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Res
             let text = explain(*s, catalog)?;
             return Ok(Outcome::Explain(text));
         }
-        dml => match plan(dml, catalog, bp.clone())? {
-            Plan::Read(mut root) => {
-                let mut res = Vec::new();
-                loop {
-                    let (_, values) = match root.next() {
-                        Some(Ok((r, v))) => (r, v),
-                        Some(Err(e)) => return Err(e),
-                        None =>{break;}
-                    };
-                    res.push(values);
+        dml => {
+            if matches!(dml, Stmt::Select { .. }) {
+                match plan(dml, catalog, bp.clone(), None)? {
+                    Plan::Read(mut root) => {
+                        let mut res = Vec::new();
+                        loop {
+                            let (_, values) = match root.next() {
+                                Some(Ok((r, v))) => (r, v),
+                                Some(Err(e)) => return Err(e),
+                                None =>{break;}
+                            };
+                            res.push(values);
+                        }
+                        return Ok(Outcome::Rows(res))
+                    }
+                    Plan::Write(_) => unreachable!()
                 }
-                return Ok(Outcome::Rows(res))
-            }
-            Plan::Write(mut op) => {
-                let count = op.execute(catalog)?;
-                return Ok(Outcome::Affected(count))
+            } else {
+                let txn_id = txn.begin()?;
+                let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id))) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        txn.abort(txn_id)?;
+                        return Err(e);
+                    }
+                };
+                match planned {
+                    Plan::Write(mut op) => match op.execute(catalog) {
+                        Ok(count) => {
+                            txn.commit(txn_id)?;
+                            return Ok(Outcome::Affected(count))
+                        }
+                        Err(e) => {
+                            txn.abort(txn_id)?;
+                            Err(e)
+                        }
+                    },
+                    Plan::Read(_) => unreachable!()
+                }
             }
         }
     }
@@ -207,6 +231,7 @@ mod tests {
     use crate::parser::scanner::Scanner;
     use crate::parser::parser::Parser;
     use crate::storage::disk_manager::DiskManager;
+use crate::wal::log::WalManager;
     use tempfile::tempdir;
 
     fn parse_one(sql: &str) -> Result<Stmt, FerroError> {
@@ -220,37 +245,39 @@ mod tests {
         stmts.into_iter().next().ok_or(FerroError::SqlParseError("no statement found".into()))
     }
 
-    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) -> Result<Outcome, FerroError> {
-        run(parse_one(sql)?, catalog, bp)
+    fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) -> Result<Outcome, FerroError> {
+        run(parse_one(sql)?, catalog, bp, txn)
     }
 
-    fn setup() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
+    fn setup() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir, Arc<TxnManager>) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("exec.db");
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let bp = Arc::new(BufferPoolManager::new(dm));
         let catalog = Catalog::create(bp.clone()).unwrap();
-        (catalog, bp, dir)
+        let wal = Arc::new(WalManager::new(dir.path().join("test.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal, bp.clone()));
+        (catalog, bp, dir, txn)
     } 
 
-    fn seed() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
-        let (mut c, bp, dir) = setup();
-        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone()).unwrap();
+    fn seed() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir, Arc<TxnManager>) {
+        let (mut c, bp, dir, txn) = setup();
+        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone(), txn.clone()).unwrap();
         for s in [
             "INSERT INTO users VALUES (1, 'alice');",
             "INSERT INTO users VALUES (2, 'bob');",
             "INSERT INTO users VALUES (3, 'carol');",
         ] {
-            exec(s, &mut c, bp.clone()).unwrap();
+            exec(s, &mut c, bp.clone(), txn.clone()).unwrap();
         }
-        (c, bp, dir)
+        (c, bp, dir, txn)
     }
 
-    fn seed_join() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir) {
-        let (mut c, bp, dir) = setup();
-        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone()).unwrap();
-        exec("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(50));", &mut c, bp.clone()).unwrap();
+    fn seed_join() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir, Arc<TxnManager>) {
+        let (mut c, bp, dir, txn) = setup();
+        exec("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(50));", &mut c, bp.clone(), txn.clone()).unwrap();
         for s in [
             "INSERT INTO users VALUES (1, 'alice');",
             "INSERT INTO users VALUES (2, 'bob');",
@@ -260,11 +287,11 @@ mod tests {
             "INSERT INTO posts VALUES (12, 2, 'sup');",
             "INSERT INTO posts VALUES (13, 99, 'orphan');",
         ] {
-            exec(s, &mut c, bp.clone()).unwrap();
+            exec(s, &mut c, bp.clone(), txn.clone()).unwrap();
         }
-        exec("ANALYZE users;", &mut c, bp.clone()).unwrap();
-        exec("ANALYZE posts;", &mut c, bp.clone()).unwrap();
-        (c, bp, dir)
+        exec("ANALYZE users;", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("ANALYZE posts;", &mut c, bp.clone(), txn.clone()).unwrap();
+        (c, bp, dir, txn)
     }
 
     fn name_title(rs: &[Vec<Value>]) -> Vec<(String, Option<String>)> {
@@ -313,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_analyze_basic() {
-        let (mut c, _bp, _d) = seed();
+        let (mut c, _bp, _d, _txn) = seed();
         c.analyze("users").unwrap();
         let stats = c.stats.get("users").unwrap();
         assert_eq!(stats.row_count, 3);
@@ -330,11 +357,11 @@ mod tests {
 
     #[test]
     fn test_analyze_nulls_duplicates() {
-        let (mut c, bp, _d) = setup();
-        exec("CREATE TABLE t (id INTEGER NOT NULL, val INTEGER);", &mut c, bp.clone()).unwrap();
-        exec("INSERT INTO t VALUES (1, 10);", &mut c, bp.clone()).unwrap();
-        exec("INSERT INTO t VALUES (2, 10);", &mut c, bp.clone()).unwrap();
-        exec("INSERT INTO t VALUES (3, NULL);", &mut c, bp.clone()).unwrap();
+        let (mut c, bp, _d, txn) = setup();
+        exec("CREATE TABLE t (id INTEGER NOT NULL, val INTEGER);", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO t VALUES (1, 10);", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO t VALUES (2, 10);", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO t VALUES (3, NULL);", &mut c, bp.clone(), txn).unwrap();
         c.analyze("t").unwrap();
         let stats = c.stats.get("t").unwrap();
 
@@ -347,8 +374,8 @@ mod tests {
 
     #[test]
     fn test_analyze_empty_table() {
-        let (mut c, bp, _d) = setup();
-        exec("CREATE TABLE a (id INTEGER NOT NULL);", &mut c, bp.clone()).unwrap();
+        let (mut c, bp, _d, txn) = setup();
+        exec("CREATE TABLE a (id INTEGER NOT NULL);", &mut c, bp.clone(), txn.clone()).unwrap();
         c.analyze("a").unwrap();
         let stats = c.stats.get("a").unwrap();
 
@@ -361,27 +388,27 @@ mod tests {
 
     #[test]
     fn test_analyze_unknown_table_error() {
-        let (mut c, _bp, _d) = setup();
+        let (mut c, _bp, _d, _txn) = setup();
         assert!(c.analyze("idk").is_err());
     }
     #[test]
     fn test_inner_join() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into())), ("bob".into(), Some("sup".into()))]);
     }
 
     #[test]
     fn test_inner_join_with_keyword() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 3);
     }
 
     #[test]
     fn test_join_select_star() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT * FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT * FROM users u INNER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 3);
         assert!(r.iter().all(|row| row.len() == 5));
         assert!(r.iter().any(|row| row == &vec![
@@ -392,64 +419,64 @@ mod tests {
 
     #[test]
     fn test_join_with_where() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id WHERE u.id = 1;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id WHERE u.id = 1;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into()))]);
     }
 
     #[test]
     fn test_join_no_match() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.id;", &mut c, bp.clone(), txn).unwrap());
         assert!(r.is_empty());
     }
 
     #[test]
     fn test_left_join() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(name_title(&r), vec![("alice".into(), Some("hi".into())), ("alice".into(), Some("yo".into())), ("bob".into(), Some("sup".into())), ("carol".into(), None)]);
     }
     
     #[test]
     fn test_left_outer_keyword() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT OUTER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT OUTER JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 4);
     }
 
     #[test]
     fn test_left_no_match() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT u.name, p.title FROM users u LEFT JOIN posts p ON u.id = p.id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(name_title(&r), vec![("alice".into(), None), ("bob".into(), None), ("carol".into(), None)]);
     }
 
     #[test]
     fn test_self_join() {
-        let (mut c, bp, _d) = seed_join();
-        let r = rows(exec("SELECT a.name, b.name FROM users a JOIN users b ON a.id = b.id;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed_join();
+        let r = rows(exec("SELECT a.name, b.name FROM users a JOIN users b ON a.id = b.id;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(two_names(&r), vec![("alice".into(), "alice".into()), ("bob".into(), "bob".into()), ("carol".into(), "carol".into())]);
     }
 
     #[test]
     fn test_unsupported_join_type_error() {
-        let (mut c, bp, _d) = seed_join();
-        assert!(exec("SELECT u.name, p.title FROM users u RIGHT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone()).is_err());
+        let (mut c, bp, _d, txn) = seed_join();
+        assert!(exec("SELECT u.name, p.title FROM users u RIGHT JOIN posts p ON u.id = p.user_id;", &mut c, bp.clone(), txn).is_err());
     }
 
     #[test]
     fn test_select_all() {
-        let (mut c, bp, _d) = seed();
-        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 3);
         assert_eq!(sorted_ids(&r), vec![1,2,3]);
     }
 
     #[test]
     fn test_filter() {
-        let (mut c, bp, _d) = seed();
-        let r = rows(exec("SELECT * FROM users WHERE id = 2;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        let r = rows(exec("SELECT * FROM users WHERE id = 2;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 1);
         assert_eq!(r[0][0], Value::Integer(2));
         assert_eq!(r[0][1], Value::Varchar("bob".into()));
@@ -457,15 +484,15 @@ mod tests {
 
     #[test]
     fn test_comparison_filter() {
-        let (mut c, bp, _d) = seed();
-        let r = rows(exec("SELECT * FROM users WHERE id > 1;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        let r = rows(exec("SELECT * FROM users WHERE id > 1;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(sorted_ids(&r), vec![2, 3]);
     }
 
     #[test]
     fn test_projection(){ 
-        let (mut c, bp, _d) = seed();
-        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].len(), 1);
         assert_eq!(r[0][0], Value::Varchar("alice".into()));
@@ -473,30 +500,30 @@ mod tests {
 
     #[test]
     fn test_update_then_select() {
-        let (mut c, bp, _d) = seed();
-        assert_eq!(affected(exec("UPDATE users SET name = 'ALICE' WHERE id = 1;", &mut c, bp.clone()).unwrap()), 1);
-        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        assert_eq!(affected(exec("UPDATE users SET name = 'ALICE' WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap()), 1);
+        let r = rows(exec("SELECT name FROM users WHERE id = 1;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(r[0][0], Value::Varchar("ALICE".into()));
     }
 
     #[test]
     fn test_delete_then_select() {
-        let (mut c, bp, _d) = seed();
-        assert_eq!(affected(exec("DELETE FROM users WHERE id = 2;", &mut c, bp.clone()).unwrap()), 1);
-        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone()).unwrap());
+        let (mut c, bp, _d, txn) = seed();
+        assert_eq!(affected(exec("DELETE FROM users WHERE id = 2;", &mut c, bp.clone(), txn.clone()).unwrap()), 1);
+        let r = rows(exec("SELECT * FROM users;", &mut c, bp.clone(), txn).unwrap());
         assert_eq!(sorted_ids(&r), vec![1,3]);
     }
 
     #[test]
     fn test_duplicate_primary_key_errors() {
-        let (mut c, bp, _d) = seed();
-        assert!(exec("INSERT INTO users VALUES (1, 'dup');", &mut c, bp.clone()).is_err());
+        let (mut c, bp, _d, txn) = seed();
+        assert!(exec("INSERT INTO users VALUES (1, 'dup');", &mut c, bp.clone(), txn).is_err());
     }
 
     #[test]
     fn not_null_violation_errors() {
-        let (mut c, bp, _d) = seed();
-        assert!(exec("INSERT INTO users VALUES (NULL, 'x');", &mut c, bp.clone()).is_err())
+        let (mut c, bp, _d, txn) = seed();
+        assert!(exec("INSERT INTO users VALUES (NULL, 'x');", &mut c, bp.clone(), txn).is_err())
     }
  
     #[test]
@@ -509,9 +536,11 @@ mod tests {
             let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
             let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
             let mut c = Catalog::create(bp.clone()).unwrap();
-            exec("CREATE TABLE nums (id INTEGER NOT NULL);", &mut c, bp.clone()).unwrap();
+            let wal = Arc::new(WalManager::new(dir.path().join("reopen.wal")).unwrap());
+            let txn = Arc::new(TxnManager::new(wal, bp.clone()));
+            exec("CREATE TABLE nums (id INTEGER NOT NULL);", &mut c, bp.clone(), txn.clone()).unwrap();
             for i in 0..n {
-                exec(&format!("INSERT INTO nums VALUES ({});", i), &mut c, bp.clone()).unwrap();
+                exec(&format!("INSERT INTO nums VALUES ({});", i), &mut c, bp.clone(), txn.clone()).unwrap();
             }
             bp.flush_all().unwrap();
         }

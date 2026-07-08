@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::TxnManager};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -8,7 +8,7 @@ pub enum Plan {
 }
 
 // for dml
-pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Plan, FerroError> {
+pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: Option<(Arc<TxnManager>, u64)>) -> Result<Plan, FerroError> {
     
     match stmt {
         Stmt::Select { .. } => {
@@ -19,7 +19,8 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
         }
         Stmt::Delete { table, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp.clone())?;
+            let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
+            let (heap, tree, handles) = open_table(entry, bp.clone(), txn, txn_id)?;
             let bound_where = match where_clause {
                 Some(w) => {
                     let binder = Binder::new(catalog);
@@ -34,7 +35,8 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
         }
         Stmt::Insert { table, values } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp)?;
+            let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
+            let (heap, tree, handles) = open_table(entry, bp, txn, txn_id)?;
             let binder = Binder::new(catalog);
             let empty = Scope::new();
             let mut bound_vals = Vec::with_capacity(values.len());
@@ -46,7 +48,8 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result
         }
         Stmt::Update { table, assignments, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp.clone())?;
+            let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
+            let (heap, tree, handles) = open_table(entry, bp.clone(), txn, txn_id)?;
             let binder = Binder::new(catalog);
             let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
@@ -77,8 +80,9 @@ pub fn explain(stmt: Stmt, catalog: &Catalog) -> Result<String, FerroError> {
 }
 
 // opens heapfilemanager twice (could cause errors)
-fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>), FerroError> {
-    let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, txn_id: u64) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>), FerroError> {
+    let mut heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+    heap.set_transaction(txn, txn_id);
     let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
     let mut handles = Vec::with_capacity(entry.indexes.len());
     for info in &entry.indexes {
@@ -143,15 +147,15 @@ mod tests {
 
 use tempfile::tempdir;
 
-use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager};
+use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager, wal::log::WalManager};
     use super::*;
 
-    fn run_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>) {
+    fn run_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
         let stmts = p.parse();
         for stmt in stmts {
-            run(stmt, catalog, bp.clone()).unwrap();
+            run(stmt, catalog, bp.clone(), txn.clone()).unwrap();
         }
     }
 
@@ -161,7 +165,9 @@ use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let mut catalog = Catalog::create(bp.clone()).unwrap();
-        run_sql("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut catalog, bp.clone());
+        let wal = Arc::new(WalManager::new(dir.path().join("test.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal, bp.clone()));
+        run_sql("CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR(50));", &mut catalog, bp.clone(), txn.clone());
         for s in [
             "INSERT INTO users VALUES (1, 'a');",
             "INSERT INTO users VALUES (2, 'b');",
@@ -169,8 +175,9 @@ use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner
             "INSERT INTO users VALUES (4, 'd');",
             "INSERT INTO users VALUES (5, 'e');",
         ] {
-            run_sql(s, &mut catalog, bp.clone());
+            run_sql(s, &mut catalog, bp.clone(), txn.clone());
         }
+        run_sql("CREATE INDEX idk ON users (name);", &mut catalog, bp.clone(), txn.clone());
         (catalog, bp, dir)
     }
 
@@ -237,8 +244,7 @@ use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner
 
     #[test]
     fn test_index_scan_secondary_equality() {
-        let (mut c, bp, _d) = setup();
-        run_sql("CREATE INDEX idk ON users (name);", &mut c, bp.clone());
+        let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Included(Value::Varchar("c".into())), upper: Bound::Included(Value::Varchar("c".into())) };
         let rows = drain(lower(plan, &c, bp).unwrap());
         assert_eq!(rows, vec![vec![Value::Integer(3), Value::Varchar("c".into())]])
@@ -246,8 +252,7 @@ use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner
 
     #[test]
     fn test_index_scan_secondary_rejects_strict_lower() {
-        let (mut c, bp, _d) = setup();
-        run_sql("CREATE INDEX idk ON users (name);", &mut c, bp.clone());
+        let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
         assert!(lower(plan, &c, bp).is_err()); // todo: composite bound handling 
     }
