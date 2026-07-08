@@ -11,7 +11,6 @@ pub enum Plan {
 pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Plan, FerroError> {
     
     match stmt {
-        // for now always use seq scan
         Stmt::Select { .. } => {
             let logical = Binder::new(catalog).bind(stmt)?;
             let logical = pushdown(logical);
