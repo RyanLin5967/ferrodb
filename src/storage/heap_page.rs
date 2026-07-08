@@ -162,6 +162,13 @@ impl Page {
         }
         min_offset
     }
+
+    pub fn restore_at(&mut self, slot_num: usize, data: &[u8]) -> Result<(), FerroError> {
+        self.tuples.splice(0..0, data.iter().copied());
+        self.slot_arr[slot_num].offset = PAGE_SIZE as u16 - self.tuples.len() as u16;
+        self.slot_arr[slot_num].length = data.len() as u16;
+        Ok(())
+    }
 }
 
 impl SlotEntry {
