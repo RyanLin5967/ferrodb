@@ -47,7 +47,7 @@ impl TxnManager {
     pub fn append_chained(&self, txn_id: u64, kind: &RecKind) -> Result<u64, FerroError> {
         let mut att = self.att.lock().unwrap();
         let entry = att.get_mut(&txn_id).ok_or_else(|| FerroError::Wal("txn not active".into()))?;
-        let lsn = self.wal.append(txn_id,0, kind)?;
+        let lsn = self.wal.append(txn_id,entry.last_lsn, kind)?;
         entry.last_lsn = lsn;
         Ok(lsn)
     }
