@@ -142,3 +142,124 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
     bp.unpin_page(page_id, true);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::OpenOptions};
+
+use crate::{catalog::catalog::Catalog, execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::LogRecord};
+
+use super::*;
+
+    fn setup() -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.path().join("txn.db")).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        (bp, wal, txn, dir)
+    }
+
+    fn walk_log(wal: &WalManager) -> Vec<LogRecord> {
+        let mut out = Vec::new();
+        let mut lsn = wal.base_lsn;
+        let end = wal.next_lsn.load(Ordering::SeqCst);
+        while lsn < end {
+            let (rec, next) = wal.read_record(lsn).unwrap();
+            out.push(rec);
+            lsn = next;
+        }
+        out
+    }
+
+    #[test]
+    fn test_commit_writes_chain_and_flushes() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        heap.insert(Tuple::new(vec![1,2,3,4])).unwrap();
+        txn.commit(t1).unwrap();
+        let recs = walk_log(&wal);
+        assert_eq!(recs.len(), 4);
+        assert!(matches!(recs[0].kind, RecKind::Begin));
+        assert!(matches!(recs[1].kind, RecKind::HeapInsert { .. }));
+        assert!(matches!(recs[2].kind, RecKind::Commit));
+        assert!(matches!(recs[3].kind, RecKind::TxnEnd));
+        assert_eq!(recs[1].prev_lsn, recs[0].lsn);
+        assert_eq!(recs[2].prev_lsn, recs[1].lsn);
+        assert!(wal.flushed_lsn.load(Ordering::SeqCst) > recs[2].lsn);
+        if let RecKind::HeapInsert { dir_root, tuple, .. } = &recs[1].kind {
+            assert_eq!(*dir_root, heap.first_directory_page_id);
+            assert_eq!(tuple, &vec![1, 2, 3, 4]);
+        }
+
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_abort_insert_removes_rows() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+
+        for i in 0..3u8 {
+            heap.insert(Tuple::new(vec![i,i,i])).unwrap();
+        }
+        txn.abort(t1).unwrap();
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        // begin, hi, hi, hi, abort, clr, clr, clr, txnend
+        let recs = walk_log(&wal);
+        let undone: Vec<u64> = recs[5..8].iter().map(|r| match &r.kind {
+            RecKind::Clr { undone_lsn, .. } => *undone_lsn,
+            _ => panic!()
+        }).collect();
+        assert!(rows.is_empty());
+        assert_eq!(recs.len(), 9);
+        assert!(matches!(recs[4].kind, RecKind::Abort));
+        assert!(matches!(recs[8].kind, RecKind::TxnEnd));
+        assert_eq!(undone, vec![recs[3].lsn, recs[2].lsn, recs[1].lsn]);
+    }
+
+    #[test]
+    fn test_abort_delete_restores_row() {
+        let (bp, _wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![8,8,8])).unwrap();
+        txn.commit(t1).unwrap();
+
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.delete(rid).unwrap();
+        assert!(heap.read(rid).is_err());
+        txn.abort(t2).unwrap();
+        
+        assert_eq!(heap.read(rid).unwrap().data, vec![8,8,8]);
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn sql_insert_commits_through_run() {
+        let (bp, wal, txn, _dir) = setup();
+        let mut catalog = Catalog::create(bp.clone()).unwrap();
+        let exec = |sql: &str, catalog: &mut Catalog| -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.remove(0), catalog, bp.clone(), txn.clone()).unwrap()
+        };
+        exec("CREATE TABLE t (id INTEGER NOT NULL, name VARCHAR(20));", &mut catalog);
+        let out = exec("INSERT INTO t VALUES (1, 'a');", &mut catalog);
+        assert!(matches!(out, Outcome::Affected(1)));
+        let recs = walk_log(&wal);
+        assert!(recs.iter().any(|r| matches!(r.kind, RecKind::HeapInsert { .. })));
+        assert!(recs.iter().any(|r| matches!(r.kind, RecKind::Commit)));
+    }
+}
