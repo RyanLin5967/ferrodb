@@ -2,11 +2,14 @@ use std::{collections::HashMap, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::Tuple}, wal::log::{RecKind, WalManager}};
 
+const CHECKPOINT_INTERVAL: u64 = 256;
+
 pub struct TxnManager {
     pub wal: Arc<WalManager>,
     pub bp: Arc<BufferPoolManager>,
     pub next_txn_id: AtomicU64,
-    pub att: Mutex<HashMap<u64, TxnEntry>>
+    pub att: Mutex<HashMap<u64, TxnEntry>>,
+    pub commits_since_checkpoint: AtomicU64,
 }
 
 pub struct TxnEntry {
@@ -22,7 +25,7 @@ pub enum TxnStatus {
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
-        Self { wal, bp, next_txn_id: AtomicU64::new(1), att: Mutex::new(HashMap::new()) }
+        Self { wal, bp, next_txn_id: AtomicU64::new(1), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -57,6 +60,9 @@ impl TxnManager {
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
+        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= CHECKPOINT_INTERVAL {
+            self.checkpoint()?;
+        }
         Ok(())
     }
 
@@ -110,6 +116,18 @@ impl TxnManager {
         }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
+        Ok(())
+    }
+
+    pub fn checkpoint(&self) -> Result<(), FerroError> {
+        if !self.att.lock().unwrap().is_empty() {
+            return Err(FerroError::Wal("checkpoint with active txns".into()));
+        }
+        self.wal.flush()?;
+        self.bp.flush_all()?;
+        self.bp.disk_manager.sync()?;
+        self.wal.truncate()?;
+        self.commits_since_checkpoint.store(0, Ordering::SeqCst);
         Ok(())
     }
 }

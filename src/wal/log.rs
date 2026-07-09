@@ -144,6 +144,12 @@ impl WalManager {
             }
             u64::from_be_bytes(header[8..16].try_into().unwrap())
         };
+        let valid_end = scan_valid_end(&file, base_lsn, len)?;
+        let file_end = HEADER_SIZE as u64 + (valid_end - base_lsn);
+        if file_end < len {
+            file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
+            file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
+        }
         let next_lsn = base_lsn + len.saturating_sub(HEADER_SIZE as u64);
         Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn: AtomicU64::new(base_lsn), path})
     }
@@ -208,6 +214,29 @@ impl WalManager {
         Ok(lsn)
     }
 
+    pub fn truncate(&self) -> Result<(), FerroError> {
+        self.flush()?;
+        let mut buffer = self.buffer.lock().unwrap();
+        let file = self.file.lock().unwrap();
+        let next = self.next_lsn.load(Ordering::SeqCst);
+        
+        let mut header = [0u8; HEADER_SIZE];
+        header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        header[4..8].copy_from_slice(&VERSION.to_be_bytes());
+        header[8..12].copy_from_slice(&next.to_be_bytes());
+        pwrite_all(&file, &mut header, 0)?;
+        file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
+        file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
+        file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
+        
+        self.base_lsn.store(next, Ordering::SeqCst);
+        buffer.bytes.clear();
+        buffer.start_lsn = next;
+        self.flushed_lsn.store(next, Ordering::SeqCst);
+        Ok(())
+        
+    }
+
     pub fn flush(&self) -> Result<(), FerroError> {
         let (bytes, start_lsn) = {
             let mut buffer = self.buffer.lock().unwrap();
@@ -235,6 +264,34 @@ impl WalManager {
         }
         self.flush()
     }
+}
+
+pub fn scan_valid_end(file: &File, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{
+    let mut offset = HEADER_SIZE as u64;
+    loop {
+        if offset + 4 > file_len {
+            break;
+        }
+        let mut len_buf = [0u8; 4];
+        pread_all(file, &mut len_buf, offset)?;
+        let total = u32::from_be_bytes(len_buf) as u64;
+        if total < MIN_FRAME as u64 || offset + total > file_len {
+            break;
+        }
+        let mut frame = vec![0u8; total as usize];
+        pread_all(file, &mut frame, offset)?;
+        let stored = u32::from_be_bytes(frame[total as usize - 4..].try_into().unwrap());
+        if crc32(&frame[..total as usize - 4]) != stored {
+            break;
+        }
+        let expected_lsn = base_lsn + (offset - HEADER_SIZE as u64);
+        let embedded = u64::from_be_bytes(frame[4..12].try_into().unwrap());
+        if embedded != expected_lsn {
+            break;
+        }
+        offset += total;
+    }
+    Ok(base_lsn + (offset - HEADER_SIZE as u64))
 }
 
 fn read_heap(bytes: &[u8]) -> Result<(u32, u32, u16, usize), FerroError> {

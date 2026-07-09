@@ -16,7 +16,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    // recover
+    bp.attach_wal(wal.clone());    
     let mut catalog = if existed {
         Catalog::open(bp.clone(), FIRST_CATALOG_PAGE_ID)?
     } else {
@@ -46,8 +46,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
             execute_sql(&complete, &mut catalog, bp.clone(), txn.clone());
         }
     }
-    wal.flush()?;
-    bp.flush_all()?;
+    txn.checkpoint()?;
     println!("bye bye");
     Ok(())
 }

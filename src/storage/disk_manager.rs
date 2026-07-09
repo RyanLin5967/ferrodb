@@ -158,6 +158,10 @@ impl DiskManager{
             return Ok(page_id)
         }
     }
+
+    pub fn sync(&self) -> Result<(), FerroError>{
+        self.file.sync_all().map_err(|e| FerroError::Io(e.to_string()))
+    }
 }
 
 pub fn pwrite(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {

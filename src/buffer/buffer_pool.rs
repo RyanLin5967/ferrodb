@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, atomic::AtomicU16};
 use std::collections::HashMap;
 use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
+use crate::wal::log::WalManager;
 use std::sync::RwLock;
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
@@ -21,13 +22,15 @@ pub struct BufferPoolManager {
     pub page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
+    pub wal: OnceLock<Arc<WalManager>>,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
-        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES))}
+        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new()}
     }
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
@@ -121,9 +124,9 @@ impl BufferPoolManager {
 
         let frame = self.frames[frame_i].read().unwrap();
         if frame.dirty_flag.load(Ordering::Relaxed) {
+            self.wal_gate(&frame.data)?;
             self.disk_manager.write(page_id, &frame.data)?;
             frame.dirty_flag.store(false, Ordering::Relaxed);
-            return Ok(());
         }
         Ok(())
     }
@@ -135,6 +138,7 @@ impl BufferPoolManager {
         for (&page_id, &frame_i) in pt.iter() {
             let frame = self.frames[frame_i].read().unwrap();
             if frame.dirty_flag.load(Ordering::Relaxed) {
+                self.wal_gate(&frame.data)?;
                 self.disk_manager.write(page_id, &frame.data)?;
                 frame.dirty_flag.store(false,Ordering::Relaxed);
             }
@@ -189,6 +193,28 @@ impl BufferPoolManager {
         }
         self.disk_manager.deallocate(page_id)?;
         Ok(())
+    }
+
+    pub fn attach_wal(&self, wal: Arc<WalManager>) {
+        let _ = self.wal.set(wal);
+    }
+
+    fn wal_gate(&self, data: &[u8; PAGE_SIZE]) -> Result<(), FerroError> {
+        if let Some(wal) = self.wal.get() {
+            let plsn = page_lsn_of(data);
+            if plsn > 0 {
+                wal.flush_up_to(plsn)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
+    match data[0] {
+        0 => u64::from_be_bytes(data[11..19].try_into().unwrap()),
+        2 | 3 => u64::from_be_bytes(data[5..13].try_into().unwrap()),
+        _ => 0,
     }
 }
 

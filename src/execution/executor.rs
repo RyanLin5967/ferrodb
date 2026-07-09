@@ -34,10 +34,12 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
     match stmt {
         Stmt::CreateIndex { table, column_name , ..} => {
             catalog.create_index(&table, &column_name)?;
+            txn.checkpoint()?;
             return Ok(Outcome::Ok)
         }
         Stmt::CreateTable { table, columns } => {
             catalog.create_table(table, Schema{columns})?;
+            txn.checkpoint()?;
             return Ok(Outcome::Ok)
         }
         Stmt::Analyze { table } => {
