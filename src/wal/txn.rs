@@ -163,7 +163,7 @@ use super::*;
 
     fn walk_log(wal: &WalManager) -> Vec<LogRecord> {
         let mut out = Vec::new();
-        let mut lsn = wal.base_lsn;
+        let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
         let end = wal.next_lsn.load(Ordering::SeqCst);
         while lsn < end {
             let (rec, next) = wal.read_record(lsn).unwrap();

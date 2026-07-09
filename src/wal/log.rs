@@ -14,7 +14,7 @@ pub struct WalManager {
     pub next_lsn: AtomicU64,
     pub flushed_lsn: AtomicU64,
     pub path: PathBuf,
-    pub base_lsn: u64,
+    pub base_lsn: AtomicU64,
 }
 
 pub struct WalBuffer {
@@ -145,7 +145,7 @@ impl WalManager {
             u64::from_be_bytes(header[8..16].try_into().unwrap())
         };
         let next_lsn = base_lsn + len.saturating_sub(HEADER_SIZE as u64);
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn, path})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn: AtomicU64::new(base_lsn), path})
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
@@ -162,7 +162,7 @@ impl WalManager {
             buffer.bytes[rel..rel+total].to_vec()
         } else {
             let file = self.file.lock().unwrap();
-            let offset = HEADER_SIZE as u64 + (lsn - self.base_lsn);
+            let offset = HEADER_SIZE as u64 + (lsn - self.base_lsn.load(Ordering::SeqCst));
             let mut len_buf = [0u8; 4];
             pread_all(&file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
@@ -219,7 +219,7 @@ impl WalManager {
             buffer.start_lsn = bytes.len() as u64 + start;
             (bytes, start)
         };
-        let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn);
+        let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn.load(Ordering::SeqCst));
         {
             let file = self.file.lock().unwrap();
             pwrite_all(&file, &bytes, offset)?;
