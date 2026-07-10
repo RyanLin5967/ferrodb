@@ -150,8 +150,7 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        let next_lsn = base_lsn + len.saturating_sub(HEADER_SIZE as u64);
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: next_lsn }), next_lsn: AtomicU64::new(next_lsn), flushed_lsn: AtomicU64::new(next_lsn), base_lsn: AtomicU64::new(base_lsn), path})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path})
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
