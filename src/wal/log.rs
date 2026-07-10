@@ -222,7 +222,7 @@ impl WalManager {
         let mut header = [0u8; HEADER_SIZE];
         header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
-        header[8..12].copy_from_slice(&next.to_be_bytes());
+        header[8..16].copy_from_slice(&next.to_be_bytes());
         pwrite_all(&file, &mut header, 0)?;
         file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
         file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
