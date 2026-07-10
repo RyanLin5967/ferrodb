@@ -163,9 +163,9 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions};
+    use std::fs::{OpenOptions, metadata};
 
-use crate::{catalog::catalog::Catalog, execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::LogRecord};
+use crate::{catalog::catalog::Catalog, execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::{LogRecord, pwrite_all}};
 
 use super::*;
 
@@ -176,6 +176,7 @@ use super::*;
         let bp = Arc::new(BufferPoolManager::new(dm));
         let wal = Arc::new(WalManager::new(dir.path().join("txn.wal")).unwrap());
         let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
         (bp, wal, txn, dir)
     }
 
@@ -279,5 +280,100 @@ use super::*;
         let recs = walk_log(&wal);
         assert!(recs.iter().any(|r| matches!(r.kind, RecKind::HeapInsert { .. })));
         assert!(recs.iter().any(|r| matches!(r.kind, RecKind::Commit)));
+    }
+
+    #[test]
+    fn gate_flushed_wal_before_page_write() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![1, 2, 3])).unwrap();
+        let target = wal.next_lsn.load(Ordering::SeqCst);
+        assert!(wal.flushed_lsn.load(Ordering::SeqCst) < target);
+        bp.flush_page(rid.page_id).unwrap();
+        assert!(wal.flushed_lsn.load(Ordering::SeqCst) >= target);
+        txn.abort(t1).unwrap();
+    }
+
+    #[test]
+    fn gate_covers_flush_all() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        heap.insert(Tuple::new(vec![9,9])).unwrap();
+
+        let target = wal.next_lsn.load(Ordering::SeqCst);
+        assert!(wal.flushed_lsn.load(Ordering::SeqCst) < target);
+        bp.flush_all().unwrap();
+        assert!(wal.flushed_lsn.load(Ordering::SeqCst) >= target);
+        txn.abort(t1).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_truncates_and_preserves_data() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        let rid = heap.insert(Tuple::new(vec![4,5,6])).unwrap();
+        txn.commit(t1).unwrap();
+        txn.checkpoint().unwrap();
+        let next = wal.next_lsn.load(Ordering::SeqCst);
+        assert!(walk_log(&wal).is_empty());
+        assert_eq!(wal.base_lsn.load(Ordering::SeqCst), next);
+        assert_eq!(metadata(&wal.path).unwrap().len(), 16);
+        assert_eq!(heap.read(rid).unwrap().data, vec![4,5,6]);
+
+        let t2 = txn.begin().unwrap();
+        let recs = walk_log(&wal);
+        assert_eq!(recs[0].lsn, next);
+        txn.abort(t2).unwrap();
+    }
+
+    #[test]
+    fn interrupted_truncation_self_heals_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.wal");
+        let new_base;
+        {
+            let wal = WalManager::new(path.clone()).unwrap();
+            wal.append(1, 0, &RecKind::Begin).unwrap();
+            wal.append(1, 0, &RecKind::Commit).unwrap();
+            wal.flush().unwrap();
+            new_base = wal.next_lsn.load(Ordering::SeqCst);
+
+            let mut header = [0u8; 16];
+            header[0..4].copy_from_slice(&0xF3_EE_DB_01u32.to_be_bytes());
+            header[4..8].copy_from_slice(&1u32.to_be_bytes());
+            header[8..16].copy_from_slice(&new_base.to_be_bytes());
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            pwrite_all(&f, &mut header, 0).unwrap();
+        }
+        let wal = WalManager::new(path.clone()).unwrap();
+        assert_eq!(metadata(&path).unwrap().len(), 16);
+        assert_eq!(wal.next_lsn.load(Ordering::SeqCst), new_base);
+        let lsn = wal.append(2, 0, &RecKind::Begin).unwrap();
+        assert_eq!(lsn, new_base);
+    }
+
+    #[test]
+    fn torn_tail_trimmed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =  dir.path().join("torn.wal");
+        let (l0, l1);
+        {
+            let wal = WalManager::new(path.clone()).unwrap();
+            l0 = wal.append(1, 0, &RecKind::Begin).unwrap();
+            l1 = wal.append(1, l0, &RecKind::HeapInsert { dir_root: 1, page_id: 1, slot: 0, tuple: vec![1,2,3,4,5,6] }).unwrap();
+            wal.flush().unwrap();
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            let len = f.metadata().unwrap().len();
+            f.set_len(len - 3).unwrap();
+        }
+        let wal = WalManager::new(path.clone()).unwrap();
+        assert_eq!(wal.next_lsn.load(Ordering::SeqCst), l1);
+        assert!(wal.read_record(l0).is_ok());
     }
 }
