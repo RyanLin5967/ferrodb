@@ -259,6 +259,20 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             }
         }
     }
+
+    pub fn free_tree(&self) -> Result<(), FerroError> {
+        self.free_from(self.root_page_id.load(Ordering::SeqCst))
+    }
+
+    fn free_from(&self, page_id: u32) -> Result<(), FerroError> {
+        if let BPlusTreePage::Internal(node) = self.read_node(page_id)? {
+            for child in &node.child_ptrs {
+                self.free_from(*child)?;
+            }
+        }
+        self.buffer_pool.free_page(page_id)
+    }
+
     // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
     // and drops to one child, make that child the new root
     #[allow(warnings)]
