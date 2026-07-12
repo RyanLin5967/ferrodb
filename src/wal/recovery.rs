@@ -43,6 +43,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         }
         txn.next_txn_id.store(max_txn, Ordering::SeqCst);
     }
+    txn.next_txn_id.store(max_txn, Ordering::SeqCst);
 
     // restore pages with broken file extensions
     let bp = &txn.bp;
