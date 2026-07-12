@@ -112,7 +112,7 @@ Executor
 - [x] SQL parser
 - [x] Query execution engine
 - [x] Cost-based query optimizer
-- [ ] Write-ahead logging with crash recovery
+- [x] Write-ahead logging with crash recovery
 - [ ] MVCC 
 - [ ] Postgres wire protocol
 - [ ] Distributed replication (Raft)
