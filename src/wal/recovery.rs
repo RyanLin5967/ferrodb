@@ -56,7 +56,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     for rec in &records {
         match &rec.kind {
             RecKind::HeapDelete { .. } | RecKind::HeapInsert { .. } | RecKind::HeapUpdate { .. } => {
-                redo_one(bp, lsn, &rec.kind)?;
+                redo_one(bp, rec.lsn, &rec.kind)?;
             }
             RecKind::Clr { redo, .. } => redo_one(bp, rec.lsn, redo)?,
             _ => {}
