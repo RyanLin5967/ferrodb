@@ -160,3 +160,133 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
     }
     catalog.persist()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs::OpenOptions, path::Path};
+
+use crate::{execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager, wal::log::WalManager};
+
+use super::*; 
+
+    fn setup(dir: &Path) -> (Arc<BufferPoolManager>, Arc<WalManager>, Arc<TxnManager>) {
+        let file = OpenOptions::new().read(true).write(true).create(true).open(dir.join("recovery.db")).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        let wal = Arc::new(WalManager::new(dir.join("recovery.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        (bp, wal, txn)
+    }
+
+    #[test]
+    fn test_insert_survives_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, rid);
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            rid = heap.insert(Tuple::new(vec![1,2,3])).unwrap();
+            txn.commit(t).unwrap();
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        assert!(recover(&txn).unwrap());
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(heap.read(rid).unwrap().data, vec![1,2,3]);
+    }
+
+    #[test]
+    fn test_uncommited_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_root;
+        {
+            let (bp, wal, txn) = setup(dir.path());
+            let t = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t);
+            heap.insert(Tuple::new(vec![7,7])).unwrap();
+            heap.insert(Tuple::new(vec![6,7])).unwrap();
+            wal.flush().unwrap();
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        assert!(recover(&txn).unwrap());
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        assert!(heap.scan().collect::<Result<Vec<_>, _>>().unwrap().is_empty());
+        assert!(recover(&txn).unwrap());
+        assert!(heap.scan().collect::<Result<Vec<_>, _>>().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_update_delete_redo_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dir_root, rid_a, rid_b);
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            let t1 = txn.begin().unwrap();
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            dir_root = heap.first_directory_page_id;
+            heap.set_transaction(txn.clone(), t1);
+            rid_a = heap.insert(Tuple::new(vec![1,1])).unwrap();
+            rid_b = heap.insert(Tuple::new(vec![2,2])).unwrap();
+            txn.commit(t1).unwrap();
+            txn.checkpoint().unwrap();
+
+            let t2 = txn.begin().unwrap();
+            heap.set_transaction(txn.clone(), t2);
+            heap.update(rid_a, Tuple::new(vec![9,9])).unwrap();
+            txn.commit(t2).unwrap();
+
+            let t3 = txn.begin().unwrap();
+            heap.set_transaction(txn.clone(), t3);
+            heap.delete(rid_b).unwrap();
+            txn.commit(t3).unwrap();
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        assert!(recover(&txn).unwrap());
+        let heap = HeapFileManager::open(dir_root, bp.clone());
+        assert!(heap.read(rid_b).is_err());
+        assert_eq!(heap.read(rid_a).unwrap().data, vec![9,9]);
+        assert_eq!(heap.scan().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sql_crash_recover_rebuild_query() {
+        use crate::execution::executor::{run, Outcome};
+        use crate::parser::{parser::Parser, scanner::Scanner};
+
+        let exec = |sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>| -> Outcome {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let mut stmts = p.parse();
+            assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
+            run(stmts.remove(0), catalog, bp.clone(), txn.clone()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (bp, _wal, txn) = setup(dir.path());
+            let mut catalog = Catalog::create(bp.clone()).unwrap();
+            exec("CREATE TABLE t (id INTEGER NOT NULL, name VARCHAR(16));", &mut catalog, &bp, &txn); // fence checkpoints
+            for i in 0..3 {
+                exec(&format!("INSERT INTO t VALUES ({}, 'u{}');", i, i), &mut catalog, &bp, &txn);
+            }
+        }
+        let (bp, _wal, txn) = setup(dir.path());
+        assert!(recover(&txn).unwrap());
+        let mut catalog = Catalog::open(bp.clone(), 1).unwrap(); // FIRST_CATALOG_PAGE_ID
+        rebuild_indexes(&mut catalog, &bp).unwrap();
+
+        match exec("SELECT name FROM t;", &mut catalog, &bp, &txn) {
+            Outcome::Rows(rows) => assert_eq!(rows.len(), 3),
+            _ => panic!("expected rows"),
+        }
+        let entry = catalog.get_table("t").unwrap();
+        let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+        assert!(tree.search(&Value::Integer(1)).unwrap().is_some());
+    }
+}
