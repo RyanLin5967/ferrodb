@@ -231,7 +231,7 @@ but once flushed, we can "trim" the log until the TXN-END record
     - go through the txn's updates in reverse order. for each one:
         - write a CLR entry to the log
         - restore old Value
-    write TXN-END log and release locks
+    write TXN-END log
 - ATT (active transaction table):
     - one entry per currently active txn (txn_id, status (running, committing, aborting), lastLSN)
     - once TXN-END, can remove its entry
