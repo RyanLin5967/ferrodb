@@ -10,6 +10,7 @@ pub enum TokenType {
 
     And, Not, False, Null, Or, True, 
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain,
+    Begin, Commit, Rollback,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     Eof,
@@ -198,6 +199,9 @@ impl Scanner {
             "OUTER" => TokenType::Outer,
             "ANALYZE" => TokenType::Analyze,
             "EXPLAIN" => TokenType::Explain,
+            "BEGIN" => TokenType::Begin,
+            "COMMIT" => TokenType::Commit,
+            "ROLLBACK" => TokenType::Rollback,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);

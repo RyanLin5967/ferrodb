@@ -16,6 +16,7 @@ pub enum FerroError {
     OnlyDML,
     Bind(String),
     Wal(String),
+    Txn(String),
 }
 
 impl Display for FerroError {
@@ -34,6 +35,7 @@ impl Display for FerroError {
             FerroError::OnlyDML => write!(f, "only supports dml"),
             FerroError::Bind(s) => write!(f, "binding error: {}", s),
             FerroError::Wal(s) => write!(f, "wal error: {}", s),
+            FerroError::Txn(s) => write!(f, "txn error: {}", s),
         }
     }
 }

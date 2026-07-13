@@ -87,7 +87,8 @@ pub enum Stmt {
     Analyze {
         table: String,
     },
-    Explain(Box<Stmt>)
+    Explain(Box<Stmt>),
+    Begin, Commit, Rollback,
 }
 
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
@@ -332,6 +333,11 @@ impl Parser {
     pub fn parse_explain(&mut self) -> Result<Stmt, FerroError> {
         let right = self.parse_statement()?;
         Ok(Stmt::Explain(Box::new(right)))
+    }
+
+    pub fn parse_txn_stmt(&mut self, stmt: Stmt) -> Result<Stmt, FerroError> {
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(stmt)
     }
 
     pub fn parse_table_ref(&mut self) -> Result<TableRef, FerroError> {

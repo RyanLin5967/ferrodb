@@ -120,7 +120,7 @@ impl<'a> Binder<'a> {
             }
             Stmt::Analyze { .. } => { unreachable!() }
             Stmt::Join { .. } => todo!(),
-            Stmt::Explain { .. } => unreachable!(),
+            Stmt::Explain { .. } | Stmt::Begin | Stmt::Commit | Stmt::Rollback => unreachable!(),
         }
     }
 
