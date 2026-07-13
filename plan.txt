@@ -260,3 +260,18 @@ but once flushed, we can "trim" the log until the TXN-END record
             - traverse lastLSN's in the same order, but in reverse for how the updates happened originally
             - write a CLR for the modification
 - add multi statement transactions later
+
+MVCC:
+- will have multiple physical versions of logical tuples
+- when txn write to an object, dbms creates a new version of that object
+- when txn reads an object, dbms reads newest version of that object (that's commited when transaction started)
+- will have snapshot isolation: provides txns a consistent snapshot of db (only has commited txns) for when txn starts. txn completes in isolation from other ones in this snapshot (good for reads)
+- if two txns update same object, first writer wins
+- txn ids can be used as timestamps (already monotonic)
+- no CLOG needed since abort restores before images through WAL undo, crash losers are undone by recovery
+- visibility of version V to transaction T with snapshot S: created_visible = V.begin_ts == T.id || (V.begin_ts < S.high_water && V.begin_ts NOT IN S.active)
+- ended_visible = V.end_ts && (V.end_ts == T.id || (V.end_ts < S.high_water && V.end_ts NOT IN S.active))
+- will use time travel storage so newest version will be kept at a stable rid (not true for append-only, delta too complex)
+- will use watermark vacuum garbage collection
+- will use logical pointers (already have)
+- will use deleted flag to mark deleted tuples
