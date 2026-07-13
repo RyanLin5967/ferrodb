@@ -2,12 +2,13 @@ use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceL
 
 use crate::{error::FerroError, storage::disk_manager::{pread, pwrite}};
 
-const HEADER_SIZE: usize = 16;
+const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const INITIAL_LSN: u64 = 1;
 const MIN_FRAME: usize = 33;
 
+// need next_txn_id for mvcc, and then multi txn statements before mvcc
 pub struct WalManager {
     pub file: Mutex<File>,
     pub buffer: Mutex<WalBuffer>,
@@ -15,6 +16,7 @@ pub struct WalManager {
     pub flushed_lsn: AtomicU64,
     pub path: PathBuf,
     pub base_lsn: AtomicU64,
+    pub header_txn_id: u64,
 }
 
 pub struct WalBuffer {
@@ -125,14 +127,15 @@ impl WalManager {
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| FerroError::Wal(e.to_string()))?;
         let len = file.metadata().map_err(|e| FerroError::Wal(e.to_string()))?.len();
 
-        let base_lsn = if len == 0 {
+        let (base_lsn, header_txn_id) = if len == 0 {
             let mut header = [0u8; HEADER_SIZE];
             header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
             header[8..16].copy_from_slice(&INITIAL_LSN.to_be_bytes());
+            header[16..24].copy_from_slice(&1u64.to_be_bytes());
             pwrite_all(&file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
-            INITIAL_LSN
+            (INITIAL_LSN, 1u64)
         } else {
             let mut header = [0u8; HEADER_SIZE];
             pread_all(&file, &mut header, 0)?;
@@ -142,7 +145,9 @@ impl WalManager {
             if u32::from_be_bytes(header[4..8].try_into().unwrap()) != VERSION {
                 return Err(FerroError::Wal("incorrect wal version".into()));
             }
-            u64::from_be_bytes(header[8..16].try_into().unwrap())
+            let base = u64::from_be_bytes(header[8..16].try_into().unwrap());
+            let txn_hwn = u64::from_be_bytes(header[16..24].try_into().unwrap());
+            (base, txn_hwn)
         };
         let valid_end = scan_valid_end(&file, base_lsn, len)?;
         let file_end = HEADER_SIZE as u64 + (valid_end - base_lsn);
@@ -150,7 +155,7 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id})
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
@@ -213,7 +218,7 @@ impl WalManager {
         Ok(lsn)
     }
 
-    pub fn truncate(&self) -> Result<(), FerroError> {
+    pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
         self.flush()?;
         let mut buffer = self.buffer.lock().unwrap();
         let file = self.file.lock().unwrap();
@@ -223,6 +228,7 @@ impl WalManager {
         header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
         header[8..16].copy_from_slice(&next.to_be_bytes());
+        header[16..24].copy_from_slice(&next_txn_id.to_be_bytes());
         pwrite_all(&file, &mut header, 0)?;
         file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
         file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
@@ -233,7 +239,7 @@ impl WalManager {
         buffer.start_lsn = next;
         self.flushed_lsn.store(next, Ordering::SeqCst);
         Ok(())
-        
+
     }
 
     pub fn flush(&self) -> Result<(), FerroError> {

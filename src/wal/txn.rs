@@ -25,7 +25,8 @@ pub enum TxnStatus {
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
-        Self { wal, bp, next_txn_id: AtomicU64::new(1), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0) }
+        let start = wal.header_txn_id;
+        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -126,7 +127,7 @@ impl TxnManager {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
-        self.wal.truncate()?;
+        self.wal.truncate(self.next_txn_id.load(Ordering::SeqCst))?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
         Ok(())
     }
@@ -323,7 +324,7 @@ use super::*;
         let next = wal.next_lsn.load(Ordering::SeqCst);
         assert!(walk_log(&wal).is_empty());
         assert_eq!(wal.base_lsn.load(Ordering::SeqCst), next);
-        assert_eq!(metadata(&wal.path).unwrap().len(), 16);
+        assert_eq!(metadata(&wal.path).unwrap().len(), 24);
         assert_eq!(heap.read(rid).unwrap().data, vec![4,5,6]);
 
         let t2 = txn.begin().unwrap();
@@ -344,15 +345,16 @@ use super::*;
             wal.flush().unwrap();
             new_base = wal.next_lsn.load(Ordering::SeqCst);
 
-            let mut header = [0u8; 16];
+            let mut header = [0u8; 24];
             header[0..4].copy_from_slice(&0xF3_EE_DB_01u32.to_be_bytes());
-            header[4..8].copy_from_slice(&1u32.to_be_bytes());
+            header[4..8].copy_from_slice(&2u32.to_be_bytes());
             header[8..16].copy_from_slice(&new_base.to_be_bytes());
+            header[16..24].copy_from_slice(&1u64.to_be_bytes());
             let f = OpenOptions::new().write(true).open(&path).unwrap();
             pwrite_all(&f, &mut header, 0).unwrap();
         }
         let wal = WalManager::new(path.clone()).unwrap();
-        assert_eq!(metadata(&path).unwrap().len(), 16);
+        assert_eq!(metadata(&path).unwrap().len(), 24);
         assert_eq!(wal.next_lsn.load(Ordering::SeqCst), new_base);
         let lsn = wal.append(2, 0, &RecKind::Begin).unwrap();
         assert_eq!(lsn, new_base);
