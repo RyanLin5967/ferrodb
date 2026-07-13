@@ -11,7 +11,7 @@
 11. Build cost-based optimizer
 12. CMU lectures 21-22 (WAL and recovery)
 13. Build WAL and crash recovery
-14. CMU lectures 17-20 (concurrency control, MVCC)
+14. CMU lecture 20 (concurrency control, MVCC)
 15. Build MVCC
 16. Postgres wire protocol docs
 17. Build wire protocol
