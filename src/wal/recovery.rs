@@ -165,7 +165,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
 mod tests {
     use std::{fs::OpenOptions, path::Path};
 
-use crate::{execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager, wal::log::WalManager};
+use crate::{storage::disk_manager::DiskManager, wal::log::WalManager};
 
 use super::*; 
 
