@@ -652,4 +652,89 @@ use crate::wal::log::WalManager;
         };
         assert_eq!(evaluate(&e_not, &[]).unwrap(), Value::Boolean(false));
     }
+
+    #[test]
+    fn test_block_commits_atomically() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s = Session::new();
+        let exec = |sql: &str, catalog: &mut Catalog, s: &mut Session| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
+        };
+        exec("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &mut s).unwrap();
+        exec("BEGIN;", &mut catalog, &mut s).unwrap();
+        exec("INSERT INTO t VALUES (1);", &mut catalog, &mut s).unwrap();
+        exec("INSERT INTO t VALUES (2);", &mut catalog, &mut s).unwrap();
+        exec("COMMIT;", &mut catalog, &mut s).unwrap();
+        match exec("SELECT id FROM t;", &mut catalog, &mut s).unwrap() {
+            Outcome::Rows(r) => assert_eq!(r.len(), 2),
+            _ => panic!()
+        }
+    }
+
+    #[test]
+    fn test_block_rollback_discards_everything() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s = Session::new();
+        let exec = |sql: &str, catalog: &mut Catalog, s: &mut Session| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
+        };
+        exec("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &mut s).unwrap();
+        exec("BEGIN;", &mut catalog, &mut s).unwrap();
+        exec("INSERT INTO t VALUES (1);", &mut catalog, &mut s).unwrap();
+        exec("ROLLBACK;", &mut catalog, &mut s).unwrap();
+        match exec("SELECT id FROM t;", &mut catalog, &mut s).unwrap() {
+            Outcome::Rows(r) => assert!(r.is_empty()),
+            _ => panic!()
+        }
+        assert!(matches!(exec("COMMIT;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+    }
+
+    #[test]
+    fn test_error_aborts_everything() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s = Session::new();
+        let exec = |sql: &str, catalog: &mut Catalog, s: &mut Session| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
+        };
+        exec("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &mut s).unwrap();
+        exec("BEGIN;", &mut catalog, &mut s).unwrap();
+        exec("INSERT INTO t VALUES (1);", &mut catalog, &mut s).unwrap();
+        assert!(exec("INSERT INTO idk VALUES (1);", &mut catalog,  &mut s).is_err());
+        match exec("SELECT id FROM t;", &mut catalog, &mut s).unwrap() {
+            Outcome::Rows(r) => assert!(r.is_empty()),
+            _ => panic!()
+        }
+        assert!(matches!(exec("COMMIT;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+    }
+
+    #[test]
+    fn test_rejects_ddl_inside_block() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s = Session::new();
+        let exec = |sql: &str, catalog: &mut Catalog, s: &mut Session| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
+        };
+        assert!(matches!(exec("COMMIT;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+        assert!(matches!(exec("ROLLBACK;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+        exec("BEGIN;", &mut catalog, &mut s).unwrap();
+        assert!(matches!(exec("BEGIN;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+        assert!(matches!(exec("CREATE TABLE idk (id INTEGER NOT NULL);", &mut catalog, &mut s), Err(FerroError::Txn(_))));
+        exec("ROLLBACK;", &mut catalog, &mut s).unwrap();
+    }
 }
