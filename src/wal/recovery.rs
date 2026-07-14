@@ -69,6 +69,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         txn.att.lock().unwrap().insert(id, TxnEntry {
             status: TxnStatus::Aborting,
             last_lsn: last_lsn[&id],
+            snapshot: None
         });
         txn.abort(id)?;
     }
@@ -165,7 +166,7 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
 mod tests {
     use std::{fs::OpenOptions, path::Path};
 
-use crate::{storage::disk_manager::DiskManager, wal::log::WalManager};
+use crate::{execution::session::Session, storage::disk_manager::DiskManager, wal::log::WalManager};
 
 use super::*; 
 
@@ -265,7 +266,8 @@ use super::*;
             let mut p = Parser::new(tokens);
             let mut stmts = p.parse();
             assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
-            run(stmts.remove(0), catalog, bp.clone(), txn.clone()).unwrap()
+            let mut session = Session::new();
+            run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut session).unwrap()
         };
         let dir = tempfile::tempdir().unwrap();
         {

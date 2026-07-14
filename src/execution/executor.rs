@@ -7,6 +7,7 @@ use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
+use crate::execution::session::Session;
 use crate::parser::parser::{Stmt};
 use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
@@ -30,14 +31,40 @@ pub enum Outcome {
     Ok,
 }
 
-pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) -> Result<Outcome, FerroError> {
+pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
     match stmt {
+        Stmt::Begin => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("txn already started".into()))
+            }
+            Ok(Outcome::Ok)
+        }
+        Stmt::Commit => match session.current.take() {
+            Some(id) => {
+                txn.commit(id)?;
+                Ok(Outcome::Ok)
+            }
+            None => Err(FerroError::Txn("not in active txn".into()))
+        }
+        Stmt::Rollback => match session.current.take() {
+            Some(id) => {
+                txn.abort(id)?;
+                Ok(Outcome::Ok)
+            }
+            None => Err(FerroError::Txn("not in active txn".into()))
+        }
         Stmt::CreateIndex { table, column_name , ..} => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
             catalog.create_index(&table, &column_name)?;
             txn.checkpoint()?;
             return Ok(Outcome::Ok)
         }
         Stmt::CreateTable { table, columns } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
             catalog.create_table(table, Schema{columns})?;
             txn.checkpoint()?;
             return Ok(Outcome::Ok)
@@ -68,22 +95,27 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     Plan::Write(_) => unreachable!()
                 }
             } else {
-                let txn_id = txn.begin()?;
+                let (txn_id, implicit) = match session.current {
+                    Some(id) => (id, false),
+                    None => (txn.begin()?, true)
+                };
                 let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id))) {
                     Ok(p) => p,
                     Err(e) => {
                         txn.abort(txn_id)?;
+                        session.current = None;
                         return Err(e);
                     }
                 };
                 match planned {
                     Plan::Write(mut op) => match op.execute(catalog) {
                         Ok(count) => {
-                            txn.commit(txn_id)?;
+                            if implicit { txn.commit(txn_id)? };
                             return Ok(Outcome::Affected(count))
                         }
                         Err(e) => {
                             txn.abort(txn_id)?;
+                            session.current = None;
                             Err(e)
                         }
                     },
@@ -248,7 +280,8 @@ use crate::wal::log::WalManager;
     }
 
     fn exec(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) -> Result<Outcome, FerroError> {
-        run(parse_one(sql)?, catalog, bp, txn)
+        let mut session = Session::new();
+        run(parse_one(sql)?, catalog, bp, txn, &mut session)
     }
 
     fn setup() -> (Catalog, Arc<BufferPoolManager>, tempfile::TempDir, Arc<TxnManager>) {

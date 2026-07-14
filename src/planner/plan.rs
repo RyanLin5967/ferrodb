@@ -147,15 +147,16 @@ mod tests {
 
 use tempfile::tempdir;
 
-use crate::{execution::executor::run, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager, wal::log::WalManager};
+use crate::{execution::{executor::run, session::Session}, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager, wal::log::WalManager};
     use super::*;
 
     fn run_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
         let stmts = p.parse();
+        let mut session = Session::new();
         for stmt in stmts {
-            run(stmt, catalog, bp.clone(), txn.clone()).unwrap();
+            run(stmt, catalog, bp.clone(), txn.clone(), &mut session).unwrap();
         }
     }
 

@@ -329,7 +329,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::executor::run, optimizer::optimizer::{optimize, pushdown}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager, wal::{log::WalManager, txn::TxnManager}};
+use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, execution::{executor::run, session::Session}, optimizer::optimizer::{optimize, pushdown}, parser::{parser::Parser, scanner::Scanner}, storage::disk_manager::DiskManager, wal::{log::WalManager, txn::TxnManager}};
     use super::*;
 
     fn setup() -> (Catalog, Arc<BufferPoolManager>, Arc<TxnManager>) {
@@ -347,8 +347,9 @@ use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, exec
         let mut parser = Parser::new(tokens);
         let stmts = parser.parse();
         assert!(parser.errors.is_empty(), "parse errors: {:?}", parser.errors);
+        let mut session = Session::new();
         for stmt in stmts {
-            run(stmt, catalog, bp.clone(), txn.clone()).unwrap();
+            run(stmt, catalog, bp.clone(), txn.clone(), &mut session).unwrap();
         }
     }
 

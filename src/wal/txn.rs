@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::Tuple}, wal::log::{RecKind, WalManager}};
 
@@ -12,9 +12,15 @@ pub struct TxnManager {
     pub commits_since_checkpoint: AtomicU64,
 }
 
+pub struct Snapshot {
+    pub high_water: u64,
+    pub active: HashSet<u64>,
+}
+
 pub struct TxnEntry {
     pub status: TxnStatus,
-    pub last_lsn: u64
+    pub last_lsn: u64,
+    pub snapshot: Option<Snapshot>,
 }
 
 pub enum TxnStatus {
@@ -32,7 +38,9 @@ impl TxnManager {
     pub fn begin(&self) -> Result<u64, FerroError> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let lsn = self.wal.append(txn_id, 0, &RecKind::Begin)?;
-        self.att.lock().unwrap().insert(txn_id, TxnEntry { status: TxnStatus::Running, last_lsn: lsn });
+        let mut att = self.att.lock().unwrap();
+        let snapshot = Snapshot { high_water: txn_id, active: att.keys().copied().collect()};
+        att.insert(txn_id, TxnEntry { status: TxnStatus::Running, last_lsn: lsn, snapshot: Some(snapshot) });
         Ok(txn_id)
     }
 
@@ -61,7 +69,7 @@ impl TxnManager {
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
-        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= CHECKPOINT_INTERVAL {
+        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= CHECKPOINT_INTERVAL && self.att.lock().unwrap().is_empty() {
             self.checkpoint()?;
         }
         Ok(())
@@ -166,7 +174,7 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
 mod tests {
     use std::fs::{OpenOptions, metadata};
 
-use crate::{catalog::catalog::Catalog, execution::executor::{Outcome, run}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::{LogRecord, pwrite_all}};
+use crate::{catalog::catalog::Catalog, execution::{executor::{Outcome, run}, session::Session}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::{LogRecord, pwrite_all}};
 
 use super::*;
 
@@ -273,7 +281,8 @@ use super::*;
             let mut p = Parser::new(tokens);
             let mut stmts = p.parse();
             assert!(p.errors.is_empty());
-            run(stmts.remove(0), catalog, bp.clone(), txn.clone()).unwrap()
+            let mut session = Session::new();
+            run(stmts.remove(0), catalog, bp.clone(), txn.clone(), &mut session).unwrap()
         };
         exec("CREATE TABLE t (id INTEGER NOT NULL, name VARCHAR(20));", &mut catalog);
         let out = exec("INSERT INTO t VALUES (1, 'a');", &mut catalog);

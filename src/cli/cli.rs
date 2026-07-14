@@ -1,6 +1,7 @@
 use std::{fs::OpenOptions, io, path::Path, sync::Arc};
 use std::io::Write;
 use crate::execution::executor::run;
+use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
 use crate::wal::log::WalManager;
@@ -17,6 +18,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     let bp = Arc::new(BufferPoolManager::new(dm));
     let wal = Arc::new(WalManager::new(format!("{}.wal", db_path).into())?);
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    let mut session = Session::new();
     bp.attach_wal(wal.clone());    
     let recovered = recover(&txn)?;
     let mut catalog = if existed {
@@ -48,7 +50,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         if let Some(pos) = buffer.rfind(';') {
             let complete = buffer[..=pos].to_string();
             buffer = buffer[pos + 1..].to_string();
-            execute_sql(&complete, &mut catalog, bp.clone(), txn.clone());
+            execute_sql(&complete, &mut catalog, bp.clone(), txn.clone(), &mut session);
         }
     }
     txn.checkpoint()?;
@@ -56,7 +58,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
+fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {
     let tokens = match Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens() {
         Ok(t) => t,
         Err(e) => { 
@@ -71,7 +73,7 @@ fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn
         return;
     }
     for stmt in stmts {
-        match run(stmt, catalog, bp.clone(), txn.clone()) {
+        match run(stmt, catalog, bp.clone(), txn.clone(), session) {
             Ok(out) => print_outcome(&out),
             Err(e) => eprintln!("error: {}", e),
         }
