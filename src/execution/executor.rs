@@ -37,6 +37,7 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             if session.current.is_some() {
                 return Err(FerroError::Txn("txn already started".into()))
             }
+            session.current = Some(txn.begin()?);
             Ok(Outcome::Ok)
         }
         Stmt::Commit => match session.current.take() {
