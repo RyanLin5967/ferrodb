@@ -124,7 +124,13 @@ impl Parser {
             return self.parse_analyze()
         } else if self.match_token(&[TokenType::Explain]){
             return self.parse_explain()
-        }else if self.match_token(&[TokenType::Create]){
+        } else if self.match_token(&[TokenType::Begin]) {
+            return self.parse_txn_stmt(Stmt::Begin)
+        } else if self.match_token(&[TokenType::Commit]) {
+            return self.parse_txn_stmt(Stmt::Commit)
+        } else if self.match_token(&[TokenType::Rollback]) {
+            return self.parse_txn_stmt(Stmt::Rollback)
+        } else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
             } else if self.match_token(&[TokenType::Table]) {
