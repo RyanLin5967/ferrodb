@@ -387,4 +387,16 @@ use super::*;
         assert_eq!(wal.next_lsn.load(Ordering::SeqCst), l1);
         assert!(wal.read_record(l0).is_ok());
     }
+
+    #[test]
+    fn test_begin_creates_snapshot() {
+        let (_bp, _wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let t2 = txn.begin().unwrap();
+        let att = txn.att.lock().unwrap();
+        let snapshot = att[&t2].snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.high_water, t2);
+        assert!(snapshot.active.contains(&t1));
+        assert!(!snapshot.active.contains(&t2));
+    }
 }
