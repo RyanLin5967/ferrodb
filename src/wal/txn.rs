@@ -42,9 +42,9 @@ impl TxnManager {
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
+        let mut att = self.att.lock().unwrap();
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let lsn = self.wal.append(txn_id, 0, &RecKind::Begin)?;
-        let mut att = self.att.lock().unwrap();
         let snapshot = Snapshot { high_water: txn_id, active: att.keys().copied().collect()};
         att.insert(txn_id, TxnEntry { status: TxnStatus::Running, last_lsn: lsn, snapshot: Some(snapshot) });
         Ok(txn_id)
