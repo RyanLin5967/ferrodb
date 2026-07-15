@@ -357,5 +357,17 @@ mod tests {
         let final_catalog = Catalog::open(catalog.buffer_pool.clone(), 1).unwrap();
         assert_eq!(final_catalog.tables.len(), 10);
     }
+
+    #[test]
+    fn test_create_table_adds_time_travel_root() {
+        let mut catalog = setup_catalog();
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        let e = catalog.get_table("t").unwrap();
+        assert_ne!(e.time_travel_root, 0);
+        assert_ne!(e.time_travel_root, e.first_directory_page_id);
+        catalog.persist().unwrap();
+        let f_c = Catalog::open(catalog.buffer_pool.clone(), 1).unwrap();
+        assert_ne!(f_c.get_table("t").unwrap().time_travel_root, 0);
+    }
 }
 
