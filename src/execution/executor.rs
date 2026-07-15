@@ -266,6 +266,7 @@ mod tests {
     use crate::parser::scanner::Scanner;
     use crate::parser::parser::Parser;
     use crate::storage::disk_manager::DiskManager;
+use crate::storage::heap_file_manager::HeapFileManager;
 use crate::wal::log::WalManager;
     use tempfile::tempdir;
 
@@ -736,5 +737,28 @@ use crate::wal::log::WalManager;
         assert!(matches!(exec("BEGIN;", &mut catalog, &mut s), Err(FerroError::Txn(_))));
         assert!(matches!(exec("CREATE TABLE idk (id INTEGER NOT NULL);", &mut catalog, &mut s), Err(FerroError::Txn(_))));
         exec("ROLLBACK;", &mut catalog, &mut s).unwrap();
+    }
+
+    #[test]
+    fn test_insert_stamps_begin_ts() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s = Session::new();
+        let exec = |sql: &str, catalog: &mut Catalog, s: &mut Session| {
+            let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+            let mut p = Parser::new(tokens);
+            let stmts = p.parse();
+            assert!(p.errors.is_empty());
+            run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
+        };
+        exec("CREATE TABLE t (id INTEGER NOT NULL, str VARCHAR(10));", &mut catalog, &mut s).unwrap();
+        let expected = txn.next_txn_id.load(Ordering::SeqCst);
+        exec("INSERT INTO t VALUES (1, 'a');", &mut catalog, &mut s).unwrap();
+        let entry = catalog.get_table("t").unwrap();
+        let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+        let (_, tuple) = heap.scan().next().unwrap().unwrap();
+        let h = tuple.version_header().unwrap();
+        assert_eq!(h.begin_ts, expected);
+        assert_eq!(h.end_ts, 0);
+        assert_eq!(h.prev(), None);
     }
 }
