@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::Tuple}, wal::log::{RecKind, WalManager}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{RecKind, WalManager}}};
 
 const CHECKPOINT_INTERVAL: u64 = 256;
 
@@ -12,6 +12,7 @@ pub struct TxnManager {
     pub commits_since_checkpoint: AtomicU64,
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub high_water: u64,
     pub active: HashSet<u64>,
@@ -27,6 +28,11 @@ pub enum TxnStatus {
     Running, 
     Commiting,
     Aborting
+}
+
+pub struct ReadView {
+    pub snapshot: Snapshot,
+    pub txn_id: u64,
 }
 
 impl TxnManager {
@@ -168,6 +174,17 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
     drop(frame);
     bp.unpin_page(page_id, true);
     Ok(())
+}
+
+impl ReadView {
+    pub fn visible(&self, h: &VersionHeader) -> bool {
+        let created = h.begin_ts == self.txn_id || (h.begin_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.begin_ts));
+        if !created {
+            return false;
+        }
+        let ended = h.end_ts == self.txn_id || (h.end_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.end_ts));
+        !ended
+    }
 }
 
 #[cfg(test)]
