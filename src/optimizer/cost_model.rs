@@ -1,6 +1,6 @@
 use std::{ops::Bound};
 
-use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema, stats::{ColumnStats}}, parser::{parser::JoinType, scanner::TokenType}, planner::physical_plan::PhysicalPlan, storage::disk_manager::PAGE_SIZE};
+use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema, stats::ColumnStats}, parser::{parser::JoinType, scanner::TokenType}, planner::physical_plan::PhysicalPlan, storage::{disk_manager::PAGE_SIZE, tuple::VERSION_HEADER_SIZE}};
 
 // magic constants
 pub const DEFAULT_SEQ_PAGE_COST: f64 = 1.0;
@@ -293,12 +293,12 @@ fn get_val(v: &Value) -> Option<f64> {
 }
 
 fn row_width(schema: &Schema) -> usize {
-    schema.columns.iter().map(|c| match c.data_type {
+    VERSION_HEADER_SIZE + schema.columns.iter().map(|c| match c.data_type {
         DataType::Boolean => 1,
         DataType::Float => 8,
         DataType::Integer => 4,
         DataType::Varchar(n) => n as usize,
-    }).sum()
+    }).sum::<usize>()
 }
 
 fn num_pages(row_count: usize, schema: &Schema) -> usize {

@@ -36,7 +36,7 @@ impl Modify for Insert {
         if self.primary_index.search(&vals[0])?.is_some() {
             return Err(FerroError::Contraint("duplicate primary key".into()))
         }
-        let tuple = Tuple::serialize(&vals, &self.schema)?;
+        let tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
         let rid = self.heap.insert(tuple)?;
         self.primary_index.insert(vals[0].clone(), rid)?;
         for sec_idx in &self.secondary_indexes {

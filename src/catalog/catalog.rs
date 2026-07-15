@@ -47,6 +47,7 @@ impl Catalog {
             first_directory_page_id: hfm.first_directory_page_id,
             schema,
             primary_index_root: primary.root_page_id.load(Ordering::Relaxed),
+            time_travel_root: hfm.first_directory_page_id, 
             indexes: Vec::new()
         };
         self.tables.insert(name, entry);
@@ -277,7 +278,7 @@ mod tests {
         let mut catalog = setup_catalog();
         assert_eq!(catalog.first_catalog_page_id, 1);
         
-        catalog.tables.insert("test_table".to_string(), TableEntry { name: "test_table".to_string(), first_directory_page_id: 2, primary_index_root: 3, schema: create_test_schema(), indexes: vec![] });
+        catalog.tables.insert("test_table".to_string(), TableEntry { name: "test_table".to_string(), first_directory_page_id: 2, primary_index_root: 3, schema: create_test_schema(), indexes: vec![] , time_travel_root: 1});
         catalog.persist().unwrap();
         let opened_catalog = Catalog::open(catalog.buffer_pool, catalog.first_catalog_page_id).unwrap();
         assert_eq!(opened_catalog.tables.len(), 1);
@@ -341,7 +342,7 @@ mod tests {
         for i in 0..200 {
             catalog.tables.insert(
                 format!("table_{}", i),
-                TableEntry { name: format!("table_{}", i), first_directory_page_id: i, primary_index_root: i + 1, schema: create_test_schema(), indexes: vec![] }
+                TableEntry { name: format!("table_{}", i), first_directory_page_id: i, primary_index_root: i + 1, schema: create_test_schema(), indexes: vec![], time_travel_root: 1 }
             );
         }
         catalog.persist().unwrap();

@@ -20,6 +20,7 @@ pub struct TableEntry {
     pub name: String,
     pub first_directory_page_id: u32,
     pub primary_index_root: u32,
+    pub time_travel_root: u32,
     pub schema: Schema,
     pub indexes: Vec<IndexInfo>,
 }
@@ -62,7 +63,8 @@ impl CatalogPage {
             offset += 4;
             bytes[offset..offset + 4].copy_from_slice(&entry.primary_index_root.to_be_bytes());
             offset += 4;
-
+            bytes[offset..offset + 4].copy_from_slice(&entry.time_travel_root.to_be_bytes());
+            offset += 4;
             let num_columns = entry.schema.columns.len() as u16;
             bytes[offset..offset + 2].copy_from_slice(&num_columns.to_be_bytes());
             offset+= 2;
@@ -136,6 +138,8 @@ impl CatalogPage {
             offset += 4;
             let primary_index_root = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
             offset += 4;
+            let time_travel_root = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            offset += 4;
             let num_columns = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
             offset += 2;
             let mut columns: Vec<Column> = Vec::new();
@@ -178,7 +182,7 @@ impl CatalogPage {
 
                 indexes.push(IndexInfo {column_name,root_page_id});
             }
-            entries.push(TableEntry { name, first_directory_page_id, primary_index_root, schema: Schema{columns}, indexes });
+            entries.push(TableEntry { name, first_directory_page_id, primary_index_root, schema: Schema{columns}, indexes , time_travel_root});
         }
         Ok(Self { page_type: CATALOG_PAGE_TYPE, page_id, next_catalog_page, num_entries, lsn, checksum, entries })
     }
@@ -212,7 +216,7 @@ impl CatalogPage {
 
 impl TableEntry {
     pub fn length(&self)  -> usize{
-        let mut length = 8;
+        let mut length = 12;
         length += 1 + self.name.len();
 
         length += 1;
@@ -237,7 +241,7 @@ mod tests {
 use super::*;
 
     fn mock_entry(name: &str) -> TableEntry {
-        TableEntry { name: name.to_string(), first_directory_page_id: 1, primary_index_root: 2, 
+        TableEntry { name: name.to_string(), first_directory_page_id: 1, primary_index_root: 2, time_travel_root: 1,
             schema: Schema {
                 columns: vec![
                     Column::new("id".to_string(), DataType::Integer, false),
@@ -254,7 +258,7 @@ use super::*;
     #[test]
     fn test_basic_roundtrip() {
         let mut catalog_page = CatalogPage::new(1);
-        let table_entry = vec![TableEntry {name: "s".into(), first_directory_page_id: 1, primary_index_root: 2, schema: Schema { columns: Vec::new() }, indexes: Vec::new()}];
+        let table_entry = vec![TableEntry {name: "s".into(), first_directory_page_id: 1, primary_index_root: 2, schema: Schema { columns: Vec::new() }, indexes: Vec::new(), time_travel_root: 1}];
         catalog_page.entries = table_entry;
         catalog_page.num_entries = 1;
 

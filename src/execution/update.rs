@@ -46,7 +46,7 @@ impl Modify for Update {
                 }
             }
             let pk = old_values[0].clone();
-            let tuple = Tuple::serialize(&new_values, &self.schema)?;
+            let tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;
             let new_rid = self.heap.update(rid, tuple)?;
             if new_rid != rid {
                 self.primary_index.delete(&pk)?;

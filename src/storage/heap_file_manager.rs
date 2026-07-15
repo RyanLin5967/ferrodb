@@ -302,7 +302,7 @@ mod tests {
         let (hfm, _dir) = setup();
         let schema = test_schema();
         let values = vec![Value::Integer(1), Value::Varchar("hello".into())];
-        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
         let rid = hfm.insert(tuple).unwrap();
         let result = hfm.read(rid).unwrap();
         let decoded = result.deserialize(&schema).unwrap();
@@ -325,11 +325,11 @@ mod tests {
         let (hfm, _dir) = setup();
         let schema = test_schema();
         let values = vec![Value::Integer(3), Value::Varchar("old".into())];
-        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
         let rid = hfm.insert(tuple).unwrap();
 
         let new_values = vec![Value::Integer(3), Value::Varchar("new".into())];
-        let new_tuple = Tuple::serialize(&new_values, &schema).unwrap();
+        let new_tuple = Tuple::serialize(&new_values, &schema, 0).unwrap();
         let new_rid = hfm.update(rid, new_tuple).unwrap();
         let result = hfm.read(new_rid).unwrap();
         let decoded = result.deserialize(&schema).unwrap();
@@ -342,7 +342,7 @@ mod tests {
         let schema = test_schema();
         for i in 0..10 {
             let values = vec![Value::Integer(i), Value::Varchar(format!("row{}", i)) ];
-            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
             hfm.insert(tuple).unwrap();
         }
         let tuples: Result<Vec<_>, _> = hfm.scan().collect();
@@ -357,7 +357,7 @@ mod tests {
         ]);
         for _ in 0..100 {
             let values = vec![Value::Varchar("x".repeat(200))];
-            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
             hfm.insert(tuple).unwrap();
         }
         
@@ -372,7 +372,7 @@ mod tests {
         let mut rids = Vec::new();
         for i in 0..10 {
             let values = vec![Value::Integer(i), Value::Varchar(format!("row{}", i))];
-            let tuple = Tuple::serialize(&values, &schema).unwrap();
+            let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
             rids.push(hfm.insert(tuple).unwrap());
         }
         // delete every other row

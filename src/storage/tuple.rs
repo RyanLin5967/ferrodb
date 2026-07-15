@@ -6,11 +6,20 @@ pub struct Tuple {
     pub data: Vec<u8>
 }
 
+pub const VERSION_HEADER_SIZE: usize = 24;
+// |begin_ts (8)|end_ts (8)|prev_page (4)|prev_slot (2)|reserved (2)|
+pub struct VersionHeader {
+    pub begin_ts: u64,
+    pub end_ts: u64,
+    pub prev_page: u32,
+    pub prev_slot: u16,
+}
+
 impl Tuple {
     pub fn new(data: Vec<u8>) -> Self{
         Tuple {data}
     }
-    pub fn serialize(values: &[Value], schema: &Schema) -> Result<Self, FerroError>{
+    pub fn serialize(values: &[Value], schema: &Schema, begin_ts: u64) -> Result<Self, FerroError>{
         if values.len() != schema.columns.len() {
             return Err(FerroError::Parse(String::from("values is not the same length as columns")))
         }
@@ -24,6 +33,11 @@ impl Tuple {
                 null_bitmap[byte_index] |= 1 << bit_index;
             }
         }
+        bytes.extend_from_slice(&begin_ts.to_be_bytes());
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(&null_bitmap);
         // add serialized values + padding between them (no padding between tuples)
         // formula: padding = (align - (len & (align - 1))) & (align - 1)
@@ -87,7 +101,7 @@ impl Tuple {
 
     pub fn deserialize(&self, schema: &Schema) -> Result<Vec<Value>, FerroError>  {
         let mut values: Vec<Value> = Vec::new();
-        let mut offset: usize = 0;
+        let mut offset: usize = VERSION_HEADER_SIZE;
 
         let bitmap_len = (schema.columns.len() + 7)/8;
         let bitmap = &self.data[offset..bitmap_len + offset];
@@ -152,7 +166,24 @@ impl Tuple {
         Ok(values)
     }
 
+    pub fn version_header(&self) -> Result<VersionHeader, FerroError> {
+        if self.data.len() < VERSION_HEADER_SIZE {
+            return Err(FerroError::Io("tuple size < version header size".into()));
+        }
+        let begin_ts = u64::from_be_bytes(self.data[0..8].try_into().unwrap());
+        let end_ts = u64::from_be_bytes(self.data[8..16].try_into().unwrap());
+        let prev_page = u32::from_be_bytes(self.data[16..20].try_into().unwrap());
+        let prev_slot = u16::from_be_bytes(self.data[20..22].try_into().unwrap());
+        Ok(VersionHeader { begin_ts, end_ts, prev_page, prev_slot })
+    }
 }
+
+impl VersionHeader {
+    pub fn prev(&self) -> Option<(u32, u16)> {
+        (self.prev_page != 0).then_some((self.prev_page, self.prev_slot))
+    }
+}
+
 pub fn get_padding(align: usize, buff_size: usize) -> usize {
     return (align - (buff_size & (align - 1))) & (align - 1)
 }
@@ -174,7 +205,7 @@ mod tests {
             ];
         let values = vec![Value::Integer(67), Value::Float(6.7), Value::Varchar(String::from("67")), Value::Boolean(false)];
         let schema = Schema::new(columns);
-        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
         let de_values = Tuple::deserialize(&tuple, &schema).unwrap();
         assert_eq!(values, de_values);
     }
@@ -196,7 +227,7 @@ mod tests {
         ];
         
         let schema = Schema::new(columns);        
-        let tuple = Tuple::serialize(&values, &schema).unwrap();
+        let tuple = Tuple::serialize(&values, &schema, 0).unwrap();
         let de_values = Tuple::deserialize(&tuple, &schema).unwrap();
         
         assert_eq!(values, de_values);
