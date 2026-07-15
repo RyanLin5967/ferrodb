@@ -42,12 +42,13 @@ impl Catalog {
         }
         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
         let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
+        let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
         let entry = TableEntry {
             name: name.clone(),
             first_directory_page_id: hfm.first_directory_page_id,
             schema,
             primary_index_root: primary.root_page_id.load(Ordering::Relaxed),
-            time_travel_root: hfm.first_directory_page_id, 
+            time_travel_root: tt_heap.first_directory_page_id, 
             indexes: Vec::new()
         };
         self.tables.insert(name, entry);
