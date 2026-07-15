@@ -232,4 +232,18 @@ mod tests {
         
         assert_eq!(values, de_values);
     }
+
+    #[test]
+    fn test_versioned_tuple_roundtrip() {
+        let schema = Schema::new(vec![
+            Column::new(String::from("i"), DataType::Integer, false), 
+            Column::new(String::from("f"), DataType::Float, true),
+            Column::new(String::from("s"), DataType::Varchar(10), false)
+        ]);
+        let values = vec![Value::Integer(5), Value::Null, Value::Varchar("hi".into())];
+        let tuple = Tuple::serialize(&values, &schema, 1).unwrap();
+        let h = tuple.version_header().unwrap();
+        assert_eq!((h.begin_ts, h.end_ts, h.prev()), (1, 0, None));
+        assert_eq!(tuple.deserialize(&schema).unwrap(), values);
+    }
 }
