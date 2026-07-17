@@ -1,6 +1,6 @@
 use std::{collections::HashSet, ops::Bound, sync::Arc};
 
-use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}};
+use crate::{binder::binder::BoundExpr, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{executor::Executor, filter::Filter, hash_join::HashJoin, index_scan::IndexScan, nested_loop_join::NestedLoopJoin, projection::Projection, sec_index_scan::SecondaryIndexScan, seq_scan::SeqScan}, optimizer::{cost_model::{DEFAULT_CPU_TUPLE_COST, cost, equi_pairs, join_cardinality}, search_algorithm::reorder_inner_joins}, parser::{parser::JoinType, scanner::TokenType}, planner::{logical_plan::LogicalPlan, physical_plan::PhysicalPlan, plan::predicate_to_bounds}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::ReadView};
 
 pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, FerroError> {
     match lp {
@@ -33,39 +33,41 @@ pub fn optimize(lp: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan, Ferr
 }
 
 // physical -> executors
-pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
+pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, view: Arc<ReadView>) -> Result<Box<dyn Executor>, FerroError> {
     match plan {
         PhysicalPlan::Filter { input, predicate } => {
-            let child = lower(*input, catalog, bp)?;
+            let child = lower(*input, catalog, bp, view)?;
             Ok(Box::new(Filter{child, predicate}))
         }
         PhysicalPlan::SeqScan { table } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
-            let heap = HeapFileManager::open(entry.first_directory_page_id, bp);
-            Ok(Box::new(SeqScan { scanner: heap.scan(), schema: entry.schema.clone()}))
+            let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+            let tt_heap = HeapFileManager::open(entry.time_travel_root, bp);
+            Ok(Box::new(SeqScan { scanner: heap.scan(), schema: entry.schema.clone(), tt_heap, view}))
         }
         PhysicalPlan::Projection { input, exprs, .. } => {
-            let child = lower(*input, catalog, bp)?;
+            let child = lower(*input, catalog, bp, view)?;
             Ok(Box::new(Projection {child, exprs}))
         }
         PhysicalPlan::NestedLoopJoin { left, right, on, join_type, right_width } => {
-            let left_exec = lower(*left, catalog, bp.clone())?;
-            let right_exec = lower(*right, catalog, bp)?;
+            let left_exec = lower(*left, catalog, bp.clone(), view.clone())?;
+            let right_exec = lower(*right, catalog, bp, view)?;
             Ok(Box::new(NestedLoopJoin::new(left_exec, right_exec, on, join_type, right_width)))
         }
         PhysicalPlan::IndexScan { table, column, lower, upper } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Bind(format!("unknown table: {}", table)))?;
             let schema = entry.schema.clone();
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+            let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
             if column == 0 {
                 let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp);
                 let scanner = tree.range_scan(lower, upper)?;
-                return Ok(Box::new(IndexScan{heap, scanner, schema}))
+                return Ok(Box::new(IndexScan{heap, scanner, schema, tt_heap, view}))
             } 
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
             let sec_tree = BPlusTreeManager::<(Value, Value), ()>::open(sec_root, bp.clone());
-            let primary_index = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp);
+            let primary_index = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
 
             let scan_lower = match lower {
                 Bound::Excluded(_) => return Err(FerroError::Bind("lower bound sec index isn't supported".into())),
@@ -73,11 +75,11 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>) 
                 Bound::Unbounded => Bound::Unbounded
             };
             let scanner = sec_tree.range_scan(scan_lower, Bound::Unbounded)?;
-            Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper}))
+            Ok(Box::new(SecondaryIndexScan {heap, scanner, primary_index, schema, sec_upper: upper, tt_heap, view, col_index: column}))
         }
         PhysicalPlan::HashJoin { left, right, on, join_type, left_keys, right_keys, right_width } => {
-            let left_exec = lower(*left, catalog, bp.clone())?;
-            let right_exec = lower(*right, catalog, bp)?;
+            let left_exec = lower(*left, catalog, bp.clone(), view.clone())?;
+            let right_exec = lower(*right, catalog, bp, view)?;
             Ok(Box::new(HashJoin::new(left_exec, right_exec, on, join_type, left_keys, right_keys, right_width)))
         }
     }

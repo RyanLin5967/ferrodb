@@ -12,7 +12,7 @@ pub struct TxnManager {
     pub commits_since_checkpoint: AtomicU64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     pub high_water: u64,
     pub active: HashSet<u64>,
@@ -30,6 +30,7 @@ pub enum TxnStatus {
     Aborting
 }
 
+#[derive(Debug, Clone)]
 pub struct ReadView {
     pub snapshot: Snapshot,
     pub txn_id: u64,
@@ -144,6 +145,15 @@ impl TxnManager {
         self.wal.truncate(self.next_txn_id.load(Ordering::SeqCst))?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn snapshot_of(&self, txn_id: u64) -> Result<Snapshot, FerroError> {
+        self.att.lock().unwrap().get(&txn_id).and_then(|e| e.snapshot.clone()).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
+    }
+
+    pub fn read_snapshot(&self) -> Snapshot {
+        let att = self.att.lock().unwrap();
+        Snapshot { high_water: self.next_txn_id.load(Ordering::SeqCst), active: att.keys().copied().collect() }
     }
 }
 

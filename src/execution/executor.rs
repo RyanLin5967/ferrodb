@@ -11,7 +11,7 @@ use crate::execution::session::Session;
 use crate::parser::parser::{Stmt};
 use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
-use crate::wal::txn::TxnManager;
+use crate::wal::txn::{ReadView, TxnManager};
 use crate::{error::FerroError};
 use crate::storage::heap_file_manager::RecordId;
 use crate::parser::scanner::TokenType;
@@ -80,7 +80,11 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
         }
         dml => {
             if matches!(dml, Stmt::Select { .. }) {
-                match plan(dml, catalog, bp.clone(), None)? {
+                let view = Arc::new(match session.current {
+                    Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id},
+                    None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+                });
+                match plan(dml, catalog, bp.clone(), None, view)? {
                     Plan::Read(mut root) => {
                         let mut res = Vec::new();
                         loop {
@@ -100,7 +104,15 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     Some(id) => (id, false),
                     None => (txn.begin()?, true)
                 };
-                let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id))) {
+                let view = match txn.snapshot_of(txn_id) {
+                    Ok(snapshot) => Arc::new(ReadView { snapshot, txn_id }),
+                    Err(e) => {
+                        txn.abort(txn_id)?;
+                        session.current = None;
+                        return Err(e)
+                    }
+                };
+                let planned = match plan(dml, catalog, bp.clone(), Some((txn.clone(), txn_id)), view) {
                     Ok(p) => p,
                     Err(e) => {
                         txn.abort(txn_id)?;

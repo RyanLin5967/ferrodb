@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::TxnManager};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -8,14 +8,14 @@ pub enum Plan {
 }
 
 // for dml
-pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: Option<(Arc<TxnManager>, u64)>) -> Result<Plan, FerroError> {
+pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: Option<(Arc<TxnManager>, u64)>, view: Arc<ReadView>) -> Result<Plan, FerroError> {
     
     match stmt {
         Stmt::Select { .. } => {
             let logical = Binder::new(catalog).bind(stmt)?;
             let logical = pushdown(logical);
             let physical = optimize(logical, catalog)?;
-            Ok(Plan::Read(lower(physical, catalog, bp)?))
+            Ok(Plan::Read(lower(physical, catalog, bp, view)?))
         }
         Stmt::Delete { table, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
@@ -29,7 +29,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 }
                 None => None
             };
-            let scan = build_scan(entry, bound_where, bp)?;
+            let scan = build_scan(entry, bound_where, bp, view)?;
             let delete = Delete {table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(delete)))
         }
@@ -61,7 +61,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 Some(w) => Some(binder.bind_expr(w, &scope)?),
                 None => None
             };
-            let child = build_scan(entry, bound_where, bp)?;
+            let child = build_scan(entry, bound_where, bp, view)?;
             let update = Update {table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(update)))
         }
@@ -93,11 +93,12 @@ fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManage
     Ok((heap, tree, handles))
 }
 
-fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPoolManager>) -> Result<Box<dyn Executor>, FerroError> {
+fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPoolManager>, view: Arc<ReadView>) -> Result<Box<dyn Executor>, FerroError> {
     let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
+    let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
     let scanner = heap.scan();
     let mut node: Box<dyn Executor> = Box::new(SeqScan {
-        scanner, schema: entry.schema.clone(),
+        scanner, schema: entry.schema.clone(), tt_heap, view
     });
     if let Some(pred) = predicate {
         node = Box::new(Filter { child: node, predicate: pred})
@@ -143,11 +144,11 @@ fn flip(op: TokenType) -> Option<TokenType> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::{collections::HashSet, fs::OpenOptions};
 
 use tempfile::tempdir;
 
-use crate::{execution::{executor::run, session::Session}, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager, wal::log::WalManager};
+use crate::{execution::{executor::run, session::Session}, parser::{parser::Parser, scanner::{Scanner, TokenType}}, planner::physical_plan::PhysicalPlan, storage::disk_manager::DiskManager, wal::{log::WalManager, txn::Snapshot}};
     use super::*;
 
     fn run_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>) {
@@ -219,7 +220,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_point() {
         let (c, bp, _d) = setup();
         let plan= PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(2)) };
-        let rows = drain(lower(plan, &c, bp).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![vec![Value::Integer(2), Value::Varchar("b".into())]]);
     }
 
@@ -227,7 +228,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_range() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(4)) };
-        let rows = drain(lower(plan, &c, bp).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![
             vec![Value::Integer(2), Value::Varchar("b".into())], 
             vec![Value::Integer(3), Value::Varchar("c".into())], 
@@ -238,7 +239,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_unbounded() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(3)), upper: Bound::Unbounded };
-        let rows = drain(lower(plan, &c, bp).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Integer(3));
     }
@@ -247,7 +248,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_secondary_equality() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Included(Value::Varchar("c".into())), upper: Bound::Included(Value::Varchar("c".into())) };
-        let rows = drain(lower(plan, &c, bp).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![vec![Value::Integer(3), Value::Varchar("c".into())]])
     }
 
@@ -255,6 +256,6 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_secondary_rejects_strict_lower() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
-        assert!(lower(plan, &c, bp).is_err()); // todo: composite bound handling 
+        assert!(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).is_err()); // todo: composite bound handling 
     }
 }
