@@ -192,7 +192,7 @@ impl ReadView {
         if !created {
             return false;
         }
-        let ended = h.end_ts == self.txn_id || (h.end_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.end_ts));
+        let ended = h.end_ts != 0 && (h.end_ts == self.txn_id || (h.end_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.end_ts)));
         !ended
     }
 }
