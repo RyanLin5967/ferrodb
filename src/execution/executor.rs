@@ -306,7 +306,8 @@ use crate::wal::log::WalManager;
         let bp = Arc::new(BufferPoolManager::new(dm));
         let catalog = Catalog::create(bp.clone()).unwrap();
         let wal = Arc::new(WalManager::new(dir.path().join("test.wal")).unwrap());
-        let txn = Arc::new(TxnManager::new(wal, bp.clone()));
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
         (catalog, bp, dir, txn)
     } 
 
@@ -385,6 +386,14 @@ use crate::wal::log::WalManager;
         let mut v: Vec<i32> = rs.iter().map(|r| match &r[0] {Value::Integer(i) => *i, _ => panic!()}).collect();
         v.sort();
         v
+    }
+
+    fn exec_s(sql: &str, catalog: &mut Catalog, bp: &Arc<BufferPoolManager>, txn: &Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError>{
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty());
+        run(stmts.remove(0), catalog, bp.clone(), txn.clone(), session)
     }
 
     #[test]
@@ -772,5 +781,23 @@ use crate::wal::log::WalManager;
         assert_eq!(h.begin_ts, expected);
         assert_eq!(h.end_ts, 0);
         assert_eq!(h.prev(), None);
+    }
+
+    #[test]
+    fn test_uncommitted_writes_invisible_across_sessions() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+        exec_s("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("BEGIN;", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("INSERT INTO t VALUES (1);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+
+        let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s2).unwrap());
+        assert!(r.is_empty());
+        let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s1).unwrap());
+        assert_eq!(r.len(), 1);
+        exec_s("COMMIT;", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s2).unwrap());
+        assert_eq!(r.len(), 1);
     }
 }
