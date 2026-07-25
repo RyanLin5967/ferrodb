@@ -4,7 +4,7 @@ pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tupl
     let mut current = head;
     loop {
         let h = current.version_header()?;
-        if !view.visible(&h) {
+        if view.visible(&h) {
             return Ok(Some(current));
         }
         match h.prev() {
