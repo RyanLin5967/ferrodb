@@ -800,4 +800,21 @@ use crate::wal::log::WalManager;
         let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s2).unwrap());
         assert_eq!(r.len(), 1);
     }
+
+    #[test]
+    fn test_snapshot_pins_at_begin() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let (mut s1, mut s2) = (Session::new(), Session::new());
+
+        exec_s("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("BEGIN;", &mut catalog, &bp, &txn, &mut s2).unwrap();
+        let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s2).unwrap());
+        assert!(r.is_empty());
+        
+        exec_s("INSERT INTO t VALUES (1);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        let r = rows(exec_s("SELECT id FROM t;", &mut catalog, &bp, &txn, &mut s2).unwrap());
+        assert!(r.is_empty());
+    }
+
+    
 }
