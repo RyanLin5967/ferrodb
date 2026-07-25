@@ -220,7 +220,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_point() {
         let (c, bp, _d) = setup();
         let plan= PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(2)) };
-        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 99, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![vec![Value::Integer(2), Value::Varchar("b".into())]]);
     }
 
@@ -228,7 +228,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_range() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(2)), upper: Bound::Included(Value::Integer(4)) };
-        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 99, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![
             vec![Value::Integer(2), Value::Varchar("b".into())], 
             vec![Value::Integer(3), Value::Varchar("c".into())], 
@@ -239,7 +239,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_unbounded() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 0, lower: Bound::Included(Value::Integer(3)), upper: Bound::Unbounded };
-        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 99, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Integer(3));
     }
@@ -248,7 +248,7 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_secondary_equality() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Included(Value::Varchar("c".into())), upper: Bound::Included(Value::Varchar("c".into())) };
-        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).unwrap());
+        let rows = drain(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 99, active: HashSet::new()}, txn_id: 0 })).unwrap());
         assert_eq!(rows, vec![vec![Value::Integer(3), Value::Varchar("c".into())]])
     }
 
@@ -256,6 +256,6 @@ use crate::{execution::{executor::run, session::Session}, parser::{parser::Parse
     fn test_index_scan_secondary_rejects_strict_lower() {
         let (c, bp, _d) = setup();
         let plan = PhysicalPlan::IndexScan { table: "users".into(), column: 1, lower: Bound::Excluded(Value::Varchar("b".into())), upper: Bound::Unbounded };
-        assert!(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 0, active: HashSet::new()}, txn_id: 0 })).is_err()); // todo: composite bound handling 
+        assert!(lower(plan, &c, bp, Arc::new(ReadView { snapshot: Snapshot {high_water: 99, active: HashSet::new()}, txn_id: 0 })).is_err()); // todo: composite bound handling 
     }
 }
