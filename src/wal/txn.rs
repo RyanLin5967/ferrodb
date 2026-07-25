@@ -201,7 +201,7 @@ impl ReadView {
 mod tests {
     use std::fs::{OpenOptions, metadata};
 
-use crate::{catalog::catalog::Catalog, execution::{executor::{Outcome, run}, session::Session}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::{LogRecord, pwrite_all}};
+use crate:: {catalog::catalog::Catalog, execution::{executor::{Outcome, run}, session::Session}, parser::{parser::Parser, scanner::Scanner}, storage::{disk_manager::DiskManager, heap_file_manager::HeapFileManager}, wal::log::{LogRecord, pwrite_all}};
 
 use super::*;
 
@@ -425,5 +425,19 @@ use super::*;
         assert_eq!(snapshot.high_water, t2);
         assert!(snapshot.active.contains(&t1));
         assert!(!snapshot.active.contains(&t2));
+    }
+
+    #[test]
+    fn test_visibility_matrix() {
+        let view = ReadView { snapshot: Snapshot { high_water: 10, active: HashSet::from([7])}, txn_id: 10};
+        let h = |b, e| VersionHeader { begin_ts: b, end_ts: e, prev_page: 0, prev_slot: 0};
+        assert!(view.visible(&h(10, 0)));
+        assert!(view.visible(&h(5, 0)));
+        assert!(!view.visible(&h(7, 0)));
+        assert!(!view.visible(&h(12, 0)));
+        assert!(!view.visible(&h(5,6)));
+        assert!(view.visible(&h(5, 12)));
+        assert!(view.visible(&h(5, 7)));
+        assert!(!view.visible(&h(5, 10)));
     }
 }
