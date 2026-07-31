@@ -29,8 +29,8 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 }
                 None => None
             };
-            let scan = build_scan(entry, bound_where, bp, view)?;
-            let delete = Delete {table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
+            let scan = build_scan(entry, bound_where, bp, view.clone())?;
+            let delete = Delete {table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
             return Ok(Plan::Write(Box::new(delete)))
         }
         Stmt::Insert { table, values } => {
@@ -49,7 +49,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Update { table, assignments, where_clause } => {
             let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp.clone(), txn, txn_id)?;
+            let (heap, tree, handles) = open_table(entry, bp.clone(), txn.clone(), txn_id)?;
             let binder = Binder::new(catalog);
             let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
@@ -61,8 +61,10 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 Some(w) => Some(binder.bind_expr(w, &scope)?),
                 None => None
             };
-            let child = build_scan(entry, bound_where, bp, view)?;
-            let update = Update {table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles};
+            let child = build_scan(entry, bound_where, bp.clone(), view.clone())?;
+            let mut tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
+            tt_heap.set_transaction(txn, txn_id);
+            let update = Update {table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, view: view.clone(), tt_heap};
             return Ok(Plan::Write(Box::new(update)))
         }
         _ => return Err(FerroError::OnlyDML)

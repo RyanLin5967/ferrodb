@@ -4,6 +4,7 @@ use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::
 
 const CHECKPOINT_INTERVAL: u64 = 256;
 
+
 pub struct TxnManager {
     pub wal: Arc<WalManager>,
     pub bp: Arc<BufferPoolManager>,
@@ -194,6 +195,10 @@ impl ReadView {
         }
         let ended = h.end_ts != 0 && (h.end_ts == self.txn_id || (h.end_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.end_ts)));
         !ended
+    }
+
+    pub fn is_commited_for_me(&self, ts: u64) -> bool {
+        ts == self.txn_id || (ts < self.snapshot.high_water && !self.snapshot.active.contains(&ts))
     }
 }
 

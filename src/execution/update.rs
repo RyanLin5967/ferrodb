@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
 use crate::binder::binder::BoundExpr;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
 use crate::execution::executor::{Modify, evaluate, sync_roots};
 use crate::storage::tuple::Tuple;
+use crate::wal::txn::ReadView;
+use crate::wal::visibility::check_write_conflict;
 use crate::{catalog::schema::Schema, execution::executor::Executor, storage::heap_file_manager::HeapFileManager};
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
@@ -17,6 +21,8 @@ pub struct Update {
     pub heap: HeapFileManager,
     pub primary_index: BPlusTreeManager<Value, RecordId>,
     pub secondary_indexes: Vec<IndexHandle>,
+    pub view: Arc<ReadView>,
+    pub tt_heap: HeapFileManager,
 }
 
 impl Modify for Update {
@@ -35,6 +41,8 @@ impl Modify for Update {
         }
         let mut count = 0;
         for (rid, old_values) in res {
+            let head_h = self.heap.read(rid)?.version_header()?;
+            check_write_conflict(&self.view, &head_h)?;
             let mut new_values = old_values.clone();
             for (col_idx, expr) in &self.assignments {
                 new_values[*col_idx] = evaluate(expr, &old_values)?;
@@ -46,7 +54,12 @@ impl Modify for Update {
                 }
             }
             let pk = old_values[0].clone();
-            let tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;
+            let mut old_ver = self.heap.read(rid)?;
+            old_ver.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
+            let mut tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;
+            let tt_rid = self.tt_heap.insert(old_ver)?;
+            tuple.data[16..20].copy_from_slice(&tt_rid.page_id.to_be_bytes());
+            tuple.data[20..22].copy_from_slice(&tt_rid.page_id.to_be_bytes());
             let new_rid = self.heap.update(rid, tuple)?;
             if new_rid != rid {
                 self.primary_index.delete(&pk)?;
@@ -57,7 +70,6 @@ impl Modify for Update {
                 let old_v = &old_values[handle.col_index];
                 let new_v = &new_values[handle.col_index];
                 if old_v != new_v {
-                    handle.tree.delete(&(old_v.clone(), pk.clone()))?;
                     handle.tree.insert((new_v.clone(), pk.clone()), ())?;
                 }
             }
