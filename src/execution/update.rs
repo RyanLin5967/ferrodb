@@ -59,7 +59,7 @@ impl Modify for Update {
             let mut tuple = Tuple::serialize(&new_values, &self.schema, self.heap.txn_id)?;
             let tt_rid = self.tt_heap.insert(old_ver)?;
             tuple.data[16..20].copy_from_slice(&tt_rid.page_id.to_be_bytes());
-            tuple.data[20..22].copy_from_slice(&tt_rid.page_id.to_be_bytes());
+            tuple.data[20..22].copy_from_slice(&tt_rid.slot_num.to_be_bytes());
             let new_rid = self.heap.update(rid, tuple)?;
             if new_rid != rid {
                 self.primary_index.delete(&pk)?;
