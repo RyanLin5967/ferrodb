@@ -242,6 +242,35 @@ fn the_feed_ships_wide_types_as_quoted_json_strings() {
     assert!(!feed.contains("\"id\":\"1\""), "INTEGER must not be stringified:\n{feed}");
 }
 
+/// **A predicate against a wide column finds the row.**
+///
+/// This is the query-side half of type-directed literal binding, and it is the one that fails
+/// silently rather than loudly if it is missing: a `WHERE` comparing a `Timestamp` cell against a
+/// literal bound as some other numeric variant falls through to the cross-type rank fallback,
+/// which is a fixed answer independent of the values. The query then returns **no rows** and
+/// reports no error, which is a wrong answer wearing an empty result's clothes.
+#[test]
+fn a_where_clause_against_a_wide_column_matches_by_value() {
+    let mut d = seeded("wide_where");
+
+    // Past 2^53, so an f64-mediated comparison would also match id 1's neighbour if it existed.
+    let big = d.rows(&format!("SELECT id FROM wide WHERE big = {BIG_MAX};"));
+    assert_eq!(big, vec![vec![Value::Integer(1)]], "BIGINT equality found {big:?}");
+
+    let ts = d.rows(&format!("SELECT id FROM wide WHERE ts = {TS_MILLIS};"));
+    assert_eq!(ts, vec![vec![Value::Integer(1)]], "TIMESTAMP equality found {ts:?}");
+
+    let dec = d.rows("SELECT id FROM wide WHERE dec = 1.50;");
+    assert_eq!(dec, vec![vec![Value::Integer(3)]], "DECIMAL equality found {dec:?}");
+
+    // Range predicates too, and the negative bound.
+    let neg = d.rows("SELECT id FROM wide WHERE ts < 0;");
+    assert_eq!(neg, vec![vec![Value::Integer(2)]], "TIMESTAMP range found {neg:?}");
+
+    let past = d.rows(&format!("SELECT id FROM wide WHERE big > {BIG_PAST_2_53};"));
+    assert_eq!(past, vec![vec![Value::Integer(1)]], "only i64::MAX is above 2^53+1: {past:?}");
+}
+
 /// The schema event names the wide types, so a consumer learns **in band** that a column is a
 /// BIGINT rather than having to infer it from a string that happens to hold digits. Without this,
 /// a sink could not tell `BIGINT` from `VARCHAR` — both arrive as JSON strings by design.

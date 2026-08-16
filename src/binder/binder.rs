@@ -340,8 +340,28 @@ impl<'a> Binder<'a> {
     pub fn bind_expr(&self, expr: Expr, scope: &Scope) -> Result<BoundExpr, FerroError> {
         match expr {
             Expr::BinaryOp { left, operator, right } => {
-                let l = self.bind_expr(*left, scope)?;
-                let r = self.bind_expr(*right, scope)?;
+                // A comparison gets the same type-directed literal binding as INSERT and UPDATE,
+                // and needs it more, because getting it wrong here is SILENT.
+                //
+                // `WHERE ts = 1700000000123` binds its literal from the text alone as a `BigInt`.
+                // `Timestamp` sits outside the numeric rank band on purpose (see `Value::cmp`), so
+                // `Timestamp == BigInt` falls through to the cross-type rank fallback, which is a
+                // fixed answer that never depends on the values. The predicate then matches
+                // nothing, the query returns an empty result, and no error is raised anywhere —
+                // a wrong answer wearing an empty result's clothes.
+                //
+                // Reading the literal as the declared type of the column it is compared against
+                // fixes that without touching the ordering, which has to stay a total order.
+                let left_ty = Self::column_type_of(&left, scope);
+                let right_ty = Self::column_type_of(&right, scope);
+                let l = match right_ty.as_ref().and_then(|t| Self::literal_for_column(&left, t)) {
+                    Some(res) => BoundExpr::Literal(res?),
+                    None => self.bind_expr(*left, scope)?,
+                };
+                let r = match left_ty.as_ref().and_then(|t| Self::literal_for_column(&right, t)) {
+                    Some(res) => BoundExpr::Literal(res?),
+                    None => self.bind_expr(*right, scope)?,
+                };
                 return Ok(BoundExpr::BinaryOp { left: Box::new(l), operator, right: Box::new(r) })
             }
             Expr::UnaryOp { operator, right } => {
@@ -427,6 +447,30 @@ impl<'a> Binder<'a> {
         Ok(v)
     }
 
+    /// The declared type of the column `expr` names, if it names one that this scope resolves.
+    ///
+    /// An unresolvable name is `None` rather than an error: this is only ever used to *decide how
+    /// to read a literal on the other side*, and the real resolution error is raised by
+    /// `bind_expr` a moment later with its own message.
+    fn column_type_of(expr: &Expr, scope: &Scope) -> Option<DataType> {
+        match Self::unwrap_grouping(expr) {
+            Expr::ColumnRef { table, column } => scope
+                .resolve(table.as_deref(), column)
+                .ok()
+                .map(|i| scope.columns[i].data_type.clone()),
+            _ => None,
+        }
+    }
+
+    /// Look through redundant parentheses, so `WHERE ts = (1700000000123)` binds like the
+    /// unparenthesised form rather than silently falling back to untyped binding.
+    fn unwrap_grouping(mut expr: &Expr) -> &Expr {
+        while let Expr::Grouping(inner) = expr {
+            expr = inner;
+        }
+        expr
+    }
+
     /// The signed text of a numeric literal, if `expr` is one.
     ///
     /// `INSERT INTO t VALUES (-9223372036854775808)` parses as unary minus applied to the literal
@@ -434,12 +478,16 @@ impl<'a> Binder<'a> {
     /// therefore cannot represent `i64::MIN` at all, so the sign is folded into the text first and
     /// the whole thing is parsed once.
     fn signed_numeric_text(expr: &Expr) -> Option<String> {
-        match expr {
+        match Self::unwrap_grouping(expr) {
             Expr::Literal { value_type: TokenType::Number, value } => Some(value.clone()),
-            Expr::UnaryOp { operator: TokenType::Minus, right } => match right.as_ref() {
-                Expr::Literal { value_type: TokenType::Number, value } => Some(format!("-{value}")),
-                _ => None,
-            },
+            Expr::UnaryOp { operator: TokenType::Minus, right } => {
+                match Self::unwrap_grouping(right.as_ref()) {
+                    Expr::Literal { value_type: TokenType::Number, value } => {
+                        Some(format!("-{value}"))
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
