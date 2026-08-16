@@ -89,6 +89,14 @@ pub enum ChangeOp {
     /// apply it, and every guess is wrong for some row. Arriving in the stream at the position the
     /// DDL actually occupied means the events before it describe the old shape and the ones after
     /// describe the new one, with no ambiguity to resolve.
+    ///
+    /// **A `CREATE_TABLE` is a declaration, not news.** It is re-emitted at every checkpoint,
+    /// because a checkpoint truncates the log and must re-establish the schema at the new base for
+    /// the log to stay self-describing. So a consumer will see the same `CREATE_TABLE` many times
+    /// for one table and must read it as "this table has this shape" rather than "a table was just
+    /// created" — anything counting them is counting checkpoints. Measured at
+    /// `FERRODB_CHECKPOINT_INTERVAL=1`, where 30 commits produced 61 events: 30 rows and 31
+    /// re-declarations.
     Schema { change: SchemaChange, columns: Vec<ColumnSpec> },
     Insert { new: Vec<Value> },
     Update { old: Vec<Value>, new: Vec<Value> },

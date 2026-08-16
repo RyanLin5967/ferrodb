@@ -88,6 +88,11 @@ func quoteIdent(s string) string {
 }
 
 // ensureTable creates the destination table from a schema event.
+//
+// IF NOT EXISTS is load-bearing, not defensive habit: a CREATE_TABLE is re-emitted at every
+// checkpoint of the source, because a checkpoint truncates the log and has to re-establish the
+// schema at the new base. A sink that treated each one as "a new table appeared" would fail on the
+// second checkpoint of every table's life.
 func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 	names := make([]string, 0, len(cols))
 	defs := make([]string, 0, len(cols)+2)

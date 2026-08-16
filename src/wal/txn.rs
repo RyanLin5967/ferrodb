@@ -3,7 +3,30 @@ use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64
 use crate::catalog::column::DataType;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager}}};
 
-const CHECKPOINT_INTERVAL: u64 = 256;
+/// Commits between automatic checkpoints.
+///
+/// Overridable by `FERRODB_CHECKPOINT_INTERVAL` **so that tests can make truncation constant
+/// instead of rare.** That is not a convenience knob: three separate features shipped with a test
+/// that passed only because it stayed under this threshold, and past it each one failed for real —
+/// a base backup dead on arrival, a table's schema erased from the log, a live consumer whose
+/// cursor had been truncated away. A condition that almost never happens is a condition nothing is
+/// tested against, so this exists to let a test set it to 1 and make every commit truncate.
+///
+/// Read once, because a value that changes underneath a running database would make checkpoint
+/// timing depend on when the environment was last read rather than on how much work has happened.
+fn checkpoint_interval() -> u64 {
+    use std::sync::OnceLock;
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("FERRODB_CHECKPOINT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            // Zero would mean "checkpoint before every commit has happened", which is not a
+            // meaningful setting; treat it as 1 rather than dividing the world by it.
+            .map(|v| v.max(1))
+            .unwrap_or(256)
+    })
+}
 
 
 pub struct TxnManager {
@@ -96,7 +119,7 @@ impl TxnManager {
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
-        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= CHECKPOINT_INTERVAL && self.att.lock().unwrap().is_empty() {
+        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= checkpoint_interval() && self.att.lock().unwrap().is_empty() {
             self.checkpoint()?;
         }
         Ok(())
