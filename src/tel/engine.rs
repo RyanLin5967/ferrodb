@@ -552,17 +552,26 @@ fn compose(
     }
 
     // ---- per-cell ----
+    // A row created *inside this merge* has no LCA value, so its initial image stands in as the
+    // base. Without this, `INSERT` then `UPDATE ... SET qty = qty - 1` on the same branch has no
+    // value for the delta to apply to.
+    let fresh: HashMap<RowKey, Vec<Value>> = out.created.iter().cloned().collect();
+
     let mut cell_keys: BTreeSet<CellKey> = BTreeSet::new();
     cell_keys.extend(ours.cells.keys().copied());
     cell_keys.extend(theirs.cells.keys().copied());
 
     for key in cell_keys {
-        if poisoned.contains(&(key.0, key.1)) {
-            continue; // already reported as DeleteVsWrite
+        let (tbl, row, col) = key;
+        if poisoned.contains(&(tbl, row)) {
+            continue; // already reported as DeleteVsWrite, or a contradictory RowCreate
         }
+        let base_value = base.column(tbl, row, col).ok().or_else(|| {
+            fresh.get(&(tbl, row)).and_then(|img| img.get(col.0 as usize).cloned())
+        });
         let o = ours.cells.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
         let t = theirs.cells.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-        compose_cell(key, o, t, policy, base, &mut out)?;
+        compose_cell(key, o, t, policy, base_value, &mut out)?;
     }
 
     Ok(out)
@@ -668,13 +677,10 @@ fn compose_cell(
     o: &[StampedOp],
     t: &[StampedOp],
     policy: &dyn ColumnPolicyLookup,
-    base_ctx: &dyn GuardContext,
+    base: Option<Value>,
     out: &mut Composition,
 ) -> Result<(), FerroError> {
-    let (tbl, row, col) = key;
-    // The LCA value. Absent is legal — the row may have been created inside this merge.
-    let base = base_ctx.column(tbl, row, col).ok();
-
+    let (tbl, _row, col) = key;
     let o_eff = fold_side(o, base.as_ref())?;
     let t_eff = fold_side(t, base.as_ref())?;
 
@@ -1452,6 +1458,36 @@ mod tests {
             }
             other => panic!("expected Commuting, got {}", other),
         }
+    }
+
+    #[test]
+    fn a_row_created_inside_the_merge_supplies_its_own_base_for_a_delta() {
+        // INSERT then `SET qty = qty - 4` on the same branch: there is no LCA value for the
+        // delta to apply to, so the RowCreate image has to stand in.
+        let m = ThreeWayMerger::new();
+        let fresh = RowId(77);
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(
+            TBL,
+            fresh,
+            None,
+            OpKind::RowCreate(vec![Value::Integer(77), Value::Null, Value::Integer(10)]),
+        ));
+        theirs.push_op(Op::new(TBL, fresh, Some(QTY), OpKind::Add(Delta::Int(-4))));
+        theirs.push_guard(Guard::holds(GuardExpr::cmp(
+            GuardExpr::col(TBL, fresh, QTY),
+            CmpOp::Ge,
+            GuardExpr::Literal(Value::Integer(0)),
+        )));
+
+        // main untouched, and the guard sees 10 - 4 = 6
+        let out = m.merge(&lca(), &[], &[theirs.clone()], &AllReject, &base(20)).unwrap();
+        assert_eq!(out, MergeOutcome::Clean, "{}", out);
+
+        // and the same shape overdrawn is caught
+        theirs.ops[1] = Op::new(TBL, fresh, Some(QTY), OpKind::Add(Delta::Int(-40)));
+        let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(20)).unwrap();
+        assert_eq!(out.conflicts()[0].kind, ConflictKind::GuardFailed, "{}", out);
     }
 
     // ---- diff (exit criterion 4) ----
