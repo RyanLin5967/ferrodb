@@ -37,6 +37,10 @@ pub mod backup;
 /// changed; this reads the same log and produces row-level change events, committed only.
 pub mod logical;
 
+/// The change feed as newline-delimited JSON — see [`jsonl`]. A feed only a Rust caller in this
+/// process can read is not a CDC source; this is the representation that leaves the process.
+pub mod jsonl;
+
 /// Optional synchronous commit — see [`sync`]. Off by default; turning it on changes the
 /// durability promise and spends availability to do it.
 pub mod sync;

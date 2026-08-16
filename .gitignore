@@ -25,3 +25,6 @@ target
 
 /target
 *.db
+# Every example that opens a database also writes `<db>.wal`, and `*.db` does not match that.
+*.wal
+*.backup/

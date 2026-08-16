@@ -65,6 +65,7 @@
 //!   needs a base backup, exactly as a replica does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
@@ -108,6 +109,12 @@ pub struct ChangeEvent {
     /// `commit_lsn + 1` and got exactly that error.
     pub commit_end_lsn: u64,
     pub table: String,
+    /// Column names, positionally matching the values in `op`.
+    ///
+    /// A feed of positional values is unusable outside the process that produced it: the consumer
+    /// would need this database's catalog to know what column three is. Shared via `Arc` because
+    /// the names are per-table, not per-row, and a busy table produces a great many rows.
+    pub columns: Arc<Vec<String>>,
     pub op: ChangeOp,
 }
 
@@ -149,7 +156,7 @@ impl Decoded {
 
 /// Why a record did or did not become a row.
 enum RowResult {
-    Row(String, Vec<Value>),
+    Row(String, Arc<Vec<String>>, Vec<Value>),
     /// No table in the catalog has this `dir_root`.
     UnknownTable,
     /// The table is known and the bytes do not match its schema.
@@ -158,8 +165,8 @@ enum RowResult {
 
 /// Reads a WAL range and produces committed row-level changes.
 pub struct LogicalDecoder {
-    /// `dir_root` -> (table name, schema).
-    tables: HashMap<u32, (String, Schema)>,
+    /// `dir_root` -> (table name, schema, column names).
+    tables: HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
     /// Time-travel heap roots. Records against these are MVCC's own bookkeeping.
     time_travel: BTreeSet<u32>,
 }
@@ -174,9 +181,11 @@ impl LogicalDecoder {
         let mut tables = HashMap::new();
         let mut time_travel = BTreeSet::new();
         for (name, entry) in &catalog.tables {
+            let columns: Vec<String> =
+                entry.schema.columns.iter().map(|c| c.name.clone()).collect();
             tables.insert(
                 entry.first_directory_page_id,
-                (name.clone(), entry.schema.clone()),
+                (name.clone(), entry.schema.clone(), Arc::new(columns)),
             );
             time_travel.insert(entry.time_travel_root);
         }
@@ -204,12 +213,12 @@ impl LogicalDecoder {
     }
 
     fn row(&self, dir_root: u32, bytes: &[u8]) -> RowResult {
-        let Some((name, schema)) = self.tables.get(&dir_root) else {
+        let Some((name, schema, columns)) = self.tables.get(&dir_root) else {
             return RowResult::UnknownTable;
         };
         let tuple = Tuple { data: bytes.to_vec() };
         match tuple.deserialize(schema) {
-            Ok(v) => RowResult::Row(name.clone(), v),
+            Ok(v) => RowResult::Row(name.clone(), Arc::clone(columns), v),
             // Reported as its own category rather than turned into a plausible-looking row.
             Err(_) => RowResult::Undecodable,
         }
@@ -226,7 +235,7 @@ impl LogicalDecoder {
     ) -> Result<Decoded, FerroError> {
         let mut out = Decoded::default();
         // txn_id -> changes staged so far, in the order they were written.
-        let mut staged: HashMap<u64, Vec<(u64, String, ChangeOp)>> = HashMap::new();
+        let mut staged: HashMap<u64, Vec<(u64, String, Arc<Vec<String>>, ChangeOp)>> = HashMap::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -254,10 +263,10 @@ impl LogicalDecoder {
             match &rec.kind {
                 RecKind::HeapInsert { dir_root, tuple, .. } => {
                     match self.row(*dir_root, tuple) {
-                        RowResult::Row(table, new) => staged
+                        RowResult::Row(table, columns, new) => staged
                             .entry(txn)
                             .or_default()
-                            .push((lsn, table, ChangeOp::Insert { new })),
+                            .push((lsn, table, columns, ChangeOp::Insert { new })),
                         RowResult::UnknownTable => {
                             *out.unresolved.entry(*dir_root).or_insert(0) += 1
                         }
@@ -267,10 +276,10 @@ impl LogicalDecoder {
                     }
                 }
                 RecKind::HeapDelete { dir_root, old, .. } => match self.row(*dir_root, old) {
-                    RowResult::Row(table, old) => staged
+                    RowResult::Row(table, columns, old) => staged
                         .entry(txn)
                         .or_default()
-                        .push((lsn, table, ChangeOp::Delete { old })),
+                        .push((lsn, table, columns, ChangeOp::Delete { old })),
                     RowResult::UnknownTable => *out.unresolved.entry(*dir_root).or_insert(0) += 1,
                     RowResult::Undecodable => *out.undecodable.entry(*dir_root).or_insert(0) += 1,
                 },
@@ -279,7 +288,7 @@ impl LogicalDecoder {
                     // the version header rather than of the columns.
                     let killed = Self::is_dead(new);
                     match (self.row(*dir_root, old), self.row(*dir_root, new)) {
-                        (RowResult::Row(table, old), RowResult::Row(_, new)) => {
+                        (RowResult::Row(table, columns, old), RowResult::Row(_, _, new)) => {
                             let op = if killed {
                                 // A SQL DELETE. Reporting it as an update would leave a consumer
                                 // holding a row the database no longer has.
@@ -287,7 +296,7 @@ impl LogicalDecoder {
                             } else {
                                 ChangeOp::Update { old, new }
                             };
-                            staged.entry(txn).or_default().push((lsn, table, op))
+                            staged.entry(txn).or_default().push((lsn, table, columns, op))
                         }
                         // Half a decoded update is not an update. Both images or neither.
                         (RowResult::UnknownTable, _) | (_, RowResult::UnknownTable) => {
@@ -300,13 +309,14 @@ impl LogicalDecoder {
                     // Release, stamped with this commit's LSN. Ordering by commit is what gives a
                     // consumer the sequence the database itself made visible.
                     if let Some(changes) = staged.remove(&txn) {
-                        for (change_lsn, table, op) in changes {
+                        for (change_lsn, table, columns, op) in changes {
                             out.events.push(ChangeEvent {
                                 txn_id: txn,
                                 lsn: change_lsn,
                                 commit_lsn: lsn,
                                 commit_end_lsn: next,
                                 table,
+                                columns,
                                 op,
                             });
                         }
@@ -353,7 +363,14 @@ mod tests {
     /// A decoder wired to one table at `dir_root` 7, without needing a real catalog.
     fn decoder() -> LogicalDecoder {
         let mut tables = HashMap::new();
-        tables.insert(7u32, ("inventory".to_string(), schema()));
+        tables.insert(
+            7u32,
+            (
+                "inventory".to_string(),
+                schema(),
+                Arc::new(vec!["id".to_string(), "qty".to_string()]),
+            ),
+        );
         // dir_root 8 is the table's time-travel heap: MVCC's own archive of superseded versions.
         LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]) }
     }
