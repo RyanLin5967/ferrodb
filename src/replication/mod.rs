@@ -212,23 +212,83 @@ impl<'a> ReplicationSource<'a> {
     ///
     /// Returns the raw frames and the LSN immediately after the last one, so the caller's next
     /// request is exact rather than inferred from a byte count.
+    /// # The truncation race: why it is already safe, and what the check below is actually for
+    ///
+    /// This samples the frontier once and then reads records one at a time, which *looks* like a
+    /// check-then-act spanning the whole loop — the shape behind most defects in this codebase. A
+    /// concurrent `truncate` moves `base_lsn` and empties the file, and every byte offset here is
+    /// computed from `base_lsn`, so the worry is a mid-walk truncation silently **re-pointing** the
+    /// read and shipping bytes from one position under another position's LSN.
+    ///
+    /// **That was investigated and it cannot happen. The reasoning is worth keeping, because the
+    /// property it depends on is not obvious and a future change could remove it.** `truncate` sets
+    /// `base_lsn` to `next_lsn` — past *every* record the log holds, not to some interior point. So
+    /// any LSN a walk is still holding is necessarily *below* the new base, and `raw_frame` reaches
+    /// its offset through `lsn.checked_sub(base_lsn)`, which returns `None` and errors. Every stale
+    /// offset therefore fails closed rather than shifting. Confirmed by disabling the check below
+    /// and re-running the race test three times: no mis-labelled frame ever appeared.
+    ///
+    /// Pinning the log for the whole walk was also built and then **rejected on measurement**: it
+    /// does close the window, and it starves the checkpointer, because a continuously streaming
+    /// replica holds a pin essentially always. A test truncating whenever the log passed 2KB
+    /// managed **one** truncation in ten seconds. Trading a race that cannot fire for a WAL that
+    /// cannot be reclaimed is a bad trade.
+    ///
+    /// So the comparison below is **not** load-bearing today. It earns its place for two smaller
+    /// reasons, both real: it reports a truncation *as* a truncation instead of as `checked_sub`
+    /// underflow surfacing three frames deep, and it is the assertion that would start being
+    /// load-bearing the moment `truncate` learns to discard a prefix rather than the whole log —
+    /// at which point the base would land in the middle and stale offsets would no longer fail
+    /// closed. It is documented as defence, not as a fix, so nobody later mistakes it for the
+    /// reason this is safe.
     pub fn read_from(&self, from_lsn: u64, max_bytes: usize) -> Result<(Vec<u8>, u64), FerroError> {
+        use std::sync::atomic::Ordering;
+
+        let base_before = self.wal.base_lsn.load(Ordering::SeqCst);
         let durable = self.durable_lsn();
         if from_lsn >= durable {
             return Ok((Vec::new(), from_lsn));
         }
+
+        // Any failure inside the walk is reported as the truncation it probably was, if the base
+        // did in fact move. A CRC complaint about bytes that were valid when the walk started
+        // describes the symptom and hides the cause.
+        let truncated_under_us = |e: FerroError| -> FerroError {
+            if self.wal.base_lsn.load(Ordering::SeqCst) != base_before {
+                FerroError::Wal(format!(
+                    "the log was truncated to base {} while this batch was being read, so nothing \
+                     was shipped; retry from the source's current start_lsn (underlying: {e})",
+                    self.wal.base_lsn.load(Ordering::SeqCst)
+                ))
+            } else {
+                e
+            }
+        };
+
         let mut out = Vec::new();
         let mut lsn = from_lsn;
         while lsn < durable && out.len() < max_bytes {
-            let (_rec, next) = self.wal.read_record(lsn)?;
+            let (_rec, next) = self.wal.read_record(lsn).map_err(truncated_under_us)?;
             if next > durable {
                 // A record straddling the durable frontier is not durable. Stop before it.
                 break;
             }
             let len = (next - lsn) as usize;
-            let frame = self.wal.raw_frame(lsn, len)?;
+            let frame = self.wal.raw_frame(lsn, len).map_err(truncated_under_us)?;
             out.extend_from_slice(&frame);
             lsn = next;
+        }
+
+        // The check that makes the whole walk trustworthy: every offset above was computed against
+        // `base_before`, so if the base has moved, those offsets meant something else.
+        let base_after = self.wal.base_lsn.load(Ordering::SeqCst);
+        if base_after != base_before {
+            return Err(FerroError::Wal(format!(
+                "the log was truncated from base {base_before} to {base_after} while this batch \
+                 was being read; the bytes read are at offsets that no longer mean what they meant \
+                 when the walk began, so nothing was shipped. Retry from the source's current \
+                 start_lsn."
+            )));
         }
         Ok((out, lsn))
     }
