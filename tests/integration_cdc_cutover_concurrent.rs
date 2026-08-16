@@ -103,7 +103,7 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         }
     };
 
-    let (snap_ids, resume_lsn, boundary_txns, slow_id) = std::thread::scope(|s| {
+    let (snap_ids, resume_lsn, boundary_txns, slow_id, handoff_pin) = std::thread::scope(|s| {
         // Racing writers: unsynchronised begin/commit for the whole run.
         for _ in 0..4 {
             let (txn, next_id, committed, commits, stop, write_row) = (
@@ -160,9 +160,9 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
             std::hint::spin_loop();
         }
 
-        // **The cutover**, taken while all four writers are still running.
+        // **The cutover**, taken while all four writers are still running. The handoff arrives
+        // already pinned, so there is no separate pin to take here.
         let handoff = txn.begin_snapshot_read().unwrap();
-        let pin = wal.pin(handoff.resume_lsn).unwrap();
         let view = ReadView { snapshot: handoff.snapshot.clone(), txn_id: handoff.txn_id };
         let snap_ids: Vec<i32> = {
             let _g = heap_lock.lock().unwrap();
@@ -186,9 +186,12 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         }
         stop.store(true, Ordering::SeqCst);
 
-        let out = (snap_ids, handoff.resume_lsn, handoff.snapshot.clone(), slow_id);
-        drop(pin);
-        out
+        // **The pin travels out with the results**, and dropping it here instead is what this test
+        // used to do. The writers below run on for another eight commits and the checkpointer runs
+        // with them, so at FERRODB_CHECKPOINT_INTERVAL=1 the resume point is truncated away long
+        // before the subscription is built - "cannot pin lsn 133: the log has already been
+        // truncated to base 5163". It survived only because the default interval is 256.
+        (snap_ids, handoff.resume_lsn, handoff.snapshot.clone(), slow_id, handoff.pin)
     });
 
     wal.flush().unwrap();
@@ -200,6 +203,9 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
     let streamer = FeedStreamer::new(LogicalDecoder::for_table(dir_root, "t", schema(), u32::MAX))
         .resuming_after_snapshot(boundary);
     let mut sub = Subscription::following(&wal, &streamer).expect("subscribe at the handoff");
+    // The subscription holds its own claim from here, so the handoff's can go. Released explicitly
+    // rather than at end of scope, so that what keeps the log alive is never ambiguous.
+    drop(handoff_pin);
     let mut feed: Vec<u8> = Vec::new();
     let mut suppressed = 0;
     for round in 0..2000 {

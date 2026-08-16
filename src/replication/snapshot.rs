@@ -69,11 +69,25 @@
 //! - **Not a multi-table snapshot, as written.** [`snapshot_table_exact`] opens one reader per
 //!   call, so snapshotting two tables through it gives two readers with two different boundaries —
 //!   fine if each table has its own stream, wrong if one stream carries both, because no single
-//!   boundary describes them. The boundary itself is transaction-level and therefore
-//!   table-independent, so the consistent version is available and is simply a different shape:
-//!   call [`TxnManager::begin_snapshot_read`] directly, read every table under the one reader it
-//!   returns, close it with [`TxnManager::end_read_only`], and use its single boundary for the
-//!   whole stream.
+//!   boundary describes them. The consistent version is available and is simply a different shape:
+//!
+//!   1. call [`TxnManager::begin_snapshot_read`] directly,
+//!   2. read every table under the one reader it returns,
+//!   3. close it with [`TxnManager::end_read_only`],
+//!   4. build one [`SnapshotBoundary`] naming **every table read in step 2** — the transaction set
+//!      answers *when*, not *what*, so a boundary that omits a table it delivered re-sends that
+//!      table, and one that names a table it did not deliver silently drops that table's entire
+//!      pre-cutover history,
+//!   5. **hold `handoff.pin` until the subscription exists**, then stream from `resume_lsn`.
+//!
+//!   Step 5 is the one this recipe used to omit, and omitting it is not a slow leak — it breaks the
+//!   cutover outright. A checkpoint between the read and the subscription truncates the log past
+//!   the resume point, and the stream is refused with *"cannot pin lsn 2597: the log has already
+//!   been truncated to base 4260"*. It went unnoticed because the default checkpoint interval is
+//!   256 commits, so nothing truncates during a small test; at `FERRODB_CHECKPOINT_INTERVAL=1` the
+//!   recipe failed on the first try. The pin now comes back attached to the handoff, so following
+//!   the recipe holds it automatically — dropping the handoff early is the remaining way to get
+//!   this wrong, which is why step 5 says what to hold rather than what to call.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -88,7 +102,7 @@ use super::jsonl::write_feed;
 use super::logical::{ChangeEvent, ChangeOp};
 
 /// What a snapshot captured, and where the stream must resume.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Snapshot {
     pub table: String,
     /// Rows written out.
@@ -101,6 +115,17 @@ pub struct Snapshot {
     /// Whether the log moved while the scan ran. When false, the handoff is exact and nothing will
     /// be re-delivered; when true, changes between `lsn` and `lsn_after` may arrive twice.
     pub concurrent_writes: bool,
+    /// A claim on the log at `lsn`, for the same reason [`ExactSnapshot::pin`] holds one: the window
+    /// between this returning and the consumer subscribing is exactly where a checkpoint lands.
+    ///
+    /// This path used to return `lsn` bare and leave the claim to the caller. Every caller then
+    /// forgot, invisibly, because the default checkpoint interval is 256 commits and nothing
+    /// truncates during a small test; at `FERRODB_CHECKPOINT_INTERVAL=1` the handoff was refused
+    /// with *"cannot pin lsn 3231: the log has already been truncated to base 3911"*. Keep it alive
+    /// until the [`Subscription`](super::stream::Subscription) that replaces it exists.
+    ///
+    /// Holding it costs `Clone` and `PartialEq` on this struct, which nothing used.
+    pub pin: WalPin,
 }
 
 impl Snapshot {
@@ -118,7 +143,7 @@ impl Snapshot {
 /// caller actually performs rather than around one this module imagines.
 pub fn snapshot_table<W, F>(
     table: &str,
-    wal: &WalManager,
+    wal: &Arc<WalManager>,
     w: &mut W,
     read_rows: F,
 ) -> Result<Snapshot, FerroError>
@@ -132,6 +157,12 @@ where
     // because a crash would move the frontier backwards underneath it.
     wal.flush()?;
     let lsn = wal.flushed_lsn.load(Ordering::SeqCst);
+
+    // Claimed immediately, before the scan runs. The scan is the slow part and the checkpointer runs
+    // during it, so a claim taken afterwards would already be too late. Takes an `Arc` rather than a
+    // bare reference for this: a pin owns a handle on the log it claims, because releasing on drop
+    // is the only thing that keeps a forgotten snapshot from freezing the WAL for ever.
+    let pin = wal.pin(lsn)?;
 
     let (columns, rows) = read_rows()?;
 
@@ -164,6 +195,7 @@ where
         lsn,
         lsn_after,
         concurrent_writes: lsn_after != lsn,
+        pin,
     })
 }
 
@@ -286,13 +318,12 @@ where
     W: Write,
     F: FnOnce(u64) -> Result<(Vec<String>, Vec<Vec<Value>>), FerroError>,
 {
+    // The handoff arrives already pinned. It used to be pinned here instead, with a `?` between
+    // `begin_snapshot_read` and `end_read_only` - and that `?` leaked the reader on every failure,
+    // which blocks every subsequent checkpoint for the life of the process. **There is now no
+    // fallible call at all between opening the reader and closing it**, which is a stronger
+    // guarantee than remembering to clean up on each error path, because there is no error path.
     let handoff = txn.begin_snapshot_read()?;
-
-    // Pinned before the reader is closed, so there is no moment at which the resume point is both
-    // published and unclaimed. Nothing can truncate before this anyway — a checkpoint refuses while
-    // a transaction is open, and the reader is one — but that is a property of `checkpoint` today
-    // rather than a promise, and the pin does not depend on it.
-    let pin = txn.wal.pin(handoff.resume_lsn)?;
 
     let read = read_rows(handoff.txn_id);
 
@@ -332,7 +363,7 @@ where
             handoff.snapshot,
             handoff.resume_lsn,
         ),
-        pin,
+        pin: handoff.pin,
         reader_txn_id: handoff.txn_id,
     })
 }
@@ -341,9 +372,9 @@ where
 mod tests {
     use super::*;
 
-    fn wal(tag: &str) -> (tempfile::TempDir, WalManager) {
+    fn wal(tag: &str) -> (tempfile::TempDir, Arc<WalManager>) {
         let d = tempfile::tempdir().unwrap();
-        let w = WalManager::new(d.path().join(format!("{tag}.wal"))).unwrap();
+        let w = Arc::new(WalManager::new(d.path().join(format!("{tag}.wal"))).unwrap());
         (d, w)
     }
 

@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 use crate::catalog::column::DataType;
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
 ///
@@ -110,7 +110,16 @@ impl Snapshot {
 ///   their events instead of re-delivering them.
 ///
 /// Resume position alone gives at-least-once; the transaction set is what removes the overlap.
-#[derive(Clone, Debug)]
+///
+/// **The pin is the third part, and it is here rather than left to the caller because leaving it to
+/// the caller did not work.** A recipe documented in `replication::snapshot` said to call this,
+/// read every table under the one reader, close it, and stream from `resume_lsn` — and omitted the
+/// pin. At the default checkpoint interval of 256 commits nothing truncates in between, so it
+/// passed; at `FERRODB_CHECKPOINT_INTERVAL=1` the very next commit truncates the log out from under
+/// the resume point and the stream is refused with *"cannot pin lsn 2597: the log has already been
+/// truncated to base 4260"*. Handing the claim back with the position it protects is the only shape
+/// in which a caller cannot forget it.
+#[derive(Debug)]
 pub struct SnapshotHandoff {
     /// The reading transaction. Reads performed under it see exactly `snapshot`.
     pub txn_id: u64,
@@ -118,6 +127,10 @@ pub struct SnapshotHandoff {
     pub snapshot: Snapshot,
     /// Where a stream must resume. Durable by the time this is returned.
     pub resume_lsn: u64,
+    /// A claim on the log at `resume_lsn`, held so a checkpoint cannot discard the records the
+    /// stream is about to ask for. Released when this handoff is dropped, so a caller that intends
+    /// to stream later must keep it alive until the subscription has taken its own.
+    pub pin: WalPin,
 }
 
 pub struct TxnEntry {
@@ -201,7 +214,7 @@ impl TxnManager {
     ///
     /// The caller must finish with [`TxnManager::end_read_only`].
     pub fn begin_snapshot_read(&self) -> Result<SnapshotHandoff, FerroError> {
-        let handoff = {
+        let (txn_id, snapshot, resume_lsn) = {
             let mut att = self.att.lock().unwrap();
             let txn_id = Self::begin_locked(&self.next_txn_id, &self.wal, &mut att)?;
             // Includes this reader's own `Begin`, which is the answer when nothing else is in
@@ -215,14 +228,55 @@ impl TxnManager {
                 .snapshot
                 .clone()
                 .expect("begin_locked always records a snapshot");
-            SnapshotHandoff { txn_id, snapshot, resume_lsn }
+            (txn_id, snapshot, resume_lsn)
         };
-        // A resume point the log has not durably written is not a position anyone can resume from:
-        // a crash moves the frontier backwards underneath it and the consumer is left pointing
-        // into a range that will be rewritten by different records. `flush` drains everything
-        // buffered, and `resume_lsn` is at or below the reader's own `Begin`, so this covers it.
-        self.wal.flush()?;
-        Ok(handoff)
+
+        // **The reader is in `att` from here on, and the caller does not have its id yet.** So a
+        // `?` on either step below would leak it with nobody able to clean it up: `checkpoint`
+        // refuses while `att` is non-empty, which means every later CREATE TABLE, CREATE INDEX and
+        // CLI shutdown fails with "checkpoint with active txns" for the life of the process. One
+        // failed snapshot would take the database with it. Both steps therefore report through
+        // `abandon_reader` rather than through `?`.
+        let prepared = (|| {
+            // A resume point the log has not durably written is not a position anyone can resume
+            // from: a crash moves the frontier backwards underneath it and the consumer is left
+            // pointing into a range that will be rewritten by different records. `flush` drains
+            // everything buffered, and `resume_lsn` is at or below the reader's own `Begin`, so
+            // this covers it.
+            self.wal.flush()?;
+            // Claimed before this returns, so there is no moment at which the resume point is
+            // published and unclaimed. See `SnapshotHandoff::pin` for what leaving this to the
+            // caller cost.
+            self.wal.pin(resume_lsn)
+        })();
+
+        match prepared {
+            Ok(pin) => Ok(SnapshotHandoff { txn_id, snapshot, resume_lsn, pin }),
+            Err(e) => {
+                self.abandon_reader(txn_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drop a snapshot reader nobody can close, because nobody else knows it exists.
+    ///
+    /// **The entry must leave `att`, and that is not negotiable** — a checkpoint refuses while any
+    /// transaction is active, so an entry left behind here blocks every checkpoint for the life of
+    /// the process. It is therefore removed directly if the ordinary close cannot write its
+    /// `TxnEnd`, which is the likely case: the reason this is being called at all is usually that
+    /// the WAL just refused a write.
+    ///
+    /// Removing it without a `TxnEnd` record is safe, and specifically because this is a *reader*.
+    /// Recovery treats a transaction with no `Commit` or `TxnEnd` as a loser and aborts it
+    /// (`wal::recovery`), and an abort walks the undo chain back from its last record — for a
+    /// transaction whose `last_lsn` is still its `begin_lsn` there is nothing on that chain, so the
+    /// abort is a no-op. A reader that had written would not reach this path: `end_read_only`
+    /// refuses and rolls it back.
+    fn abandon_reader(&self, txn_id: u64) {
+        // The ordinary close first, so the common case still records its `TxnEnd` in the log.
+        let _ = self.end_read_only(txn_id);
+        self.att.lock().unwrap().remove(&txn_id);
     }
 
     /// Close a transaction that only read.
@@ -253,8 +307,17 @@ impl TxnManager {
                  database; it has been rolled back"
             )));
         }
-        self.append_chained(txn_id, &RecKind::TxnEnd)?;
+        // **The entry leaves `att` whether or not the `TxnEnd` could be written.** Ordering these
+        // the other way round - append with `?`, then remove - meant an IO error on the append
+        // returned to a caller who had already handed over responsibility for this transaction and
+        // now had nothing useful to do with it. Retrying calls back into a WAL that just failed;
+        // not retrying leaves the reader active for ever, and an active transaction blocks every
+        // checkpoint. The error is still reported; what changes is that reporting it no longer
+        // wedges the database. See `abandon_reader` for why a reader with no `TxnEnd` record is
+        // safe for recovery.
+        let appended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att.lock().unwrap().remove(&txn_id);
+        appended?;
         Ok(())
     }
 
