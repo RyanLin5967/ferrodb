@@ -1756,6 +1756,63 @@ mod tests {
         assert_eq!(out.conflicts()[0].kind, ConflictKind::GuardUnevaluable);
     }
 
+    /// R2: a frame's OWN guarded delete must not be unevaluable.
+    ///
+    /// The review found that `ComposedState::column` errors for any cell of a row this merge
+    /// deleted, while pass 3 checked every frame's guards — including the deleting frame's own.
+    /// That made every guarded `DELETE ... WHERE <pred>` a `GuardUnevaluable` conflict with
+    /// nothing to conflict with. Pass 3a now checks a frame's guards against the running state
+    /// *before* applying that frame's ops, which is the precondition reading, so this must pass.
+    #[test]
+    fn a_frames_own_guarded_delete_is_not_unevaluable() {
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_guard(floor_guard(0)); // WHERE qty >= 0, read before our own delete lands
+        ours.push_op(Op::new(TBL, R1, None, OpKind::RowDelete));
+        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20)).unwrap();
+        assert!(
+            out.conflicts().is_empty(),
+            "a solo guarded delete conflicted with nothing: {:?}",
+            out.conflicts()
+        );
+    }
+
+    /// R1: a solo decrement whose own result falsifies its guard must not self-conflict.
+    ///
+    /// `qty -= 5 WHERE qty >= 5` from a base of exactly 5 lands on 0. Checked as a POSTcondition
+    /// that is a conflict; checked as the precondition it actually is, it is clean. The base must
+    /// land ON the bound or the case does not discriminate — from 20 it lands on 15 and passes
+    /// under both readings, which is why the pre-existing tests did not catch this.
+    #[test]
+    fn a_solo_decrement_landing_on_its_own_bound_is_not_a_conflict() {
+        let m = ThreeWayMerger::new();
+        let mut ours = decrement(1, 1, 5);
+        ours.push_guard(floor_guard(5));
+        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(5)).unwrap();
+        assert!(
+            out.conflicts().is_empty(),
+            "an uncontended decrement self-conflicted: {:?}",
+            out.conflicts()
+        );
+    }
+
+    /// Control for both of the above — without it they would pass against an engine that had
+    /// stopped evaluating guards altogether. A genuinely violated precondition must still fire.
+    #[test]
+    fn a_genuinely_violated_precondition_still_conflicts() {
+        let m = ThreeWayMerger::new();
+        let mut ours = decrement(1, 1, 5);
+        ours.push_guard(floor_guard(5));
+        let mut theirs = decrement(2, 2, 5);
+        theirs.push_guard(floor_guard(5));
+        // Base 5: whichever runs second sees 0 and its `qty >= 5` must fail.
+        let out = m.merge(&lca(), &[ours], &[theirs], &AllReject, &base(5)).unwrap();
+        assert!(
+            !out.conflicts().is_empty(),
+            "two takers of 5 from a stock of 5 both passed"
+        );
+    }
+
     #[test]
     fn a_delete_versus_a_write_names_the_right_side_in_the_report() {
         // `ours` and `theirs` name sides, not roles. Attributing the incoming branch's delete
