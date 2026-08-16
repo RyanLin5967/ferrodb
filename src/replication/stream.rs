@@ -166,6 +166,85 @@ impl FeedStreamer {
     }
 }
 
+/// A live consumer's place in the log, with a **claim on the records it still needs**.
+///
+/// Without this, a streaming consumer is broken by every checkpoint. Measured rather than
+/// theorised: a latency run of 1000 commits died at commit ~256 with *"cursor 46446 is below the
+/// log's base 46661: the records it points at have been truncated away"*. The 200-commit run before
+/// it had passed — for the same reason E4's 40-row replication test passed, which is to say for a
+/// reason that does not generalise past the checkpoint interval.
+///
+/// So a subscription pins the log at its cursor, exactly as a base backup does, and moves the pin
+/// forward as it advances. The cost is the same one and it is not free: **the WAL cannot be
+/// reclaimed below the slowest live consumer**, so a consumer that stops reading and never drops
+/// its subscription is a log that never shrinks. That is the trade every replication slot makes,
+/// and it is the right one here — the alternative was measured too, and it is a feed that breaks
+/// every 256 commits.
+pub struct Subscription {
+    wal: std::sync::Arc<WalManager>,
+    cursor: u64,
+    pin: crate::wal::log::WalPin,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately not printing the WalManager: it has no Debug, and a subscription is
+        // identified by where it sits, not by the log it sits in.
+        write!(f, "Subscription(cursor {}, {:?})", self.cursor, self.pin)
+    }
+}
+
+impl Subscription {
+    /// Subscribe from `from`, claiming the log there.
+    ///
+    /// Refuses if that position has already been truncated away — the same refusal `pump` gives,
+    /// made at subscription time so a consumer learns immediately rather than on its first read.
+    pub fn new(wal: &std::sync::Arc<WalManager>, from: u64) -> Result<Self, FerroError> {
+        let pin = wal.pin(from)?;
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin })
+    }
+
+    /// Subscribe from the start of the retained log.
+    pub fn from_start(wal: &std::sync::Arc<WalManager>) -> Result<Self, FerroError> {
+        let from = FeedStreamer::start_cursor(wal);
+        Self::new(wal, from)
+    }
+
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Pump, then move the claim forward to the new cursor.
+    ///
+    /// The new pin is taken **before** the old one is released. Releasing first would open a window
+    /// in which this consumer holds no claim at all, and a checkpoint landing in that window
+    /// discards precisely the records it is about to ask for — the same check-then-act shape that
+    /// has produced most of the defects in this codebase.
+    ///
+    /// **Moving the pin forward is not load-bearing today, and that is worth stating rather than
+    /// implying otherwise.** `truncate` discards the whole log rather than a prefix, so a pin held
+    /// at the subscription's *start* blocks reclamation exactly as effectively as one held at its
+    /// cursor — measured, by removing the forward move and watching every test still pass. What it
+    /// does change is `min_pinned_lsn`, which is the signal a prefix-truncating checkpoint would
+    /// consult, and which is asserted below. So this is the same kind of thing as the base
+    /// comparison in `read_from`: correct, cheap, and the piece that starts mattering the day
+    /// truncation learns to discard a prefix.
+    pub fn pump<W: Write>(
+        &mut self,
+        streamer: &FeedStreamer,
+        w: &mut W,
+    ) -> Result<Pumped, FerroError> {
+        let pumped = streamer.pump(&self.wal, self.cursor, w)?;
+        if pumped.cursor != self.cursor {
+            let next = self.wal.pin(pumped.cursor)?;
+            let old = std::mem::replace(&mut self.pin, next);
+            drop(old);
+            self.cursor = pumped.cursor;
+        }
+        Ok(pumped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +284,83 @@ mod tests {
             &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
         )
         .unwrap();
+    }
+
+    /// **A live subscription survives a checkpoint that would otherwise truncate under it.**
+    ///
+    /// Without the pin this is the failure a 1000-commit latency run hit at commit ~256.
+    #[test]
+    fn a_subscription_holds_the_log_across_a_checkpoint() {
+        let (_d, w) = wal("subscribe");
+        let w = std::sync::Arc::new(w);
+        let s = streamer();
+
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut sub = Subscription::from_start(&w).unwrap();
+        let base_before = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+
+        // More work, then a checkpoint that would discard what the subscriber has not read.
+        for i in 2..=4u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32 * 10);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+        w.truncate(99).unwrap();
+
+        assert_eq!(
+            w.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            base_before,
+            "the checkpoint discarded log a live subscriber still needed"
+        );
+
+        // And the subscriber can still read everything it was promised.
+        let mut buf = Vec::new();
+        let p = sub.pump(&s, &mut buf).unwrap();
+        assert_eq!(p.emitted, 4, "the subscriber lost events across the checkpoint: {p:?}");
+
+        // The claim moved forward with the consumer. Not observable through `truncate`, which is
+        // all-or-nothing, but this is the value a prefix-truncating checkpoint would consult — and
+        // asserting it is what makes the forward move testable at all.
+        assert_eq!(
+            w.min_pinned_lsn(),
+            Some(sub.cursor()),
+            "the subscription's claim did not move with its cursor"
+        );
+        assert!(
+            sub.cursor() > base_before,
+            "the cursor never advanced, so the claim had nowhere to move"
+        );
+
+        // Dropping it releases the claim, so the log can be reclaimed again.
+        drop(sub);
+        w.truncate(100).unwrap();
+        assert!(
+            w.base_lsn.load(std::sync::atomic::Ordering::SeqCst) > base_before,
+            "the log was never reclaimed even after the subscription was dropped"
+        );
+    }
+
+    /// Subscribing to a position already gone is refused at subscribe time, not at first read.
+    #[test]
+    fn subscribing_below_the_base_is_refused_immediately() {
+        let (_d, w) = wal("subgone");
+        let w = std::sync::Arc::new(w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 1);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        w.truncate(7).unwrap();
+        let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(base > 1);
+
+        let err = Subscription::new(&w, base - 1).expect_err("a stale subscription was accepted");
+        assert!(format!("{err}").contains("truncated"), "wrong reason: {err}");
+        assert!(Subscription::new(&w, base).is_ok(), "a current subscription was refused");
     }
 
     /// Lag shrinks as a consumer catches up, and is an upper bound rather than an exact zero.
