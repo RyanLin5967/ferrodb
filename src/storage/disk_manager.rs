@@ -159,18 +159,18 @@ impl DiskManager{
             global_offset += BITS_PER_BITMAP;
         }
         let from_bitmap = highest.map(|h| h + 1).unwrap_or(0);
-        // Third bound, and it is not redundant: a page can exist without any bitmap bit. The
-        // arena store writes its pages directly and never sets a bit, and any legacy `write()`
-        // that bypassed `allocate` does the same. The bitmap cannot see those; the file length
-        // can. Over-reporting costs address space, which is free. Under-reporting hands a second
-        // allocator a page that already holds data.
-        let file_pages = match self.file.metadata() {
-            Ok(m) => (m.len() / PAGE_SIZE as u64) as u32,
-            Err(e) => return Err(FerroError::Io(e.to_string())),
-        };
-        Ok(from_bitmap
-            .max(file_pages)
-            .max(self.next_page_id.load(Ordering::SeqCst)))
+        // Deliberately NOT bounded by the file length, though "every page that exists" sounds
+        // like the safer answer. This function answers a narrower question: how far does THIS
+        // allocator's ownership reach. An arena's pages extend the file without ever setting a
+        // bit here, so folding the file length in makes the mark climb above the arena's own
+        // base — and `ArenaPageStore::new`, which refuses a base below the mark, can then never
+        // reopen a store at the base it already uses. Tried it; it breaks every restart test
+        // (`free_space_map_survives_a_restart`, `checkpoint_round_trips_through_a_file`,
+        // `branches_abandoned_before_a_restart_are_still_reaped_after_it`).
+        //
+        // The file length is the right instrument for "what pages exist" and the wrong one for
+        // "what does the bitmap own". Anything needing the former should ask the file directly.
+        Ok(from_bitmap.max(self.next_page_id.load(Ordering::SeqCst)))
     }
 
     /// Reserve `[base, infinity)` for another allocator, so this one stops there.
