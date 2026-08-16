@@ -193,6 +193,15 @@ pub struct ServerContext {
     pub catalog: Catalog,
     pub bp: Arc<BufferPoolManager>,
     pub txn: Arc<TxnManager>,
+    /// **Shared by every connection, deliberately.** A runtime per connection would give each
+    /// client its own branch namespace: two clients could not see each other's branches, `AS OF
+    /// BRANCH` across connections would resolve nothing, and a merge would land somewhere the other
+    /// client never sees. Branches are a property of the database, not of the socket.
+    ///
+    /// Until this field existed the server built `Session::new()` — `storage: None` — so an agent
+    /// session over the wire staged its writes in a `BTreeMap` while the copy-on-write engine sat
+    /// beside it, which is the same gap E31 closed for the CLI and E35 for the demo.
+    pub runtime: Arc<crate::agent_sql::runtime::AgentRuntime>,
 }
 
 /// Serve connections until `listener` stops yielding them.
@@ -268,7 +277,7 @@ pub fn handle(mut stream: TcpStream, ctx: &mut ServerContext) -> std::io::Result
     stream.flush()?;
 
     // --- message loop ------------------------------------------------------------------------
-    let mut session = Session::new();
+    let mut session = Session::with_runtime(Arc::clone(&ctx.runtime));
     loop {
         let mut tag = [0u8; 1];
         if reader.read_exact(&mut tag).is_err() {

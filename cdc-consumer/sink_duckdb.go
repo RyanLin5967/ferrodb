@@ -111,14 +111,35 @@ var duckTypes = map[string]bool{
 // INTEGER becomes BIGINT deliberately: the feed's integers are JSON numbers with no declared width,
 // and narrowing them at the destination would turn a value the source accepted into an error here.
 // VARCHAR(n) loses its n, which DuckDB ignores anyway.
+//
+// Every type the feed can name is handled explicitly. The `default` is for a type this consumer has
+// never heard of, not a parking space for ones it has: BIGINT and TIMESTAMP were reaching it and
+// being declared VARCHAR, so `WHERE big > 99` did not even compile against the destination —
+// DuckDB refuses to compare VARCHAR with a number rather than silently mis-ordering it the way
+// SQLite would.
+//
+// The three wide types are string-encoded on the wire, so each mapping below is a claim that DuckDB
+// accepts that string into that column. Each was measured against DuckDB 1.4.1 rather than assumed:
+//
+//	"9223372036854775807"     -> BIGINT     stores 9223372036854775807
+//	"1700000000123"           -> TIMESTAMP  Conversion Error: timestamp field value out of range
+//	"1234...890.1234...890"   -> DECIMAL    Could not convert string ... to DECIMAL(18,3)
 func duckType(t string) string {
 	switch {
-	case t == "INTEGER":
+	case t == "INTEGER" || t == "BIGINT":
+		return "BIGINT"
+	// Epoch MILLISECONDS as an i64, so a 64-bit integer and deliberately not DuckDB's TIMESTAMP,
+	// which reads the wire's digit-string as a datetime literal and rejects it outright.
+	case t == "TIMESTAMP":
 		return "BIGINT"
 	case t == "BOOLEAN":
 		return "BOOLEAN"
 	case t == "FLOAT" || t == "DOUBLE" || t == "REAL":
 		return "DOUBLE"
+	// The feed's exact decimal has no digit cap; DuckDB's bare DECIMAL is DECIMAL(18,3). VARCHAR is
+	// the only destination that keeps every digit, so this stays text by decision, not by fallback.
+	case t == "DECIMAL":
+		return "VARCHAR"
 	case strings.HasPrefix(t, "VARCHAR") || t == "TEXT":
 		return "VARCHAR"
 	default:
@@ -453,12 +474,38 @@ func (s *DuckSink) Close() error {
 //   - A DOUBLE holding an integral value prints as `2.0`; `fmt.Sprint(float64(2))` gives `2`.
 //   - A TIMESTAMP prints as `2024-01-02 03:04:05`, with fractional seconds only when it has them;
 //     Go's `time.Time` stringer appends a zone (`+0000 UTC`) the CLI never shows.
+// renderBlob formats a BLOB the way the `duckdb` CLI does.
+//
+// This returned the raw bytes until it was measured against the CLI, which does not: a BLOB holding
+// 0x00 0xFF printed as two unprintable bytes here and as the eight characters `\x00\xFF` there. Two
+// ways that mattered, neither of them cosmetic. A raw 0x00 or 0x0A inside a cell corrupts the
+// `|`-joined, one-row-per-line format this reader and the CLI both claim to emit — a newline in a
+// value silently becomes an extra row. And any test comparing the two readers over a BLOB would
+// report a rendering difference as a DATA disagreement, which is the exact failure this file exists
+// to prevent.
+//
+// The rule, measured byte by byte against `duckdb -noheader -list` v1.5.5 rather than assumed:
+// 0x20..0x7E pass through, everything else becomes `\xHH` with UPPERCASE hex, and the backslash
+// itself is escaped despite being printable — without that, a literal `\x41` in the data would read
+// back as the byte 0x41.
+func renderBlob(b []byte) string {
+	var sb strings.Builder
+	for _, c := range b {
+		if c >= 0x20 && c <= 0x7E && c != '\\' {
+			sb.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&sb, `\x%02X`, c)
+	}
+	return sb.String()
+}
+
 func renderCell(c any) string {
 	switch v := c.(type) {
 	case nil:
 		return "NULL"
 	case []byte:
-		return string(v)
+		return renderBlob(v)
 	case bool:
 		if v {
 			return "true"
