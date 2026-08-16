@@ -1384,15 +1384,26 @@ fn criterion_9(led: &mut Ledger) {
 
     step("Ask the effect log which task touched a given row, then resolve that task's run.");
     for (row, want_agent) in [(RowId(1), "restock-agent"), (RowId(2), "auditor-agent")] {
-        let mut answer: Option<RunEntity> = None;
+        // Collect EVERY branch whose frame carries an op on this row, so "one writer" is a
+        // measured fact. Taking the first match would report a unique author even if both
+        // branches had touched the row.
+        let mut authors: Vec<RunEntity> = Vec::new();
         for branch in [sa.branch, sb.branch] {
             let frames = db.runtime.log().frames_for(branch, 0).unwrap();
-            let touched = frames.iter().any(|f| f.ops.iter().any(|o| o.row == row));
-            if touched {
-                answer = db.runtime.run_of(branch);
+            let ops_on_row =
+                frames.iter().flat_map(|f| f.ops.iter()).filter(|o| o.row == row).count();
+            if ops_on_row > 0 {
+                if let Some(run) = db.runtime.run_of(branch) {
+                    authors.push(run);
+                }
             }
         }
-        match &answer {
+        kv(&format!("branches carrying an op on row {}", row.0), authors.len());
+        c.that(
+            authors.len() == 1,
+            format!("row {} resolves to exactly ONE writing task, not a set", row.0),
+        );
+        match authors.first() {
             Some(run) => {
                 kv(&format!("who wrote row {}", row.0), run.describe());
                 c.that(
