@@ -20,6 +20,7 @@
 
 pub mod changeset;
 pub mod dispatch;
+pub mod gate;
 pub mod mem_catalog;
 pub mod merge_engine;
 pub mod paged_rows;
@@ -28,6 +29,7 @@ pub mod session;
 
 pub use changeset::{ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome};
 pub use dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
+pub use gate::{BlindWriteCheck, Check, CheckStatus, Finding, GateOutcome, Tier, VerificationGate};
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use paged_rows::PagedRows;
