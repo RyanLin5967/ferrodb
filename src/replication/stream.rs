@@ -68,6 +68,18 @@ impl Pumped {
     pub fn is_clean(&self) -> bool {
         self.unresolved == 0
     }
+
+    /// How far behind the log this consumer is, in bytes.
+    ///
+    /// **An upper bound, not an exact distance, and the difference is not pedantry.** The cursor
+    /// tracks *commits* while the frontier is a byte position that includes records producing no
+    /// events at all — a `TxnEnd` sits above the final commit permanently. So a fully caught-up
+    /// consumer reports a small non-zero lag rather than zero, and code that waits for `lag == 0`
+    /// waits for ever. That mistake hung the CDC server until a Go consumer reading to EOF found
+    /// it; "nothing left to emit" is the caught-up test, not "lag is zero".
+    pub fn lag_bytes(&self) -> u64 {
+        self.frontier.saturating_sub(self.cursor)
+    }
 }
 
 /// Follows a WAL, emitting committed changes as JSON Lines.
@@ -193,6 +205,37 @@ mod tests {
             &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
         )
         .unwrap();
+    }
+
+    /// Lag shrinks as a consumer catches up, and is an upper bound rather than an exact zero.
+    #[test]
+    fn lag_shrinks_as_a_consumer_catches_up() {
+        let (_d, w) = wal("lag");
+        let s = streamer();
+        let start = FeedStreamer::start_cursor(&w);
+
+        for i in 1..=5u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+
+        let behind = FeedStreamer::start_cursor(&w);
+        let mut buf = Vec::new();
+        let p = s.pump(&w, behind, &mut buf).unwrap();
+        assert!(p.emitted > 0, "nothing was emitted, so lag cannot be judged");
+
+        let mut buf2 = Vec::new();
+        let caught_up = s.pump(&w, p.cursor, &mut buf2).unwrap();
+        assert!(
+            caught_up.lag_bytes() < p.frontier - start,
+            "lag did not shrink after catching up: {} vs {}",
+            caught_up.lag_bytes(),
+            p.frontier - start
+        );
+        // Deliberately NOT asserting zero: the tail holds records that produce no events, so a
+        // caught-up consumer legitimately reports a small positive lag.
     }
 
     #[test]

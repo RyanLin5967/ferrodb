@@ -241,6 +241,57 @@ Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 - **The verification gate reports; it does not decide.** The blind-write metric is a heuristic, and
   a heuristic's outcome is quarantine, so it never blocks a merge on its own.
 
+## Change data capture
+
+Physical replication ships *pages*, which keeps a replica byte-identical and tells a consumer
+nothing about **what changed**. The same WAL also drives a logical change feed.
+
+```
+$ cargo run --example cdc_feed | jq -c '{op, table, after}'
+{"op":"INSERT","table":"inventory","after":{"id":1,"item":"widget","qty":10}}
+{"op":"UPDATE","table":"inventory","after":{"id":1,"item":"widget","qty":999}}
+{"op":"DELETE","table":"inventory","after":null}
+```
+
+- **Only committed transactions, in commit order.** Changes buffer per transaction and release on
+  `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
+  than emitted. A consumer shown an aborted transaction's rows has been told about data that never
+  existed.
+- **Resumable.** Each event carries `commit_end_lsn`, the position to resume from. A consumer
+  reconnects there and the halves join with no gap and no overlap. The cursor advances only past a
+  commit that was actually emitted — never to the durable frontier, which would step over an
+  in-flight transaction's records permanently.
+- **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
+  the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
+  direction is deliberate: handing off after the scan silently loses concurrent changes, while
+  handing off before re-delivers a few — and duplication is recoverable where loss is not.
+- **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
+  written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
+
+Two things the log says that a naive decoder gets wrong, both found by decoding real executor
+output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
+kinds onto change kinds reports every delete as an update, and a consumer keeps a row forever), and
+superseded row versions written to the time-travel heap are internal traffic (emitting them
+double-counts every update as an insert).
+
+### The consumer is a separate program, in a separate language
+
+`cdc-consumer/` is a small Go program that shares no code with the database. It validates the feed
+against the documented envelope using Go's `encoding/json` — which rejects `NaN` and `Infinity`
+outright — and, in `follow` mode, materialises the stream into a local table:
+
+```
+$ go run . follow 127.0.0.1:5555 -key id
+```
+
+The tests judge the feed by comparing that materialised table against the source, so a feed that is
+well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
+author's idea of the format agrees with itself about any shared misreading.
+
+**Limits:** the catalog lives outside the WAL, so DDL is not carried by the feed — a consumer sees
+rows and not the schema change that preceded them. There is no wire framing beyond newline
+delimiting, and the feed is JSON rather than a compact binary format.
+
 ## Replication — what it gives you, and what it cannot
 
 There is a working primary/replica pair: **asynchronous physical WAL log shipping** over TCP. A

@@ -41,6 +41,10 @@ pub mod logical;
 /// process can read is not a CDC source; this is the representation that leaves the process.
 pub mod jsonl;
 
+/// Initial snapshot and the handoff to the stream — see [`snapshot`]. Without it a consumer learns
+/// only what changes after it connects, and never what was already there.
+pub mod snapshot;
+
 /// Streaming the change feed — see [`stream`]. A CDC consumer follows a database as it changes and
 /// resumes where it left off; the cursor rule that makes that safe lives there.
 pub mod stream;

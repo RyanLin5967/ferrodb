@@ -103,6 +103,14 @@ fn main() {
         }
 
         loop {
+            // Sampled BEFORE the pump, and that ordering is the whole of it. The writer flushes and
+            // THEN sets `done`, so a pump that begins after `done` is observed is guaranteed to see
+            // the final frontier. Reading `done` after the pump instead leaves a window: the pump
+            // samples the frontier, the writer flushes its tail and sets `done`, and the server
+            // then breaks on "emitted 0 and finished" having never sent those last events. That is
+            // the same check-then-act shape as the cursor rule, and it made this test pass alone
+            // and fail under a loaded full suite.
+            let finished_before_pump = done.load(Ordering::SeqCst);
             let pumped = match streamer.pump(&wal, cursor, &mut stream) {
                 Ok(p) => p,
                 Err(e) => {
@@ -114,7 +122,15 @@ fn main() {
             if pumped.emitted == 0 {
                 // Caught up. Finish only when the workload is finished too, so a consumer is not
                 // disconnected merely for being faster than the writer.
-                if done.load(Ordering::SeqCst) && cursor >= pumped.frontier {
+                //
+                // The condition is "nothing left to emit", NOT "cursor has reached the frontier".
+                // Those are not the same and the difference hangs the server forever: the cursor
+                // tracks COMMITS, while the frontier is a byte position that includes records
+                // producing no events — a `TxnEnd` sits above the final commit permanently, so
+                // `cursor >= frontier` is never satisfied and a consumer waiting for EOF waits for
+                // ever. Caught by the Go consumer, which reads until close rather than stopping at
+                // a client-side limit the way the earlier tests did.
+                if finished_before_pump {
                     break;
                 }
                 std::thread::yield_now();

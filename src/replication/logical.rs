@@ -77,6 +77,12 @@ use crate::wal::log::{RecKind, WalManager};
 /// What happened to one row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeOp {
+    /// A row observed by an initial snapshot: it exists, and this is not news of a change.
+    ///
+    /// Distinct from `Insert` on purpose. Replaying a snapshot as inserts would make every
+    /// pre-existing row look like fresh activity, and anything downstream that counts events would
+    /// be wrong by the size of the table.
+    Read { row: Vec<Value> },
     Insert { new: Vec<Value> },
     Update { old: Vec<Value>, new: Vec<Value> },
     Delete { old: Vec<Value> },
@@ -85,6 +91,7 @@ pub enum ChangeOp {
 impl ChangeOp {
     pub fn name(&self) -> &'static str {
         match self {
+            ChangeOp::Read { .. } => "READ",
             ChangeOp::Insert { .. } => "INSERT",
             ChangeOp::Update { .. } => "UPDATE",
             ChangeOp::Delete { .. } => "DELETE",

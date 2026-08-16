@@ -137,7 +137,8 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
     // `op` is not.
     out.push_str(",\"before\":");
     match &e.op {
-        ChangeOp::Insert { .. } => out.push_str("null"),
+        // A snapshot row has no prior state to report, the same as an insert.
+        ChangeOp::Read { .. } | ChangeOp::Insert { .. } => out.push_str("null"),
         ChangeOp::Update { old, .. } | ChangeOp::Delete { old } => {
             row_into(&e.columns, old, &mut out)
         }
@@ -145,6 +146,7 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
 
     out.push_str(",\"after\":");
     match &e.op {
+        ChangeOp::Read { row } => row_into(&e.columns, row, &mut out),
         ChangeOp::Insert { new } | ChangeOp::Update { new, .. } => {
             row_into(&e.columns, new, &mut out)
         }
@@ -296,6 +298,57 @@ mod tests {
             line.contains("__unnamed_column_1\":2"),
             "the surplus value vanished from the feed: {line}"
         );
+    }
+
+    /// **Integer fidelity.** JSON numbers are commonly parsed into f64, which loses integers past
+    /// 2^53 — the classic silent-corruption bug in CDC pipelines carrying BIGINT.
+    ///
+    /// It cannot happen here, and the reason is worth pinning rather than assuming: this engine's
+    /// only integer type is `INTEGER`, which is `i32`. Its extremes are ±2.1e9, three orders of
+    /// magnitude inside f64's exactly-representable range. If a wider integer type is ever added,
+    /// this test is where that reasoning stops holding and it should fail loudly.
+    #[test]
+    fn integer_extremes_survive_exactly() {
+        for v in [i32::MIN, i32::MAX, 0, -1] {
+            let mut out = String::new();
+            value_into(&Value::Integer(v), &mut out);
+            assert_eq!(out, v.to_string(), "integer {v} did not round-trip");
+            // Exactly representable as f64, so a consumer parsing into a double is still safe.
+            assert_eq!(out.parse::<f64>().unwrap() as i64, v as i64, "{v} lost precision as f64");
+        }
+    }
+
+    /// Float fidelity: the printed form must parse back to the identical bit pattern. `{}` would
+    /// print 0.30000000000000004 as "0.3", which is a different number.
+    #[test]
+    fn floats_round_trip_bit_for_bit() {
+        for v in [0.1 + 0.2, 1e300, -1e-300, f64::MIN_POSITIVE, -0.0, 12345.6789] {
+            let mut out = String::new();
+            value_into(&Value::Float(v), &mut out);
+            let back: f64 = out.parse().unwrap_or_else(|e| panic!("{out} did not parse: {e}"));
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "float {v} printed as {out} and came back as {back}"
+            );
+        }
+    }
+
+    /// NULL and a missing key are different things and must stay different. A consumer that cannot
+    /// tell "this column is null" from "this column was not sent" cannot apply an update correctly.
+    #[test]
+    fn a_null_column_is_present_and_null_not_absent() {
+        let e = ChangeEvent {
+            txn_id: 1,
+            lsn: 1,
+            commit_lsn: 2,
+            commit_end_lsn: 3,
+            table: "t".into(),
+            columns: Arc::new(vec!["a".into(), "b".into()]),
+            op: ChangeOp::Insert { new: vec![Value::Integer(1), Value::Null] },
+        };
+        let line = to_json_line(&e);
+        assert!(line.contains("\"b\":null"), "the null column was omitted entirely: {line}");
     }
 
     #[test]
