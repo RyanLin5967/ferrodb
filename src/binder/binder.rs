@@ -492,31 +492,24 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind a literal **against the column it is being written into**.
+    /// Bind a literal **against the declared type of the column it concerns**, for the wide types.
     ///
     /// Type-directed for exactly one reason: a bare numeric literal carries no type, and deciding
     /// its type from its own text alone loses information the statement actually contains. Left to
     /// itself, `literal_value` would read `123.4567890123456789012` as an `f64` — rounding it
     /// before it ever reaches a `DECIMAL` column — and `1700000000000` as a `BigInt` rather than a
-    /// `TIMESTAMP`. The declared column type is the missing half of that decision, and at INSERT
-    /// and UPDATE it is right there.
+    /// `TIMESTAMP`. The declared column type is the missing half of that decision.
     ///
-    /// `FLOAT` is here for a different and more mundane reason. A whole-numbered literal reads as
-    /// `Integer`, and `INSERT INTO t (f FLOAT) VALUES (5)` is ordinary SQL that every dialect
-    /// accepts. Writing an `Integer` into a `FLOAT` column is refused by `value_fits`, because
-    /// `serialize` would lay down four bytes where `deserialize` reads eight and shift every
-    /// column after it — so without the coercion here that statement is a hard error. Widening the
-    /// literal to `f64` at bind time is exact for every i32, which is why it is safe to do
-    /// silently where narrowing never would be.
+    /// This is the form used by **comparisons as well as writes**, so it is deliberately limited to
+    /// the three wide types, where reading the literal as the column's type is strictly more exact
+    /// than the alternative. See [`Binder::literal_for_written_column`] for the write-only
+    /// coercion, and the note there on why it must not be used here.
     ///
     /// Returns `None` when this is not a case that needs redirecting, so the caller falls through
     /// to ordinary binding. `Some(Err(..))` means the literal was aimed at one of these columns and
     /// could not be represented — which is a refusal, never a silent truncation.
     pub fn literal_for_column(expr: &Expr, target: &DataType) -> Option<Result<Value, FerroError>> {
-        if !matches!(
-            target,
-            DataType::BigInt | DataType::Decimal | DataType::Timestamp | DataType::Float
-        ) {
+        if !matches!(target, DataType::BigInt | DataType::Decimal | DataType::Timestamp) {
             return None;
         }
         let text = Self::signed_numeric_text(expr)?;
@@ -532,12 +525,42 @@ impl<'a> Binder<'a> {
             DataType::Decimal => crate::catalog::column::parse_decimal(&text)
                 .map(Value::Decimal)
                 .map_err(FerroError::Bind),
-            DataType::Float => text
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|e| FerroError::Bind(format!("`{text}` is not a FLOAT: {e}"))),
             _ => unreachable!("guarded above"),
         })
+    }
+
+    /// As [`Binder::literal_for_column`], plus the `FLOAT` widening — for **writes only**.
+    ///
+    /// A whole-numbered literal reads as `Integer`, and `INSERT INTO t (f FLOAT) VALUES (5)` is
+    /// ordinary SQL that every dialect accepts. Writing an `Integer` into a `FLOAT` column is
+    /// refused by `value_fits`, because `serialize` would lay down four bytes where `deserialize`
+    /// reads eight and shift every column after it — so without this coercion that plain statement
+    /// is a hard error. Widening an i32 to f64 is exact, which is why it is safe to do silently.
+    ///
+    /// **Why this is not shared with comparisons.** In a predicate there is no storage width to
+    /// satisfy, and rounding the literal to f64 first would throw away the exactness the wide types
+    /// were added for. `WHERE f = 9007199254740993` against a `FLOAT` column must return no rows —
+    /// 2^53+1 is not representable as any f64, so no stored float can equal it — but if the literal
+    /// were parsed straight to f64 it would become 2^53 and match a row holding 2^53.
+    /// `Value::cmp` already compares an i64 against an f64 exactly, via `cmp_i64_f64`; letting it
+    /// see the unrounded literal is what makes that machinery reachable. This was briefly shared
+    /// with the comparison path and produced exactly that wrong answer.
+    pub fn literal_for_written_column(
+        expr: &Expr,
+        target: &DataType,
+    ) -> Option<Result<Value, FerroError>> {
+        if let Some(res) = Self::literal_for_column(expr, target) {
+            return Some(res);
+        }
+        if !matches!(target, DataType::Float) {
+            return None;
+        }
+        let text = Self::signed_numeric_text(expr)?;
+        Some(
+            text.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a FLOAT: {e}"))),
+        )
     }
 
     /// Bind one row of INSERT/UPDATE values, redirecting numeric literals to the declared type of
@@ -550,7 +573,7 @@ impl<'a> Binder<'a> {
     ) -> Result<Vec<BoundExpr>, FerroError> {
         let mut out = Vec::with_capacity(values.len());
         for (i, v) in values.into_iter().enumerate() {
-            match column_types.get(i).and_then(|t| Binder::literal_for_column(&v, t)) {
+            match column_types.get(i).and_then(|t| Binder::literal_for_written_column(&v, t)) {
                 Some(res) => out.push(BoundExpr::Literal(res?)),
                 None => out.push(self.bind_expr(v, scope)?),
             }

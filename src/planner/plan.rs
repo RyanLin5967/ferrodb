@@ -59,7 +59,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 // `SET big = 9223372036854775807` gets the same type-directed reading as INSERT;
                 // without it the assignment would land as a rounded f64 or a rejected i32.
                 let ty = &entry.schema.columns[idx].data_type;
-                let bound = match Binder::literal_for_column(&expr, ty) {
+                let bound = match Binder::literal_for_written_column(&expr, ty) {
                     Some(res) => BoundExpr::Literal(res?),
                     None => binder.bind_expr(expr, &scope)?,
                 };
