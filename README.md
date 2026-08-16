@@ -228,7 +228,10 @@ Kept here deliberately; a fabricated pass would be worse than an admitted gap.
   `qty >= 0`, two agents each taking 12 from 20 both merge and the counter reaches **−4**. Guards are
   preconditions evaluated *before* the composed ops apply, so a precondition cannot see a post-op
   violation. Escrow (`EscrowLedger`) is the answer and is implemented — claim the slack at fork and
-  the overdraw is refused at *write* time — but it is opt-in per cell, not automatic.
+  the overdraw is refused at *write* time — with two scope limits worth stating plainly: it is
+  **opt-in per cell**, and it governs **agent-session writes only**. A plain `UPDATE` outside a
+  session never reaches the capture point and is not charged, so "the counter cannot go below its
+  floor" is true of agents and not of direct SQL.
 - **Crash safety means process death, not power loss.** The test kills the process with `abort()`;
   bytes already handed to `write()` survive in the OS page cache, so nothing here exercises a dead
   machine.

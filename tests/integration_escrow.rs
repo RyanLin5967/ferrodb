@@ -337,3 +337,77 @@ fn deleting_the_row_is_not_governed_by_escrow_and_this_is_a_known_gap() {
         "if a delete now spends escrow, this gap has been closed and the test should say so"
     );
 }
+
+/// **Scope boundary, asserted rather than implied.** Escrow governs AGENT-SESSION writes. A plain
+/// `UPDATE` outside any session goes straight through the executor, never reaches `stage()`, and is
+/// therefore not charged against any pool — it drives the counter to -100 here.
+///
+/// This is the third instance of one pattern found in three passes: a safety check attached to a
+/// SHAPE or a PATH rather than to the outcome. D14 was merge-vs-abandon, D15 was Add-vs-Assign,
+/// this is agent-vs-direct.
+///
+/// It is left as a boundary rather than "fixed" because closing it needs a decision that is not an
+/// implementation detail: escrow claims are branch-scoped and a direct write has no branch, so
+/// someone has to say whether the operator gets an implicit unlimited claim, a shared pool, or a
+/// refusal. Inventing one of those quietly would be worse than saying it is open. What is NOT
+/// acceptable is the claim "a bounded counter cannot go below its floor" without this qualifier,
+/// and the README now carries it.
+#[test]
+fn escrow_governs_agent_writes_only_and_a_direct_write_is_not_charged() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut s = db.session(); // no BEGIN AGENT SESSION
+    db.ok("UPDATE inventory SET qty = -100 WHERE id = 1;", &mut s);
+
+    assert_eq!(
+        db.qty(),
+        -100,
+        "if a direct write is now charged against escrow, this boundary has moved and the README \
+         and the escrow module doc must be updated to match"
+    );
+    assert_eq!(
+        db.runtime.unclaimed_escrow("inventory", RowId(1), QTY),
+        Some(20),
+        "the pool should be untouched by a write it never saw"
+    );
+}
+
+/// Changing the primary key while lowering the cell must still be charged: row identity comes from
+/// the row as it was, so the resource cannot be moved out from under its own pool.
+#[test]
+fn changing_the_primary_key_does_not_move_the_cell_out_of_its_pool() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'mover' RUN 'r_m';", &mut a);
+    let br = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(br, "inventory", RowId(1), QTY, 1).unwrap();
+
+    let err = match db.exec("UPDATE inventory SET id = 2, qty = -100 WHERE id = 1;", &mut a) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a primary-key change carried the bounded cell past its pool"),
+    };
+    assert!(err.contains("escrow"), "refused for the wrong reason: {err}");
+}
+
+/// Writing a bounded cell with no claim at all is refused, so escrow cannot be skipped by simply
+/// never asking for headroom.
+#[test]
+fn a_bounded_cell_cannot_be_written_without_claiming_first() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'noclaim' RUN 'r_n';", &mut a);
+    let err = match db.exec("UPDATE inventory SET qty = qty - 1 WHERE id = 1;", &mut a) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a bounded cell was written with no claim"),
+    };
+    assert!(err.contains("escrow"), "refused for the wrong reason: {err}");
+    assert_eq!(db.qty(), 20);
+}

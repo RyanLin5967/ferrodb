@@ -17,6 +17,20 @@
 //!
 //! By merge time the arithmetic is already guaranteed to fit, so the merge has nothing to enforce.
 //! That is the difference between a bound that holds and a bound that is checked too late to.
+//!
+//! # Scope
+//!
+//! Escrow is charged from the agent capture path (`AgentRuntime::stage`), so it governs
+//! **agent-session writes**. A plain `UPDATE` outside a session goes straight through the executor
+//! and is never charged. That is a real boundary, not an oversight to be discovered later:
+//! `escrow_governs_agent_writes_only_and_a_direct_write_is_not_charged` asserts it. Closing it
+//! needs a decision rather than an implementation — claims are branch-scoped and a direct write
+//! has no branch, so someone must say whether the operator gets an implicit unlimited claim, a
+//! shared pool, or a refusal.
+//!
+//! What escrow does NOT depend on is the shape of the write. It is charged from the change to the
+//! cell, so `Assign`, `Add` and float deltas are all covered; keying off `Add` was a real hole and
+//! let `SET qty = -100` through.
 
 use std::collections::BTreeMap;
 
