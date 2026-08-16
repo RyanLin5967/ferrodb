@@ -958,6 +958,126 @@ mod tests {
         let _ = ArenaId(0);
     }
 
+    /// D6's actual claim: the depth guard and collapse are one mechanism, not two features.
+    ///
+    /// The guard refusing the ninth fork is only useful if there is a way forward afterwards, and
+    /// collapse is only motivated by the guard. Each was tested alone; neither test showed that a
+    /// chain which has hit the ceiling can carry on working.
+    #[test]
+    fn a_chain_at_max_depth_can_only_fork_again_after_collapsing() {
+        let h = Harness::new();
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_links(Arc::new(ToyLinks));
+
+        let mut cur = BranchId::TRUNK;
+        use crate::branch::types::MAX_BRANCH_DEPTH;
+        for _ in 0..MAX_BRANCH_DEPTH {
+            cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
+        }
+        assert_eq!(h.catalog.get(cur).unwrap().depth, MAX_BRANCH_DEPTH);
+
+        let err = h
+            .catalog
+            .fork(cur, LeaseDeadline::from_now(LEASE_MS))
+            .expect_err("the ninth fork must be refused");
+        assert!(err.to_string().contains("depth"), "got {err}");
+
+        // Give the chain a real root before collapsing. A branch that has never written still
+        // carries the trunk's placeholder root id, which is not an allocated page — collapse then
+        // fails while trying to copy it, with an IO error rather than anything explanatory.
+        let arena = h.store.arena_for(cur).unwrap();
+        let ep = h.catalog.next_epoch();
+        let root = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, ep).unwrap();
+        {
+            let handle = h.store.read_page(root).unwrap();
+            let mut f = handle.write();
+            stamp_checksum(&mut f.data);
+        }
+        h.catalog.set_root(cur, root).unwrap();
+
+        let collapsed = reaper.collapse(cur).unwrap();
+        assert_eq!(collapsed.depth, 1, "collapse must reset the chain, not just move it");
+        assert_eq!(collapsed.parent_id, Some(BranchId::TRUNK));
+
+        // The whole point: the branch is usable again.
+        let child = h
+            .catalog
+            .fork(cur, LeaseDeadline::from_now(LEASE_MS))
+            .expect("forking after a collapse must succeed, or the ceiling is permanent");
+        assert_eq!(h.catalog.get(child.branch_id).unwrap().depth, 2);
+    }
+
+    /// Why collapse **materialises** instead of merely re-pointing the parent.
+    ///
+    /// A re-parent alone would leave the branch reading pages its ancestors own. Those ancestors
+    /// are exactly what the collapse exists to let go of, and the interval rule would then be free
+    /// to reclaim pages still under the collapsed branch's root — silent corruption, visible only
+    /// later as a checksum failure or a wrong answer. So the test does the dangerous thing on
+    /// purpose: reap the entire ancestor chain afterwards and read the data back.
+    #[test]
+    fn after_collapse_the_ancestor_chain_can_be_reaped_and_the_data_survives() {
+        let h = Harness::new();
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_links(Arc::new(ToyLinks));
+
+        // An ancestor owns the pages; a deep chain inherits them.
+        let anc = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
+        let a_arena = h.store.arena_for(anc.branch_id).unwrap();
+        let e = h.catalog.next_epoch();
+        let leaf = h.store.alloc_in_arena(a_arena, PageType::BTreeLeaf, e).unwrap();
+        {
+            let handle = h.store.read_page(leaf).unwrap();
+            let mut f = handle.write();
+            f.data[PAGE_HEADER_SIZE + 32] = 0xD6;
+            stamp_checksum(&mut f.data);
+        }
+        let root = h.store.alloc_in_arena(a_arena, PageType::BTreeInternal, e).unwrap();
+        {
+            let handle = h.store.read_page(root).unwrap();
+            let mut f = handle.write();
+            ToyLinks::write(&mut f.data, &[leaf]);
+            stamp_checksum(&mut f.data);
+        }
+
+        let mut cur = anc.branch_id;
+        for _ in 0..6 {
+            cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
+        }
+        h.catalog.set_root(cur, root).unwrap();
+
+        let collapsed = reaper.collapse(cur).unwrap();
+        let own_root = collapsed.root_page_id;
+        assert_ne!(own_root, root, "collapse aliased the ancestor's page instead of copying it");
+
+        // Keep the collapsed branch alive; `far_future()` expires every lease, including its own,
+        // and reaping the subject along with the ancestors would prove nothing about either.
+        h.catalog.renew_lease(cur, LeaseDeadline(u64::MAX)).unwrap();
+
+        // Now let go of every ancestor. Before the collapse this would have been unsafe.
+        let reaped = reaper.reap_expired(far_future()).unwrap();
+        assert!(
+            reaped.len() >= 6,
+            "the ancestor chain did not go away, so this proves nothing: {reaped:?}"
+        );
+        assert!(
+            !reaped.contains(&cur),
+            "the collapsed branch was reaped along with its old ancestors"
+        );
+        reaper.drain_pending().ok();
+
+        // The collapsed branch still answers, from pages it owns.
+        let children = ToyLinks
+            .child_pages(PageType::BTreeInternal, &h.store.read_page(own_root).unwrap().read().data)
+            .unwrap();
+        assert_eq!(children.len(), 1, "the materialised root lost its child");
+        let handle = h.store.read_page(children[0]).unwrap();
+        assert_eq!(
+            handle.read().data[PAGE_HEADER_SIZE + 32],
+            0xD6,
+            "the collapsed branch's data did not survive its ancestors being reclaimed"
+        );
+    }
+
     #[test]
     fn collapse_refuses_a_cyclic_page_graph() {
         let h = Harness::new();
