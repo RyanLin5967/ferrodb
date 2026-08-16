@@ -256,6 +256,26 @@ impl LogicalDecoder {
         LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
     }
 
+    /// Teach a catalog-less decoder one more table.
+    ///
+    /// [`LogicalDecoder::for_table`] covers a consumer that knows one table's shape out of band,
+    /// but a decoder that can only ever resolve one table cannot represent the case the
+    /// snapshot-to-stream cutover turns on: a stream carrying more tables than the snapshot
+    /// covered. A decoder built from a catalog is multi-table for free; this is the same thing for
+    /// the catalog-less path.
+    pub fn and_table(
+        mut self,
+        dir_root: u32,
+        name: &str,
+        schema: Schema,
+        time_travel_root: u32,
+    ) -> Self {
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        self.tables.insert(dir_root, (name.to_string(), schema, Arc::new(columns)));
+        self.time_travel.insert(time_travel_root);
+        self
+    }
+
     /// A decoder that knows nothing at all.
     ///
     /// Useful on its own, because the log now carries `CREATE TABLE`: a blank decoder walking a

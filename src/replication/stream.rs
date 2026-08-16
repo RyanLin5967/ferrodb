@@ -41,9 +41,15 @@
 //! # Joining an initial snapshot
 //!
 //! One duplication is *not* left to the consumer: the overlap at a snapshot-to-stream cutover.
-//! [`FeedStreamer::resuming_after_snapshot`] takes the transaction set a snapshot already contained
-//! and drops those transactions' events, so the two feeds meet with no gap and no overlap. See
+//! [`Subscription::following`] takes a [`SnapshotBoundary`] and drops the events of transactions
+//! that snapshot already contained, so the two feeds meet with no gap and no overlap. See
 //! [`super::snapshot`] for why that has to be decided per transaction and not per LSN.
+//!
+//! It hangs off the *subscription* rather than off the streamer, and that is a correctness
+//! decision rather than an organisational one. A boundary is correct from exactly one starting
+//! cursor — its own `resume_lsn`. Pairing it with any other cursor is silently wrong in one
+//! direction or the other, so `following` reads the cursor out of the boundary instead of
+//! accepting one, and there is no public way to supply the two separately.
 
 use std::io::Write;
 
@@ -105,6 +111,12 @@ impl Pumped {
 /// from exactly one starting cursor — so that lives on [`Subscription::following`], which takes the
 /// cursor from the boundary instead of from the caller. See [`SnapshotBoundary`] for why pairing a
 /// boundary with a cursor of one's own choosing loses data silently.
+///
+/// The streamer therefore has no `resuming_after_snapshot`. It used to, and the shape was the
+/// defect: a streamer that carried a boundary could be handed to `pump` with any cursor at all,
+/// and the two wrong pairings are the same two failures the cutover exists to remove — a cursor
+/// above the boundary's resume point re-opens the gap, one below it re-opens the overlap. Neither
+/// is detectable from the feed. The filter now travels with the cursor that makes it true.
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
@@ -136,10 +148,29 @@ impl FeedStreamer {
     ///
     /// See the module docs: the returned cursor is the highest `commit_end_lsn` emitted, **not**
     /// the frontier, and it is unchanged when nothing was emitted.
+    ///
+    /// Suppresses nothing. To follow a snapshot, subscribe with [`Subscription::following`] — the
+    /// boundary and the cursor it is correct from are not separable.
     pub fn pump<W: Write>(
         &self,
         wal: &WalManager,
         cursor: u64,
+        w: &mut W,
+    ) -> Result<Pumped, FerroError> {
+        self.pump_with(wal, cursor, None, w)
+    }
+
+    /// The body of [`FeedStreamer::pump`], with the snapshot filter supplied.
+    ///
+    /// **Deliberately private.** The boundary and the cursor are one value split in two here for
+    /// the duration of one call; making that pairing available to callers is the defect this shape
+    /// exists to prevent, so the only way in is [`Subscription::following`], which takes the cursor
+    /// out of the boundary itself.
+    fn pump_with<W: Write>(
+        &self,
+        wal: &WalManager,
+        cursor: u64,
+        boundary: Option<&SnapshotBoundary>,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
         use std::sync::atomic::Ordering;
@@ -180,7 +211,7 @@ impl FeedStreamer {
             .unwrap_or(cursor);
 
         let mut events = decoded.events;
-        let suppressed = match &self.already_snapshotted {
+        let suppressed = match boundary {
             None => 0,
             Some(already) => {
                 let before = events.len();
@@ -225,6 +256,10 @@ pub struct Subscription {
     wal: std::sync::Arc<WalManager>,
     cursor: u64,
     pin: crate::wal::log::WalPin,
+    /// The snapshot this subscription is continuing, if it is continuing one. Held **here**,
+    /// beside the cursor it is correct from, so the two cannot be paired wrongly — see
+    /// [`Subscription::following`].
+    boundary: Option<SnapshotBoundary>,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -242,7 +277,7 @@ impl Subscription {
     /// made at subscription time so a consumer learns immediately rather than on its first read.
     pub fn new(wal: &std::sync::Arc<WalManager>, from: u64) -> Result<Self, FerroError> {
         let pin = wal.pin(from)?;
-        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin })
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin, boundary: None })
     }
 
     /// Subscribe from the start of the retained log.
@@ -251,8 +286,39 @@ impl Subscription {
         Self::new(wal, from)
     }
 
+    /// **Continue an exact snapshot: no gap, no overlap.**
+    ///
+    /// The cursor is not a parameter. It is `boundary.resume_lsn()`, and taking it from anywhere
+    /// else is what this constructor exists to make impossible:
+    ///
+    /// - **Above it**, and the transactions that were in flight when the snapshot was taken have
+    ///   their records below the cursor. The stream meets their `Commit` having never read their
+    ///   changes, emits nothing, and those rows reach nobody. Silent, permanent loss.
+    /// - **Below it**, and the range re-read contains commits the snapshot already delivered but
+    ///   which the boundary was not built to suppress at that depth. Duplication.
+    ///
+    /// Both are invisible downstream — a feed missing rows looks exactly like a feed that had
+    /// none. So the boundary and its cursor arrive as one value and stay one value.
+    ///
+    /// Subscribing claims the log at the resume point *before* this returns, so a caller holding
+    /// an [`ExactSnapshot`](super::snapshot::ExactSnapshot)'s pin may drop it as soon as this
+    /// succeeds: at no instant is the resume point unclaimed.
+    pub fn following(
+        wal: &std::sync::Arc<WalManager>,
+        boundary: SnapshotBoundary,
+    ) -> Result<Self, FerroError> {
+        let mut sub = Self::new(wal, boundary.resume_lsn())?;
+        sub.boundary = Some(boundary);
+        Ok(sub)
+    }
+
     pub fn cursor(&self) -> u64 {
         self.cursor
+    }
+
+    /// The snapshot boundary this subscription is continuing, if any.
+    pub fn boundary(&self) -> Option<&SnapshotBoundary> {
+        self.boundary.as_ref()
     }
 
     /// Pump, then move the claim forward to the new cursor.
@@ -275,7 +341,7 @@ impl Subscription {
         streamer: &FeedStreamer,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
-        let pumped = streamer.pump(&self.wal, self.cursor, w)?;
+        let pumped = streamer.pump_with(&self.wal, self.cursor, self.boundary.as_ref(), w)?;
         if pumped.cursor != self.cursor {
             let next = self.wal.pin(pumped.cursor)?;
             let old = std::mem::replace(&mut self.pin, next);
@@ -293,6 +359,7 @@ mod tests {
     use crate::catalog::schema::Schema;
     use crate::storage::tuple::Tuple;
     use crate::wal::log::RecKind;
+    use crate::wal::txn::Snapshot as TxnSnapshot;
 
     fn schema() -> Schema {
         Schema::new(vec![
@@ -569,16 +636,63 @@ mod tests {
         assert!(msg.contains("skip"), "the message does not say what would go wrong: {msg}");
     }
 
-    /// A boundary that already contains transactions 1 and 2 but not 3.
-    fn boundary() -> TxnSnapshot {
-        TxnSnapshot { high_water: 3, active: std::collections::HashSet::new() }
+    /// A WAL a subscription can be taken against.
+    fn arc_wal(tag: &str) -> (tempfile::TempDir, std::sync::Arc<WalManager>) {
+        let (d, w) = wal(tag);
+        (d, std::sync::Arc::new(w))
+    }
+
+    /// A boundary over `inventory` that already contains transactions 1 and 2 but not 3, resuming
+    /// at `from`.
+    ///
+    /// The resume point is a parameter because the boundary now carries it: a `Subscription` takes
+    /// its cursor from here rather than from the caller, so a test that wants to stream a range
+    /// must say so through the boundary, exactly as a real consumer does.
+    fn boundary_at(from: u64) -> SnapshotBoundary {
+        boundary_over(["inventory"], from)
+    }
+
+    /// The same, over whichever tables are named.
+    fn boundary_over<const N: usize>(tables: [&str; N], from: u64) -> SnapshotBoundary {
+        SnapshotBoundary::new(
+            tables.iter().map(|t| t.to_string()).collect(),
+            TxnSnapshot { high_water: 3, active: std::collections::HashSet::new() },
+            from,
+        )
+    }
+
+    /// Drain a subscription in one pump, returning what it did and wrote.
+    fn pump_once(sub: &mut Subscription, s: &FeedStreamer) -> (Pumped, String) {
+        let mut buf = Vec::new();
+        let p = sub.pump(s, &mut buf).unwrap();
+        (p, String::from_utf8(buf).unwrap())
+    }
+
+    /// **The cursor is not the caller's to choose.** `following` reads it out of the boundary, so
+    /// the filter and the range it is correct for cannot be separated.
+    #[test]
+    fn following_a_boundary_starts_at_the_boundarys_own_resume_point() {
+        let (_d, w) = arc_wal("bound_cursor");
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let resume = FeedStreamer::start_cursor(&w) + 1;
+        let sub = Subscription::following(&w, boundary_at(resume)).unwrap();
+        assert_eq!(
+            sub.cursor(),
+            resume,
+            "the subscription started somewhere other than its boundary's resume point"
+        );
+        assert!(sub.boundary().is_some(), "the boundary did not travel with the subscription");
     }
 
     /// **The overlap the cutover exists to remove.** Events from transactions the snapshot already
     /// contained are decoded and then dropped; everything else is delivered.
     #[test]
     fn events_the_snapshot_already_contained_are_not_re_delivered() {
-        let (_d, w) = wal("suppress");
+        let (_d, w) = arc_wal("suppress");
         let start = FeedStreamer::start_cursor(&w);
         for i in 1..=3u64 {
             w.append(i, 0, &RecKind::Begin).unwrap();
@@ -592,23 +706,65 @@ mod tests {
         let mut all = Vec::new();
         assert_eq!(streamer().pump(&w, start, &mut all).unwrap().emitted, 3);
 
-        let s = streamer().resuming_after_snapshot(boundary());
-        let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        let mut sub = Subscription::following(&w, boundary_at(start)).unwrap();
+        let (p, text) = pump_once(&mut sub, &streamer());
 
         assert_eq!(p.emitted, 1, "the snapshot's own transactions were re-delivered: {p:?}");
         assert_eq!(p.suppressed, 2, "the suppression was not reported: {p:?}");
-        let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("\"qty\":30"), "the transaction after the snapshot was lost: {text}");
         assert!(!text.contains("\"qty\":10"), "a snapshotted row came back: {text}");
         assert!(!text.contains("\"qty\":20"), "a snapshotted row came back: {text}");
+    }
+
+    /// **A boundary suppresses only the tables its snapshot actually delivered.**
+    ///
+    /// The transaction set answers *when*, not *what*. `inventory`'s transactions are in it, but a
+    /// snapshot of `inventory` delivered no `elsewhere` rows — and the stream is the only path
+    /// those had. Filtering on the transaction alone loses them permanently and reports the loss as
+    /// legitimate suppression.
+    #[test]
+    fn a_boundary_does_not_suppress_a_table_its_snapshot_never_delivered() {
+        let (_d, w) = arc_wal("cross_table_unit");
+        let start = FeedStreamer::start_cursor(&w);
+        // Transaction 1 writes to both tables, and the boundary contains transaction 1.
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert { dir_root: 9, page_id: 1, slot: 0, tuple: tuple_bytes(2, 20) },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // A decoder that carries both tables — the ordinary case, since it is built from a catalog.
+        let s = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8)
+                .and_table(9, "elsewhere", schema(), 10),
+        );
+
+        // The snapshot covered `inventory` only, and the boundary says so.
+        let mut sub = Subscription::following(&w, boundary_at(start)).unwrap();
+        let (p, text) = pump_once(&mut sub, &s);
+
+        assert!(
+            text.contains("\"table\":\"elsewhere\""),
+            "a row from a table the snapshot never covered was suppressed by that snapshot's \
+             boundary; it was in no snapshot and the stream was its only path: {text} ({p:?})"
+        );
+        assert!(
+            !text.contains("\"table\":\"inventory\""),
+            "a row the snapshot already delivered came back: {text}"
+        );
+        assert_eq!(p.suppressed, 1, "the inventory row should have been the only suppression: {p:?}");
     }
 
     /// A transaction still in flight when the snapshot was taken is **not** in it, so its events
     /// must survive the filter. This is the half a naive "skip everything older" rule gets wrong.
     #[test]
     fn a_transaction_that_was_in_flight_at_snapshot_time_is_still_delivered() {
-        let (_d, w) = wal("inflight_at_snapshot");
+        let (_d, w) = arc_wal("inflight_at_snapshot");
         let start = FeedStreamer::start_cursor(&w);
         w.append(1, 0, &RecKind::Begin).unwrap();
         insert(&w, 1, 1, 10);
@@ -616,11 +772,13 @@ mod tests {
         w.flush().unwrap();
 
         // Transaction 1 is below the high water mark but was open when the snapshot was taken.
-        let boundary =
-            TxnSnapshot { high_water: 3, active: std::collections::HashSet::from([1u64]) };
-        let s = streamer().resuming_after_snapshot(boundary);
-        let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        let boundary = SnapshotBoundary::new(
+            std::collections::BTreeSet::from(["inventory".to_string()]),
+            TxnSnapshot { high_water: 3, active: std::collections::HashSet::from([1u64]) },
+            start,
+        );
+        let mut sub = Subscription::following(&w, boundary).unwrap();
+        let (p, _) = pump_once(&mut sub, &streamer());
         assert_eq!(
             p.emitted, 1,
             "an in-flight transaction's changes were suppressed as though the snapshot had them, \
@@ -633,7 +791,7 @@ mod tests {
     /// entirely pre-snapshot pumps the same range for ever and never reaches the live edge.
     #[test]
     fn a_batch_that_is_entirely_suppressed_still_advances_the_cursor() {
-        let (_d, w) = wal("all_suppressed");
+        let (_d, w) = arc_wal("all_suppressed");
         let start = FeedStreamer::start_cursor(&w);
         for i in 1..=2u64 {
             w.append(i, 0, &RecKind::Begin).unwrap();
@@ -642,13 +800,13 @@ mod tests {
         }
         w.flush().unwrap();
 
-        let s = streamer().resuming_after_snapshot(boundary());
-        let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        let mut sub = Subscription::following(&w, boundary_at(start)).unwrap();
+        let (p, text) = pump_once(&mut sub, &streamer());
         assert_eq!(p.emitted, 0);
         assert_eq!(p.suppressed, 2);
         assert!(p.cursor > start, "the cursor stuck on a batch it had decided about: {p:?}");
-        assert!(buf.is_empty(), "something was written despite emitting nothing");
+        assert!(text.is_empty(), "something was written despite emitting nothing");
+        assert!(sub.cursor() > start, "the subscription itself did not advance: {p:?}");
     }
 
     /// **Schema events are never suppressed.** They are logged outside any transaction, under id 0,
@@ -659,7 +817,7 @@ mod tests {
         use crate::catalog::column::DataType;
         use crate::wal::log::DdlOp;
 
-        let (_d, w) = wal("schema_filter");
+        let (_d, w) = arc_wal("schema_filter");
         let start = FeedStreamer::start_cursor(&w);
         w.append(
             0,
@@ -675,13 +833,13 @@ mod tests {
         .unwrap();
         w.flush().unwrap();
 
-        // A boundary that would "include" transaction 0 if the rule were applied blindly.
-        let s = streamer().resuming_after_snapshot(boundary());
-        let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        // A boundary that would "include" transaction 0 if the rule were applied blindly, and that
+        // names the schema event's own table so the table half cannot be what saves it.
+        let mut sub = Subscription::following(&w, boundary_over(["inventory", "later"], start)).unwrap();
+        let (p, text) = pump_once(&mut sub, &streamer());
         assert_eq!(p.suppressed, 0, "a schema event was filtered by a transaction boundary");
         assert_eq!(p.emitted, 1, "the schema event never arrived: {p:?}");
-        assert!(String::from_utf8(buf).unwrap().contains("CREATE_TABLE"));
+        assert!(text.contains("CREATE_TABLE"));
     }
 
     /// A streamer with no boundary behaves exactly as it did before there was one.
