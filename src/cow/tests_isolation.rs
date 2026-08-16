@@ -252,6 +252,41 @@ fn a_live_child_forces_the_parent_to_shadow_instead_of_mutating() {
     assert_eq!(f.count(), pages_at_fork);
 }
 
+/// The ownership half of the privacy rule.
+///
+/// Through [`CowTree`] alone this is belt-and-braces — a sibling's root never points at another
+/// sibling's pages, so the birth-epoch test already refuses. But [`PageStore::cow_page`] is a
+/// public entry point that the branch engine and the reaper call directly with a page id and a
+/// branch, and there the two halves come apart: a page born *after* a branch forked, in someone
+/// else's arena, passes the epoch test and fails only on ownership. Without this test the
+/// ownership check is unfalsifiable, and an unfalsifiable guard is not a verified one.
+#[test]
+fn a_branch_can_never_mutate_another_branchs_page_in_place() {
+    let f = Fixture::new(16);
+    f.store.register_branch(B1, Some(BranchId::TRUNK), Epoch(2)).unwrap();
+    f.store.register_branch(B2, Some(BranchId::TRUNK), Epoch(3)).unwrap();
+
+    let a1 = f.store.arena_for(B1).unwrap();
+    let p = f.store.alloc_in_arena(a1, PageType::BTreeLeaf, Epoch(10)).unwrap();
+
+    // B2 forked at epoch 3, the page was born at epoch 10: the birth-epoch test alone would call
+    // this private. Only ownership says otherwise.
+    assert!(Epoch(10) >= Epoch(3), "the test setup must defeat the epoch test, not rely on it");
+    assert!(!f.store.is_private(p, B2, Epoch(11)).unwrap());
+    assert!(f.store.is_private(p, B1, Epoch(11)).unwrap(), "B1 owns it and must write in place");
+
+    let cp = f.store.cow_page(p, B2, Epoch(11)).unwrap();
+    assert!(cp.copied, "B2 was handed another branch's page to mutate");
+    assert_ne!(cp.page_id, p);
+    drop(cp);
+
+    // B1's page is still B1's, and B2 did not free it
+    let hdr = PageHeader::read_from(&f.store.read_page(p).unwrap().read().data).unwrap();
+    assert_eq!(f.store.owner_of_arena(hdr.arena_id), Some(B1));
+    assert_eq!(hdr.birth_epoch, Epoch(10));
+    assert_eq!(f.store.pending_free_len(), 0);
+}
+
 #[test]
 fn splits_and_multi_level_growth_preserve_every_key() {
     let f = Fixture::new(128);
@@ -348,7 +383,7 @@ fn reaping_an_abandoned_branch_returns_the_page_count_to_baseline() {
         r1 = f.put(r1, B1, &format!("k{:05}", i), "agent-wrote-this");
     }
     assert!(f.count() > baseline, "the child never allocated anything");
-    assert!(f.store.arenas_of(B1).unwrap().len() >= 1);
+    assert!(!f.store.arenas_of(B1).unwrap().is_empty());
 
     // no client cooperation: nobody closed anything, the store is simply told the branch is gone
     let reclaimed = f.store.forget_branch(B1).unwrap();
@@ -474,13 +509,9 @@ fn a_recycled_extent_never_hands_back_stale_page_contents() {
     }
     let arenas = f.store.arenas_of(BranchId::TRUNK).unwrap();
     let victim = arenas[0];
-    let start = {
-        // remember a page that is about to be recycled
-        f.tree.walk_pages(root).unwrap();
-        f.store.free_arena(victim).unwrap();
-        victim
-    };
-    let _ = start;
+    let recycled_pages = f.tree.walk_pages(root).unwrap();
+    assert!(!recycled_pages.is_empty());
+    f.store.free_arena(victim).unwrap();
 
     // the freed extent is handed to a different branch; every page it serves must come back
     // formatted, never carrying the old branch's bytes

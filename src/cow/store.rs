@@ -240,8 +240,8 @@ impl CowStore {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.branches.remove(&branch);
-            if let Some(p) = parent {
-                if let Some(pm) = inner.branches.get_mut(&p) {
+            if let Some(pm) = parent.and_then(|p| inner.branches.get_mut(&p)) {
+                {
                     let at = pm.live_children.partition_point(|e| *e < fork_epoch);
                     if at < pm.live_children.len() && pm.live_children[at] == fork_epoch {
                         pm.live_children.remove(at);
@@ -304,7 +304,7 @@ impl CowStore {
     ) -> Result<bool, FerroError> {
         let hdr = self.header_of(page_id)?;
         let inner = self.inner.lock().unwrap();
-        Ok(Self::privacy(&inner, &hdr, branch, epoch)?)
+        Self::privacy(&inner, &hdr, branch, epoch)
     }
 
     fn privacy(
@@ -530,11 +530,9 @@ impl PageStore for CowStore {
     fn arena_for(&self, branch: BranchId) -> Result<ArenaId, FerroError> {
         {
             let inner = self.inner.lock().unwrap();
-            let m = inner.meta(branch)?;
-            if let Some(a) = m.current_arena {
-                if inner.has_capacity(a) {
-                    return Ok(a);
-                }
+            match inner.meta(branch)?.current_arena {
+                Some(a) if inner.has_capacity(a) => return Ok(a),
+                _ => {}
             }
         }
         self.alloc_arena(branch)

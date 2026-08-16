@@ -52,6 +52,11 @@ pub const NODE_CAPACITY: usize = PAYLOAD_LEN - SLOT_BASE;
 /// MAX_ENTRY_BYTES`, which still fits.
 pub const MAX_ENTRY_BYTES: usize = NODE_CAPACITY / 4;
 
+/// Key/value pairs held by a leaf.
+pub type LeafEntries = Vec<(Vec<u8>, Vec<u8>)>;
+/// Separator/child pairs held by an internal node.
+pub type InternalEntries = Vec<(Vec<u8>, PageId)>;
+
 /// Bytes an entry occupies: its slot plus its cell.
 pub fn leaf_entry_bytes(key: &[u8], value: &[u8]) -> usize {
     SLOT_SIZE + 4 + key.len() + value.len()
@@ -177,7 +182,7 @@ impl<'a> Node<'a> {
         }
     }
 
-    pub fn leaf_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FerroError> {
+    pub fn leaf_entries(&self) -> Result<LeafEntries, FerroError> {
         let mut out = Vec::with_capacity(self.count());
         for i in 0..self.count() {
             out.push((self.key(i)?.to_vec(), self.value(i)?.to_vec()));
@@ -185,7 +190,7 @@ impl<'a> Node<'a> {
         Ok(out)
     }
 
-    pub fn internal_entries(&self) -> Result<Vec<(Vec<u8>, PageId)>, FerroError> {
+    pub fn internal_entries(&self) -> Result<InternalEntries, FerroError> {
         let mut out = Vec::with_capacity(self.count());
         for i in 0..self.count() {
             out.push((self.key(i)?.to_vec(), self.child(i)?));
@@ -459,13 +464,14 @@ mod tests {
                 assert!(n.insert_cell_at(idx, &leaf_cell(k, k)).unwrap());
             }
         }
+        {
         let n = Node::new(&p);
         assert_eq!(n.count(), 4);
         assert_eq!(n.key(0).unwrap(), b"a");
         assert_eq!(n.key(3).unwrap(), b"e");
         assert_eq!(n.search(b"b").unwrap(), Ok(1));
         assert_eq!(n.search(b"d").unwrap(), Err(3));
-        drop(n);
+        }
 
         NodeMut::new(&mut p).remove_at(1).unwrap();
         let n = Node::new(&p);

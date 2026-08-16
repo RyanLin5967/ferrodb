@@ -37,6 +37,10 @@ const MAX_DESCENT: usize = 64;
 /// A separator key promoted from a split, together with the page it separates off.
 type Split = Option<(Vec<u8>, PageId)>;
 
+/// The internal nodes walked on the way to a leaf, each with the child slot taken. `None` in the
+/// slot means the leftmost child, which has no slot of its own.
+type DescentPath = Vec<(PageId, Option<usize>)>;
+
 pub struct CowTree {
     store: Arc<dyn PageStore>,
 }
@@ -102,7 +106,7 @@ impl CowTree {
         root: PageId,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FerroError> {
+    ) -> Result<node::LeafEntries, FerroError> {
         let mut out = Vec::new();
         self.scan_into(root, lo, hi, 0, &mut out)?;
         Ok(out)
@@ -114,7 +118,7 @@ impl CowTree {
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
         depth: usize,
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        out: &mut node::LeafEntries,
     ) -> Result<(), FerroError> {
         if depth > MAX_DESCENT {
             return Err(FerroError::Cow("btree scan exceeded the depth guard".into()));
@@ -146,15 +150,11 @@ impl CowTree {
                         // child ci covers keys >= key(ci-1) and < key(ci)
                         let lower = if ci == 0 { None } else { Some(n.key(ci - 1)?) };
                         let upper = if ci < n.count() { Some(n.key(ci)?) } else { None };
-                        if let (Some(u), Some(l)) = (upper, lo) {
-                            if u <= l {
-                                continue;
-                            }
+                        if upper.zip(lo).is_some_and(|(u, l)| u <= l) {
+                            continue;
                         }
-                        if let (Some(lw), Some(h)) = (lower, hi) {
-                            if lw >= h {
-                                continue;
-                            }
+                        if lower.zip(hi).is_some_and(|(lw, h)| lw >= h) {
+                            continue;
                         }
                         keep.push(child);
                     }
@@ -300,7 +300,7 @@ impl CowTree {
         &self,
         root: PageId,
         key: &[u8],
-    ) -> Result<(Vec<(PageId, Option<usize>)>, PageId), FerroError> {
+    ) -> Result<(DescentPath, PageId), FerroError> {
         let mut path = Vec::new();
         let mut pid = root;
         for _ in 0..MAX_DESCENT {
@@ -394,10 +394,11 @@ impl CowTree {
         };
         // Checked before anything is mutated: bailing out after the child pointer has moved but
         // before the checksum is restamped would leave a page that fails verification.
-        if let Some((sep, _)) = promoted.as_ref() {
-            if node::internal_entry_bytes(sep) > node::MAX_ENTRY_BYTES {
-                return Err(FerroError::Cow("separator key is too large for a 4KB page".into()));
-            }
+        if promoted
+            .as_ref()
+            .is_some_and(|(sep, _)| node::internal_entry_bytes(sep) > node::MAX_ENTRY_BYTES)
+        {
+            return Err(FerroError::Cow("separator key is too large for a 4KB page".into()));
         }
         let (leftmost, mut entries) = {
             let mut f = handle.write();
@@ -450,7 +451,7 @@ impl CowTree {
     fn relink_up(
         &self,
         root: PageId,
-        path: Vec<(PageId, Option<usize>)>,
+        path: DescentPath,
         mut child_old: PageId,
         mut child_new: PageId,
         mut promoted: Split,
