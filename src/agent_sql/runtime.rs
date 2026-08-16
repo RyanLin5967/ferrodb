@@ -838,7 +838,7 @@ impl AgentRuntime {
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
-            return Err(FerroError::Contraint(format!(
+            return Err(FerroError::Constraint(format!(
                 "duplicate primary key in {}",
                 table
             )));

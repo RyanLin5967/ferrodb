@@ -57,7 +57,10 @@ impl Modify for Update {
             
             for (i, col) in self.schema.columns.iter().enumerate() {
                 if !col.nullable && matches!(new_values[i], Value::Null) {
-                    return Err(FerroError::Contraint(format!("column {} can't be null", col.name)))
+                    return Err(FerroError::Constraint(format!(
+                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
+                        col.name, self.table
+                    )))
                 }
             }
             let pk = old_values[0].clone();

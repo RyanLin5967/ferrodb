@@ -107,7 +107,7 @@ impl EscrowLedger {
         })?;
         let free = pool.unclaimed();
         if amount > free {
-            return Err(FerroError::Contraint(format!(
+            return Err(FerroError::Constraint(format!(
                 "escrow claim of {amount} exceeds the {free} unit(s) still unclaimed on {cell:?}"
             )));
         }
@@ -130,7 +130,7 @@ impl EscrowLedger {
         let spent = pool.spent.get(&branch.id).copied().unwrap_or(0);
         let left = claimed - spent;
         if amount > left {
-            return Err(FerroError::Contraint(format!(
+            return Err(FerroError::Constraint(format!(
                 "write of {amount} exceeds this branch's remaining escrow of {left} on {cell:?} \
                  (claimed {claimed}, already spent {spent}); claim more before writing"
             )));

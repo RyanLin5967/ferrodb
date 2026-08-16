@@ -304,7 +304,25 @@ impl<'a> Binder<'a> {
         }
         let table_entry = match self.catalog.get_table(&table.name) {
             Some(t) => t,
-            None => return Err(FerroError::Bind("unknown table: {}".into())),
+            None => {
+                // This said `"unknown table: {}"` as a LITERAL — no `format!`, so it printed the
+                // braces and never named the table. Every other site in the codebase formats it.
+                let mut known: Vec<&str> = self.catalog.tables.keys().map(|s| s.as_str()).collect();
+                known.sort_unstable();
+                return Err(FerroError::Bind(if known.is_empty() {
+                    format!(
+                        "unknown table '{}'; this database has no tables yet — CREATE TABLE one \
+                         first",
+                        table.name
+                    )
+                } else {
+                    format!(
+                        "unknown table '{}'; known tables are: {}",
+                        table.name,
+                        known.join(", ")
+                    )
+                }));
+            }
         };
         let qualifier = table.alias.clone().unwrap_or_else(|| table.name.clone());
         scope.add_table(&qualifier, &table_entry.schema)?;

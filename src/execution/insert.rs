@@ -34,15 +34,30 @@ impl Modify for Insert {
             vals.push(evaluate(expr, &[])?);
         }
         if vals.len() != self.schema.columns.len() {
-            return Err(FerroError::Contraint("value count != column count".into()))
+            return Err(FerroError::Constraint(format!(
+                "table '{}' has {} column(s) but {} value(s) were given; list a value for each \
+                 column, in declared order",
+                self.table,
+                self.schema.columns.len(),
+                vals.len()
+            )))
         }
         for (i, col) in self.schema.columns.iter().enumerate() {
             if !col.nullable && matches!(vals[i], Value::Null) {
-                return Err(FerroError::Contraint(format!("column {} can't be null", col.name)))
+                return Err(FerroError::Constraint(format!(
+                    "column '{}' of '{}' is declared NOT NULL, so it needs a value",
+                    col.name, self.table
+                )))
             }
         }
         if self.primary_index.search(&vals[0])?.is_some() {
-            return Err(FerroError::Contraint("duplicate primary key".into()))
+            return Err(FerroError::Constraint(format!(
+                "duplicate primary key {:?} in '{}': column '{}' already has that value; use \
+                 UPDATE to change the existing row",
+                vals[0],
+                self.table,
+                self.schema.columns.first().map(|c| c.name.as_str()).unwrap_or("?")
+            )))
         }
         let tuple = Tuple::serialize(&vals, &self.schema, self.heap.txn_id)?;
         let rid = self.heap.insert(tuple)?;
