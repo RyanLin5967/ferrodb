@@ -33,6 +33,10 @@ use crate::wal::log::WalManager;
 /// its WAL at every checkpoint, so a replica needs a page image plus the LSN it corresponds to.
 pub mod backup;
 
+/// Logical decoding — see [`logical`]. Physical replication ships pages and cannot say *what*
+/// changed; this reads the same log and produces row-level change events, committed only.
+pub mod logical;
+
 /// Optional synchronous commit — see [`sync`]. Off by default; turning it on changes the
 /// durability promise and spends availability to do it.
 pub mod sync;
