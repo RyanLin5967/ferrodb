@@ -17,6 +17,11 @@ pub enum FerroError {
     Bind(String),
     Wal(String),
     Txn(String),
+    // agent-isolation layer
+    Branch(String),
+    Cow(String),
+    Merge(String),
+    Provenance(String),
 }
 
 impl Display for FerroError {
@@ -36,6 +41,10 @@ impl Display for FerroError {
             FerroError::Bind(s) => write!(f, "binding error: {}", s),
             FerroError::Wal(s) => write!(f, "wal error: {}", s),
             FerroError::Txn(s) => write!(f, "txn error: {}", s),
+            FerroError::Branch(s) => write!(f, "branch error: {}", s),
+            FerroError::Cow(s) => write!(f, "cow page store error: {}", s),
+            FerroError::Merge(s) => write!(f, "merge error: {}", s),
+            FerroError::Provenance(s) => write!(f, "provenance error: {}", s),
         }
     }
 }

@@ -180,7 +180,7 @@ impl<'a> Binder<'a> {
                 return Ok(BoundExpr::UnaryOp { operator, right: Box::new(r) })
             }
             Expr::Grouping(inner) => {
-                return Ok(self.bind_expr(*inner, scope))?
+                return self.bind_expr(*inner, scope);
             }
             Expr::Literal { value_type, value } => {
                 return self.bind_literal(value_type, value);
