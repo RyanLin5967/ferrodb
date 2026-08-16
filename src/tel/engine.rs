@@ -1813,6 +1813,49 @@ mod tests {
         );
     }
 
+    /// R3: under MultiValue the composed list must carry each side's NET effect, not its last op.
+    ///
+    /// The review's reproduction: ours = `Assign(10)` then `Add(-3)` (net `Assign(7)`), theirs =
+    /// `Assign(99)`. Taking the raw last op yielded `[Add(-3), Assign(99)]`, so a caller replaying
+    /// the composed ops onto the base got `20-3=17` then `99` — ours' `Assign(10)` gone, silently,
+    /// while the outcome reported `Commuting` and `lost_a_write()` was false. Nothing discarded a
+    /// write on purpose, so no report would ever mention it.
+    #[test]
+    fn multivalue_composes_net_effects_not_last_ops() {
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(10))));
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-3))));
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(99))));
+
+        let out = m
+            .merge(&lca(), &[ours], &[theirs], &Fixed(MergePolicy::MultiValue), &base(20))
+            .unwrap();
+        let composed = match &out {
+            MergeOutcome::Commuting { composed } => composed.clone(),
+            other => panic!("expected Commuting, got {:?}", other),
+        };
+        let kinds: Vec<_> = composed.iter().map(|o| o.kind.clone()).collect();
+        assert!(
+            !kinds.contains(&OpKind::Add(Delta::Int(-3))),
+            "the raw last op leaked into the composed list, losing our Assign(10): {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&OpKind::Assign(Value::Integer(7))),
+            "our side's net effect Assign(7) is missing: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&OpKind::Assign(Value::Integer(99))),
+            "their side's write is missing: {:?}",
+            kinds
+        );
+        // MultiValue retains both sides, so nothing was discarded and the outcome must say so.
+        assert!(!out.lost_a_write(), "MultiValue reported a loss it did not make");
+    }
+
     #[test]
     fn a_delete_versus_a_write_names_the_right_side_in_the_report() {
         // `ours` and `theirs` name sides, not roles. Attributing the incoming branch's delete
