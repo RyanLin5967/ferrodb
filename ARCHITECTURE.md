@@ -233,10 +233,11 @@ Kept deliberately; a fabricated pass would be worse than an admitted gap.
   afterwards updates them. Measured, not assumed: after a backup taken while the primary was still
   inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
   So a backup taken against a running primary does **not** by itself give a usable replica.
-- **No synchronous commit.** Replication is asynchronous: a primary returns from commit without
-  waiting for any replica, so a crash can lose recently committed work that no replica received.
-  Reconnect and catch-up *is* demonstrated — a replica aborted mid-stream restarts and converges —
-  but "converges eventually" is the only promise on offer.
+- **Synchronous commit exists but is off by default, and it spends availability.** Asynchronous is
+  the default, so by default a crash can lose committed work no replica received. Turning sync on
+  means commit waits for a replica ack; when that cannot be had, it does not block forever and does
+  not quietly commit anyway — it returns an error naming exactly what was not achieved. With one
+  replica and no consensus, that trade cannot be avoided, only stated.
 - **SQL statements do not write CoW pages.** `UPDATE`/`INSERT` inside an agent session stage into an
   in-memory workspace. A page-backed row path exists and criteria 1 and 8 are measured on it, but
   reading "criterion 2 is MET" as "isolation enforced by shadow paging" is wrong for the SQL
@@ -254,7 +255,7 @@ Kept deliberately; a fabricated pass would be worse than an admitted gap.
 
 ## 6. Testing posture
 
-639 tests, 0 failed, 0 ignored. Three habits matter more than the count:
+646 tests, 0 failed, 0 ignored. Three habits matter more than the count:
 
 1. **A test that has never failed is not evidence.** Fixes are fire-checked by reintroducing the
    defect and confirming the test catches it. Several "passing" tests this project has held were

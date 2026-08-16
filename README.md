@@ -278,6 +278,12 @@ Three further limits, each found by a test rather than reasoned about:
   inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
   The practical consequence is that a backup taken while the primary is running does **not** by
   itself give a usable replica — take it when the schema is settled.
+- **Synchronous commit is available and off by default.** With it on, commit waits for a replica to
+  acknowledge the LSN, so a primary crash cannot lose work a client was told had committed. When no
+  replica can acknowledge, it neither blocks forever nor commits silently: it returns an error
+  naming the lsn it wanted, how far the furthest replica got, that the data is durable on the
+  primary, and that nothing was rolled back. With one replica and no consensus that trade cannot be
+  designed away, only stated.
 - **Reconnect and catch-up works, and its ordering is the replica's half of the durability rule.**
   A replica records progress only *after* the pages it describes are durable, so a crash leaves its
   state file behind the pages and never ahead — behind is repaired by idempotent redo, ahead would
