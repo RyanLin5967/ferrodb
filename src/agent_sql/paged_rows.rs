@@ -84,12 +84,26 @@ fn value_span(bytes: &[u8]) -> Result<usize, FerroError> {
         || FerroError::Parse("row value ends mid-cell; the encoded page is truncated".into());
     let tag = *bytes.first().ok_or_else(truncated)?;
     let span = match tag {
-        0 => 5,                    // Integer: tag + i32
-        2 => 9,                    // Float:   tag + f64
-        3 => 2,                    // Boolean: tag + u8
-        4 => 1,                    // Null:    tag
-        1 => {
-            // Varchar: tag + u16 length + payload
+        0 => 5,                    // Integer:   tag + i32
+        2 => 9,                    // Float:     tag + f64
+        3 => 2,                    // Boolean:   tag + u8
+        4 => 1,                    // Null:      tag
+        5 => 9,                    // BigInt:    tag + i64
+        7 => 9,                    // Timestamp: tag + i64
+        // Varchar (1) and Decimal (6) share the tag + u16 length + payload layout.
+        //
+        // These MUST be kept in step with `Value::serialize` in `storage::index_page`. When the
+        // wide types were added there, this function was not updated, and the result was worse
+        // than a decode error: `encode_row` succeeded, so the write landed, and every later
+        // `decode_row` of that row failed with "unknown value tag" — a BIGINT/DECIMAL/TIMESTAMP
+        // cell was write-only on a page-backed agent branch, which `AgentRuntime::page_changeset`
+        // hits for the before and after image of every changed row. A tag this function does not
+        // know is not a cell it can skip, so there is no safe fallback: it has to be exhaustive.
+        //
+        // `wide_typed_cells_survive_a_round_trip_through_a_branchs_pages` in
+        // `tests/integration_branch_pages.rs` drives that path from SQL, so the reachability this
+        // paragraph asserts is checked rather than only claimed.
+        1 | 6 => {
             if bytes.len() < 3 {
                 return Err(truncated());
             }
@@ -290,6 +304,16 @@ mod tests {
 
     // ---- codec ---------------------------------------------------------------------------
 
+    /// The name is a promise: **every** variant, not the ones that existed when it was written.
+    ///
+    /// It previously listed only the five original variants, and that omission was not cosmetic.
+    /// `encode_row` delegates to `Value::serialize`, which learned the wide types' tags, while
+    /// `value_span` here did not — so a `BIGINT`, `DECIMAL` or `TIMESTAMP` cell on a page-backed
+    /// agent branch encoded cleanly and then failed **every** later read with "unknown value tag".
+    /// A write-only cell is worse than a rejected write, because nothing reports it at write time.
+    ///
+    /// Adding a variant to `Value` without adding it here must fail this test, which is the whole
+    /// point of enumerating them exhaustively rather than sampling.
     #[test]
     fn every_value_variant_round_trips() {
         let row = vec![
@@ -299,9 +323,44 @@ mod tests {
             Value::Boolean(true),
             Value::Null,
             Value::Varchar(String::new()),
+            // The wide types, at the extremes that a narrower encoding would lose.
+            Value::BigInt(i64::MAX),
+            Value::BigInt(i64::MIN),
+            Value::BigInt(9007199254740993),
+            Value::Decimal("123456789012345678901234567890.12345678901234567890".into()),
+            Value::Decimal("1.50".into()),
+            Value::Timestamp(1_700_000_000_123),
+            Value::Timestamp(i64::MIN),
         ];
         let bytes = encode_row(&row).unwrap();
-        assert_eq!(decode_row(&bytes).unwrap(), row);
+        let back = decode_row(&bytes).unwrap();
+        assert_eq!(back, row);
+        // `Value`'s PartialEq is numeric, so `Decimal("1.50") == Decimal("1.5")`. Check the bytes
+        // themselves too, or a decoder that dropped the trailing zero would pass the line above.
+        assert!(
+            matches!(&back[10], Value::Decimal(d) if d == "1.50"),
+            "decimal scale was lost in the page encoding: {:?}",
+            back[10]
+        );
+    }
+
+    /// A cell of every variant must also survive **individually**, so a failure names the variant
+    /// rather than pointing at one long row.
+    #[test]
+    fn each_wide_variant_round_trips_on_its_own() {
+        for v in [
+            Value::BigInt(i64::MAX),
+            Value::BigInt(-1),
+            Value::Decimal("-0.00000000000000000001".into()),
+            Value::Decimal("0.0".into()),
+            Value::Timestamp(-1),
+            Value::Timestamp(0),
+        ] {
+            let bytes = encode_row(std::slice::from_ref(&v)).unwrap();
+            let back = decode_row(&bytes)
+                .unwrap_or_else(|e| panic!("{v:?} encoded but would not decode: {e}"));
+            assert_eq!(back, vec![v.clone()], "{v:?} did not survive the page encoding");
+        }
     }
 
     #[test]

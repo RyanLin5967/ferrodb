@@ -18,17 +18,43 @@ impl PartialEq for HashKey {
 impl Eq for HashKey {}
 
 // Hash must follow Eq: equal keys hash equal, or they land in different buckets and never meet.
-// Since Integer(5) and Float(5.0) are now equal, they cannot be separated by discriminant, and
-// the two must hash through one canonical numeric form. Widening i32 -> f64 is lossless, and
-// `to_bits` matches the `total_cmp` that Value::cmp uses: -0.0 and 0.0 stay distinct under both,
-// and two NaNs agree under both.
+// The reverse is not required — two unequal keys are allowed to collide, they just cost a probe.
+//
+// Every member of the numeric band (Integer, BigInt, Float, Decimal) can be equal to every other,
+// so none of them may be separated by discriminant; all four hash through one canonical form, the
+// bits of the nearest f64. That is deliberately a LOSSY canonical form and it is still correct
+// here, because rounding two equal numbers to f64 always produces the same f64:
+//
+//   * `i as f64` and `i.to_string().parse::<f64>()` both round the same exact integer the same
+//     way, so `BigInt(9007199254740993)` and `Decimal("9007199254740993")` — equal under `cmp`,
+//     since neither widens during comparison — land on the same bucket even though that bucket is
+//     labelled 2^53.
+//   * Two decimals that differ only in trailing zeros (`1.50`, `1.5`) parse to the same f64.
+//
+// The one place the canonical form needs a nudge: `-0.0` and `0.0` have different bits, and
+// `Value::cmp` keeps `Float(-0.0)` strictly below `Float(0.0)` (that is `total_cmp`'s ordering),
+// while Decimal has no signed zero, so `Decimal("-0.0") == Decimal("0")`. A decimal zero of either
+// sign therefore has to hash as `+0.0`. A `Float` keeps its own bits, since no other value equals
+// `Float(-0.0)`.
+//
+// Timestamp is equal only to another Timestamp, so it keeps its discriminant and hashes its i64.
 impl Hash for HashKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         const NUMERIC: u8 = 0xF0;
         for v in &self.0 {
             match v {
                 Value::Integer(i) => { NUMERIC.hash(state); (*i as f64).to_bits().hash(state) }
+                Value::BigInt(i) => { NUMERIC.hash(state); (*i as f64).to_bits().hash(state) }
                 Value::Float(f) => { NUMERIC.hash(state); f.to_bits().hash(state) }
+                Value::Decimal(d) => {
+                    NUMERIC.hash(state);
+                    // Text that `parse_decimal` produced always parses; a hand-built `Decimal`
+                    // holding something else hashes to a single shared bucket rather than panicking.
+                    let f: f64 = d.parse().unwrap_or(f64::NAN);
+                    let f = if f == 0.0 { 0.0 } else { f };
+                    f.to_bits().hash(state)
+                }
+                Value::Timestamp(ms) => { discriminant(v).hash(state); ms.hash(state) }
                 Value::Boolean(b) => { discriminant(v).hash(state); b.hash(state) }
                 Value::Varchar(s) => { discriminant(v).hash(state); s.hash(state) }
                 Value::Null => discriminant(v).hash(state),

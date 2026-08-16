@@ -289,6 +289,11 @@ fn write_value(f: &mut Formatter<'_>, v: &Value) -> std::fmt::Result {
     match v {
         Value::Integer(i) => write!(f, "{}", i),
         Value::Float(x) => write!(f, "{}", x),
+        Value::BigInt(i) => write!(f, "{}", i),
+        // A guard's rendered text is what the agent is shown as the violated predicate, so the
+        // decimal's own digits go there rather than a float rendering that would round them.
+        Value::Decimal(d) => write!(f, "{}", d),
+        Value::Timestamp(ms) => write!(f, "{}", ms),
         Value::Varchar(s) => write!(f, "'{}'", s),
         Value::Boolean(b) => write!(f, "{}", b),
         Value::Null => write!(f, "NULL"),

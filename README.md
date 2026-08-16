@@ -19,12 +19,20 @@ Prebuilt binaries (in zip files) for Linux, macOS, and Windows are in the releas
 
 Requires Rust 1.85 or newer (this project uses edition 2024).
 
-`cargo test` additionally needs **Go 1.24+** and the **`sqlite3` CLI** on PATH. The change-feed
-tests drive a consumer written in Go and check its SQLite output with the sqlite3 command — the
+`cargo test` additionally needs **Go 1.25+ with cgo enabled** and the **`sqlite3` CLI** on PATH. The
+change-feed tests drive a consumer written in Go and check its output with the sqlite3 command — the
 independence is the point, since an encoder validated by its own decoder agrees with itself about
 any shared misreading. Those tests **fail loudly** rather than skipping when the toolchain is
 missing: a test that silently skips is a test that always passes. `cargo build` and `cargo run`
-need neither.
+need none of it.
+
+The **`duckdb` CLI** is optional on a developer machine and is the one exception to that rule. It is
+not shipped with any OS here, so its absence is a fact about the machine rather than a broken
+checkout; the DuckDB sink tests fall back to a second process through the Go driver and print which
+reader ran, because a green run on the weaker reader must not be mistaken for one that exercised the
+CLI. Set **`FERRODB_REQUIRE_DUCKDB_CLI=1`** to turn that notice into a failure — CI does, so the
+fallback is never what CI silently measures. cgo is *not* optional: the DuckDB driver links DuckDB
+statically, so `CGO_ENABLED=0` fails to build the whole consumer module, SQLite sink included.
 
 ```
 git clone https://github.com/RyanLin5967/ferrodb.git
@@ -103,8 +111,15 @@ FROM table [AS] [alias]
 [WHERE expr];
 ```
 
-- **Types:** INTEGER, FLOAT, BOOLEAN, VARCHAR(n)
-- **Literals:** integers, floats, single quoted strings, TRUE, FALSE, NULL
+- **Types:** INTEGER (i32), BIGINT (i64), DECIMAL / NUMERIC (exact, unbounded digits),
+  TIMESTAMP (epoch milliseconds, i64), FLOAT (f64), BOOLEAN, VARCHAR(n)
+- **Literals:** integers, floats, single quoted strings, TRUE, FALSE, NULL. A bare numeric literal
+  is read as the declared type of the column it is written to or compared against, so
+  `123456789012345678901234567890.5` reaches a DECIMAL column with every digit intact instead of
+  being rounded to an f64 on the way.
+- **DECIMAL** has no declared precision or scale. It stores the digits you wrote — `1.50` stays
+  `1.50` — and there is no decimal arithmetic: this engine stores and ships decimals, it does not
+  add them. Comparison is numeric, so `1.50` and `1.5` are equal.
 - **Operators:** = != <= > >= + - * / AND OR NOT
 - **Columns:** *, qualified references, table aliases, qualified star
 
@@ -337,10 +352,26 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   record of a still-open transaction. Clamping it that way re-reads transactions that committed
   afterwards, which is why the delivered position exists to suppress them — read from the low-water
   mark, deliver past the high-water mark.
-- **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
-  the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
-  direction is deliberate: handing off after the scan silently loses concurrent changes, while
-  handing off before re-delivers a few — and duplication is recoverable where loss is not.
+- **Initial snapshot with a handoff, at-least-once.** A consumer joining a database that already has
+  rows reads the current contents as `READ` events, then streams from the LSN captured *before* the
+  scan. That direction is deliberate: handing off after the scan silently loses concurrent changes,
+  while handing off before re-delivers a few — and duplication is recoverable where loss is not.
+  This is `snapshot_table`, kept for callers holding only a WAL.
+- **…or exactly once, given a transaction manager.** `snapshot_table_exact` takes the read *inside a
+  transaction*, so it knows precisely which transactions its rows already contain, and hands back a
+  `SnapshotBoundary` the stream uses to skip exactly those
+  (`FeedStreamer::resuming_after_snapshot`, paired with `Subscription::following` so the resume
+  cursor comes from the boundary rather than from the caller). Every row then appears **exactly
+  once** across the two feeds. Skipping by LSN cannot do this: the resume point has to reach back
+  over any transaction that was already in flight — MVCC excludes its uncommitted work from the
+  snapshot, and its records sit *below* the scan — and reaching back drags in commits the snapshot
+  did contain. Those two sets interleave in the log, so no byte offset separates them; only the
+  transaction id does. The boundary carries the *table set* as well, because a transaction id alone
+  answers *when* and not *what*: a snapshot of `orders` says nothing about `shipments`, and a
+  transaction-only filter would drop `shipments` rows that were in no snapshot at all.
+  `tests/integration_cdc_cutover.rs` asserts exactly-once over a scenario holding one transaction
+  open across the cutover, and its companion test asserts that `snapshot_table` both duplicates and
+  drops on that same scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
 
@@ -364,9 +395,89 @@ The tests judge the feed by comparing that materialised table against the source
 well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
 author's idea of the format agrees with itself about any shared misreading.
 
-**Limits:** the catalog lives outside the WAL, so DDL is not carried by the feed — a consumer sees
-rows and not the schema change that preceded them. There is no wire framing beyond newline
-delimiting, and the feed is JSON rather than a compact binary format.
+### Wide values ship as strings, on purpose
+
+JSON has one number type and no stated precision, and the overwhelmingly common consumer
+behaviour is to parse every JSON number into an **IEEE 754 double** — that is what JavaScript's
+`JSON.parse` does, and what Go's `encoding/json` does into `interface{}`. A double carries a 53-bit
+significand, so `9223372036854775807` comes back as `9223372036854775808`, `9007199254740993` comes
+back as `9007199254740992`, and a decimal past 17 significant digits comes back rounded. **No error
+is raised** for any of it: the parse succeeds and the number is simply wrong.
+
+So `BIGINT`, `DECIMAL` and `TIMESTAMP` are emitted as JSON **strings**, which no parser coerces
+(envelope fields elided here — a real line also carries `txn`, `lsn`, `commit_lsn`,
+`commit_end_lsn` and `before`):
+
+```json
+{"op":"INSERT","table":"wide","after":{"id":1,"big":"9223372036854775807","dec":"1.50","ts":"1700000000123"}}
+```
+
+`INTEGER` deliberately stays a bare number — it is `i32`, three orders of magnitude inside what a
+double holds exactly, and stringifying it would break every consumer reading that column today.
+`FLOAT` stays a number too, since it *is* a double.
+
+`cdc-consumer precision <feed.jsonl>` reports the JSON type of every column and flags any whose
+digits a default float64 decode would corrupt. `tests/integration_cdc_wide_types.rs` runs it over a
+feed produced by real SQL (expecting zero corrupted columns) and then over a hand-built feed
+carrying the same values as bare numbers, requiring it to report the corruption — so a clean result
+means the checker works rather than that it never fires.
+
+**Limits:** there is no wire framing beyond newline delimiting, and the feed is JSON rather than a
+compact binary format. `TIMESTAMP` is epoch milliseconds with no calendar formatting, and over
+pgwire it is announced as `int8` rather than `timestamp` for that reason. `DECIMAL` supports no
+arithmetic, and its text cannot exceed 65535 bytes (the row encoding's length prefix).
+### Landing the feed: SQLite and DuckDB sinks
+
+A change feed nobody lands anywhere is a demo. `cdc-consumer sink` writes it into a destination
+database — SQLite for an operational replica, DuckDB for the analysts' copy:
+
+```
+$ go run . sink feed.jsonl -db out.sqlite -key id                  # default engine
+$ go run . sink feed.jsonl -db out.duckdb -key id -engine duckdb
+```
+
+Both carry the same four properties, and they are the whole point, because the feed is
+**at-least-once**: a sink will be handed the same event twice, and can be handed a stale one after a
+newer one. Re-applying an old `UPDATE` overwrites current data with a previous value; re-applying an
+`INSERT` after a `DELETE` resurrects a row the source no longer has. Both leave the destination
+silently wrong *and self-consistent*, which is the worst failure a pipeline can have.
+
+- Every destination row carries `_commit_lsn`, the commit that last wrote it.
+- An event applies **only if its `commit_lsn` is strictly greater**. That test lives in the
+  `ON CONFLICT … DO UPDATE … WHERE` clause, not in the program's control flow, so every write path
+  inherits it — including one added later by someone who did not read the comment above it.
+- Deletes are **soft**. A hard delete throws away the LSN, and with it the only evidence that would
+  reject a stale re-insert arriving afterwards. The tombstone is what makes "gone" stick.
+- `CREATE_TABLE` events drive the destination DDL, learned in band and in log order.
+
+The DuckDB destination is checked with the **`duckdb` CLI** — a different binary and a different
+build of DuckDB from the one the Go driver links — for the same reason the feed is validated by a
+separate program. On a machine with no CLI the tests fall back to a second process through the Go
+driver and say so; that fallback is the weaker check, and `both_readers_agree` pins the two together
+wherever both exist. Because DuckDB is *typed*, its tests catch something SQLite's cannot: a sink
+that declared every column `TEXT` would pass every SQLite assertion, and fails here.
+
+CI installs a pinned `duckdb` CLI on all three runners and sets `FERRODB_REQUIRE_DUCKDB_CLI=1`,
+which makes falling back to the Go reader a **failure** rather than a quiet degradation. That
+variable is the point of the arrangement: without it, a CI run whose CLI install had stopped working
+would report exactly the same green as one that compared against the CLI.
+
+This corrects what this section said until recently — that the runners had no CLI, so the comparison
+ran nowhere but a developer's laptop. That was accurate when written and is why it is recorded here
+rather than quietly deleted: the comparison had been *written* and was *running nowhere*, and no
+test failure would ever have said so. The fallback is held to the CLI's exact rendering — `NULL`
+printed as four characters, a `DOUBLE` of 2 printed `2.0`, a `TIMESTAMP` printed without a zone —
+and `both_readers_agree` compares those cases specifically, since queries returning plain non-null
+scalars agree by accident and prove nothing.
+
+`-engine duckdb` needs **cgo** (`github.com/marcboeker/go-duckdb` links DuckDB statically), so
+`CGO_ENABLED=0` will not build the consumer at all — the cost is module-wide, not per-engine.
+
+**Limits:** there is no wire framing beyond newline delimiting, and the feed is JSON rather than a
+compact binary format. `ALTER TABLE` is not carried — `CREATE_TABLE` and `DROP_TABLE` are, so a
+consumer learns a table's shape and its disappearance but not a column added later. The sinks
+replace whole rows rather than merging, which is correct only because this feed always emits full
+before/after images.
 
 ## Replication — what it gives you, and what it cannot
 

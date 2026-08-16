@@ -340,8 +340,44 @@ impl<'a> Binder<'a> {
     pub fn bind_expr(&self, expr: Expr, scope: &Scope) -> Result<BoundExpr, FerroError> {
         match expr {
             Expr::BinaryOp { left, operator, right } => {
-                let l = self.bind_expr(*left, scope)?;
-                let r = self.bind_expr(*right, scope)?;
+                // A comparison gets the same type-directed literal binding as INSERT and UPDATE,
+                // and needs it more, because getting it wrong here is SILENT.
+                //
+                // `WHERE ts = 1700000000123` binds its literal from the text alone as a `BigInt`.
+                // `Timestamp` sits outside the numeric rank band on purpose (see `Value::cmp`), so
+                // `Timestamp == BigInt` falls through to the cross-type rank fallback, which is a
+                // fixed answer that never depends on the values. The predicate then matches
+                // nothing, the query returns an empty result, and no error is raised anywhere —
+                // a wrong answer wearing an empty result's clothes.
+                //
+                // Reading the literal as the declared type of the column it is compared against
+                // fixes that without touching the ordering, which has to stay a total order.
+                // **Comparisons only.** The paragraph above is an argument about comparing a
+                // literal to a column, and it does not carry over to `+`, `-`, `*` or `/`: there
+                // the literal is a COUNT, not another value of the column's type. Redirecting it
+                // anyway read `ts + 1000` as `Timestamp + Timestamp(1000)` — adding one instant to
+                // another, which has no meaning to evaluate — so shifting a timestamp by a
+                // thousand milliseconds failed as "can't add non numbers". `big + 1` survived only
+                // because BigInt happens to be the type a bare `1` would take anyway.
+                let comparison = matches!(
+                    operator,
+                    TokenType::Equal
+                        | TokenType::BangEqual
+                        | TokenType::Less
+                        | TokenType::LessEqual
+                        | TokenType::Greater
+                        | TokenType::GreaterEqual
+                );
+                let left_ty = if comparison { Self::column_type_of(&left, scope) } else { None };
+                let right_ty = if comparison { Self::column_type_of(&right, scope) } else { None };
+                let l = match right_ty.as_ref().and_then(|t| Self::literal_for_column(&left, t)) {
+                    Some(res) => BoundExpr::Literal(res?),
+                    None => self.bind_expr(*left, scope)?,
+                };
+                let r = match left_ty.as_ref().and_then(|t| Self::literal_for_column(&right, t)) {
+                    Some(res) => BoundExpr::Literal(res?),
+                    None => self.bind_expr(*right, scope)?,
+                };
                 return Ok(BoundExpr::BinaryOp { left: Box::new(l), operator, right: Box::new(r) })
             }
             Expr::UnaryOp { operator, right } => {
@@ -404,8 +440,18 @@ impl<'a> Binder<'a> {
             TokenType::Number => {
                 if value.contains('.') {
                     Value::Float(value.parse::<f64>().map_err(|e| FerroError::Bind(format!("invalid float: {}, {}", value, e)))?)
+                } else if let Ok(i) = value.parse::<i32>() {
+                    // `INTEGER` stays the default for anything that fits it, so no existing
+                    // consumer of a bound literal changes shape.
+                    Value::Integer(i)
+                } else if let Ok(i) = value.parse::<i64>() {
+                    // Wider than i32. Before BIGINT existed this was a hard "invalid int" error,
+                    // so widening here can only accept statements that used to be rejected — it
+                    // never reinterprets one that used to work. It is what makes a predicate like
+                    // `WHERE created_ms > 1700000000000` bindable at all.
+                    Value::BigInt(i)
                 } else {
-                    Value::Integer(value.parse::<i32>().map_err(|e| FerroError::Bind(format!("invalid int: {}, {}", value, e)))?)
+                    return Err(FerroError::Bind(format!("integer literal out of range for BIGINT: {}", value)))
                 }
             }
             TokenType::String => Value::Varchar(value),
@@ -415,6 +461,140 @@ impl<'a> Binder<'a> {
             _ => return Err(FerroError::Bind(format!("invalid literal: {}", value)))
         };
         Ok(v)
+    }
+
+    /// The declared type of the column `expr` names, if it names one that this scope resolves.
+    ///
+    /// An unresolvable name is `None` rather than an error: this is only ever used to *decide how
+    /// to read a literal on the other side*, and the real resolution error is raised by
+    /// `bind_expr` a moment later with its own message.
+    fn column_type_of(expr: &Expr, scope: &Scope) -> Option<DataType> {
+        match Self::unwrap_grouping(expr) {
+            Expr::ColumnRef { table, column } => scope
+                .resolve(table.as_deref(), column)
+                .ok()
+                .map(|i| scope.columns[i].data_type.clone()),
+            _ => None,
+        }
+    }
+
+    /// Look through redundant parentheses, so `WHERE ts = (1700000000123)` binds like the
+    /// unparenthesised form rather than silently falling back to untyped binding.
+    fn unwrap_grouping(mut expr: &Expr) -> &Expr {
+        while let Expr::Grouping(inner) = expr {
+            expr = inner;
+        }
+        expr
+    }
+
+    /// The signed text of a numeric literal, if `expr` is one.
+    ///
+    /// `INSERT INTO t VALUES (-9223372036854775808)` parses as unary minus applied to the literal
+    /// `9223372036854775808` — a number that does **not** fit an `i64`. Negating after parsing
+    /// therefore cannot represent `i64::MIN` at all, so the sign is folded into the text first and
+    /// the whole thing is parsed once.
+    fn signed_numeric_text(expr: &Expr) -> Option<String> {
+        match Self::unwrap_grouping(expr) {
+            Expr::Literal { value_type: TokenType::Number, value } => Some(value.clone()),
+            Expr::UnaryOp { operator: TokenType::Minus, right } => {
+                match Self::unwrap_grouping(right.as_ref()) {
+                    Expr::Literal { value_type: TokenType::Number, value } => {
+                        Some(format!("-{value}"))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Bind a literal **against the declared type of the column it concerns**, for the wide types.
+    ///
+    /// Type-directed for exactly one reason: a bare numeric literal carries no type, and deciding
+    /// its type from its own text alone loses information the statement actually contains. Left to
+    /// itself, `literal_value` would read `123.4567890123456789012` as an `f64` — rounding it
+    /// before it ever reaches a `DECIMAL` column — and `1700000000000` as a `BigInt` rather than a
+    /// `TIMESTAMP`. The declared column type is the missing half of that decision.
+    ///
+    /// This is the form used by **comparisons as well as writes**, so it is deliberately limited to
+    /// the three wide types, where reading the literal as the column's type is strictly more exact
+    /// than the alternative. See [`Binder::literal_for_written_column`] for the write-only
+    /// coercion, and the note there on why it must not be used here.
+    ///
+    /// Returns `None` when this is not a case that needs redirecting, so the caller falls through
+    /// to ordinary binding. `Some(Err(..))` means the literal was aimed at one of these columns and
+    /// could not be represented — which is a refusal, never a silent truncation.
+    pub fn literal_for_column(expr: &Expr, target: &DataType) -> Option<Result<Value, FerroError>> {
+        if !matches!(target, DataType::BigInt | DataType::Decimal | DataType::Timestamp) {
+            return None;
+        }
+        let text = Self::signed_numeric_text(expr)?;
+        Some(match target {
+            DataType::BigInt => text
+                .parse::<i64>()
+                .map(Value::BigInt)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a BIGINT: {e}"))),
+            DataType::Timestamp => text
+                .parse::<i64>()
+                .map(Value::Timestamp)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a TIMESTAMP (epoch milliseconds): {e}"))),
+            DataType::Decimal => crate::catalog::column::parse_decimal(&text)
+                .map(Value::Decimal)
+                .map_err(FerroError::Bind),
+            _ => unreachable!("guarded above"),
+        })
+    }
+
+    /// As [`Binder::literal_for_column`], plus the `FLOAT` widening — for **writes only**.
+    ///
+    /// A whole-numbered literal reads as `Integer`, and `INSERT INTO t (f FLOAT) VALUES (5)` is
+    /// ordinary SQL that every dialect accepts. Writing an `Integer` into a `FLOAT` column is
+    /// refused by `value_fits`, because `serialize` would lay down four bytes where `deserialize`
+    /// reads eight and shift every column after it — so without this coercion that plain statement
+    /// is a hard error. Widening an i32 to f64 is exact, which is why it is safe to do silently.
+    ///
+    /// **Why this is not shared with comparisons.** In a predicate there is no storage width to
+    /// satisfy, and rounding the literal to f64 first would throw away the exactness the wide types
+    /// were added for. `WHERE f = 9007199254740993` against a `FLOAT` column must return no rows —
+    /// 2^53+1 is not representable as any f64, so no stored float can equal it — but if the literal
+    /// were parsed straight to f64 it would become 2^53 and match a row holding 2^53.
+    /// `Value::cmp` already compares an i64 against an f64 exactly, via `cmp_i64_f64`; letting it
+    /// see the unrounded literal is what makes that machinery reachable. This was briefly shared
+    /// with the comparison path and produced exactly that wrong answer.
+    pub fn literal_for_written_column(
+        expr: &Expr,
+        target: &DataType,
+    ) -> Option<Result<Value, FerroError>> {
+        if let Some(res) = Self::literal_for_column(expr, target) {
+            return Some(res);
+        }
+        if !matches!(target, DataType::Float) {
+            return None;
+        }
+        let text = Self::signed_numeric_text(expr)?;
+        Some(
+            text.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a FLOAT: {e}"))),
+        )
+    }
+
+    /// Bind one row of INSERT/UPDATE values, redirecting numeric literals to the declared type of
+    /// the column each one lands in. Values that are not plain literals bind normally.
+    pub fn bind_row_against(
+        &self,
+        values: Vec<Expr>,
+        column_types: &[&DataType],
+        scope: &Scope,
+    ) -> Result<Vec<BoundExpr>, FerroError> {
+        let mut out = Vec::with_capacity(values.len());
+        for (i, v) in values.into_iter().enumerate() {
+            match column_types.get(i).and_then(|t| Binder::literal_for_written_column(&v, t)) {
+                Some(res) => out.push(BoundExpr::Literal(res?)),
+                None => out.push(self.bind_expr(v, scope)?),
+            }
+        }
+        Ok(out)
     }
 }
 

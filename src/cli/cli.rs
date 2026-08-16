@@ -95,6 +95,11 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         let base = bp.disk_manager.high_water()?.saturating_add(arena_headroom());
         ArenaPageStore::new(bp.clone(), branches.clone(), base)?
     });
+    // Persist the free-space map whenever the arena claims a new extent, not only at exit. The
+    // exit checkpoint below is still worth taking - it captures the final partial extent - but it
+    // is the one a `kill -9` or a power cut never reaches, and a map older than the durable branch
+    // catalog is a map that re-issues pages the catalog still points at.
+    store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
     let runtime = Arc::new(if arena_exists {
         AgentRuntime::reopen_with_storage(
@@ -185,6 +190,11 @@ fn display_value(v: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Varchar(s)=> s.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        // The stored digits verbatim: rendering a decimal through a float here would undo the
+        // whole point of storing it as digits.
+        Value::Decimal(d) => d.to_string(),
+        Value::Timestamp(ms) => ms.to_string(),
         Value::Null => "NULL".to_string(),
     }
 }

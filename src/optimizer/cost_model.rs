@@ -284,10 +284,19 @@ fn flip(op: TokenType) -> TokenType {
     }
 }
 
+/// A numeric value as an `f64`, for **selectivity estimation only**.
+///
+/// The `as f64` on a `BigInt`/`Timestamp` and the `parse` on a `Decimal` are lossy past 2^53, and
+/// that is fine *here* and nowhere else: the result feeds a fraction-of-rows guess that picks a
+/// plan. Being off by one ulp changes which scan is chosen, never which rows come back. Ordering
+/// and equality deliberately do not use this function — see `Value::cmp`.
 fn get_val(v: &Value) -> Option<f64> {
     match v {
         Value::Integer(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        Value::BigInt(i) => Some(*i as f64),
+        Value::Timestamp(ms) => Some(*ms as f64),
+        Value::Decimal(d) => d.parse::<f64>().ok(),
         _ => None
     }
 }
@@ -297,6 +306,11 @@ fn row_width(schema: &Schema) -> usize {
         DataType::Boolean => 1,
         DataType::Float => 8,
         DataType::Integer => 4,
+        DataType::BigInt => 8,
+        DataType::Timestamp => 8,
+        // A decimal's text has no declared bound, so costing uses a nominal 24 bytes: roughly a
+        // 20-digit amount plus its 2-byte length prefix. This only scales a page-count estimate.
+        DataType::Decimal => 24,
         DataType::Varchar(n) => n as usize,
     }).sum::<usize>()
 }

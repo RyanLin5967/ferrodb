@@ -113,6 +113,14 @@ pub struct ArenaPageStore {
     /// Extent pages currently reserved by some branch. Returns to baseline only if freed extents
     /// are genuinely recycled, which is the stronger claim exit criterion 8 actually wants.
     reserved_pages: AtomicU32,
+    /// Where to persist the free-space map when a new extent is claimed, if anywhere.
+    ///
+    /// Without this the map reaches disk only when the owner remembers to call `checkpoint`, which
+    /// for the CLI is at clean exit — so a `kill -9` leaves a durable map older than the durable
+    /// branch catalog, and the next open re-issues pages that catalog still points at. Claiming an
+    /// extent is the rare event (once per `extent_pages`, default 256), so persisting there costs
+    /// a small write per 256 allocations and bounds what a crash can lose to one extent.
+    checkpoint_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ArenaPageStore {
@@ -202,6 +210,7 @@ impl ArenaPageStore {
             }),
             live_pages: AtomicU32::new(0),
             reserved_pages: AtomicU32::new(0),
+            checkpoint_path: Mutex::new(None),
         })
     }
 
@@ -534,6 +543,17 @@ impl ArenaPageStore {
             .into());
         }
 
+        // **Never resume filling a restored extent.** The image records `next_free` as of the last
+        // checkpoint, but a session that died after it may have handed out pages beyond that mark,
+        // and one of them can be the root a durable branch record still names. Dropping `current`
+        // sends `arena_for` to `alloc_arena` for a fresh extent instead, so allocation resumes
+        // above everything any previous session could have touched. The extents themselves stay in
+        // the map, so their pages remain accounted for and the reaper can still free them; what is
+        // given up is the tail of one extent per restore, which reclamation later takes back.
+        //
+        // `recycled` is deliberately kept: those pages were durably recorded as free *before* the
+        // checkpoint, so handing them out again is correct rather than a collision.
+        current.clear();
         *self.state.lock().unwrap() = StoreState { extents, recycled, current, pending };
         *self.space.free_extent_starts.lock().unwrap() = free_starts;
         self.space.next_extent_start.store(next_start, Ordering::SeqCst);
@@ -541,6 +561,22 @@ impl ArenaPageStore {
         self.live_pages.store(live, Ordering::SeqCst);
         self.reserved_pages.store(reserved, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Persist the map on every extent claim from now on.
+    ///
+    /// Separate from construction because `reopen_from_checkpoint` already takes the path it read
+    /// from, and a store that is only ever a test fixture should not be writing files.
+    pub fn checkpoint_to(&self, path: std::path::PathBuf) {
+        *self.checkpoint_path.lock().unwrap() = Some(path);
+    }
+
+    fn persist_if_configured(&self) -> Result<(), FerroError> {
+        let path = self.checkpoint_path.lock().unwrap().clone();
+        match path {
+            Some(p) => self.checkpoint(&p),
+            None => Ok(()),
+        }
     }
 
     /// Write the free-space map to `path`, via a temporary file and a rename, so a crash leaves
@@ -610,6 +646,10 @@ impl ArenaPageStore {
         let base = Self::base_page_in_state(&bytes)?;
         let store = Self::reopen(pool, catalog, base)?;
         store.load_state(&bytes)?;
+        // Reattaching implies continuing to own this image. Leaving it unarmed is how the first
+        // version of this still aliased after a crash: the restored store claimed a fresh extent,
+        // never wrote that fact down, and the open after it claimed the very same range.
+        store.checkpoint_to(path.to_path_buf());
         Ok(store)
     }
 }
@@ -790,6 +830,13 @@ impl PageStore for ArenaPageStore {
                 self.catalog.put(&rec)?;
             }
         }
+
+        // Persist the map now that the region has grown. This is the write that makes
+        // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
+        // invisible to the next open, which then claims the same range and hands out pages that are
+        // already in use. Ordered AFTER the catalog write so a crash between the two leaves an
+        // extent recorded as reserved but unreferenced, which leaks; the other order aliases.
+        self.persist_if_configured()?;
         Ok(arena)
     }
 
@@ -1055,6 +1102,84 @@ mod tests {
         assert_eq!(restored.live_page_count().unwrap(), live_before, "the map came with it");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&ckpt);
+    }
+
+    /// **A crash between two checkpoints must not put a live page back into circulation.**
+    ///
+    /// The free-space map lives in atomics and reaches disk only when `checkpoint` is called. A
+    /// process killed after allocating is therefore describable exactly: the durable map is older
+    /// than the durable branch catalog, and every page allocated in between reads as free while
+    /// `.branches` still names one of them as a branch's root. The next open hands that page to
+    /// somebody else, and two writers now share a page — which is not detectable by a checksum,
+    /// because each write leaves a perfectly valid page behind.
+    ///
+    /// Written against the CLI's exact sequence: E31 wired the arena into the shipped binary and
+    /// checkpoints it on clean exit only, so this is reachable by pressing Ctrl-C.
+    #[test]
+    fn a_page_allocated_after_the_last_checkpoint_is_not_reissued_over_a_live_root() {
+        use std::fs::OpenOptions;
+        use crate::storage::disk_manager::DiskManager;
+        let n: u64 = 7717;
+        let dir = std::env::temp_dir();
+        let db = dir.join(format!("ferro-crash-{}-{}.db", std::process::id(), n));
+        let ckpt = dir.join(format!("ferro-crash-{}-{}.ckpt", std::process::id(), n));
+        let brs = dir.join(format!("ferro-crash-{}-{}.branches", std::process::id(), n));
+        for f in [&db, &ckpt, &brs] { let _ = std::fs::remove_file(f); }
+        let open = || OpenOptions::new().create(true).read(true).write(true).open(&db).unwrap();
+
+        // --- session 1: allocate, exit cleanly, checkpoint ---
+        let base = {
+            let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+            let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
+            for _ in 0..8 { pool.disk_manager.allocate().unwrap(); }
+            let base = pool.disk_manager.high_water().unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap();
+            store.checkpoint_to(ckpt.clone());
+            let a = store.arena_for(BranchId::TRUNK).unwrap();
+            store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
+            store.checkpoint(&ckpt).unwrap();
+            base
+        };
+
+        // --- session 2: allocate a page, record it as trunk's root, then CRASH ---
+        let live_root = {
+            let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+            let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
+            let store =
+                ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+            let a = store.arena_for(BranchId::TRUNK).unwrap();
+            let p = store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
+            // `set_root` appends to the branch log, so this survives the crash. `checkpoint` is
+            // deliberately NOT called: that is what being killed looks like.
+            cat.set_root(BranchId::TRUNK, p).unwrap();
+            p
+        };
+
+        // --- session 3: reopen from the now-stale checkpoint ---
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+        let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
+        let store = ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+        assert_eq!(store.base_page(), base, "fixture: the region moved between opens");
+        assert_eq!(
+            cat.get(BranchId::TRUNK).unwrap().root_page_id,
+            live_root,
+            "fixture: the branch catalog did not survive the crash, so nothing references the \
+             page and this test cannot detect a collision"
+        );
+
+        let a = store.arena_for(BranchId::TRUNK).unwrap();
+        let mut handed = Vec::new();
+        for _ in 0..4 {
+            handed.push(store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap());
+        }
+        for f in [&db, &ckpt, &brs] { let _ = std::fs::remove_file(f); }
+
+        assert!(
+            !handed.contains(&live_root),
+            "after a crash the arena re-issued page {live_root}, which the branch catalog still \
+             names as trunk's root (handed out {handed:?}). The next write to it silently \
+             overwrites the trunk tree."
+        );
     }
 
     // Grafting one region's free-space map onto another store would make every page id in the
