@@ -164,6 +164,19 @@ impl Page {
     }
 
     pub fn restore_at(&mut self, slot_num: usize, data: &[u8]) -> Result<(), FerroError> {
+        // Refuse rather than index out of bounds. Redo reaches here with a slot number that came
+        // off the wire or out of a log, and a replica applying a WAL from a position it has no
+        // base image for will legitimately ask for a slot this page has never had — that PANICKED
+        // (`index out of bounds: the len is 0 but the index is 75`) instead of reporting that the
+        // page and the record disagree.
+        if slot_num >= self.slot_arr.len() {
+            return Err(FerroError::Wal(format!(
+                "slot {slot_num} is past this page's {} slot(s); the page does not match the \
+                 record being applied, which usually means replay started without a base image \
+                 of the page",
+                self.slot_arr.len()
+            )));
+        }
         self.tuples.splice(0..0, data.iter().copied());
         self.slot_arr[slot_num].offset = PAGE_SIZE as u16 - self.tuples.len() as u16;
         self.slot_arr[slot_num].length = data.len() as u16;

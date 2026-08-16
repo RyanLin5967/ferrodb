@@ -12,8 +12,55 @@
 //! rather than rounded up.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+
+/// Refuse to run against a stale example binary.
+///
+/// `cargo test` does NOT rebuild examples — confirmed by mtime — so a test that spawns one can
+/// silently exercise a build from before the change under test. That is not a hypothetical: the
+/// first fire-check of this file passed while the injected defect was live, because the replica
+/// binary predated it.
+///
+/// A test that cannot observe the code it claims to test is worse than no test, so this refuses
+/// with an instruction instead of passing.
+fn assert_example_is_fresh(bin: &Path) {
+    let bin_time = std::fs::metadata(bin)
+        .unwrap_or_else(|e| panic!("{} is missing ({e}); run: cargo build --examples", bin.display()))
+        .modified()
+        .expect("mtime");
+    let newest_src = walk_newest(Path::new("src"));
+    if let Some(src_time) = newest_src {
+        assert!(
+            bin_time >= src_time,
+            "{} is older than src/ — cargo test does not rebuild examples, so this would test a \
+             stale binary. Run: cargo build --examples",
+            bin.display()
+        );
+    }
+}
+
+fn walk_newest(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        let t = if p.is_dir() {
+            walk_newest(&p)
+        } else {
+            std::fs::metadata(&p).ok().and_then(|m| m.modified().ok())
+        };
+        if let Some(t) = t {
+            newest = Some(match newest {
+                None => t,
+                Some(cur) if t > cur => t,
+                Some(cur) => cur,
+            });
+        }
+    }
+    newest
+}
 
 fn example_bin(name: &str) -> PathBuf {
     let mut p = std::env::current_exe().expect("test exe");
@@ -21,7 +68,9 @@ fn example_bin(name: &str) -> PathBuf {
     if p.ends_with("deps") {
         p.pop();
     }
-    p.join("examples").join(name)
+    let out = p.join("examples").join(name);
+    assert_example_is_fresh(&out);
+    out
 }
 
 struct Server {
