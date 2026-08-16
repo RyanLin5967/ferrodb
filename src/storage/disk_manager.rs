@@ -159,7 +159,18 @@ impl DiskManager{
             global_offset += BITS_PER_BITMAP;
         }
         let from_bitmap = highest.map(|h| h + 1).unwrap_or(0);
-        Ok(from_bitmap.max(self.next_page_id.load(Ordering::SeqCst)))
+        // Third bound, and it is not redundant: a page can exist without any bitmap bit. The
+        // arena store writes its pages directly and never sets a bit, and any legacy `write()`
+        // that bypassed `allocate` does the same. The bitmap cannot see those; the file length
+        // can. Over-reporting costs address space, which is free. Under-reporting hands a second
+        // allocator a page that already holds data.
+        let file_pages = match self.file.metadata() {
+            Ok(m) => (m.len() / PAGE_SIZE as u64) as u32,
+            Err(e) => return Err(FerroError::Io(e.to_string())),
+        };
+        Ok(from_bitmap
+            .max(file_pages)
+            .max(self.next_page_id.load(Ordering::SeqCst)))
     }
 
     /// Reserve `[base, infinity)` for another allocator, so this one stops there.
