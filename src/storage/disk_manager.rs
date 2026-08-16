@@ -8,7 +8,18 @@ const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
     pub file: File,
-    bitmap_lock: Mutex<()>
+    bitmap_lock: Mutex<()>,
+    /// First page of a region this allocator must never touch, or `u32::MAX` when there is none.
+    ///
+    /// `branch::arena::ArenaPageStore` hands out pages from extents it tracks itself and never
+    /// sets their bitmap bits, so without this floor the bitmap scan below sees that whole region
+    /// as free and hands the same pages out a second time. The bits are zero from page 0, so this
+    /// is not a hazard that needs the file to grow into the region first: on a fresh database the
+    /// very first `allocate()` collides with the very first arena page. Two writers then share a
+    /// page and each silently overwrites the other.
+    ///
+    /// Documented exclusivity is not exclusivity. This is the enforcement.
+    arena_floor: AtomicU32,
 }
 
 impl DiskManager{
@@ -41,7 +52,8 @@ impl DiskManager{
         Ok(DiskManager {
             next_page_id: AtomicU32::new(next_page_id),
             file,
-            bitmap_lock: Mutex::new(())
+            bitmap_lock: Mutex::new(()),
+            arena_floor: AtomicU32::new(u32::MAX),
         })
     }
     
@@ -86,6 +98,14 @@ impl DiskManager{
     // sets a page as free/unused
     pub fn deallocate(&self, page_id: u32) -> Result<(), FerroError>{
         let _guard = self.bitmap_lock.lock().unwrap();
+        // An arena page has no bit here. Clearing the bit at that index would free an unrelated
+        // page belonging to this allocator.
+        if page_id >= self.arena_floor.load(Ordering::SeqCst) {
+            return Err(FerroError::Io(format!(
+                "page {} is inside the reserved arena region and is not this allocator's to free",
+                page_id
+            )));
+        }
         let mut current_bitmap_id = 0;
         let mut jumps_needed = page_id/BITS_PER_BITMAP;
         let mut page_bitmap = self.read(current_bitmap_id)?;
@@ -111,9 +131,36 @@ impl DiskManager{
         Ok(())
     }
 
+    /// Reserve `[base, infinity)` for another allocator, so this one stops there.
+    ///
+    /// Called by `ArenaPageStore::new`, which has already checked that `base` is at or above the
+    /// high-water mark. Registering a second, lower floor is refused rather than accepted: the
+    /// pages between the two are already inside the first store's extents, and lowering the floor
+    /// would put them back in circulation.
+    pub fn reserve_from(&self, base: u32) -> Result<(), FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        let current = self.arena_floor.load(Ordering::SeqCst);
+        if current != u32::MAX && base < current {
+            return Err(FerroError::Io(format!(
+                "page region [{}, inf) is already reserved; cannot lower the floor to {}",
+                current, base
+            )));
+        }
+        if current == u32::MAX {
+            self.arena_floor.store(base, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// First page this allocator must not touch.
+    pub fn arena_floor(&self) -> u32 {
+        self.arena_floor.load(Ordering::SeqCst)
+    }
+
     //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
     pub fn allocate(&self) -> Result<u32, FerroError>{
         let _guard = self.bitmap_lock.lock().unwrap();
+        let floor = self.arena_floor.load(Ordering::SeqCst);
         let mut current_bitmap_id = 0;
         let mut global_offset = 0;
         loop {
@@ -123,10 +170,19 @@ impl DiskManager{
                 if page_bitmap[byte_index] != 0xFF {
                     for bit_index in 0..8 {
                         if page_bitmap[byte_index] & (1<<bit_index) == 0 {
+                            let page_id: usize = (byte_index - 4) * 8 + bit_index;
+                            let candidate = global_offset + page_id as u32;
+                            // Everything at or above the floor belongs to the arena store, whose
+                            // pages are not tracked here. Handing one out would alias it.
+                            if candidate >= floor {
+                                return Err(FerroError::Io(format!(
+                                    "no free page below the reserved arena region at {}",
+                                    floor
+                                )));
+                            }
                             page_bitmap[byte_index] |= 1 << bit_index;
                             self.write(current_bitmap_id, &page_bitmap)?;
-                            let page_id: usize = (byte_index - 4) * 8 + bit_index;
-                            return Ok(global_offset + page_id as u32);
+                            return Ok(candidate);
                         }
                     }
                 }
@@ -137,6 +193,14 @@ impl DiskManager{
                 current_bitmap_id = next_bitmap_id;
                 global_offset += BITS_PER_BITMAP;
                 continue;
+            }
+            // Growing the file would run straight into the arena region, which starts at the
+            // high-water mark. Refuse instead of extending into somebody else's pages.
+            if self.next_page_id.load(Ordering::SeqCst).saturating_add(1) >= floor {
+                return Err(FerroError::Io(format!(
+                    "cannot grow the bitmap past the reserved arena region at {}",
+                    floor
+                )));
             }
             let new_bitmap_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
             let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);

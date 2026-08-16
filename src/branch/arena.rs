@@ -124,6 +124,10 @@ impl ArenaPageStore {
             ))
             .into());
         }
+        // Claim the region from the legacy bitmap allocator. Being above the high-water mark is
+        // not enough on its own: the bitmap's bits are zero from page 0, so without this the very
+        // first `DiskManager::allocate` hands out the very first arena page a second time.
+        pool.disk_manager.reserve_from(base_page)?;
         Ok(ArenaPageStore {
             pool,
             catalog,
