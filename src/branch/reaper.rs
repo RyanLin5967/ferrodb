@@ -585,6 +585,104 @@ mod tests {
         assert_eq!(h.catalog.get(BranchId::TRUNK).unwrap().live_children, Vec::new());
     }
 
+    /// D1: fork and abandon 1000 branches from 8 threads at once.
+    ///
+    /// The module claims concurrency is correct by construction - one Mutex over store state, one
+    /// RwLock over catalog state - but nothing exercised it. "Correct by construction" that has
+    /// never had two threads in it is a claim, not a result.
+    ///
+    /// The sharpest invariant is **epoch uniqueness**, not the branch count. `next_epoch` is
+    /// documented as "strictly monotonic across the whole store", and the reclamation rule is a
+    /// range query over fork epochs: if a race ever handed the same epoch to two branches, the
+    /// interval test `[birth, freed)` would answer for the wrong branch and the reaper would free
+    /// a page another branch can still see. That corruption is silent, so it is asserted directly
+    /// rather than inferred from page counts.
+    #[test]
+    fn a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent() {
+        let (h, reaper) = setup();
+        let baseline_live = h.store.live_page_count().unwrap();
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 125; // 1000 total
+
+        let mut all: Vec<(BranchId, Epoch)> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let catalog = Arc::clone(&h.catalog);
+                let store = Arc::clone(&h.store);
+                handles.push(scope.spawn(move || {
+                    let mut mine = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        let rec = catalog
+                            .fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS))
+                            .expect("fork under contention");
+                        let arena = store.arena_for(rec.branch_id).expect("arena");
+                        let epoch = catalog.next_epoch();
+                        let p = store
+                            .alloc_in_arena(arena, PageType::BTreeLeaf, epoch)
+                            .expect("alloc under contention");
+                        {
+                            let handle = store.read_page(p).expect("read");
+                            let mut frame = handle.write();
+                            frame.data[PAGE_HEADER_SIZE] = 0xD1;
+                            stamp_checksum(&mut frame.data);
+                        }
+                        mine.push((rec.branch_id, rec.fork_epoch));
+                    }
+                    mine
+                }));
+            }
+            for hnd in handles {
+                all.extend(hnd.join().expect("no thread panicked"));
+            }
+        });
+
+        assert_eq!(all.len(), THREADS * PER_THREAD, "not every fork returned");
+
+        let mut ids: Vec<u64> = all.iter().map(|(b, _)| b.id).collect();
+        ids.sort_unstable();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "a branch id was handed out more than once");
+
+        let mut epochs: Vec<u64> = all.iter().map(|(_, e)| e.0).collect();
+        epochs.sort_unstable();
+        let n = epochs.len();
+        epochs.dedup();
+        assert_eq!(
+            epochs.len(), n,
+            "next_epoch handed the same epoch to two branches; the interval rule cannot tell them \
+             apart and would free a page still visible to one"
+        );
+
+        // `reclaimable` binary-searches this array with `partition_point`, which is only defined
+        // on a SORTED slice. `fork` allocates the epoch BEFORE it takes the write lock, so under
+        // contention children genuinely do arrive at the array out of epoch order. What saves it
+        // is that `add_live_child` sorted-inserts rather than pushes. `live_children_stay_sorted`
+        // already pins that insert, so this is not the only guard on it; what this one adds is the
+        // concurrent ARRIVAL ORDER, which no single-threaded test can produce.
+        let trunk_children = h.catalog.get(BranchId::TRUNK).unwrap().live_children;
+        let mut sorted = trunk_children.clone();
+        sorted.sort();
+        assert_eq!(
+            trunk_children, sorted,
+            "live_children is out of order, so reclaimable()'s partition_point is undefined and \
+             can report a page reclaimable while a live child still sees it"
+        );
+
+        let reaped = reaper.reap_expired(far_future()).expect("reap with no cooperation");
+        assert_eq!(reaped.len(), THREADS * PER_THREAD, "not every abandoned branch was reaped");
+
+        reaper.drain_pending().ok();
+        let after = h.store.live_page_count().unwrap();
+        assert_eq!(
+            after, baseline_live,
+            "pages did not return to baseline after 1000 concurrent branches: {} vs {}",
+            after, baseline_live
+        );
+    }
+
     #[test]
     fn reap_is_idempotent_and_a_stale_handle_is_refused() {
         let (h, reaper) = setup();
