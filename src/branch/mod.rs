@@ -16,9 +16,11 @@
 //! 5. **Leases are non-cooperative.** Every branch has a deadline; the reaper does not wait for
 //!    a client to close anything.
 
+pub mod catalog;
 pub mod record;
 pub mod types;
 
+pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub use record::{reclaimable, ArenaExtent, BranchRecord, PendingFree};
 pub use types::{
     ArenaId, BranchError, BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId,
