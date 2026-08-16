@@ -32,7 +32,7 @@ use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
 };
-use crate::agent_sql::paged_rows::PagedRows;
+use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
 use crate::branch::types::{BranchId, CommitHash, LeaseDeadline, PageId};
@@ -128,6 +128,12 @@ struct Workspace {
     /// Apply-sequence of the target at fork time. Anything applied after this is concurrent with
     /// us, which is what makes the three-way comparison well defined.
     fork_seq: u64,
+    /// The branch's root page at fork time.
+    ///
+    /// `set_root` moves the branch's live root on every copy-on-write write, so the fork point is
+    /// gone the moment the branch writes anything. It has to be captured here or the changeset
+    /// has nothing to diff against.
+    fork_root: PageId,
     rows: BTreeMap<(u32, u64), RowState>,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
@@ -456,6 +462,7 @@ impl AgentRuntime {
                 prov,
                 txn,
                 fork_seq,
+                fork_root: record.root_page_id,
                 rows,
                 base_rows,
                 tables,
@@ -507,6 +514,41 @@ impl AgentRuntime {
     }
 
     // ---- reads -----------------------------------------------------------------------------
+
+    /// The branch's changeset, derived from the PAGES rather than from the workspace map.
+    ///
+    /// This is what `DIFF` looks like when shadow paging provides it: compare the branch's current
+    /// root against the root it forked from, and let shared subtrees answer "nothing changed here"
+    /// by page identity instead of by comparison.
+    ///
+    /// It agrees with the map-derived changeset today for a specific reason worth stating, because
+    /// it will stop being true: the branch's tree currently holds exactly the rows the branch
+    /// staged, so the fork-point tree is empty of them and the diff is precisely the delta. Once
+    /// base tables live in the tree as well, the fork root will hold real rows and this same call
+    /// will return the same answer for a better reason — the diff will then be doing the work the
+    /// map is doing now.
+    pub fn page_changeset(&self, branch: BranchId) -> Result<Vec<PageRowChange>, FerroError> {
+        let rows = self.rows()?;
+        let fork_root = {
+            let state = self.state.lock().unwrap();
+            state.workspaces.get(&branch.id).map(|w| w.fork_root)
+        }
+        .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
+        let current = self.root_of(branch)?;
+
+        let diff = rows.tree().diff(fork_root, current)?;
+        let mut out = Vec::with_capacity(diff.deltas.len());
+        for (key, before, after) in diff.deltas {
+            let (table, row) = split_row_key(&key)?;
+            out.push(PageRowChange {
+                table,
+                row,
+                before: before.as_deref().map(decode_row).transpose()?,
+                after: after.as_deref().map(decode_row).transpose()?,
+            });
+        }
+        Ok(out)
+    }
 
     /// Every row of `table` as `branch` sees it: the shared table overlaid with that branch's
     /// uncommitted buffer.

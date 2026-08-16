@@ -24,6 +24,7 @@ use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
 use ferrodb::cow::PageStore;
 use ferrodb::error::FerroError;
+use ferrodb::agent_sql::runtime::ExecCtx;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -263,5 +264,120 @@ fn staging_allocates_pages_and_an_untouched_branch_allocates_none() {
     assert!(
         after > before_idle,
         "staging a row allocated no pages ({before_idle} -> {after}), so nothing was mirrored"
+    );
+}
+
+/// S2b-3c-i: the changeset derived from the PAGES agrees with the one derived from the map.
+///
+/// This is the step that has to hold before the map can go away: if the two disagree, moving `DIFF`
+/// onto the page diff would silently change what a merge does.
+#[test]
+fn the_page_derived_changeset_agrees_with_the_map_derived_one() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_a';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+
+    db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = 22 WHERE id = 2;", &mut a);
+
+    let from_map = {
+        let bp = db.bp.clone();
+        let txn = db.txn.clone();
+        let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+        db.runtime.diff(&mut ctx, branch).unwrap()
+    };
+    let from_pages = db.runtime.page_changeset(branch).unwrap();
+
+    // Same rows, and the same resulting image for each.
+    let mut map_rows: Vec<(u32, u64, Option<Vec<Value>>)> =
+        from_map.rows.iter().map(|r| (r.tbl.0, r.row.0, r.after.clone())).collect();
+    let mut page_rows: Vec<(u32, u64, Option<Vec<Value>>)> =
+        from_pages.iter().map(|c| (c.table, c.row, c.after.clone())).collect();
+    map_rows.sort();
+    page_rows.sort();
+    assert_eq!(
+        page_rows, map_rows,
+        "the page-derived changeset and the map-derived one disagree about what the branch changed"
+    );
+    assert_eq!(page_rows.len(), 2, "expected exactly the two staged rows");
+}
+
+/// The one place the two representations genuinely differ, pinned rather than glossed over.
+///
+/// `RowChange::before` is the fork-point image and comes from the heap, so it carries the row's
+/// old value. The page diff's `before` is `None`, because base rows are not in the tree yet — the
+/// branch's tree starts empty and holds only what was staged. This is the gap S2b-3c-ii is about,
+/// and it is asserted here so that when base rows do move into the tree this test fails and forces
+/// the claim to be restated rather than quietly becoming true.
+#[test]
+fn the_page_diff_has_no_fork_point_image_yet_because_base_rows_are_not_on_the_tree() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_a';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+    db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut a);
+
+    let from_map = {
+        let bp = db.bp.clone();
+        let txn = db.txn.clone();
+        let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+        db.runtime.diff(&mut ctx, branch).unwrap()
+    };
+    let from_pages = db.runtime.page_changeset(branch).unwrap();
+
+    assert_eq!(
+        from_map.rows[0].before,
+        Some(vec![Value::Integer(1), Value::Integer(100)]),
+        "the map-derived changeset should carry the heap's fork-point image"
+    );
+    assert_eq!(
+        from_pages[0].before, None,
+        "the page diff reported a fork-point image; if base rows now live on the tree, this test \
+         has done its job and the S2b-3c-ii claim needs restating"
+    );
+}
+
+/// A session that staged nothing has an empty changeset, and the diff proves it without reading
+/// a page: the branch's root is still the root it forked from.
+#[test]
+fn an_untouched_session_has_an_empty_page_changeset() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_a';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+
+    assert!(
+        db.runtime.page_changeset(branch).unwrap().is_empty(),
+        "a session that wrote nothing reported changes"
+    );
+}
+
+#[test]
+fn a_staged_delete_appears_in_the_page_changeset_as_a_removal() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_a';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+
+    db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut a);
+    db.ok("DELETE FROM inventory WHERE id = 1;", &mut a);
+
+    // Staged then deleted within one session: the tree ends where it started for that row, so the
+    // page diff correctly reports nothing for it rather than inventing a delete of a row the tree
+    // never held.
+    let changes = db.runtime.page_changeset(branch).unwrap();
+    assert!(
+        changes.iter().all(|c| c.row != rid(1)),
+        "row 1 was staged and then deleted in one session; the tree returned to its fork state, so \
+         the page diff must report no change for it, got {changes:?}"
     );
 }

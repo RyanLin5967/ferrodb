@@ -152,6 +152,17 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>, FerroError> {
     Ok(out)
 }
 
+/// One row's change between two roots, decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageRowChange {
+    pub table: u32,
+    pub row: u64,
+    /// `None` means the row did not exist at the fork point.
+    pub before: Option<Vec<Value>>,
+    /// `None` means the row was deleted on the branch.
+    pub after: Option<Vec<Value>>,
+}
+
 /// Rows on copy-on-write pages, one tree per branch root.
 ///
 /// Every mutating call returns the branch's **new root page id**, because a copy-on-write write
