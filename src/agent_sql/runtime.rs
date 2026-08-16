@@ -177,7 +177,6 @@ struct State {
     workspaces: BTreeMap<u64, Workspace>,
     names: BTreeMap<String, BranchId>,
     runs: BTreeMap<u32, RunEntity>,
-    next_prov: u32,
     next_txn: u64,
     next_merge: u64,
     apply_seq: u64,
