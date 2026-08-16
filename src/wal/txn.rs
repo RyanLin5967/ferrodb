@@ -75,6 +75,25 @@ impl Snapshot {
     pub fn includes(&self, txn_id: u64) -> bool {
         txn_id < self.high_water && !self.active.contains(&txn_id)
     }
+
+    /// Whether a **change-feed event** attributed to `txn_id` was already delivered by this
+    /// snapshot, and therefore must not be delivered again by the stream.
+    ///
+    /// This differs from [`Snapshot::includes`] in exactly one case, and that case is the reason it
+    /// exists rather than callers being trusted to remember it. **Id 0 is not a transaction.** DDL
+    /// is logged under it and `begin` never hands it out, but the arithmetic in `includes` is about
+    /// timestamps and answers "yes, contained" for 0 — it is below every high water mark and in no
+    /// active set. A stream that asked `includes` would suppress every schema declaration and leave
+    /// a consumer without the shape of any table created after the cutover.
+    ///
+    /// The two questions are not the same question with a special case bolted on. `includes` asks
+    /// about a *version timestamp*, where 0 is a legitimate value meaning "not written by any
+    /// transaction this snapshot has to reason about", and MVCC visibility depends on it staying
+    /// that way. This asks about an *event's author*, where 0 means there is no author to compare.
+    /// Sharing the arithmetic is right; sharing the answer for 0 is not.
+    pub fn already_delivered(&self, txn_id: u64) -> bool {
+        txn_id != 0 && self.includes(txn_id)
+    }
 }
 
 /// A snapshot taken so a change-feed consumer can cut over to the live stream.
@@ -760,6 +779,39 @@ use super::*;
         );
         let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
         assert!(rows.is_empty(), "the reader's write survived its rollback");
+    }
+
+    /// **Transaction id 0 is never handed out, and something now depends on that.**
+    ///
+    /// The change feed treats id 0 as "not attributed to a transaction" — DDL is logged under it —
+    /// and the snapshot-to-stream filter exempts those events, because a snapshot's transaction set
+    /// says nothing about a schema declaration. If `begin` ever returned 0, that exemption would
+    /// silently start applying to a real transaction's rows and re-deliver them after a cutover.
+    /// The invariant comes from the WAL header's initial `next_txn_id` of 1, which is a long way
+    /// from here, so it is asserted here rather than assumed.
+    #[test]
+    fn transaction_ids_never_start_at_zero() {
+        let (_bp, _wal, txn, _dir) = setup();
+        let first = txn.begin().unwrap();
+        assert_ne!(first, 0, "the first transaction was given the id the feed reserves for DDL");
+        txn.commit(first).unwrap();
+
+        let handoff = txn.begin_snapshot_read().unwrap();
+        assert_ne!(handoff.txn_id, 0);
+
+        // The raw rule genuinely does say "contained" for 0 — it is arithmetic over timestamps, and
+        // MVCC visibility needs it to keep saying that. The cutover asks a different question.
+        assert!(handoff.snapshot.includes(0));
+        assert!(
+            !handoff.snapshot.already_delivered(0),
+            "an event with no transaction author was treated as already delivered by the snapshot; \
+             a stream would suppress every schema declaration"
+        );
+        assert!(
+            handoff.snapshot.already_delivered(first),
+            "a transaction that committed before the snapshot was not treated as delivered by it"
+        );
+        txn.end_read_only(handoff.txn_id).unwrap();
     }
 
     /// **The high water mark is exclusive, and nothing in the matrix below pins that.**

@@ -204,9 +204,11 @@ impl FeedStreamer {
             None => 0,
             Some(already) => {
                 let before = events.len();
-                // Transaction id 0 means "not attributed to a transaction" — DDL, which the
-                // snapshot boundary says nothing about. `begin` starts handing out ids at 1.
-                events.retain(|e| e.txn_id == 0 || !already.includes(e.txn_id));
+                // `already_delivered`, not `includes`: the difference is events logged under
+                // transaction id 0 (DDL), which `includes` reports as contained because 0 is below
+                // every high water mark. The exemption lives in that method rather than here so a
+                // second consumer of the boundary cannot omit it.
+                events.retain(|e| !already.already_delivered(e.txn_id));
                 before - events.len()
             }
         };
