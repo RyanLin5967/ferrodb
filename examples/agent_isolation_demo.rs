@@ -40,13 +40,18 @@ use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
 use ferrodb::cow::{stamp_checksum, CowPageLinks, CowTree, PageStore, PageType, PAGE_HEADER_SIZE};
 use ferrodb::error::FerroError;
-use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::executor::{run, Executor, Outcome};
+use ferrodb::optimizer::optimizer::lower;
+use ferrodb::planner::physical_plan::PhysicalPlan;
+use ferrodb::provenance::{ProvId, ProvenanceStore};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::tel::ids::{ColId, RowId};
 use ferrodb::tel::merge::{MergeOutcome, MergePolicy};
+use ferrodb::wal::txn::ReadView;
 
 // =================================================================================================
 // transcript plumbing
@@ -560,6 +565,26 @@ impl Db {
         self.ok("INSERT INTO inventory VALUES (2, 5);", &mut s);
     }
 
+    /// The physical slot currently holding the row with this id, so the STORAGE-level
+    /// attribution can be asked about a real version rather than a runtime-side row key.
+    fn rid_of(&self, table: &str, id: i32) -> Option<RecordId> {
+        let view = Arc::new(ReadView { snapshot: self.txn.read_snapshot(), txn_id: 0 });
+        let mut exec: Box<dyn Executor> = lower(
+            PhysicalPlan::SeqScan { table: table.into() },
+            &self.catalog,
+            self.bp.clone(),
+            view,
+        )
+        .ok()?;
+        while let Some(row) = exec.next() {
+            let (rid, values) = row.ok()?;
+            if values[0] == Value::Integer(id) {
+                return Some(rid);
+            }
+        }
+        None
+    }
+
     fn qty(&mut self, id: i32) -> i32 {
         let mut s = self.session();
         let sql = format!("SELECT qty FROM inventory WHERE id = {};", id);
@@ -939,6 +964,12 @@ fn criterion_9_provenance(led: &mut Ledger) {
     let mut db = Db::new();
     db.seed();
 
+    // A row written with NO agent session open, so the "unattributed" check below has a real
+    // version to be about. Asking about a row that does not exist would satisfy the same check
+    // while proving nothing — the seed has only rows 1 and 2.
+    let mut plain = db.session();
+    db.ok("INSERT INTO inventory VALUES (3, 77);", &mut plain);
+
     let (mut a, mut b) = (db.session(), db.session());
     db.ok(
         "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus-5/2026-05';",
@@ -981,18 +1012,68 @@ fn criterion_9_provenance(led: &mut Ledger) {
     led.check(9, "row 2 is attributed to a different agent, run and model", r2_ok);
     led.check(9, "an unwritten row reports no author rather than guessing", unknown.is_none());
 
+    // The above is the runtime's own bookkeeping. This is the storage level: take the RecordId of
+    // the version the merge actually published and ask who wrote THAT. Until the publish path
+    // carried the run down to the executor, this answered `NONE` for every row.
+    println!("\n    same question, asked of the stored version rather than the runtime:");
+    let store = db.runtime.provenance();
+    let rid1 = db.rid_of("inventory", 1);
+    let rid2 = db.rid_of("inventory", 2);
+    let stored1 = rid1.and_then(|r| store.attribute(r).ok());
+    let stored2 = rid2.and_then(|r| store.attribute(r).ok());
+    let named = |p: Option<ProvId>| -> String {
+        match p {
+            Some(id) if id != ProvId::NONE => match store.lookup(id) {
+                Ok(run) => run.describe(),
+                Err(e) => format!("<{e}>"),
+            },
+            Some(_) => "unattributed".into(),
+            None => "<no such row>".into(),
+        }
+    };
+    println!("      RecordId of inventory row 1 -> {}", named(stored1));
+    println!("      RecordId of inventory row 2 -> {}", named(stored2));
+
+    let stored1_ok = stored1
+        .and_then(|id| store.lookup(id).ok())
+        .map(|r| r.agent_id == "restock-agent" && r.run_id == "run-42")
+        == Some(true);
+    let stored2_ok = stored2
+        .and_then(|id| store.lookup(id).ok())
+        .map(|r| r.agent_id == "audit-agent")
+        == Some(true);
+    led.check(9, "the STORED version of row 1 names restock-agent/run-42", stored1_ok);
+    led.check(9, "the STORED version of row 2 names the other agent", stored2_ok);
+
+    // A write nobody made as an agent must stay unattributed rather than be swept into the
+    // nearest run — abstaining is the correct answer, not a missing feature.
+    let untouched_rid = db.rid_of("inventory", 3);
+    let untouched = untouched_rid.and_then(|r| store.attribute(r).ok());
+    // Strict: the row must EXIST and be unattributed. Accepting "no such row" here would let the
+    // check pass by asking about nothing, which is how a vacuous guard reads as a pass.
+    let untouched_ok = untouched_rid.is_some() && untouched == Some(ProvId::NONE);
+    println!("      a row no agent wrote -> {}", named(untouched));
+    led.check(9, "a row no agent wrote stays unattributed rather than guessing", untouched_ok);
+
     note("attribution is interned once per RUN, not copied per row — the actor tuple has");
     note("run-level cardinality, so storing it literally per version costs ~3.4x for nothing.");
 
+    let runtime_ok = r1_ok && r2_ok && unknown.is_none();
+    let storage_ok = stored1_ok && stored2_ok && untouched_ok;
     led.record(
         9,
         "Provenance: which agent + run + model wrote a given row",
-        if r1_ok && r2_ok && unknown.is_none() { Verdict::Partial } else { Verdict::NotMet },
-        "PARTIAL, and the boundary matters: attribution is recorded by the agent runtime when a \
-merge publishes a row, NOT by the storage write path. `src/execution` contains zero provenance \
-references, so an ordinary non-agent INSERT or UPDATE is never attributed. The storage-level \
-per-RecordId path (MemProvenanceStore::who_wrote) is real and tested in tests/provenance_e2e.rs, \
-but nothing calls it from the executor.",
+        if runtime_ok && storage_ok { Verdict::Met } else if runtime_ok { Verdict::Partial } else { Verdict::NotMet },
+        "MET at both levels. The agent runtime answers for a row key, and the STORAGE path now \
+answers for a RecordId: the merge publish path carries the authoring run down to \
+`Modify::set_author`, so Insert/Update/Delete stamp the version they write. This was PARTIAL \
+while `src/execution` held zero provenance references and the per-RecordId path, though real and \
+tested, was called by nothing. BOUNDARY, unchanged and deliberate: a write made outside any agent \
+session is left unattributed (`ProvId::NONE`), and a REVERT is not attributed to the agent whose \
+work it undoes — abstaining is the correct answer there, and it is checked above rather than \
+assumed. Second boundary: one run cannot be re-interned, because `RunEntity::same_actor` compares \
+`started_at`; the run-level guarantee therefore holds by refusing a duplicate session, not by \
+reusing its id.",
     );
 }
 

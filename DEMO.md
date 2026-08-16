@@ -23,10 +23,10 @@ It exits `0` when every self-check passes and `1` otherwise, printing
 | 6 | Two branches doing `qty -= n` compose arithmetically | **MET** |
 | 7 | Guard violation rejected, violated predicate handed back | **MET** |
 | 8 | **THE THESIS** — abandoned branches reaped on lease expiry, pages return to baseline | **MET** |
-| 9 | Provenance: which agent + run + model wrote a given row | **PARTIAL** |
+| 9 | Provenance: which agent + run + model wrote a given row | **MET** |
 | 10 | `REVERT ... CASCADE` finds a downstream dependent via read-sets | **MET** |
 
-**9 MET, 1 PARTIAL, 0 NOT MET.** Every verdict is computed from a check inside the demo, not
+**10 MET, 0 PARTIAL, 0 NOT MET.** Every verdict is computed from a check inside the demo, not
 written into it. Read "What this does not do yet" before quoting any of them.
 
 ---
@@ -222,15 +222,27 @@ Listed because each one bounds a verdict above.
    through the `BranchCatalog` trait only; it does not invoke `TwoTierReaper`. Since Act II holds no
    pages, there is nothing to free — but the two halves of abandonment are not connected either.
 
-### Criterion 9 is PARTIAL, and this is why
+### Criterion 9 was PARTIAL; what closed it, and what still bounds it
 
-7. **The executor does no provenance stamping at all.** `grep -rn 'provenance' src/execution/`
-   returns **zero matches**. Attribution is recorded by the agent runtime when a `MERGE` publishes a
-   row, not by the storage write path. An ordinary non-agent `INSERT`/`UPDATE` is never attributed.
-8. **Two provenance paths exist and are not connected.** The storage-level, per-`RecordId` path
-   (`MemProvenanceStore::who_wrote`, interned `RunEntity`, page-local dictionary) is real and tested
-   in `tests/provenance_e2e.rs` — but nothing calls it from the executor, so the test stamps writes
-   itself. The path the demo exercises is the agent runtime's, keyed by row id.
+7. **The executor now stamps.** It previously did not: `grep -rn 'provenance' src/execution/`
+   returned zero matches, so a row a `MERGE` published — a real tuple at a real `RecordId` — could
+   not be attributed at all. The publish path now carries the authoring run down to
+   `Modify::set_author`, and `Insert`/`Update`/`Delete` stamp the version they write. The demo asks
+   the question **both** ways: of the runtime, keyed by row id, and of the stored version, keyed by
+   `RecordId`. Removing the wiring drops the demo's own verdict back to `PARTIAL`, so the `MET` is
+   computed rather than asserted.
+8. **Two things stay deliberately unattributed, and both are checked.** A write made outside any
+   agent session reads back as `ProvId::NONE`, and a `REVERT` is not attributed to the agent whose
+   work it undoes — a revert is not that agent's write. Abstaining is the correct answer in both
+   cases; a provenance system that over-claims is worse than one that admits it does not know. The
+   demo asserts the unattributed case against a row that **exists** (it inserts one with no agent
+   open), because asking about a missing row would satisfy the same check while proving nothing.
+8b. **A run cannot be re-interned, so the run-level guarantee holds by refusal.**
+   `RunEntity::same_actor` compares `started_at`, and two sessions for one run necessarily start at
+   different instants — so a second `BEGIN AGENT SESSION` for the same `(agent, run)` is rejected
+   rather than reusing the id. One run is therefore never split across two entities, but by the
+   session failing loudly, not by the store returning the existing id as its trait doc describes.
+   Relaxing `same_actor` would silently convert that refusal into a second entity for one run.
 9. **Row identity is derived from the primary key.** `agent_sql::runtime::row_id_of` hashes the
    first column because no layer mints surrogate row ids yet. `DESIGN.md` is explicit that the PK is
    a *constraint*, not identity, so **updating a primary key would currently look like a delete plus
