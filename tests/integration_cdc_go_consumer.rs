@@ -116,20 +116,68 @@ fn start(rows: u32) -> Server {
     Server { child, addr, _dir: dir }
 }
 
-/// Run the Go consumer against `addr` until the server closes. Returns the `TABLE ...` line.
-fn materialise(addr: &str) -> String {
+/// Run the Go consumer once, returning its output and exit status.
+fn run_consumer(addr: &str) -> (bool, String, String) {
     let out = Command::new(go_bin())
         // `cdc-consumer` has its own go.mod and the repo root is not a Go module.
         .current_dir("cdc-consumer")
         .args(["run", ".", "follow", addr, "-key", "id"])
         .output()
         .expect("failed to run the Go CDC consumer");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(
+    (
         out.status.success(),
-        "the Go consumer failed (exit {:?}):\nstderr: {}\nstdout: {stdout}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Run the Go consumer against the server until it closes. Returns the `TABLE ...` line.
+///
+/// # Why this retries exactly once, and what it refuses to retry
+///
+/// On 2026-08-16 this failed on windows-latest alone with `dial tcp 127.0.0.1:65402: connectex: No
+/// connection could be made because the target machine actively refused it`, and passed on a re-run
+/// — eight consecutive green runs on either side of it. `start` already waits for the server to
+/// print `LISTENING`, so the port is bound before the consumer is spawned, and `go run` compiles
+/// before it dials, which makes the gap between the two large and variable on that runner.
+///
+/// A connect failure has two very different causes and they must not be conflated:
+///
+/// - **the server is gone** — it died between binding and being dialled. Retrying is wrong: the
+///   next attempt fails the same way and the test spends twice as long saying so, and if it somehow
+///   passed it would be hiding a crash. So this case is failed IMMEDIATELY, and the panic reports
+///   the exit status, which is the fact the next occurrence needs and the original failure did not
+///   record.
+/// - **the server is alive and listening** — a transient dial failure. That is the case worth one
+///   more attempt, and the retry is announced on stderr so a green run still leaves a trace that it
+///   was needed rather than swallowing it.
+fn materialise(server: &mut Server) -> String {
+    let addr = server.addr.clone();
+    let (mut ok, mut stdout, mut stderr) = run_consumer(&addr);
+
+    if !ok {
+        // Ask the one question the original failure could not answer.
+        let status = server.child.try_wait().expect("query the server process");
+        assert!(
+            status.is_none(),
+            "the Go consumer could not reach the server, and the server had already exited \
+             ({status:?}). This is not a dial race — the server died between printing LISTENING \
+             and being connected to, and retrying would only hide it.\nstderr: {stderr}"
+        );
+        eprintln!(
+            "NOTE: the Go consumer failed to reach a server that is still alive; retrying once. \
+             This is the windows-latest dial race. stderr was: {stderr}"
+        );
+        let again = run_consumer(&addr);
+        ok = again.0;
+        stdout = again.1;
+        stderr = again.2;
+    }
+
+    let stdout = stdout;
+    assert!(
+        ok,
+        "the Go consumer failed twice against a live server:\nstderr: {stderr}\nstdout: {stdout}"
     );
     stdout
         .lines()
@@ -149,8 +197,8 @@ fn expected_row(i: u32) -> String {
 #[test]
 fn a_go_consumer_rebuilds_the_source_table_from_the_feed_alone() {
     const ROWS: u32 = 12;
-    let server = start(ROWS);
-    let table = materialise(&server.addr);
+    let mut server = start(ROWS);
+    let table = materialise(&mut server);
 
     assert!(table.starts_with('['), "the consumer did not print a JSON array: {table}");
     for i in 1..=ROWS {
@@ -174,8 +222,8 @@ fn a_go_consumer_rebuilds_the_source_table_from_the_feed_alone() {
 #[test]
 fn an_updated_row_shows_its_latest_value_only() {
     const ROWS: u32 = 10;
-    let server = start(ROWS);
-    let table = materialise(&server.addr);
+    let mut server = start(ROWS);
+    let table = materialise(&mut server);
 
     // id 5 and id 10 were updated to i*100.
     for i in [5u32, 10] {
@@ -189,4 +237,33 @@ fn an_updated_row_shows_its_latest_value_only() {
             "id {i} still shows its pre-update value, so the update did not overwrite: {table}"
         );
     }
+}
+
+/// **The retry above must not be able to hide a dead server.** Forces the branch that distinguishes
+/// the two causes: kill the server, then ask the consumer to reach it. The failure must name the
+/// exit status rather than spending a second `go run` to arrive at the same place.
+///
+/// Without this, the retry is the kind of accommodation that turns a real crash into a slow, silent
+/// one — and the reason the retry exists at all is a failure nobody could diagnose, so the guard
+/// that keeps it honest is the part worth pinning.
+#[test]
+fn a_dead_server_is_reported_as_dead_rather_than_retried() {
+    let mut server = start(4);
+    server.child.kill().expect("kill the server");
+    server.child.wait().expect("reap the server");
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        materialise(&mut server)
+    }));
+    let err = panicked.expect_err("a consumer reached a server that had been killed");
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("had already exited"),
+        "the failure did not identify a dead server, so the next occurrence is as undiagnosable \
+         as the one that prompted this: {msg}"
+    );
 }
