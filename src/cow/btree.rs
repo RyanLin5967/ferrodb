@@ -487,3 +487,40 @@ impl CowTree {
         Ok(child_new)
     }
 }
+
+/// The CoW B+tree's page layout, described to the branch reaper.
+///
+/// `TwoTierReaper::collapse` materialises a branch's visible state by deep-copying every page
+/// reachable from its root before re-parenting it to trunk. It cannot know this module's node
+/// format, so it takes a [`crate::branch::PageLinks`] walker; without one it refuses to collapse
+/// rather than re-parent a branch onto ancestor-owned pages that the interval rule would then be
+/// free to reclaim. This is that walker.
+///
+/// Only `BTreeInternal` pages have children. A leaf returns an empty vector — this tree chains no
+/// sibling pointers, so a leaf's `leftmost` field is unused and must not be reported as a link, or
+/// collapse would follow a zero page id.
+pub struct CowPageLinks;
+
+impl crate::branch::PageLinks for CowPageLinks {
+    fn child_pages(&self, page_type: PageType, page: &[u8; crate::storage::disk_manager::PAGE_SIZE]) -> Vec<PageId> {
+        match page_type {
+            PageType::BTreeInternal => Node::new(page).all_children().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn rewrite_child(&self, page: &mut [u8; crate::storage::disk_manager::PAGE_SIZE], old: PageId, new: PageId) {
+        let count = Node::new(page).count();
+        let mut n = NodeMut::new(page);
+        if n.leftmost() == old {
+            n.set_leftmost(new);
+        }
+        for i in 0..count {
+            // `child` errors on a leaf cell; a leaf never reaches here because `child_pages`
+            // reported no links for it, so there is nothing to rewrite.
+            if n.view().child(i).ok() == Some(old) {
+                let _ = n.set_child(i, new);
+            }
+        }
+    }
+}

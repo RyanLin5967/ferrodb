@@ -23,7 +23,7 @@ pub mod store;
 #[cfg(test)]
 mod tests_isolation;
 
-pub use btree::CowTree;
+pub use btree::{CowPageLinks, CowTree};
 pub use page_header::{
     flags, stamp_checksum, verify_checksum, PageHeader, PageType, PAGE_HEADER_SIZE,
 };
