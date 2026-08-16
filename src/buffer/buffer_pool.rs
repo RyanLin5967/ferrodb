@@ -248,9 +248,12 @@ mod tests {
     use std::sync::Arc;
 
     /// A pool over a real file, with an arena floor registered so `deallocate` will refuse.
-    fn pool_with_arena_floor() -> (Arc<BufferPoolManager>, u32, std::path::PathBuf) {
+    ///
+    /// `tag` must be unique per test. These run as threads in one binary, so a filename keyed
+    /// only on the pid is shared, and one test's `remove_file`-then-create races another's open.
+    fn pool_with_arena_floor(tag: &str) -> (Arc<BufferPoolManager>, u32, std::path::PathBuf) {
         let path = std::env::temp_dir()
-            .join(format!("ferro-bp-partialfree-{}.db", std::process::id()));
+            .join(format!("ferro-bp-partialfree-{}-{}.db", std::process::id(), tag));
         let _ = std::fs::remove_file(&path);
         let file = OpenOptions::new().create(true).read(true).write(true)
             .open(&path).unwrap();
@@ -272,7 +275,7 @@ mod tests {
     /// page's contents went with it. The error says the free did not happen; the pool disagreed.
     #[test]
     fn a_refused_delete_leaves_the_page_intact_in_the_pool() {
-        let (bp, page, path) = pool_with_arena_floor();
+        let (bp, page, path) = pool_with_arena_floor("delete");
 
         // Dirty the page and do NOT flush: memory is now the only copy of this byte.
         let frame_i = bp.fetch_page(page).unwrap();
@@ -302,7 +305,7 @@ mod tests {
     /// Same contract for `free_page`, which has the same evict-then-ask ordering.
     #[test]
     fn a_refused_free_page_leaves_the_page_intact_in_the_pool() {
-        let (bp, page, path) = pool_with_arena_floor();
+        let (bp, page, path) = pool_with_arena_floor("free");
 
         let frame_i = bp.fetch_page(page).unwrap();
         bp.frames[frame_i].write().unwrap().data[100] = 0xCD;
@@ -330,7 +333,7 @@ mod tests {
     /// the two tests above would pass against a `delete_page` that simply never did anything.
     #[test]
     fn an_accepted_delete_still_evicts_the_page() {
-        let (bp, _refused, path) = pool_with_arena_floor();
+        let (bp, _refused, path) = pool_with_arena_floor("accepted");
         let below = 1u32; // below the floor, so the deallocate is allowed
         bp.fetch_page(below).unwrap();
         bp.unpin_page(below, false);
