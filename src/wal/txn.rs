@@ -244,9 +244,23 @@ impl TxnManager {
             // everything buffered, and `resume_lsn` is at or below the reader's own `Begin`, so
             // this covers it.
             self.wal.flush()?;
-            // Claimed before this returns, so there is no moment at which the resume point is
-            // published and unclaimed. See `SnapshotHandoff::pin` for what leaving this to the
-            // caller cost.
+            // Claimed before this returns, so the resume point is never *published* unclaimed. See
+            // `SnapshotHandoff::pin` for what leaving this to the caller cost.
+            //
+            // **It is not claimed from the moment it exists, and the gap is real rather than
+            // theoretical.** The `Begin` above went in under the `att` lock, which was then
+            // released; the pin is taken here, without it. A concurrent `checkpoint` samples
+            // `att.is_empty()` and *drops that lock before truncating*, so one that found the table
+            // empty a moment before this reader was inserted can truncate in between - and then
+            // this `pin` fails. It is tempting to write that a checkpoint cannot truncate while a
+            // transaction is open; it is not true as written, because the check and the truncation
+            // are not one critical section.
+            //
+            // Which is precisely why the failure below closes the reader instead of returning `?`.
+            // The race is narrow, its outcome is a clean refusal the caller can retry, and the
+            // alternative - holding `att` across a checkpoint's flush, page writes and fsync - buys
+            // atomicity here at the cost of blocking every begin and commit on disk IO. The error
+            // path is the cheaper correct answer; it just has to not leak.
             self.wal.pin(resume_lsn)
         })();
 
@@ -315,14 +329,14 @@ impl TxnManager {
         // reported; what changes is that reporting it no longer wedges the database. See
         // `abandon_reader` for why a reader with no `TxnEnd` record is safe for recovery.
         //
-        // **Latent, not live, and worth saying so rather than implying a fix for a live bug.**
-        // `append_chained` can fail two ways: the entry is missing from `att`, which cannot happen
-        // here because it was just checked and would mean no leak anyway; or `WalManager::append`
-        // returns `Err`, which it never does today - it extends an in-memory buffer and ends in
-        // `Ok(lsn)` unconditionally (`wal::log`). So this ordering cannot currently be observed to
-        // matter, and there is no test that forces it, because nothing can. It goes in because the
-        // day `append` does any IO - a bounded buffer that flushes when full, a direct write - the
-        // failure becomes reachable and its cost is the whole database, not one transaction.
+        // **Not reachable in production today, which is why the test forces it.** `append_chained`
+        // fails two ways: the entry is missing from `att`, which cannot happen here because it was
+        // just checked and would mean no leak anyway; or `WalManager::append` returns `Err`, which
+        // it never does today - it extends an in-memory buffer and ends in `Ok(lsn)`. Rather than
+        // leave the guard unproven, `WalManager::fail_next_append` (test-only) fires it on demand;
+        // see `a_reader_is_not_leaked_when_its_txn_end_cannot_be_written`. The guard earns its
+        // place the day `append` does any IO - a bounded buffer that flushes when full, a direct
+        // write - because then the failure is real and its cost is the whole database.
         let appended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att.lock().unwrap().remove(&txn_id);
         appended?;
@@ -898,6 +912,42 @@ use super::*;
         txn.commit(open).unwrap();
         txn.checkpoint()
             .expect("a failed snapshot left a reader open, so checkpoints are blocked for good");
+    }
+
+    /// **The other half of the same leak: closing the reader fails, and it still has to go.**
+    ///
+    /// `end_read_only` used to append its `TxnEnd` with `?` and only then remove the entry, so a
+    /// failed append returned an error to a caller who had already handed the transaction over.
+    /// Retrying means calling back into a WAL that just refused; not retrying leaves the reader
+    /// active for ever. Either way `checkpoint` refuses from then on and the database never
+    /// truncates its log again.
+    ///
+    /// `WalManager::append` cannot fail on its own — it extends a buffer and returns `Ok` — so this
+    /// drives it through the test-only one-shot lever rather than pretending the path is reachable
+    /// by ordinary means. Without the lever the guard could not be shown to work at all.
+    #[test]
+    fn a_reader_is_not_leaked_when_its_txn_end_cannot_be_written() {
+        let (_bp, wal, txn, _dir) = setup();
+        let handoff = txn.begin_snapshot_read().unwrap();
+        let reader = handoff.txn_id;
+
+        // Arm the failure for exactly the `TxnEnd` this close is about to write.
+        wal.fail_next_append.store(true, Ordering::SeqCst);
+
+        let err = txn.end_read_only(reader).expect_err("a failed TxnEnd was reported as success");
+        assert!(format!("{err}").contains("injected"), "wrong reason: {err}");
+
+        // **The error is reported AND the reader is gone.** Reporting it is not the hard part.
+        assert!(
+            !txn.att.lock().unwrap().contains_key(&reader),
+            "the reader survived a failed close, so every later checkpoint is refused"
+        );
+
+        // The consequence that makes it matter. The handoff still holds a pin at the resume point,
+        // so it is dropped first - otherwise this fails for the unrelated reason that the log is
+        // legitimately claimed, and would pass just as well with the reader leaked.
+        drop(handoff);
+        txn.checkpoint().expect("a leaked reader is blocking every checkpoint");
     }
 
     /// **Transaction id 0 is never handed out, and something now depends on that.**
