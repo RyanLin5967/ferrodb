@@ -12,13 +12,17 @@
 //! Getting that distinction backwards (logging deltas, dropping guards) produces a merge engine
 //! that composes arithmetic correctly and still lets a bounded counter go negative.
 
+pub mod engine;
 pub mod frame;
 pub mod guard;
 pub mod ids;
+pub mod log;
 pub mod merge;
 pub mod op;
 
+pub use engine::{dedup_by_txn, ComposedState, Deduped, Side, ThreeWayMerger};
 pub use frame::{SchemaVer, TxnFrame};
+pub use log::MemEffectLog;
 pub use guard::{ArithOp, CmpOp, Guard, GuardContext, GuardExpr};
 pub use ids::{ColId, Dot, RowId, TableId, TxnId};
 pub use merge::{
