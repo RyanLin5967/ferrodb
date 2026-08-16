@@ -48,18 +48,63 @@ impl GuardContext for RowSnapshot<'_> {
     }
 }
 
+/// Where the target table's columns sit inside the plan's output row.
+///
+/// `BoundExpr::Column(i)` is an offset into the plan's **combined** row — `Scope.columns` in the
+/// binder documents it as "index = offset in combined row" — not an ordinal in the target table's
+/// schema. Those coincide only for a single-table plan. For an `UPDATE`/`DELETE` over a join,
+/// treating them as identical silently renames the guard onto a different column and re-evaluates
+/// a predicate nobody wrote, which is exactly the silent degradation this module refuses to do.
+#[derive(Debug, Clone, Copy)]
+pub struct ColMap {
+    /// Plan offset at which the target table's columns begin.
+    pub base: usize,
+    /// How many columns the target table has.
+    pub count: usize,
+}
+
+impl ColMap {
+    /// The single-table case, where plan offset and schema ordinal do coincide.
+    pub fn single_table(count: usize) -> Self {
+        ColMap { base: 0, count }
+    }
+
+    /// `None` when the offset falls outside the target table — i.e. the guard reads a column of
+    /// some other relation in the plan, which cannot be expressed as `(tbl, row, col)`.
+    pub fn col_of(&self, offset: usize) -> Option<ColId> {
+        if offset < self.base || offset >= self.base + self.count {
+            return None;
+        }
+        Some(ColId((offset - self.base) as u32))
+    }
+}
+
 /// Translate a bound expression into a re-evaluable [`GuardExpr`] over `(tbl, row, col)`.
 ///
 /// Returns `Err` for anything not representable. Callers must propagate that: a write whose guard
 /// could not be captured has to fail at capture time, because by merge time the predicate is
 /// unrecoverable.
-pub fn to_guard_expr(tbl: TableId, row: RowId, e: &BoundExpr) -> Result<GuardExpr, FerroError> {
+pub fn to_guard_expr(
+    tbl: TableId,
+    row: RowId,
+    map: ColMap,
+    e: &BoundExpr,
+) -> Result<GuardExpr, FerroError> {
     Ok(match e {
         BoundExpr::Literal(v) => GuardExpr::Literal(v.clone()),
-        BoundExpr::Column(i) => GuardExpr::col(tbl, row, ColId::from(*i)),
+        BoundExpr::Column(i) => match map.col_of(*i) {
+            Some(col) => GuardExpr::col(tbl, row, col),
+            None => {
+                return Err(FerroError::Merge(format!(
+                    "guard reads plan offset {}, which is outside target table {}'s columns \
+                     [{}, {}); capturing it would rename the predicate onto a different column",
+                    i, tbl, map.base, map.base + map.count
+                )))
+            }
+        },
         BoundExpr::BinaryOp { left, operator, right } => {
-            let l = to_guard_expr(tbl, row, left)?;
-            let r = to_guard_expr(tbl, row, right)?;
+            let l = to_guard_expr(tbl, row, map, left)?;
+            let r = to_guard_expr(tbl, row, map, right)?;
             match operator {
                 TokenType::And => GuardExpr::And(vec![l, r]),
                 TokenType::Or => GuardExpr::Or(vec![l, r]),
@@ -75,7 +120,7 @@ pub fn to_guard_expr(tbl: TableId, row: RowId, e: &BoundExpr) -> Result<GuardExp
             }
         }
         BoundExpr::UnaryOp { operator, right } => {
-            let r = to_guard_expr(tbl, row, right)?;
+            let r = to_guard_expr(tbl, row, map, right)?;
             match operator {
                 TokenType::Not | TokenType::Bang => GuardExpr::Not(Box::new(r)),
                 TokenType::Minus => GuardExpr::arith(
@@ -127,10 +172,11 @@ fn arith_of(t: &TokenType) -> Option<ArithOp> {
 pub fn capture_guard(
     tbl: TableId,
     row: RowId,
+    map: ColMap,
     predicate: &BoundExpr,
     source_text: Option<&str>,
 ) -> Result<Guard, FerroError> {
-    let g = Guard::holds(to_guard_expr(tbl, row, predicate)?);
+    let g = Guard::holds(to_guard_expr(tbl, row, map, predicate)?);
     Ok(match source_text {
         Some(t) => g.with_source(t),
         None => g,
@@ -158,7 +204,8 @@ pub fn capture_assignment(
         Some(d) => OpKind::Add(d),
         None => {
             let snap = RowSnapshot { tbl, row, values: old_values };
-            OpKind::Assign(to_guard_expr(tbl, row, expr)?.eval(&snap)?)
+            let map = ColMap::single_table(old_values.len());
+            OpKind::Assign(to_guard_expr(tbl, row, map, expr)?.eval(&snap)?)
         }
     };
     let op = Op::new(tbl, row, Some(col), kind);
@@ -293,7 +340,7 @@ mod tests {
             TokenType::GreaterEqual,
             BoundExpr::Literal(Value::Integer(5)),
         );
-        let g = capture_guard(TBL, R1, &e, Some("qty >= 5")).unwrap();
+        let g = capture_guard(TBL, R1, ColMap::single_table(row().len()), &e, Some("qty >= 5")).unwrap();
         assert_eq!(g.violated_predicate(), "qty >= 5");
 
         // and it is re-evaluable against a state nobody had at capture time
@@ -322,7 +369,7 @@ mod tests {
                 ),
             )),
         };
-        let g = capture_guard(TBL, R1, &e, None).unwrap();
+        let g = capture_guard(TBL, R1, ColMap::single_table(row().len()), &e, None).unwrap();
         assert_eq!(g.expr.referenced_cells().len(), 2);
         let snap = RowSnapshot { tbl: TBL, row: R1, values: &row() };
         // qty >= 5 AND id = 1 holds, so NOT(...) is false
@@ -338,7 +385,7 @@ mod tests {
             TokenType::Select, // not an operator this translation knows
             BoundExpr::Literal(Value::Integer(5)),
         );
-        let err = capture_guard(TBL, R1, &e, None).unwrap_err();
+        let err = capture_guard(TBL, R1, ColMap::single_table(row().len()), &e, None).unwrap_err();
         assert!(format!("{}", err).contains("refusing"));
     }
 
@@ -354,7 +401,7 @@ mod tests {
             TokenType::GreaterEqual,
             BoundExpr::Literal(Value::Integer(0)),
         );
-        let g = capture_guard(TBL, R1, &e, None).unwrap();
+        let g = capture_guard(TBL, R1, ColMap::single_table(row().len()), &e, None).unwrap();
         let snap = RowSnapshot { tbl: TBL, row: R1, values: &row() };
         assert!(g.check(&snap).unwrap());
         let scarce = vec![Value::Integer(1), Value::Null, Value::Integer(4)];
@@ -411,7 +458,7 @@ mod tests {
             );
             f.push_op(capture_assignment(TBL, R1, QTY, &assignment, seen).unwrap());
             f.push_guard(
-                capture_guard(TBL, R1, &predicate, Some(&format!("qty >= {}", n))).unwrap(),
+                capture_guard(TBL, R1, ColMap::single_table(row().len()), &predicate, Some(&format!("qty >= {}", n))).unwrap(),
             );
             f
         }
@@ -471,5 +518,51 @@ mod tests {
         let snap = RowSnapshot { tbl: TBL, row: R1, values: &row() };
         assert!(snap.column(TBL, RowId(9), QTY).is_err());
         assert!(snap.column(TBL, R1, ColId(99)).is_err());
+    }
+
+    /// R7: a plan offset outside the target table must be refused, not silently renamed.
+    ///
+    /// `BoundExpr::Column(i)` indexes the plan's combined output row. For a single-table plan that
+    /// equals the schema ordinal; for an UPDATE/DELETE over a join it does not. Mapping it as
+    /// identity would point the guard at a different column of the target table and re-evaluate a
+    /// predicate nobody wrote — the silent degradation this module's header forbids.
+    #[test]
+    fn a_guard_reading_outside_the_target_table_is_refused() {
+        // Target table has 2 columns at plan offsets 0..2. Offset 5 belongs to some other relation.
+        let map = ColMap::single_table(2);
+        let e = BoundExpr::Column(5);
+        let err = to_guard_expr(TBL, R1, map, &e).unwrap_err();
+        assert!(
+            format!("{}", err).contains("outside target table"),
+            "the refusal did not name the problem: {}",
+            err
+        );
+    }
+
+    /// The join case the identity mapping got wrong: the target sits on the RIGHT of the join, so
+    /// its columns start at offset 2. Offset 2 is the target's column 0; offset 0 belongs to the
+    /// left relation and must be refused. A width-only check would have accepted offset 0 and
+    /// silently renamed it, which is why the map carries a base and not just a count.
+    #[test]
+    fn a_join_shifts_the_target_tables_offsets() {
+        let map = ColMap { base: 2, count: 2 };
+        assert_eq!(map.col_of(2), Some(ColId(0)));
+        assert_eq!(map.col_of(3), Some(ColId(1)));
+        assert_eq!(map.col_of(0), None, "left relation's column was accepted as the target's");
+        assert_eq!(map.col_of(4), None);
+
+        let ok = to_guard_expr(TBL, R1, map, &BoundExpr::Column(2)).unwrap();
+        assert_eq!(ok, GuardExpr::col(TBL, R1, ColId(0)));
+        assert!(to_guard_expr(TBL, R1, map, &BoundExpr::Column(0)).is_err());
+    }
+
+    /// Control: the single-table case must still map straight through, or the refusal above would
+    /// just be breaking every guard.
+    #[test]
+    fn a_single_table_plan_still_maps_offsets_straight_through() {
+        let map = ColMap::single_table(3);
+        assert_eq!(map.col_of(0), Some(ColId(0)));
+        assert_eq!(map.col_of(2), Some(ColId(2)));
+        assert_eq!(map.col_of(3), None);
     }
 }
