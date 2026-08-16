@@ -19,6 +19,13 @@ Prebuilt binaries (in zip files) for Linux, macOS, and Windows are in the releas
 
 Requires Rust 1.85 or newer (this project uses edition 2024).
 
+`cargo test` additionally needs **Go 1.24+** and the **`sqlite3` CLI** on PATH. The change-feed
+tests drive a consumer written in Go and check its SQLite output with the sqlite3 command — the
+independence is the point, since an encoder validated by its own decoder agrees with itself about
+any shared misreading. Those tests **fail loudly** rather than skipping when the toolchain is
+missing: a test that silently skips is a test that always passes. `cargo build` and `cargo run`
+need neither.
+
 ```
 git clone https://github.com/RyanLin5967/ferrodb.git
 cd ferrodb
