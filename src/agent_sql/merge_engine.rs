@@ -94,7 +94,7 @@ impl GuardContext for CellState {
         self.cells
             .get(&(tbl, row, col))
             .cloned()
-            .ok_or_else(|| FerroError::Merge(format!("no such cell {}.{}[{}]", tbl, col, row)))
+            .ok_or_else(|| FerroError::CellAbsent(format!("no such cell {}.{}[{}]", tbl, col, row)))
     }
 }
 

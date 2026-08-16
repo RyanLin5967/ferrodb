@@ -43,7 +43,7 @@ impl GuardContext for RowSnapshot<'_> {
             )));
         }
         self.values.get(col.0 as usize).cloned().ok_or_else(|| {
-            FerroError::Merge(format!("column {} outside the row image for {}", col, row))
+            FerroError::CellAbsent(format!("column {} outside the row image for {}", col, row))
         })
     }
 }

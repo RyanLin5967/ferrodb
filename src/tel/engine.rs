@@ -193,7 +193,7 @@ impl GuardContext for ComposedState<'_> {
         }
         if let Some(image) = self.created.get(&(tbl, row)) {
             return image.get(col.0 as usize).cloned().ok_or_else(|| {
-                FerroError::Merge(format!("column {} outside the RowCreate image for {}", col, row))
+                FerroError::CellAbsent(format!("column {} outside the RowCreate image for {}", col, row))
             });
         }
         self.base.column(tbl, row, col)
@@ -658,9 +658,18 @@ fn compose(
         if poisoned.contains(&(tbl, row)) {
             continue; // already reported as DeleteVsWrite, or a contradictory RowCreate
         }
-        let base_value = base.column(tbl, row, col).ok().or_else(|| {
-            fresh.get(&(tbl, row)).and_then(|img| img.get(col.0 as usize).cloned())
-        });
+        // Absence and failure are different answers. A row this merge is creating has no LCA
+        // value, and the fresh image supplies it — that is `CellAbsent`. Anything else is a real
+        // fault, and `.ok()` used to turn it into "no LCA value": an Assign-only merge then
+        // reported `Commuting` as though the base had been read, and an Add failed with
+        // "cannot resolve an Add without the LCA value" while the actual cause never surfaced.
+        let base_value = match base.column(tbl, row, col) {
+            Ok(v) => Some(v),
+            Err(FerroError::CellAbsent(_)) => {
+                fresh.get(&(tbl, row)).and_then(|img| img.get(col.0 as usize).cloned())
+            }
+            Err(e) => return Err(e),
+        };
         let o = ours.cells.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
         let t = theirs.cells.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
         compose_cell(key, o, t, policy, base_value, &mut out)?;
@@ -1128,7 +1137,7 @@ mod tests {
                 .iter()
                 .find(|(k, _)| *k == (tbl, row, col))
                 .map(|(_, v)| v.clone())
-                .ok_or_else(|| FerroError::Merge(format!("no cell {}.{}[{}]", tbl, col, row)))
+                .ok_or_else(|| FerroError::CellAbsent(format!("no cell {}.{}[{}]", tbl, col, row)))
         }
     }
 
@@ -1854,6 +1863,52 @@ mod tests {
         );
         // MultiValue retains both sides, so nothing was discarded and the outcome must say so.
         assert!(!out.lost_a_write(), "MultiValue reported a loss it did not make");
+    }
+
+    /// R5: a real LCA read failure must surface, not be swallowed as "no LCA value".
+    ///
+    /// `base.column(...).ok()` collapsed two different answers. With a base that genuinely fails
+    /// (a disk error, say), an Assign-only merge came back `Commuting` as though the LCA had been
+    /// read successfully, and an Add merge failed with "cannot resolve an Add without the LCA
+    /// value" — naming a consequence while the actual cause never appeared anywhere.
+    #[test]
+    fn a_failing_lca_read_surfaces_instead_of_becoming_no_lca_value() {
+        struct Failing;
+        impl GuardContext for Failing {
+            fn column(&self, _t: TableId, _r: RowId, _c: ColId) -> Result<Value, FerroError> {
+                // NOT CellAbsent: this is a fault, not an absence.
+                Err(FerroError::Merge("disk read failed".into()))
+            }
+        }
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(1))));
+        let err = m
+            .merge(&lca(), &[ours], &[], &Fixed(MergePolicy::Lww), &Failing)
+            .expect_err("a failing LCA read must not merge cleanly");
+        assert!(
+            format!("{}", err).contains("disk read failed"),
+            "the real cause was replaced by something else: {}",
+            err
+        );
+    }
+
+    /// Control: an ABSENT cell must still fall through to the fresh image rather than erroring,
+    /// or every row this merge creates would fail. Without this, the test above would pass
+    /// against an engine that propagated every base error indiscriminately.
+    #[test]
+    fn an_absent_lca_cell_still_falls_back_to_the_fresh_image() {
+        struct Absent;
+        impl GuardContext for Absent {
+            fn column(&self, _t: TableId, _r: RowId, _c: ColId) -> Result<Value, FerroError> {
+                Err(FerroError::CellAbsent("no such cell".into()))
+            }
+        }
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, None, OpKind::RowCreate(vec![Value::Integer(3)])));
+        let out = m.merge(&lca(), &[ours], &[], &Fixed(MergePolicy::Lww), &Absent);
+        assert!(out.is_ok(), "an absent LCA cell must not be treated as a fault: {:?}", out.err());
     }
 
     #[test]

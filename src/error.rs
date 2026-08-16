@@ -21,6 +21,12 @@ pub enum FerroError {
     Branch(String),
     Cow(String),
     Merge(String),
+    /// A cell has no value here — distinct from a failed read of one.
+    ///
+    /// Merge needs to tell "the LCA never had this cell" (expected for a row this merge is
+    /// creating) from "reading the LCA failed" (a real fault). Collapsing both into `Merge`
+    /// meant `.ok()` at the call site silently turned a disk failure into "no LCA value".
+    CellAbsent(String),
     Provenance(String),
 }
 
@@ -44,6 +50,7 @@ impl Display for FerroError {
             FerroError::Branch(s) => write!(f, "branch error: {}", s),
             FerroError::Cow(s) => write!(f, "cow page store error: {}", s),
             FerroError::Merge(s) => write!(f, "merge error: {}", s),
+            FerroError::CellAbsent(s) => write!(f, "cell absent: {}", s),
             FerroError::Provenance(s) => write!(f, "provenance error: {}", s),
         }
     }
