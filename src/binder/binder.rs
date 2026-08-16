@@ -501,11 +501,22 @@ impl<'a> Binder<'a> {
     /// `TIMESTAMP`. The declared column type is the missing half of that decision, and at INSERT
     /// and UPDATE it is right there.
     ///
+    /// `FLOAT` is here for a different and more mundane reason. A whole-numbered literal reads as
+    /// `Integer`, and `INSERT INTO t (f FLOAT) VALUES (5)` is ordinary SQL that every dialect
+    /// accepts. Writing an `Integer` into a `FLOAT` column is refused by `value_fits`, because
+    /// `serialize` would lay down four bytes where `deserialize` reads eight and shift every
+    /// column after it — so without the coercion here that statement is a hard error. Widening the
+    /// literal to `f64` at bind time is exact for every i32, which is why it is safe to do
+    /// silently where narrowing never would be.
+    ///
     /// Returns `None` when this is not a case that needs redirecting, so the caller falls through
     /// to ordinary binding. `Some(Err(..))` means the literal was aimed at one of these columns and
     /// could not be represented — which is a refusal, never a silent truncation.
     pub fn literal_for_column(expr: &Expr, target: &DataType) -> Option<Result<Value, FerroError>> {
-        if !matches!(target, DataType::BigInt | DataType::Decimal | DataType::Timestamp) {
+        if !matches!(
+            target,
+            DataType::BigInt | DataType::Decimal | DataType::Timestamp | DataType::Float
+        ) {
             return None;
         }
         let text = Self::signed_numeric_text(expr)?;
@@ -521,6 +532,10 @@ impl<'a> Binder<'a> {
             DataType::Decimal => crate::catalog::column::parse_decimal(&text)
                 .map(Value::Decimal)
                 .map_err(FerroError::Bind),
+            DataType::Float => text
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a FLOAT: {e}"))),
             _ => unreachable!("guarded above"),
         })
     }

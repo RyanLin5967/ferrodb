@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
+use ferrodb::catalog::column::{DataType, Value};
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -80,6 +80,18 @@ impl Db {
 
     fn sql(&mut self, sql: &str) {
         self.exec(sql);
+    }
+
+    /// Like `sql`, but hands back the failure instead of panicking. Scan and parse errors are
+    /// folded into the same `Err` so a refusal at any stage counts as a refusal.
+    fn try_sql(&mut self, sql: &str) -> Result<Outcome, ferrodb::error::FerroError> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens()?;
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        if !p.errors.is_empty() {
+            return Err(ferrodb::error::FerroError::Parse(format!("{:?}", p.errors)));
+        }
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut self.session)
     }
 
     fn rows(&mut self, sql: &str) -> Vec<Vec<Value>> {
@@ -240,6 +252,104 @@ fn the_feed_ships_wide_types_as_quoted_json_strings() {
     // would be a regression for every consumer reading that column today.
     assert!(feed.contains("\"id\":1"), "INTEGER must stay a bare JSON number:\n{feed}");
     assert!(!feed.contains("\"id\":\"1\""), "INTEGER must not be stringified:\n{feed}");
+}
+
+/// **A literal that cannot be represented is refused, loudly, at bind or write time.**
+///
+/// The alternative is what this whole feature exists to remove: a value that is quietly turned
+/// into a different value. `serialize` picks its width from the VALUE and `deserialize` picks it
+/// from the SCHEMA, so a mismatch is not a type-checking nicety — it shifts every column after it
+/// in the row. Each of these must come back as an error, never as a stored row.
+#[test]
+fn a_literal_that_does_not_fit_its_column_is_refused_not_truncated() {
+    let mut d = db("wide_refuse");
+    d.sql("CREATE TABLE wide (id INTEGER NOT NULL, big BIGINT, dec DECIMAL, ts TIMESTAMP);");
+
+    for sql in [
+        // Past i64 in both directions.
+        "INSERT INTO wide VALUES (1, 9223372036854775808, 1.0, 0);",
+        "INSERT INTO wide VALUES (1, -9223372036854775809, 1.0, 0);",
+        // A fractional literal is not an integer, in either integral column.
+        "INSERT INTO wide VALUES (1, 1.5, 1.0, 0);",
+        "INSERT INTO wide VALUES (1, 1, 1.0, 1.5);",
+        // A string is not a number.
+        "INSERT INTO wide VALUES (1, 'nope', 1.0, 0);",
+    ] {
+        assert!(d.try_sql(sql).is_err(), "`{sql}` was accepted; it must be refused");
+    }
+
+    // Nothing was stored by any of them.
+    assert!(d.rows("SELECT id FROM wide;").is_empty(), "a refused INSERT still wrote a row");
+
+    // And the representable extremes still go in, so the refusals above are not just "everything
+    // fails".
+    d.sql(&format!("INSERT INTO wide VALUES (1, {BIG_MAX}, {DEC_MANY_DIGITS}, {BIG_MIN});"));
+    assert_eq!(d.rows("SELECT id FROM wide;").len(), 1);
+}
+
+/// A whole-numbered literal in a `FLOAT` column is ordinary SQL and must work. It reads as
+/// `Integer` on its own, and an `Integer` written to a `FLOAT` column is refused by the width
+/// guard — so without type-directed binding this plain statement is a hard error. Widening an i32
+/// to f64 is exact, which is why this coercion is safe where a narrowing one would not be.
+#[test]
+fn a_whole_numbered_literal_lands_in_a_float_column() {
+    let mut d = db("wide_float");
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, f FLOAT);");
+    d.sql("INSERT INTO t VALUES (1, 5);");
+    d.sql("INSERT INTO t VALUES (2, -3);");
+    let rows = d.rows("SELECT id, f FROM t;");
+    assert!(rows.contains(&vec![Value::Integer(1), Value::Float(5.0)]), "{rows:?}");
+    assert!(rows.contains(&vec![Value::Integer(2), Value::Float(-3.0)]), "{rows:?}");
+
+    // INTEGER columns are untouched: a whole literal there is still an i32, not a float.
+    let ids = d.rows("SELECT id FROM t WHERE id = 1;");
+    assert_eq!(ids, vec![vec![Value::Integer(1)]]);
+}
+
+/// **The declared types survive a catalog reload.**
+///
+/// `DataType` is written to the catalog page as a one-byte tag, and the wide types took the next
+/// three free numbers. If a tag were wrong or unhandled, a reopened database would either refuse
+/// the page or — far worse — read the column back as a *different* type, at which point
+/// `Tuple::deserialize` takes the wrong width and every column after it in the row shifts.
+///
+/// Reading the rows back rather than just the schema is what makes that second failure detectable:
+/// a wrong width is invisible in the column list and obvious in the values.
+#[test]
+fn the_declared_types_and_their_rows_survive_a_catalog_reload() {
+    let mut d = seeded("wide_reload");
+    let first_page = d.catalog.first_catalog_page_id;
+
+    // Reopen the catalog from the pages, as recovery and the CLI do.
+    d.catalog = Catalog::open(d.bp.clone(), first_page).expect("reopen catalog");
+
+    let entry = d.catalog.get_table("wide").expect("table missing after reload");
+    let declared: Vec<(&str, &DataType)> =
+        entry.schema.columns.iter().map(|c| (c.name.as_str(), &c.data_type)).collect();
+    assert_eq!(
+        declared,
+        vec![
+            ("id", &DataType::Integer),
+            ("big", &DataType::BigInt),
+            ("dec", &DataType::Decimal),
+            ("ts", &DataType::Timestamp),
+            ("note", &DataType::Varchar(16)),
+        ],
+        "the reloaded schema is not the declared one"
+    );
+
+    // And the rows still decode at the right widths through that reloaded schema.
+    let rows = d.rows("SELECT id, big, dec, ts, note FROM wide;");
+    assert_eq!(rows.len(), 3);
+    let r1 = rows
+        .iter()
+        .find(|r| r[0] == Value::Integer(1))
+        .unwrap_or_else(|| panic!("row 1 missing after reload: {rows:?}"));
+    assert!(matches!(r1[1], Value::BigInt(v) if v == i64::MAX), "{:?}", r1[1]);
+    assert!(matches!(&r1[2], Value::Decimal(d) if d == DEC_MANY_DIGITS), "{:?}", r1[2]);
+    assert!(matches!(r1[3], Value::Timestamp(v) if v == 1_700_000_000_123), "{:?}", r1[3]);
+    // The column AFTER the wide ones is the one a wrong width corrupts, so check it explicitly.
+    assert_eq!(r1[4], Value::Varchar("max".into()), "the column after the wide ones shifted");
 }
 
 /// **A predicate against a wide column finds the row.**
