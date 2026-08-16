@@ -10,6 +10,29 @@ pub struct Parser {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// `AS OF BRANCH b_123` — read this table as the named branch sees it, including that
+    /// branch's *uncommitted* state (DESIGN.md exit criterion 3). `None` is the ordinary read of
+    /// the session's own branch.
+    pub as_of: Option<BranchRef>,
+}
+
+impl TableRef {
+    pub fn plain(name: String, alias: Option<String>) -> Self {
+        TableRef { name, alias, as_of: None }
+    }
+}
+
+/// How a branch was named in SQL. Resolution to a `BranchId` happens in the binder, not here —
+/// the parser never touches the branch catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRef {
+    pub name: String,
+}
+
+impl BranchRef {
+    pub fn new(name: impl Into<String>) -> Self {
+        BranchRef { name: name.into() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +71,54 @@ pub enum Expr {
     },
     // for parentheses overriding precedence
     Grouping(Box<Expr>),
+}
+
+impl Expr {
+    /// Render back to SQL text.
+    ///
+    /// This exists for one reason: a captured `Guard` must hand the agent **the violated
+    /// predicate itself** (DESIGN.md exit criterion 7), and the agent wrote it in SQL. Rendering
+    /// the parsed expression keeps that text alive without the executor having to carry raw
+    /// source offsets around.
+    pub fn to_sql(&self) -> String {
+        match self {
+            Expr::BinaryOp { left, operator, right } => {
+                format!("{} {} {}", left.to_sql(), token_sql(*operator), right.to_sql())
+            }
+            Expr::UnaryOp { operator, right } => {
+                format!("{} {}", token_sql(*operator), right.to_sql())
+            }
+            Expr::Literal { value_type, value } => match value_type {
+                TokenType::String => format!("'{}'", value),
+                _ => value.clone(),
+            },
+            Expr::ColumnRef { table, column } => match table {
+                Some(t) => format!("{}.{}", t, column),
+                None => column.clone(),
+            },
+            Expr::Grouping(inner) => format!("({})", inner.to_sql()),
+        }
+    }
+}
+
+fn token_sql(t: TokenType) -> &'static str {
+    match t {
+        TokenType::Plus => "+",
+        TokenType::Minus => "-",
+        TokenType::Star => "*",
+        TokenType::Slash => "/",
+        TokenType::Equal => "=",
+        TokenType::BangEqual => "<>",
+        TokenType::Less => "<",
+        TokenType::LessEqual => "<=",
+        TokenType::Greater => ">",
+        TokenType::GreaterEqual => ">=",
+        TokenType::And => "AND",
+        TokenType::Or => "OR",
+        TokenType::Not => "NOT",
+        TokenType::Bang => "NOT",
+        _ => "?",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +160,36 @@ pub enum Stmt {
     },
     Explain(Box<Stmt>),
     Begin, Commit, Rollback,
+
+    // ---- agent-isolation surface (DESIGN.md section 5) --------------------------------------
+    /// `BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';`
+    ///
+    /// Forks a branch for one agent task. The fork copies zero data pages (exit criterion 1);
+    /// the agent identity and run id are what provenance interns (exit criterion 9).
+    BeginAgentSession {
+        agent: String,
+        run: Option<String>,
+    },
+    /// `DIFF;` — the structured changeset this session's branch would merge (exit criterion 4).
+    Diff {
+        branch: Option<BranchRef>,
+    },
+    /// `MERGE;` — three-way merge of this session's branch into its parent, reporting
+    /// Clean / Commuting / Conflict / ResolvedWithLoss (exit criterion 5).
+    Merge {
+        branch: Option<BranchRef>,
+    },
+    /// `ABANDON;` — drop this session's branch. Abandoning is also what happens with *no* client
+    /// cooperation at all when the lease expires (exit criterion 8); this is the polite form.
+    Abandon {
+        branch: Option<BranchRef>,
+    },
+    /// `REVERT MERGE m_44 CASCADE;` — causal rollback over retained read-sets. Without `CASCADE`
+    /// the revert halts and reports the dependency tree (exit criterion 10).
+    RevertMerge {
+        merge_id: String,
+        cascade: bool,
+    },
 }
 
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
@@ -125,7 +226,24 @@ impl Parser {
         } else if self.match_token(&[TokenType::Explain]){
             return self.parse_explain()
         } else if self.match_token(&[TokenType::Begin]) {
+            if self.match_token(&[TokenType::Agent]) {
+                return self.parse_begin_agent_session()
+            }
             return self.parse_txn_stmt(Stmt::Begin)
+        } else if self.match_token(&[TokenType::Diff]) {
+            let branch = self.parse_optional_branch_arg()?;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::Diff { branch })
+        } else if self.match_token(&[TokenType::Merge]) {
+            let branch = self.parse_optional_branch_arg()?;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::Merge { branch })
+        } else if self.match_token(&[TokenType::Abandon]) {
+            let branch = self.parse_optional_branch_arg()?;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::Abandon { branch })
+        } else if self.match_token(&[TokenType::Revert]) {
+            return self.parse_revert()
         } else if self.match_token(&[TokenType::Commit]) {
             return self.parse_txn_stmt(Stmt::Commit)
         } else if self.match_token(&[TokenType::Rollback]) {
@@ -346,11 +464,53 @@ impl Parser {
         Ok(stmt)
     }
 
+    // BEGIN AGENT SESSION AS 'agent-id' [RUN 'run-id']
+    pub fn parse_begin_agent_session(&mut self) -> Result<Stmt, FerroError> {
+        self.consume(TokenType::Session, "expected SESSION after BEGIN AGENT")?;
+        self.consume(TokenType::As, "expected AS after BEGIN AGENT SESSION")?;
+        let agent = self.consume(TokenType::String, "expected a quoted agent id")?.lexeme;
+        let run = if self.match_token(&[TokenType::Run]) {
+            Some(self.consume(TokenType::String, "expected a quoted run id after RUN")?.lexeme)
+        } else {
+            None
+        };
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::BeginAgentSession { agent, run })
+    }
+
+    // REVERT MERGE m_44 [CASCADE]
+    pub fn parse_revert(&mut self) -> Result<Stmt, FerroError> {
+        self.consume(TokenType::Merge, "expected MERGE after REVERT")?;
+        let merge_id = self.consume_name("expected a merge id")?;
+        let cascade = self.match_token(&[TokenType::Cascade]);
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::RevertMerge { merge_id, cascade })
+    }
+
+    // optional `BRANCH b_1` argument on DIFF / MERGE / ABANDON; absent means "this session's branch"
+    pub fn parse_optional_branch_arg(&mut self) -> Result<Option<BranchRef>, FerroError> {
+        if self.match_token(&[TokenType::Branch]) {
+            return Ok(Some(BranchRef::new(self.consume_name("expected a branch name")?)));
+        }
+        Ok(None)
+    }
+
+    /// An unquoted name: an identifier, or a bare number so `BRANCH 3` and `MERGE 44` scan.
+    pub fn consume_name(&mut self, message: &str) -> Result<String, FerroError> {
+        if self.check(TokenType::Identifier) || self.check(TokenType::Number) {
+            return Ok(self.advance().lexeme);
+        }
+        Err(Parser::error(self.peek(), message.to_string()))
+    }
+
     pub fn parse_table_ref(&mut self) -> Result<TableRef, FerroError> {
         let name = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
         let mut alias = None;
 
-        if self.match_token(&[TokenType::As]) {
+        // `AS OF` is a time/branch qualifier, not an alias: do not let `AS` eat the `OF`.
+        let as_alias = self.check(TokenType::As) && !self.check_next(TokenType::Of);
+        if as_alias {
+            self.advance();
             alias = Some(self.consume(TokenType::Identifier, "expected alias")?.lexeme);
         } else if self.check(TokenType::Identifier) {
             let lexeme_upper = self.peek().lexeme.to_uppercase();
@@ -358,7 +518,16 @@ impl Parser {
                 alias = Some(self.advance().lexeme);
             }
         }
-        Ok(TableRef{name, alias})
+
+        let as_of = if self.check(TokenType::As) && self.check_next(TokenType::Of) {
+            self.advance();
+            self.advance();
+            self.consume(TokenType::Branch, "expected BRANCH after AS OF")?;
+            Some(BranchRef::new(self.consume_name("expected a branch name")?))
+        } else {
+            None
+        };
+        Ok(TableRef{name, alias, as_of})
     }
 
     pub fn match_token(&mut self, types: &[TokenType]) -> bool{
@@ -376,6 +545,14 @@ impl Parser {
             return false;
         }
         return self.peek().token_type == token_type;
+    }
+
+    /// One token of lookahead past `peek`. Needed to tell `AS alias` from `AS OF BRANCH b`.
+    pub fn check_next(&self, token_type: TokenType) -> bool {
+        match self.tokens.get(self.current + 1) {
+            Some(t) => t.token_type == token_type,
+            None => false,
+        }
     }
 
     pub fn advance(&mut self) -> Token{
@@ -545,8 +722,134 @@ impl Parser {
 mod tests {
     use super::*;
 
+    use crate::parser::scanner::Scanner;
+
     fn t(token_type: TokenType, lexeme: &str) -> Token {
         Token::new(token_type, lexeme.to_string(), 1)
+    }
+
+    fn parse_sql(sql: &str) -> Result<Vec<Stmt>, String> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new())
+            .scan_tokens()
+            .map_err(|e| e.to_string())?;
+        let mut p = Parser::new(tokens);
+        let stmts = p.parse();
+        if !p.errors.is_empty() {
+            return Err(p.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "));
+        }
+        Ok(stmts)
+    }
+
+    fn one(sql: &str) -> Stmt {
+        let mut s = parse_sql(sql).expect("should parse");
+        assert_eq!(s.len(), 1, "expected exactly one statement from {}", sql);
+        s.remove(0)
+    }
+
+    #[test]
+    fn test_parse_begin_agent_session() {
+        match one("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';") {
+            Stmt::BeginAgentSession { agent, run } => {
+                assert_eq!(agent, "pricing-agent");
+                assert_eq!(run.as_deref(), Some("r_8fk2"));
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // RUN is optional
+        match one("BEGIN AGENT SESSION AS 'pricing-agent';") {
+            Stmt::BeginAgentSession { agent, run } => {
+                assert_eq!(agent, "pricing-agent");
+                assert!(run.is_none());
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // plain BEGIN still means a transaction
+        assert!(matches!(one("BEGIN;"), Stmt::Begin));
+    }
+
+    #[test]
+    fn test_begin_agent_session_requires_a_quoted_agent_id() {
+        assert!(parse_sql("BEGIN AGENT SESSION AS pricing;").is_err());
+        assert!(parse_sql("BEGIN AGENT AS 'a';").is_err());
+    }
+
+    #[test]
+    fn test_parse_diff_merge_abandon() {
+        assert!(matches!(one("DIFF;"), Stmt::Diff { branch: None }));
+        assert!(matches!(one("MERGE;"), Stmt::Merge { branch: None }));
+        assert!(matches!(one("ABANDON;"), Stmt::Abandon { branch: None }));
+        match one("DIFF BRANCH b_7;") {
+            Stmt::Diff { branch: Some(b) } => assert_eq!(b.name, "b_7"),
+            other => panic!("expected Diff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_as_of_branch() {
+        match one("SELECT * FROM inventory AS OF BRANCH b_123;") {
+            Stmt::Select { from, .. } => {
+                assert_eq!(from.name, "inventory");
+                assert_eq!(from.alias, None);
+                assert_eq!(from.as_of, Some(BranchRef::new("b_123")));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_as_of_coexists_with_alias_and_where() {
+        match one("SELECT i.qty FROM inventory i AS OF BRANCH b_2 WHERE i.qty > 0;") {
+            Stmt::Select { from, where_clause, .. } => {
+                assert_eq!(from.alias, Some("i".to_string()));
+                assert_eq!(from.as_of, Some(BranchRef::new("b_2")));
+                assert!(where_clause.is_some());
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+        // `AS alias` still works and is not confused with `AS OF`
+        match one("SELECT * FROM inventory AS i;") {
+            Stmt::Select { from, .. } => {
+                assert_eq!(from.alias, Some("i".to_string()));
+                assert!(from.as_of.is_none());
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_as_of_without_branch_keyword_is_an_error() {
+        assert!(parse_sql("SELECT * FROM t AS OF b_1;").is_err());
+        assert!(parse_sql("SELECT * FROM t AS OF BRANCH;").is_err());
+    }
+
+    #[test]
+    fn test_parse_revert_merge() {
+        match one("REVERT MERGE m_44 CASCADE;") {
+            Stmt::RevertMerge { merge_id, cascade } => {
+                assert_eq!(merge_id, "m_44");
+                assert!(cascade);
+            }
+            other => panic!("expected RevertMerge, got {:?}", other),
+        }
+        // no CASCADE means halt-and-report, which is the deliberate default
+        match one("REVERT MERGE m_44;") {
+            Stmt::RevertMerge { merge_id, cascade } => {
+                assert_eq!(merge_id, "m_44");
+                assert!(!cascade);
+            }
+            other => panic!("expected RevertMerge, got {:?}", other),
+        }
+        assert!(parse_sql("REVERT m_44;").is_err());
+    }
+
+    #[test]
+    fn test_expr_renders_back_to_sql_for_guard_capture() {
+        match one("SELECT * FROM t WHERE qty >= 5 AND name = 'a';") {
+            Stmt::Select { where_clause: Some(w), .. } => {
+                assert_eq!(w.to_sql(), "qty >= 5 AND name = 'a'");
+            }
+            other => panic!("expected Select with WHERE, got {:?}", other),
+        }
     }
 
     #[test]

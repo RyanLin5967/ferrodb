@@ -1,4 +1,36 @@
-use crate::{catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{Expr, JoinClause, Stmt, TableRef}, scanner::TokenType}, planner::logical_plan::LogicalPlan};
+use crate::{agent_sql::runtime::BranchResolver, branch::types::BranchId, catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{BranchRef, Expr, JoinClause, Stmt, TableRef}, scanner::TokenType}, planner::logical_plan::LogicalPlan, provenance::revert::RevertMode};
+
+/// An agent-session statement with every name resolved.
+///
+/// Design authority: DESIGN.md section 5. Branch names and merge ids are resolved here so the
+/// runtime receives identities, never strings to look up.
+#[derive(Debug, Clone)]
+pub enum BoundAgentStmt {
+    BeginAgentSession {
+        agent_id: String,
+        run_id: Option<String>,
+        /// The branch to fork from: trunk, or the current session's branch for a nested task.
+        parent: BranchId,
+    },
+    Diff {
+        branch: BranchId,
+    },
+    Merge {
+        branch: BranchId,
+    },
+    Abandon {
+        branch: BranchId,
+    },
+    RevertMerge {
+        merge_id: String,
+        mode: RevertMode,
+    },
+    /// `SELECT ... AS OF BRANCH b` — read another branch's *uncommitted* state.
+    SelectAsOf {
+        branch: BranchId,
+        stmt: Stmt,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
@@ -121,6 +153,91 @@ impl<'a> Binder<'a> {
             Stmt::Analyze { .. } => { unreachable!() }
             Stmt::Join { .. } => todo!(),
             Stmt::Explain { .. } | Stmt::Begin | Stmt::Commit | Stmt::Rollback => unreachable!(),
+            // Agent statements do not describe a relational plan; they are bound by
+            // `bind_agent`, which resolves branch names and merge ids instead of columns.
+            Stmt::BeginAgentSession { .. }
+            | Stmt::Diff { .. }
+            | Stmt::Merge { .. }
+            | Stmt::Abandon { .. }
+            | Stmt::RevertMerge { .. } => Err(FerroError::Bind(
+                "agent-session statements are bound by Binder::bind_agent, not into a plan".into(),
+            )),
+        }
+    }
+
+    /// Bind an agent-session statement.
+    ///
+    /// Design authority: DESIGN.md section 5. Name resolution happens here and nowhere else: the
+    /// parser never touches the branch catalog, and the runtime never parses. `current` is the
+    /// branch of the session issuing the statement, which is what `DIFF` / `MERGE` / `ABANDON`
+    /// mean when no branch is named.
+    pub fn bind_agent(
+        &self,
+        stmt: &Stmt,
+        resolver: &dyn BranchResolver,
+        current: Option<BranchId>,
+    ) -> Result<BoundAgentStmt, FerroError> {
+        let target = |branch: &Option<BranchRef>| -> Result<BranchId, FerroError> {
+            match branch {
+                Some(b) => resolver.resolve_branch(&b.name),
+                None => current.ok_or_else(|| {
+                    FerroError::Bind(
+                        "no agent session in this connection; name a branch (e.g. BRANCH b_1)".into(),
+                    )
+                }),
+            }
+        };
+        match stmt {
+            Stmt::BeginAgentSession { agent, run } => {
+                if agent.trim().is_empty() {
+                    return Err(FerroError::Bind("agent id must not be empty".into()));
+                }
+                if let Some(r) = run {
+                    if r.trim().is_empty() {
+                        return Err(FerroError::Bind("run id must not be empty".into()));
+                    }
+                }
+                Ok(BoundAgentStmt::BeginAgentSession {
+                    agent_id: agent.clone(),
+                    run_id: run.clone(),
+                    // Forking from the session's own branch nests the task; from trunk otherwise.
+                    parent: current.unwrap_or(BranchId::TRUNK),
+                })
+            }
+            Stmt::Diff { branch } => Ok(BoundAgentStmt::Diff { branch: target(branch)? }),
+            Stmt::Merge { branch } => Ok(BoundAgentStmt::Merge { branch: target(branch)? }),
+            Stmt::Abandon { branch } => Ok(BoundAgentStmt::Abandon { branch: target(branch)? }),
+            Stmt::RevertMerge { merge_id, cascade } => {
+                if merge_id.trim().is_empty() {
+                    return Err(FerroError::Bind("merge id must not be empty".into()));
+                }
+                Ok(BoundAgentStmt::RevertMerge {
+                    merge_id: merge_id.clone(),
+                    // Halt is the default deliberately: cascading a revert through an agent's
+                    // downstream work is not recoverable by that agent.
+                    mode: if *cascade { RevertMode::Cascade } else { RevertMode::Halt },
+                })
+            }
+            Stmt::Select { from, columns, where_clause, joins } => {
+                let branch_ref = from.as_of.as_ref().ok_or_else(|| {
+                    FerroError::Bind("SELECT without AS OF BRANCH is not an agent statement".into())
+                })?;
+                let branch = resolver.resolve_branch(&branch_ref.name)?;
+                if !joins.is_empty() {
+                    return Err(FerroError::Bind(
+                        "AS OF BRANCH does not support joins yet".into(),
+                    ));
+                }
+                // Bind it now so an unknown column fails at bind time, not mid-scan.
+                let mut plain = from.clone();
+                plain.as_of = None;
+                self.bind_select(plain, Vec::new(), columns.clone(), where_clause.clone())?;
+                Ok(BoundAgentStmt::SelectAsOf { branch, stmt: stmt.clone() })
+            }
+            other => Err(FerroError::Bind(format!(
+                "not an agent-session statement: {:?}",
+                other
+            ))),
         }
     }
 
@@ -223,6 +340,14 @@ impl<'a> Binder<'a> {
 
     // parse literal into value
     pub fn bind_literal(&self, value_type: TokenType, value: String) -> Result<BoundExpr, FerroError> {
+        Ok(BoundExpr::Literal(Binder::literal_value(value_type, value)?))
+    }
+
+    /// The literal's value, with no expression wrapper.
+    ///
+    /// Guard capture needs the bare `Value`: a `GuardExpr` has to survive into a merge on a
+    /// different branch, so it cannot carry a `BoundExpr::Column` offset into one plan's row.
+    pub fn literal_value(value_type: TokenType, value: String) -> Result<Value, FerroError> {
         let v = match value_type {
             TokenType::Number => {
                 if value.contains('.') {
@@ -237,7 +362,7 @@ impl<'a> Binder<'a> {
             TokenType::Null => Value::Null,
             _ => return Err(FerroError::Bind(format!("invalid literal: {}", value)))
         };
-        Ok(BoundExpr::Literal(v))
+        Ok(v)
     }
 }
 
