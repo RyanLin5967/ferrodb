@@ -196,7 +196,7 @@ Run it yourself: `cargo run --release --example agent_isolation_demo`. Every ver
 computed by a check inside the demo, not written into a table by hand — removing the code behind a
 criterion makes its verdict change.
 
-- `cargo test` — **561 passed, 0 failed**
+- `cargo test` — **699 passed, 0 failed**
 - the demo reports **10 MET, 0 PARTIAL, 0 NOT MET** of the ten exit criteria, and exits non-zero
   if any self-check fails
 - the thesis criterion is observed firing: 32 branches take a lease, write novel pages, and are

@@ -300,7 +300,7 @@ exited non-zero — so "all self-checks passed" is a result, not a default.
 ## Where the criteria are also covered by tests
 
 The demo is not the only evidence; it is the readable evidence. The suite behind it is
-**435 passing, 0 failing** (`cargo test`) — 430 inherited, plus 5 added here for criterion 9.
+**699 passing, 0 failing** (`cargo test`), of which 5 were added here for criterion 9.
 
 Those 5 were mutation-checked: deleting the one line that records authorship
 (`state.row_author.insert(...)`) makes 4 of them fail. A test that cannot fail proves nothing, so
