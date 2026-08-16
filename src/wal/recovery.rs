@@ -92,6 +92,16 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     Ok(true)
 }
 
+/// Apply one log record to the pages, for callers outside recovery — a replica applying a
+/// primary's stream is doing redo, and should do it through the same code that recovery uses
+/// rather than a second implementation that can drift from it.
+///
+/// Idempotent by page LSN: a record whose LSN is at or below the page's is skipped, which is what
+/// makes a re-sent overlap after a reconnect harmless.
+pub fn apply_redo(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
+    redo_one(bp, lsn, kind)
+}
+
 fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(), FerroError> {
     let page_id = match kind {
         RecKind::HeapDelete { page_id, .. } | RecKind::HeapInsert { page_id, ..} | RecKind::HeapUpdate { page_id, ..} => *page_id,

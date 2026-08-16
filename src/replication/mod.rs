@@ -316,3 +316,131 @@ mod tests {
         assert!(format!("{e}").contains("version 99"), "got {e}");
     }
 }
+
+/// Applies a primary's shipped WAL frames on a replica.
+///
+/// Redo goes through `wal::recovery::apply_redo`, the same code recovery uses, rather than a
+/// second implementation that could drift from it. That also inherits its idempotence: a record
+/// whose LSN is at or below the page's own LSN is skipped, which is what makes a reconnect's
+/// overlap harmless instead of a double-apply.
+pub struct ReplicaApplier {
+    bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
+    applied_lsn: std::sync::atomic::AtomicU64,
+}
+
+impl ReplicaApplier {
+    /// `start_lsn` is where this replica's log begins — the primary's base, not zero.
+    pub fn new(
+        bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
+        start_lsn: u64,
+    ) -> Self {
+        ReplicaApplier { bp, applied_lsn: std::sync::atomic::AtomicU64::new(start_lsn) }
+    }
+
+    /// How far this replica has applied. This is what it sends in `Hello`.
+    pub fn applied_lsn(&self) -> u64 {
+        self.applied_lsn.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Apply a batch of raw frames that begin at `start_lsn`.
+    ///
+    /// Returns the LSN immediately after the last frame applied.
+    ///
+    /// Every frame is CRC-checked against the bytes that actually arrived, and its embedded LSN is
+    /// checked against where the walk says it should be. A batch that fails either is refused
+    /// whole: applying a prefix and then erroring would leave the replica at an LSN it cannot
+    /// justify, which is worse than refusing to advance at all.
+    pub fn apply(&self, start_lsn: u64, bytes: &[u8]) -> Result<u64, FerroError> {
+        use crate::wal::log::{crc32, LogRecord};
+
+        // Validate the whole batch before touching a page.
+        let mut checked: Vec<(u64, LogRecord)> = Vec::new();
+        let mut at = 0usize;
+        let mut lsn = start_lsn;
+        while at < bytes.len() {
+            if at + 4 > bytes.len() {
+                return Err(FerroError::Wal("batch ends mid-length-prefix".into()));
+            }
+            let total = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            if total < 33 || at + total > bytes.len() {
+                return Err(FerroError::Wal(format!(
+                    "frame at offset {at} claims {total} bytes, which runs past the batch"
+                )));
+            }
+            let frame = &bytes[at..at + total];
+
+            let stored = u32::from_be_bytes(frame[total - 4..total].try_into().unwrap());
+            if crc32(&frame[..total - 4]) != stored {
+                return Err(FerroError::Wal(format!(
+                    "frame at lsn {lsn} failed its CRC; the bytes on the wire are not the bytes \
+                     the primary wrote"
+                )));
+            }
+
+            let embedded = u64::from_be_bytes(frame[4..12].try_into().unwrap());
+            if embedded != lsn {
+                return Err(FerroError::Wal(format!(
+                    "frame says it is lsn {embedded} but the stream places it at {lsn}; the \
+                     replica would silently apply the log out of order"
+                )));
+            }
+
+            let prev_lsn = u64::from_be_bytes(frame[12..20].try_into().unwrap());
+            let txn_id = u64::from_be_bytes(frame[20..28].try_into().unwrap());
+            let kind = crate::wal::log::RecKind::deserialize(&frame[28..total - 4])?;
+            checked.push((lsn, LogRecord { lsn, prev_lsn, txn_id, kind }));
+
+            at += total;
+            lsn += total as u64;
+        }
+
+        // A replica's file does not yet contain the pages the primary is describing, so redo
+        // would fail with a bare EOF on the first record. Recovery has the same problem after a
+        // crash that extended the file without flushing, and solves it the same way: materialise
+        // an empty page first. Found by the test, which is why this mirrors `recover()` rather
+        // than being a second answer to one question.
+        for (_, rec) in &checked {
+            let touched = match &rec.kind {
+                crate::wal::log::RecKind::HeapInsert { page_id, .. }
+                | crate::wal::log::RecKind::HeapDelete { page_id, .. }
+                | crate::wal::log::RecKind::HeapUpdate { page_id, .. } => Some(*page_id),
+                crate::wal::log::RecKind::Clr { redo, .. } => match redo.as_ref() {
+                    crate::wal::log::RecKind::HeapInsert { page_id, .. }
+                    | crate::wal::log::RecKind::HeapDelete { page_id, .. }
+                    | crate::wal::log::RecKind::HeapUpdate { page_id, .. } => Some(*page_id),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(page_id) = touched {
+                if self.bp.disk_manager.read(page_id).is_err() {
+                    self.bp.disk_manager.write(
+                        page_id,
+                        &crate::storage::heap_page::Page::empty(page_id).serialize()?,
+                    )?;
+                }
+            }
+        }
+
+        // Only now apply. Redo is idempotent by page LSN, so an overlap re-sent after a reconnect
+        // is skipped rather than applied twice.
+        for (rec_lsn, rec) in &checked {
+            match &rec.kind {
+                crate::wal::log::RecKind::HeapInsert { .. }
+                | crate::wal::log::RecKind::HeapDelete { .. }
+                | crate::wal::log::RecKind::HeapUpdate { .. } => {
+                    crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, &rec.kind)?;
+                }
+                crate::wal::log::RecKind::Clr { redo, .. } => {
+                    crate::wal::recovery::apply_redo(&self.bp, *rec_lsn, redo)?;
+                }
+                _ => {}
+            }
+        }
+
+        // `fetch_max`, not a store: a late batch that overlaps ground already covered must not
+        // move the replica backwards.
+        self.applied_lsn.fetch_max(lsn, std::sync::atomic::Ordering::SeqCst);
+        Ok(lsn)
+    }
+}
