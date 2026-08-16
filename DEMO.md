@@ -23,11 +23,25 @@ line is a live comparison, not a label. There are no hard-coded expected values 
 were measurements.
 
 ```sh
-cargo test                               # 430 tests, unchanged by this demo
+cargo test                               # the demo adds no tests and changes no existing one
 ```
 
 `cargo test` **compiles** the example (so it cannot rot silently against the API) but does **not
 run** it. The demo is a demonstration, not part of the test gate.
+
+### Proof that the gate actually fails
+
+A demo that always prints `MET` proves nothing. The failure path was forced twice, each time
+against a throwaway extraction of the committed tree so the real one was untouched:
+
+| sabotage | result |
+|---|---|
+| **demo-level** — run the lease scan *before* the leases expire (`far_future` → `now_millis()`) | criterion 8 **NOT MET**, 5 named failed checks, `branches reaped: 0`, pages `8 → 40 → 40`, exit **1** |
+| **engine-level** — `MergeOutcome::lost_a_write()` hard-coded to `false` in `src/tel/merge.rs` | criterion 5 **NOT MET**, failed check "a lossy resolution reports ResolvedWithLoss", exit **1** |
+
+The second matters more than the first: it breaks the *engine*, not the demo, and the demo caught
+it. Both runs still reported 10 of 10 criteria and failed on the count of those met, so the
+"fewer than ten reported" guard and the per-criterion verdict are independently live.
 
 ---
 
