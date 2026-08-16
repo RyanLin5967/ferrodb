@@ -27,7 +27,7 @@
 //! asserts it does in fact duplicate and drop. Without it, the exactly-once test above would pass
 //! just as well against a scenario that never put any pressure on the join.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
@@ -37,7 +37,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
-use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact};
+use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact, SnapshotBoundary};
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -214,13 +214,13 @@ fn snapshot_and_stream_deliver_every_row_exactly_once() {
         "the snapshot is not the state its own transaction saw: {snapshot_feed}"
     );
     assert!(
-        snap.included.includes(1) || snap.included.high_water > 1,
+        snap.boundary.txns().includes(1) || snap.boundary.txns().high_water > 1,
         "the snapshot boundary is empty, so nothing could be filtered by it"
     );
 
-    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog))
-        .resuming_after_snapshot(snap.included.clone());
-    let (stream_feed, suppressed) = drain(&streamer, &d.wal, snap.resume_lsn);
+    let streamer =
+        FeedStreamer::new(LogicalDecoder::new(catalog)).resuming_after_snapshot(snap.boundary.clone());
+    let (stream_feed, suppressed) = drain(&streamer, &d.wal, snap.resume_lsn());
 
     assert!(
         suppressed > 0,
@@ -401,8 +401,14 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
     exec("INSERT INTO b VALUES (7, 70);", catalog, &bp, &txn, &mut app);
     d.wal.flush().unwrap();
 
-    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog))
-        .resuming_after_snapshot(handoff.snapshot.clone());
+    // One boundary naming both tables, because this one reader delivered both.
+    let boundary = SnapshotBoundary::new(
+        BTreeSet::from(["a".to_string(), "b".to_string()]),
+        handoff.snapshot.clone(),
+        handoff.resume_lsn,
+    );
+    let streamer =
+        FeedStreamer::new(LogicalDecoder::new(catalog)).resuming_after_snapshot(boundary);
     let (stream_feed, suppressed) = drain(&streamer, &d.wal, handoff.resume_lsn);
     assert!(suppressed > 0, "the single boundary suppressed nothing, so it was never exercised");
 

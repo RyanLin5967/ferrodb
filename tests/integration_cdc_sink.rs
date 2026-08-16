@@ -41,7 +41,10 @@ fn example_bin(name: &str) -> PathBuf {
     if p.ends_with("deps") {
         p.pop();
     }
-    let bin = p.join("examples").join(name);
+        // `EXE_SUFFIX` is "" on unix and ".exe" on Windows. Hardcoding the unix name made every
+    // example-spawning test fail on the Windows runner with "The system cannot find the file
+    // specified" - the binary was built, just not under the name being looked for.
+    let bin = p.join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let bin_time = std::fs::metadata(&bin)
         .unwrap_or_else(|e| panic!("{} missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
@@ -105,7 +108,15 @@ fn query(db: &Path, sql: &str) -> String {
         .output()
         .expect("run sqlite3");
     assert!(out.status.success(), "sqlite3 failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    // The sqlite3 CLI terminates rows with CRLF on Windows and LF elsewhere, so a raw comparison
+    // fails there on line endings alone while every byte of DATA matches - which is exactly what
+    // the Windows runner reported:
+    //   left:  "1|widget|999|0\r\n2|gadget|20|1\r\n3|doohickey|30|0"
+    //   right: "1|widget|999|0\n2|gadget|20|1\n3|doohickey|30|0"
+    //
+    // Only the row SEPARATOR is normalised, deliberately - a bare `\r` inside a value is data and
+    // must still show up as a difference. Stripping every `\r` would hide it.
+    String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n").trim().to_string()
 }
 
 #[test]

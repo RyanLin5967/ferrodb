@@ -143,13 +143,20 @@ pub struct ChangeEvent {
     pub lsn: u64,
     /// LSN of the `Commit` that made it visible. Events are ordered by this.
     pub commit_lsn: u64,
-    /// The LSN immediately **after** that commit record — where a consumer resumes.
+    /// The LSN immediately **after** that commit record.
     ///
-    /// This exists because `commit_lsn + 1` is not a position: LSNs are byte offsets and records
-    /// are variable length, so resuming one byte past a commit lands inside it and the walk dies
-    /// with `eof before finished record`. A consumer that has processed this event stores
-    /// `commit_end_lsn` and passes it as the next `from_lsn`. Found by a test that split a range at
-    /// `commit_lsn + 1` and got exactly that error.
+    /// It exists because `commit_lsn + 1` is not a position: LSNs are byte offsets and records are
+    /// variable length, so resuming one byte past a commit lands inside it and the walk dies with
+    /// `eof before finished record`.
+    ///
+    /// **It is NOT a safe resume point on its own, and this doc used to say it was.** A transaction
+    /// that opened before this commit and has not committed yet has records BELOW this position, so
+    /// a consumer restarting here reads past them and loses that transaction entirely when it
+    /// commits. Measured: a consumer persisting only a commit position lost an in-flight
+    /// transaction's row across a restart, while one persisting the streamer's own read cursor kept
+    /// it. Persist [`super::stream::Pumped::cursor`] for where to READ and
+    /// [`super::stream::Pumped::emitted_through`] for what has been DELIVERED; this field is useful
+    /// for ordering and idempotence, not for seeking.
     pub commit_end_lsn: u64,
     pub table: String,
     /// Column names, positionally matching the values in `op`.
@@ -190,6 +197,13 @@ pub struct Decoded {
     /// Transactions still open when the scan ended. Their changes are **withheld, not lost** — a
     /// later decode covering their commit will emit them.
     pub open: BTreeSet<u64>,
+    /// The earliest record belonging to any still-open transaction.
+    ///
+    /// A caller advancing a cursor MUST NOT go past this, or those records are stepped over and the
+    /// transaction's changes are lost when it finally commits — the decoder would see a `Commit`
+    /// with nothing staged and emit nothing at all. `open` alone cannot express that, because it
+    /// names the transactions without saying where they began.
+    pub open_from: Option<u64>,
 }
 
 impl Decoded {
@@ -486,6 +500,12 @@ impl LogicalDecoder {
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
         // and said so.
         out.open = staged.keys().copied().collect();
+        // The earliest STAGED record, not the `Begin`: `Begin` stages nothing, so resuming at the
+        // first row record loses no information and rewinds less.
+        out.open_from = staged
+            .values()
+            .flat_map(|changes| changes.iter().map(|(lsn, _, _, _)| *lsn))
+            .min();
         Ok(out)
     }
 }

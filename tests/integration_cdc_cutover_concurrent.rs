@@ -21,6 +21,7 @@
 //! because the green run tells you nothing about which kind you got. The anti-vacuity assertions at
 //! the end fail the test rather than let it pass having checked nothing.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +29,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::{Column, DataType, Value};
 use ferrodb::catalog::schema::Schema;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::snapshot::SnapshotBoundary;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::HeapFileManager;
@@ -101,7 +103,7 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         }
     };
 
-    let (snap_ids, resume_lsn, boundary, slow_id) = std::thread::scope(|s| {
+    let (snap_ids, resume_lsn, boundary_txns, slow_id) = std::thread::scope(|s| {
         // Racing writers: unsynchronised begin/commit for the whole run.
         for _ in 0..4 {
             let (txn, next_id, committed, commits, stop, write_row) = (
@@ -191,10 +193,13 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
 
     wal.flush().unwrap();
 
-    // Stream from the handoff, skipping what the snapshot already had.
+    // Stream from the handoff, skipping what the snapshot already had. The boundary names `t`
+    // because `t` is the only table this snapshot read.
+    let boundary =
+        SnapshotBoundary::new(BTreeSet::from(["t".to_string()]), boundary_txns, resume_lsn);
     let streamer = FeedStreamer::new(LogicalDecoder::for_table(dir_root, "t", schema(), u32::MAX))
         .resuming_after_snapshot(boundary);
-    let mut sub = Subscription::new(&wal, resume_lsn).expect("subscribe at the handoff");
+    let mut sub = Subscription::following(&wal, &streamer).expect("subscribe at the handoff");
     let mut feed: Vec<u8> = Vec::new();
     let mut suppressed = 0;
     for round in 0..2000 {

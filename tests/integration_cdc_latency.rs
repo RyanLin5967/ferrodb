@@ -19,7 +19,10 @@ fn example_bin(name: &str) -> PathBuf {
     if p.ends_with("deps") {
         p.pop();
     }
-    let bin = p.join("examples").join(name);
+        // `EXE_SUFFIX` is "" on unix and ".exe" on Windows. Hardcoding the unix name made every
+    // example-spawning test fail on the Windows runner with "The system cannot find the file
+    // specified" - the binary was built, just not under the name being looked for.
+    let bin = p.join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let t = std::fs::metadata(&bin)
         .unwrap_or_else(|e| panic!("{} missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
