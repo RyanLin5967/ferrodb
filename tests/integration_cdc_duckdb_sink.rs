@@ -19,6 +19,11 @@
 //! driver — [`Reader`] below records which one ran, and the fallback is explicitly the weaker of the
 //! two rather than an equal. When both are present, `both_readers_agree` checks them against each
 //! other, which is what stops the fallback rotting unnoticed.
+//!
+//! CI installs the CLI on all three runners and sets `FERRODB_REQUIRE_DUCKDB_CLI=1`, so there the
+//! fallback is not merely discouraged — taking it is a failure. That variable is what closes the
+//! hole this file used to have: the comparison was written, and then ran nowhere but a developer's
+//! laptop, because every CI runner quietly took the other branch and still reported green.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -88,20 +93,68 @@ fn target_dir() -> PathBuf {
     p
 }
 
-/// The `duckdb` CLI, if this machine has one. Unlike `sqlite3` it is not shipped with macOS, so its
-/// absence is a fact about the machine rather than a broken checkout — hence an Option and a
-/// documented fallback, not a panic.
+/// Whether this environment has DECLARED that the `duckdb` CLI must be present.
+///
+/// Unset means "a developer machine": fall back to the Go reader and say so. CI sets it to `1`,
+/// which turns that fallback from a documented degradation into a hard failure. Without this the
+/// two outcomes are indistinguishable — a CI run whose CLI install silently did nothing reports
+/// exactly the same green as one that compared against the CLI, and the independence this file
+/// claims would be unverified on every platform at once.
+///
+/// An unrecognised value is REFUSED rather than read as "not required". A guard that falls through
+/// to allow when it cannot parse its own input is not a guard, and the failure it would wave
+/// through here is precisely the one it exists to catch.
+fn cli_required() -> bool {
+    match std::env::var("FERRODB_REQUIRE_DUCKDB_CLI") {
+        Err(_) => false,
+        Ok(v) => match v.trim() {
+            "1" => true,
+            "0" | "" => false,
+            other => panic!(
+                "FERRODB_REQUIRE_DUCKDB_CLI is {other:?}; it takes 1 or 0. Refusing to guess, \
+                 because guessing \"not required\" would silently drop the CLI comparison."
+            ),
+        },
+    }
+}
+
+/// The `duckdb` CLI, if this machine has one. Unlike `sqlite3` it is not shipped with macOS, so on
+/// a developer machine its absence is a fact about the machine rather than a broken checkout —
+/// hence an Option and a documented fallback, not a panic.
+///
+/// Where `FERRODB_REQUIRE_DUCKDB_CLI=1` says otherwise, that same absence is a broken environment
+/// and this refuses. The check lives HERE rather than in each caller so that every path to the
+/// weaker reader inherits it — including one added later by someone who did not read this comment.
 fn duckdb_cli() -> Option<String> {
+    // Parsed FIRST, and on every call, rather than only in the not-found branch below. A typo like
+    // `FERRODB_REQUIRE_DUCKDB_CLI=true` would otherwise sit unnoticed on every machine that happens
+    // to have a CLI, and stop being a requirement on the exact day one went missing — which is the
+    // day it was supposed to speak up.
+    let required = cli_required();
     for c in ["duckdb", "/opt/homebrew/bin/duckdb", "/usr/local/bin/duckdb"] {
         if Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
             return Some(c.to_string());
         }
     }
+    assert!(
+        !required,
+        "FERRODB_REQUIRE_DUCKDB_CLI=1, but no `duckdb` CLI is on PATH.\n\
+         These tests would otherwise read the destination back through the same Go driver that \
+         wrote it, which agrees with itself about any shared misreading — so the independence they \
+         claim would be unverified, and the run would still be green.\n\
+         Install the CLI, or unset the variable to accept the weaker reader knowingly."
+    );
     None
 }
 
 fn example_bin(name: &str) -> PathBuf {
-    let bin = target_dir().join("examples").join(name);
+    // `EXE_SUFFIX` is "" on unix and ".exe" on Windows, and leaving it out is not a portability
+    // nicety — it is the difference between this file running on Windows and not running at all.
+    // Nine sibling helpers hardcoded the unix name, all failed the Windows runner with "the system
+    // cannot find the file specified" on a binary `cargo build --examples` had just built, and were
+    // fixed together. This file was written in parallel with that fix and did not inherit it, so
+    // every test here panicked before reaching a single DuckDB assertion.
+    let bin = target_dir().join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let bin_time = std::fs::metadata(&bin)
         .unwrap_or_else(|e| panic!("{} missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
@@ -386,7 +439,8 @@ fn both_readers_agree() {
         let _ = writeln!(
             std::io::stderr(),
             "NOTE: no duckdb CLI on this machine; the other tests in this file ran on the WEAKER \
-             fallback reader (the same Go driver that did the writing)."
+             fallback reader (the same Go driver that did the writing). Set \
+             FERRODB_REQUIRE_DUCKDB_CLI=1 to make that a failure instead of a notice — CI does."
         );
         return;
     };

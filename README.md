@@ -26,12 +26,13 @@ any shared misreading. Those tests **fail loudly** rather than skipping when the
 missing: a test that silently skips is a test that always passes. `cargo build` and `cargo run`
 need none of it.
 
-The **`duckdb` CLI** is optional and is the one exception to that rule. It is not shipped with any
-OS here, so its absence is a fact about the machine rather than a broken checkout; the DuckDB sink
-tests fall back to a second process through the Go driver and print which reader ran, because a
-green run on the weaker reader must not be mistaken for one that exercised the CLI. cgo is *not*
-optional: the DuckDB driver links DuckDB statically, so `CGO_ENABLED=0` fails to build the whole
-consumer module, SQLite sink included.
+The **`duckdb` CLI** is optional on a developer machine and is the one exception to that rule. It is
+not shipped with any OS here, so its absence is a fact about the machine rather than a broken
+checkout; the DuckDB sink tests fall back to a second process through the Go driver and print which
+reader ran, because a green run on the weaker reader must not be mistaken for one that exercised the
+CLI. Set **`FERRODB_REQUIRE_DUCKDB_CLI=1`** to turn that notice into a failure — CI does, so the
+fallback is never what CI silently measures. cgo is *not* optional: the DuckDB driver links DuckDB
+statically, so `CGO_ENABLED=0` fails to build the whole consumer module, SQLite sink included.
 
 ```
 git clone https://github.com/RyanLin5967/ferrodb.git
@@ -402,12 +403,18 @@ driver and say so; that fallback is the weaker check, and `both_readers_agree` p
 wherever both exist. Because DuckDB is *typed*, its tests catch something SQLite's cannot: a sink
 that declared every column `TEXT` would pass every SQLite assertion, and fails here.
 
-Worth being exact about, because a green CI badge otherwise implies more than it should: **the CI
-runners have no `duckdb` CLI**, so every CI run exercises the fallback reader and the CLI
-comparison runs only on a developer machine that has the CLI installed. The fallback is held to the
-CLI's exact rendering — `NULL` printed as four characters, a `DOUBLE` of 2 printed `2.0`, a
-`TIMESTAMP` printed without a zone — and `both_readers_agree` compares those cases specifically,
-since queries returning plain non-null scalars agree by accident and prove nothing.
+CI installs a pinned `duckdb` CLI on all three runners and sets `FERRODB_REQUIRE_DUCKDB_CLI=1`,
+which makes falling back to the Go reader a **failure** rather than a quiet degradation. That
+variable is the point of the arrangement: without it, a CI run whose CLI install had stopped working
+would report exactly the same green as one that compared against the CLI.
+
+This corrects what this section said until recently — that the runners had no CLI, so the comparison
+ran nowhere but a developer's laptop. That was accurate when written and is why it is recorded here
+rather than quietly deleted: the comparison had been *written* and was *running nowhere*, and no
+test failure would ever have said so. The fallback is held to the CLI's exact rendering — `NULL`
+printed as four characters, a `DOUBLE` of 2 printed `2.0`, a `TIMESTAMP` printed without a zone —
+and `both_readers_agree` compares those cases specifically, since queries returning plain non-null
+scalars agree by accident and prove nothing.
 
 `-engine duckdb` needs **cgo** (`github.com/marcboeker/go-duckdb` links DuckDB statically), so
 `CGO_ENABLED=0` will not build the consumer at all — the cost is module-wide, not per-engine.

@@ -484,9 +484,13 @@ func renderCell(c any) string {
 }
 
 // duckSQL runs one statement against a DuckDB file from a separate process and renders any rows the
-// way the `duckdb` and `sqlite3` CLIs do in list mode — columns joined by `|`, one row per line,
-// NULL as the empty string, booleans as true/false. Byte-for-byte comparable with the CLI, which is
-// the point: a test can run both and check they agree.
+// way the `duckdb` CLI does in list mode — columns joined by `|`, one row per line, NULL as the four
+// characters `NULL`, booleans as true/false. Byte-for-byte comparable with the CLI, which is the
+// point: a test can run both and check they agree.
+//
+// (This said "NULL as the empty string" and named `sqlite3` alongside `duckdb`. The empty string is
+// sqlite3's convention; `renderCell` implements duckdb's, and its tests pin duckdb's — so the
+// sentence described neither the code nor a reader anyone here uses.)
 //
 // This exists so a destination can be inspected on a machine with no `duckdb` CLI installed. It is
 // a STRICTLY WEAKER check than the CLI and callers must not pretend otherwise — it is the same

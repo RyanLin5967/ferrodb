@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -427,5 +429,81 @@ func TestRenderCellMatchesTheDuckdbCLI(t *testing.T) {
 		if got := renderCell(c.in); got != c.want {
 			t.Errorf("renderCell(%#v) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// duckdbCLI finds the `duckdb` CLI, and refuses to report it missing when the environment has said
+// it must be there.
+//
+// The same contract as the Rust suite's guard, deliberately: the CLI is optional on a developer
+// machine and mandatory under FERRODB_REQUIRE_DUCKDB_CLI=1, which CI sets. Returning "" is how a
+// developer machine legitimately opts out; it is never how a misconfigured CI run opts out, because
+// that path fails the test instead.
+func duckdbCLI(t *testing.T) string {
+	t.Helper()
+	// Parsed FIRST, and on every call, rather than only when no CLI turned up. A typo like
+	// `FERRODB_REQUIRE_DUCKDB_CLI=true` would otherwise sit unnoticed on every machine that happens
+	// to have a CLI, and stop being a requirement on the exact day one went missing.
+	//
+	// An unrecognised value is refused rather than read as "not required": a guard that falls
+	// through to allow when it cannot parse its own input waves through exactly the
+	// misconfiguration it exists to catch.
+	required := false
+	switch v := strings.TrimSpace(os.Getenv("FERRODB_REQUIRE_DUCKDB_CLI")); v {
+	case "", "0":
+	case "1":
+		required = true
+	default:
+		t.Fatalf("FERRODB_REQUIRE_DUCKDB_CLI is %q; it takes 1 or 0", v)
+	}
+	for _, c := range []string{"duckdb", "/opt/homebrew/bin/duckdb", "/usr/local/bin/duckdb"} {
+		if err := exec.Command(c, "--version").Run(); err == nil {
+			return c
+		}
+	}
+	if required {
+		t.Fatal("FERRODB_REQUIRE_DUCKDB_CLI=1, but no `duckdb` CLI is on PATH; the rendering " +
+			"expectations below would then be checked against nothing but themselves")
+	}
+	return ""
+}
+
+// The hardcoded table above is a claim about what a program on ANOTHER machine prints, and nothing
+// in this package could contradict it — the expectations were measured once, by hand, and would go
+// on passing forever after the CLI changed or after someone mistyped one of them.
+//
+// This runs the real CLI and the fallback reader over the same values and compares the two. It is
+// the unit-level twin of the Rust suite's `both_readers_agree`, and it covers the cases that can
+// actually differ: NULL, a DOUBLE holding an integral value, and timestamps with and without a
+// fractional part. Anything returning plain non-null scalars agrees by accident and proves nothing.
+func TestRenderCellAgreesWithTheRealDuckdbCLI(t *testing.T) {
+	cli := duckdbCLI(t)
+	if cli == "" {
+		// Reachable only on a developer machine with no CLI. CI cannot land here: the guard above
+		// fails the test instead, so this is never how a CI run goes green.
+		t.Skip("no duckdb CLI on this machine; set FERRODB_REQUIRE_DUCKDB_CLI=1 to make this fatal")
+	}
+	const probe = `SELECT NULL, CAST(2 AS DOUBLE), CAST(1.5 AS DOUBLE), CAST(7 AS BIGINT), ` +
+		`true, false, CAST('2024-01-02 03:04:05' AS TIMESTAMP), ` +
+		`CAST('2024-01-02 03:04:05.123' AS TIMESTAMP);`
+
+	// The CLI with no database argument runs in memory, which is all this needs.
+	out, err := exec.Command(cli, "-noheader", "-list", "-c", probe).Output()
+	if err != nil {
+		t.Fatalf("run the duckdb CLI: %v", err)
+	}
+	want := strings.TrimSpace(string(out))
+
+	got, err := duckSQL(filepath.Join(t.TempDir(), "probe.duckdb"), probe)
+	if err != nil {
+		t.Fatalf("run the fallback reader: %v", err)
+	}
+	got = strings.TrimSpace(got)
+
+	if want == "" {
+		t.Fatal("the CLI printed nothing, so the comparison would be vacuous")
+	}
+	if got != want {
+		t.Errorf("the fallback reader and the duckdb CLI disagree:\n  CLI:      %q\n  fallback: %q", want, got)
 	}
 }

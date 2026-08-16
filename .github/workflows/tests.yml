@@ -14,6 +14,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # The DuckDB sink tests read their destination back with the `duckdb` CLI - a separate binary
+      # and a separately built DuckDB - because a writer checked with its own reader agrees with
+      # itself about any shared misreading. Where no CLI is found they fall back to the Go driver
+      # that did the writing, which is strictly weaker.
+      #
+      # This says the fallback is NOT acceptable here. Without it, a run whose CLI install stopped
+      # working reports exactly the same green as a run that compared against the CLI, and the
+      # comparison would go back to running nowhere but a developer's laptop - which is the state
+      # this variable exists to end, and which no test failure would have revealed.
+      FERRODB_REQUIRE_DUCKDB_CLI: "1"
+      # Pinned, not "latest": an unpinned CLI upgrade that changed a rendering would turn
+      # `both_readers_agree` red on an unrelated pull request, and this is also the version the
+      # rendering expectations in sink_duckdb_test.go were measured against.
+      DUCKDB_VERSION: v1.5.5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,14 +58,73 @@ jobs:
         working-directory: cdc-consumer
         run: go mod download
 
-      - name: Go tests
-        working-directory: cdc-consumer
-        run: go test ./...
-
       # sqlite3 ships on the ubuntu and macos runners; Windows needs it installed.
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'
         run: choco install sqlite --no-progress -y
+
+      # The duckdb CLI ships with no runner image, so it is fetched. Two steps rather than one
+      # because the extraction tool differs: `unzip` is absent from Git-for-Windows bash, and
+      # PowerShell's Expand-Archive does not exist on the unix runners. One step spanning both
+      # would have to guess, and a guess here degrades to "no CLI", which is the silent skip.
+      - name: Install the duckdb CLI (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An ALLOWLIST of (os, arch) pairs, not a default. A pair nobody has thought about must
+          # stop the run, because the alternative is downloading an asset for the wrong machine or
+          # falling through to no CLI at all - and the whole point of the variable set above is
+          # that "no CLI" can no longer pass quietly.
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64)   asset=duckdb_cli-linux-amd64.zip ;;
+            Linux/ARM64) asset=duckdb_cli-linux-arm64.zip ;;
+            macOS/X64|macOS/ARM64) asset=duckdb_cli-osx-universal.zip ;;
+            *)
+              echo "No duckdb CLI asset is known for ${RUNNER_OS}/${RUNNER_ARCH}." >&2
+              echo "Add the pair here rather than letting the sink tests fall back silently." >&2
+              exit 1 ;;
+          esac
+          dest="$HOME/duckdb-cli"
+          mkdir -p "$dest"
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${asset}"
+          unzip -o -q /tmp/duckdb.zip -d "$dest"
+          rm -f /tmp/duckdb.zip
+          # Name the failure here rather than three steps later as "duckdb: command not found",
+          # which reads like a PATH problem and is not one.
+          test -f "$dest/duckdb" || {
+            echo "$asset extracted but produced no duckdb binary in $dest" >&2
+            exit 1
+          }
+          chmod +x "$dest/duckdb"
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: Install the duckdb CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Invoke-WebRequest spends most of a large download rendering a progress bar it cannot
+          # show on a runner; silencing it is the difference between seconds and minutes.
+          $ProgressPreference = 'SilentlyContinue'
+          $asset = switch ($env:RUNNER_ARCH) {
+            'X64'   { 'duckdb_cli-windows-amd64.zip' }
+            'ARM64' { 'duckdb_cli-windows-arm64.zip' }
+            # Same allowlist discipline as the unix step: refuse, do not fall back to no CLI.
+            default { throw "No duckdb CLI asset is known for Windows/$($env:RUNNER_ARCH)." }
+          }
+          $dest = Join-Path $env:USERPROFILE 'duckdb-cli'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'duckdb.zip'
+          Invoke-WebRequest -Uri "https://github.com/duckdb/duckdb/releases/download/$env:DUCKDB_VERSION/$asset" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Remove-Item $zip
+          # Name the failure here rather than three steps later as "duckdb: command not found",
+          # which reads like a PATH problem and is not one.
+          $exe = Join-Path $dest 'duckdb.exe'
+          if (-not (Test-Path $exe)) { throw "$asset extracted but produced no duckdb.exe in $dest" }
+          Add-Content -Path $env:GITHUB_PATH -Value $dest
 
       - name: Verify the test toolchain is present
         shell: bash
@@ -64,11 +138,48 @@ jobs:
             echo "CGO_ENABLED is '$(go env CGO_ENABLED)'; the DuckDB sink links DuckDB statically" >&2
             exit 1
           }
-          # No duckdb CLI is installed on these runners, so the DuckDB sink tests read the
-          # destination back through the WEAKER fallback reader (the same Go driver that wrote it).
-          # Recorded here rather than left to be inferred from a green run: the CLI comparison in
-          # `both_readers_agree` does NOT run in CI, only on a developer machine that has the CLI.
-          echo "toolchain OK (duckdb CLI absent: DuckDB sink tests use the fallback reader)"
+          # cgo needs a C compiler, and on Windows that is the one part of this toolchain the image
+          # supplies rather than a step above. Naming its absence here beats discovering it as a
+          # link error inside `go build` with no indication that the compiler was the missing piece.
+          cc="$(go env CC)"
+          command -v "$cc" >/dev/null 2>&1 || {
+            echo "cgo needs a C compiler but '$cc' (go env CC) is not on PATH" >&2
+            exit 1
+          }
+          "$cc" --version | head -1
+          # The duckdb CLI is now INSTALLED on every runner (see the steps above) and
+          # FERRODB_REQUIRE_DUCKDB_CLI=1 makes the sink tests refuse the fallback reader rather
+          # than quietly using it. Both halves are asserted here, because the failure this catches
+          # is the one that produces a green run: an install step that stopped working would
+          # otherwise just move the tests back onto the weaker reader without saying anything.
+          duckdb --version
+          duckdb --version | grep -qF "${DUCKDB_VERSION}" || {
+            echo "duckdb on PATH is '$(duckdb --version)', not the pinned ${DUCKDB_VERSION}." >&2
+            echo "A different CLI may render values differently, which reads as a data mismatch." >&2
+            exit 1
+          }
+          test "${FERRODB_REQUIRE_DUCKDB_CLI}" = "1" || {
+            echo "FERRODB_REQUIRE_DUCKDB_CLI is not 1, so the sink tests may silently fall back" >&2
+            exit 1
+          }
+          echo "toolchain OK (duckdb CLI ${DUCKDB_VERSION} present and required)"
+
+      # cgo, proven per platform and attributed to its own step.
+      #
+      # go-duckdb links DuckDB statically, so this is where a platform without a working cgo
+      # toolchain fails - loudly, by name, before `go test` and `cargo test` fail with a stack of
+      # link errors that say nothing about the cause. It is also the step that makes the Windows
+      # claim real rather than assumed: the DuckDB sink had only ever been built on darwin/arm64.
+      - name: Build the consumer (proves cgo and go-duckdb work on this platform)
+        working-directory: cdc-consumer
+        run: go build ./...
+
+      # After the toolchain checks, not before them. These tests now include a rendering comparison
+      # against the real duckdb CLI, so running them earlier - as this step used to - would have
+      # them refuse on a CLI that had not been installed yet.
+      - name: Go tests
+        working-directory: cdc-consumer
+        run: go test ./...
 
       # Examples are spawned by several integration tests, and `cargo test` does NOT rebuild them.
       # Without this they would be stale or absent, and the freshness guards in those tests would
