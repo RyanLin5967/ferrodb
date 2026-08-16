@@ -273,10 +273,17 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
   than emitted. A consumer shown an aborted transaction's rows has been told about data that never
   existed.
-- **Resumable.** Each event carries `commit_end_lsn`, the position to resume from. A consumer
-  reconnects there and the halves join with no gap and no overlap. The cursor advances only past a
-  commit that was actually emitted — never to the durable frontier, which would step over an
-  in-flight transaction's records permanently.
+- **Resumable, from two positions rather than one.** A consumer persists where to resume *reading*
+  and what it has already been *delivered*, and they are different numbers whenever a transaction is
+  in flight. Persisting only a commit position loses data: a transaction that opened before that
+  commit has records *below* it, so a restart reads past them and never sees that transaction at
+  all. Measured, not reasoned — a consumer resuming from its highest `commit_lsn` lost an in-flight
+  transaction's row, while one restoring both positions kept it.
+
+  The read cursor advances only past a commit that was actually emitted, and never past the earliest
+  record of a still-open transaction. Clamping it that way re-reads transactions that committed
+  afterwards, which is why the delivered position exists to suppress them — read from the low-water
+  mark, deliver past the high-water mark.
 - **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
   the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
   direction is deliberate: handing off after the scan silently loses concurrent changes, while

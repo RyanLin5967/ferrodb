@@ -265,6 +265,30 @@ impl Subscription {
         Self::new(wal, from)
     }
 
+    /// Resume a subscription a previous process was running, restoring BOTH positions.
+    ///
+    /// A consumer must persist both, and persisting only a commit position loses data. Measured
+    /// rather than reasoned: with a transaction in flight, a consumer that stored only its highest
+    /// `commit_lsn` and resumed reading there missed that transaction's rows entirely when it
+    /// committed, because its records sit BELOW the commit that was recorded. Storing
+    /// [`Pumped::cursor`] as well kept them.
+    ///
+    /// `cursor` is where to resume reading; `emitted_through` is what has already been delivered
+    /// and is what stops the replay between them being handed to the consumer twice.
+    pub fn resume(
+        wal: &std::sync::Arc<WalManager>,
+        cursor: u64,
+        emitted_through: u64,
+    ) -> Result<Self, FerroError> {
+        let pin = wal.pin(cursor)?;
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor, emitted_through, pin })
+    }
+
+    /// What this subscription has delivered. Persist alongside [`Subscription::cursor`].
+    pub fn emitted_through(&self) -> u64 {
+        self.emitted_through
+    }
+
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
@@ -401,6 +425,61 @@ mod tests {
 
     fn decoded_open_hint() -> &'static str {
         "the decoder reported an open transaction"
+    }
+
+    /// **A restart must restore BOTH positions, or an in-flight transaction is lost.**
+    ///
+    /// This is the failure the resumability contract used to describe: `commit_end_lsn` was
+    /// documented as "where a consumer resumes", and a consumer that did exactly that lost a
+    /// transaction which opened before the recorded commit and committed after the restart. Its
+    /// records sit BELOW the commit that was persisted.
+    #[test]
+    fn resuming_from_a_commit_position_alone_loses_an_in_flight_transaction() {
+        let (_d, w) = wal("restart");
+        let w = std::sync::Arc::new(w);
+        let s = streamer();
+
+        // T9 opens and stays open across the restart. T1 commits after it.
+        w.append(9, 0, &RecKind::Begin).unwrap();
+        insert(&w, 9, 99, 990);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut sub = Subscription::from_start(&w).unwrap();
+        let mut buf = Vec::new();
+        let p = sub.pump(&s, &mut buf).unwrap();
+        assert_eq!(p.emitted, 1, "T1 should have been delivered: {p:?}");
+        let (read_at, delivered) = (sub.cursor(), sub.emitted_through());
+        assert!(
+            read_at < delivered,
+            "the read cursor {read_at} is not behind the delivered position {delivered}, so this \
+             test is not exercising a restart with a transaction in flight"
+        );
+        drop(sub);
+
+        w.append(9, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // The WRONG restart: resume reading at the commit position, as the old doc said to.
+        let mut wrong = Subscription::resume(&w, delivered, delivered).unwrap();
+        let mut wb = Vec::new();
+        wrong.pump(&s, &mut wb).unwrap();
+        assert!(
+            !String::from_utf8(wb).unwrap().contains("\"qty\":990"),
+            "resuming at the commit position happened to keep the row - if that is now true the \
+             hazard is gone and this test should be rewritten rather than relaxed"
+        );
+
+        // The RIGHT restart: both positions.
+        let mut right = Subscription::resume(&w, read_at, delivered).unwrap();
+        let mut rb = Vec::new();
+        right.pump(&s, &mut rb).unwrap();
+        assert!(
+            String::from_utf8(rb).unwrap().contains("\"qty\":990"),
+            "restoring both positions still lost the in-flight transaction"
+        );
     }
 
     /// **Clamping the cursor must not turn into unbounded re-delivery.**
