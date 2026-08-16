@@ -74,7 +74,10 @@ fn example_bin(name: &str) -> PathBuf {
     if p.ends_with("deps") {
         p.pop();
     }
-    let out = p.join("examples").join(name);
+        // `EXE_SUFFIX` is "" on unix and ".exe" on Windows. Hardcoding the unix name made every
+    // example-spawning test fail on the Windows runner with "The system cannot find the file
+    // specified" - the binary was built, just not under the name being looked for.
+    let out = p.join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     assert_example_is_fresh(&out);
     out
 }
