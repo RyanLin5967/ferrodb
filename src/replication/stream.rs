@@ -49,7 +49,7 @@ use std::io::Write;
 
 use crate::error::FerroError;
 use crate::wal::log::WalManager;
-use crate::wal::txn::Snapshot as TxnSnapshot;
+use super::snapshot::SnapshotBoundary;
 
 use super::jsonl::write_feed;
 use super::logical::{Decoded, LogicalDecoder};
@@ -99,47 +99,27 @@ impl Pumped {
 }
 
 /// Follows a WAL, emitting committed changes as JSON Lines.
+///
+/// A streamer is **stateless about position** on purpose: it decodes whatever range it is asked
+/// for, and a caller supplies the cursor. Following a snapshot is *not* stateless — it is correct
+/// from exactly one starting cursor — so that lives on [`Subscription::following`], which takes the
+/// cursor from the boundary instead of from the caller. See [`SnapshotBoundary`] for why pairing a
+/// boundary with a cursor of one's own choosing loses data silently.
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
     max_bytes: u64,
-    /// The transactions an initial snapshot already delivered, when this streamer is following one.
-    /// See [`FeedStreamer::resuming_after_snapshot`].
-    already_snapshotted: Option<TxnSnapshot>,
 }
 
 impl FeedStreamer {
     pub fn new(decoder: LogicalDecoder) -> Self {
-        FeedStreamer { decoder, max_bytes: 1 << 20, already_snapshotted: None }
+        FeedStreamer { decoder, max_bytes: 1 << 20 }
     }
 
     /// Bound how much log one pump will decode. A consumer that has been away for a long time
     /// should not cause one unbounded allocation.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes.max(1);
-        self
-    }
-
-    /// Follow on from an initial snapshot **without re-delivering what it already contained**.
-    ///
-    /// The resume LSN a snapshot hands back is deliberately early: it sits at or before the oldest
-    /// transaction that was in flight when the snapshot was taken, so no excluded change can be
-    /// below it. That closes the gap and opens an overlap — the range from there to the snapshot's
-    /// read also contains commits the snapshot *did* see, and re-delivering those is exactly the
-    /// duplication at-least-once tolerates.
-    ///
-    /// The snapshot's transaction set closes it. An event carries the id of the transaction that
-    /// produced it, and [`TxnSnapshot::includes`] answers, by the same visibility rule the rows
-    /// were read with, whether that transaction's work is already in the snapshot. Skipping by
-    /// transaction rather than by LSN is what makes this exact: the two feeds interleave in the
-    /// log, so no single byte offset separates them.
-    ///
-    /// **Only events attributed to a transaction are filtered.** Schema events are logged outside
-    /// any transaction (under id 0, which `begin` never hands out) so the snapshot boundary says
-    /// nothing about them, and suppressing them would leave a consumer without the shape of a table
-    /// created after the cutover.
-    pub fn resuming_after_snapshot(mut self, already_snapshotted: TxnSnapshot) -> Self {
-        self.already_snapshotted = Some(already_snapshotted);
         self
     }
 
@@ -204,11 +184,11 @@ impl FeedStreamer {
             None => 0,
             Some(already) => {
                 let before = events.len();
-                // `already_delivered`, not `includes`: the difference is events logged under
-                // transaction id 0 (DDL), which `includes` reports as contained because 0 is below
-                // every high water mark. The exemption lives in that method rather than here so a
-                // second consumer of the boundary cannot omit it.
-                events.retain(|e| !already.already_delivered(e.txn_id));
+                // Table AND transaction, both asked through the boundary rather than open-coded:
+                // a transaction-only test drops another table's history, and a rule that consults
+                // `includes` instead of `already_delivered` drops DDL. Both defects were real; both
+                // guards now live in the value rather than in this caller.
+                events.retain(|e| !already.suppresses(&e.table, e.txn_id));
                 before - events.len()
             }
         };

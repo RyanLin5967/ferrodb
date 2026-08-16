@@ -426,3 +426,72 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
         }
     }
 }
+
+
+/// **A boundary from a one-table snapshot must not silence another table's history.**
+///
+/// The transaction set answers *when*, not *what*. A snapshot of `a` says nothing whatever about
+/// `b`, yet `b`'s rows were committed by transactions that set contains — so a filter keyed on the
+/// transaction alone drops them. They were never in any snapshot, so nothing else will ever send
+/// them: the stream is the only path they had, and the suppression is reported as legitimate.
+///
+/// It needs a transaction open across the cutover to bite. That is what pulls the resume point back
+/// far enough for the stream to re-read commits from before the snapshot; without it those commits
+/// sit below the cursor and are never decoded, so the filter never gets the chance to be wrong.
+#[test]
+fn a_one_table_boundary_does_not_suppress_another_tables_rows() {
+    let mut d = db("cutover_cross_table");
+    let (bp, txn) = (d.bp.clone(), d.txn.clone());
+    let catalog = &mut d.catalog;
+    let mut app = Session::new();
+    let mut holder = Session::new();
+
+    exec("CREATE TABLE a (id INTEGER NOT NULL, qty INTEGER);", catalog, &bp, &txn, &mut app);
+    exec("CREATE TABLE b (id INTEGER NOT NULL, qty INTEGER);", catalog, &bp, &txn, &mut app);
+    exec("INSERT INTO a VALUES (1, 10);", catalog, &bp, &txn, &mut app);
+
+    // Open across the cutover, so the resume point reaches back over what follows.
+    exec("BEGIN;", catalog, &bp, &txn, &mut holder);
+    exec("INSERT INTO a VALUES (100, 1000);", catalog, &bp, &txn, &mut holder);
+
+    // Committed above the resume point and below the read. Its transaction IS in the snapshot's
+    // set — but the snapshot is of `a`, and this row is in `b`. Nothing has delivered it.
+    exec("INSERT INTO b VALUES (5, 50);", catalog, &bp, &txn, &mut app);
+
+    let mut snap_out: Vec<u8> = Vec::new();
+    let snap = snapshot_table_exact("a", &txn, &mut snap_out, |reader| {
+        app.current = Some(reader);
+        let rows = match exec("SELECT * FROM a;", catalog, &bp, &txn, &mut app) {
+            Outcome::Rows(r) => r,
+            _ => panic!("SELECT did not return rows"),
+        };
+        app.current = None;
+        Ok((vec!["id".into(), "qty".into()], rows))
+    })
+    .expect("exact snapshot of a");
+
+    exec("COMMIT;", catalog, &bp, &txn, &mut holder);
+    d.wal.flush().unwrap();
+
+    // The snapshot covered `a` only, and said so.
+    assert_eq!(ids(&String::from_utf8(snap_out).unwrap()), vec![1u64], "the snapshot of `a` is wrong");
+
+    // A stream whose decoder carries both tables — the ordinary case, since the decoder is built
+    // from the catalog.
+    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog))
+        .resuming_after_snapshot(snap.boundary.clone());
+    let (stream_feed, _suppressed) = drain(&streamer, &d.wal, snap.resume_lsn());
+
+    let b_ids = id_counts_for(&stream_feed, "b");
+    assert_eq!(
+        b_ids.get(&5),
+        Some(&1),
+        "table b's row was suppressed by a boundary taken from a snapshot of table a. It was in no \
+         snapshot and the stream was its only path, so it is gone. Stream: {stream_feed}"
+    );
+
+    // And `a` is still deduplicated, so the fix did not simply disable the filter.
+    let a_ids = id_counts_for(&stream_feed, "a");
+    assert_eq!(a_ids.get(&1), None, "a row the snapshot of `a` already delivered came back");
+    assert_eq!(a_ids.get(&100), Some(&1), "the in-flight transaction's row to `a` never arrived");
+}

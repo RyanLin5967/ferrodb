@@ -75,6 +75,7 @@
 //!   returns, close it with [`TxnManager::end_read_only`], and use its single boundary for the
 //!   whole stream.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -166,6 +167,61 @@ where
     })
 }
 
+/// **Everything a stream needs to join a snapshot exactly, kept as one value.**
+///
+/// The three parts travel together because each is unsafe without the others, and unsafe silently:
+///
+/// - `resume_lsn` without `txns` re-delivers every commit between the resume point and the read.
+/// - `txns` without `tables` is the one a review caught, and it is the dangerous one. **The
+///   transaction set answers *when*, not *what*.** A snapshot of `orders` says nothing whatever
+///   about `shipments` — but `shipments` rows were committed by transactions that set contains, so
+///   a filter keyed on the transaction alone drops them. They were in no snapshot, the stream was
+///   their only path, and the drop is reported as legitimate suppression. That is permanent, silent
+///   loss of one table's history caused by snapshotting a different table.
+/// - `tables` without `resume_lsn` lets a caller start the stream above the resume point, which
+///   re-opens the gap the early resume point exists to close.
+///
+/// So it is built once, by whatever took the snapshot, from what that snapshot actually did.
+#[derive(Debug, Clone)]
+pub struct SnapshotBoundary {
+    tables: BTreeSet<String>,
+    txns: TxnSnapshot,
+    resume_lsn: u64,
+}
+
+impl SnapshotBoundary {
+    /// `tables` must be exactly the tables the snapshot wrote rows for — no more, no fewer.
+    ///
+    /// Naming one it did not deliver suppresses that table's pre-cutover history; omitting one it
+    /// did deliver re-delivers it. Neither is detectable downstream.
+    pub fn new(tables: BTreeSet<String>, txns: TxnSnapshot, resume_lsn: u64) -> Self {
+        SnapshotBoundary { tables, txns, resume_lsn }
+    }
+
+    /// Where the stream must start.
+    pub fn resume_lsn(&self) -> u64 {
+        self.resume_lsn
+    }
+
+    /// The tables the snapshot delivered rows for.
+    pub fn tables(&self) -> &BTreeSet<String> {
+        &self.tables
+    }
+
+    /// The transactions whose work the snapshot's rows already contain.
+    pub fn txns(&self) -> &TxnSnapshot {
+        &self.txns
+    }
+
+    /// **Whether the stream must drop this event because the snapshot already delivered it.**
+    ///
+    /// Both halves, and they fail in opposite directions: the table must be one this snapshot
+    /// covered, and the transaction must be one it contained.
+    pub fn suppresses(&self, table: &str, txn_id: u64) -> bool {
+        self.tables.contains(table) && self.txns.already_delivered(txn_id)
+    }
+}
+
 /// A snapshot whose handoff to the stream is exact: no change missed, none delivered twice.
 ///
 /// Not merged into [`Snapshot`] on purpose. The two carry different promises, and a caller holding
@@ -174,14 +230,11 @@ pub struct ExactSnapshot {
     pub table: String,
     /// Rows written out.
     pub rows: usize,
-    /// **Where the stream resumes.** At or before the oldest transaction in flight when the read
-    /// was taken, so nothing the snapshot excluded can sit below it. Durable.
-    pub resume_lsn: u64,
-    /// **The transactions the rows already contain.** Hand this to
+    /// **What the stream needs to join this snapshot.** Hand it whole to
     /// [`FeedStreamer::resuming_after_snapshot`](super::stream::FeedStreamer::resuming_after_snapshot);
-    /// without it the stream re-delivers everything between `resume_lsn` and the read.
-    pub included: TxnSnapshot,
-    /// A claim on the log at `resume_lsn`, held so a checkpoint cannot discard the records the
+    /// see [`SnapshotBoundary`] for why its parts are not separately safe.
+    pub boundary: SnapshotBoundary,
+    /// A claim on the log at the resume point, held so a checkpoint cannot discard the records the
     /// stream is about to ask for.
     ///
     /// Taken here rather than left to the caller because the window between "snapshot returns" and
@@ -195,13 +248,19 @@ pub struct ExactSnapshot {
     pub reader_txn_id: u64,
 }
 
+impl ExactSnapshot {
+    /// Where the stream resumes. Shorthand for `self.boundary.resume_lsn()`.
+    pub fn resume_lsn(&self) -> u64 {
+        self.boundary.resume_lsn()
+    }
+}
+
 impl std::fmt::Debug for ExactSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExactSnapshot")
             .field("table", &self.table)
             .field("rows", &self.rows)
-            .field("resume_lsn", &self.resume_lsn)
-            .field("included", &self.included)
+            .field("boundary", &self.boundary)
             .field("reader_txn_id", &self.reader_txn_id)
             .finish()
     }
@@ -265,8 +324,14 @@ where
     Ok(ExactSnapshot {
         table: table.to_string(),
         rows: n,
-        resume_lsn: handoff.resume_lsn,
-        included: handoff.snapshot,
+        // The table set is exactly the one table this call read — built from what the snapshot did
+        // rather than from what a caller meant. Naming a table it did not deliver would suppress
+        // that table's whole pre-cutover history in the stream, silently.
+        boundary: SnapshotBoundary::new(
+            BTreeSet::from([table.to_string()]),
+            handoff.snapshot,
+            handoff.resume_lsn,
+        ),
         pin,
         reader_txn_id: handoff.txn_id,
     })
@@ -399,13 +464,13 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("\"op\":\"READ\""), "{text}");
         assert!(
-            txn.wal.flushed_lsn.load(Ordering::SeqCst) >= snap.resume_lsn,
+            txn.wal.flushed_lsn.load(Ordering::SeqCst) >= snap.resume_lsn(),
             "the resume point is not durable"
         );
-        assert_eq!(snap.pin.lsn(), snap.resume_lsn, "the pin is not on the resume point");
+        assert_eq!(snap.pin.lsn(), snap.resume_lsn(), "the pin is not on the resume point");
         assert_eq!(
             txn.wal.min_pinned_lsn(),
-            Some(snap.resume_lsn),
+            Some(snap.resume_lsn()),
             "the log was not claimed at the resume point, so a checkpoint could discard it"
         );
         // The reader is closed: it must not go on blocking checkpoints.
