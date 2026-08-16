@@ -28,3 +28,10 @@ target
 # Every example that opens a database also writes `<db>.wal`, and `*.db` does not match that.
 *.wal
 *.backup/
+
+# `go build` inside cdc-consumer/ names its output after the directory, so this 60MB+ binary
+# (DuckDB is linked statically) reappears every time anyone builds by hand. Named explicitly
+# rather than as `cdc-consumer/*`, which would also swallow the Go sources next to it.
+/cdc-consumer/cdc-consumer
+# DuckDB destinations written by the tests and by the README's examples. `*.db` does not match.
+*.duckdb

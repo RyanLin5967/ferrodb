@@ -8,13 +8,19 @@
 // Go's json package rejects bare NaN and Infinity outright, which is a stronger guarantee than the
 // Python version had — that one accepted them by default and needed an explicit override to refuse.
 //
-// Two subcommands:
+// Subcommands:
 //
-//	validate <feed.jsonl>          check a feed file's format, exit non-zero on any violation
-//	precision <feed.jsonl>         report the JSON type of every column, and which numbers a
-//	                               default float64 decode would silently corrupt
-//	follow <addr> [-key id]        stream a live feed, materialise it, print the resulting table
-//	sink <feed.jsonl> -db f.sqlite land the feed in SQLite with idempotent, order-guarded upserts
+//	validate <feed.jsonl>            check a feed file's format, exit non-zero on any violation
+//	precision <feed.jsonl>           report the JSON type of every column, and which numbers a
+//	                                 default float64 decode would silently corrupt
+//	follow <addr> [-key id]          stream a live feed, materialise it, print the resulting table
+//	sink <feed.jsonl> -db f [-engine] land the feed with idempotent, order-guarded upserts
+//	duckdb-sql <file> <sql>          run one statement against a DuckDB destination, separate process
+//
+// `sink` speaks to two destinations, chosen with `-engine`: `sqlite` (the default, and what the
+// existing tests exercise) and `duckdb`. They are not two spellings of one thing — SQLite is where
+// an operational replica goes and DuckDB is where the analysts' copy goes — but they carry the same
+// four guarantees, and both put the ordering guard in the SQL statement rather than in Go.
 //
 // `follow` is the interesting one. It maintains the table the feed describes — applying READ,
 // INSERT, UPDATE and DELETE to a local map — and prints the result. A caller can then compare that
@@ -448,13 +454,43 @@ func follow(addr, key string, cursor uint64, limit int) error {
 	return table.dump(os.Stdout)
 }
 
-// runSink lands a feed file into SQLite.
+// changeSink is what landing a feed needs of a destination, and nothing more.
+//
+// The interface exists so `runSink` below has exactly one copy of the replay bookkeeping. Two
+// destinations with two hand-written loops is two places for the cursor logic to drift, and drift
+// there is invisible until a replay corrupts one of them.
+type changeSink interface {
+	// apply writes one event, ignoring it if the destination already holds a newer one. The
+	// ordering guard belongs in the implementation's SQL, not in any caller.
+	apply(e *Event) error
+	saveCursor(table string, cursor uint64) error
+	cursor(table string) uint64
+	Close() error
+}
+
+// openDestination picks a sink by engine name, and refuses an engine it does not know.
+//
+// No fallback to a default: a typo in `-engine` that quietly landed the feed somewhere other than
+// where the operator asked is worse than an error, because the destination they were watching stays
+// empty and the one they were not fills up.
+func openDestination(engine, dbPath, key string) (changeSink, error) {
+	switch engine {
+	case "sqlite":
+		return openSink(dbPath, key)
+	case "duckdb":
+		return openDuckSink(dbPath, key)
+	default:
+		return nil, fmt.Errorf("unknown -engine %q; known engines are sqlite and duckdb", engine)
+	}
+}
+
+// runSink lands a feed file into the chosen destination.
 //
 // Deliberately not transactional across the whole file. A sink that only becomes visible at the end
 // of a batch is a sink that loses everything when it dies mid-batch, and the per-row guard already
 // makes re-applying safe — so crashing part-way and being restarted is a normal, correct thing to
 // do here rather than a recovery problem.
-func runSink(feedPath, dbPath, key string) error {
+func runSink(feedPath, dbPath, key, engine string) error {
 	raw, err := os.ReadFile(feedPath)
 	if err != nil {
 		return err
@@ -462,23 +498,39 @@ func runSink(feedPath, dbPath, key string) error {
 	if len(raw) == 0 {
 		return errors.New("feed is empty; a sink that landed nothing has not succeeded")
 	}
-	sink, err := openSink(dbPath, key)
+	sink, err := openDestination(engine, dbPath, key)
 	if err != nil {
 		return err
 	}
-	defer sink.Close()
 
-	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-	applied, skipped := 0, 0
-	var lastTable string
-	var cursor uint64
+	applied, skipped, cursor, lastTable, err := applyFeed(sink, string(raw))
+	// Closing is part of landing the feed, not cleanup after it: the DuckDB sink checkpoints on
+	// close, and a checkpoint that failed leaves a database an outside reader cannot open. Reporting
+	// APPLIED over the top of that would be a green that is not one, so the close error is folded in
+	// before anything is printed.
+	if cerr := sink.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("closing the destination: %w", cerr)
+	}
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "applied %d, skipped %d re-delivered\n", applied, skipped)
+	fmt.Printf("APPLIED %d SKIPPED %d CURSOR %d TABLE %s\n", applied, skipped, cursor, lastTable)
+	return nil
+}
+
+// applyFeed folds every line of a feed into a sink, counting what landed and what was a
+// re-delivery. Engine-independent by construction: everything engine-specific is behind changeSink.
+func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64, lastTable string, err error) {
+	lines := strings.Split(strings.TrimSuffix(raw, "\n"), "\n")
 	for i, line := range lines {
 		if line == "" {
 			continue
 		}
-		e, err := decodeLine(line, i+1)
-		if err != nil {
-			return err
+		e, derr := decodeLine(line, i+1)
+		if derr != nil {
+			return applied, skipped, cursor, lastTable, derr
 		}
 		// Events at or below what this table has already absorbed are re-deliveries. Counted rather
 		// than hidden: "skipped 40" is how an operator sees a replay happening at all.
@@ -486,8 +538,8 @@ func runSink(feedPath, dbPath, key string) error {
 			skipped++
 			continue
 		}
-		if err := sink.apply(e); err != nil {
-			return err
+		if aerr := sink.apply(e); aerr != nil {
+			return applied, skipped, cursor, lastTable, aerr
 		}
 		applied++
 		lastTable = e.Table
@@ -495,19 +547,18 @@ func runSink(feedPath, dbPath, key string) error {
 			cursor = e.CommitEndLSN
 		}
 		if !isSchema(e.Op) {
-			if err := sink.saveCursor(e.Table, e.CommitLSN); err != nil {
-				return err
+			if serr := sink.saveCursor(e.Table, e.CommitLSN); serr != nil {
+				return applied, skipped, cursor, lastTable, serr
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "applied %d, skipped %d re-delivered\n", applied, skipped)
-	fmt.Printf("APPLIED %d SKIPPED %d CURSOR %d TABLE %s\n", applied, skipped, cursor, lastTable)
-	return nil
+	return applied, skipped, cursor, lastTable, nil
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | sink <feed.jsonl> -db <file>")
+		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | "+
+			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -531,18 +582,34 @@ func main() {
 		}
 	case "sink":
 		fs := flag.NewFlagSet("sink", flag.ExitOnError)
-		dbPath := fs.String("db", "cdc.sqlite", "destination SQLite file")
+		dbPath := fs.String("db", "cdc.sqlite", "destination database file")
 		key := fs.String("key", "id", "primary key column")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: cdc-consumer sink <feed.jsonl> -db <file>")
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer sink <feed.jsonl> -db <file> [-engine sqlite|duckdb]")
 			os.Exit(2)
 		}
 		feed := os.Args[2]
 		_ = fs.Parse(os.Args[3:])
-		if err := runSink(feed, *dbPath, *key); err != nil {
+		if err := runSink(feed, *dbPath, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "duckdb-sql":
+		// Running one statement against a DuckDB destination from a separate process, for machines
+		// with no `duckdb` CLI. Weaker than the CLI and never a substitute for it in a check that
+		// claims independence: it is the same driver and the same linked DuckDB that did the
+		// writing, so it shares any misreading either has.
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer duckdb-sql <file.duckdb> <sql>")
+			os.Exit(2)
+		}
+		out, err := duckSQL(os.Args[2], os.Args[3])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(out)
 	case "follow":
 		fs := flag.NewFlagSet("follow", flag.ExitOnError)
 		key := fs.String("key", "id", "column to key the materialised table by")
