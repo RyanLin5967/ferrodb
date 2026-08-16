@@ -857,6 +857,7 @@ as before/after images. Reported as Commuting, not Clean, because both sides wro
 /// Criterion 7 — a guard violation is rejected and the predicate is handed back.
 fn criterion_7_guard(led: &mut Ledger) {
     criterion(7, "A branch violating `qty >= 0` is rejected and THE VIOLATED PREDICATE returned");
+    println!("  (a) THE GOOD CASE — the agent wrote a guard that implies the bound");
     let mut db = Db::new();
     db.seed();
     let (mut a, mut b) = (db.session(), db.session());

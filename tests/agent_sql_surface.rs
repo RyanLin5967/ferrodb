@@ -832,3 +832,56 @@ fn a_malformed_model_is_refused_rather_than_recorded_blank() {
     // and a well-formed one still works on the same connection
     assert!(db.exec("BEGIN AGENT SESSION AS 'a' MODEL 'claude-opus-5/2026-05';", &mut s).is_ok());
 }
+
+
+// ---- the boundary of exit criterion 7 -------------------------------------------------------
+
+/// The engine enforces **the precondition the agent wrote**, not a declarative invariant.
+///
+/// `a_guard_that_fails_against_merged_state_returns_the_predicate_itself` above shows the good
+/// case, and it passes because its guard `qty >= 12` happens to imply the bound being protected.
+/// These two pin what happens when it does not — because a test whose inputs were chosen by
+/// whoever chose the semantics tends to agree with them, and this project has been bitten by that
+/// three times. There are no CHECK constraints anywhere, so nothing here is a *bug* relative to
+/// DESIGN.md; it is the boundary of what the bounded-counter story actually covers, and it is
+/// pinned so that a future CHECK-constraint or fork-time-escrow change breaks this test loudly
+/// rather than silently widening a claim.
+#[test]
+fn without_a_guard_a_bounded_counter_composes_straight_through_zero() {
+    let mut db = Db::new();
+    db.seed();
+    let (mut a, mut b) = (db.session(), db.session());
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r2';", &mut b);
+    // Neither agent writes a precondition.
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1;", &mut b);
+
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+    let second = report(db.ok("MERGE;", &mut b));
+
+    // The Adds compose exactly as criterion 6 requires...
+    assert!(matches!(second.outcome, MergeOutcome::Commuting { .. }));
+    assert!(second.applied_to_target);
+    // ...and take the counter negative, with no predicate to hand back, because none was written.
+    assert_eq!(qty_of(&mut db, 1), -4);
+    assert!(second.violated_predicates().is_empty());
+}
+
+#[test]
+fn a_guard_too_weak_to_imply_the_bound_does_not_protect_it() {
+    // `qty >= 1` is true at every point it is evaluated, including against the merged state
+    // (20 - 12 = 8, and 8 >= 1). It still permits the composition that lands at -4.
+    let mut db = Db::new();
+    db.seed();
+    let (mut a, mut b) = (db.session(), db.session());
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r2';", &mut b);
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 1;", &mut b);
+
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+    let second = report(db.ok("MERGE;", &mut b));
+    assert!(second.applied_to_target, "the guard holds, so the merge lands: {}", second);
+    assert_eq!(qty_of(&mut db, 1), -4);
+}
