@@ -1395,12 +1395,16 @@ impl AgentRuntime {
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
         let publish_txn = ctx.txn.begin()?;
+        let mut published = 0usize;
         for w in pending_writes {
+            // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
+            crash_after_rows(published);
             let author = Some((Arc::clone(self.provenance()), snapshot.prov));
             if let Err(e) = w.apply_in(ctx, publish_txn, author) {
                 ctx.txn.abort(publish_txn)?;
                 return Err(e);
             }
+            published += 1;
         }
         ctx.txn.commit(publish_txn)?;
         self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
@@ -1672,6 +1676,27 @@ struct WorkspaceSnapshot {
     ops: Vec<Op>,
     guards: Vec<Guard>,
     reads: Vec<crate::provenance::readset::ReadSet>,
+}
+
+/// Fault injection for crash-safety testing (D8). **Inert unless `FERRODB_CRASH_AFTER_ROWS` is
+/// set**, and read once rather than per row.
+///
+/// `abort()` and not `exit()`: no destructors, no Rust-level flush, no chance for anything to tidy
+/// up on the way out. That models a process being killed.
+///
+/// What it does **not** model is power loss. Bytes already handed to `write()` sit in the OS page
+/// cache and outlive the process, so this exercises the recovery path against a dead process, not
+/// against a dead machine. Saying otherwise would be claiming a durability property nothing here
+/// tested.
+fn crash_after_rows(published: usize) {
+    use std::sync::OnceLock;
+    static POINT: OnceLock<Option<usize>> = OnceLock::new();
+    let point = POINT.get_or_init(|| {
+        std::env::var("FERRODB_CRASH_AFTER_ROWS").ok().and_then(|v| v.parse::<usize>().ok())
+    });
+    if *point == Some(published) {
+        std::process::abort();
+    }
 }
 
 /// Rows a branch changed **without ever looking at them** — DESIGN.md section 4's cheap metric.
