@@ -15,11 +15,19 @@
 //!
 //! Liveness is answered instead by the epoch interval rule in `branch::record::reclaimable`.
 
+pub mod btree;
+pub mod node;
 pub mod page_header;
+pub mod store;
 
+#[cfg(test)]
+mod tests_isolation;
+
+pub use btree::CowTree;
 pub use page_header::{
     flags, stamp_checksum, verify_checksum, PageHeader, PageType, PAGE_HEADER_SIZE,
 };
+pub use store::CowStore;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
