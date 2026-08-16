@@ -713,6 +713,117 @@ fn ordinary_statements_are_unaffected_by_the_agent_surface() {
     db.ok("ROLLBACK;", &mut s);
 }
 
+// ---- wide and narrow numeric literals on a branch --------------------------------------------
+
+/// **The third write site.**
+///
+/// A numeric literal is bound against the declared type of the column it lands in, and there are
+/// two forms of that: `literal_for_column`, shared with comparisons, and
+/// `literal_for_written_column`, which adds the `FLOAT` widening that only makes sense for a write.
+/// Three places write a literal into a typed column — INSERT's `bind_row_against`, trunk UPDATE in
+/// the planner, and agent-branch UPDATE here. The first two were switched to the write-only form;
+/// this one was still calling the comparison form.
+///
+/// The symptom is not subtle. `UPDATE ... SET amount = 5` against a FLOAT column is ordinary SQL
+/// that every dialect accepts, and a whole-numbered literal reads as `Integer`. Without the
+/// widening, `value_fits` refuses it — `serialize` would lay down four bytes where `deserialize`
+/// reads eight and shift every column after it — so the statement is a hard error on a branch
+/// while the identical statement on trunk succeeds.
+///
+/// Trunk is exercised in the same test, so a failure says which of the two paths broke rather than
+/// leaving that to be guessed.
+#[test]
+fn a_whole_numbered_literal_updates_a_float_column_on_a_branch_and_on_trunk() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE prices (id INTEGER NOT NULL, amount FLOAT);", &mut s);
+    db.ok("INSERT INTO prices VALUES (1, 2.5);", &mut s);
+    db.ok("INSERT INTO prices VALUES (2, 2.5);", &mut s);
+
+    // Trunk: the planner's UPDATE path.
+    db.ok("UPDATE prices SET amount = 7 WHERE id = 2;", &mut s);
+    let trunk = rows(db.ok("SELECT amount FROM prices WHERE id = 2;", &mut s));
+    // The VARIANT, not just the number. `Value`'s `PartialEq` is numeric, so
+    // `Integer(7) == Float(7.0)` — an `assert_eq!` against `Value::Float(7.0)` passes just as
+    // happily on an `Integer` that was never widened, and would report a green result for exactly
+    // the bug this test exists to catch.
+    assert!(
+        matches!(trunk[0][0], Value::Float(v) if v == 7.0),
+        "trunk UPDATE lost the FLOAT widening: {:?}",
+        trunk[0][0]
+    );
+
+    // Branch: the agent runtime's UPDATE path, which is the one that was missed.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'repricer' RUN 'r1';", &mut a);
+    db.ok("UPDATE prices SET amount = 5 WHERE id = 1;", &mut a);
+    let seen = rows(db.ok("SELECT amount FROM prices WHERE id = 1;", &mut a));
+    assert!(
+        matches!(seen[0][0], Value::Float(v) if v == 5.0),
+        "an agent branch stored a whole-numbered literal into a FLOAT column as {:?} rather than \
+         widening it to Float, though trunk widens the identical statement. A page-backed branch \
+         does not run the tuple encoder's width check, so the wrong variant is written silently \
+         and only surfaces when the branch merges back into a heap tuple.",
+        seen[0][0]
+    );
+
+    // A negative literal takes the same path through `signed_numeric_text`.
+    db.ok("UPDATE prices SET amount = -3 WHERE id = 1;", &mut a);
+    let neg = rows(db.ok("SELECT amount FROM prices WHERE id = 1;", &mut a));
+    assert!(
+        matches!(neg[0][0], Value::Float(v) if v == -3.0),
+        "a negative whole literal was not widened on a branch: {:?}",
+        neg[0][0]
+    );
+
+    // And the branch's value must survive the trip back to trunk, where the tuple encoder DOES
+    // enforce the column's width. This is where a wrong variant stops being invisible.
+    db.ok("MERGE;", &mut a);
+    let merged = rows(db.ok("SELECT amount FROM prices WHERE id = 1;", &mut s));
+    assert!(
+        matches!(merged[0][0], Value::Float(v) if v == -3.0),
+        "the branch's FLOAT did not survive the merge onto trunk: {:?}",
+        merged[0][0]
+    );
+}
+
+/// The other half of the same split, on the branch: a **comparison** must NOT get the widening.
+///
+/// 2^53+1 is not representable as any f64, so no stored float can equal it and the honest answer
+/// is the empty set. If the branch's WHERE clause bound its literal through the FLOAT widening it
+/// would round to 2^53 and match the row below — returning a row it can prove is unequal, with no
+/// error anywhere. `Value::cmp` compares an i64 against an f64 exactly for precisely this reason.
+#[test]
+fn a_comparison_on_a_branch_does_not_round_the_literal() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE prices (id INTEGER NOT NULL, amount FLOAT);", &mut s);
+    db.ok("INSERT INTO prices VALUES (1, 9007199254740992);", &mut s); // 2^53
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'auditor' RUN 'r1';", &mut a);
+
+    let exact = rows(db.ok("SELECT id FROM prices WHERE amount = 9007199254740992;", &mut a));
+    assert_eq!(exact.len(), 1, "2^53 is an f64 and must still match: {exact:?}");
+
+    let past = rows(db.ok("SELECT id FROM prices WHERE amount = 9007199254740993;", &mut a));
+    assert!(
+        past.is_empty(),
+        "2^53+1 is not representable as an f64, so nothing can equal it; the literal was rounded \
+         down to 2^53 and matched a row it is provably unequal to: {past:?}"
+    );
+
+    // And an UPDATE guarded by that predicate must touch nothing, or the rounding would silently
+    // rewrite a row the statement never named.
+    db.ok("UPDATE prices SET amount = 1 WHERE amount = 9007199254740993;", &mut a);
+    let after = rows(db.ok("SELECT amount FROM prices WHERE id = 1;", &mut a));
+    assert_eq!(
+        after[0][0],
+        Value::Float(9007199254740992.0),
+        "an UPDATE matched on a rounded literal and overwrote an untouched row"
+    );
+}
+
 // ---- exit criterion 9: which agent + run + model wrote a given row ---------------------------
 
 #[test]

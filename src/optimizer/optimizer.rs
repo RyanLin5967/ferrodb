@@ -289,6 +289,9 @@ fn format_value(v: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Timestamp(ms) => ms.to_string(),
         Value::Null => "NULL".into(),
         Value::Varchar(s) => format!("'{}'", s)
     }

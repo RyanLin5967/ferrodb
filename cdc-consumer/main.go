@@ -11,6 +11,8 @@
 // Two subcommands:
 //
 //	validate <feed.jsonl>          check a feed file's format, exit non-zero on any violation
+//	precision <feed.jsonl>         report the JSON type of every column, and which numbers a
+//	                               default float64 decode would silently corrupt
 //	follow <addr> [-key id]        stream a live feed, materialise it, print the resulting table
 //	sink <feed.jsonl> -db f.sqlite land the feed in SQLite with idempotent, order-guarded upserts
 //
@@ -27,9 +29,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -223,6 +227,151 @@ func (t *Table) dump(w io.Writer) error {
 	return enc.Encode(out)
 }
 
+// exactFloat renders a float64's exact value, not its shortest round-trip form.
+//
+// `strconv.FormatFloat(v, 'f', -1, 64)` prints the fewest digits that parse back to the same
+// double, so `i64::MAX` decoded as a double prints as 9223372036854776000 — which is neither the
+// value that was sent nor the value actually held. Every finite binary float is a terminating
+// decimal, so a `big.Rat` holds it exactly and prints the true value: 9223372036854775808.
+// Understating the corruption would make this report less useful than saying nothing.
+func exactFloat(v float64) string {
+	r := new(big.Rat).SetFloat64(v)
+	if r == nil { // NaN or Inf, which the feed never carries as a bare number
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	if r.IsInt() {
+		return r.Num().String()
+	}
+	// A finite non-integer double is m/2^k in lowest terms with m odd, so m/2^k = m*5^k/10^k: its
+	// exact decimal expansion TERMINATES after exactly k fractional digits. Asking `FloatString`
+	// for exactly k is therefore lossless.
+	//
+	// A fixed 40 was not. `FloatString` ROUNDS to the requested places, so every double smaller
+	// than 1e-40 came out as "0" — including every subnormal, and including pairs that are
+	// provably different numbers. Printing two distinct corrupted values identically, as zero, is
+	// the same understatement this function's doc exists to forbid.
+	prec := r.Denom().BitLen() - 1
+	s := strings.TrimRight(r.FloatString(prec), "0")
+	return strings.TrimSuffix(s, ".")
+}
+
+// sameNumber reports whether a consumer decoding this JSON number as a float64 ends up holding the
+// number that was actually sent.
+//
+// Two ways that can be true, and BOTH are needed:
+//
+//  1. The wire digits denote exactly the value the double holds. `1.50` on the wire and the double
+//     1.5 are one number, and so is `-9223372036854775808`, which is exactly -2^63. Calling either
+//     a precision loss would be false.
+//
+//  2. The wire digits are the double's own SHORTEST ROUND-TRIP form. Rust prints an `f64` with
+//     `{}`, which emits the fewest digits that parse back to the identical double — so `0.1` is
+//     not the wire being sloppy about one tenth, it is the exact NAME of the double that was sent,
+//     and the consumer recovers it bit for bit. Nothing was lost end to end.
+//
+// Testing only (1) is what this function used to do, and it made a FLOAT column unreportable: no
+// finite decimal fraction except a dyadic one equals its double exactly, so `"f":0.1` — an
+// ordinary, perfectly faithful value — was reported LOSSY. A detector that fires on the common
+// case teaches its reader to ignore it, which is worse than not shipping one.
+//
+// What survives both tests is the real thing: wire digits that no double can represent AND that
+// are not any double's canonical name, so the value a consumer holds is a different number from
+// the one that was sent. `9223372036854775807` is that: it is not -2^63, and the double it lands
+// on is named `9.223372036854776e+18`, a third number again.
+func sameNumber(wire string, held float64) bool {
+	w, ok := new(big.Rat).SetString(wire)
+	if !ok {
+		return false
+	}
+	h := new(big.Rat).SetFloat64(held)
+	if h == nil {
+		return false
+	}
+	if w.Cmp(h) == 0 {
+		return true
+	}
+	canon, ok := new(big.Rat).SetString(strconv.FormatFloat(held, 'g', -1, 64))
+	return ok && canon.Cmp(w) == 0
+}
+
+// precision reports, for every row column in the feed, the JSON type it arrived as and what a
+// consumer using Go's DEFAULT decoding would end up holding.
+//
+// This is the independent half of the producer's claim that BIGINT, DECIMAL and TIMESTAMP ship as
+// JSON strings. The Rust unit tests assert on bytes the Rust encoder produced, which cannot detect
+// a shared misreading of JSON. This decodes with `encoding/json` into `map[string]any` — the
+// single most common consumer shape there is, and the one where every JSON number becomes a
+// float64 — and then compares what that yields against the exact digits on the wire.
+//
+// Each column prints one line:
+//
+//	FIELD <line> <col> string <exact text>
+//	FIELD <line> <col> number <what a float64 consumer holds> [LOSSY <exact digits on the wire>]
+//
+// LOSSY marks a column whose digits did not survive the float64, which is the corruption the
+// string encoding exists to prevent. Note that Go raised no error on any of these: the parse
+// succeeded and the number is simply wrong, which is exactly the failure mode being demonstrated.
+func precision(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return errors.New("feed is empty; a feed that collected nothing has not passed")
+	}
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	strings_, numbers, lossy := 0, 0, 0
+	for i, line := range lines {
+		// Two decodes of the same line: the default one a consumer writes, and an exact one used
+		// only as the reference for what was actually on the wire.
+		var loose map[string]any
+		if err := json.Unmarshal([]byte(line), &loose); err != nil {
+			return fmt.Errorf("line %d is not valid JSON: %w", i+1, err)
+		}
+		exactDec := json.NewDecoder(strings.NewReader(line))
+		exactDec.UseNumber()
+		var exact map[string]any
+		if err := exactDec.Decode(&exact); err != nil {
+			return fmt.Errorf("line %d is not valid JSON: %w", i+1, err)
+		}
+
+		for _, side := range []string{"after", "before"} {
+			looseRow, ok := loose[side].(map[string]any)
+			if !ok {
+				continue
+			}
+			exactRow, _ := exact[side].(map[string]any)
+			cols := make([]string, 0, len(looseRow))
+			for k := range looseRow {
+				cols = append(cols, k)
+			}
+			sort.Strings(cols)
+			for _, col := range cols {
+				switch v := looseRow[col].(type) {
+				case string:
+					strings_++
+					fmt.Printf("FIELD %d %s string %s\n", i+1, col, v)
+				case float64:
+					numbers++
+					held := exactFloat(v)
+					wire := ""
+					if n, ok := exactRow[col].(json.Number); ok {
+						wire = n.String()
+					}
+					if wire != "" && !sameNumber(wire, v) {
+						lossy++
+						fmt.Printf("FIELD %d %s number %s LOSSY %s\n", i+1, col, held, wire)
+					} else {
+						fmt.Printf("FIELD %d %s number %s\n", i+1, col, held)
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("SUMMARY strings=%d numbers=%d lossy=%d\n", strings_, numbers, lossy)
+	return nil
+}
+
 func validate(path string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -368,6 +517,15 @@ func main() {
 			os.Exit(2)
 		}
 		if err := validate(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "precision":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer precision <feed.jsonl>")
+			os.Exit(2)
+		}
+		if err := precision(os.Args[2]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

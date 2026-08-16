@@ -129,10 +129,43 @@ pub enum SchemaChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSpec {
     pub name: String,
-    /// `INTEGER`, `FLOAT`, `BOOLEAN`, or `VARCHAR(n)` — the width is part of the type, so a
-    /// consumer recreating the column gets the same one.
+    /// The column's type, spelled the way the feed spells it. This is a **wire contract**: a
+    /// consumer recreating the column has nothing else to go on, so the complete set of values it
+    /// can take belongs here rather than in whichever arm of the encoder happens to produce them.
+    ///
+    /// `INTEGER`, `FLOAT`, `BOOLEAN`, `VARCHAR(n)`, `BIGINT`, `DECIMAL`, `TIMESTAMP`.
+    ///
+    /// For `VARCHAR(n)` the width is part of the type, so a consumer recreating the column gets
+    /// the same one.
+    ///
+    /// The last three arrived with the wide types and this list was not extended, which is not a
+    /// cosmetic omission: the Go sink is written against this contract, and it mapped `BIGINT` and
+    /// `TIMESTAMP` onto SQLite TEXT through its unknown-type fallback — where SQLite compares
+    /// lexicographically and `WHERE big > 5` sorts "10" below "5". A consumer cannot be blamed for
+    /// not handling a type the contract does not mention.
+    ///
+    /// `sql_type_contract_is_exhaustive` pins the full mapping against `DataType` with a match the
+    /// compiler forces to be exhaustive, so an eighth type cannot be added without this list and
+    /// that test being updated together.
     pub sql_type: String,
     pub nullable: bool,
+}
+
+/// How a [`DataType`] is spelled in the feed — the single definition of [`ColumnSpec::sql_type`].
+///
+/// It is a named function rather than a `match` inside the decoder so that the wire contract has
+/// one definition a test can enumerate, and so that adding a `DataType` variant fails to compile
+/// here instead of silently acquiring a spelling somewhere downstream.
+pub fn sql_type_of(ty: &DataType) -> String {
+    match ty {
+        DataType::Integer => "INTEGER".to_string(),
+        DataType::Float => "FLOAT".to_string(),
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Varchar(n) => format!("VARCHAR({n})"),
+        DataType::BigInt => "BIGINT".to_string(),
+        DataType::Decimal => "DECIMAL".to_string(),
+        DataType::Timestamp => "TIMESTAMP".to_string(),
+    }
 }
 
 /// One row-level change, attributed to the transaction that committed it.
@@ -430,12 +463,7 @@ impl LogicalDecoder {
                         .iter()
                         .map(|(name, ty, nullable)| ColumnSpec {
                             name: name.clone(),
-                            sql_type: match ty {
-                                DataType::Integer => "INTEGER".to_string(),
-                                DataType::Float => "FLOAT".to_string(),
-                                DataType::Boolean => "BOOLEAN".to_string(),
-                                DataType::Varchar(n) => format!("VARCHAR({n})"),
-                            },
+                            sql_type: sql_type_of(ty),
                             nullable: *nullable,
                         })
                         .collect();
@@ -520,6 +548,53 @@ mod tests {
             Column { name: "id".into(), data_type: DataType::Integer, nullable: false },
             Column { name: "qty".into(), data_type: DataType::Integer, nullable: true },
         ])
+    }
+
+    /// **The wire contract, enumerated.**
+    ///
+    /// `ColumnSpec::sql_type` is all a consumer has to recreate a column with, so the set of
+    /// values it can take is a contract and not an implementation detail. Its doc described that
+    /// contract as four types long after it was seven, and the Go sink — written against the doc —
+    /// mapped `BIGINT` and `TIMESTAMP` onto SQLite TEXT through its unknown-type fallback.
+    ///
+    /// The `match` below is what makes this test worth having: it is exhaustive over `DataType`,
+    /// with no wildcard arm, so adding an eighth variant stops compiling here. A `for` loop over a
+    /// hand-written list would have gone stale exactly the way the doc did.
+    #[test]
+    fn sql_type_contract_is_exhaustive() {
+        let every = [
+            DataType::Integer,
+            DataType::Float,
+            DataType::Boolean,
+            DataType::Varchar(16),
+            DataType::BigInt,
+            DataType::Decimal,
+            DataType::Timestamp,
+        ];
+        for ty in &every {
+            // No `_` arm: the compiler, not this list, is what guarantees completeness.
+            let want = match ty {
+                DataType::Integer => "INTEGER",
+                DataType::Float => "FLOAT",
+                DataType::Boolean => "BOOLEAN",
+                DataType::Varchar(_) => "VARCHAR(16)",
+                DataType::BigInt => "BIGINT",
+                DataType::Decimal => "DECIMAL",
+                DataType::Timestamp => "TIMESTAMP",
+            };
+            assert_eq!(sql_type_of(ty), want, "the feed spelling of {ty:?} changed");
+        }
+
+        // The width is part of a VARCHAR's type, or a consumer recreates a different column.
+        assert_eq!(sql_type_of(&DataType::Varchar(1)), "VARCHAR(1)");
+        assert_eq!(sql_type_of(&DataType::Varchar(255)), "VARCHAR(255)");
+
+        // Every spelling is distinct, so a consumer can branch on it. Two types sharing a name
+        // would make the contract unusable while every assertion above still passed.
+        let mut names: Vec<String> = every.iter().map(sql_type_of).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), every.len(), "two DataTypes share one feed spelling: {names:?}");
     }
 
     /// A decoder wired to one table at `dir_root` 7, without needing a real catalog.

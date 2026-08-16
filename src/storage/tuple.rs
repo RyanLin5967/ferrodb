@@ -38,6 +38,19 @@ impl Tuple {
         bytes.extend_from_slice(&0u32.to_be_bytes());
         bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(&0u16.to_be_bytes());
+        // A value whose variant disagrees with its column's declared type is not a warning, it is
+        // silent corruption: `serialize` picks the width from the VALUE and `deserialize` picks it
+        // from the SCHEMA, so a Varchar written into a BIGINT column lays down a 2-byte length
+        // prefix where the reader will take 8 bytes of whatever follows. Every column after it in
+        // the row then reads at the wrong offset. Refuse instead.
+        for (i, value) in values.iter().enumerate() {
+            if !value_fits(value, &schema.columns[i].data_type) {
+                return Err(FerroError::Constraint(format!(
+                    "column '{}' is declared {:?} but was given {:?}",
+                    schema.columns[i].name, schema.columns[i].data_type, value
+                )))
+            }
+        }
         bytes.extend_from_slice(&null_bitmap);
         // add serialized values + padding between them (no padding between tuples)
         // formula: padding = (align - (len & (align - 1))) & (align - 1)
@@ -59,6 +72,29 @@ impl Tuple {
                     let padding = get_padding(4, bytes.len());
                     bytes.resize(bytes.len() + padding, 0);
                     bytes.extend_from_slice(&i.to_be_bytes());
+                },
+                // BIGINT and TIMESTAMP are both a fixed 8-byte big-endian i64. They are stored
+                // full width rather than narrowed to whatever the current row happens to fit in:
+                // a width that depends on the value is a width the reader cannot know.
+                Value::BigInt(v) => {
+                    let padding = get_padding(8, bytes.len());
+                    bytes.resize(bytes.len() + padding, 0);
+                    bytes.extend_from_slice(&v.to_be_bytes());
+                },
+                Value::Timestamp(ms) => {
+                    let padding = get_padding(8, bytes.len());
+                    bytes.resize(bytes.len() + padding, 0);
+                    bytes.extend_from_slice(&ms.to_be_bytes());
+                },
+                // DECIMAL is digit text, so it reuses the pascal-string layout VARCHAR already
+                // uses rather than inventing a second variable-length encoding.
+                Value::Decimal(d) => {
+                    let str_bytes = d.as_bytes();
+                    if str_bytes.len() > u16::MAX as usize {
+                        return Err(FerroError::Parse(format!("decimal is {} bytes, over the {} the length prefix can hold", str_bytes.len(), u16::MAX)))
+                    }
+                    bytes.extend_from_slice(&(str_bytes.len() as u16).to_be_bytes());
+                    bytes.extend_from_slice(str_bytes);
                 },
                 // use pascal string, doesn't need padding
                 Value::Varchar(c) => {
@@ -89,7 +125,12 @@ impl Tuple {
                             bytes.resize(bytes.len() + padding, 0);
                             bytes.extend_from_slice(&[0u8; 4]);
                         },
-                        DataType::Varchar(_) => {
+                        DataType::BigInt | DataType::Timestamp => {
+                            let padding = get_padding(8, bytes.len());
+                            bytes.resize(bytes.len() + padding, 0);
+                            bytes.extend_from_slice(&[0u8; 8]);
+                        },
+                        DataType::Decimal | DataType::Varchar(_) => {
                             bytes.extend_from_slice(&[0u8; 2]);
                         },
                     }
@@ -148,6 +189,44 @@ impl Tuple {
                     values.push(Value::Integer(int));
                     offset += 4;
                 },
+                DataType::BigInt => {
+                    let padding = get_padding(8, offset);
+                    offset += padding;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += 8;
+                        continue;
+                    }
+                    let int_bytes = &self.data[offset..offset+8];
+                    values.push(Value::BigInt(i64::from_be_bytes(int_bytes.try_into().unwrap())));
+                    offset += 8;
+                },
+                DataType::Timestamp => {
+                    let padding = get_padding(8, offset);
+                    offset += padding;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += 8;
+                        continue;
+                    }
+                    let ms_bytes = &self.data[offset..offset+8];
+                    values.push(Value::Timestamp(i64::from_be_bytes(ms_bytes.try_into().unwrap())));
+                    offset += 8;
+                },
+                DataType::Decimal => {
+                    let len_bytes = &self.data[offset..offset + 2];
+                    let len = u16::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+                    offset += 2;
+                    if (bitmap[i/8] & (1 << i % 8)) != 0 {
+                        values.push(Value::Null);
+                        offset += len;
+                        continue;
+                    }
+                    let str_bytes = &self.data[offset..offset + len];
+                    let text = std::str::from_utf8(str_bytes).map_err(|_| FerroError::Parse("decimal column held invalid utf8".into()))?;
+                    values.push(Value::Decimal(text.to_string()));
+                    offset += len;
+                },
                 DataType::Varchar(_) => {
                     let len_bytes = &self.data[offset..offset + 2];
                     let len = u16::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
@@ -181,6 +260,23 @@ impl Tuple {
 impl VersionHeader {
     pub fn prev(&self) -> Option<(u32, u16)> {
         (self.prev_page != 0).then_some((self.prev_page, self.prev_slot))
+    }
+}
+
+/// Whether a value can be written into a column of this declared type without the on-disk width
+/// disagreeing between `serialize` and `deserialize`. NULL fits anything: the null bitmap carries
+/// it and the placeholder bytes are sized from the schema.
+pub fn value_fits(value: &Value, ty: &DataType) -> bool {
+    match (value, ty) {
+        (Value::Null, _) => true,
+        (Value::Integer(_), DataType::Integer) => true,
+        (Value::Float(_), DataType::Float) => true,
+        (Value::Varchar(_), DataType::Varchar(_)) => true,
+        (Value::Boolean(_), DataType::Boolean) => true,
+        (Value::BigInt(_), DataType::BigInt) => true,
+        (Value::Decimal(_), DataType::Decimal) => true,
+        (Value::Timestamp(_), DataType::Timestamp) => true,
+        _ => false,
     }
 }
 

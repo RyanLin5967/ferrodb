@@ -34,9 +34,11 @@ use crate::wal::txn::TxnManager;
 /// Postgres type OIDs for the value kinds this database has.
 mod oid {
     pub const BOOL: i32 = 16;
+    pub const INT8: i32 = 20;
     pub const INT4: i32 = 23;
     pub const TEXT: i32 = 25;
     pub const FLOAT8: i32 = 701;
+    pub const NUMERIC: i32 = 1700;
 }
 
 /// `80877103` — the magic version a client sends to ask for TLS before anything else.
@@ -158,6 +160,15 @@ fn oid_of(v: &Value) -> i32 {
         Value::Integer(_) => oid::INT4,
         Value::Float(_) => oid::FLOAT8,
         Value::Boolean(_) => oid::BOOL,
+        Value::BigInt(_) => oid::INT8,
+        // `numeric`'s text format is exactly the digit string this type already holds, so a
+        // conforming client reads it back without loss.
+        Value::Decimal(_) => oid::NUMERIC,
+        // Deliberately NOT `timestamp` (1114). This engine stores epoch milliseconds and has no
+        // calendar formatter, so it would send `1700000000000` where a conforming client expects
+        // `2023-11-14 22:13:20`. Announcing `int8` and sending an integer is true; announcing
+        // `timestamp` and sending an integer is a parse error at every real driver.
+        Value::Timestamp(_) => oid::INT8,
         Value::Varchar(_) | Value::Null => oid::TEXT,
     }
 }
@@ -170,6 +181,9 @@ fn render(v: &Value) -> Option<String> {
         Value::Integer(i) => Some(i.to_string()),
         Value::Float(f) => Some(f.to_string()),
         Value::Boolean(b) => Some(if *b { "t".into() } else { "f".into() }),
+        Value::BigInt(i) => Some(i.to_string()),
+        Value::Decimal(d) => Some(d.clone()),
+        Value::Timestamp(ms) => Some(ms.to_string()),
         Value::Varchar(s) => Some(s.clone()),
     }
 }
