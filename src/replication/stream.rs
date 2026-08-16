@@ -719,6 +719,38 @@ mod tests {
         assert!(Subscription::new(&w, base).is_ok(), "a current subscription was refused");
     }
 
+    /// **`following` takes the cursor from the boundary, and refuses when there is none.**
+    ///
+    /// The refusal is the interesting half. Defaulting to the start of the log would look harmless
+    /// and be the data-losing choice arrived at by omission: a boundary exists precisely because
+    /// the resume point is not a free parameter, and any other cursor either skips the transactions
+    /// that were in flight at snapshot time or re-delivers what the snapshot already sent.
+    #[test]
+    fn following_takes_its_cursor_from_the_boundary_and_refuses_without_one() {
+        let (_d, w) = wal("following");
+        let w = std::sync::Arc::new(w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 1);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // No boundary: refused, and the message says what to build instead.
+        let err = Subscription::following(&w, &streamer())
+            .expect_err("a streamer with no snapshot boundary was allowed to follow one");
+        let msg = format!("{err}");
+        assert!(msg.contains("resuming_after_snapshot"), "the message does not say what is missing: {msg}");
+
+        // With one, the cursor comes from the boundary rather than from the caller - asserted
+        // against a resume point that is deliberately NOT the start of the log, so a `from_start`
+        // default would be visible here rather than coincidentally right.
+        let resume = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst) + 1;
+        let boundary =
+            SnapshotBoundary::new(std::collections::BTreeSet::new(), included_txns(), resume);
+        let sub = Subscription::following(&w, &streamer().resuming_after_snapshot(boundary))
+            .expect("a boundary-carrying streamer could not follow its own snapshot");
+        assert_eq!(sub.cursor(), resume, "the subscription did not start where the snapshot said");
+    }
+
     /// Lag shrinks as a consumer catches up, and is an upper bound rather than an exact zero.
     #[test]
     fn lag_shrinks_as_a_consumer_catches_up() {
