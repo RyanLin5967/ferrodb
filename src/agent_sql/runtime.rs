@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent_sql::changeset::{
     ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome,
 };
-use crate::agent_sql::mem_catalog::MemBranchCatalog;
+use crate::branch::catalog::LogBranchCatalog;
 use crate::tel::MemEffectLog;
 use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
@@ -36,6 +36,10 @@ use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
 use crate::branch::types::{BranchId, CommitHash, LeaseDeadline};
 use crate::branch::BranchCatalog;
+
+/// Root page the trunk branch starts at. The CoW store publishes a real root over this on the
+/// first write; until then it is only an identity for the trunk record.
+const TRUNK_ROOT_PAGE: u32 = 1;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
@@ -194,8 +198,17 @@ impl Default for AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Build over the real branch engine.
+    ///
+    /// `LogBranchCatalog` is the durable implementation: an append-only record log, generation
+    /// counters so a reaped id can never be mistaken for a live one, and id release on reap.
+    /// `MemBranchCatalog` remains for callers that explicitly want the simplified stand-in, but
+    /// it is no longer what an agent session gets by default.
+    ///
+    /// The record log is memory-backed here because `Session::new` carries no path. A caller
+    /// with somewhere to put it uses `LogBranchCatalog::open` and `with_catalog`.
     pub fn new() -> Self {
-        AgentRuntime::with_catalog(Arc::new(MemBranchCatalog::new()))
+        AgentRuntime::with_catalog(Arc::new(LogBranchCatalog::in_memory(TRUNK_ROOT_PAGE)))
     }
 
     /// Build over any `BranchCatalog` — the durable branch engine drops in here.
