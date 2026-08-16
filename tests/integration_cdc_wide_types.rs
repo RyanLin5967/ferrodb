@@ -325,6 +325,141 @@ fn a_whole_numbered_literal_lands_in_a_float_column() {
     assert_eq!(ids, vec![vec![Value::Integer(1)]]);
 }
 
+/// **A comparison against a FLOAT column must not round the literal.**
+///
+/// This is the exactness the wide types exist for, aimed at the one column type that cannot hold
+/// them. `Value::cmp` compares an i64 against an f64 exactly, via `cmp_i64_f64`, precisely so that
+/// a question like this has a right answer. 2^53+1 is not representable as any f64, so NO stored
+/// float can equal it, and the honest result is the empty set.
+///
+/// Getting there requires the literal to still BE 2^53+1 when the comparison happens. Bind it
+/// through the FLOAT widening — `text.parse::<f64>()` — and it silently becomes 2^53 before
+/// `cmp_i64_f64` is ever consulted, and the query returns the row holding 2^53: a row that is
+/// provably not equal to the value asked for. No error is raised, which is what makes it the
+/// dangerous kind of wrong.
+///
+/// The widening itself is not the bug and must stay — see the write test below. The bug was
+/// SHARING it with the comparison path, where there is no storage width to satisfy and nothing to
+/// gain by rounding early.
+#[test]
+fn a_comparison_against_a_float_column_does_not_round_the_literal() {
+    let mut d = db("float_exact_cmp");
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, f FLOAT);");
+    // 2^53 exactly — the largest integer with an f64 neighbour-free representation.
+    d.sql("INSERT INTO t VALUES (1, 9007199254740992);");
+
+    // The row is really there, so an empty result below is about the predicate and not the table.
+    let all = d.rows("SELECT id FROM t;");
+    assert_eq!(all, vec![vec![Value::Integer(1)]], "the fixture row is missing: {all:?}");
+
+    let exact = d.rows("SELECT id FROM t WHERE f = 9007199254740992;");
+    assert_eq!(exact, vec![vec![Value::Integer(1)]], "2^53 is an f64 and must match: {exact:?}");
+
+    let past = d.rows(&format!("SELECT id FROM t WHERE f = {BIG_PAST_2_53};"));
+    assert!(
+        past.is_empty(),
+        "`WHERE f = {BIG_PAST_2_53}` matched {past:?}. 2^53+1 is not representable as an f64, so \
+         no stored float equals it — the literal was rounded down to 2^53 at bind time and the \
+         query returned a row it can prove is unequal."
+    );
+
+    // The same statement, spelled as an inequality, must agree: 2^53+1 is strictly above 2^53.
+    let above = d.rows(&format!("SELECT id FROM t WHERE f < {BIG_PAST_2_53};"));
+    assert_eq!(
+        above,
+        vec![vec![Value::Integer(1)]],
+        "2^53 is below 2^53+1; a rounded literal makes them equal and this empty: {above:?}"
+    );
+}
+
+/// **BIGINT has to work as a counter**, which is most of what a 64-bit integer column is for.
+///
+/// `arithmetic` matched only Integer/Float pairs, so every one of these was
+/// `Err("can't add non numbers")` — for two operands that are unambiguously numbers. A column type
+/// that cannot be incremented is not a usable integer type, and the failure is not subtle: it is a
+/// hard error on `SET big = big + 1`.
+///
+/// The values are chosen past 2^53 on purpose. If the fix routed BIGINT arithmetic through f64 the
+/// statement would stop erroring and start returning the wrong number, which is a worse outcome
+/// than the error it replaced — so the assertions are on exact i64 results.
+#[test]
+fn bigint_arithmetic_works_and_stays_exact() {
+    let mut d = db("bigint_arith");
+    d.sql("CREATE TABLE c (id INTEGER NOT NULL, big BIGINT);");
+    d.sql(&format!("INSERT INTO c VALUES (1, {BIG_PAST_2_53});")); // 2^53 + 1
+
+    // SELECT with arithmetic on a BIGINT.
+    let sum = d.rows("SELECT big + 1 FROM c;");
+    assert!(
+        matches!(sum[0][0], Value::BigInt(v) if v == 9007199254740994),
+        "`SELECT big + 1` gave {:?}; an f64 detour would land on 9007199254740994 by luck here, \
+         so the variant matters as much as the value",
+        sum[0][0]
+    );
+
+    for (expr, want) in [
+        ("big - 1", 9007199254740992i64),
+        ("big * 2", 18014398509481986),
+        ("big / 2", 4503599627370496),
+    ] {
+        let got = d.rows(&format!("SELECT {expr} FROM c;"));
+        assert!(
+            matches!(got[0][0], Value::BigInt(v) if v == want),
+            "`SELECT {expr}` gave {:?}, want BigInt({want})",
+            got[0][0]
+        );
+    }
+
+    // UPDATE as a counter: the read-modify-write that makes it a counter rather than a constant.
+    d.sql("UPDATE c SET big = big + 1 WHERE id = 1;");
+    let after = d.rows("SELECT big FROM c;");
+    assert!(
+        matches!(after[0][0], Value::BigInt(v) if v == 9007199254740994),
+        "the counter did not advance exactly: {:?}",
+        after[0][0]
+    );
+
+    // Increment again, to show it is not a one-off that happens to survive a single round trip.
+    d.sql("UPDATE c SET big = big + 1 WHERE id = 1;");
+    let twice = d.rows("SELECT big FROM c;");
+    assert!(
+        matches!(twice[0][0], Value::BigInt(v) if v == 9007199254740995),
+        "two increments past 2^53 must be distinguishable, which f64 cannot do: {:?}",
+        twice[0][0]
+    );
+
+    // Mixing a BIGINT with a narrow INTEGER column is ordinary SQL and must widen, not refuse.
+    let mixed = d.rows("SELECT big + id FROM c;");
+    assert!(
+        matches!(mixed[0][0], Value::BigInt(v) if v == 9007199254740996),
+        "BIGINT + INTEGER should widen to BIGINT: {:?}",
+        mixed[0][0]
+    );
+}
+
+/// TIMESTAMP is an i64 too, and epoch millis are a thing you add to.
+#[test]
+fn timestamp_arithmetic_advances_by_milliseconds() {
+    let mut d = db("ts_arith");
+    d.sql("CREATE TABLE e (id INTEGER NOT NULL, ts TIMESTAMP);");
+    d.sql(&format!("INSERT INTO e VALUES (1, {TS_MILLIS});"));
+
+    let plus = d.rows("SELECT ts + 1000 FROM e;");
+    assert!(
+        matches!(plus[0][0], Value::Timestamp(v) if v == 1_700_000_001_123),
+        "a second past the timestamp is still a timestamp: {:?}",
+        plus[0][0]
+    );
+
+    d.sql("UPDATE e SET ts = ts - 123 WHERE id = 1;");
+    let back = d.rows("SELECT ts FROM e;");
+    assert!(
+        matches!(back[0][0], Value::Timestamp(v) if v == 1_700_000_000_000),
+        "{:?}",
+        back[0][0]
+    );
+}
+
 /// **The declared types survive a catalog reload.**
 ///
 /// `DataType` is written to the catalog page as a one-byte tag, and the wide types took the next

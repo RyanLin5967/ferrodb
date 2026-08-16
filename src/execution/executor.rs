@@ -281,7 +281,91 @@ fn arithmetic(l: &Value, r: &Value, op: &TokenType) -> Result<Value, FerroError>
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_arith(*a, *b, *op)?)),
         (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(float_arith(*a as f64, *b, *op)?)),
         (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(float_arith(*a, *b as f64, *op)?)),
+
+        // ---- the i64-backed wide types ----------------------------------------------------
+        //
+        // Without these, `SELECT big + 1` and `UPDATE t SET big = big + 1` both failed with
+        // "can't add non numbers" — for two operands that are unambiguously numbers. A 64-bit
+        // integer column that cannot be incremented is not a usable integer type; counting is
+        // most of what one is for.
+        //
+        // Widening an i32 to i64 is exact, so mixing BIGINT with INTEGER promotes rather than
+        // refuses. The result stays `BigInt` rather than detouring through f64: past 2^53 a
+        // double cannot tell one increment from the next, so an f64 route would turn a hard
+        // error into a silently wrong count, which is the worse of the two.
+        (Value::BigInt(a), Value::BigInt(b)) => int_arith(*a, *b, op).map(Value::BigInt),
+        (Value::BigInt(a), Value::Integer(b)) => int_arith(*a, *b as i64, op).map(Value::BigInt),
+        (Value::Integer(a), Value::BigInt(b)) => int_arith(*a as i64, *b, op).map(Value::BigInt),
+
+        // A TIMESTAMP is a point in time, not a count, so the algebra is not the same as BIGINT's:
+        // shifting one by a number of milliseconds gives another instant, while differencing two
+        // gives an elapsed count that is no longer an instant. Anything else — a product of two
+        // instants, an instant divided by a date — has no meaning to give, so it is refused rather
+        // than assigned one.
+        (Value::Timestamp(a), Value::Timestamp(b)) if matches!(op, TokenType::Minus) => {
+            int_arith(*a, *b, op).map(Value::BigInt)
+        }
+        (Value::Timestamp(a), Value::Integer(b)) if is_shift(op) => {
+            int_arith(*a, *b as i64, op).map(Value::Timestamp)
+        }
+        (Value::Timestamp(a), Value::BigInt(b)) if is_shift(op) => {
+            int_arith(*a, *b, op).map(Value::Timestamp)
+        }
+        // `1000 + ts` is the same instant as `ts + 1000`; `1000 - ts` is not an instant at all.
+        (Value::Integer(a), Value::Timestamp(b)) if matches!(op, TokenType::Plus) => {
+            int_arith(*a as i64, *b, op).map(Value::Timestamp)
+        }
+        (Value::BigInt(a), Value::Timestamp(b)) if matches!(op, TokenType::Plus) => {
+            int_arith(*a, *b, op).map(Value::Timestamp)
+        }
+
+        // Mixing an exact i64 with a float is the one place exactness is deliberately given up,
+        // and only because the statement asked for it by naming a float operand. It follows the
+        // rule INTEGER already used, so `big * 1.5` behaves the way `qty * 1.5` always has.
+        (Value::BigInt(a), Value::Float(b)) => Ok(Value::Float(float_arith(*a as f64, *b, *op)?)),
+        (Value::Float(a), Value::BigInt(b)) => Ok(Value::Float(float_arith(*a, *b as f64, *op)?)),
+
+        // DECIMAL is stored as the digit text the user wrote, with no scaled-integer backing —
+        // see the type's own doc, which says this engine stores and ships decimals rather than
+        // adding them. Routing it through f64 to make an answer appear would round exactly the
+        // digits the type exists to keep, so the refusal is deliberate and says which type it is
+        // refusing instead of claiming a DECIMAL is not a number.
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => Err(FerroError::Parse(
+            "DECIMAL arithmetic is not supported: this engine stores and ships exact decimals \
+             rather than computing on them, and evaluating one as a float would round away the \
+             digits the type exists to preserve"
+                .into(),
+        )),
+
         _ => Err(FerroError::Parse("can't add non numbers".into()))
+    }
+}
+
+/// Does `op` shift a TIMESTAMP along the line rather than combine two of them?
+fn is_shift(op: &TokenType) -> bool {
+    matches!(op, TokenType::Plus | TokenType::Minus)
+}
+
+/// `i64` arithmetic that refuses to wrap.
+///
+/// The i32 path above uses bare operators, which panic in a debug build and WRAP in a release one.
+/// Wrapping is the failure mode that matters here: a BIGINT column exists to hold values near the
+/// i64 extremes, `9223372036854775807 + 1` is reachable from ordinary SQL, and silently answering
+/// `-9223372036854775808` would be a wrong number reported as a success.
+fn int_arith(a: i64, b: i64, op: &TokenType) -> Result<i64, FerroError> {
+    let overflow = || FerroError::Parse(format!("64-bit integer overflow in `{a} {op:?} {b}`"));
+    match op {
+        TokenType::Plus => a.checked_add(b).ok_or_else(overflow),
+        TokenType::Minus => a.checked_sub(b).ok_or_else(overflow),
+        TokenType::Star => a.checked_mul(b).ok_or_else(overflow),
+        TokenType::Slash => {
+            if b == 0 {
+                return Err(FerroError::Parse("div by 0".into()));
+            }
+            // i64::MIN / -1 is the one division that overflows.
+            a.checked_div(b).ok_or_else(overflow)
+        }
+        _ => Err(FerroError::Parse("invalid arithmetic op".into())),
     }
 }
 

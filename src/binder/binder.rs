@@ -352,8 +352,24 @@ impl<'a> Binder<'a> {
                 //
                 // Reading the literal as the declared type of the column it is compared against
                 // fixes that without touching the ordering, which has to stay a total order.
-                let left_ty = Self::column_type_of(&left, scope);
-                let right_ty = Self::column_type_of(&right, scope);
+                // **Comparisons only.** The paragraph above is an argument about comparing a
+                // literal to a column, and it does not carry over to `+`, `-`, `*` or `/`: there
+                // the literal is a COUNT, not another value of the column's type. Redirecting it
+                // anyway read `ts + 1000` as `Timestamp + Timestamp(1000)` — adding one instant to
+                // another, which has no meaning to evaluate — so shifting a timestamp by a
+                // thousand milliseconds failed as "can't add non numbers". `big + 1` survived only
+                // because BigInt happens to be the type a bare `1` would take anyway.
+                let comparison = matches!(
+                    operator,
+                    TokenType::Equal
+                        | TokenType::BangEqual
+                        | TokenType::Less
+                        | TokenType::LessEqual
+                        | TokenType::Greater
+                        | TokenType::GreaterEqual
+                );
+                let left_ty = if comparison { Self::column_type_of(&left, scope) } else { None };
+                let right_ty = if comparison { Self::column_type_of(&right, scope) } else { None };
                 let l = match right_ty.as_ref().and_then(|t| Self::literal_for_column(&left, t)) {
                     Some(res) => BoundExpr::Literal(res?),
                     None => self.bind_expr(*left, scope)?,
