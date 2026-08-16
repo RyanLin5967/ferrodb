@@ -61,9 +61,19 @@
 //!   with ones it did not. No byte offset separates those two sets, which is the whole reason
 //!   skipping by LSN alone cannot be exact.
 //!
-//! What this still does not promise is end-to-end exactly-once *delivery*: a consumer that acts on
-//! an event and dies before recording its cursor will see that event again on restart. That is a
-//! property of the consumer's checkpointing, not of the cutover, and no source can supply it.
+//! # What this does not promise
+//!
+//! - **Not end-to-end exactly-once delivery.** A consumer that acts on an event and dies before
+//!   recording its cursor sees that event again on restart. That is a property of the consumer's
+//!   checkpointing, not of the cutover, and no source can supply it.
+//! - **Not a multi-table snapshot, as written.** [`snapshot_table_exact`] opens one reader per
+//!   call, so snapshotting two tables through it gives two readers with two different boundaries —
+//!   fine if each table has its own stream, wrong if one stream carries both, because no single
+//!   boundary describes them. The boundary itself is transaction-level and therefore
+//!   table-independent, so the consistent version is available and is simply a different shape:
+//!   call [`TxnManager::begin_snapshot_read`] directly, read every table under the one reader it
+//!   returns, close it with [`TxnManager::end_read_only`], and use its single boundary for the
+//!   whole stream.
 
 use std::io::Write;
 use std::sync::Arc;

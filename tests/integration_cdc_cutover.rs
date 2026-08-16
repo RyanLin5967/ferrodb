@@ -110,6 +110,17 @@ fn ids(feed: &str) -> Vec<u64> {
     id_counts(feed).keys().copied().collect()
 }
 
+/// The same count, restricted to one table's events.
+fn id_counts_for(feed: &str, table: &str) -> BTreeMap<u64, usize> {
+    let want = format!("{{\"table\":\"{table}\"");
+    let only: String = feed
+        .lines()
+        .filter(|l| l.starts_with(&want))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    id_counts(&only)
+}
+
 /// Drain a streamer to the end of the durable log, returning the feed it wrote.
 ///
 /// Stops when a pump neither emits anything **nor moves the cursor**. `emitted == 0` alone is not
@@ -314,4 +325,98 @@ fn the_at_least_once_handoff_both_duplicates_and_drops_in_this_scenario() {
         None,
         "expected the at-least-once handoff to lose the in-flight transaction's row: {counts:?}"
     );
+}
+
+/// **Two tables, one reader, one boundary.**
+///
+/// `snapshot_table_exact` opens a reader per call, so two calls give two boundaries — fine when
+/// each table has its own stream, wrong when one stream carries both. The boundary is
+/// transaction-level and says nothing about tables, so the consistent version is available; it is
+/// just a different shape, and `src/replication/snapshot.rs` documents it. This test is here
+/// because a documented alternative nobody has run is a claim, not a feature.
+#[test]
+fn one_reader_snapshots_two_tables_against_a_single_boundary() {
+    use ferrodb::catalog::column::Value;
+
+    let mut d = db("cutover_two_tables");
+    let (bp, txn) = (d.bp.clone(), d.txn.clone());
+    let catalog = &mut d.catalog;
+    let mut app = Session::new();
+    let mut holder = Session::new();
+
+    exec("CREATE TABLE a (id INTEGER NOT NULL, qty INTEGER);", catalog, &bp, &txn, &mut app);
+    exec("CREATE TABLE b (id INTEGER NOT NULL, qty INTEGER);", catalog, &bp, &txn, &mut app);
+    for i in 1..=4 {
+        exec(&format!("INSERT INTO a VALUES ({i}, {});", i * 10), catalog, &bp, &txn, &mut app);
+        exec(&format!("INSERT INTO b VALUES ({i}, {});", i * 10), catalog, &bp, &txn, &mut app);
+    }
+
+    // One transaction spanning both tables, open across the cutover. The resume point has to reach
+    // back to its `Begin`, which drags the commits below back into the stream's range.
+    exec("BEGIN;", catalog, &bp, &txn, &mut holder);
+    exec("INSERT INTO a VALUES (100, 1000);", catalog, &bp, &txn, &mut holder);
+    exec("INSERT INTO b VALUES (100, 1000);", catalog, &bp, &txn, &mut holder);
+
+    // Committed while that transaction is open, so these sit *above* the resume point and *inside*
+    // the snapshot: exactly the events the single boundary has to suppress.
+    exec("INSERT INTO a VALUES (5, 50);", catalog, &bp, &txn, &mut app);
+    exec("INSERT INTO b VALUES (5, 50);", catalog, &bp, &txn, &mut app);
+
+    let handoff = txn.begin_snapshot_read().expect("snapshot read");
+
+    // Committed while the reader is open: invisible to it, so the stream owes them.
+    exec("INSERT INTO a VALUES (6, 60);", catalog, &bp, &txn, &mut app);
+    exec("INSERT INTO b VALUES (6, 60);", catalog, &bp, &txn, &mut app);
+
+    // Both tables read under the one reader, so both describe the same instant.
+    let read = |sql: &str, catalog: &mut Catalog, app: &mut Session| -> Vec<u64> {
+        app.current = Some(handoff.txn_id);
+        let rows = match exec(sql, catalog, &bp, &txn, app) {
+            Outcome::Rows(r) => r,
+            _ => panic!("SELECT did not return rows"),
+        };
+        app.current = None;
+        rows.iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i as u64,
+                _ => panic!("id column is not an integer"),
+            })
+            .collect()
+    };
+    let snap_a = read("SELECT * FROM a;", catalog, &mut app);
+    let snap_b = read("SELECT * FROM b;", catalog, &mut app);
+    txn.end_read_only(handoff.txn_id).expect("close reader");
+
+    assert_eq!(snap_a, (1..=5).collect::<Vec<u64>>(), "table a snapshot is not the reader's state");
+    assert_eq!(snap_b, (1..=5).collect::<Vec<u64>>(), "table b snapshot is not the reader's state");
+
+    exec("COMMIT;", catalog, &bp, &txn, &mut holder);
+    exec("INSERT INTO a VALUES (7, 70);", catalog, &bp, &txn, &mut app);
+    exec("INSERT INTO b VALUES (7, 70);", catalog, &bp, &txn, &mut app);
+    d.wal.flush().unwrap();
+
+    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog))
+        .resuming_after_snapshot(handoff.snapshot.clone());
+    let (stream_feed, suppressed) = drain(&streamer, &d.wal, handoff.resume_lsn);
+    assert!(suppressed > 0, "the single boundary suppressed nothing, so it was never exercised");
+
+    for (table, snap) in [("a", &snap_a), ("b", &snap_b)] {
+        let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+        for id in snap.iter() {
+            *counts.entry(*id).or_insert(0) += 1;
+        }
+        for (id, n) in id_counts_for(&stream_feed, table) {
+            *counts.entry(id).or_insert(0) += n;
+        }
+        let mut expected: Vec<u64> = (1..=7).collect();
+        expected.push(100);
+        assert_eq!(
+            counts.keys().copied().collect::<Vec<u64>>(),
+            expected,
+            "table {table} did not receive exactly the rows written: {counts:?}"
+        );
+        for (id, n) in &counts {
+            assert_eq!(*n, 1, "table {table} delivered id {id} {n} times: {counts:?}");
+        }
+    }
 }
