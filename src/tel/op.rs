@@ -177,9 +177,17 @@ impl Op {
 
 /// A reservation taken against a bounded resource.
 ///
-/// Bounded counters need **no special merge logic**: compose the `Add`s normally, then
-/// re-evaluate the guard against the *merged* state. Claims exist so the pre-merge admission
-/// path can reserve headroom, not so merge can shortcut that re-evaluation.
+/// A reservation of headroom in a bounded resource, taken **before** the writes that spend it.
+///
+/// This comment used to say bounded counters need no special merge logic — compose the `Add`s and
+/// re-evaluate the guard against the merged state. That is measurably false and DESIGN.md section
+/// 3 has been corrected: guards are *preconditions*, evaluated against merged state before the
+/// ops apply, so with a start of 20 and two takes of 12 the second merge tests `8 >= 0`, passes,
+/// and the counter lands at -4. A precondition cannot see a post-op violation.
+///
+/// Escrow is the answer to that, and it works by moving the failure earlier rather than by making
+/// the merge cleverer: the slack is partitioned at claim time, so an agent that would overdraw is
+/// refused when it *writes*, while it can still do something about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EscrowClaim {
     pub tbl: TableId,

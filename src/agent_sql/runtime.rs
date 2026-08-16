@@ -32,6 +32,7 @@ use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
 };
+use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
@@ -184,6 +185,8 @@ struct State {
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id slot.
     quarantine_reasons: BTreeMap<u64, String>,
+    /// Reservations over bounded cells, so an overdraw fails when it is written.
+    escrow: EscrowLedger,
     /// Which run last published each row, surviving the merge that published it.
     ///
     /// Without this, criterion 9 could only be answered for a row on a *live* branch: `run_of`
@@ -896,6 +899,22 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
+        // Write-time escrow. This runs BEFORE anything is recorded, so a refused overdraw leaves
+        // no trace in the workspace, the frame or the log — the statement simply fails, which is
+        // the entire point of moving the check off the merge path. A decrement of `n` on a bounded
+        // cell spends `n` of this branch's reservation.
+        for op in &ops {
+            if let (OpKind::Add(Delta::Int(d)), Some(col)) = (&op.kind, op.col) {
+                if *d < 0 {
+                    self.state.lock().unwrap().escrow.spend(
+                        branch,
+                        (op.tbl, op.row, col),
+                        -*d,
+                    )?;
+                }
+            }
+        }
+
         let mirrored = after.clone();
         let frame = {
             let mut state = self.state.lock().unwrap();
@@ -1021,6 +1040,48 @@ impl AgentRuntime {
     ///
     /// Composition first, guards second, verdict third. A conflicting merge publishes **nothing**
     /// and leaves the branch alive so the agent can retry with the returned predicate.
+    /// Declare a cell bounded, with `slack` units of headroom above its floor.
+    pub fn open_escrow(
+        &self,
+        table: &str,
+        row: RowId,
+        col: ColId,
+        slack: i64,
+    ) -> Result<(), FerroError> {
+        self.state.lock().unwrap().escrow.open((table_id(table), row, col), slack)
+    }
+
+    /// Reserve part of a bounded cell's slack for `branch`.
+    ///
+    /// Refused when the slack is already spoken for, which is what stops two agents each taking
+    /// 12 out of 20 — and it is refused here, where the agent can still ask for less.
+    pub fn claim_escrow(
+        &self,
+        branch: BranchId,
+        table: &str,
+        row: RowId,
+        col: ColId,
+        amount: i64,
+    ) -> Result<(), FerroError> {
+        self.state.lock().unwrap().escrow.claim(branch, (table_id(table), row, col), amount)
+    }
+
+    /// Headroom on a bounded cell that nobody has reserved.
+    pub fn unclaimed_escrow(&self, table: &str, row: RowId, col: ColId) -> Option<i64> {
+        self.state.lock().unwrap().escrow.unclaimed(&(table_id(table), row, col))
+    }
+
+    /// What `branch` has reserved and not yet spent.
+    pub fn remaining_escrow(
+        &self,
+        branch: BranchId,
+        table: &str,
+        row: RowId,
+        col: ColId,
+    ) -> Option<i64> {
+        self.state.lock().unwrap().escrow.remaining(branch, &(table_id(table), row, col))
+    }
+
     /// Hold a branch a verification gate declined: **unmerged, still queryable**.
     ///
     /// Both halves matter. Not merging is the point of declining; staying queryable is what makes
@@ -1457,6 +1518,9 @@ impl AgentRuntime {
     fn seal(&self, branch: BranchId) -> Result<(), FerroError> {
         {
             let mut state = self.state.lock().unwrap();
+            // Whether this branch merged or was abandoned, it is done holding headroom. An agent
+            // that dies with a claim outstanding must not strand the resource for everyone else.
+            state.escrow.release(branch);
             if let Some(ws) = state.workspaces.remove(&branch.id) {
                 state.names.remove(&ws.name);
             }

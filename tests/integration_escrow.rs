@@ -1,0 +1,228 @@
+//! D5: escrow at fork, through the SQL surface.
+//!
+//! This is the row that closes the finding the demo has been carrying since C5. Two agents each
+//! take 12 from a counter of 20 under `WHERE qty >= 0`, both merges are admitted, and main lands
+//! at **−4** — because a guard is a *precondition* re-evaluated against merged state before the
+//! ops apply, so the second merge tests `8 >= 0` and passes. No amount of care at merge time fixes
+//! that; the check is simply too late.
+//!
+//! Escrow moves the failure earlier. The slack is partitioned when it is claimed, and the write
+//! that would overdraw is refused **while the agent is still writing** and can do something about
+//! it. The first test here is the unescrowed case, kept deliberately, so the fix is measured
+//! against the defect rather than asserted on its own.
+
+use std::fs::OpenOptions;
+use std::sync::Arc;
+
+use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::branch::types::BranchId;
+use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::catalog::catalog::Catalog;
+use ferrodb::catalog::column::Value;
+use ferrodb::error::FerroError;
+use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::session::Session;
+use ferrodb::parser::parser::Parser;
+use ferrodb::parser::scanner::Scanner;
+use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::tel::ids::{ColId, RowId};
+use ferrodb::wal::log::WalManager;
+use ferrodb::wal::txn::TxnManager;
+
+/// `qty` is the second column, and columns are 1-indexed in `ColId`.
+const QTY: ColId = ColId(1);
+
+struct Db {
+    catalog: Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    runtime: Arc<AgentRuntime>,
+    _dir: tempfile::TempDir,
+}
+
+impl Db {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("escrow.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(WalManager::new(dir.path().join("escrow.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        Db { catalog, bp, txn, runtime: Arc::new(AgentRuntime::new()), _dir: dir }
+    }
+
+    fn session(&self) -> Session {
+        Session::with_runtime(self.runtime.clone())
+    }
+
+    fn exec(&mut self, sql: &str, s: &mut Session) -> Result<Outcome, FerroError> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens()?;
+        let mut parser = Parser::new(tokens);
+        let mut stmts = parser.parse();
+        if !parser.errors.is_empty() {
+            return Err(FerroError::SqlParseError(
+                parser.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+            ));
+        }
+        assert_eq!(stmts.len(), 1, "expected one statement: {}", sql);
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), s)
+    }
+
+    fn ok(&mut self, sql: &str, s: &mut Session) -> Outcome {
+        self.exec(sql, s).unwrap_or_else(|e| panic!("{sql} failed: {e}"))
+    }
+
+    fn seed(&mut self, start: i32) {
+        let mut s = self.session();
+        self.ok("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+        self.ok(&format!("INSERT INTO inventory VALUES (1, {start});"), &mut s);
+    }
+
+    fn qty(&mut self) -> i32 {
+        let mut s = self.session();
+        match self.ok("SELECT qty FROM inventory WHERE id = 1;", &mut s) {
+            Outcome::Rows(rows) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Integer(i)) => *i,
+                other => panic!("unexpected qty: {other:?}"),
+            },
+            _ => panic!("expected rows"),
+        }
+    }
+}
+
+/// The defect, kept so the fix has something to be measured against. Without escrow the counter
+/// really does go under, and a test that only showed escrow working would not prove escrow was
+/// what did it.
+#[test]
+fn without_escrow_two_agents_drive_the_counter_below_its_floor() {
+    let mut db = Db::new();
+    db.seed(20);
+
+    for (agent, run_id) in [("a", "r_a"), ("b", "r_b")] {
+        let mut s = db.session();
+        db.ok(&format!("BEGIN AGENT SESSION AS '{agent}' RUN '{run_id}';"), &mut s);
+        db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 0;", &mut s);
+        db.ok("MERGE;", &mut s);
+    }
+
+    assert_eq!(
+        db.qty(),
+        -4,
+        "the unescrowed case is supposed to reach -4; if this changed, the premise of this whole \
+         file changed with it"
+    );
+}
+
+/// The same scenario with the slack partitioned first.
+#[test]
+fn with_escrow_the_second_agent_is_refused_while_it_is_still_writing() {
+    let mut db = Db::new();
+    db.seed(20);
+    // 20 units of headroom above a floor of 0.
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    let a_branch = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(a_branch, "inventory", RowId(1), QTY, 12).unwrap();
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    let b_branch = b.agent.as_ref().unwrap().branch;
+
+    // Agent b cannot even reserve 12: only 8 are left, and it finds out now rather than after
+    // doing the work.
+    let err = db
+        .runtime
+        .claim_escrow(b_branch, "inventory", RowId(1), QTY, 12)
+        .expect_err("both agents reserved 12 out of 20, which is how the counter reached -4");
+    assert!(format!("{err}").contains("exceeds the 8"), "got {err}");
+
+    // It takes what actually exists instead.
+    db.runtime.claim_escrow(b_branch, "inventory", RowId(1), QTY, 8).unwrap();
+
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 0;", &mut a);
+    db.ok("MERGE;", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 8 WHERE id = 1 AND qty >= 0;", &mut b);
+    db.ok("MERGE;", &mut b);
+
+    assert_eq!(db.qty(), 0, "12 + 8 = 20 out of 20 should land exactly on the floor");
+}
+
+/// The write-time half, through SQL: a claim that is not enforced on write is a suggestion.
+#[test]
+fn a_write_beyond_the_claim_fails_at_write_time_not_at_merge() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'greedy' RUN 'r_g';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(branch, "inventory", RowId(1), QTY, 5).unwrap();
+
+    // Within the claim.
+    db.ok("UPDATE inventory SET qty = qty - 3 WHERE id = 1;", &mut a);
+    assert_eq!(db.runtime.remaining_escrow(branch, "inventory", RowId(1), QTY), Some(2));
+
+    // Over it — and the failure lands on the UPDATE, not on the MERGE.
+    let err = match db.exec("UPDATE inventory SET qty = qty - 9 WHERE id = 1;", &mut a) {
+        Err(e) => e,
+        Ok(_) => panic!("a write of 9 against a remaining claim of 2 was allowed"),
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("remaining escrow of 2"), "the error must say what is left: {msg}");
+
+    // The refused statement left nothing behind: the claim is untouched and main is unchanged.
+    assert_eq!(
+        db.runtime.remaining_escrow(branch, "inventory", RowId(1), QTY),
+        Some(2),
+        "a refused write still consumed part of the claim"
+    );
+    assert_eq!(db.qty(), 20, "a refused write reached main");
+}
+
+/// An agent that walks away must not strand the resource — the failure mode that makes
+/// reservation schemes unusable in practice.
+#[test]
+fn abandoning_a_branch_returns_its_claim_to_the_pool() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'quitter' RUN 'r_q';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(branch, "inventory", RowId(1), QTY, 15).unwrap();
+    assert_eq!(db.runtime.unclaimed_escrow("inventory", RowId(1), QTY), Some(5));
+
+    db.ok("ABANDON;", &mut a);
+    assert_eq!(
+        db.runtime.unclaimed_escrow("inventory", RowId(1), QTY),
+        Some(20),
+        "an abandoned agent stranded its reservation, so the resource shrinks with every crash"
+    );
+}
+
+/// Escrow governs only what was declared. Policing every column silently would make the mechanism
+/// impossible to reason about, and would break every table that is not a bounded resource.
+#[test]
+fn a_column_with_no_declared_bound_is_not_escrowed() {
+    let mut db = Db::new();
+    db.seed(20);
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    // No open_escrow call at all: this must behave exactly as it did before escrow existed.
+    db.ok("UPDATE inventory SET qty = qty - 500 WHERE id = 1;", &mut a);
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty(), -480);
+    assert_eq!(db.runtime.unclaimed_escrow("inventory", RowId(1), QTY), None);
+}
