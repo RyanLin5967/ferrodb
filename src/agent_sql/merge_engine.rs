@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::branch::record::BranchRecord;
-use crate::branch::types::{BranchId, CommitHash};
+use crate::branch::types::BranchId;
 use crate::catalog::column::Value;
 use crate::error::FerroError;
 use crate::tel::frame::TxnFrame;
@@ -471,7 +471,7 @@ pub fn delta_of(kind: &OpKind) -> Option<Delta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branch::types::LeaseDeadline;
+    use crate::branch::types::{CommitHash, LeaseDeadline};
     use crate::tel::guard::{CmpOp, GuardExpr};
 
     fn cell(ours: OpKind, theirs: Option<OpKind>, base: i32, target: i32) -> CellMerge {

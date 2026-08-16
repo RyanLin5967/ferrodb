@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent_sql::changeset::{
     ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome,
 };
-use crate::agent_sql::mem_catalog::MemBranchCatalog;
+use crate::agent_sql::mem_catalog::{MemBranchCatalog, MemEffectLog};
 use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
@@ -53,6 +53,7 @@ use crate::tel::guard::{ArithOp, CmpOp, Guard, GuardExpr};
 use crate::tel::ids::{ColId, RowId, TableId, TxnId};
 use crate::tel::merge::{ConflictKind, ConflictReport, MergeOutcome, MergePolicy};
 use crate::tel::op::{Delta, Op, OpKind};
+use crate::tel::EffectLog;
 use crate::wal::txn::{ReadView, TxnManager};
 
 /// Default lease on an agent branch. Leases are non-cooperative: expiry does not require the
@@ -112,10 +113,8 @@ enum RowState {
 
 /// One agent task's private workspace: its uncommitted rows, its frame, its read-set.
 struct Workspace {
-    branch: BranchId,
     name: String,
-    agent_id: String,
-    run_id: String,
+    /// The interned run: which agent + run + model owns every write on this branch.
     prov: ProvId,
     txn: TxnId,
     /// Apply-sequence of the target at fork time. Anything applied after this is concurrent with
@@ -151,9 +150,9 @@ struct AppliedOp {
     before_row: Option<Vec<Value>>,
 }
 
+/// What one `MERGE` published, so `REVERT` can find it again.
 #[derive(Debug, Clone)]
 struct MergeRecord {
-    merge_id: String,
     branch: BranchId,
     txns: Vec<TxnId>,
 }
@@ -181,6 +180,9 @@ pub trait BranchResolver {
 
 pub struct AgentRuntime {
     branches: Arc<dyn BranchCatalog>,
+    /// Where captured frames go. One frame per agent task, re-appended as the task grows, so a
+    /// merge engine on the other side of this trait sees exactly what the SQL layer captured.
+    log: Arc<dyn EffectLog>,
     state: Mutex<State>,
 }
 
@@ -197,11 +199,22 @@ impl AgentRuntime {
 
     /// Build over any `BranchCatalog` — the durable branch engine drops in here.
     pub fn with_catalog(branches: Arc<dyn BranchCatalog>) -> Self {
-        AgentRuntime { branches, state: Mutex::new(State::default()) }
+        AgentRuntime::with_parts(branches, Arc::new(MemEffectLog::new()))
+    }
+
+    /// Build over any `BranchCatalog` and any `EffectLog`.
+    pub fn with_parts(branches: Arc<dyn BranchCatalog>, log: Arc<dyn EffectLog>) -> Self {
+        AgentRuntime { branches, log, state: Mutex::new(State::default()) }
     }
 
     pub fn branches(&self) -> &Arc<dyn BranchCatalog> {
         &self.branches
+    }
+
+    /// The captured Typed Effect Log. `MERGE` and `DIFF` both read from here through the shared
+    /// traits, so the log is on the live path rather than a side record.
+    pub fn log(&self) -> &Arc<dyn EffectLog> {
+        &self.log
     }
 
     /// Declare a column's concurrent-write policy. Absent a declaration the policy is `REJECT`.
@@ -253,10 +266,7 @@ impl AgentRuntime {
         state.workspaces.insert(
             branch.id,
             Workspace {
-                branch,
                 name: name.clone(),
-                agent_id: agent_id.to_string(),
-                run_id: run.clone(),
                 prov,
                 txn,
                 fork_seq,
@@ -621,21 +631,26 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        let mut state = self.state.lock().unwrap();
-        let ws = state
-            .workspaces
-            .get_mut(&branch.id)
-            .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {}", branch)))?;
-        let key = Workspace::key(tbl, row);
-        ws.base_rows.entry(key).or_insert(before);
-        ws.tables.insert(tbl.0, table.to_string());
-        ws.rows.insert(key, after);
-        for op in ops {
-            ws.frame.push_op(op);
-        }
-        if let Some(g) = guard {
-            ws.frame.push_guard(g);
-        }
+        let frame = {
+            let mut state = self.state.lock().unwrap();
+            let ws = state.workspaces.get_mut(&branch.id).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {}", branch))
+            })?;
+            let key = Workspace::key(tbl, row);
+            ws.base_rows.entry(key).or_insert(before);
+            ws.tables.insert(tbl.0, table.to_string());
+            ws.rows.insert(key, after);
+            for op in ops {
+                ws.frame.push_op(op);
+            }
+            if let Some(g) = guard {
+                ws.frame.push_guard(g);
+            }
+            ws.frame.clone()
+        };
+        // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
+        // not idempotent and two copies of one frame would double-count.
+        self.log.append(&frame)?;
         Ok(())
     }
 
@@ -751,7 +766,8 @@ impl AgentRuntime {
 
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
-        let mut merged_state = CellState::new();
+        // The state guards are re-checked against; see the comment where it is filled in.
+        let mut admit_state = CellState::new();
         let policy_snapshot = { self.state.lock().unwrap().policy.clone() };
 
         for ((t, r), after) in &snapshot.rows {
@@ -765,7 +781,20 @@ impl AgentRuntime {
             let mut discarded = Vec::new();
             let mut conflicts: Vec<ConflictReport> = Vec::new();
             let mut composed: Vec<Op> = Vec::new();
-            let mut merged_row = now.clone().or_else(|| before.clone());
+            // **The state a guard is re-evaluated against**: the target as it stands at merge
+            // time, which already carries every concurrent branch's composed effect, and which is
+            // exactly what this branch's ops are about to be applied to.
+            //
+            // This is the reading that makes the bounded counter work as DESIGN.md describes it.
+            // `UPDATE qty = qty - 12 WHERE qty >= 12` on a base of 20: merged solo the guard sees
+            // 20 and holds; merged after a concurrent -12 it sees 8 and fails, returning
+            // `qty >= 12` to the agent. Checking it against the *post*-op image instead would
+            // reject the solo merge too, because a precondition is not a postcondition.
+            let admit_image = match (before.as_ref(), after) {
+                // An insert has no prior image, so its own new row is what a guard can refer to.
+                (None, RowState::Present(v)) => Some(v.clone()),
+                _ => now.clone().or_else(|| before.clone()),
+            };
 
             match (before.as_ref(), after) {
                 // insert
@@ -787,7 +816,6 @@ impl AgentRuntime {
                             table: table.clone(),
                             row: v.clone(),
                         });
-                        merged_row = Some(v.clone());
                     }
                 }
                 // delete
@@ -807,9 +835,7 @@ impl AgentRuntime {
                         pending_writes.push(PendingWrite::Delete {
                             table: table.clone(),
                             key: b[0].clone(),
-                            before: b.clone(),
                         });
-                        merged_row = None;
                     }
                     None => {
                         // already gone on the target: nothing to publish
@@ -869,14 +895,13 @@ impl AgentRuntime {
                             before: now.clone().unwrap_or_else(|| b.clone()),
                         });
                     }
-                    merged_row = Some(new_row);
                 }
                 (None, RowState::Deleted) => {}
             }
 
-            if let Some(img) = &merged_row {
+            if let Some(img) = &admit_image {
                 for (idx, val) in img.iter().enumerate() {
-                    merged_state.set(tbl, row, ColId(idx as u32), val.clone());
+                    admit_state.set(tbl, row, ColId(idx as u32), val.clone());
                 }
             }
 
@@ -904,7 +929,7 @@ impl AgentRuntime {
         }
 
         // Guards are re-checked **after** composition, against the state the merge would produce.
-        let guard_conflicts = check_guards(&snapshot.guards, &merged_state);
+        let guard_conflicts = check_guards(&snapshot.guards, &admit_state);
         for c in guard_conflicts {
             match row_outcomes.iter_mut().find(|r| r.tbl == c.tbl && r.row == c.row) {
                 Some(r) => {
@@ -1040,7 +1065,7 @@ impl AgentRuntime {
         }
         state.merges.insert(
             merge_id.to_string(),
-            MergeRecord { merge_id: merge_id.to_string(), branch, txns: vec![txn] },
+            MergeRecord { branch, txns: vec![txn] },
         );
     }
 
@@ -1092,17 +1117,22 @@ impl AgentRuntime {
         merge_id: &str,
         mode: RevertMode,
     ) -> Result<RevertPlan, FerroError> {
-        let (targets, graph) = {
+        let (targets, rec_branch, graph) = {
             let state = self.state.lock().unwrap();
             let rec = state
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), state.dep.build())
+            (rec.txns.clone(), rec.branch, state.dep.build())
         };
         let target = *targets
             .first()
-            .ok_or_else(|| FerroError::Merge(format!("merge {} recorded no transaction", merge_id)))?;
+            .ok_or_else(|| {
+                FerroError::Merge(format!(
+                    "merge {} of branch {} recorded no transaction",
+                    merge_id, rec_branch
+                ))
+            })?;
         let plan = graph.plan_revert(target, mode);
         if plan.is_blocked() {
             return Ok(plan);
@@ -1131,12 +1161,8 @@ impl AgentRuntime {
             let schema = entry.schema.clone();
             match (&a.kind, a.col) {
                 (OpKind::RowCreate(row), _) => {
-                    PendingWrite::Delete {
-                        table: a.table.clone(),
-                        key: row[0].clone(),
-                        before: row.clone(),
-                    }
-                    .apply(ctx)?;
+                    PendingWrite::Delete { table: a.table.clone(), key: row[0].clone() }
+                        .apply(ctx)?;
                 }
                 (OpKind::RowDelete, _) => {
                     let row = a.before_row.clone().ok_or_else(|| {
@@ -1207,7 +1233,7 @@ struct WorkspaceSnapshot {
 enum PendingWrite {
     Insert { table: String, row: Vec<Value> },
     Update { table: String, schema: Schema, key: Value, row: Vec<Value>, before: Vec<Value> },
-    Delete { table: String, key: Value, before: Vec<Value> },
+    Delete { table: String, key: Value },
 }
 
 impl PendingWrite {
@@ -1238,7 +1264,7 @@ impl PendingWrite {
                     }),
                 }
             }
-            PendingWrite::Delete { table, key, before: _ } => {
+            PendingWrite::Delete { table, key } => {
                 let pk = ctx
                     .catalog
                     .get_table(&table)

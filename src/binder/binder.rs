@@ -542,6 +542,112 @@ mod tests {
         assert!(matches!(Binder::new(&catalog).bind(parse_one("SELECT name FROM idk;")), Err(FerroError::Bind(_))));
     }
 
+    // ---- agent-session statements ------------------------------------------------------------
+
+    struct StubResolver;
+
+    impl BranchResolver for StubResolver {
+        fn resolve_branch(&self, name: &str) -> Result<BranchId, FerroError> {
+            match name {
+                "b_1" => Ok(BranchId::new(1, 0)),
+                "b_2" => Ok(BranchId::new(2, 0)),
+                other => Err(FerroError::Branch(format!("unknown branch: {}", other))),
+            }
+        }
+    }
+
+    fn bind_agent(sql: &str, current: Option<BranchId>) -> Result<BoundAgentStmt, FerroError> {
+        let (catalog, _dir) = setup();
+        Binder::new(&catalog).bind_agent(&parse_one(sql), &StubResolver, current)
+    }
+
+    #[test]
+    fn test_bind_begin_agent_session() {
+        match bind_agent("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';", None).unwrap() {
+            BoundAgentStmt::BeginAgentSession { agent_id, run_id, parent } => {
+                assert_eq!(agent_id, "pricing-agent");
+                assert_eq!(run_id.as_deref(), Some("r_8fk2"));
+                assert_eq!(parent, BranchId::TRUNK);
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // inside a session, a new task forks from that session's branch
+        let nested = bind_agent("BEGIN AGENT SESSION AS 'a';", Some(BranchId::new(1, 0))).unwrap();
+        match nested {
+            BoundAgentStmt::BeginAgentSession { parent, .. } => {
+                assert_eq!(parent, BranchId::new(1, 0))
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bind_diff_merge_abandon_default_to_the_session_branch() {
+        let current = Some(BranchId::new(2, 0));
+        assert!(matches!(
+            bind_agent("DIFF;", current).unwrap(),
+            BoundAgentStmt::Diff { branch } if branch == BranchId::new(2, 0)
+        ));
+        assert!(matches!(
+            bind_agent("MERGE;", current).unwrap(),
+            BoundAgentStmt::Merge { branch } if branch == BranchId::new(2, 0)
+        ));
+        assert!(matches!(
+            bind_agent("ABANDON;", current).unwrap(),
+            BoundAgentStmt::Abandon { branch } if branch == BranchId::new(2, 0)
+        ));
+        // an explicitly named branch wins over the session's own
+        assert!(matches!(
+            bind_agent("DIFF BRANCH b_1;", current).unwrap(),
+            BoundAgentStmt::Diff { branch } if branch == BranchId::new(1, 0)
+        ));
+    }
+
+    #[test]
+    fn test_bind_without_a_session_or_branch_is_an_error() {
+        for sql in ["DIFF;", "MERGE;", "ABANDON;"] {
+            let err = bind_agent(sql, None).unwrap_err();
+            assert!(err.to_string().contains("no agent session"), "{} gave {}", sql, err);
+        }
+        assert!(bind_agent("DIFF BRANCH b_9;", None).is_err());
+    }
+
+    #[test]
+    fn test_bind_select_as_of_resolves_the_branch_and_the_columns() {
+        match bind_agent("SELECT name FROM users AS OF BRANCH b_1;", None).unwrap() {
+            BoundAgentStmt::SelectAsOf { branch, .. } => assert_eq!(branch, BranchId::new(1, 0)),
+            other => panic!("expected SelectAsOf, got {:?}", other),
+        }
+        // an unknown column fails at bind time, not mid-scan
+        assert!(bind_agent("SELECT nope FROM users AS OF BRANCH b_1;", None).is_err());
+        // an unknown branch is an error, never an empty result
+        assert!(bind_agent("SELECT name FROM users AS OF BRANCH b_9;", None).is_err());
+        // a SELECT without AS OF is not an agent statement
+        assert!(bind_agent("SELECT name FROM users;", None).is_err());
+    }
+
+    #[test]
+    fn test_bind_revert_merge_defaults_to_halt() {
+        match bind_agent("REVERT MERGE m_44;", None).unwrap() {
+            BoundAgentStmt::RevertMerge { merge_id, mode } => {
+                assert_eq!(merge_id, "m_44");
+                assert_eq!(mode, RevertMode::Halt);
+            }
+            other => panic!("expected RevertMerge, got {:?}", other),
+        }
+        match bind_agent("REVERT MERGE m_44 CASCADE;", None).unwrap() {
+            BoundAgentStmt::RevertMerge { mode, .. } => assert_eq!(mode, RevertMode::Cascade),
+            other => panic!("expected RevertMerge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bind_rejects_an_agent_statement_as_a_plan() {
+        let (catalog, _dir) = setup();
+        let err = Binder::new(&catalog).bind(parse_one("DIFF;")).unwrap_err();
+        assert!(matches!(err, FerroError::Bind(_)));
+    }
+
     #[test]
     fn test_duplicate_qualifier_bind() {
         let (catalog, _dir) = setup();
