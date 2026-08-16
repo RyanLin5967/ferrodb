@@ -52,19 +52,22 @@ branch engine directly: `criterion_1_fork_copies_zero_pages` builds its own `Are
 calls `BranchCatalog::fork`, with no `AgentRuntime`, no `Session`, and no SQL statement executed.
 The `sql>` line printed inside criterion 1 is an echo, not an executed statement.
 
-**And the statement path is not the thing that is unwired.** `stage()` mirrors every staged row
-onto the branch's CoW tree whenever the runtime has a page store
+**The statement path was never the thing that was unwired, and as of 2026-08-16 nothing is.**
+`stage()` mirrors every staged row onto the branch's CoW tree whenever the runtime has a page store
 (`src/agent_sql/runtime.rs:967-978`), and `tests/integration_branch_pages.rs` drives exactly that
-through the real scanner, parser, binder and executor in 9 tests. What is unwired is narrower:
-nothing in `src/` builds a storage-backed runtime — `Session::new()` sets `storage: None` and
-`Session::with_runtime` has no caller — so the CLI, the pgwire server and this demo are all
-map-backed. `with_storage` also mints a fresh trunk root with no reattach path, so it is not a
-switch that can be flipped on a database holding data.
+through the real scanner, parser, binder and executor in 9 tests. What was missing was the
+*constructor call*: nothing in `src/` built a storage-backed runtime. `src/cli/cli.rs` now does, and
+this demo now does too, so Act II runs on pages.
 
-Reading "criterion 2 is MET" as "branch isolation is enforced by shadow paging" is therefore still
-wrong *for this demo*
-for Act II — the shadow-paging path now exists and is measured, but statements do not go through
-it yet.
+**Reading "criterion 2 is MET" as "branch isolation is enforced by shadow paging" is now correct,
+and the demo proves it rather than asking to be believed.** Criterion 2 reads the branch's own
+copy-on-write tree and trunk's, and prints both counts — 1 row on the branch, 0 on trunk. Run the
+demo against `AgentRuntime::new()` instead and criterion 2 reports **NOT MET**, with the reason
+printed, which is what makes the MET a measurement rather than a default.
+
+This section said the opposite until 2026-08-16. It was accurate when written — the constructor
+genuinely had no caller — and it is corrected here rather than deleted, because a reader who saw the
+earlier claim deserves to know which sentence changed and why.
 
 One genuine connection between the acts, worth stating because it is easy to assume the opposite:
 `AgentRuntime::begin_session` really does call `BranchCatalog::fork`, and the runtime's default
