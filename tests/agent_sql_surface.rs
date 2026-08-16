@@ -360,6 +360,24 @@ fn a_solo_merge_is_clean_and_publishes_to_main() {
 }
 
 #[test]
+fn a_multi_row_merge_publishes_every_row_in_one_transaction() {
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r1';", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut a);
+    db.ok("INSERT INTO inventory VALUES (5, 50);", &mut a);
+
+    let r = report(db.ok("MERGE;", &mut a));
+    assert!(r.applied_to_target, "{}", r);
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(qty_of(&mut db, 1), 15);
+    assert_eq!(qty_of(&mut db, 2), 6);
+    assert_eq!(qty_of(&mut db, 5), 50);
+}
+
+#[test]
 fn two_branches_decrementing_the_same_row_compose_arithmetically() {
     // Exit criterion 6. 20 - 5 - 3 = 12, which is neither branch's own answer.
     let mut db = Db::new();

@@ -32,7 +32,7 @@ use crate::tel::merge::{
     ColumnPolicyLookup, ConflictKind, ConflictReport, Diff, DiscardedWrite, MergeOutcome,
     MergePolicy, Merger,
 };
-use crate::tel::op::{Delta, Op, OpKind};
+use crate::tel::op::{Op, OpKind};
 use crate::tel::EffectLog;
 
 /// Per-column merge policy, defaulting to [`MergePolicy::Reject`].
@@ -460,18 +460,11 @@ pub fn invert(kind: &OpKind, witness: Option<&Value>) -> Result<OpKind, FerroErr
     })
 }
 
-/// Turn an arithmetic delta into the value it would produce, for reporting.
-pub fn delta_of(kind: &OpKind) -> Option<Delta> {
-    match kind {
-        OpKind::Add(d) => Some(*d),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::branch::types::{CommitHash, LeaseDeadline};
+    use crate::tel::op::Delta;
     use crate::tel::guard::{CmpOp, GuardExpr};
 
     fn cell(ours: OpKind, theirs: Option<OpKind>, base: i32, target: i32) -> CellMerge {

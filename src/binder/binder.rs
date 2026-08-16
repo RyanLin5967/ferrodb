@@ -268,6 +268,15 @@ impl<'a> Binder<'a> {
 
     // one table -> Scan node: adds its columns to scope
     pub fn bind_scan(&self, table: &TableRef, scope: &mut Scope) -> Result<LogicalPlan, FerroError> {
+        // A relational plan reads the shared tables and knows nothing about branches, so binding
+        // one from a table qualified `AS OF BRANCH b` would silently answer from main. Refuse
+        // instead: `bind_agent` strips the qualifier and routes the read through the runtime.
+        if let Some(b) = &table.as_of {
+            return Err(FerroError::Bind(format!(
+                "AS OF BRANCH {} must be executed through an agent session, not a plain plan",
+                b.name
+            )));
+        }
         let table_entry = match self.catalog.get_table(&table.name) {
             Some(t) => t,
             None => return Err(FerroError::Bind("unknown table: {}".into())),
@@ -646,6 +655,17 @@ mod tests {
         let (catalog, _dir) = setup();
         let err = Binder::new(&catalog).bind(parse_one("DIFF;")).unwrap_err();
         assert!(matches!(err, FerroError::Bind(_)));
+    }
+
+    #[test]
+    fn test_binding_a_plain_plan_from_an_as_of_table_is_refused_not_silently_main() {
+        // The dangerous outcome is a *wrong answer*: a plan bound from `AS OF BRANCH b` would
+        // read main and look like a successful branch read.
+        let (catalog, _dir) = setup();
+        let err = Binder::new(&catalog)
+            .bind(parse_one("SELECT name FROM users AS OF BRANCH b_1;"))
+            .unwrap_err();
+        assert!(err.to_string().contains("AS OF BRANCH b_1"), "got {}", err);
     }
 
     #[test]

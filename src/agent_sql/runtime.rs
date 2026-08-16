@@ -969,9 +969,17 @@ impl AgentRuntime {
             });
         }
 
+        // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
+        // failed halfway visible on the target, which is exactly the state a merge exists to
+        // avoid: the report says the merge landed or it says it did not.
+        let publish_txn = ctx.txn.begin()?;
         for w in pending_writes {
-            w.apply(ctx)?;
+            if let Err(e) = w.apply_in(ctx, publish_txn) {
+                ctx.txn.abort(publish_txn)?;
+                return Err(e);
+            }
         }
+        ctx.txn.commit(publish_txn)?;
         self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
         self.seal(branch)?;
 
@@ -1237,7 +1245,27 @@ enum PendingWrite {
 }
 
 impl PendingWrite {
+    /// Publish inside an already-open transaction.
+    fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64) -> Result<usize, FerroError> {
+        let stmt = self.into_stmt(ctx)?;
+        let stmt = match stmt {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        apply_dml_in(stmt, ctx, txn_id)
+    }
+
+    /// Publish in a transaction of its own.
     fn apply(self, ctx: &mut ExecCtx) -> Result<usize, FerroError> {
+        let stmt = match self.into_stmt(ctx)? {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        apply_dml(stmt, ctx)
+    }
+
+    /// `None` when the write turned out to be a no-op.
+    fn into_stmt(self, ctx: &mut ExecCtx) -> Result<Option<Stmt>, FerroError> {
         let stmt = match self {
             PendingWrite::Insert { table, row } => Stmt::Insert {
                 table,
@@ -1251,7 +1279,7 @@ impl PendingWrite {
                     }
                 }
                 if assignments.is_empty() {
-                    return Ok(0);
+                    return Ok(None);
                 }
                 let pk = schema.columns[0].name.clone();
                 Stmt::Update {
@@ -1283,40 +1311,32 @@ impl PendingWrite {
                 }
             }
         };
-        apply_dml(stmt, ctx)
+        Ok(Some(stmt))
     }
 }
 
 /// Run a DML statement against the shared tables in its own transaction.
 fn apply_dml(stmt: Stmt, ctx: &mut ExecCtx) -> Result<usize, FerroError> {
     let txn_id = ctx.txn.begin()?;
-    let view = match ctx.txn.snapshot_of(txn_id) {
-        Ok(snapshot) => Arc::new(ReadView { snapshot, txn_id }),
-        Err(e) => {
-            ctx.txn.abort(txn_id)?;
-            return Err(e);
-        }
-    };
-    let planned = plan(stmt, ctx.catalog, ctx.bp.clone(), Some((ctx.txn.clone(), txn_id)), view);
-    match planned {
-        Ok(Plan::Write(mut op)) => match op.execute(ctx.catalog) {
-            Ok(n) => {
-                ctx.txn.commit(txn_id)?;
-                Ok(n)
-            }
-            Err(e) => {
-                ctx.txn.abort(txn_id)?;
-                Err(e)
-            }
-        },
-        Ok(Plan::Read(_)) => {
-            ctx.txn.abort(txn_id)?;
-            Err(FerroError::Bind("expected a write plan".into()))
+    match apply_dml_in(stmt, ctx, txn_id) {
+        Ok(n) => {
+            ctx.txn.commit(txn_id)?;
+            Ok(n)
         }
         Err(e) => {
             ctx.txn.abort(txn_id)?;
             Err(e)
         }
+    }
+}
+
+/// Run a DML statement inside an already-open transaction. The caller owns commit and abort.
+fn apply_dml_in(stmt: Stmt, ctx: &mut ExecCtx, txn_id: u64) -> Result<usize, FerroError> {
+    let snapshot = ctx.txn.snapshot_of(txn_id)?;
+    let view = Arc::new(ReadView { snapshot, txn_id });
+    match plan(stmt, ctx.catalog, ctx.bp.clone(), Some((ctx.txn.clone(), txn_id)), view)? {
+        Plan::Write(mut op) => op.execute(ctx.catalog),
+        Plan::Read(_) => Err(FerroError::Bind("expected a write plan".into())),
     }
 }
 

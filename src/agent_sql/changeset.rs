@@ -41,18 +41,19 @@ pub enum ChangeOutcome {
     /// Not merged yet, and nothing on the target has touched this row since the fork.
     Pending,
     /// Not merged yet, and the target *has* moved under this row. Whether that is a conflict is
-    /// only knowable at merge time, after composition and the guard re-check.
+    /// only knowable at merge time, after composition and the guard re-check — which is why this
+    /// is not called `Conflict`.
     PendingConcurrent,
-    /// Already merged, with the outcome the merge reported.
-    Merged(MergeOutcome),
 }
+
+// There is deliberately no `Merged` variant: a merged branch has no workspace left to diff, so a
+// variant nothing can produce would be a claim the type does not back.
 
 impl Display for ChangeOutcome {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ChangeOutcome::Pending => write!(f, "pending"),
             ChangeOutcome::PendingConcurrent => write!(f, "pending (target moved)"),
-            ChangeOutcome::Merged(o) => write!(f, "merged: {}", o.name()),
         }
     }
 }
@@ -150,7 +151,9 @@ pub struct MergeReport {
     pub into: BranchId,
     pub outcome: MergeOutcome,
     pub rows: Vec<RowMergeOutcome>,
-    /// True when the merge was rejected and the target was left untouched.
+    /// True when the merge was published to the target. False means the merge was rejected and
+    /// the target was left **untouched** — which is the only honest report for a conflict, since
+    /// a half-applied merge is exactly what a merge exists to prevent.
     pub applied_to_target: bool,
 }
 
