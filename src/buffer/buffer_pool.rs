@@ -158,6 +158,16 @@ impl BufferPoolManager {
         if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
             return Err(FerroError::PagePinned);
         }
+        // Ask the disk manager BEFORE touching anything. `deallocate` can refuse — a page inside
+        // a reserved arena region is not this allocator's to free — and evicting first would make
+        // that refusal a lie: the caller gets an Err saying the free did not happen, while the
+        // frame has already been zeroed and the page table entry dropped. For an unflushed dirty
+        // page, memory is the only copy, so the "failed" delete is what destroys it.
+        //
+        // Still holding the page-table write lock, so no other thread can fault the page in
+        // between the two steps. page_table -> bitmap_lock is the only order taken anywhere.
+        self.disk_manager.deallocate(page_id)?;
+
         pt.remove(&page_id);
         drop(pt);
 
@@ -169,16 +179,26 @@ impl BufferPoolManager {
         drop(frame);
 
         self.arc_cache.lock().unwrap().remove(page_id)?;
-        self.disk_manager.deallocate(page_id)?;
         Ok(())
     }
 
     pub fn free_page(&self, page_id: u32) -> Result<(), FerroError> {
         let mut pt = self.page_table.write().unwrap();
-        if let Some(&frame_i) = pt.get(&page_id) {
-            if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
-                return Err(FerroError::PagePinned)
+        let resident = match pt.get(&page_id) {
+            Some(&frame_i) => {
+                if self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                    return Err(FerroError::PagePinned);
+                }
+                Some(frame_i)
             }
+            None => None,
+        };
+
+        // Same ordering rule as `delete_page`: the refusable step goes first, so a refusal leaves
+        // the pool exactly as it found it rather than reporting a failure it already half did.
+        self.disk_manager.deallocate(page_id)?;
+
+        if let Some(frame_i) = resident {
             pt.remove(&page_id);
             drop(pt);
             let mut frame = self.frames[frame_i].write().unwrap();
@@ -188,10 +208,7 @@ impl BufferPoolManager {
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
             self.arc_cache.lock().unwrap().remove(page_id)?;
-        } else {
-            drop(pt);
         }
-        self.disk_manager.deallocate(page_id)?;
         Ok(())
     }
 
@@ -221,5 +238,109 @@ fn page_lsn_of(data: &[u8; PAGE_SIZE]) -> u64 {
 impl Frame {
     pub fn new() -> Self {
         Frame {data: [0u8; PAGE_SIZE], page_id: None, pin_counter: AtomicU16::new(0), dirty_flag: AtomicBool::new(false)}
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::disk_manager::DiskManager;
+    use std::fs::OpenOptions;
+    use std::sync::Arc;
+
+    /// A pool over a real file, with an arena floor registered so `deallocate` will refuse.
+    fn pool_with_arena_floor() -> (Arc<BufferPoolManager>, u32, std::path::PathBuf) {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-bp-partialfree-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new().create(true).read(true).write(true)
+            .open(&path).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let bp = Arc::new(BufferPoolManager::new(dm));
+        // Hand out a few pages, then declare everything from `floor` up to be arena-owned. The
+        // pages already handed out above the floor are exactly the ones `deallocate` must refuse.
+        let mut pages = Vec::new();
+        for _ in 0..6 {
+            pages.push(bp.new_page().unwrap());
+        }
+        let floor = pages[2];
+        bp.disk_manager.reserve_from(floor).unwrap();
+        (bp, pages[4], path) // pages[4] is above the floor -> deallocate refuses it
+    }
+
+    /// S6. `delete_page` evicted the frame before asking the disk manager, so a refusal came back
+    /// as `Err` *after* the page had already been dropped from the pool — and an unflushed dirty
+    /// page's contents went with it. The error says the free did not happen; the pool disagreed.
+    #[test]
+    fn a_refused_delete_leaves_the_page_intact_in_the_pool() {
+        let (bp, page, path) = pool_with_arena_floor();
+
+        // Dirty the page and do NOT flush: memory is now the only copy of this byte.
+        let frame_i = bp.fetch_page(page).unwrap();
+        bp.frames[frame_i].write().unwrap().data[100] = 0xAB;
+        bp.unpin_page(page, true);
+
+        let err = bp.delete_page(page);
+        assert!(err.is_err(), "precondition: the arena floor must make this deallocate refuse");
+
+        // The delete was refused, so nothing about the page may have changed.
+        let pt = bp.page_table.read().unwrap();
+        let still_resident = pt.get(&page).copied();
+        drop(pt);
+        assert!(
+            still_resident.is_some(),
+            "delete_page reported failure but dropped page {} from the page table",
+            page
+        );
+        let i = still_resident.unwrap();
+        assert_eq!(
+            bp.frames[i].read().unwrap().data[100], 0xAB,
+            "delete_page reported failure but zeroed the frame, destroying the only copy"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same contract for `free_page`, which has the same evict-then-ask ordering.
+    #[test]
+    fn a_refused_free_page_leaves_the_page_intact_in_the_pool() {
+        let (bp, page, path) = pool_with_arena_floor();
+
+        let frame_i = bp.fetch_page(page).unwrap();
+        bp.frames[frame_i].write().unwrap().data[100] = 0xCD;
+        bp.unpin_page(page, true);
+
+        let err = bp.free_page(page);
+        assert!(err.is_err(), "precondition: the arena floor must make this deallocate refuse");
+
+        let pt = bp.page_table.read().unwrap();
+        let still_resident = pt.get(&page).copied();
+        drop(pt);
+        assert!(
+            still_resident.is_some(),
+            "free_page reported failure but dropped page {} from the page table",
+            page
+        );
+        assert_eq!(
+            bp.frames[still_resident.unwrap()].read().unwrap().data[100], 0xCD,
+            "free_page reported failure but zeroed the frame"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Control: when the disk manager does NOT refuse, the page really is evicted. Without this
+    /// the two tests above would pass against a `delete_page` that simply never did anything.
+    #[test]
+    fn an_accepted_delete_still_evicts_the_page() {
+        let (bp, _refused, path) = pool_with_arena_floor();
+        let below = 1u32; // below the floor, so the deallocate is allowed
+        bp.fetch_page(below).unwrap();
+        bp.unpin_page(below, false);
+        assert!(bp.page_table.read().unwrap().contains_key(&below));
+
+        bp.delete_page(below).unwrap();
+        assert!(
+            !bp.page_table.read().unwrap().contains_key(&below),
+            "an accepted delete must actually evict"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
