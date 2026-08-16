@@ -37,6 +37,7 @@ use crate::cow::page_header::{flags, stamp_checksum, verify_checksum, PageHeader
 use crate::cow::{CowPage, PageHandle, PageStore, PAGE_HEADER_SIZE};
 use crate::error::FerroError;
 use crate::storage::disk_manager::PAGE_SIZE;
+use crate::wal::log::crc32;
 
 /// The epoch at or after which a page in this branch's own arena may still be mutated in place.
 ///
@@ -161,6 +162,12 @@ impl ArenaPageStore {
     /// The branch that owns `arena`, or `None` if the extent has been freed.
     pub fn arena_owner(&self, arena: ArenaId) -> Option<BranchId> {
         self.state.lock().unwrap().extents.get(&arena).map(|e| e.owner)
+    }
+
+    /// The page range `arena` covers, as `(start_page, page_count)`. Two live extents that
+    /// overlap is silent corruption, so this is what a restart test must actually check.
+    pub fn extent_range(&self, arena: ArenaId) -> Option<(PageId, u32)> {
+        self.state.lock().unwrap().extents.get(&arena).map(|e| (e.start_page, e.page_count))
     }
 
     /// Pages handed out inside `arena` and not since released.
@@ -293,6 +300,219 @@ impl ArenaPageStore {
 
     fn page_birth(&self, page_id: PageId) -> Result<Epoch, FerroError> {
         Ok(self.read_page(page_id)?.header()?.birth_epoch)
+    }
+
+    // ---- durable free-space map ------------------------------------------------------------
+    //
+    // `BranchRecord::arenas` is durable, but which *pages* an extent covers, which of them came
+    // back, and what is parked in the pending-free log are not derivable from it. Without this,
+    // a restart would forget the free-space map: every extent would look untouched, freed space
+    // would never be handed out again, and the pending-free log would silently release pages a
+    // live child can still see. So the whole map is checkpointed, not reconstructed by guesswork.
+    //
+    // Format (big-endian, matching the rest of ferrodb):
+    //   version u8 | next_extent_start u32 | next_arena_id u32 | live u32 | reserved u32
+    //   free_starts: u32 count, u32 each
+    //   extents: u32 count, then per extent
+    //       arena u32 | owner.id u64 | owner.gen u32 | start u32 | page_count u32 | next_free u32
+    //       | recycled u32 count, u32 each
+    //   current: u32 count, then branch.id u64 | branch.gen u32 | arena u32
+    //   pending: u32 count, then page u32 | arena u32 | birth u64 | free u64 | owner.id u64
+    //       | owner.gen u32
+    //   crc32 u32
+
+    const STATE_VERSION: u8 = 1;
+
+    /// Serialize the free-space map and pending-free log.
+    pub fn state_bytes(&self) -> Vec<u8> {
+        let st = self.state.lock().unwrap();
+        let mut b = Vec::new();
+        b.push(Self::STATE_VERSION);
+        b.extend_from_slice(&self.space.next_extent_start.load(Ordering::SeqCst).to_be_bytes());
+        b.extend_from_slice(&self.space.next_arena_id.load(Ordering::SeqCst).to_be_bytes());
+        b.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
+        b.extend_from_slice(&self.reserved_pages.load(Ordering::SeqCst).to_be_bytes());
+
+        let free = self.space.free_extent_starts.lock().unwrap();
+        b.extend_from_slice(&(free.len() as u32).to_be_bytes());
+        for s in free.iter() {
+            b.extend_from_slice(&s.to_be_bytes());
+        }
+        drop(free);
+
+        b.extend_from_slice(&(st.extents.len() as u32).to_be_bytes());
+        for (arena, ext) in st.extents.iter() {
+            b.extend_from_slice(&arena.0.to_be_bytes());
+            b.extend_from_slice(&ext.owner.id.to_be_bytes());
+            b.extend_from_slice(&ext.owner.generation.to_be_bytes());
+            b.extend_from_slice(&ext.start_page.to_be_bytes());
+            b.extend_from_slice(&ext.page_count.to_be_bytes());
+            b.extend_from_slice(&ext.next_free.to_be_bytes());
+            let empty = Vec::new();
+            let rec = st.recycled.get(arena).unwrap_or(&empty);
+            b.extend_from_slice(&(rec.len() as u32).to_be_bytes());
+            for p in rec {
+                b.extend_from_slice(&p.to_be_bytes());
+            }
+        }
+
+        b.extend_from_slice(&(st.current.len() as u32).to_be_bytes());
+        for (branch, arena) in st.current.iter() {
+            b.extend_from_slice(&branch.id.to_be_bytes());
+            b.extend_from_slice(&branch.generation.to_be_bytes());
+            b.extend_from_slice(&arena.0.to_be_bytes());
+        }
+
+        b.extend_from_slice(&(st.pending.len() as u32).to_be_bytes());
+        for p in st.pending.iter() {
+            b.extend_from_slice(&p.page_id.to_be_bytes());
+            b.extend_from_slice(&p.arena_id.0.to_be_bytes());
+            b.extend_from_slice(&p.birth_epoch.0.to_be_bytes());
+            b.extend_from_slice(&p.free_epoch.0.to_be_bytes());
+            b.extend_from_slice(&p.owner.id.to_be_bytes());
+            b.extend_from_slice(&p.owner.generation.to_be_bytes());
+        }
+
+        let crc = crc32(&b);
+        b.extend_from_slice(&crc.to_be_bytes());
+        b
+    }
+
+    /// Replace the free-space map from a checkpoint. Refuses a truncated or corrupt image rather
+    /// than loading a partial map — a free-space map that is half right hands out live pages.
+    pub fn load_state(&self, bytes: &[u8]) -> Result<(), FerroError> {
+        let body = bytes
+            .len()
+            .checked_sub(4)
+            .ok_or_else(|| BranchError::Arena("arena state shorter than its checksum".into()))?;
+        let stored = u32::from_be_bytes(bytes[body..].try_into().unwrap());
+        if crc32(&bytes[..body]) != stored {
+            return Err(BranchError::Arena("arena state checksum mismatch".into()).into());
+        }
+        let mut c = StateCursor { b: &bytes[..body], at: 0 };
+        let version = c.u8()?;
+        if version != Self::STATE_VERSION {
+            return Err(BranchError::Arena(format!(
+                "unknown arena state version {} (expected {})",
+                version,
+                Self::STATE_VERSION
+            ))
+            .into());
+        }
+        let next_start = c.u32()?;
+        let next_arena = c.u32()?;
+        let live = c.u32()?;
+        let reserved = c.u32()?;
+
+        let n = c.u32()? as usize;
+        let mut free_starts = Vec::with_capacity(n);
+        for _ in 0..n {
+            free_starts.push(c.u32()?);
+        }
+
+        let n = c.u32()? as usize;
+        let mut extents = HashMap::with_capacity(n);
+        let mut recycled = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let arena = ArenaId(c.u32()?);
+            let owner = BranchId::new(c.u64()?, c.u32()?);
+            let ext = ArenaExtent {
+                arena_id: arena,
+                owner,
+                start_page: c.u32()?,
+                page_count: c.u32()?,
+                next_free: c.u32()?,
+            };
+            let rn = c.u32()? as usize;
+            let mut r = Vec::with_capacity(rn);
+            for _ in 0..rn {
+                r.push(c.u32()?);
+            }
+            extents.insert(arena, ext);
+            recycled.insert(arena, r);
+        }
+
+        let n = c.u32()? as usize;
+        let mut current = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let branch = BranchId::new(c.u64()?, c.u32()?);
+            current.insert(branch, ArenaId(c.u32()?));
+        }
+
+        let n = c.u32()? as usize;
+        let mut pending = Vec::with_capacity(n);
+        for _ in 0..n {
+            pending.push(PendingFree {
+                page_id: c.u32()?,
+                arena_id: ArenaId(c.u32()?),
+                birth_epoch: Epoch(c.u64()?),
+                free_epoch: Epoch(c.u64()?),
+                owner: BranchId::new(c.u64()?, c.u32()?),
+            });
+        }
+        if c.at != c.b.len() {
+            return Err(BranchError::Arena(format!(
+                "arena state has {} trailing bytes; refusing a partial free-space map",
+                c.b.len() - c.at
+            ))
+            .into());
+        }
+
+        *self.state.lock().unwrap() = StoreState { extents, recycled, current, pending };
+        *self.space.free_extent_starts.lock().unwrap() = free_starts;
+        self.space.next_extent_start.store(next_start, Ordering::SeqCst);
+        self.space.next_arena_id.store(next_arena, Ordering::SeqCst);
+        self.live_pages.store(live, Ordering::SeqCst);
+        self.reserved_pages.store(reserved, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Write the free-space map to `path`, via a temporary file and a rename, so a crash leaves
+    /// either the previous checkpoint or the new one and never a half-written map.
+    pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), FerroError> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, self.state_bytes()).map_err(|e| FerroError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| FerroError::Io(e.to_string()))
+    }
+
+    /// Restore from a checkpoint written by [`ArenaPageStore::checkpoint`]. A missing file is not
+    /// an error: it means nothing has been checkpointed yet.
+    pub fn restore(&self, path: &std::path::Path) -> Result<bool, FerroError> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
+        self.load_state(&bytes)?;
+        Ok(true)
+    }
+}
+
+struct StateCursor<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> StateCursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], FerroError> {
+        if self.at + n > self.b.len() {
+            return Err(BranchError::Arena(format!(
+                "arena state truncated at byte {} (wanted {})",
+                self.at, n
+            ))
+            .into());
+        }
+        let s = &self.b[self.at..self.at + n];
+        self.at += n;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, FerroError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, FerroError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, FerroError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 }
 
@@ -544,6 +764,18 @@ pub(crate) mod harness {
             Harness { catalog, store, path }
         }
 
+        /// A second store over the same file and catalog, as if the process had restarted.
+        pub fn fresh_store(&self) -> Arc<ArenaPageStore> {
+            Arc::new(
+                ArenaPageStore::new(
+                    Arc::clone(&self.store.pool),
+                    Arc::clone(&self.catalog),
+                    self.store.base_page(),
+                )
+                .unwrap(),
+            )
+        }
+
         /// The OS's view of how much space the store is actually occupying. An independent
         /// instrument: `live_page_count` is a counter this module maintains itself, so a test
         /// that only consults it cannot tell reclamation from bookkeeping.
@@ -701,6 +933,114 @@ mod tests {
             0,
         );
         assert!(err.is_err(), "overlapping the bitmap allocator must be refused, not warned about");
+    }
+
+    #[test]
+    fn free_space_map_survives_a_restart() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a1 = h.store.arena_for(parent.branch_id).unwrap();
+        for _ in 0..5 {
+            h.store.alloc_in_arena(a1, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        }
+        // one extent handed back, so the free-extent list is non-empty
+        let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a2 = h.store.arena_for(spare.branch_id).unwrap();
+        let a2_start = h.store.extent_range(a2).unwrap().0;
+        h.store.free_arena(a2).unwrap();
+        // and one page parked against a live child
+        let page = h.store.alloc_in_arena(a1, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        let _child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        h.store.free_page(page, h.catalog.next_epoch()).unwrap();
+
+        let before = (
+            h.store.live_page_count().unwrap(),
+            h.store.reserved_page_count(),
+            h.store.pending_len(),
+            h.store.allocated_pages(a1),
+        );
+        assert_eq!(before.2, 1, "the parked page is what a restart most easily loses");
+
+        let bytes = h.store.state_bytes();
+        let restored = h.fresh_store();
+        restored.load_state(&bytes).unwrap();
+
+        assert_eq!(restored.live_page_count().unwrap(), before.0);
+        assert_eq!(restored.reserved_page_count(), before.1);
+        assert_eq!(restored.pending_len(), before.2);
+        assert_eq!(restored.allocated_pages(a1), before.3);
+        assert_eq!(restored.arena_owner(a1), Some(parent.branch_id));
+        assert_eq!(restored.arena_owner(a2), None, "the freed extent stayed freed");
+        // The bump pointer must not rewind. Drain the recycled-extent free list first, so the
+        // next reservation has to come from the bump pointer, then check the range it hands out
+        // does not overlap the live extent. Two overlapping live extents is silent corruption,
+        // and comparing arena *ids* would never notice it.
+        let (a1_start, a1_len) = restored.extent_range(a1).unwrap();
+        let recycled = restored.alloc_arena(spare.branch_id).unwrap();
+        assert_eq!(
+            restored.extent_range(recycled).map(|r| r.0),
+            Some(a2_start),
+            "the freed extent is handed out first"
+        );
+        let from_bump = restored.alloc_arena(spare.branch_id).unwrap();
+        let (b_start, b_len) = restored.extent_range(from_bump).unwrap();
+        assert!(
+            b_start >= a1_start + a1_len || b_start + b_len <= a1_start,
+            "extent {}..{} overlaps live extent {}..{}: the bump pointer rewound on restore",
+            b_start,
+            b_start + b_len,
+            a1_start,
+            a1_start + a1_len
+        );
+    }
+
+    #[test]
+    fn a_corrupt_free_space_map_is_refused_not_partially_loaded() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+        let good = h.store.state_bytes();
+
+        let target = h.fresh_store();
+        let mut bad = good.clone();
+        bad[1] ^= 0xff;
+        assert!(target.load_state(&bad).is_err(), "checksum must reject a flipped byte");
+        assert!(target.load_state(&good[..good.len() - 7]).is_err(), "truncation must be refused");
+        let mut versioned = good.clone();
+        versioned[0] = 9;
+        // recompute the crc so only the version is wrong
+        let body = versioned.len() - 4;
+        let crc = crc32(&versioned[..body]);
+        versioned[body..].copy_from_slice(&crc.to_be_bytes());
+        assert!(target.load_state(&versioned).is_err(), "unknown version must be refused");
+
+        // none of those refusals may have left a half-loaded map behind
+        assert_eq!(target.live_page_count().unwrap(), 0);
+        assert_eq!(target.reserved_page_count(), 0);
+        assert_eq!(target.arena_owner(a), None);
+        // and the good image still loads
+        target.load_state(&good).unwrap();
+        assert_eq!(target.arena_owner(a), Some(b.branch_id));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_through_a_file() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-ckpt-{}-{:?}.bin", std::process::id(), a));
+        let _ = std::fs::remove_file(&path);
+
+        let target = h.fresh_store();
+        assert!(!target.restore(&path).unwrap(), "no checkpoint yet is not an error");
+        h.store.checkpoint(&path).unwrap();
+        assert!(target.restore(&path).unwrap());
+        assert_eq!(target.live_page_count().unwrap(), 1);
+        assert_eq!(target.arena_owner(a), Some(b.branch_id));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

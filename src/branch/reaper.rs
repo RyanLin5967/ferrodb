@@ -597,6 +597,37 @@ mod tests {
     }
 
     #[test]
+    fn branches_abandoned_before_a_restart_are_still_reaped_after_it() {
+        // The thesis test with a process restart in the middle. If the free-space map were
+        // rebuilt by guesswork rather than checkpointed, the reaper would come back believing
+        // every extent was untouched and reclaim nothing.
+        let h = Harness::new();
+        let baseline = h.store.live_page_count().unwrap();
+
+        const N: usize = 12;
+        for _ in 0..N {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
+            write_pages(&h, b.branch_id, 6);
+        }
+        assert_eq!(h.store.live_page_count().unwrap(), baseline + 72);
+        h.store.flush().unwrap();
+        let checkpoint = h.store.state_bytes();
+
+        // Restart: brand new store object, same file and same catalog. Nobody called close.
+        let store2 = h.fresh_store();
+        assert_eq!(store2.live_page_count().unwrap(), 0, "a fresh store knows nothing yet");
+        store2.load_state(&checkpoint).unwrap();
+        assert_eq!(store2.live_page_count().unwrap(), baseline + 72, "the map came back");
+
+        let reaper2 = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&store2));
+        let reaped = reaper2.reap_expired(far_future()).unwrap();
+
+        assert_eq!(reaped.len(), N);
+        assert_eq!(store2.live_page_count().unwrap(), baseline, "reclaimed across the restart");
+        assert_eq!(store2.reserved_page_count(), 0);
+    }
+
+    #[test]
     fn a_reap_interrupted_by_a_crash_is_resumed_not_leaked() {
         let (h, reaper) = setup();
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
