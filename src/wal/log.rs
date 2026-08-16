@@ -159,20 +159,44 @@ impl WalManager {
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
-        let frame = if lsn >= self.flushed_lsn.load(Ordering::SeqCst) {
+        // Whether a record is still in the buffer is decided UNDER the buffer lock, using the
+        // buffer's own `start_lsn`, and read in the same critical section.
+        //
+        // It used to branch on the `flushed_lsn` atomic and only then take the lock. Between those
+        // two steps another thread could flush, advancing `start_lsn` past `lsn`, and
+        // `lsn - buffer.start_lsn` then UNDERFLOWED — a subtract-with-overflow panic that poisoned
+        // the WAL mutexes, so one aborting transaction took down every other thread in the process
+        // with `PoisonError`. Reproduced by concurrent commit/abort, which walks the record chain.
+        let buffered = {
             let buffer = self.buffer.lock().unwrap();
-            let rel = (lsn - buffer.start_lsn) as usize;
-            if rel + 4 > buffer.bytes.len() {
-                return Err(FerroError::Wal("lsn past end of buffer".into()));
+            if lsn >= buffer.start_lsn {
+                let rel = (lsn - buffer.start_lsn) as usize; // safe: guarded above, same lock
+                if rel + 4 > buffer.bytes.len() {
+                    return Err(FerroError::Wal("lsn past end of buffer".into()));
+                }
+                let total =
+                    u32::from_be_bytes(buffer.bytes[rel..rel + 4].try_into().unwrap()) as usize;
+                if total < MIN_FRAME || rel + total > buffer.bytes.len() {
+                    return Err(FerroError::Wal("record goes past buffer".into()));
+                }
+                Some(buffer.bytes[rel..rel + total].to_vec())
+            } else {
+                None
             }
-            let total = u32::from_be_bytes(buffer.bytes[rel..rel+4].try_into().unwrap()) as usize;
-            if total < MIN_FRAME || rel + total > buffer.bytes.len() {
-                return Err(FerroError::Wal("record goes past buffer".into()));
-            }
-            buffer.bytes[rel..rel+total].to_vec()
+        };
+
+        let frame = if let Some(f) = buffered {
+            f
         } else {
             let file = self.file.lock().unwrap();
-            let offset = HEADER_SIZE as u64 + (lsn - self.base_lsn.load(Ordering::SeqCst));
+            // `truncate` can advance `base_lsn` past an lsn a caller still holds, which underflowed
+            // here for the same reason. Refuse with a description instead of panicking.
+            let rel = lsn.checked_sub(self.base_lsn.load(Ordering::SeqCst)).ok_or_else(|| {
+                FerroError::Wal(format!(
+                    "lsn {lsn} is below the log's base; it was truncated away"
+                ))
+            })?;
+            let offset = HEADER_SIZE as u64 + rel;
             let mut len_buf = [0u8; 4];
             pread_all(&file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
