@@ -52,7 +52,25 @@ impl BufferPoolManager {
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
     pub fn fetch_page(&self, page_id: u32) -> Result<usize, FerroError>{
-        let result = self.arc_cache.lock().unwrap().request(page_id, &|id| {
+        // The cache's verdict and the action taken on it must be one atomic step.
+        //
+        // This lock used to be taken just for `request` and released immediately, so the verdict
+        // was already stale by the time the page table was consulted: another thread could evict
+        // the page this call was told was a Hit, or evict the very victim it was handed. Both then
+        // indexed a HashMap with `[]` on a key that had gone, which PANICS the process —
+        // `no entry found for key` at the hit path and at the eviction path, reproducibly, under
+        // 8 threads with more pages than frames.
+        //
+        // Holding it across the whole of `fetch_page` makes the decision and the mutation
+        // inseparable. Lock order is arc_cache -> page_table -> frame, and nothing else in this
+        // file takes arc_cache, so there is nothing to invert against.
+        //
+        // This serialises fetches. That is a real cost and it is the right trade here: the
+        // alternative on offer is a buffer pool that crashes, and a faster wrong answer is not a
+        // better one. Narrowing it later means giving the cache and the table a single lock, not
+        // taking this one for less time.
+        let mut cache = self.arc_cache.lock().unwrap();
+        let result = cache.request(page_id, &|id| {
             let pt = self.page_table.read().unwrap();
             let frame_i = pt[&id];
             let frame = self.frames[frame_i].read().unwrap();
@@ -133,6 +151,8 @@ impl BufferPoolManager {
                 return Err(FerroError::NotEnoughSpace)
             }
         }
+        // `cache` is deliberately still alive at every return above: dropping it earlier is what
+        // reintroduces the stale-verdict window.
     }
 
     // decrement pin count, if page was modified, add dirty flag
