@@ -406,8 +406,11 @@ func TestAHostileTypeInACreateTableEventCannotReachTheDDL(t *testing.T) {
 // the CLI fails on a machine that fell back — and reports as a data disagreement rather than a
 // rendering one, sending the reader after a corruption that is not there.
 //
-// Expectations measured against `duckdb -noheader -list` v1.5.5, not assumed.
-func TestRenderCellMatchesTheDuckdbCLI(t *testing.T) {
+// These are RECORDED constants, and the name says so: this test runs no CLI and cannot tell you the
+// CLI still agrees with them. It pins the contract on a machine that has no CLI at all, which is the
+// only thing a table of literals can do. `TestRenderCellAgreesWithTheRealDuckdbCLI` below is what
+// checks them against a live one — the two are a pair, and neither replaces the other.
+func TestRenderCellMatchesItsRecordedCLIExpectations(t *testing.T) {
 	ts := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
 	cases := []struct {
 		in   any
@@ -418,6 +421,15 @@ func TestRenderCellMatchesTheDuckdbCLI(t *testing.T) {
 		{true, "true"},
 		{false, "false"},
 		{[]byte("ab"), "ab"},
+		// A BLOB is not passed through raw. Printable ASCII survives; everything else becomes \xHH
+		// with uppercase hex, and the backslash is escaped despite being printable. This returned
+		// raw bytes until it was measured — a 0x0A in a value then became an extra ROW in a format
+		// that is one row per line.
+		{[]byte{0x00, 0xFF}, `\x00\xFF`},
+		{[]byte{'a', 0x00, 'b', '\\', 0xFF}, `a\x00b\x5C\xFF`},
+		{[]byte{0x0A}, `\x0A`},
+		{[]byte{0x7F, 0x80}, `\x7F\x80`},
+		{[]byte{0x20, 0x7E}, " ~"},
 		{int64(7), "7"},
 		{1.5, "1.5"},
 		// A DOUBLE holding an integral value keeps its point; fmt.Sprint would give "2".
@@ -462,8 +474,8 @@ func duckdbCLI(t *testing.T) string {
 		}
 	}
 	if required {
-		t.Fatal("FERRODB_REQUIRE_DUCKDB_CLI=1, but no `duckdb` CLI is on PATH; the rendering " +
-			"expectations below would then be checked against nothing but themselves")
+		t.Fatal("FERRODB_REQUIRE_DUCKDB_CLI=1, but no `duckdb` CLI is on PATH; the recorded " +
+			"rendering expectations would then be checked against nothing but themselves")
 	}
 	return ""
 }
@@ -474,8 +486,14 @@ func duckdbCLI(t *testing.T) string {
 //
 // This runs the real CLI and the fallback reader over the same values and compares the two. It is
 // the unit-level twin of the Rust suite's `both_readers_agree`, and it covers the cases that can
-// actually differ: NULL, a DOUBLE holding an integral value, and timestamps with and without a
-// fractional part. Anything returning plain non-null scalars agrees by accident and proves nothing.
+// actually differ: NULL, a DOUBLE holding an integral value, timestamps with and without a
+// fractional part, and BLOBs — which the CLI escapes and this reader returned raw until it was
+// measured. Anything returning plain non-null scalars agrees by accident and proves nothing.
+//
+// TWO ROWS, deliberately. A single-row probe cannot see a row-SEPARATOR difference at all: the
+// trailing terminator is trimmed off both sides, so the CRLF that Windows emits and the LF this
+// reader emits compare equal and the test passes while the readers genuinely disagree. Two rows put
+// a separator in the middle of the compared string, where trimming cannot reach it.
 func TestRenderCellAgreesWithTheRealDuckdbCLI(t *testing.T) {
 	cli := duckdbCLI(t)
 	if cli == "" {
@@ -485,17 +503,18 @@ func TestRenderCellAgreesWithTheRealDuckdbCLI(t *testing.T) {
 	}
 	const probe = `SELECT NULL, CAST(2 AS DOUBLE), CAST(1.5 AS DOUBLE), CAST(7 AS BIGINT), ` +
 		`true, false, CAST('2024-01-02 03:04:05' AS TIMESTAMP), ` +
-		`CAST('2024-01-02 03:04:05.123' AS TIMESTAMP);`
+		`CAST('2024-01-02 03:04:05.123' AS TIMESTAMP), 'a\x00b\x5C\xFF'::BLOB ` +
+		`UNION ALL SELECT NULL, CAST(-0.5 AS DOUBLE), CAST(3 AS DOUBLE), CAST(-8 AS BIGINT), ` +
+		`false, true, CAST('1999-12-31 23:59:59' AS TIMESTAMP), ` +
+		`CAST('2000-01-01 00:00:00.5' AS TIMESTAMP), '\x7F\x80~'::BLOB;`
 
 	// The CLI with no database argument runs in memory, which is all this needs.
 	out, err := exec.Command(cli, "-noheader", "-list", "-c", probe).Output()
 	if err != nil {
 		t.Fatalf("run the duckdb CLI: %v", err)
 	}
-	// The CLI terminates rows with CRLF on Windows; duckSQL joins with "\n" everywhere. The probe
-	// below is a single row, so TrimSpace would cover it today - normalised anyway, because the
-	// day someone adds a second row is not the day to rediscover this on the Windows runner only.
-	// Only the row separator, so a bare \r inside a value still registers as a difference.
+	// The CLI terminates rows with CRLF on Windows; duckSQL joins with "\n" everywhere. Only the row
+	// SEPARATOR is normalised, so a bare \r inside a value still registers as a difference.
 	want := strings.TrimSpace(strings.ReplaceAll(string(out), "\r\n", "\n"))
 
 	got, err := duckSQL(filepath.Join(t.TempDir(), "probe.duckdb"), probe)
@@ -506,6 +525,14 @@ func TestRenderCellAgreesWithTheRealDuckdbCLI(t *testing.T) {
 
 	if want == "" {
 		t.Fatal("the CLI printed nothing, so the comparison would be vacuous")
+	}
+	// Both halves of what makes this probe worth running, asserted rather than assumed: a second row
+	// (so a separator is actually compared) and an escaped BLOB (so the case that diverged is in).
+	if !strings.Contains(want, "\n") {
+		t.Fatalf("the probe returned one row, so a row-separator difference is unreachable: %q", want)
+	}
+	if !strings.Contains(want, `\x00`) {
+		t.Fatalf("the probe did not exercise BLOB escaping, which is why it exists: %q", want)
 	}
 	if got != want {
 		t.Errorf("the fallback reader and the duckdb CLI disagree:\n  CLI:      %q\n  fallback: %q", want, got)
