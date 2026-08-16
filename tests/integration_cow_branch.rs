@@ -42,7 +42,7 @@ fn env(tag: &str) -> Env {
     let dm = Arc::new(DiskManager::new(file).unwrap());
     let pool = Arc::new(BufferPoolManager::new(dm));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-    let base = pool.disk_manager.next_page_id.load(std::sync::atomic::Ordering::SeqCst);
+    let base = pool.disk_manager.high_water().unwrap();
     let store =
         Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap());
     Env { catalog, store, path }

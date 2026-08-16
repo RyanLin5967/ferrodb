@@ -116,7 +116,11 @@ impl ArenaPageStore {
         catalog: Arc<LogBranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
-        let high_water = pool.disk_manager.next_page_id.load(Ordering::SeqCst);
+        // NOT `next_page_id` — that counter only advances when a new bitmap page is created, so
+        // it reads 1 after 500 allocations and would accept an arena base of 1 that the bitmap
+        // already owns. `reserve_from` would then refuse every subsequent allocate AND every
+        // deallocate, turning latent aliasing into aliasing plus a dead allocator.
+        let high_water = pool.disk_manager.high_water()?;
         if base_page < high_water {
             return Err(BranchError::Arena(format!(
                 "arena region must start at or above the disk manager high-water mark {} (got {})",
@@ -756,7 +760,7 @@ pub(crate) mod harness {
             let dm = Arc::new(DiskManager::new(file).unwrap());
             let pool = Arc::new(BufferPoolManager::new(dm));
             let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-            let base = pool.disk_manager.next_page_id.load(Ordering::SeqCst);
+            let base = pool.disk_manager.high_water().unwrap();
             let store = Arc::new(
                 ArenaPageStore::new(
                     Arc::clone(&pool),

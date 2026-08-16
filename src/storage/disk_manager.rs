@@ -131,6 +131,37 @@ impl DiskManager{
         Ok(())
     }
 
+    /// One past the highest page the bitmap has ever handed out.
+    ///
+    /// NOT `next_page_id`: that counter only advances when a whole new bitmap page is chained, so
+    /// it still reads 1 after 500 allocations. Anything deciding where a second allocator's
+    /// region may safely begin has to consult the bitmap itself, or it will place that region on
+    /// top of pages this allocator already owns.
+    pub fn high_water(&self) -> Result<u32, FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        let mut current_bitmap_id = 0;
+        let mut global_offset = 0u32;
+        let mut highest: Option<u32> = None;
+        loop {
+            let page_bitmap = self.read(current_bitmap_id)?;
+            for local in (0..BITS_PER_BITMAP).rev() {
+                let byte_index = (local / 8) as usize + 4;
+                if page_bitmap[byte_index] & (1 << (local % 8)) != 0 {
+                    highest = Some(global_offset + local);
+                    break;
+                }
+            }
+            let next_bitmap_id = u32::from_le_bytes(page_bitmap[0..4].try_into().unwrap());
+            if next_bitmap_id == 0 {
+                break;
+            }
+            current_bitmap_id = next_bitmap_id;
+            global_offset += BITS_PER_BITMAP;
+        }
+        let from_bitmap = highest.map(|h| h + 1).unwrap_or(0);
+        Ok(from_bitmap.max(self.next_page_id.load(Ordering::SeqCst)))
+    }
+
     /// Reserve `[base, infinity)` for another allocator, so this one stops there.
     ///
     /// Called by `ArenaPageStore::new`, which has already checked that `base` is at or above the
@@ -254,6 +285,7 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize>
 mod tests {
     use tempfile::TempDir;
     use crate::storage::disk_manager::DiskManager;
+    use std::sync::atomic::Ordering;
     use std::fs::OpenOptions;
     #[test]
     pub fn test_rw() -> Result<(), Box<dyn std::error::Error>>{
@@ -270,6 +302,61 @@ mod tests {
         let read2 = dm.read(3)?;
         assert_eq!(read1, data1);
         assert_eq!(read2, data2);
+        Ok(())
+    }
+
+    /// S1: the trap that made an arena alias the bitmap allocator.
+    ///
+    /// `next_page_id` looks like a high-water mark and is not one. `allocate()`'s fast path
+    /// satisfies a request from a free bit and returns without touching it, so it stays at 1
+    /// through thousands of allocations. Anything validating "is this page region unclaimed?"
+    /// against it accepts a region the bitmap already owns.
+    ///
+    /// This asserts the gap directly, so the trap cannot quietly come back.
+    #[test]
+    pub fn next_page_id_is_not_the_high_water_mark() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("hw.db"))?;
+        let dm = DiskManager::new(temp_file).unwrap();
+
+        let mut highest = 0u32;
+        for _ in 0..500 {
+            highest = highest.max(dm.allocate().unwrap());
+        }
+        assert!(highest >= 500, "expected ~500 pages handed out, got {}", highest);
+
+        // The stale counter: still 1 after 500 allocations.
+        let stale = dm.next_page_id.load(Ordering::SeqCst);
+        assert!(
+            stale <= highest,
+            "next_page_id ({}) unexpectedly tracked the allocator (highest {}) - if this ever \
+             becomes true the S1 trap is gone, but high_water() must still be the API used",
+            stale, highest
+        );
+
+        // The real answer covers everything handed out.
+        let hw = dm.high_water().unwrap();
+        assert!(
+            hw > highest,
+            "high_water ({}) must exceed the highest allocated page ({})",
+            hw, highest
+        );
+        Ok(())
+    }
+
+    /// A page freed and reused must not push the high-water mark backwards.
+    #[test]
+    pub fn high_water_does_not_regress_after_a_free() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("hw2.db"))?;
+        let dm = DiskManager::new(temp_file).unwrap();
+        for _ in 0..64 { dm.allocate().unwrap(); }
+        let before = dm.high_water().unwrap();
+        dm.deallocate(10).unwrap();
+        let after = dm.high_water().unwrap();
+        assert!(after >= before - 1, "high_water fell from {} to {} after one free", before, after);
         Ok(())
     }
 
