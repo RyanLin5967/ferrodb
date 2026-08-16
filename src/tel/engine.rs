@@ -58,7 +58,7 @@ pub enum Side {
 }
 
 impl Side {
-    fn other(self) -> Side {
+    pub fn other(self) -> Side {
         match self {
             Side::Ours => Side::Theirs,
             Side::Theirs => Side::Ours,
@@ -298,6 +298,10 @@ struct Composition {
 }
 
 impl Merger for ThreeWayMerger {
+    /// The LCA record itself is not consulted: what the merge needs from the fork point is its
+    /// *state*, and that arrives as `merged_state`, the snapshot the composed writes are laid
+    /// over. The record is retained in the signature because the caller has to prove it found a
+    /// common ancestor before merging at all.
     fn merge(
         &self,
         _lca: &BranchRecord,
@@ -902,10 +906,10 @@ fn compose_two(
                 let t_stamp = t.last().map(|s| s.stamp()).unwrap_or((0, 0));
                 // Tie-break to `theirs`, the incoming branch: it is the side that asked to merge.
                 let ours_wins = o_stamp > t_stamp;
-                let (winner, loser_side, loser_ops) = if ours_wins {
-                    (&a, Side::Ours.other(), t)
+                let (winner, winner_side, loser_ops) = if ours_wins {
+                    (&a, Side::Ours, t)
                 } else {
-                    (&b, Side::Theirs.other(), o)
+                    (&b, Side::Theirs, o)
                 };
                 let v = winner.resolve(base)?;
                 out.cells.push((key, v));
@@ -917,10 +921,7 @@ fn compose_two(
                         policy: MergePolicy::Lww,
                         reason: format!(
                             "LWW on {}.{}[{}] kept the write from the {:?} side",
-                            tbl,
-                            col,
-                            row,
-                            loser_side.other()
+                            tbl, col, row, winner_side
                         ),
                     });
                 }
