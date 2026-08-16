@@ -17,3 +17,4 @@ pub mod cow;
 pub mod tel;
 pub mod pgwire;
 pub mod provenance;
+pub mod replication;

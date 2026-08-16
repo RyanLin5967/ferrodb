@@ -242,6 +242,40 @@ impl WalManager {
         Ok(lsn)
     }
 
+    /// The raw bytes of the frame at `lsn`, for shipping to a replica verbatim.
+    ///
+    /// Replication sends the log's own bytes rather than re-serialising a parsed record: the CRC
+    /// already in the frame then covers what actually crosses the wire, so a replica validates the
+    /// primary's bytes rather than trusting that two encoders agree.
+    ///
+    /// Same lock discipline as `read_record`: the buffer-or-file decision is made under the buffer
+    /// lock and the read happens in that same critical section, because deciding from the
+    /// `flushed_lsn` atomic and then locking is exactly what underflowed in D23.
+    pub fn raw_frame(&self, lsn: u64, len: usize) -> Result<Vec<u8>, FerroError> {
+        let buffered = {
+            let buffer = self.buffer.lock().unwrap();
+            if lsn >= buffer.start_lsn {
+                let rel = (lsn - buffer.start_lsn) as usize;
+                if rel + len > buffer.bytes.len() {
+                    return Err(FerroError::Wal("frame runs past the buffer".into()));
+                }
+                Some(buffer.bytes[rel..rel + len].to_vec())
+            } else {
+                None
+            }
+        };
+        if let Some(b) = buffered {
+            return Ok(b);
+        }
+        let file = self.file.lock().unwrap();
+        let rel = lsn.checked_sub(self.base_lsn.load(Ordering::SeqCst)).ok_or_else(|| {
+            FerroError::Wal(format!("lsn {lsn} is below the log's base; it was truncated away"))
+        })?;
+        let mut buf = vec![0u8; len];
+        pread_all(&file, &mut buf, HEADER_SIZE as u64 + rel)?;
+        Ok(buf)
+    }
+
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
         self.flush()?;
         let mut buffer = self.buffer.lock().unwrap();
