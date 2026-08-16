@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Unit tests for the DuckDB sink.
@@ -318,5 +319,113 @@ func TestOpenDestinationRefusesAnUnknownEngine(t *testing.T) {
 			t.Fatalf("engine %q was refused: %v", e, err)
 		}
 		s.Close()
+	}
+}
+
+// A table first created by INFERENCE and then described by an authoritative CREATE_TABLE must not
+// keep the guess silently.
+//
+// `CREATE TABLE IF NOT EXISTS` makes that disagreement a no-op, which is the one door that bypasses
+// the typing DuckDB is being used for: `qty` inferred VARCHAR from a null first row would go on
+// storing 42 as the string "42" for the life of the table, reading back looking fine.
+func TestALaterCreateTableThatDisagreesIsRefused(t *testing.T) {
+	s := newSink(t)
+
+	// A first row whose qty is null: nothing to infer from, so it becomes VARCHAR.
+	if err := s.apply(ins("inv", 100, map[string]any{
+		"id": json.Number("1"), "item": "widget", "qty": nil,
+	})); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	_, types, err := s.catalogSchema("inv")
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	if types[2] != "VARCHAR" {
+		t.Fatalf("precondition failed: qty inferred as %q, so this test is not exercising the gap", types[2])
+	}
+
+	// The authoritative schema now arrives and says BIGINT. Silently ignoring it is the bug.
+	err = s.apply(schemaEvent("inv"))
+	if err == nil {
+		t.Fatal("a CREATE_TABLE disagreeing with the destination was silently ignored; " +
+			"qty would keep storing integers as strings")
+	}
+	if !strings.Contains(err.Error(), "BIGINT") || !strings.Contains(err.Error(), "VARCHAR") {
+		t.Errorf("the error does not name both types, so it cannot be acted on: %v", err)
+	}
+}
+
+// Re-emission is the COMMON case: a CREATE_TABLE is re-sent at every checkpoint of the source. The
+// refusal above must not fire on it, or every table breaks on its second checkpoint.
+func TestARepeatedIdenticalCreateTableIsStillANoOp(t *testing.T) {
+	s := newSink(t)
+	for i := 0; i < 3; i++ {
+		if err := s.apply(schemaEvent("inv")); err != nil {
+			t.Fatalf("CREATE_TABLE #%d was refused, but it is identical: %v", i+1, err)
+		}
+	}
+	if err := s.apply(ins("inv", 100, row(1, "widget", 10))); err != nil {
+		t.Fatalf("insert after re-emitted schema: %v", err)
+	}
+}
+
+// The allowlist proven on the path the FEED actually takes, not by calling ensureDuckTable directly.
+//
+// `duckType` collapses anything unrecognised to VARCHAR, so a hostile type string in a CREATE_TABLE
+// event should never reach the DDL intact. That is the claim; this drives it through `apply` — the
+// only entry point the feed has — rather than reaching past it.
+func TestAHostileTypeInACreateTableEventCannotReachTheDDL(t *testing.T) {
+	s := newSink(t)
+	evil := "VARCHAR); DROP TABLE inv; CREATE TABLE pwned(x INTEGER"
+	err := s.apply(&Event{Table: "inv", Op: "CREATE_TABLE", CommitLSN: 1, CommitEndLSN: 2,
+		After: map[string]any{"columns": []any{
+			map[string]any{"name": "id", "type": "INTEGER"},
+			map[string]any{"name": "qty", "type": evil},
+		}}})
+	if err != nil {
+		t.Fatalf("the event was refused outright: %v", err)
+	}
+	// The hostile type must have been collapsed to VARCHAR, not concatenated.
+	names, types, err := s.catalogSchema("inv")
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	if len(names) != 2 || types[1] != "VARCHAR" {
+		t.Errorf("the DDL did not come out as expected: %v / %v", names, types)
+	}
+	// And the injected statement must not have run.
+	if cols, err := s.catalogColumns("pwned"); err != nil || len(cols) != 0 {
+		t.Errorf("the injected CREATE TABLE ran: cols=%v err=%v", cols, err)
+	}
+}
+
+// The fallback reader has to render EXACTLY like the `duckdb` CLI, or an assertion written against
+// the CLI fails on a machine that fell back — and reports as a data disagreement rather than a
+// rendering one, sending the reader after a corruption that is not there.
+//
+// Expectations measured against `duckdb -noheader -list` v1.5.5, not assumed.
+func TestRenderCellMatchesTheDuckdbCLI(t *testing.T) {
+	ts := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		in   any
+		want string
+	}{
+		// The CLI prints the four characters NULL, not an empty cell.
+		{nil, "NULL"},
+		{true, "true"},
+		{false, "false"},
+		{[]byte("ab"), "ab"},
+		{int64(7), "7"},
+		{1.5, "1.5"},
+		// A DOUBLE holding an integral value keeps its point; fmt.Sprint would give "2".
+		{float64(2), "2.0"},
+		{ts, "2024-01-02 03:04:05"},
+		{ts.Add(123 * time.Millisecond), "2024-01-02 03:04:05.123"},
+	}
+	for _, c := range cases {
+		if got := renderCell(c.in); got != c.want {
+			t.Errorf("renderCell(%#v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

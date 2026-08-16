@@ -44,8 +44,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
 )
@@ -167,6 +170,7 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		return fmt.Errorf("cannot create %s with no columns", table)
 	}
 	names := make([]string, 0, len(cols))
+	types := make([]string, 0, len(cols))
 	defs := make([]string, 0, len(cols)+2)
 	sawKey := false
 	for _, c := range cols {
@@ -178,6 +182,7 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 			return fmt.Errorf("column %s.%s: type %q is not one this sink will emit", table, name, typ)
 		}
 		names = append(names, name)
+		types = append(types, typ)
 		def := quoteIdent(name) + " " + typ
 		if name == s.key {
 			def += " PRIMARY KEY"
@@ -199,39 +204,92 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 	}
 	// The table may already have existed with a different shape — an older run's inference, say. Ask
 	// the catalog what is actually there rather than assuming the DDL just issued is what took.
-	actual, err := s.catalogColumns(table)
+	//
+	// IF NOT EXISTS makes a disagreement SILENT, and that is the dangerous part. A table first
+	// created by inference from a row whose `qty` was null gets VARCHAR; the authoritative
+	// CREATE_TABLE saying BIGINT arrives later and does nothing at all, and from then on `qty: 42`
+	// is stored as the string "42" — which is precisely the corruption DuckDB's typing is supposed
+	// to catch, arriving through the one door that bypasses it. So the declared shape is compared
+	// against the catalog and a disagreement is REFUSED rather than warned about: continuing would
+	// write wrongly typed data that reads back looking fine.
+	actualCols, actualTypes, err := s.catalogSchema(table)
 	if err != nil {
 		return err
 	}
-	if len(actual) > 0 {
-		s.columns[table] = actual
-	} else {
+	if len(actualCols) == 0 {
+		// The table does not exist even after CREATE — nothing to reconcile against.
 		s.columns[table] = names
+		return nil
+	}
+	if err := s.checkSchemaAgrees(table, names, types, actualCols, actualTypes); err != nil {
+		return err
+	}
+	s.columns[table] = actualCols
+	return nil
+}
+
+// checkSchemaAgrees refuses when the destination table is not the table the event describes.
+//
+// Re-emission is the COMMON case, not the exception — a CREATE_TABLE is re-sent at every checkpoint
+// of the source — so agreement has to stay a silent no-op. Only a genuine difference is an error,
+// and the message names the column and both types, because "schema mismatch" alone sends the reader
+// to diff two schemas by hand.
+func (s *DuckSink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []string) error {
+	if len(want) != len(got) {
+		return fmt.Errorf(
+			"table %s already exists with %d column(s) %v but the CREATE_TABLE event declares %d %v; "+
+				"refusing to write through a schema that does not match the source",
+			table, len(got), got, len(want), want)
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return fmt.Errorf(
+				"table %s column %d is %q in the destination but %q in the CREATE_TABLE event; "+
+					"refusing to write through a schema that does not match the source",
+				table, i, got[i], want[i])
+		}
+		if !strings.EqualFold(wantTypes[i], gotTypes[i]) {
+			return fmt.Errorf(
+				"table %s column %q is %s in the destination but the CREATE_TABLE event declares %s; "+
+					"a value written through the wrong type reads back looking fine, so this is refused "+
+					"rather than warned about",
+				table, got[i], gotTypes[i], wantTypes[i])
+		}
 	}
 	return nil
 }
 
-// catalogColumns reads a destination table's data columns, excluding this sink's bookkeeping ones.
-// An empty result means the table does not exist; that is not an error here, it is the question.
-func (s *DuckSink) catalogColumns(table string) ([]string, error) {
+// catalogSchema reads a destination table's data columns and their types, excluding this sink's
+// bookkeeping ones. An empty result means the table does not exist; that is not an error here, it is
+// the question being asked.
+func (s *DuckSink) catalogSchema(table string) (names, types []string, err error) {
 	rows, err := s.db.Query(
-		`SELECT column_name FROM duckdb_columns() WHERE table_name = ? AND schema_name = 'main'
+		`SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = ? AND schema_name = 'main'
 		 ORDER BY column_index`, table)
 	if err != nil {
-		return nil, fmt.Errorf("read catalog for %s: %w", table, err)
+		return nil, nil, fmt.Errorf("read catalog for %s: %w", table, err)
 	}
 	defer rows.Close()
-	var out []string
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return nil, err
+		var n, t string
+		if err := rows.Scan(&n, &t); err != nil {
+			return nil, nil, err
 		}
 		if !bookkeeping[n] {
-			out = append(out, n)
+			names = append(names, n)
+			types = append(types, t)
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return names, types, nil
+}
+
+// catalogColumns is catalogSchema when only the names are wanted.
+func (s *DuckSink) catalogColumns(table string) ([]string, error) {
+	names, _, err := s.catalogSchema(table)
+	return names, err
 }
 
 // ensureDuckFromRow settles a table's columns when no CREATE_TABLE has been seen this run.
@@ -382,6 +440,49 @@ func (s *DuckSink) Close() error {
 	return err
 }
 
+// renderCell formats one value the way the `duckdb` CLI does in `-list` mode.
+//
+// Byte-for-byte agreement with the CLI is the whole point, and it is not free — three cases differ
+// from what Go's default formatting produces, and each was measured against `duckdb -noheader -list`
+// (v1.5.5) rather than assumed:
+//
+//   - NULL prints as the four characters `NULL`, not as the empty string. Getting this wrong is
+//     worse than cosmetic: an assertion written against the CLI on one machine then fails on a
+//     machine that fell back to this reader, and reports as a DATA disagreement rather than a
+//     rendering one — sending the reader after a corruption that is not there.
+//   - A DOUBLE holding an integral value prints as `2.0`; `fmt.Sprint(float64(2))` gives `2`.
+//   - A TIMESTAMP prints as `2024-01-02 03:04:05`, with fractional seconds only when it has them;
+//     Go's `time.Time` stringer appends a zone (`+0000 UTC`) the CLI never shows.
+func renderCell(c any) string {
+	switch v := c.(type) {
+	case nil:
+		return "NULL"
+	case []byte:
+		return string(v)
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case float64:
+		s := strconv.FormatFloat(v, 'g', -1, 64)
+		// `g` drops the point on an integral value; the CLI keeps it. Inf and NaN carry neither a
+		// point nor an exponent either, so they are excluded explicitly rather than by luck.
+		if !strings.ContainsAny(s, ".eE") && !math.IsInf(v, 0) && !math.IsNaN(v) {
+			s += ".0"
+		}
+		return s
+	case time.Time:
+		if v.Nanosecond() == 0 {
+			return v.Format("2006-01-02 15:04:05")
+		}
+		// The trailing nines trim insignificant zeros, matching the CLI's `.123` over `.123000`.
+		return v.Format("2006-01-02 15:04:05.999999999")
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 // duckSQL runs one statement against a DuckDB file from a separate process and renders any rows the
 // way the `duckdb` and `sqlite3` CLIs do in list mode — columns joined by `|`, one row per line,
 // NULL as the empty string, booleans as true/false. Byte-for-byte comparable with the CLI, which is
@@ -422,21 +523,7 @@ func duckSQL(path, query string) (string, error) {
 		}
 		parts := make([]string, len(cols))
 		for i, c := range cells {
-			switch v := c.(type) {
-			case nil:
-				parts[i] = ""
-			case []byte:
-				parts[i] = string(v)
-			case bool:
-				// Matches the duckdb CLI's rendering, so both readers can be compared byte for byte.
-				if v {
-					parts[i] = "true"
-				} else {
-					parts[i] = "false"
-				}
-			default:
-				parts[i] = fmt.Sprint(v)
-			}
+			parts[i] = renderCell(c)
 		}
 		out = append(out, strings.Join(parts, "|"))
 	}

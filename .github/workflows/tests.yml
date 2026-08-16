@@ -19,14 +19,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # The CDC tests drive an independent consumer written in Go and verify its SQLite output with
-      # the sqlite3 CLI. That independence is the point - an encoder checked with its own decoder
+      # The CDC tests drive an independent consumer written in Go and verify its output with the
+      # sqlite3 CLI. That independence is the point - an encoder checked with its own decoder
       # agrees with itself about any shared misreading - so the toolchain is a real requirement
       # rather than a convenience, and the tests fail loudly when it is missing instead of skipping.
       # A test that silently skips is a test that always passes.
+      #
+      # 1.25 because cdc-consumer/go.mod declares `go 1.25.0`. Pinned at 1.24 this step still
+      # worked, but only because GOTOOLCHAIN defaults to auto and silently downloaded 1.25 later -
+      # which moves a toolchain fetch out of this step and into a build step, exactly what the
+      # explicit `go mod download` below exists to prevent.
+      #
+      # cgo is required and not optional: the DuckDB sink links DuckDB statically, so CGO_ENABLED=0
+      # fails to build the consumer module at all, SQLite sink included.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache-dependency-path: cdc-consumer/go.sum
 
       # Pre-fetch the sink's one dependency, so a network blip shows up as its own failed step
@@ -50,7 +58,17 @@ jobs:
           set -euo pipefail
           go version
           sqlite3 --version
-          echo "toolchain OK"
+          # A zero here is not a warning, it is a build failure a few steps later with a stack of
+          # "undefined: bindings.Type" errors that say nothing about the cause. Name it now.
+          test "$(go env CGO_ENABLED)" = "1" || {
+            echo "CGO_ENABLED is '$(go env CGO_ENABLED)'; the DuckDB sink links DuckDB statically" >&2
+            exit 1
+          }
+          # No duckdb CLI is installed on these runners, so the DuckDB sink tests read the
+          # destination back through the WEAKER fallback reader (the same Go driver that wrote it).
+          # Recorded here rather than left to be inferred from a green run: the CLI comparison in
+          # `both_readers_agree` does NOT run in CI, only on a developer machine that has the CLI.
+          echo "toolchain OK (duckdb CLI absent: DuckDB sink tests use the fallback reader)"
 
       # Examples are spawned by several integration tests, and `cargo test` does NOT rebuild them.
       # Without this they would be stale or absent, and the freshness guards in those tests would

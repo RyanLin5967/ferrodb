@@ -19,7 +19,7 @@ Prebuilt binaries (in zip files) for Linux, macOS, and Windows are in the releas
 
 Requires Rust 1.85 or newer (this project uses edition 2024).
 
-`cargo test` additionally needs **Go 1.24+ with cgo enabled** and the **`sqlite3` CLI** on PATH. The
+`cargo test` additionally needs **Go 1.25+ with cgo enabled** and the **`sqlite3` CLI** on PATH. The
 change-feed tests drive a consumer written in Go and check its output with the sqlite3 command — the
 independence is the point, since an encoder validated by its own decoder agrees with itself about
 any shared misreading. Those tests **fail loudly** rather than skipping when the toolchain is
@@ -341,6 +341,13 @@ separate program. On a machine with no CLI the tests fall back to a second proce
 driver and say so; that fallback is the weaker check, and `both_readers_agree` pins the two together
 wherever both exist. Because DuckDB is *typed*, its tests catch something SQLite's cannot: a sink
 that declared every column `TEXT` would pass every SQLite assertion, and fails here.
+
+Worth being exact about, because a green CI badge otherwise implies more than it should: **the CI
+runners have no `duckdb` CLI**, so every CI run exercises the fallback reader and the CLI
+comparison runs only on a developer machine that has the CLI installed. The fallback is held to the
+CLI's exact rendering — `NULL` printed as four characters, a `DOUBLE` of 2 printed `2.0`, a
+`TIMESTAMP` printed without a zone — and `both_readers_agree` compares those cases specifically,
+since queries returning plain non-null scalars agree by accident and prove nothing.
 
 `-engine duckdb` needs **cgo** (`github.com/marcboeker/go-duckdb` links DuckDB statically), so
 `CGO_ENABLED=0` will not build the consumer at all — the cost is module-wide, not per-engine.

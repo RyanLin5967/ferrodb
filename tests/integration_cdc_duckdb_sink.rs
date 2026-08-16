@@ -20,6 +20,7 @@
 //! two rather than an equal. When both are present, `both_readers_agree` checks them against each
 //! other, which is what stops the fallback rotting unnoticed.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -47,7 +48,17 @@ fn go_bin() -> String {
 fn consumer() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        let out = std::env::temp_dir().join(format!("cdc-consumer-{}", std::process::id()));
+        // Into cargo's own target directory, not `$TMPDIR`, and under a FIXED name.
+        //
+        // A pid-stamped path in `$TMPDIR` is never the same twice, so nothing ever overwrites and
+        // nothing ever cleans up: this binary is 60MB+ because DuckDB is linked statically, and a
+        // few dozen `cargo test` runs quietly leave gigabytes behind on the developer's machine.
+        // A fixed name under `target/` is overwritten by the next run and removed by `cargo clean`.
+        //
+        // `EXE_SUFFIX` is not decoration — `go build -o` writes exactly the name it is given, and on
+        // Windows a file without `.exe` cannot be executed by `Command::new`.
+        let mut out = target_dir();
+        out.push(format!("cdc-consumer-test{}", std::env::consts::EXE_SUFFIX));
         let st = Command::new(go_bin())
             .current_dir("cdc-consumer")
             .args(["build", "-o"])
@@ -64,6 +75,19 @@ fn consumer() -> &'static Path {
     })
 }
 
+/// The directory holding this test binary — `target/debug/deps` — walked up to `target/debug`.
+///
+/// Derived from `current_exe` rather than from `CARGO_TARGET_DIR` or a hardcoded `target/`, so it
+/// still lands in the right place when the target directory has been relocated.
+fn target_dir() -> PathBuf {
+    let mut p = std::env::current_exe().expect("test exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p
+}
+
 /// The `duckdb` CLI, if this machine has one. Unlike `sqlite3` it is not shipped with macOS, so its
 /// absence is a fact about the machine rather than a broken checkout — hence an Option and a
 /// documented fallback, not a panic.
@@ -77,12 +101,7 @@ fn duckdb_cli() -> Option<String> {
 }
 
 fn example_bin(name: &str) -> PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    let bin = p.join("examples").join(name);
+    let bin = target_dir().join("examples").join(name);
     let bin_time = std::fs::metadata(&bin)
         .unwrap_or_else(|e| panic!("{} missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
@@ -358,7 +377,17 @@ fn both_readers_agree() {
     let Some(bin) = duckdb_cli() else {
         // Nothing to compare against. Not a pass and not a silent skip: say which reader ran, so a
         // green suite here is not mistaken for one that exercised the CLI.
-        eprintln!("no duckdb CLI on this machine; the other tests ran on the WEAKER fallback reader");
+        //
+        // Written straight to `io::stderr()` rather than with `eprintln!`, and that is the whole
+        // point of the line. libtest captures the `eprintln!`/`println!` macros and only replays
+        // them for FAILING tests, so this notice — emitted by a passing one — would be swallowed
+        // and the run would print `5 passed` and nothing else, defeating the guard it exists to be.
+        // A direct write to the stderr handle bypasses that capture (verified on this machine).
+        let _ = writeln!(
+            std::io::stderr(),
+            "NOTE: no duckdb CLI on this machine; the other tests in this file ran on the WEAKER \
+             fallback reader (the same Go driver that did the writing)."
+        );
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -372,6 +401,16 @@ fn both_readers_agree() {
         ROWS,
         "SELECT id,_commit_lsn,_deleted FROM inventory ORDER BY id;",
         "SELECT table_name, \"cursor\" FROM _cdc_checkpoint ORDER BY table_name;",
+        // The renderings that actually differ between the two readers, and therefore the only ones
+        // that make this test worth running. Every query above returns non-null scalars, on which
+        // any two readers agree by accident — this one is chosen so a mismatch is REACHABLE:
+        //   - NULL, which the CLI prints as the four characters `NULL` and Go's zero value does not;
+        //   - a DOUBLE holding an integral value, printed `2.0` by the CLI and `2` by fmt.Sprint;
+        //   - a TIMESTAMP, which Go's stringer decorates with a zone the CLI never shows.
+        // Without a case like this the fallback could drift arbitrarily far and still look green on
+        // every machine that has the CLI, while silently failing on every machine that does not.
+        "SELECT NULL, CAST(2 AS DOUBLE), CAST(1.5 AS DOUBLE), \
+         CAST('2024-01-02 03:04:05' AS TIMESTAMP), CAST('2024-01-02 03:04:05.123' AS TIMESTAMP);",
     ] {
         let a = cli.sql(&db, sql);
         let b = fallback.sql(&db, sql);
