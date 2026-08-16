@@ -173,6 +173,14 @@ struct State {
     apply_seq: u64,
     applied: Vec<AppliedOp>,
     merges: BTreeMap<String, MergeRecord>,
+    /// Which run last published each row, surviving the merge that published it.
+    ///
+    /// Without this, criterion 9 could only be answered for a row on a *live* branch: `run_of`
+    /// reads the workspace, and `seal` drops the workspace the instant the merge succeeds — so
+    /// the question "which agent wrote this row" became unanswerable at exactly the moment the
+    /// row became visible to anyone else. The map is keyed by row, not by branch, because that
+    /// is the question being asked.
+    row_author: BTreeMap<(u32, u64), ProvId>,
     versions: BTreeMap<(u32, u64), VersionRef>,
     dep: DependencyGraphBuilder,
     policy: PolicyTable,
@@ -248,6 +256,21 @@ impl AgentRuntime {
         run_id: Option<&str>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
+        self.begin_session_with_model(agent_id, run_id, None, parent)
+    }
+
+    /// As [`AgentRuntime::begin_session`], but recording the model behind the run.
+    ///
+    /// Criterion 9 names the model explicitly, so it is carried rather than defaulted: a caller
+    /// that declares none gets the literal string `unspecified`, which reads as "never declared"
+    /// instead of attributing the write to a model nobody named.
+    pub fn begin_session_with_model(
+        &self,
+        agent_id: &str,
+        run_id: Option<&str>,
+        model: Option<(&str, &str)>,
+        parent: BranchId,
+    ) -> Result<AgentSession, FerroError> {
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
@@ -262,12 +285,13 @@ impl AgentRuntime {
         state.next_txn += 1;
         let txn = TxnId(state.next_txn);
         let run = run_id.unwrap_or("<unnamed>").to_string();
+        let (model_name, model_version) = model.unwrap_or(("unspecified", "unspecified"));
         let entity = RunEntity::new(
             prov,
             agent_id,
             run.clone(),
-            "unspecified",
-            "unspecified",
+            model_name,
+            model_version,
             [0u8; 32],
             LeaseDeadline::now_millis(),
             parent,
@@ -311,10 +335,36 @@ impl AgentRuntime {
     }
 
     /// The interned run behind a branch: which agent + run + model wrote here.
+    ///
+    /// Answers only for a *live* branch — the workspace is dropped when the branch merges or is
+    /// abandoned. For a row that has already been published, ask [`AgentRuntime::who_wrote_row`].
     pub fn run_of(&self, branch: BranchId) -> Option<RunEntity> {
         let state = self.state.lock().unwrap();
         let prov = state.workspaces.get(&branch.id)?.prov;
         state.runs.get(&prov.0).cloned()
+    }
+
+    /// Exit criterion 9: which agent + run + model wrote a given row.
+    ///
+    /// Answers for a row in the shared tables — that is, one some merge published — and keeps
+    /// answering after the writing branch is gone. A row nobody attributed (seeded before any
+    /// agent ran) returns `None`, never a guess.
+    pub fn who_wrote_row(&self, table: &str, row: RowId) -> Option<RunEntity> {
+        let state = self.state.lock().unwrap();
+        let prov = *state.row_author.get(&(table_id(table).0, row.0))?;
+        state.runs.get(&prov.0).cloned()
+    }
+
+    /// Every attributed row of `table`, as `(row, run)`, ordered by row id.
+    pub fn authors_of(&self, table: &str) -> Vec<(RowId, RunEntity)> {
+        let state = self.state.lock().unwrap();
+        let tbl = table_id(table).0;
+        state
+            .row_author
+            .iter()
+            .filter(|((t, _), _)| *t == tbl)
+            .filter_map(|((_, r), p)| state.runs.get(&p.0).map(|e| (RowId(*r), e.clone())))
+            .collect()
     }
 
     // ---- reads -----------------------------------------------------------------------------
@@ -764,6 +814,7 @@ impl AgentRuntime {
             })?;
             WorkspaceSnapshot {
                 txn: ws.txn,
+                prov: ws.prov,
                 fork_seq: ws.fork_seq,
                 rows: ws.rows.clone(),
                 base_rows: ws.base_rows.clone(),
@@ -1092,6 +1143,8 @@ impl AgentRuntime {
                 };
                 state.versions.insert((op.tbl.0, op.row.0), v);
                 state.dep.record_write(txn, v);
+                // Authorship of the published row, kept past `seal` (exit criterion 9).
+                state.row_author.insert((op.tbl.0, op.row.0), snapshot.prov);
             }
         }
         state.merges.insert(
@@ -1251,6 +1304,8 @@ impl BranchResolver for AgentRuntime {
 
 struct WorkspaceSnapshot {
     txn: TxnId,
+    /// The run behind this task, carried into the merge so authorship outlives the workspace.
+    prov: ProvId,
     fork_seq: u64,
     rows: BTreeMap<(u32, u64), RowState>,
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,

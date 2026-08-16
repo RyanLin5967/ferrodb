@@ -9,6 +9,9 @@ pub enum BoundAgentStmt {
     BeginAgentSession {
         agent_id: String,
         run_id: Option<String>,
+        /// `MODEL 'name/version'`, already split into its halves. `None` when the client
+        /// declared no model at all — which is distinct from declaring an empty one.
+        model: Option<(String, String)>,
         /// The branch to fork from: trunk, or the current session's branch for a nested task.
         parent: BranchId,
     },
@@ -188,7 +191,7 @@ impl<'a> Binder<'a> {
             }
         };
         match stmt {
-            Stmt::BeginAgentSession { agent, run } => {
+            Stmt::BeginAgentSession { agent, run, model } => {
                 if agent.trim().is_empty() {
                     return Err(FerroError::Bind("agent id must not be empty".into()));
                 }
@@ -197,9 +200,31 @@ impl<'a> Binder<'a> {
                         return Err(FerroError::Bind("run id must not be empty".into()));
                     }
                 }
+                // `name/version`; a bare name leaves the version half unspecified rather than
+                // inventing one. An empty MODEL is refused outright — an attribution that reads
+                // as blank is worse than one that says it was never declared.
+                let model = match model {
+                    Some(m) if m.trim().is_empty() => {
+                        return Err(FerroError::Bind("model must not be empty".into()))
+                    }
+                    Some(m) => Some(match m.split_once('/') {
+                        Some((n, v)) if !n.trim().is_empty() && !v.trim().is_empty() => {
+                            (n.to_string(), v.to_string())
+                        }
+                        Some(_) => {
+                            return Err(FerroError::Bind(format!(
+                                "model '{}' must be 'name/version' with both halves present",
+                                m
+                            )))
+                        }
+                        None => (m.clone(), "unspecified".to_string()),
+                    }),
+                    None => None,
+                };
                 Ok(BoundAgentStmt::BeginAgentSession {
                     agent_id: agent.clone(),
                     run_id: run.clone(),
+                    model,
                     // Forking from the session's own branch nests the task; from trunk otherwise.
                     parent: current.unwrap_or(BranchId::TRUNK),
                 })
@@ -573,12 +598,39 @@ mod tests {
     #[test]
     fn test_bind_begin_agent_session() {
         match bind_agent("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';", None).unwrap() {
-            BoundAgentStmt::BeginAgentSession { agent_id, run_id, parent } => {
+            BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, parent } => {
                 assert_eq!(agent_id, "pricing-agent");
                 assert_eq!(run_id.as_deref(), Some("r_8fk2"));
+                assert!(model.is_none());
                 assert_eq!(parent, BranchId::TRUNK);
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // MODEL splits into name and version at the single '/'.
+        match bind_agent("BEGIN AGENT SESSION AS 'a' MODEL 'claude-opus-5/2026-05';", None).unwrap()
+        {
+            BoundAgentStmt::BeginAgentSession { model, .. } => {
+                assert_eq!(
+                    model,
+                    Some(("claude-opus-5".to_string(), "2026-05".to_string()))
+                );
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // A bare name leaves the version half explicitly unspecified rather than inventing one.
+        match bind_agent("BEGIN AGENT SESSION AS 'a' MODEL 'gpt-9';", None).unwrap() {
+            BoundAgentStmt::BeginAgentSession { model, .. } => {
+                assert_eq!(model, Some(("gpt-9".to_string(), "unspecified".to_string())));
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // A blank model, or a half-empty name/version, is refused rather than recorded as blank.
+        for sql in [
+            "BEGIN AGENT SESSION AS 'a' MODEL '';",
+            "BEGIN AGENT SESSION AS 'a' MODEL '/2026-05';",
+            "BEGIN AGENT SESSION AS 'a' MODEL 'claude/';",
+        ] {
+            assert!(bind_agent(sql, None).is_err(), "{} should not bind", sql);
         }
         // inside a session, a new task forks from that session's branch
         let nested = bind_agent("BEGIN AGENT SESSION AS 'a';", Some(BranchId::new(1, 0))).unwrap();

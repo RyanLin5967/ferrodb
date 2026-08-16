@@ -13,7 +13,7 @@ pub enum TokenType {
     Begin, Commit, Rollback,
 
     // agent-isolation surface (DESIGN.md section 5)
-    Agent, Session, Run, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
+    Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     Eof,
@@ -208,6 +208,7 @@ impl Scanner {
             "AGENT" => TokenType::Agent,
             "SESSION" => TokenType::Session,
             "RUN" => TokenType::Run,
+            "MODEL" => TokenType::Model,
             "DIFF" => TokenType::Diff,
             "MERGE" => TokenType::Merge,
             "ABANDON" => TokenType::Abandon,
