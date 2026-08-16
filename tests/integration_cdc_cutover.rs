@@ -37,7 +37,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
-use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact, SnapshotBoundary};
+use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact, SnapshotBoundaryBuilder};
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -368,7 +368,11 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
     exec("INSERT INTO a VALUES (5, 50);", catalog, &bp, &txn, &mut app);
     exec("INSERT INTO b VALUES (5, 50);", catalog, &bp, &txn, &mut app);
 
-    let handoff = txn.begin_snapshot_read().expect("snapshot read");
+    // The recipe from `replication::snapshot`, step for step: one reader, every table read under
+    // it, one boundary built from what that reader delivered.
+    let mut boundary = SnapshotBoundaryBuilder::new(txn.begin_snapshot_read().expect("snapshot read"));
+    let reader = boundary.reader();
+    let resume_lsn = boundary.resume_lsn();
 
     // Committed while the reader is open: invisible to it, so the stream owes them.
     exec("INSERT INTO a VALUES (6, 60);", catalog, &bp, &txn, &mut app);
@@ -376,7 +380,7 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
 
     // Both tables read under the one reader, so both describe the same instant.
     let read = |sql: &str, catalog: &mut Catalog, app: &mut Session| -> Vec<u64> {
-        app.current = Some(handoff.txn_id);
+        app.current = Some(reader);
         let rows = match exec(sql, catalog, &bp, &txn, app) {
             Outcome::Rows(r) => r,
             _ => panic!("SELECT did not return rows"),
@@ -389,9 +393,14 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
             })
             .collect()
     };
+    // Each table recorded where it is read, rather than restated in a set further down. These reads
+    // go through the executor and never write a feed, so the escape hatch is the honest call here -
+    // and it sits next to the read it describes, which is the property that matters.
     let snap_a = read("SELECT * FROM a;", catalog, &mut app);
+    boundary.delivered_elsewhere("a");
     let snap_b = read("SELECT * FROM b;", catalog, &mut app);
-    txn.end_read_only(handoff.txn_id).expect("close reader");
+    boundary.delivered_elsewhere("b");
+    txn.end_read_only(reader).expect("close reader");
 
     assert_eq!(snap_a, (1..=5).collect::<Vec<u64>>(), "table a snapshot is not the reader's state");
     assert_eq!(snap_b, (1..=5).collect::<Vec<u64>>(), "table b snapshot is not the reader's state");
@@ -401,15 +410,16 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
     exec("INSERT INTO b VALUES (7, 70);", catalog, &bp, &txn, &mut app);
     d.wal.flush().unwrap();
 
-    // One boundary naming both tables, because this one reader delivered both.
-    let boundary = SnapshotBoundary::new(
-        BTreeSet::from(["a".to_string(), "b".to_string()]),
-        handoff.snapshot.clone(),
-        handoff.resume_lsn,
+    let (boundary, handoff_pin) = boundary.finish();
+    assert_eq!(
+        boundary.tables(),
+        &BTreeSet::from(["a".to_string(), "b".to_string()]),
+        "the boundary does not describe the tables this reader delivered"
     );
     let streamer =
         FeedStreamer::new(LogicalDecoder::new(catalog)).resuming_after_snapshot(boundary);
-    let (stream_feed, suppressed) = drain(&streamer, &d.wal, handoff.resume_lsn);
+    let (stream_feed, suppressed) = drain(&streamer, &d.wal, resume_lsn);
+    drop(handoff_pin);
     assert!(suppressed > 0, "the single boundary suppressed nothing, so it was never exercised");
 
     for (table, snap) in [("a", &snap_a), ("b", &snap_b)] {

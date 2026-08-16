@@ -35,3 +35,7 @@ target
 /cdc-consumer/cdc-consumer
 # DuckDB destinations written by the tests and by the README's examples. `*.db` does not match.
 *.duckdb
+
+# Python bytecode from the independent wire clients in tests/pg.
+__pycache__/
+*.pyc

@@ -20,6 +20,18 @@ pub struct WalManager {
     /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
     pins: Mutex<std::collections::BTreeMap<u64, u64>>,
     next_pin_id: AtomicU64,
+    /// **Test-only: make the next [`WalManager::append`] fail once.**
+    ///
+    /// `append` cannot fail on its own — it extends an in-memory buffer and ends in `Ok`. That
+    /// makes several error paths that guard against a failed append unreachable, and an unreachable
+    /// guard is one nobody can show works. `end_read_only` has one whose cost is the whole database
+    /// (a reader left in `att` blocks every checkpoint for the life of the process), so it is worth
+    /// being able to fire deliberately.
+    ///
+    /// `#[cfg(test)]` so it does not exist in any shipped build, nor in integration tests: this is
+    /// a lever for the unit tests in this crate and nothing else.
+    #[cfg(test)]
+    pub(crate) fail_next_append: std::sync::atomic::AtomicBool,
 }
 
 /// A claim on the log from `lsn` onwards. Released on drop.
@@ -318,7 +330,9 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1)})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1),
+            #[cfg(test)]
+            fail_next_append: std::sync::atomic::AtomicBool::new(false)})
     }
 
     /// Pin the log at its current durable frontier, and return where that turned out to be.
@@ -428,6 +442,12 @@ impl WalManager {
 
     // |total_len: u32|lsn: u64|prev_lsn: u64|txn_id: u64|tag: u8|payload: ...|crc32: u32|
     pub fn append(&self, txn_id: u64, prev_lsn: u64, kind: &RecKind) -> Result<u64, FerroError> {
+        // One-shot, and it disarms itself so a test can fail exactly the append it means to and let
+        // the cleanup that follows succeed. Compiled out entirely outside this crate's unit tests.
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::SeqCst) {
+            return Err(FerroError::Wal("injected append failure".into()));
+        }
         let mut buffer = self.buffer.lock().unwrap();
         let lsn = self.next_lsn.load(Ordering::SeqCst);
         let mut body = Vec::new();
