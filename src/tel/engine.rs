@@ -640,7 +640,7 @@ fn compose(
     for key in &row_keys {
         let o = ours.rows.get(key).map(|v| v.as_slice()).unwrap_or(&[]);
         let t = theirs.rows.get(key).map(|v| v.as_slice()).unwrap_or(&[]);
-        compose_row(*key, o, t, ours, theirs, &mut out, &mut poisoned);
+        compose_row(*key, o, t, ours, theirs, &mut out, &mut poisoned)?;
     }
 
     // ---- per-cell ----
@@ -686,7 +686,7 @@ fn compose_row(
     theirs: &SideIndex,
     out: &mut Composition,
     poisoned: &mut HashSet<RowKey>,
-) {
+) -> Result<(), FerroError> {
     let o_last = o.last().cloned();
     let t_last = t.last().cloned();
 
@@ -725,7 +725,7 @@ fn compose_row(
                 d.branch, key.1
             ),
         });
-        return;
+        return Ok(());
     }
 
     if o_deletes || t_deletes {
@@ -734,7 +734,7 @@ fn compose_row(
         let src = if o_deletes { o_last.unwrap() } else { t_last.unwrap() };
         out.composed.push(src.op.clone());
         poisoned.insert(key);
-        return;
+        return Ok(());
     }
 
     // RowCreate on both sides: identical images are not a conflict (equality detection).
@@ -776,8 +776,24 @@ fn compose_row(
             out.created.push((key, b));
             out.composed.push(st.op.clone());
         }
-        (None, None) => {}
+        (None, None) => {
+            // Reaching here means a row-routed op was neither RowCreate nor RowDelete. Ops are
+            // routed to the row index purely on `op.col.is_none()` (`SideIndex::push`), so an
+            // `Assign`/`Add`/`Max` built without a column lands here and used to be dropped with
+            // no error, no conflict and no trace — the write simply disappeared from a merge that
+            // reported success. `fold_side` refuses the mirror-image case loudly; this is the
+            // other half of that symmetry.
+            let offender = o_last.as_ref().or(t_last.as_ref());
+            if let Some(s) = offender {
+                return Err(FerroError::Merge(format!(
+                    "op {:?} on {}[{}] carries no column but is not RowCreate/RowDelete, so it \
+                     cannot be composed at either the row or the cell level",
+                    s.op.kind, key.0, key.1
+                )));
+            }
+        }
     }
+    Ok(())
 }
 
 fn compose_cell(
@@ -1909,6 +1925,43 @@ mod tests {
         ours.push_op(Op::new(TBL, R1, None, OpKind::RowCreate(vec![Value::Integer(3)])));
         let out = m.merge(&lca(), &[ours], &[], &Fixed(MergePolicy::Lww), &Absent);
         assert!(out.is_ok(), "an absent LCA cell must not be treated as a fault: {:?}", out.err());
+    }
+
+    /// R6: a row-routed op that is neither RowCreate nor RowDelete must be refused, not dropped.
+    ///
+    /// `SideIndex::push` routes on `op.col.is_none()` alone, so an `Assign` built without a column
+    /// lands in the row index. `compose_row` matched only RowCreate/RowDelete, and its
+    /// `(None, None)` arm was empty — the write vanished from a merge that reported success, with
+    /// no conflict and nothing in any report to notice. `fold_side` refuses the mirror-image case
+    /// loudly, so this is the other half of that symmetry.
+    #[test]
+    fn a_row_routed_op_that_is_not_create_or_delete_is_refused() {
+        let m = ThreeWayMerger::new();
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, None, OpKind::Assign(Value::Integer(5))));
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-1))));
+
+        let err = m
+            .merge(&lca(), &[ours], &[theirs], &AllReject, &base(20))
+            .expect_err("a column-less Assign must be refused, not silently dropped");
+        let text = format!("{}", err);
+        assert!(
+            text.contains("carries no column"),
+            "the refusal did not name the problem: {}",
+            text
+        );
+    }
+
+    /// Control: the refusal must come from the malformed op, not from row-level ops in general.
+    /// A well-formed RowCreate is also column-less and must still merge.
+    #[test]
+    fn a_well_formed_row_create_is_still_composed() {
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, None, OpKind::RowCreate(vec![Value::Integer(3)])));
+        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20));
+        assert!(out.is_ok(), "a valid RowCreate was refused: {:?}", out.err());
     }
 
     #[test]
