@@ -241,6 +241,46 @@ Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 - **The verification gate reports; it does not decide.** The blind-write metric is a heuristic, and
   a heuristic's outcome is quarantine, so it never blocks a merge on its own.
 
+## Replication — what it gives you, and what it cannot
+
+There is a working primary/replica pair: **asynchronous physical WAL log shipping** over TCP. A
+replica restores a base backup, connects, says how far it has got, and follows the primary's log
+until it converges. Convergence is judged in the tests by comparing page bytes on both disks, not
+by asking either process whether it thinks it worked.
+
+Two guarantees hold and are tested:
+
+- **A primary never ships a record it has not durably written.** A replica holding records the
+  primary loses on a crash is *ahead* of its primary — divergence, not lag, and nothing downstream
+  can reconcile it. The source stops at `flushed_lsn`.
+- **Applying is idempotent and all-or-nothing.** Redo goes through the same code path recovery
+  uses, so a reconnect's re-sent overlap is absorbed rather than double-applied; a batch with one
+  bad frame applies none of it, so the replica never sits at an LSN it cannot account for.
+
+**Without consensus, this is not a highly-available cluster, and the gap is not a detail.** There
+is no Raft, no leader election, no automatic failover, no split-brain protection. Two nodes that
+both believed they were primary would diverge and nothing here would notice. Promoting a replica is
+a manual act with no safety net. That is why the checklist below still has `Distributed
+replication (Raft)` unchecked — log shipping is a real component of replication, and it is not the
+hard part.
+
+Three further limits, each found by a test rather than reasoned about:
+
+- **A replica needs a base backup, and a base backup holds the primary's WAL open.** The primary
+  checkpoints every 256 commits and truncates its log, so there is nothing for a bare replica to
+  start from. A backup takes a *pin* that stops the next checkpoint discarding what it points into.
+  This log cannot be truncated part-way, so a pin means keeping all of it: **a backup handle that
+  is never dropped is a WAL that never shrinks.** PostgreSQL replication slots have the same
+  hazard.
+- **Only pages the WAL describes are replicated.** The catalog and the heap page directory are
+  written outside the log, so a base backup carries them *as of the instant it ran* and nothing
+  afterwards updates them. Measured directly: after a backup taken while the primary was still
+  inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
+  The practical consequence is that a backup taken while the primary is running does **not** by
+  itself give a usable replica — take it when the schema is settled.
+- **Reconnect-and-catch-up is not yet demonstrated end to end.** The applier is idempotent by
+  construction and unit-tested as such, but no test yet kills a replica mid-stream and restarts it.
+
 ## Current progress
 
 ### ferrodb (the SQL database)
@@ -255,7 +295,8 @@ Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 - [x] Write-ahead logging with crash recovery
 - [x] MVCC (tuple version chains, snapshot visibility)
 - [x] Postgres wire protocol (v3 subset: startup, simple query, errors — see the caveat above)
-- [ ] Distributed replication (Raft)
+- [x] Asynchronous physical replication: WAL log shipping over TCP, base backup, WAL pin
+- [ ] Distributed replication (Raft) — no consensus, no failover; see the section above
 
 ### ferrobranch (agent isolation)
 

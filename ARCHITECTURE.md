@@ -197,10 +197,18 @@ agent can still act on it. It charges the *change to the cell*, not the shape of
 
 ## 4. Replication (`src/replication`)
 
-Primary/replica **physical WAL log shipping**. A replica connects, says how far it has, and the
-primary streams frames onward; the replica CRC-checks each frame, verifies its embedded LSN against
-the stream position, and applies it through the same `apply_redo` recovery uses — inheriting ARIES
-idempotence, so a reconnect's re-sent overlap is absorbed rather than double-applied.
+Primary/replica **physical WAL log shipping**. A replica restores a base backup, connects, says how
+far it has, and the primary streams frames onward; the replica CRC-checks each frame, verifies its
+embedded LSN against the stream position, and applies it through the same `apply_redo` recovery
+uses — inheriting ARIES idempotence, so a reconnect's re-sent overlap is absorbed rather than
+double-applied.
+
+Log shipping alone cannot start a replica, which is what the 2000-row case proved: the primary
+truncates its WAL at every checkpoint, so there is no state for the surviving records to apply to.
+`backup::take` copies pages **through the buffer pool**, so each page is atomic against a concurrent
+writer. That is what makes the copy safe without full-page writes — redo skips by comparing against
+a page's own LSN, so a torn page whose LSN read new while its bytes read old would make redo skip
+exactly the records needed to repair it.
 
 The rule the scheme rests on: **a primary never ships a record it has not durably written.** A
 replica holding records the primary loses on a crash is *ahead* of its primary, which is divergence
@@ -214,13 +222,19 @@ Kept deliberately; a fabricated pass would be worse than an admitted gap.
 
 - **No consensus.** No Raft, no leader election, no automatic failover, no split-brain protection.
   Two nodes that both believe they are primary would diverge and nothing here would notice.
-- **No base backup, so replication does not yet generalise.** A replica cannot start from an
-  arbitrary LSN against an empty file. The primary checkpoints every 256 commits and truncates the
-  WAL; a replica starting after a truncation has missed records it needs. The end-to-end test
-  converges at 40 rows *because* that is under the checkpoint threshold — at 2000 rows it correctly
-  refuses. `pg_basebackup` exists for exactly this.
-- **The catalog is not replicated.** It is written outside the WAL, so a replica receives heap pages
-  and no schema: the rows are there and nothing on the replica can interpret them.
+- **A base backup holds the primary's WAL open.** Base backup now exists (`src/replication/backup.rs`),
+  and the 2000-row case that used to fail now converges. The cost is a *pin*: a backup stops the
+  next checkpoint discarding the log it points into, and since this log cannot be truncated
+  part-way, honouring the pin means keeping all of it. **A backup handle nobody drops is a WAL that
+  never shrinks** — the same hazard PostgreSQL replication slots have. Without the pin the failure
+  is not subtle: a backup taken while the primary runs is refused the moment a replica uses it.
+- **Only pages the WAL describes are replicated.** The catalog and the heap page directory are
+  written outside the log. A base backup carries them *as of the instant it ran*, and nothing
+  afterwards updates them. Measured, not assumed: after a backup taken while the primary was still
+  inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
+  So a backup taken against a running primary does **not** by itself give a usable replica.
+- **Reconnect and catch-up is not demonstrated end to end.** The applier is idempotent by
+  construction and unit-tested as such; no test yet kills a replica mid-stream and restarts it.
 - **SQL statements do not write CoW pages.** `UPDATE`/`INSERT` inside an agent session stage into an
   in-memory workspace. A page-backed row path exists and criteria 1 and 8 are measured on it, but
   reading "criterion 2 is MET" as "isolation enforced by shadow paging" is wrong for the SQL
@@ -238,7 +252,7 @@ Kept deliberately; a fabricated pass would be worse than an admitted gap.
 
 ## 6. Testing posture
 
-627 tests, 0 failed, 0 ignored. Three habits matter more than the count:
+638 tests, 0 failed, 0 ignored. Three habits matter more than the count:
 
 1. **A test that has never failed is not evidence.** Fixes are fire-checked by reintroducing the
    defect and confirming the test catches it. Several "passing" tests this project has held were
