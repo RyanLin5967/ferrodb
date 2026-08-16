@@ -297,6 +297,45 @@ fn as_of_branch_sees_uncommitted_inserts_and_deletes_too() {
     assert_eq!(rows(db.ok("SELECT id FROM inventory;", &mut observer)).len(), 2);
 }
 
+#[test]
+fn a_nested_task_forks_from_its_parents_state_and_then_diverges() {
+    // The child's visible state is the parent's state at fork time — the row-level equivalent of
+    // the child's root page being the parent's root page. Writes the parent makes *after* the
+    // fork stay invisible to the child, and the child never walks a parent chain to find them.
+    let mut db = Db::new();
+    db.seed();
+    let mut parent = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'planner' RUN 'r1';", &mut parent);
+    db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut parent);
+
+    // A sub-task forks from the parent *branch*. SQL allows one session per connection, so a
+    // nested fork is asked for through the runtime with an explicit parent.
+    let parent_branch = parent.agent.as_ref().unwrap().branch;
+    let child = db
+        .runtime
+        .begin_session("sub", Some("r2"), parent_branch)
+        .unwrap();
+    let mut observer = db.session();
+
+    let sql = format!("SELECT qty FROM inventory AS OF BRANCH {} WHERE id = 1;", child.branch_name);
+    let seen = rows(db.ok(&sql, &mut observer));
+    assert_eq!(
+        seen[0][0],
+        Value::Integer(15),
+        "the child inherits the parent's uncommitted row"
+    );
+
+    // Now the parent moves again; the child must not see it, and must not go looking up the
+    // parent chain for it either.
+    db.ok("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut parent);
+    let seen = rows(db.ok(&sql, &mut observer));
+    assert_eq!(seen[0][0], Value::Integer(15));
+    let seen = rows(db.ok("SELECT qty FROM inventory WHERE id = 1;", &mut parent));
+    assert_eq!(seen[0][0], Value::Integer(10));
+    // and main is still untouched by either of them
+    assert_eq!(qty_of(&mut db, 1), 20);
+}
+
 // ---- exit criterion 4: DIFF is structured ---------------------------------------------------
 
 #[test]

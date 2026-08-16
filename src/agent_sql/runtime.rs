@@ -263,6 +263,15 @@ impl AgentRuntime {
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
         let fork_seq = state.apply_seq;
+        // Forking from a branch that is itself an open agent task: the child's visible state *is*
+        // the parent's state at fork time, uncommitted rows included, exactly as the child's root
+        // page is the parent's root page. Taking a snapshot rather than a link is what keeps the
+        // parent's *later* writes invisible to the child, and keeps the read path from walking
+        // the parent chain — the one pattern DESIGN.md rules out outright.
+        let (rows, base_rows, tables) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
+            None => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+        };
         state.workspaces.insert(
             branch.id,
             Workspace {
@@ -270,9 +279,9 @@ impl AgentRuntime {
                 prov,
                 txn,
                 fork_seq,
-                rows: BTreeMap::new(),
-                base_rows: BTreeMap::new(),
-                tables: BTreeMap::new(),
+                rows,
+                base_rows,
+                tables,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
                 reads: Vec::new(),
             },
