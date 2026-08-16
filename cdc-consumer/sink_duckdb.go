@@ -347,8 +347,12 @@ func (s *DuckSink) apply(e *Event) error {
 	row := e.After
 	deleted := false
 	if e.Op == "DELETE" {
-		row = e.Before
-		deleted = true
+		// FIRE-CHECK: hard delete, to prove the soft-delete tests actually catch it.
+		if _, err := s.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s = ?",
+			quoteIdent(e.Table), quoteIdent(s.key)), normalise(e.Before[s.key])); err != nil {
+			return err
+		}
+		return nil
 	}
 	if row == nil {
 		return fmt.Errorf("%s event for %s carries no row", e.Op, e.Table)
