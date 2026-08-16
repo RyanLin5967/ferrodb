@@ -71,23 +71,35 @@
 //!   fine if each table has its own stream, wrong if one stream carries both, because no single
 //!   boundary describes them. The consistent version is available and is simply a different shape:
 //!
-//!   1. call [`TxnManager::begin_snapshot_read`] directly,
-//!   2. read every table under the one reader it returns,
-//!   3. close it with [`TxnManager::end_read_only`],
-//!   4. build one [`SnapshotBoundary`] naming **every table read in step 2** — the transaction set
-//!      answers *when*, not *what*, so a boundary that omits a table it delivered re-sends that
-//!      table, and one that names a table it did not deliver silently drops that table's entire
-//!      pre-cutover history,
-//!   5. **hold `handoff.pin` until the subscription exists**, then stream from `resume_lsn`.
+//!   1. hand [`TxnManager::begin_snapshot_read`]'s result to [`SnapshotBoundaryBuilder::new`],
+//!   2. read every table under `builder.reader()`, recording each with
+//!      [`deliver`](SnapshotBoundaryBuilder::deliver),
+//!   3. close the reader with [`TxnManager::end_read_only`],
+//!   4. [`finish`](SnapshotBoundaryBuilder::finish) for the boundary and the pin,
+//!   5. **hold that pin until the subscription exists**, then stream from `resume_lsn`.
 //!
-//!   Step 5 is the one this recipe used to omit, and omitting it is not a slow leak — it breaks the
+//!   **Two steps of this recipe used to be prose, and prose is what failed.**
+//!
+//!   Step 4 used to say "build a boundary naming every table read in step 2". The transaction set
+//!   answers *when*, not *what*, so a boundary omitting a table it delivered re-sends that table,
+//!   and one naming a table it did not deliver silently drops that table's entire pre-cutover
+//!   history — those rows were in no snapshot, the stream was their only path, and the drop is
+//!   reported downstream as legitimate suppression. Asking a caller to restate correctly what it
+//!   already did elsewhere is a contract every refactor can break: add a third table to the read
+//!   loop, forget the set, and one table goes dark with no error anywhere. So the set is no longer
+//!   a parameter — `deliver` writes a table's rows and records the table in one call, and
+//!   `SnapshotBoundary::new` is private. A caller that genuinely delivers by another route says so
+//!   through [`delivered_elsewhere`](SnapshotBoundaryBuilder::delivered_elsewhere), which at least
+//!   puts the assertion next to the read it describes.
+//!
+//!   Step 5 used to be missing altogether, and omitting it is not a slow leak — it breaks the
 //!   cutover outright. A checkpoint between the read and the subscription truncates the log past
 //!   the resume point, and the stream is refused with *"cannot pin lsn 2597: the log has already
 //!   been truncated to base 4260"*. It went unnoticed because the default checkpoint interval is
 //!   256 commits, so nothing truncates during a small test; at `FERRODB_CHECKPOINT_INTERVAL=1` the
-//!   recipe failed on the first try. The pin now comes back attached to the handoff, so following
-//!   the recipe holds it automatically — dropping the handoff early is the remaining way to get
-//!   this wrong, which is why step 5 says what to hold rather than what to call.
+//!   recipe failed on the first try. The pin now comes back attached to the handoff and then to
+//!   `finish`, so following the recipe holds it automatically — dropping it early is the remaining
+//!   way to get this wrong, which is why step 5 says what to hold rather than what to call.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -226,7 +238,12 @@ impl SnapshotBoundary {
     ///
     /// Naming one it did not deliver suppresses that table's pre-cutover history; omitting one it
     /// did deliver re-delivers it. Neither is detectable downstream.
-    pub fn new(tables: BTreeSet<String>, txns: TxnSnapshot, resume_lsn: u64) -> Self {
+    ///
+    /// **Not public, because that contract cannot be met by a caller reliably.** It is a promise
+    /// about what already happened, stated separately from the thing that happened, and the two
+    /// drift the moment anyone edits one of them. [`SnapshotBoundaryBuilder`] derives the set from
+    /// the deliveries themselves instead, which is the only version that cannot be wrong.
+    pub(crate) fn new(tables: BTreeSet<String>, txns: TxnSnapshot, resume_lsn: u64) -> Self {
         SnapshotBoundary { tables, txns, resume_lsn }
     }
 
@@ -252,6 +269,125 @@ impl SnapshotBoundary {
     pub fn suppresses(&self, table: &str, txn_id: u64) -> bool {
         self.tables.contains(table) && self.txns.already_delivered(txn_id)
     }
+}
+
+/// **Builds a [`SnapshotBoundary`] out of what a snapshot actually delivered.**
+///
+/// The boundary's table set is the dangerous field. Naming a table the snapshot did not deliver
+/// suppresses that table's entire pre-cutover history — those rows were in no snapshot, the stream
+/// was their only path, and the drop is reported downstream as legitimate suppression. Omitting a
+/// table it did deliver is the milder direction: that table is simply re-sent.
+///
+/// Handing a caller a `tables` parameter asks it to restate, correctly, something it has already
+/// done elsewhere in its own code. That is a contract no comment can enforce and every refactor can
+/// break — add a third table to the read loop, forget the set, and one table goes silently dark.
+///
+/// So the set is not a parameter here. [`deliver`](Self::deliver) writes a table's rows *and*
+/// records the table, in one call, and there is no way to do one without the other.
+///
+/// ```text
+/// let mut b = SnapshotBoundaryBuilder::new(txn.begin_snapshot_read()?);
+/// b.deliver("orders", cols_a, rows_a, &mut out)?;      // read under b.reader()
+/// b.deliver("shipments", cols_b, rows_b, &mut out)?;
+/// txn.end_read_only(b.reader())?;
+/// let (boundary, pin) = b.finish();
+/// ```
+///
+/// Deliberately `text` rather than a doctest: the setup a real one needs (a buffer pool, a WAL, a
+/// `TxnManager`) is several times the size of the thing being shown, and an `ignore` doctest is a
+/// sample nothing compiles, which is the kind that goes stale unnoticed. The shape above is
+/// executed for real by `the_boundary_covers_exactly_the_tables_that_were_delivered` in this file
+/// and by `one_reader_snapshots_two_tables_against_a_single_boundary` in
+/// `tests/integration_cdc_cutover.rs`; those run on every build, and this does not.
+pub struct SnapshotBoundaryBuilder {
+    handoff: crate::wal::txn::SnapshotHandoff,
+    tables: BTreeSet<String>,
+}
+
+impl SnapshotBoundaryBuilder {
+    /// Start from an open snapshot read. The handoff carries the reader, the resume point and the
+    /// pin that protects it; all three are kept here so a caller cannot drop the claim early.
+    pub fn new(handoff: crate::wal::txn::SnapshotHandoff) -> Self {
+        SnapshotBoundaryBuilder { handoff, tables: BTreeSet::new() }
+    }
+
+    /// The transaction every read must be performed under, or the rows are not the snapshot's.
+    pub fn reader(&self) -> u64 {
+        self.handoff.txn_id
+    }
+
+    /// Where the stream will resume.
+    pub fn resume_lsn(&self) -> u64 {
+        self.handoff.resume_lsn
+    }
+
+    /// **Write one table's rows as `READ` events, and record that this snapshot covered it.**
+    ///
+    /// The recording is not separable from the writing, which is the entire point: the boundary's
+    /// table set is then a description of what this builder did rather than a claim about it.
+    pub fn deliver<W: Write>(
+        &mut self,
+        table: &str,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        w: &mut W,
+    ) -> Result<usize, FerroError> {
+        let events = read_events(table, &self.handoff, columns, rows);
+        let n = write_feed(&events, w)?;
+        self.tables.insert(table.to_string());
+        Ok(n)
+    }
+
+    /// Record a table whose rows this snapshot delivered by some other route.
+    ///
+    /// **The escape hatch, and it carries back exactly the risk `deliver` removes.** Some callers
+    /// genuinely do not write a JSON Lines feed — a test that scans the heap directly, a sink that
+    /// materialises rows itself — and for them the set has to be asserted rather than derived. Say
+    /// it here, where the name records that an assertion is being made, rather than by assembling a
+    /// set out of sight of the reads it is supposed to describe. Naming a table nothing delivered
+    /// silences that table's pre-cutover history for good.
+    pub fn delivered_elsewhere(&mut self, table: &str) {
+        self.tables.insert(table.to_string());
+    }
+
+    /// The boundary, and the claim on the log that must outlive it until the subscription exists.
+    ///
+    /// Returned as a pair rather than dropped, because releasing the pin here would reopen the very
+    /// window the handoff took it to close.
+    pub fn finish(self) -> (SnapshotBoundary, WalPin) {
+        let boundary = SnapshotBoundary::new(
+            self.tables,
+            self.handoff.snapshot,
+            self.handoff.resume_lsn,
+        );
+        (boundary, self.handoff.pin)
+    }
+}
+
+/// The `READ` events for one table's rows, all attributed to the reading transaction.
+///
+/// Shared by [`snapshot_table_exact`] and [`SnapshotBoundaryBuilder::deliver`] so the two cannot
+/// disagree about what a snapshot row looks like on the wire.
+fn read_events(
+    table: &str,
+    handoff: &crate::wal::txn::SnapshotHandoff,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+) -> Vec<ChangeEvent> {
+    let columns = Arc::new(columns);
+    rows.into_iter()
+        .map(|values| ChangeEvent {
+            txn_id: handoff.txn_id,
+            lsn: handoff.resume_lsn,
+            commit_lsn: handoff.resume_lsn,
+            commit_end_lsn: handoff.resume_lsn,
+            table: table.to_string(),
+            columns: Arc::clone(&columns),
+            // `READ`, not `INSERT`: a row that already existed is not news of a change, and a
+            // consumer counting inserts must not count the size of the table.
+            op: ChangeOp::Read { row: values },
+        })
+        .collect()
 }
 
 /// A snapshot whose handoff to the stream is exact: no change missed, none delivered twice.
@@ -350,38 +486,14 @@ where
         (Ok(read_ok), Ok(())) => read_ok,
     };
 
-    let columns = Arc::new(columns);
-    let events: Vec<ChangeEvent> = rows
-        .into_iter()
-        .map(|values| ChangeEvent {
-            txn_id: handoff.txn_id,
-            lsn: handoff.resume_lsn,
-            commit_lsn: handoff.resume_lsn,
-            commit_end_lsn: handoff.resume_lsn,
-            table: table.to_string(),
-            columns: Arc::clone(&columns),
-            // `READ`, for the same reason as above: a row that already existed is not news of a
-            // change, and a consumer counting inserts must not count the size of the table.
-            op: ChangeOp::Read { row: values },
-        })
-        .collect();
+    // Through the same builder the multi-table recipe uses, so the one-table case cannot drift from
+    // it: the table set is whatever `deliver` recorded, and `deliver` records only what it wrote.
+    let reader_txn_id = handoff.txn_id;
+    let mut builder = SnapshotBoundaryBuilder::new(handoff);
+    let n = builder.deliver(table, columns, rows, w)?;
+    let (boundary, pin) = builder.finish();
 
-    let n = write_feed(&events, w)?;
-
-    Ok(ExactSnapshot {
-        table: table.to_string(),
-        rows: n,
-        // The table set is exactly the one table this call read — built from what the snapshot did
-        // rather than from what a caller meant. Naming a table it did not deliver would suppress
-        // that table's whole pre-cutover history in the stream, silently.
-        boundary: SnapshotBoundary::new(
-            BTreeSet::from([table.to_string()]),
-            handoff.snapshot,
-            handoff.resume_lsn,
-        ),
-        pin: handoff.pin,
-        reader_txn_id: handoff.txn_id,
-    })
+    Ok(ExactSnapshot { table: table.to_string(), rows: n, boundary, pin, reader_txn_id })
 }
 
 #[cfg(test)]
@@ -578,6 +690,49 @@ mod tests {
         // choice between diagnosing and cleaning up.
         assert!(txn.att.lock().unwrap().is_empty(), "the reader was left open");
         txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
+    }
+
+    /// **The boundary's table set is what was delivered, not what anyone said.**
+    ///
+    /// This is the property the builder exists for. A boundary that names a table the snapshot did
+    /// not deliver silences that table's entire pre-cutover history — those rows were in no
+    /// snapshot, so the stream was their only path, and the drop is reported downstream as
+    /// legitimate suppression. Deriving the set from the deliveries is what makes that
+    /// unrepresentable rather than merely warned about.
+    #[test]
+    fn the_boundary_covers_exactly_the_tables_that_were_delivered() {
+        let (_d, txn) = engine("builder_tables");
+        let mut buf = Vec::new();
+
+        // A real transaction that commits before the snapshot, so it is genuinely one the snapshot
+        // contains. Id 0 would not do: it is the DDL id and is exempt by design.
+        let earlier = txn.begin().unwrap();
+        txn.commit(earlier).unwrap();
+
+        let mut b = SnapshotBoundaryBuilder::new(txn.begin_snapshot_read().unwrap());
+        let reader = b.reader();
+        let (cols, rows) = rows();
+        b.deliver("orders", cols, rows, &mut buf).unwrap();
+        txn.end_read_only(reader).unwrap();
+        let (boundary, _pin) = b.finish();
+
+        assert_eq!(
+            boundary.tables(),
+            &BTreeSet::from(["orders".to_string()]),
+            "the table set is not what was delivered"
+        );
+
+        // `shipments` was never delivered, so nothing about it may be suppressed - even though its
+        // rows were written by transactions this boundary's set contains. That asymmetry is the
+        // whole point: the transaction set answers *when*, the table set answers *what*.
+        assert!(
+            !boundary.suppresses("shipments", earlier),
+            "a table this snapshot never read is being suppressed, which loses its history for good"
+        );
+        assert!(
+            boundary.suppresses("orders", earlier),
+            "the table the snapshot did deliver is not being deduplicated"
+        );
     }
 
     /// **The same, for a failure that happens before the scan is even reached.**

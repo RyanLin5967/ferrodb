@@ -29,7 +29,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::{Column, DataType, Value};
 use ferrodb::catalog::schema::Schema;
 use ferrodb::replication::logical::LogicalDecoder;
-use ferrodb::replication::snapshot::SnapshotBoundary;
+use ferrodb::replication::snapshot::SnapshotBoundaryBuilder;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::HeapFileManager;
@@ -103,7 +103,7 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         }
     };
 
-    let (snap_ids, resume_lsn, boundary_txns, slow_id, handoff_pin) = std::thread::scope(|s| {
+    let (snap_ids, handoff, slow_id) = std::thread::scope(|s| {
         // Racing writers: unsynchronised begin/commit for the whole run.
         for _ in 0..4 {
             let (txn, next_id, committed, commits, stop, write_row) = (
@@ -191,15 +191,20 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         // with them, so at FERRODB_CHECKPOINT_INTERVAL=1 the resume point is truncated away long
         // before the subscription is built - "cannot pin lsn 133: the log has already been
         // truncated to base 5163". It survived only because the default interval is 256.
-        (snap_ids, handoff.resume_lsn, handoff.snapshot.clone(), slow_id, handoff.pin)
+        (snap_ids, handoff, slow_id)
     });
 
     wal.flush().unwrap();
 
-    // Stream from the handoff, skipping what the snapshot already had. The boundary names `t`
-    // because `t` is the only table this snapshot read.
-    let boundary =
-        SnapshotBoundary::new(BTreeSet::from(["t".to_string()]), boundary_txns, resume_lsn);
+    let resume_lsn = handoff.resume_lsn;
+
+    // Stream from the handoff, skipping what the snapshot already had. This snapshot read `t` by
+    // scanning the heap directly rather than by writing a feed, so the table is asserted through
+    // the builder's escape hatch - which is the point of it having a name that says so.
+    let mut boundary = SnapshotBoundaryBuilder::new(handoff);
+    boundary.delivered_elsewhere("t");
+    let (boundary, handoff_pin) = boundary.finish();
+
     let streamer = FeedStreamer::new(LogicalDecoder::for_table(dir_root, "t", schema(), u32::MAX))
         .resuming_after_snapshot(boundary);
     let mut sub = Subscription::following(&wal, &streamer).expect("subscribe at the handoff");
