@@ -255,3 +255,85 @@ fn escrow_bounds_sequential_agents_not_just_concurrent_ones() {
     assert_eq!(db.qty(), 8, "the counter left its floor: {}", db.qty());
     assert!(db.qty() >= 0, "escrow let the counter go below its floor");
 }
+
+/// D15: escrow governs the CHANGE TO THE CELL, not the shape of the op.
+///
+/// The hook used to match `Add(Int(d < 0))`, which looked equivalent and was not. `SET qty = -100`
+/// is an `Assign`: it walked past the bound and put the counter at -100 against a floor of 0.
+#[test]
+fn a_direct_assignment_below_the_floor_is_refused_not_waved_through() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'sneaky' RUN 'r_s';", &mut a);
+    let br = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(br, "inventory", RowId(1), QTY, 1).unwrap();
+
+    let err = match db.exec("UPDATE inventory SET qty = -100 WHERE id = 1;", &mut a) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an assignment straight through the floor was accepted"),
+    };
+    assert!(err.contains("escrow"), "refused for the wrong reason: {err}");
+    // The implied drop is 20 -> -100, i.e. 120 units, and the message should say so.
+    assert!(err.contains("120"), "the error should name the implied drop: {err}");
+
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty(), 20, "a refused write still reached main");
+}
+
+/// A raise is always safe and must not be charged, or an agent could not undo its own decrement.
+#[test]
+fn raising_the_value_costs_no_escrow() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'giver' RUN 'r_g';", &mut a);
+    let br = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(br, "inventory", RowId(1), QTY, 5).unwrap();
+
+    db.ok("UPDATE inventory SET qty = 999 WHERE id = 1;", &mut a);
+    assert_eq!(
+        db.runtime.remaining_escrow(br, "inventory", RowId(1), QTY),
+        Some(5),
+        "raising the value consumed headroom"
+    );
+}
+
+/// An unbounded column is untouched by any of this.
+#[test]
+fn an_assignment_on_an_unbounded_cell_is_not_governed() {
+    let mut db = Db::new();
+    db.seed(20);
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'free' RUN 'r_f';", &mut a);
+    db.ok("UPDATE inventory SET qty = -100 WHERE id = 1;", &mut a);
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty(), -100, "an undeclared cell must behave exactly as before");
+}
+
+/// **Known limit, asserted rather than left to be discovered.** Deleting the row removes the
+/// bounded cell without spending against the claim: there is no "after" value to compare, so the
+/// before/after rule has nothing to charge. Recorded so the gap is visible; closing it means
+/// deciding what deleting a bounded resource even means, which is a design question.
+#[test]
+fn deleting_the_row_is_not_governed_by_escrow_and_this_is_a_known_gap() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'deleter' RUN 'r_d';", &mut a);
+    let br = a.agent.as_ref().unwrap().branch;
+    db.runtime.claim_escrow(br, "inventory", RowId(1), QTY, 1).unwrap();
+
+    db.ok("DELETE FROM inventory WHERE id = 1;", &mut a);
+    assert_eq!(
+        db.runtime.remaining_escrow(br, "inventory", RowId(1), QTY),
+        Some(1),
+        "if a delete now spends escrow, this gap has been closed and the test should say so"
+    );
+}

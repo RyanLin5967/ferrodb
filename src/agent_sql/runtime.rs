@@ -902,15 +902,33 @@ impl AgentRuntime {
         // no trace in the workspace, the frame or the log — the statement simply fails, which is
         // the entire point of moving the check off the merge path. A decrement of `n` on a bounded
         // cell spends `n` of this branch's reservation.
-        for op in &ops {
-            if let (OpKind::Add(Delta::Int(d)), Some(col)) = (&op.kind, op.col) {
-                if *d < 0 {
-                    self.state.lock().unwrap().escrow.spend(
-                        branch,
-                        (op.tbl, op.row, col),
-                        -*d,
-                    )?;
+        //
+        // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying
+        // off `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so
+        // it walked straight past the bound and landed the counter at -100 against a floor of 0.
+        // A float decrement slipped through the same gap. Comparing before against after catches
+        // every op that lowers the value, including ones not yet invented.
+        if let (Some(before_row), RowState::Present(after_row)) = (&before, &after) {
+            let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
+            {
+                let state = self.state.lock().unwrap();
+                for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
+                    let cell = (tbl, row, ColId(idx as u32));
+                    if !state.escrow.is_bounded(&cell) {
+                        continue;
+                    }
+                    if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
+                        // Only a decrease consumes headroom; raising the value gives it back and
+                        // is always safe, so it is not charged.
+                        let drop = b - a;
+                        if drop > 0 {
+                            spends.push((cell, drop));
+                        }
+                    }
                 }
+            }
+            for (cell, amount) in spends {
+                self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
             }
         }
 
@@ -1690,6 +1708,19 @@ struct WorkspaceSnapshot {
     ops: Vec<Op>,
     guards: Vec<Guard>,
     reads: Vec<crate::provenance::readset::ReadSet>,
+}
+
+/// A cell's value as an integer, for escrow accounting. `None` for anything not numeric.
+///
+/// Floats are truncated toward zero deliberately: escrow counts whole units of a bounded resource,
+/// and a fractional claim is not a thing the ledger models. Truncation rounds a decrease DOWN,
+/// which under-charges by at most one unit rather than letting a fractional write escape entirely.
+fn numeric(v: &Value) -> Option<i64> {
+    match v {
+        Value::Integer(i) => Some(*i as i64),
+        Value::Float(f) if f.is_finite() => Some(*f as i64),
+        _ => None,
+    }
 }
 
 /// Fault injection for crash-safety testing (D8). **Inert unless `FERRODB_CRASH_AFTER_ROWS` is
