@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
@@ -28,10 +29,23 @@ pub enum Outcome {
     Rows(Vec<Vec<Value>>),
     Affected(usize),
     Explain(String),
+    /// The structured result of an agent-session statement.
+    Agent(AgentOutput),
     Ok,
 }
 
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
+    if is_agent_stmt(&stmt) {
+        return run_agent_stmt(stmt, catalog, bp, txn, session);
+    }
+    // Inside an agent session, DML is captured on that session's branch instead of being applied
+    // to the shared tables — that is what makes a branch's writes invisible until MERGE.
+    if session.agent.is_some()
+        && matches!(stmt, Stmt::Select { .. } | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. })
+    {
+        return run_in_session(stmt, catalog, bp, txn, session);
+    }
     match stmt {
         Stmt::Begin => {
             if session.current.is_some() {

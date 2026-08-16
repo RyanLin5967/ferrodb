@@ -91,6 +91,7 @@ fn print_outcome(out: &Outcome) {
         }
         Outcome::Affected(n) => println!("({} row{} affected)", n, if *n == 1 {""} else {"s"}),
         Outcome::Explain(s) => println!("{}", s.trim_end()),
+        Outcome::Agent(a) => println!("{}", a),
         Outcome::Ok => println!("ok"),
     }
 }
