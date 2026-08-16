@@ -331,8 +331,24 @@ where
     // life of the process, so an error path that skipped this would turn one failed snapshot into a
     // WAL that never shrinks again.
     let closed = txn.end_read_only(handoff.txn_id);
-    let (columns, rows) = read?;
-    closed?;
+
+    // **Both failures are reported, and the close's is the one that used to vanish.** Writing this
+    // as `read?; closed?;` returns on the scan's error and drops `closed` unread - so a scan that
+    // failed *because* the closure wrote through the reader would report only the scan, while the
+    // far more informative "was opened to take a snapshot and then wrote to the database; it has
+    // been rolled back" was discarded. That is the case where the two are most likely to fail
+    // together and where the second explains the first.
+    let (columns, rows) = match (read, closed) {
+        (Err(read_err), Err(close_err)) => {
+            return Err(FerroError::Txn(format!(
+                "the snapshot scan failed ({read_err}) and closing its reader also failed \
+                 ({close_err}); the reader is no longer active either way"
+            )));
+        }
+        (Err(read_err), Ok(())) => return Err(read_err),
+        (Ok(_), Err(close_err)) => return Err(close_err),
+        (Ok(read_ok), Ok(())) => read_ok,
+    };
 
     let columns = Arc::new(columns);
     let events: Vec<ChangeEvent> = rows
@@ -524,6 +540,43 @@ mod tests {
             txn.att.lock().unwrap().is_empty(),
             "the reader was left open after a failed scan"
         );
+        txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
+    }
+
+    /// **When the scan and the close both fail, neither error is swallowed.**
+    ///
+    /// This is the case the old `read?; closed?;` ordering lost, and it is the case where the
+    /// second error explains the first: a closure that writes through the snapshot reader makes the
+    /// scan fail *and* makes `end_read_only` refuse and roll the transaction back. Reporting only
+    /// the scan tells the caller its query broke; reporting the close tells it why.
+    #[test]
+    fn a_scan_that_fails_after_writing_reports_the_rollback_too() {
+        use crate::storage::heap_file_manager::HeapFileManager;
+        use crate::storage::tuple::Tuple;
+
+        let (_d, txn) = engine("exact_fail_both");
+        let bp = txn.bp.clone();
+        let mut buf = Vec::new();
+
+        let r = snapshot_table_exact("t", &txn, &mut buf, |reader| {
+            // Writing through the reader is what makes the close refuse.
+            let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+            heap.set_transaction(txn.clone(), reader);
+            heap.insert(Tuple::new(vec![1, 2, 3])).unwrap();
+            Err(FerroError::Io("table vanished".into()))
+        });
+
+        let msg = format!("{}", r.expect_err("a failed scan produced a snapshot"));
+        assert!(msg.contains("table vanished"), "the scan's error was dropped: {msg}");
+        assert!(
+            msg.contains("rolled back"),
+            "the close's error was dropped, so a reader that wrote is reported as a broken query \
+             rather than as the refused snapshot it is: {msg}"
+        );
+
+        // And the reader is gone either way, which is what makes reporting safe rather than a
+        // choice between diagnosing and cleaning up.
+        assert!(txn.att.lock().unwrap().is_empty(), "the reader was left open");
         txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
     }
 
