@@ -951,8 +951,9 @@ fn criterion_7_guard(led: &mut Ledger) {
         format!(
             "Returned predicate: {:?}. BOUNDARY: this holds for a guard naming the amount taken \
              (`qty >= 12`). Written as the invariant (`qty >= 0`) the same case is NOT refused and \
-             main ends at {}. DESIGN.md section 3 uses `qty >= 0` as its worked example and says \
-             re-evaluation yields Conflict; it does not. See DEMO.md criterion 7.",
+             main ends at {}. DESIGN.md section 3 used to give `qty >= 0` as its worked example and \
+             claim re-evaluation yields Conflict; it does not, and section 3 has since been \
+             corrected at source to say the guard must name the amount. See DEMO.md criterion 7.",
             predicates, floor_qty
         ),
     );
