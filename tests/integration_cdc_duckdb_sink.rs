@@ -216,7 +216,17 @@ impl Reader {
             "reading the destination failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        // The duckdb CLI terminates rows with CRLF on Windows and LF elsewhere, exactly as the
+        // sqlite3 CLI does — and the Go fallback joins rows with `\n` on every platform. Without
+        // this, the two readers differ on Windows by line endings alone while every byte of DATA
+        // matches, and `both_readers_agree` reports it as a disagreement about the data. That is
+        // the failure this file's own comments warn about: a rendering difference that sends the
+        // reader after a corruption which is not there.
+        //
+        // Only the row SEPARATOR is normalised, deliberately. A bare `\r` inside a VARCHAR is data
+        // and must still register as a difference; stripping every `\r` would be shorter and would
+        // hide precisely the case worth catching.
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n").trim().to_string()
     }
 }
 

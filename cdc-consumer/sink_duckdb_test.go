@@ -492,7 +492,11 @@ func TestRenderCellAgreesWithTheRealDuckdbCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run the duckdb CLI: %v", err)
 	}
-	want := strings.TrimSpace(string(out))
+	// The CLI terminates rows with CRLF on Windows; duckSQL joins with "\n" everywhere. The probe
+	// below is a single row, so TrimSpace would cover it today - normalised anyway, because the
+	// day someone adds a second row is not the day to rediscover this on the Windows runner only.
+	// Only the row separator, so a bare \r inside a value still registers as a difference.
+	want := strings.TrimSpace(strings.ReplaceAll(string(out), "\r\n", "\n"))
 
 	got, err := duckSQL(filepath.Join(t.TempDir(), "probe.duckdb"), probe)
 	if err != nil {
