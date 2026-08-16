@@ -49,16 +49,49 @@ fn main() {
     };
 
     exec("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut catalog, &mut session);
+
+    // E8: a base backup, either taken after the work or taken *while it is still happening*.
+    //
+    // The hot mode is the one that tests the design rather than the happy path. A backup of a
+    // quiescent database has an empty [start_lsn, end_lsn] window, so it proves the base image
+    // works and proves nothing at all about the window — and the window is the entire reason the
+    // copy is allowed to run without stopping the world. Taking it on a thread while inserts
+    // continue means pages really are copied at different points in the log, and a replica that
+    // converges anyway has exercised the per-page redo-idempotence argument.
+    let backup_dir = format!("{db}.backup");
+    let hot = args.get(4).map(|s| s == "hot").unwrap_or(false);
+
+    let handle = if hot {
+        let (bp2, wal2, dir2) = (bp.clone(), wal.clone(), backup_dir.clone());
+        Some(std::thread::spawn(move || {
+            ferrodb::replication::backup::take(&bp2, &wal2, dir2.as_ref()).expect("hot base backup")
+        }))
+    } else {
+        None
+    };
+
     for i in 1..=rows {
         exec(&format!("INSERT INTO inventory VALUES ({i}, {});", i * 10), &mut catalog, &mut session);
     }
     bp.flush_all().expect("flush pages");
     wal.flush().expect("flush wal");
 
+    // Without this a replica can only start when the primary has never checkpointed, because a
+    // checkpoint truncates the WAL out from under it. `BACKUP_START` is where the replica must
+    // begin and is generally NOT `START`: it is inside the surviving log, not at its base.
+    let label = match handle {
+        Some(h) => h.join().expect("hot backup thread panicked"),
+        None => ferrodb::replication::backup::take(&bp, &wal, backup_dir.as_ref())
+            .expect("take base backup"),
+    };
+
     let listener = TcpListener::bind(&addr).expect("bind");
     println!("LISTENING {}", listener.local_addr().unwrap());
     println!("DURABLE {}", ReplicationSource::new(&wal).durable_lsn());
     println!("START {}", ReplicationSource::new(&wal).start_lsn());
+    println!("BACKUP {backup_dir}");
+    println!("BACKUP_START {}", label.start_lsn);
+    println!("BACKUP_END {}", label.end_lsn);
     std::io::stdout().flush().unwrap();
 
     for stream in listener.incoming() {

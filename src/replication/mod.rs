@@ -29,6 +29,10 @@ use std::io::{Read, Write};
 use crate::error::FerroError;
 use crate::wal::log::WalManager;
 
+/// Base backup — see [`backup`]. Log shipping alone cannot start a replica: the primary truncates
+/// its WAL at every checkpoint, so a replica needs a page image plus the LSN it corresponds to.
+pub mod backup;
+
 /// `0xFEDB` then a protocol version, so a mismatched peer is rejected at the handshake rather than
 /// misparsed into nonsense several frames later.
 pub const REPL_MAGIC: u32 = 0xFEDB_0001;

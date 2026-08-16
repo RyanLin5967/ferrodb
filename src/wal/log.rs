@@ -17,6 +17,41 @@ pub struct WalManager {
     pub path: PathBuf,
     pub base_lsn: AtomicU64,
     pub header_txn_id: u64,
+    /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
+    pins: Mutex<std::collections::BTreeMap<u64, u64>>,
+    next_pin_id: AtomicU64,
+}
+
+/// A claim on the log from `lsn` onwards. Released on drop.
+///
+/// This is a minimal **replication slot**. It exists because a base backup taken while the primary
+/// is running was found to be dead on arrival: the copy recorded a start LSN, the next checkpoint
+/// truncated the whole log, and the replica was refused with *"lsn 183 is below the log's base"*
+/// before it applied a single record. A backup is only usable if the log it points into survives.
+pub struct WalPin {
+    wal: std::sync::Arc<WalManager>,
+    id: u64,
+    /// The LSN this pin holds. Exposed because a caller that pins "wherever the log is now" has no
+    /// other way to learn where that turned out to be.
+    pub lsn: u64,
+}
+
+impl WalPin {
+    pub fn lsn(&self) -> u64 {
+        self.lsn
+    }
+}
+
+impl Drop for WalPin {
+    fn drop(&mut self) {
+        self.wal.pins.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl std::fmt::Debug for WalPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WalPin({} @ lsn {})", self.id, self.lsn)
+    }
 }
 
 pub struct WalBuffer {
@@ -155,7 +190,48 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1)})
+    }
+
+    /// Pin the log at its current durable frontier, and return where that turned out to be.
+    ///
+    /// **Reading the LSN and registering the claim happen under one lock, and that is the whole
+    /// point.** Doing it in two steps — read `flushed_lsn`, then pin it — is the check-then-act
+    /// shape that has produced six separate defects in this codebase: a truncation landing in the
+    /// gap leaves a pin on an LSN that has already been discarded, which is exactly the bug the
+    /// pin was added to prevent, reintroduced by the fix for it. [`WalManager::truncate`] takes
+    /// the same lock, so there is no gap to land in.
+    ///
+    /// Lock order is pins -> buffer -> file, matching `truncate`.
+    pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
+        let mut pins = self.pins.lock().unwrap();
+        let lsn = self.flushed_lsn.load(Ordering::SeqCst);
+        let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
+        pins.insert(id, lsn);
+        WalPin { wal: std::sync::Arc::clone(self), id, lsn }
+    }
+
+    /// Pin a specific LSN, refusing if it has already been truncated away.
+    ///
+    /// Refuses rather than clamping: a caller asking for an LSN the log no longer holds has state
+    /// built on records that are gone, and silently moving the pin forward would hand it a
+    /// plausible-looking claim over the wrong range.
+    pub fn pin(self: &std::sync::Arc<Self>, lsn: u64) -> Result<WalPin, FerroError> {
+        let mut pins = self.pins.lock().unwrap();
+        let base = self.base_lsn.load(Ordering::SeqCst);
+        if lsn < base {
+            return Err(FerroError::Wal(format!(
+                "cannot pin lsn {lsn}: the log has already been truncated to base {base}"
+            )));
+        }
+        let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
+        pins.insert(id, lsn);
+        Ok(WalPin { wal: std::sync::Arc::clone(self), id, lsn })
+    }
+
+    /// The oldest LSN any pin still needs, if there are any.
+    pub fn min_pinned_lsn(&self) -> Option<u64> {
+        self.pins.lock().unwrap().values().min().copied()
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
@@ -276,12 +352,34 @@ impl WalManager {
         Ok(buf)
     }
 
+    /// Discard the log and restart it at the current end.
+    ///
+    /// **A pin below that point cancels the truncation.** This log cannot be truncated part-way —
+    /// it is thrown away whole and restarted — so honouring a pin means keeping everything. The
+    /// checkpoint still succeeds; it simply reclaims nothing this time.
+    ///
+    /// The cost is the same one PostgreSQL replication slots have: a pin nobody releases makes the
+    /// WAL grow without bound. That is a real hazard and it is not guarded here beyond
+    /// [`WalManager::min_pinned_lsn`] being available to look at. It is the right trade against the
+    /// alternative, which is discarding records a replica has been promised and only finding out
+    /// when the replica is refused.
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
         self.flush()?;
+        // Taken first and held across the decision, so a pin cannot be registered against a range
+        // this call is in the middle of discarding. `pin_durable` reads the frontier under this
+        // same lock for the same reason.
+        let pins = self.pins.lock().unwrap();
         let mut buffer = self.buffer.lock().unwrap();
         let file = self.file.lock().unwrap();
         let next = self.next_lsn.load(Ordering::SeqCst);
-        
+
+        if let Some(&oldest) = pins.values().min() {
+            if oldest < next {
+                // Something still needs records below the new base. Keep the log.
+                return Ok(());
+            }
+        }
+
         let mut header = [0u8; HEADER_SIZE];
         header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
