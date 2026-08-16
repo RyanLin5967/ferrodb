@@ -192,6 +192,25 @@ impl LogicalDecoder {
         LogicalDecoder { tables, time_travel }
     }
 
+    /// Build a decoder for a single table, without a catalog.
+    ///
+    /// A catalog is the normal source of the mapping, but it is not the only possible one: a
+    /// consumer that already knows a table's shape — because it was told out of band, or because it
+    /// is decoding an archived log whose catalog is long gone — has the same need. Column names are
+    /// derived from the schema rather than passed separately, so they cannot drift out of step with
+    /// the columns they name.
+    pub fn for_table(
+        dir_root: u32,
+        name: &str,
+        schema: Schema,
+        time_travel_root: u32,
+    ) -> Self {
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let mut tables = HashMap::new();
+        tables.insert(dir_root, (name.to_string(), schema, Arc::new(columns)));
+        LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
+    }
+
     /// Number of tables this decoder can resolve. A decoder that knows no tables would report every
     /// record as unresolved, which is a configuration mistake rather than an empty database.
     pub fn known_tables(&self) -> usize {

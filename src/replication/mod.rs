@@ -41,6 +41,10 @@ pub mod logical;
 /// process can read is not a CDC source; this is the representation that leaves the process.
 pub mod jsonl;
 
+/// Streaming the change feed — see [`stream`]. A CDC consumer follows a database as it changes and
+/// resumes where it left off; the cursor rule that makes that safe lives there.
+pub mod stream;
+
 /// Optional synchronous commit — see [`sync`]. Off by default; turning it on changes the
 /// durability promise and spends availability to do it.
 pub mod sync;
