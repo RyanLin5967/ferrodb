@@ -195,6 +195,11 @@ impl RecKind {
                             buffer.push(3);
                             buffer.extend_from_slice(&n.to_be_bytes());
                         }
+                        // Tags 0..3 are fixed by every DDL record already in a log; the wide
+                        // types take the next free numbers so an existing WAL still replays.
+                        DataType::BigInt => buffer.push(4),
+                        DataType::Decimal => buffer.push(5),
+                        DataType::Timestamp => buffer.push(6),
                     }
                     buffer.push(if *nullable { 1 } else { 0 });
                 }
@@ -257,6 +262,9 @@ impl RecKind {
                         1 => DataType::Float,
                         2 => DataType::Boolean,
                         3 => DataType::Varchar(take_u16(bytes, &mut at)?),
+                        4 => DataType::BigInt,
+                        5 => DataType::Decimal,
+                        6 => DataType::Timestamp,
                         other => {
                             return Err(FerroError::Wal(format!("unknown column type tag {other}")))
                         }

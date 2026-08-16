@@ -39,10 +39,11 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let (heap, tree, handles) = open_table(entry, bp, txn, txn_id)?;
             let binder = Binder::new(catalog);
             let empty = Scope::new();
-            let mut bound_vals = Vec::with_capacity(values.len());
-            for v in values {
-                bound_vals.push(binder.bind_expr(v, &empty)?);
-            }
+            // Positional: value i lands in column i, so column i's declared type is what decides
+            // how a bare numeric literal is read. See `Binder::literal_for_column`.
+            let column_types: Vec<&crate::catalog::column::DataType> =
+                entry.schema.columns.iter().map(|c| &c.data_type).collect();
+            let bound_vals = binder.bind_row_against(values, &column_types, &empty)?;
             let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(insert)))
         }
@@ -55,7 +56,14 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let mut resolved = Vec::with_capacity(assignments.len());
             for (name, expr) in assignments {
                 let idx = entry.schema.columns.iter().position(|c| c.name == name).ok_or(FerroError::Parse(format!("unknown column: {}", name)))?;
-                resolved.push((idx, binder.bind_expr(expr, &scope)?));
+                // `SET big = 9223372036854775807` gets the same type-directed reading as INSERT;
+                // without it the assignment would land as a rounded f64 or a rejected i32.
+                let ty = &entry.schema.columns[idx].data_type;
+                let bound = match Binder::literal_for_column(&expr, ty) {
+                    Some(res) => BoundExpr::Literal(res?),
+                    None => binder.bind_expr(expr, &scope)?,
+                };
+                resolved.push((idx, bound));
             }
             let bound_where = match where_clause {
                 Some(w) => Some(binder.bind_expr(w, &scope)?),

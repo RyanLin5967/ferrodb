@@ -95,6 +95,20 @@ impl CatalogPage {
                         bytes[offset] = 3;
                         offset += 1;
                     }
+                    // Tags 0..3 are fixed by every catalog page already on disk. The wide types
+                    // take the next free numbers so an existing file keeps deserialising.
+                    DataType::BigInt => {
+                        bytes[offset] = 4;
+                        offset += 1;
+                    }
+                    DataType::Decimal => {
+                        bytes[offset] = 5;
+                        offset += 1;
+                    }
+                    DataType::Timestamp => {
+                        bytes[offset] = 6;
+                        offset += 1;
+                    }
                 }
                 bytes[offset] = if col.nullable {1} else {0};
                 offset += 1
@@ -161,6 +175,9 @@ impl CatalogPage {
                     }
                     2 => DataType::Float,
                     3 => DataType::Boolean,
+                    4 => DataType::BigInt,
+                    5 => DataType::Decimal,
+                    6 => DataType::Timestamp,
                     _ => return Err(FerroError::Parse(String::from("invalid tag")))
                 };
                 let nullable = bytes[offset] != 0;

@@ -236,6 +236,17 @@ pub fn evaluate(expr: &BoundExpr, row: &[Value]) -> Result<Value, FerroError> {
                 TokenType::Minus => match v {
                     Value::Integer(i) => Ok(Value::Integer(-i)),
                     Value::Float(f) => Ok(Value::Float(-f)),
+                    // `checked_neg` rather than `-i`: negating i64::MIN has no i64 result, and
+                    // wrapping it back to itself would turn the most negative timestamp in the
+                    // table into itself with the opposite meaning.
+                    Value::BigInt(i) => i.checked_neg().map(Value::BigInt)
+                        .ok_or_else(|| FerroError::Parse(format!("negating {i} overflows BIGINT"))),
+                    Value::Timestamp(ms) => ms.checked_neg().map(Value::Timestamp)
+                        .ok_or_else(|| FerroError::Parse(format!("negating {ms} overflows TIMESTAMP"))),
+                    Value::Decimal(d) => Ok(Value::Decimal(match d.strip_prefix('-') {
+                        Some(rest) => rest.to_string(),
+                        None => format!("-{d}"),
+                    })),
                     Value::Null => Ok(Value::Null),
                     _ => Err(FerroError::Parse("unary minus non numeric".into()))
                 },

@@ -42,6 +42,37 @@
 //!
 //! The third is used. A consumer that sees a string where it expected a number has been told
 //! something true and can act on it; one that sees `null` has been told something false.
+//!
+//! # Why BIGINT, DECIMAL and TIMESTAMP ship as JSON strings
+//!
+//! JSON has one number type and no stated precision. In practice the overwhelmingly common
+//! consumer behaviour is to parse every JSON number into an **IEEE 754 double**: that is what
+//! JavaScript's `JSON.parse` does, what Python's `json` does for anything with a decimal point,
+//! what Go's `encoding/json` does into `interface{}`, and what almost every dynamically typed
+//! pipeline does by default. A double carries a 53-bit significand, so:
+//!
+//! * `9223372036854775807` (`i64::MAX`) comes back as `9223372036854775808` — off by one, and
+//!   larger than the type it came from.
+//! * `9007199254740993` (2^53 + 1) comes back as `9007199254740992`.
+//! * `0.1` comes back as `0.1000000000000000055511151231257827…`, and a decimal with more than 17
+//!   significant digits comes back rounded.
+//!
+//! None of that raises an error. The parse succeeds, the number is wrong, and the corruption is
+//! discovered — if ever — downstream of the system that could have prevented it. A payment ledger
+//! that reconciles to the cent and a job queue keyed on a snowflake id both fail this way silently.
+//!
+//! So `BIGINT`, `DECIMAL` and `TIMESTAMP` are emitted as **JSON strings**. A string is not
+//! coerced by any JSON parser: the digits arrive at the consumer byte-for-byte as they left, and
+//! the consumer decides what to widen them into with full knowledge of what it is doing. The cost
+//! is that the consumer must call `strconv.ParseInt`/`BigInt(...)`/its own decimal type rather
+//! than reading a number field — an explicit step that can fail loudly, replacing an implicit one
+//! that fails quietly.
+//!
+//! `INTEGER` is deliberately **not** included: it is `i32`, whose extremes are ±2.1e9, three
+//! orders of magnitude inside what a double represents exactly. There is no precision to lose, and
+//! turning it into a string would break every consumer reading that column today for no gain.
+//! `FLOAT` is not included either — it *is* a double, so a double round-trips it exactly, and the
+//! shortest-round-trip printing below is what makes that true.
 
 use std::io::Write;
 
@@ -79,12 +110,19 @@ pub fn escape_json_into(s: &str, out: &mut String) {
 
 /// Append a value as JSON.
 ///
-/// See the module docs for why non-finite floats become strings rather than bare tokens or nulls.
+/// See the module docs for why non-finite floats become strings rather than bare tokens or nulls,
+/// and why `BIGINT`/`DECIMAL`/`TIMESTAMP` become strings while `INTEGER` and `FLOAT` do not.
 pub fn value_into(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Integer(i) => out.push_str(&i.to_string()),
+        // The three string-encoded types. `escape_json_into` is used rather than a hand-built
+        // `"..."` so that the quoting is the same code path every other string goes through; the
+        // digits themselves need no escaping, but nothing here depends on that staying true.
+        Value::BigInt(i) => escape_json_into(&i.to_string(), out),
+        Value::Decimal(d) => escape_json_into(d, out),
+        Value::Timestamp(ms) => escape_json_into(&ms.to_string(), out),
         Value::Float(f) if f.is_nan() => out.push_str("\"NaN\""),
         Value::Float(f) if f.is_infinite() => {
             out.push_str(if *f > 0.0 { "\"Infinity\"" } else { "\"-Infinity\"" })
@@ -323,10 +361,14 @@ mod tests {
     /// **Integer fidelity.** JSON numbers are commonly parsed into f64, which loses integers past
     /// 2^53 — the classic silent-corruption bug in CDC pipelines carrying BIGINT.
     ///
-    /// It cannot happen here, and the reason is worth pinning rather than assuming: this engine's
-    /// only integer type is `INTEGER`, which is `i32`. Its extremes are ±2.1e9, three orders of
-    /// magnitude inside f64's exactly-representable range. If a wider integer type is ever added,
-    /// this test is where that reasoning stops holding and it should fail loudly.
+    /// `INTEGER` is `i32`, whose extremes are ±2.1e9, three orders of magnitude inside f64's
+    /// exactly-representable range, so it stays a **bare JSON number**: there is nothing to lose,
+    /// and stringifying it would break every consumer reading that column today.
+    ///
+    /// This test used to carry a note saying that if a wider integer type were ever added it would
+    /// start failing. That was wrong — it only ever looked at `Value::Integer`, so it would have
+    /// stayed green while `BIGINT` shipped broken next to it. `BIGINT` was added; the note is
+    /// corrected here, and the tests that actually cover the wide types are below.
     #[test]
     fn integer_extremes_survive_exactly() {
         for v in [i32::MIN, i32::MAX, 0, -1] {
@@ -335,6 +377,139 @@ mod tests {
             assert_eq!(out, v.to_string(), "integer {v} did not round-trip");
             // Exactly representable as f64, so a consumer parsing into a double is still safe.
             assert_eq!(out.parse::<f64>().unwrap() as i64, v as i64, "{v} lost precision as f64");
+        }
+    }
+
+    /// **The three wide types are JSON strings, quotes included.**
+    ///
+    /// Asserting on the exact bytes rather than on "contains the digits" is deliberate: a bare
+    /// number also contains the digits, so a `contains` check would pass on the encoding this test
+    /// exists to forbid.
+    #[test]
+    fn the_wide_types_are_emitted_as_quoted_strings() {
+        let cases: Vec<(Value, &str)> = vec![
+            (Value::BigInt(i64::MAX), "\"9223372036854775807\""),
+            (Value::BigInt(i64::MIN), "\"-9223372036854775808\""),
+            (Value::BigInt(9007199254740993), "\"9007199254740993\""),
+            (Value::BigInt(0), "\"0\""),
+            (Value::Decimal("123456789012345678901234567890.123456789".into()),
+             "\"123456789012345678901234567890.123456789\""),
+            (Value::Decimal("-0.00000000000000000001".into()), "\"-0.00000000000000000001\""),
+            (Value::Decimal("1.50".into()), "\"1.50\""),
+            (Value::Timestamp(1_700_000_000_123), "\"1700000000123\""),
+            (Value::Timestamp(i64::MIN), "\"-9223372036854775808\""),
+        ];
+        for (v, expected) in cases {
+            let mut out = String::new();
+            value_into(&v, &mut out);
+            assert_eq!(out, expected, "{v:?} was not emitted as the exact JSON string {expected}");
+            assert!(out.starts_with('"') && out.ends_with('"'), "{v:?} left the quotes off: {out}");
+        }
+    }
+
+    /// **The negative control.** This is the test that would go red if the three types were ever
+    /// switched back to bare JSON numbers, and it says *why* in the assertion rather than just
+    /// failing: it strips the quotes the encoder added — which is exactly what a bare-number
+    /// encoder would have produced — and shows the value not surviving a double.
+    ///
+    /// Without this, "we emit strings" is a stylistic preference. With it, the preference has a
+    /// number attached.
+    #[test]
+    fn a_bare_json_number_would_lose_these_values_which_is_why_they_are_strings() {
+        // BIGINT past 2^53.
+        for v in [i64::MAX, i64::MIN + 1, 9007199254740993, -9007199254740993] {
+            let mut out = String::new();
+            value_into(&Value::BigInt(v), &mut out);
+            let unquoted = out.trim_matches('"');
+            assert_eq!(unquoted, v.to_string(), "the digits themselves must be intact");
+            // The loss is measured on the DIGITS, not through `as_double as i64`.
+            //
+            // A float-to-int `as` cast in Rust saturates. `i64::MAX` parses to the double 2^63
+            // (9223372036854775808), and casting that back to `i64` clamps it to `i64::MAX` —
+            // landing on the original value and making the round trip look lossless when it was
+            // not. The saturating cast reverses exactly the error being measured, so it reported
+            // "survived" for `i64::MAX` while the four other values here reported "lost". A
+            // consumer does not have that clamp: it holds the double and prints 2^63.
+            //
+            // Comparing the rendered integral digits has no such blind spot. Every double at this
+            // magnitude is an exact integer, so `{:.0}` prints its true value.
+            let as_double: f64 = unquoted.parse().unwrap();
+            assert_ne!(
+                format!("{as_double:.0}"),
+                v.to_string(),
+                "premise broken: {v} survived an f64 round trip, so this test proves nothing. \
+                 Pick a value that does not."
+            );
+            // And the string form does survive, which is the whole point.
+            assert_eq!(unquoted.parse::<i64>().unwrap(), v);
+        }
+
+        // DECIMAL with more significant digits than a double carries.
+        let d = "123456789012345678901234567890.123456789";
+        let mut out = String::new();
+        value_into(&Value::Decimal(d.into()), &mut out);
+        let unquoted = out.trim_matches('"');
+        assert_eq!(unquoted, d);
+        let as_double: f64 = unquoted.parse().unwrap();
+        assert_ne!(
+            format!("{as_double}"),
+            d,
+            "premise broken: this decimal survived an f64 round trip"
+        );
+
+        // TIMESTAMP: epoch millis fits a double, but the type is i64 and its extremes do not.
+        let ts = i64::MAX - 7;
+        let mut out = String::new();
+        value_into(&Value::Timestamp(ts), &mut out);
+        let unquoted = out.trim_matches('"');
+        assert_eq!(unquoted, ts.to_string());
+        // Same digit comparison as above, and for the same reason: the saturating cast would
+        // measure this one through the very clamp that hides the error.
+        let as_double: f64 = unquoted.parse().unwrap();
+        assert_ne!(format!("{as_double:.0}"), ts.to_string());
+    }
+
+    /// A row mixing all of them: the narrow types stay numbers, the wide ones become strings.
+    /// A consumer reading this line can tell which is which by JSON type alone.
+    #[test]
+    fn a_mixed_row_keeps_narrow_types_as_numbers_and_wide_types_as_strings() {
+        let e = ChangeEvent {
+            txn_id: 1,
+            lsn: 1,
+            commit_lsn: 2,
+            commit_end_lsn: 3,
+            table: "t".into(),
+            columns: Arc::new(vec![
+                "i".into(), "f".into(), "b".into(), "big".into(), "dec".into(), "ts".into(),
+            ]),
+            op: ChangeOp::Insert {
+                new: vec![
+                    Value::Integer(42),
+                    Value::Float(1.5),
+                    Value::Boolean(true),
+                    Value::BigInt(i64::MAX),
+                    Value::Decimal("0.10".into()),
+                    Value::Timestamp(1_700_000_000_123),
+                ],
+            },
+        };
+        let line = to_json_line(&e);
+        assert!(line.contains("\"i\":42"), "INTEGER must stay a bare number: {line}");
+        assert!(line.contains("\"f\":1.5"), "FLOAT must stay a bare number: {line}");
+        assert!(line.contains("\"b\":true"), "{line}");
+        assert!(line.contains("\"big\":\"9223372036854775807\""), "{line}");
+        assert!(line.contains("\"dec\":\"0.10\""), "{line}");
+        assert!(line.contains("\"ts\":\"1700000000123\""), "{line}");
+    }
+
+    /// A NULL in a wide column is JSON `null`, not the string `"null"`. A consumer that cannot tell
+    /// a missing amount from the four characters n-u-l-l has a worse problem than precision.
+    #[test]
+    fn a_null_wide_column_is_json_null_not_a_quoted_null() {
+        for v in [Value::Null] {
+            let mut out = String::new();
+            value_into(&v, &mut out);
+            assert_eq!(out, "null");
         }
     }
 

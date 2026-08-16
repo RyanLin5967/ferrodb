@@ -179,6 +179,21 @@ impl BTreeSerialize for Value { // primary
             Value::Null => {
                 buf.push(4);
             }
+            // Tags 0..4 are fixed by every index page already on disk; the wide types take the
+            // next free numbers so an existing tree keeps deserialising.
+            Value::BigInt(v) => {
+                buf.push(5);
+                buf.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Decimal(d) => {
+                buf.push(6);
+                buf.extend_from_slice(&(d.as_bytes().len() as u16).to_be_bytes());
+                buf.extend_from_slice(d.as_bytes());
+            }
+            Value::Timestamp(ms) => {
+                buf.push(7);
+                buf.extend_from_slice(&ms.to_be_bytes());
+            }
         }
     }
 
@@ -204,6 +219,19 @@ impl BTreeSerialize for Value { // primary
             }
             4 => {
                 Ok((Value::Null, 1))
+            }
+            5 => {
+                let v = i64::from_be_bytes(bytes[1..9].try_into().unwrap());
+                Ok((Value::BigInt(v), 9))
+            }
+            6 => {
+                let len = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
+                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Parse("bad utf8".into()))?;
+                Ok((Value::Decimal(s), 3 + len))
+            }
+            7 => {
+                let ms = i64::from_be_bytes(bytes[1..9].try_into().unwrap());
+                Ok((Value::Timestamp(ms), 9))
             }
             _ => Err(FerroError::Io(String::from("invalid tag value")))
         }

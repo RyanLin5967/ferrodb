@@ -405,6 +405,15 @@ impl Parser {
                 DataType::Boolean
             } else if self.match_token(&[TokenType::TypeFloat]) {
                 DataType::Float
+            } else if self.match_token(&[TokenType::TypeBigInt]) {
+                DataType::BigInt
+            } else if self.match_token(&[TokenType::TypeDecimal]) {
+                // No `DECIMAL(p,s)`. This engine stores the digits the writer supplied, so there
+                // is nothing for a declared precision to do except introduce a rounding rule —
+                // which is the loss the type exists to prevent. See `Value::Decimal`.
+                DataType::Decimal
+            } else if self.match_token(&[TokenType::TypeTimestamp]) {
+                DataType::Timestamp
             } else if self.match_token(&[TokenType::TypeVarchar]) {
                 self.consume(TokenType::LeftParen, "expected ( after VARCHAR")?;
                 let size_token = self.consume(TokenType::Number, "expected size")?;

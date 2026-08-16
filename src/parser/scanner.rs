@@ -16,6 +16,8 @@ pub enum TokenType {
     Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
+    // wide numeric and temporal types
+    TypeBigInt, TypeDecimal, TypeTimestamp,
     Eof,
 }
 
@@ -196,6 +198,11 @@ impl Scanner {
             "FLOAT" => TokenType::TypeFloat,
             "BOOLEAN" => TokenType::TypeBoolean,
             "VARCHAR" => TokenType::TypeVarchar,
+            "BIGINT" => TokenType::TypeBigInt,
+            // NUMERIC is SQL's spelling of the same type; accepting both saves a consumer
+            // discovering the difference at CREATE TABLE time.
+            "DECIMAL" | "NUMERIC" => TokenType::TypeDecimal,
+            "TIMESTAMP" => TokenType::TypeTimestamp,
             "NULL" => TokenType::Null,
             "AS" => TokenType::As,
             "JOIN" => TokenType::Join,

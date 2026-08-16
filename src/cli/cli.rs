@@ -102,6 +102,11 @@ fn display_value(v: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Varchar(s)=> s.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        // The stored digits verbatim: rendering a decimal through a float here would undo the
+        // whole point of storing it as digits.
+        Value::Decimal(d) => d.to_string(),
+        Value::Timestamp(ms) => ms.to_string(),
         Value::Null => "NULL".to_string(),
     }
 }

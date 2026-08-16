@@ -421,6 +421,9 @@ impl LogicalDecoder {
                                 DataType::Float => "FLOAT".to_string(),
                                 DataType::Boolean => "BOOLEAN".to_string(),
                                 DataType::Varchar(n) => format!("VARCHAR({n})"),
+                                DataType::BigInt => "BIGINT".to_string(),
+                                DataType::Decimal => "DECIMAL".to_string(),
+                                DataType::Timestamp => "TIMESTAMP".to_string(),
                             },
                             nullable: *nullable,
                         })

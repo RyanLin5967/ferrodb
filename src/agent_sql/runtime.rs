@@ -109,6 +109,11 @@ pub fn row_id_of(row: &[Value]) -> RowId {
         Some(Value::Varchar(s)) => RowId(fnv64(s.as_bytes())),
         Some(Value::Boolean(b)) => RowId(fnv64(&[*b as u8])),
         Some(Value::Float(f)) => RowId(fnv64(&f.to_bits().to_be_bytes())),
+        Some(Value::BigInt(i)) => RowId(*i as u64),
+        // A decimal's identity is its digits, not a float rendering of them: two amounts that
+        // differ only past 2^53 must not collapse onto the same row.
+        Some(Value::Decimal(d)) => RowId(fnv64(d.as_bytes())),
+        Some(Value::Timestamp(ms)) => RowId(*ms as u64),
         Some(Value::Null) | None => RowId(0),
     }
 }
@@ -840,7 +845,11 @@ impl AgentRuntime {
                     .iter()
                     .position(|c| c.name == name)
                     .ok_or_else(|| FerroError::Bind(format!("unknown column: {}", name)))?;
-                let bound = binder.bind_expr(expr.clone(), &scope)?;
+                // Type-directed, as on trunk: see `Binder::literal_for_column`.
+                let bound = match Binder::literal_for_column(&expr, &schema.columns[idx].data_type) {
+                    Some(res) => crate::binder::binder::BoundExpr::Literal(res?),
+                    None => binder.bind_expr(expr.clone(), &scope)?,
+                };
                 resolved.push((idx, expr, bound));
             }
             (bw, resolved)
@@ -890,9 +899,15 @@ impl AgentRuntime {
         let tbl = table_id(table);
         let binder = Binder::new(ctx.catalog);
         let empty = Scope::new();
-        let mut row = Vec::with_capacity(values.len());
-        for v in values {
-            row.push(evaluate(&binder.bind_expr(v, &empty)?, &[])?);
+        // Same type-directed literal binding as the trunk INSERT path in `planner::plan`: a bare
+        // numeric literal is read as the declared type of the column it lands in, so a BIGINT or
+        // DECIMAL written on a branch is the same value it would have been on trunk.
+        let column_types: Vec<&crate::catalog::column::DataType> =
+            schema.columns.iter().map(|c| &c.data_type).collect();
+        let bound = binder.bind_row_against(values, &column_types, &empty)?;
+        let mut row = Vec::with_capacity(bound.len());
+        for b in &bound {
+            row.push(evaluate(b, &[])?);
         }
         if row.len() != schema.columns.len() {
             return Err(FerroError::Bind(format!(
@@ -2006,6 +2021,17 @@ fn value_expr(v: &Value) -> Expr {
         Value::Integer(i) => Expr::Literal { value_type: TokenType::Number, value: i.to_string() },
         Value::Float(f) if *f < 0.0 => neg(format!("{:?}", -f)),
         Value::Float(f) => Expr::Literal { value_type: TokenType::Number, value: format!("{:?}", f) },
+        // The wide types render their exact digits, never a float rendering of them. Re-binding
+        // the literal against the target column's declared type is what turns those digits back
+        // into a BigInt/Decimal/Timestamp — see `Binder::literal_for_column`.
+        Value::BigInt(i) if *i < 0 => neg(i.unsigned_abs().to_string()),
+        Value::BigInt(i) => Expr::Literal { value_type: TokenType::Number, value: i.to_string() },
+        Value::Decimal(d) => match d.strip_prefix('-') {
+            Some(rest) => neg(rest.to_string()),
+            None => Expr::Literal { value_type: TokenType::Number, value: d.clone() },
+        },
+        Value::Timestamp(ms) if *ms < 0 => neg(ms.unsigned_abs().to_string()),
+        Value::Timestamp(ms) => Expr::Literal { value_type: TokenType::Number, value: ms.to_string() },
         Value::Varchar(s) => Expr::Literal { value_type: TokenType::String, value: s.clone() },
         Value::Boolean(true) => Expr::Literal { value_type: TokenType::True, value: "true".into() },
         Value::Boolean(false) => Expr::Literal { value_type: TokenType::False, value: "false".into() },

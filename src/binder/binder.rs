@@ -404,8 +404,18 @@ impl<'a> Binder<'a> {
             TokenType::Number => {
                 if value.contains('.') {
                     Value::Float(value.parse::<f64>().map_err(|e| FerroError::Bind(format!("invalid float: {}, {}", value, e)))?)
+                } else if let Ok(i) = value.parse::<i32>() {
+                    // `INTEGER` stays the default for anything that fits it, so no existing
+                    // consumer of a bound literal changes shape.
+                    Value::Integer(i)
+                } else if let Ok(i) = value.parse::<i64>() {
+                    // Wider than i32. Before BIGINT existed this was a hard "invalid int" error,
+                    // so widening here can only accept statements that used to be rejected — it
+                    // never reinterprets one that used to work. It is what makes a predicate like
+                    // `WHERE created_ms > 1700000000000` bindable at all.
+                    Value::BigInt(i)
                 } else {
-                    Value::Integer(value.parse::<i32>().map_err(|e| FerroError::Bind(format!("invalid int: {}, {}", value, e)))?)
+                    return Err(FerroError::Bind(format!("integer literal out of range for BIGINT: {}", value)))
                 }
             }
             TokenType::String => Value::Varchar(value),
@@ -415,6 +425,74 @@ impl<'a> Binder<'a> {
             _ => return Err(FerroError::Bind(format!("invalid literal: {}", value)))
         };
         Ok(v)
+    }
+
+    /// The signed text of a numeric literal, if `expr` is one.
+    ///
+    /// `INSERT INTO t VALUES (-9223372036854775808)` parses as unary minus applied to the literal
+    /// `9223372036854775808` — a number that does **not** fit an `i64`. Negating after parsing
+    /// therefore cannot represent `i64::MIN` at all, so the sign is folded into the text first and
+    /// the whole thing is parsed once.
+    fn signed_numeric_text(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Literal { value_type: TokenType::Number, value } => Some(value.clone()),
+            Expr::UnaryOp { operator: TokenType::Minus, right } => match right.as_ref() {
+                Expr::Literal { value_type: TokenType::Number, value } => Some(format!("-{value}")),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Bind a literal **against the column it is being written into**.
+    ///
+    /// Type-directed for exactly one reason: a bare numeric literal carries no type, and deciding
+    /// its type from its own text alone loses information the statement actually contains. Left to
+    /// itself, `literal_value` would read `123.4567890123456789012` as an `f64` — rounding it
+    /// before it ever reaches a `DECIMAL` column — and `1700000000000` as a `BigInt` rather than a
+    /// `TIMESTAMP`. The declared column type is the missing half of that decision, and at INSERT
+    /// and UPDATE it is right there.
+    ///
+    /// Returns `None` when this is not a case that needs redirecting, so the caller falls through
+    /// to ordinary binding. `Some(Err(..))` means the literal was aimed at one of these columns and
+    /// could not be represented — which is a refusal, never a silent truncation.
+    pub fn literal_for_column(expr: &Expr, target: &DataType) -> Option<Result<Value, FerroError>> {
+        if !matches!(target, DataType::BigInt | DataType::Decimal | DataType::Timestamp) {
+            return None;
+        }
+        let text = Self::signed_numeric_text(expr)?;
+        Some(match target {
+            DataType::BigInt => text
+                .parse::<i64>()
+                .map(Value::BigInt)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a BIGINT: {e}"))),
+            DataType::Timestamp => text
+                .parse::<i64>()
+                .map(Value::Timestamp)
+                .map_err(|e| FerroError::Bind(format!("`{text}` is not a TIMESTAMP (epoch milliseconds): {e}"))),
+            DataType::Decimal => crate::catalog::column::parse_decimal(&text)
+                .map(Value::Decimal)
+                .map_err(FerroError::Bind),
+            _ => unreachable!("guarded above"),
+        })
+    }
+
+    /// Bind one row of INSERT/UPDATE values, redirecting numeric literals to the declared type of
+    /// the column each one lands in. Values that are not plain literals bind normally.
+    pub fn bind_row_against(
+        &self,
+        values: Vec<Expr>,
+        column_types: &[&DataType],
+        scope: &Scope,
+    ) -> Result<Vec<BoundExpr>, FerroError> {
+        let mut out = Vec::with_capacity(values.len());
+        for (i, v) in values.into_iter().enumerate() {
+            match column_types.get(i).and_then(|t| Binder::literal_for_column(&v, t)) {
+                Some(res) => out.push(BoundExpr::Literal(res?)),
+                None => out.push(self.bind_expr(v, scope)?),
+            }
+        }
+        Ok(out)
     }
 }
 
