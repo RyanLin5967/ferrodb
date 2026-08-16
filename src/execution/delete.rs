@@ -10,6 +10,7 @@ use crate::storage::index::BPlusTreeManager;
 use crate::catalog::column::Value;
 use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::IndexHandle;
+use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Delete {
     pub table: String,
@@ -19,9 +20,15 @@ pub struct Delete {
     pub primary_index: BPlusTreeManager<Value, RecordId>,
     pub secondary_indexes: Vec<IndexHandle>,
     pub view: Arc<ReadView>,
+    /// Who to attribute the tombstone to. `None` means unattributed.
+    pub author: Option<(std::sync::Arc<dyn ProvenanceStore>, ProvId)>,
 }
 
 impl Modify for Delete {
+    fn set_author(&mut self, prov: std::sync::Arc<dyn ProvenanceStore>, id: ProvId) {
+        self.author = Some((prov, id));
+    }
+
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError> {
         let mut res = Vec::new();
         let mut count = 0;
@@ -39,6 +46,9 @@ impl Modify for Delete {
             check_write_conflict(&self.view, &head_h)?;
             head.data[8..16].copy_from_slice(&self.heap.txn_id.to_be_bytes());
             self.heap.update(rid, head)?;
+            if let Some((prov, id)) = &self.author {
+                prov.stamp(rid, *id)?;
+            }
             count += 1;
         }
         sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;

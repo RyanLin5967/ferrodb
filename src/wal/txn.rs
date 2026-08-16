@@ -1,8 +1,32 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{RecKind, WalManager}}};
+use crate::catalog::column::DataType;
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager}}};
 
-const CHECKPOINT_INTERVAL: u64 = 256;
+/// Commits between automatic checkpoints.
+///
+/// Overridable by `FERRODB_CHECKPOINT_INTERVAL` **so that tests can make truncation constant
+/// instead of rare.** That is not a convenience knob: three separate features shipped with a test
+/// that passed only because it stayed under this threshold, and past it each one failed for real —
+/// a base backup dead on arrival, a table's schema erased from the log, a live consumer whose
+/// cursor had been truncated away. A condition that almost never happens is a condition nothing is
+/// tested against, so this exists to let a test set it to 1 and make every commit truncate.
+///
+/// Read once, because a value that changes underneath a running database would make checkpoint
+/// timing depend on when the environment was last read rather than on how much work has happened.
+fn checkpoint_interval() -> u64 {
+    use std::sync::OnceLock;
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("FERRODB_CHECKPOINT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            // Zero would mean "checkpoint before every commit has happened", which is not a
+            // meaningful setting; treat it as 1 rather than dividing the world by it.
+            .map(|v| v.max(1))
+            .unwrap_or(256)
+    })
+}
 
 
 pub struct TxnManager {
@@ -11,6 +35,24 @@ pub struct TxnManager {
     pub next_txn_id: AtomicU64,
     pub att: Mutex<HashMap<u64, TxnEntry>>,
     pub commits_since_checkpoint: AtomicU64,
+    /// Every table's DDL, retained so a checkpoint can re-establish it at the head of the new log.
+    ///
+    /// A checkpoint truncates the WAL, which would otherwise discard the `CREATE TABLE` records a
+    /// log reader needs — and `CREATE TABLE` itself checkpoints, so creating a second table wiped
+    /// the first one's schema. Replaying them after each truncation keeps the log self-describing
+    /// from its own base, which is the same reason an ARIES checkpoint re-records the dirty page
+    /// table rather than assuming a reader saw the original entries.
+    schema_log: Mutex<Vec<DdlRecord>>,
+}
+
+/// A retained DDL record, replayed into the log after every checkpoint.
+#[derive(Debug, Clone)]
+pub struct DdlRecord {
+    pub op: DdlOp,
+    pub table: String,
+    pub dir_root: u32,
+    pub time_travel_root: u32,
+    pub columns: Vec<(String, DataType, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +82,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0) }
+        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -77,7 +119,7 @@ impl TxnManager {
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
-        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= CHECKPOINT_INTERVAL && self.att.lock().unwrap().is_empty() {
+        if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= checkpoint_interval() && self.att.lock().unwrap().is_empty() {
             self.checkpoint()?;
         }
         Ok(())
@@ -136,6 +178,56 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Remember a schema change and write it to the log.
+    ///
+    /// Retained rather than merely written, because the next checkpoint truncates whatever is
+    /// there. A `DropTable` removes the table from the retained set as well as being logged, so a
+    /// replay after truncation does not resurrect a table that no longer exists.
+    pub fn log_ddl(&self, rec: DdlRecord) -> Result<(), FerroError> {
+        {
+            let mut log = self.schema_log.lock().unwrap();
+            match rec.op {
+                DdlOp::CreateTable => {
+                    log.retain(|r| r.dir_root != rec.dir_root);
+                    log.push(rec.clone());
+                }
+                DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
+            }
+        }
+        self.append_ddl(&rec)?;
+        self.wal.flush()
+    }
+
+    fn append_ddl(&self, r: &DdlRecord) -> Result<(), FerroError> {
+        self.wal.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: r.op,
+                table: r.table.clone(),
+                dir_root: r.dir_root,
+                time_travel_root: r.time_travel_root,
+                columns: r.columns.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Re-establish every known table's schema at the head of the log.
+    ///
+    /// Called immediately after a truncation. Without it the log is self-describing only until the
+    /// first checkpoint, which is to say almost never.
+    fn replay_schema(&self) -> Result<(), FerroError> {
+        let records = self.schema_log.lock().unwrap().clone();
+        if records.is_empty() {
+            return Ok(());
+        }
+        for r in &records {
+            self.append_ddl(r)?;
+        }
+        self.wal.flush()
+    }
+
     pub fn checkpoint(&self) -> Result<(), FerroError> {
         if !self.att.lock().unwrap().is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
@@ -145,6 +237,9 @@ impl TxnManager {
         self.bp.disk_manager.sync()?;
         self.wal.truncate(self.next_txn_id.load(Ordering::SeqCst))?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
+        // The truncation just discarded every DDL record. Put them back, or a log reader starting
+        // at the new base has no way to know what any table is.
+        self.replay_schema()?;
         Ok(())
     }
 

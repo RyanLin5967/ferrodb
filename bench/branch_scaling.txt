@@ -1,0 +1,28 @@
+ferrodb branch-scaling benchmark
+instrument: std::time::Instant, wall clock, single process, warm cache
+trunk: 2000 rows; reads: 2000 samples per configuration
+
+calibration: descent p50 over 2,000 rows = 13.62us, over 40,000 rows = 20.46us (x1.50)
+the instrument responds to tree size, so flatness below is a real result.
+
+ branches |     state |   pages |         fork (us) |      get_row (us) |      descent (us)
+          |           |         |      p50      p99 |      p50      p99 |      p50      p99
+------------------------------------------------------------------------------------------------
+       10 |      idle |      44 |     0.79     3.50 |    13.62    17.50 |    13.62    15.21
+      100 |      idle |      44 |     0.58     5.54 |    13.62    18.21 |    13.62    15.75
+     1000 |      idle |      44 |     0.58     4.88 |    13.62    17.50 |    13.62    16.54
+       10 |  diverged |      64 |     1.33     9.62 |    13.67    17.67 |    13.62    15.38
+      100 |  diverged |     244 |     0.71     7.25 |    13.67    16.71 |    13.92    18.17
+     1000 |  diverged |    2044 |     0.92     2.54 |    13.62    14.12 |    13.62    14.29
+
+diverged branches, 10 -> 1000:
+  get_row p50 x1.00  (includes a per-call catalog lookup)
+  descent p50 x1.00  (tree only, root resolved once)
+  fork  p50 x0.69  (below 1.0 is warm-up, not forks getting faster with branch count - do not read it as a speedup)
+  pages 64 -> 2044
+
+These are ferrodb's numbers against ITSELF at three branch counts, on this machine.
+BranchBench's 5400x figure is that paper's measurement of other systems' overlay pattern;
+nothing here reproduces it and none of the above is a comparison against it.
+
+read latency did not degrade materially with branch count.

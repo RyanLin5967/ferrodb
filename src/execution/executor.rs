@@ -1,9 +1,14 @@
+use crate::catalog::column::DataType;
+use crate::wal::log::DdlOp;
+use crate::wal::txn::DdlRecord;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
@@ -22,16 +27,37 @@ pub trait Executor {
 
 pub trait Modify {
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>;
+
+    /// Attribute every version this statement writes to `id`.
+    ///
+    /// Default is a no-op, which leaves versions unattributed — `ProvId::NONE`, the honest answer
+    /// for a write made outside any agent session. Only statements run inside an agent session
+    /// get an author, and it is attached here rather than threaded through `plan()` so the
+    /// planner keeps knowing nothing about sessions.
+    fn set_author(&mut self, _prov: Arc<dyn ProvenanceStore>, _id: ProvId) {}
 }
 
 pub enum Outcome {
     Rows(Vec<Vec<Value>>),
     Affected(usize),
     Explain(String),
+    /// The structured result of an agent-session statement.
+    Agent(AgentOutput),
     Ok,
 }
 
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
+    if is_agent_stmt(&stmt) {
+        return run_agent_stmt(stmt, catalog, bp, txn, session);
+    }
+    // Inside an agent session, DML is captured on that session's branch instead of being applied
+    // to the shared tables — that is what makes a branch's writes invisible until MERGE.
+    if session.agent.is_some()
+        && matches!(stmt, Stmt::Select { .. } | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. })
+    {
+        return run_in_session(stmt, catalog, bp, txn, session);
+    }
     match stmt {
         Stmt::Begin => {
             if session.current.is_some() {
@@ -66,8 +92,36 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             if session.current.is_some() {
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
             }
+            let name = table.clone();
+            let spec: Vec<(String, DataType, bool)> = columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                .collect();
             catalog.create_table(table, Schema{columns})?;
             txn.checkpoint()?;
+
+            // Logged AFTER the checkpoint, and that ordering is not stylistic: `checkpoint`
+            // truncates the WAL, so a DDL record written before it would be discarded by the very
+            // call that follows it — the record would exist for microseconds and no reader would
+            // ever see one.
+            //
+            // This record does not drive recovery; the catalog is still authoritative for the
+            // running database. It exists so a reader of the log knows what the tables were, which
+            // is what lets the change feed carry schema instead of assuming today's catalog
+            // describes yesterday's rows.
+            if let Some(entry) = catalog.get_table(&name) {
+                // Through `log_ddl`, not a bare append: the record must be RETAINED, because the
+                // next checkpoint truncates the log and would otherwise erase it. Creating a second
+                // table is itself a checkpoint, so a bare append meant the first table's schema
+                // survived exactly until the second one was created.
+                txn.log_ddl(DdlRecord {
+                    op: DdlOp::CreateTable,
+                    table: name.clone(),
+                    dir_root: entry.first_directory_page_id,
+                    time_travel_root: entry.time_travel_root,
+                    columns: spec,
+                })?;
+            }
             return Ok(Outcome::Ok)
         }
         Stmt::Analyze { table } => {
@@ -121,6 +175,12 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     }
                 };
                 match planned {
+                    // No author is attached here, and that is not an omission. DML inside an
+                    // agent session returns above at `run_in_session`, so a write reaching this
+                    // arm is by definition outside every session and has no agent to name — the
+                    // version stays `ProvId::NONE`. Rows an agent wrote are stamped where they
+                    // actually reach shared storage: the merge publish path in
+                    // `agent_sql::runtime`, which carries the run down to `Modify::set_author`.
                     Plan::Write(mut op) => match op.execute(catalog) {
                         Ok(count) => {
                             if implicit { txn.commit(txn_id)? };

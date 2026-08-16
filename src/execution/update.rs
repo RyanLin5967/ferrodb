@@ -12,6 +12,7 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
 use crate::execution::index_handle::IndexHandle;
+use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
     pub table: String,
@@ -23,9 +24,15 @@ pub struct Update {
     pub secondary_indexes: Vec<IndexHandle>,
     pub view: Arc<ReadView>,
     pub tt_heap: HeapFileManager,
+    /// Who to attribute each new version to. `None` means unattributed.
+    pub author: Option<(std::sync::Arc<dyn ProvenanceStore>, ProvId)>,
 }
 
 impl Modify for Update {
+    fn set_author(&mut self, prov: std::sync::Arc<dyn ProvenanceStore>, id: ProvId) {
+        self.author = Some((prov, id));
+    }
+
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
         if self.assignments.iter().any(|(col, _)| *col == 0) {
             return Err(FerroError::Parse("can't update primary key".into()));
@@ -50,7 +57,10 @@ impl Modify for Update {
             
             for (i, col) in self.schema.columns.iter().enumerate() {
                 if !col.nullable && matches!(new_values[i], Value::Null) {
-                    return Err(FerroError::Contraint(format!("column {} can't be null", col.name)))
+                    return Err(FerroError::Constraint(format!(
+                        "column '{}' of '{}' is declared NOT NULL, so it cannot be set to NULL",
+                        col.name, self.table
+                    )))
                 }
             }
             let pk = old_values[0].clone();
@@ -61,6 +71,9 @@ impl Modify for Update {
             tuple.data[16..20].copy_from_slice(&tt_rid.page_id.to_be_bytes());
             tuple.data[20..22].copy_from_slice(&tt_rid.slot_num.to_be_bytes());
             let new_rid = self.heap.update(rid, tuple)?;
+            if let Some((prov, id)) = &self.author {
+                prov.stamp(new_rid, *id)?;
+            }
             if new_rid != rid {
                 self.primary_index.delete(&pk)?;
                 self.primary_index.insert(pk.clone(), new_rid)?;

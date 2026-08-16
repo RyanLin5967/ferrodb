@@ -1,6 +1,6 @@
 use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::{error::FerroError, storage::disk_manager::{pread, pwrite}};
+use crate::{catalog::column::DataType, error::FerroError, storage::disk_manager::{pread, pwrite}};
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
@@ -17,11 +17,53 @@ pub struct WalManager {
     pub path: PathBuf,
     pub base_lsn: AtomicU64,
     pub header_txn_id: u64,
+    /// LSNs some reader still needs, so a checkpoint may not discard them. See [`WalManager::pin`].
+    pins: Mutex<std::collections::BTreeMap<u64, u64>>,
+    next_pin_id: AtomicU64,
+}
+
+/// A claim on the log from `lsn` onwards. Released on drop.
+///
+/// This is a minimal **replication slot**. It exists because a base backup taken while the primary
+/// is running was found to be dead on arrival: the copy recorded a start LSN, the next checkpoint
+/// truncated the whole log, and the replica was refused with *"lsn 183 is below the log's base"*
+/// before it applied a single record. A backup is only usable if the log it points into survives.
+pub struct WalPin {
+    wal: std::sync::Arc<WalManager>,
+    id: u64,
+    /// The LSN this pin holds. Exposed because a caller that pins "wherever the log is now" has no
+    /// other way to learn where that turned out to be.
+    pub lsn: u64,
+}
+
+impl WalPin {
+    pub fn lsn(&self) -> u64 {
+        self.lsn
+    }
+}
+
+impl Drop for WalPin {
+    fn drop(&mut self) {
+        self.wal.pins.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl std::fmt::Debug for WalPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WalPin({} @ lsn {})", self.id, self.lsn)
+    }
 }
 
 pub struct WalBuffer {
     pub bytes: Vec<u8>,
     pub start_lsn: u64,
+}
+
+/// What a [`RecKind::Ddl`] record describes.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DdlOp {
+    CreateTable,
+    DropTable,
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,7 +73,22 @@ pub enum RecKind {
     HeapDelete { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8> }, 
     HeapUpdate { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8>, new: Vec<u8> },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
-    Checkpoint
+    Checkpoint,
+    /// A schema change, logged so the change feed can carry it.
+    ///
+    /// The catalog itself is written outside the WAL, so this record does not *drive* DDL — recovery
+    /// does not replay it and the catalog is authoritative for the running database. It exists so
+    /// that a **reader of the log** can know what the tables were at each point in it. Without it a
+    /// decoder can only assume today's catalog describes yesterday's rows, which is wrong the moment
+    /// anyone runs `CREATE TABLE` or `DROP TABLE`, and wrong silently.
+    Ddl {
+        op: DdlOp,
+        table: String,
+        dir_root: u32,
+        time_travel_root: u32,
+        /// `(name, type, nullable)` per column. Empty for a drop.
+        columns: Vec<(String, DataType, bool)>,
+    },
 }
 
 pub struct LogRecord {
@@ -39,6 +96,50 @@ pub struct LogRecord {
     pub prev_lsn: u64,
     pub txn_id: u64,
     pub kind: RecKind
+}
+
+/// Length-prefixed string, so a name containing anything at all cannot desync the reader.
+fn write_str(buffer: &mut Vec<u8>, s: &str) {
+    buffer.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    buffer.extend_from_slice(s.as_bytes());
+}
+
+// Bounds-checked readers. These bytes arrive from a disk or a socket, so every read has to be able
+// to refuse: indexing past the end of a truncated record panics the whole process, which is a
+// denial of service triggered by a corrupt log rather than a parse error.
+fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
+    let v = *bytes.get(*at).ok_or_else(|| short(*at, 1, bytes.len()))?;
+    *at += 1;
+    Ok(v)
+}
+
+fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
+    let end = *at + 2;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 2, bytes.len()))?;
+    *at = end;
+    Ok(u16::from_be_bytes(slice.try_into().unwrap()))
+}
+
+fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
+    let end = *at + 4;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 4, bytes.len()))?;
+    *at = end;
+    Ok(u32::from_be_bytes(slice.try_into().unwrap()))
+}
+
+fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
+    let len = take_u16(bytes, at)? as usize;
+    let end = *at + len;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, len, bytes.len()))?;
+    *at = end;
+    String::from_utf8(slice.to_vec())
+        .map_err(|e| FerroError::Wal(format!("ddl record holds a non-utf8 name: {e}")))
+}
+
+fn short(at: usize, want: usize, have: usize) -> FerroError {
+    FerroError::Wal(format!(
+        "log record is truncated: wanted {want} byte(s) at offset {at} but the record is {have} bytes"
+    ))
 }
 
 impl RecKind {
@@ -75,6 +176,29 @@ impl RecKind {
                 buffer.extend_from_slice(&(new.len() as u32).to_be_bytes());
                 buffer.extend_from_slice(new);
             }
+            RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
+                buffer.push(9);
+                buffer.push(match op { DdlOp::CreateTable => 0, DdlOp::DropTable => 1 });
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&time_travel_root.to_be_bytes());
+                write_str(buffer, table);
+                buffer.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+                for (name, ty, nullable) in columns {
+                    write_str(buffer, name);
+                    // Type tag, then any payload the type carries. Varchar's length is part of the
+                    // type, so a consumer that recreates the column gets the same width.
+                    match ty {
+                        DataType::Integer => buffer.push(0),
+                        DataType::Float => buffer.push(1),
+                        DataType::Boolean => buffer.push(2),
+                        DataType::Varchar(n) => {
+                            buffer.push(3);
+                            buffer.extend_from_slice(&n.to_be_bytes());
+                        }
+                    }
+                    buffer.push(if *nullable { 1 } else { 0 });
+                }
+            }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
@@ -110,6 +234,37 @@ impl RecKind {
                 let new_len = u32::from_be_bytes(bytes[15 + length..19 + length].try_into().unwrap()) as usize;
                 let new = bytes[19 + length.. 19 + length + new_len].to_vec();
                 Ok(RecKind::HeapUpdate { dir_root, page_id, slot, old, new })
+            }
+            9 => {
+                // Every read is bounds-checked against the record's own length: these bytes came
+                // off a disk or a socket, and `deserialize` must refuse a truncated record rather
+                // than index past it and panic the process.
+                let mut at = 1usize;
+                let op = match take_u8(bytes, &mut at)? {
+                    0 => DdlOp::CreateTable,
+                    1 => DdlOp::DropTable,
+                    other => return Err(FerroError::Wal(format!("unknown ddl op {other}"))),
+                };
+                let dir_root = take_u32(bytes, &mut at)?;
+                let time_travel_root = take_u32(bytes, &mut at)?;
+                let table = take_str(bytes, &mut at)?;
+                let count = take_u16(bytes, &mut at)? as usize;
+                let mut columns = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    let name = take_str(bytes, &mut at)?;
+                    let ty = match take_u8(bytes, &mut at)? {
+                        0 => DataType::Integer,
+                        1 => DataType::Float,
+                        2 => DataType::Boolean,
+                        3 => DataType::Varchar(take_u16(bytes, &mut at)?),
+                        other => {
+                            return Err(FerroError::Wal(format!("unknown column type tag {other}")))
+                        }
+                    };
+                    let nullable = take_u8(bytes, &mut at)? != 0;
+                    columns.push((name, ty, nullable));
+                }
+                Ok(RecKind::Ddl { op, table, dir_root, time_travel_root, columns })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -155,24 +310,89 @@ impl WalManager {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
         }
-        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id})
+        Ok(Self {file: Mutex::new(file), buffer: Mutex::new(WalBuffer { bytes: Vec::new(), start_lsn: valid_end }), next_lsn: AtomicU64::new(valid_end), flushed_lsn: AtomicU64::new(valid_end), base_lsn: AtomicU64::new(base_lsn), path, header_txn_id, pins: Mutex::new(std::collections::BTreeMap::new()), next_pin_id: AtomicU64::new(1)})
+    }
+
+    /// Pin the log at its current durable frontier, and return where that turned out to be.
+    ///
+    /// **Reading the LSN and registering the claim happen under one lock, and that is the whole
+    /// point.** Doing it in two steps — read `flushed_lsn`, then pin it — is the check-then-act
+    /// shape that has produced six separate defects in this codebase: a truncation landing in the
+    /// gap leaves a pin on an LSN that has already been discarded, which is exactly the bug the
+    /// pin was added to prevent, reintroduced by the fix for it. [`WalManager::truncate`] takes
+    /// the same lock, so there is no gap to land in.
+    ///
+    /// Lock order is pins -> buffer -> file, matching `truncate`.
+    pub fn pin_durable(self: &std::sync::Arc<Self>) -> WalPin {
+        let mut pins = self.pins.lock().unwrap();
+        let lsn = self.flushed_lsn.load(Ordering::SeqCst);
+        let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
+        pins.insert(id, lsn);
+        WalPin { wal: std::sync::Arc::clone(self), id, lsn }
+    }
+
+    /// Pin a specific LSN, refusing if it has already been truncated away.
+    ///
+    /// Refuses rather than clamping: a caller asking for an LSN the log no longer holds has state
+    /// built on records that are gone, and silently moving the pin forward would hand it a
+    /// plausible-looking claim over the wrong range.
+    pub fn pin(self: &std::sync::Arc<Self>, lsn: u64) -> Result<WalPin, FerroError> {
+        let mut pins = self.pins.lock().unwrap();
+        let base = self.base_lsn.load(Ordering::SeqCst);
+        if lsn < base {
+            return Err(FerroError::Wal(format!(
+                "cannot pin lsn {lsn}: the log has already been truncated to base {base}"
+            )));
+        }
+        let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst);
+        pins.insert(id, lsn);
+        Ok(WalPin { wal: std::sync::Arc::clone(self), id, lsn })
+    }
+
+    /// The oldest LSN any pin still needs, if there are any.
+    pub fn min_pinned_lsn(&self) -> Option<u64> {
+        self.pins.lock().unwrap().values().min().copied()
     }
 
     pub fn read_record(&self, lsn: u64) -> Result<(LogRecord, u64), FerroError> {
-        let frame = if lsn >= self.flushed_lsn.load(Ordering::SeqCst) {
+        // Whether a record is still in the buffer is decided UNDER the buffer lock, using the
+        // buffer's own `start_lsn`, and read in the same critical section.
+        //
+        // It used to branch on the `flushed_lsn` atomic and only then take the lock. Between those
+        // two steps another thread could flush, advancing `start_lsn` past `lsn`, and
+        // `lsn - buffer.start_lsn` then UNDERFLOWED — a subtract-with-overflow panic that poisoned
+        // the WAL mutexes, so one aborting transaction took down every other thread in the process
+        // with `PoisonError`. Reproduced by concurrent commit/abort, which walks the record chain.
+        let buffered = {
             let buffer = self.buffer.lock().unwrap();
-            let rel = (lsn - buffer.start_lsn) as usize;
-            if rel + 4 > buffer.bytes.len() {
-                return Err(FerroError::Wal("lsn past end of buffer".into()));
+            if lsn >= buffer.start_lsn {
+                let rel = (lsn - buffer.start_lsn) as usize; // safe: guarded above, same lock
+                if rel + 4 > buffer.bytes.len() {
+                    return Err(FerroError::Wal("lsn past end of buffer".into()));
+                }
+                let total =
+                    u32::from_be_bytes(buffer.bytes[rel..rel + 4].try_into().unwrap()) as usize;
+                if total < MIN_FRAME || rel + total > buffer.bytes.len() {
+                    return Err(FerroError::Wal("record goes past buffer".into()));
+                }
+                Some(buffer.bytes[rel..rel + total].to_vec())
+            } else {
+                None
             }
-            let total = u32::from_be_bytes(buffer.bytes[rel..rel+4].try_into().unwrap()) as usize;
-            if total < MIN_FRAME || rel + total > buffer.bytes.len() {
-                return Err(FerroError::Wal("record goes past buffer".into()));
-            }
-            buffer.bytes[rel..rel+total].to_vec()
+        };
+
+        let frame = if let Some(f) = buffered {
+            f
         } else {
             let file = self.file.lock().unwrap();
-            let offset = HEADER_SIZE as u64 + (lsn - self.base_lsn.load(Ordering::SeqCst));
+            // `truncate` can advance `base_lsn` past an lsn a caller still holds, which underflowed
+            // here for the same reason. Refuse with a description instead of panicking.
+            let rel = lsn.checked_sub(self.base_lsn.load(Ordering::SeqCst)).ok_or_else(|| {
+                FerroError::Wal(format!(
+                    "lsn {lsn} is below the log's base; it was truncated away"
+                ))
+            })?;
+            let offset = HEADER_SIZE as u64 + rel;
             let mut len_buf = [0u8; 4];
             pread_all(&file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
@@ -218,12 +438,68 @@ impl WalManager {
         Ok(lsn)
     }
 
+    /// The raw bytes of the frame at `lsn`, for shipping to a replica verbatim.
+    ///
+    /// Replication sends the log's own bytes rather than re-serialising a parsed record: the CRC
+    /// already in the frame then covers what actually crosses the wire, so a replica validates the
+    /// primary's bytes rather than trusting that two encoders agree.
+    ///
+    /// Same lock discipline as `read_record`: the buffer-or-file decision is made under the buffer
+    /// lock and the read happens in that same critical section, because deciding from the
+    /// `flushed_lsn` atomic and then locking is exactly what underflowed in D23.
+    pub fn raw_frame(&self, lsn: u64, len: usize) -> Result<Vec<u8>, FerroError> {
+        let buffered = {
+            let buffer = self.buffer.lock().unwrap();
+            if lsn >= buffer.start_lsn {
+                let rel = (lsn - buffer.start_lsn) as usize;
+                if rel + len > buffer.bytes.len() {
+                    return Err(FerroError::Wal("frame runs past the buffer".into()));
+                }
+                Some(buffer.bytes[rel..rel + len].to_vec())
+            } else {
+                None
+            }
+        };
+        if let Some(b) = buffered {
+            return Ok(b);
+        }
+        let file = self.file.lock().unwrap();
+        let rel = lsn.checked_sub(self.base_lsn.load(Ordering::SeqCst)).ok_or_else(|| {
+            FerroError::Wal(format!("lsn {lsn} is below the log's base; it was truncated away"))
+        })?;
+        let mut buf = vec![0u8; len];
+        pread_all(&file, &mut buf, HEADER_SIZE as u64 + rel)?;
+        Ok(buf)
+    }
+
+    /// Discard the log and restart it at the current end.
+    ///
+    /// **A pin below that point cancels the truncation.** This log cannot be truncated part-way —
+    /// it is thrown away whole and restarted — so honouring a pin means keeping everything. The
+    /// checkpoint still succeeds; it simply reclaims nothing this time.
+    ///
+    /// The cost is the same one PostgreSQL replication slots have: a pin nobody releases makes the
+    /// WAL grow without bound. That is a real hazard and it is not guarded here beyond
+    /// [`WalManager::min_pinned_lsn`] being available to look at. It is the right trade against the
+    /// alternative, which is discarding records a replica has been promised and only finding out
+    /// when the replica is refused.
     pub fn truncate(&self, next_txn_id: u64) -> Result<(), FerroError> {
         self.flush()?;
+        // Taken first and held across the decision, so a pin cannot be registered against a range
+        // this call is in the middle of discarding. `pin_durable` reads the frontier under this
+        // same lock for the same reason.
+        let pins = self.pins.lock().unwrap();
         let mut buffer = self.buffer.lock().unwrap();
         let file = self.file.lock().unwrap();
         let next = self.next_lsn.load(Ordering::SeqCst);
-        
+
+        if let Some(&oldest) = pins.values().min() {
+            if oldest < next {
+                // Something still needs records below the new base. Keep the log.
+                return Ok(());
+            }
+        }
+
         let mut header = [0u8; HEADER_SIZE];
         header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
@@ -243,21 +519,46 @@ impl WalManager {
     }
 
     pub fn flush(&self) -> Result<(), FerroError> {
-        let (bytes, start_lsn) = {
-            let mut buffer = self.buffer.lock().unwrap();
-            if buffer.bytes.is_empty() {
-                return Ok(());
-            }
-            let start = buffer.start_lsn;
-            let bytes = take(&mut buffer.bytes);
-            buffer.start_lsn = bytes.len() as u64 + start;
-            (bytes, start)
-        };
+        // The buffer lock is held across the file write, and that is the correctness fix rather
+        // than caution.
+        //
+        // It used to be released after draining, so two flushes could overlap. Thread A drains
+        // [100,200) and thread B drains [200,300); if B reaches the file first, `fetch_max` puts
+        // `flushed_lsn` at 300 while [100,200) is still only in memory. `fetch_max` cannot express
+        // "durable to 300 except for a hole", and `flush_up_to` reads that number as a guarantee —
+        // so the buffer pool would write a data page to disk before the log record describing it,
+        // which is the single rule write-ahead logging exists to enforce. Measured before the fix:
+        // over-reporting by up to ~117,000 bytes across 400 samples taken during the race.
+        //
+        // Order is buffer -> file, matching `truncate` and `read_record`; taking the file lock
+        // first here would invert against them.
+        //
+        // The cost is that appends block for the duration of an fsync, because `append` also takes
+        // the buffer lock. That is the honest price of a single-buffer WAL, and a faster log that
+        // lies about durability is not a better one.
+        let mut buffer = self.buffer.lock().unwrap();
+        if buffer.bytes.is_empty() {
+            return Ok(());
+        }
+        let start_lsn = buffer.start_lsn;
+        let bytes = take(&mut buffer.bytes);
+        buffer.start_lsn = bytes.len() as u64 + start_lsn;
+
         let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn.load(Ordering::SeqCst));
-        {
+        let wrote = {
             let file = self.file.lock().unwrap();
-            pwrite_all(&file, &bytes, offset)?;
-            file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
+            pwrite_all(&file, &bytes, offset)
+                .and_then(|()| file.sync_data().map_err(|e| FerroError::Wal(e.to_string())))
+        };
+        if let Err(e) = wrote {
+            // The bytes were drained but never reached disk. Putting them back keeps them
+            // recoverable by a later flush; dropping them would lose committed log records on an
+            // error path, which is a worse outcome than the error itself.
+            buffer.start_lsn = start_lsn;
+            let mut restored = bytes;
+            restored.append(&mut buffer.bytes);
+            buffer.bytes = restored;
+            return Err(e);
         }
         self.flushed_lsn.fetch_max(start_lsn + bytes.len() as u64, Ordering::SeqCst);
         Ok(())

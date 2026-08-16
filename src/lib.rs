@@ -9,3 +9,12 @@ pub mod cli;
 pub mod binder;
 pub mod optimizer;
 pub mod wal;
+
+// agent-isolation layer
+pub mod agent_sql;
+pub mod branch;
+pub mod cow;
+pub mod tel;
+pub mod pgwire;
+pub mod provenance;
+pub mod replication;

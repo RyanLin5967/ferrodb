@@ -2,6 +2,12 @@
 
 A relational database built from scratch in Rust.
 
+It has a second identity: **ferrobranch**, an *agent-isolation* database in which the unit of
+isolation is an agent task rather than a transaction. All ten of its exit criteria are demonstrated
+by a runnable demo that computes its own verdicts — `cargo run --release --example
+agent_isolation_demo`. See [ferrobranch — agent isolation](#ferrobranch--agent-isolation) below,
+including an explicit account of what is **not** covered.
+
 
 ## How to run
 
@@ -13,12 +19,72 @@ Prebuilt binaries (in zip files) for Linux, macOS, and Windows are in the releas
 
 Requires Rust 1.85 or newer (this project uses edition 2024).
 
+`cargo test` additionally needs **Go 1.24+** and the **`sqlite3` CLI** on PATH. The change-feed
+tests drive a consumer written in Go and check its SQLite output with the sqlite3 command — the
+independence is the point, since an encoder validated by its own decoder agrees with itself about
+any shared misreading. Those tests **fail loudly** rather than skipping when the toolchain is
+missing: a test that silently skips is a test that always passes. `cargo build` and `cargo run`
+need neither.
+
 ```
 git clone https://github.com/RyanLin5967/ferrodb.git
 cd ferrodb
 cargo run
 ```
 You can add an argument if you want a custom name. For example, `cargo run -- customname.db` will persist tables in `customname.db`.
+### Agent isolation, in the binary you just built
+
+The branch engine is not a library sitting beside the CLI — `cargo run` puts you on it. This is a
+real transcript, not an illustration:
+
+```
+$ cargo run -- shop.db
+ferrodb=> CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);
+ok
+ferrodb=> INSERT INTO inv VALUES (1, 10);
+(1 row affected)
+
+ferrodb=> BEGIN AGENT SESSION AS 'pricing' RUN 'r_1';
+agent session b_1 on b1@g0 (agent=pricing run=r_1)
+ferrodb=> INSERT INTO inv VALUES (2, 20);
+(1 row affected)
+ferrodb=> SELECT * FROM inv;            -- the agent sees its own write
+1 | 10
+2 | 20
+(2 rows)
+ferrodb=> DIFF;
+diff b0@g0 -> b1@g0: 1 row(s)
+  INSERT inv.row2 [pending]
+    op RowCreate on <row>
+```
+
+In **another** terminal, against the same database, the row does not exist:
+
+```
+ferrodb=> SELECT * FROM inv;
+1 | 10
+(1 row)
+```
+
+`MERGE;` publishes it, reports the outcome per row, and the result survives a restart:
+
+```
+ferrodb=> MERGE;
+m_1 b1@g0 -> b0@g0: Clean
+  inv.row2: Clean
+```
+
+The isolation is enforced by shadow paging, not by staging rows somewhere: the agent's write copies
+pages into a reserved arena above the ordinary table region, which is what
+`tests/integration_cli_agent_isolation.rs` checks by watching the database file grow past the arena
+floor. Those tests drive the built binary over a pipe, so they cannot pass by calling a constructor
+the binary does not call — reverting the wiring fails three of the five.
+
+`FERRODB_ARENA_HEADROOM` sets how many pages of ordinary table growth are reserved below the arena
+floor (default 32736, about 128 MB). It is read once, when a database's arena is first created, and
+then persisted: changing it later cannot move an existing database's floor, because moving the floor
+would put pages the arena already owns back into the ordinary allocator's circulation.
+
 ### Supported SQL
 
 Here is the SQL syntax that has been implemented so far:
@@ -103,7 +169,257 @@ Executor
     -> DiskManager: page-level IO to disk
 ```
 
+## ferrobranch — agent isolation
+
+Transactions isolate *operations*. They are the wrong unit for an LLM agent, whose task is long,
+speculative, and frequently abandoned halfway through. ferrobranch makes the unit of isolation the
+**agent task**: an agent opens a session, gets a private branch of the whole database, writes freely,
+and either merges or is thrown away. Nothing it did is visible to anyone until it merges.
+
+The load-bearing assumption is that **agents abandon their work and never tell you**. A design that
+requires the client to call `close` is a design that leaks forever.
+
+### The three layers
+
+**1. Branch engine.** A branch *is* a root pointer. Forking sets `child.root_page_id =
+parent.root_page_id` and appends a `fork_epoch` to the parent's sorted live-children array — one
+durable metadata record, and **zero data pages read, written, or refcounted**.
+
+Because the child's root *is* the parent's root at fork time, ordinary B+tree descent already
+reaches parent data, so the read path never walks a parent chain. That is a hard rule, not an
+optimisation: BranchBench (arXiv 2604.17180) measured the "not found here, ask my parent" overlay
+pattern at up to **5400x read degradation** as branches accumulate.
+
+Storage is a copy-on-write B+tree with shadow paging, fixed 4KB pages, and a self-describing page
+header carrying `birth_epoch`. Reclamation is ZFS-style birth-time algebra generalised from a linear
+chain to a tree:
+
+> page `p` is reclaimable iff no live child has `fork_epoch` in `[birth(p), free(p))`
+
+which is a range-emptiness query over a sorted array — O(log k), no global liveness question. Novel
+pages come from per-branch ~1MB arenas, so reaping a childless branch is an extent-level free, and a
+branch that dies before flushing its ~1MB write buffer has allocated **nothing at all**.
+
+Every branch carries a `lease_deadline`, and a background reaper hard-reaps anything past it **with
+no client cooperation whatsoever**. `BranchId` carries a generation counter, so a reaped id can
+never be mistaken for a live one — reading a reaped branch is a hard error, never stale data.
+
+**2. Provenance and read-sets.** The actor tuple (agent, run, model, model version, prompt hash) has
+*run-level* cardinality, so storing it per row version is ~3.4x density loss for nothing. It is
+interned: a page-local dictionary slot points at a reified `RunEntity`. Read-sets are retained too,
+in a form chosen by **access shape** rather than size — point lookups keep exact version ids, scans
+keep a predicate summary. Retaining reads is what makes causal rollback possible: reverting write A
+can find the write B that *read* A. It halts and shows the tree by default; cascade is explicit.
+
+**3. Typed Effect Log, merge, and verification gate.** Writes are logged as typed operations
+(`RowCreate`, `RowDelete`, `Assign`, `Add`, `Max`, `Min`, `SetInsert`, `SetRemove`) alongside the **guards** that made them
+legal. Guards are the part that genuinely cannot be reconstructed from a byte WAL — numeric deltas
+can be, but `WHERE qty >= 5` cannot. Merge is three-way against the fork point, which is strictly
+stronger than CRDT replication: no per-replica vectors that grow without bound.
+
+Merge reports **four** outcomes, and the fourth is the point:
+
+| Outcome | Meaning |
+|---|---|
+| `Clean` | main untouched |
+| `Commuting` | both branches wrote, and the ops compose (`Add`+`Add`, `SetInsert`∪`SetInsert`) |
+| `Conflict` | contradictory, or a guard failed when re-evaluated against merged state |
+| `ResolvedWithLoss` | a policy succeeded **while discarding a write** |
+
+Reporting `ResolvedWithLoss` as `Clean` is the most dangerous thing this system could do to an
+agent, so it is a distinct outcome by construction. On `Conflict` the **violated predicate is handed
+back**, so the agent retries with real feedback instead of a boolean.
+
+### How it differs from Dolt and Neon
+
+**Dolt** is git-for-data: content-addressed Merkle/prolly trees, commits and diffs aimed at humans.
+Content addressing forces a *global* liveness question — you cannot free a chunk without a global
+statement about who else references it — which is exactly why Dolt needs copying mark-and-sweep GC.
+ferrobranch deliberately uses **no content addressing, no reference counts, and no immutable
+segments**: birth-epoch algebra answers reclamation locally. Refcounts were rejected for the same
+class of reason — one parent with 5000 children would put refcount 5001 on the most-shared page in
+the database, which is btrfs's backref explosion.
+
+**Neon** branches Postgres cheaply at the storage layer by copy-on-write over a page server at an
+LSN. It is genuinely cheap to branch — but branches are a *service and recovery* feature: there is
+no merge back, no semantic conflict story, and no notion of who wrote a row or why. ferrobranch is
+built for the return path. Branching is the easy half; **merging, attributing, verifying and reaping
+are the product.**
+
+The nearest whole-system prior art is Write-Audit-Publish on Iceberg branches — with the difference
+that the audit step here has retained read-sets to work from, including the `write-set \ read-set`
+metric: rows an agent changed without ever looking at them.
+
+### Status — what is actually demonstrated
+
+Run it yourself: `cargo run --release --example agent_isolation_demo`. Every verdict below is
+computed by a check inside the demo, not written into a table by hand — removing the code behind a
+criterion makes its verdict change.
+
+- `cargo test` — **699 passed, 0 failed**
+- the demo reports **10 MET, 0 PARTIAL, 0 NOT MET** of the ten exit criteria, and exits non-zero
+  if any self-check fails
+- the thesis criterion is observed firing: 32 branches take a lease, write novel pages, and are
+  **never closed** — no `close`, `commit`, `abort` or `ABANDON`. The lease scan reaps them and the
+  allocated page count returns to baseline. The control is **temporal**: the identical scan run
+  *before* the leases expire reaps 0, which is what shows the reaper frees on expiry rather than
+  freeing whatever it is pointed at. (This bullet previously claimed a healthy long-lease branch
+  sat in the baseline as the control. There is none — the only survivor is trunk, and trunk is
+  excluded by an `is_trunk()` filter rather than by its lease, so it never tested what was claimed.)
+
+Measured rather than asserted:
+
+| Claim | Measurement |
+|---|---|
+| forking copies zero data pages | 44 pages at 10, 100 and 1000 branches |
+| read latency does not degrade with branch count | descent p50 flat (x1.00) from 10 to 1000 *diverged* branches |
+| a crash mid-merge leaves no torn state | process killed inside the publish loop at 3 points; database untouched every time |
+
+The benchmark **calibrates before reporting** — growing the tree 20x moves descent p50 13.6 → 20.5µs
+— and refuses to print numbers if the instrument cannot move, because "flat" from a gauge that
+cannot respond would prove nothing. Raw output is committed at `bench/branch_scaling.txt`.
+
+### What this does *not* do
+
+Kept here deliberately; a fabricated pass would be worse than an admitted gap.
+
+- **The shipped binaries are map-backed, though the statement path is not the reason.** `UPDATE` /
+  `INSERT` inside an agent session stage into an in-memory workspace *in the CLI, the pgwire server
+  and the demo*, because all three build `Session::new()`, which sets `storage: None`. Given a
+  storage-backed runtime the statement path does write copy-on-write pages — `stage()` mirrors each
+  staged row onto the branch's tree, and `tests/integration_branch_pages.rs` drives that through the
+  real scanner, parser, binder and executor in 9 tests. The gap is that nothing in `src/` constructs
+  such a runtime (`Session::with_runtime` has no caller), and `with_storage` mints a fresh trunk
+  root with no reattach path, so it cannot simply be switched on for a database that already holds
+  data. Reads are also still served from the heap plus the workspace overlay, and a branch's tree
+  holds its staged delta rather than the base table. This is the largest remaining gap.
+- **A guard must name the amount taken.** `qty >= 12` is refused correctly; written as the invariant
+  `qty >= 0`, two agents each taking 12 from 20 both merge and the counter reaches **−4**. Guards are
+  preconditions evaluated *before* the composed ops apply, so a precondition cannot see a post-op
+  violation. Escrow (`EscrowLedger`) is the answer and is implemented — claim the slack at fork and
+  the overdraw is refused at *write* time — with two scope limits worth stating plainly: it is
+  **opt-in per cell**, and it governs **agent-session writes only**. A plain `UPDATE` outside a
+  session never reaches the capture point and is not charged, so "the counter cannot go below its
+  floor" is true of agents and not of direct SQL.
+- **Crash safety means process death, not power loss.** The test kills the process with `abort()`;
+  bytes already handed to `write()` survive in the OS page cache, so nothing here exercises a dead
+  machine.
+- **`psql` itself has not been run.** The Postgres wire subset is verified by an independently
+  written client that speaks the same protocol, not by psql, which is not installed on the machine
+  this was built on.
+- **The verification gate reports; it does not decide.** The blind-write metric is a heuristic, and
+  a heuristic's outcome is quarantine, so it never blocks a merge on its own.
+
+## Change data capture
+
+Physical replication ships *pages*, which keeps a replica byte-identical and tells a consumer
+nothing about **what changed**. The same WAL also drives a logical change feed.
+
+```
+$ cargo run --example cdc_feed | jq -c '{op, table, after}'
+{"op":"INSERT","table":"inventory","after":{"id":1,"item":"widget","qty":10}}
+{"op":"UPDATE","table":"inventory","after":{"id":1,"item":"widget","qty":999}}
+{"op":"DELETE","table":"inventory","after":null}
+```
+
+- **Only committed transactions, in commit order.** Changes buffer per transaction and release on
+  `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
+  than emitted. A consumer shown an aborted transaction's rows has been told about data that never
+  existed.
+- **Resumable, from two positions rather than one.** A consumer persists where to resume *reading*
+  and what it has already been *delivered*, and they are different numbers whenever a transaction is
+  in flight. Persisting only a commit position loses data: a transaction that opened before that
+  commit has records *below* it, so a restart reads past them and never sees that transaction at
+  all. Measured, not reasoned — a consumer resuming from its highest `commit_lsn` lost an in-flight
+  transaction's row, while one restoring both positions kept it.
+
+  The read cursor advances only past a commit that was actually emitted, and never past the earliest
+  record of a still-open transaction. Clamping it that way re-reads transactions that committed
+  afterwards, which is why the delivered position exists to suppress them — read from the low-water
+  mark, deliver past the high-water mark.
+- **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
+  the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
+  direction is deliberate: handing off after the scan silently loses concurrent changes, while
+  handing off before re-delivers a few — and duplication is recoverable where loss is not.
+- **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
+  written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
+
+Two things the log says that a naive decoder gets wrong, both found by decoding real executor
+output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
+kinds onto change kinds reports every delete as an update, and a consumer keeps a row forever), and
+superseded row versions written to the time-travel heap are internal traffic (emitting them
+double-counts every update as an insert).
+
+### The consumer is a separate program, in a separate language
+
+`cdc-consumer/` is a small Go program that shares no code with the database. It validates the feed
+against the documented envelope using Go's `encoding/json` — which rejects `NaN` and `Infinity`
+outright — and, in `follow` mode, materialises the stream into a local table:
+
+```
+$ go run . follow 127.0.0.1:5555 -key id
+```
+
+The tests judge the feed by comparing that materialised table against the source, so a feed that is
+well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
+author's idea of the format agrees with itself about any shared misreading.
+
+**Limits:** the catalog lives outside the WAL, so DDL is not carried by the feed — a consumer sees
+rows and not the schema change that preceded them. There is no wire framing beyond newline
+delimiting, and the feed is JSON rather than a compact binary format.
+
+## Replication — what it gives you, and what it cannot
+
+There is a working primary/replica pair: **asynchronous physical WAL log shipping** over TCP. A
+replica restores a base backup, connects, says how far it has got, and follows the primary's log
+until it converges. Convergence is judged in the tests by comparing page bytes on both disks, not
+by asking either process whether it thinks it worked.
+
+Two guarantees hold and are tested:
+
+- **A primary never ships a record it has not durably written.** A replica holding records the
+  primary loses on a crash is *ahead* of its primary — divergence, not lag, and nothing downstream
+  can reconcile it. The source stops at `flushed_lsn`.
+- **Applying is idempotent and all-or-nothing.** Redo goes through the same code path recovery
+  uses, so a reconnect's re-sent overlap is absorbed rather than double-applied; a batch with one
+  bad frame applies none of it, so the replica never sits at an LSN it cannot account for.
+
+**Without consensus, this is not a highly-available cluster, and the gap is not a detail.** There
+is no Raft, no leader election, no automatic failover, no split-brain protection. Two nodes that
+both believed they were primary would diverge and nothing here would notice. Promoting a replica is
+a manual act with no safety net. That is why the checklist below still has `Distributed
+replication (Raft)` unchecked — log shipping is a real component of replication, and it is not the
+hard part.
+
+Three further limits, each found by a test rather than reasoned about:
+
+- **A replica needs a base backup, and a base backup holds the primary's WAL open.** The primary
+  checkpoints every 256 commits and truncates its log, so there is nothing for a bare replica to
+  start from. A backup takes a *pin* that stops the next checkpoint discarding what it points into.
+  This log cannot be truncated part-way, so a pin means keeping all of it: **a backup handle that
+  is never dropped is a WAL that never shrinks.** PostgreSQL replication slots have the same
+  hazard.
+- **Only pages the WAL describes are replicated.** The catalog and the heap page directory are
+  written outside the log, so a base backup carries them *as of the instant it ran* and nothing
+  afterwards updates them. Measured directly: after a backup taken while the primary was still
+  inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
+  The practical consequence is that a backup taken while the primary is running does **not** by
+  itself give a usable replica — take it when the schema is settled.
+- **Synchronous commit is available and off by default.** With it on, commit waits for a replica to
+  acknowledge the LSN, so a primary crash cannot lose work a client was told had committed. When no
+  replica can acknowledge, it neither blocks forever nor commits silently: it returns an error
+  naming the lsn it wanted, how far the furthest replica got, that the data is durable on the
+  primary, and that nothing was rolled back. With one replica and no consensus that trade cannot be
+  designed away, only stated.
+- **Reconnect and catch-up works, and its ordering is the replica's half of the durability rule.**
+  A replica records progress only *after* the pages it describes are durable, so a crash leaves its
+  state file behind the pages and never ahead — behind is repaired by idempotent redo, ahead would
+  be a replica claiming an LSN whose pages never reached disk. Tested by aborting a replica at a
+  fixed batch count mid-stream and restarting it.
+
 ## Current progress
+
+### ferrodb (the SQL database)
 
 - [x] Disk Manager (page-level IO, bitmap-based page allocation)
 - [x] Page layout and tuple serialization
@@ -113,9 +429,28 @@ Executor
 - [x] Query execution engine
 - [x] Cost-based query optimizer
 - [x] Write-ahead logging with crash recovery
-- [ ] MVCC 
-- [ ] Postgres wire protocol
-- [ ] Distributed replication (Raft)
+- [x] MVCC (tuple version chains, snapshot visibility)
+- [x] Postgres wire protocol (v3 subset: startup, simple query, errors — see the caveat above)
+- [x] Asynchronous physical replication: WAL log shipping over TCP, base backup, WAL pin
+- [ ] Distributed replication (Raft) — no consensus, no failover; see the section above
+
+### ferrobranch (agent isolation)
+
+- [x] Branch records, ids with generation counters, fork epochs
+- [x] CoW page header with `birth_epoch`
+- [x] Typed Effect Log: ops, guards, three-way merge algebra with four outcomes
+- [x] Read-set representations and revert/dependency structures
+- [x] CoW B+tree and store, with a structural diff that prunes shared subtrees by page id
+- [x] Per-branch arenas and write buffers
+- [x] Non-cooperative lease reaper (**the thesis**) — observed firing, pages back to baseline
+- [x] Provenance capture on the write path: a merge-published version names its agent, run and model
+- [x] SQL surface: `BEGIN AGENT SESSION`, `AS OF BRANCH`, `DIFF`, `MERGE`, `REVERT ... CASCADE`
+- [x] Verification gate tiers, ordered by cost ÷ rejection-probability, and the
+      `write-set \ read-set` blind-write metric
+- [x] Quarantine: a declined branch stays unmerged but still queryable
+- [x] Escrow at fork, so a bounded-counter overdraw fails at write time
+- [x] Depth guard + `COLLAPSE` at ancestry depth 8
+- [ ] SQL statements writing directly to CoW pages (the largest remaining gap, above)
 
 ## Why I built it
 

@@ -12,6 +12,9 @@ pub enum TokenType {
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain,
     Begin, Commit, Rollback,
 
+    // agent-isolation surface (DESIGN.md section 5)
+    Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
+
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     Eof,
 }
@@ -202,6 +205,17 @@ impl Scanner {
             "BEGIN" => TokenType::Begin,
             "COMMIT" => TokenType::Commit,
             "ROLLBACK" => TokenType::Rollback,
+            "AGENT" => TokenType::Agent,
+            "SESSION" => TokenType::Session,
+            "RUN" => TokenType::Run,
+            "MODEL" => TokenType::Model,
+            "DIFF" => TokenType::Diff,
+            "MERGE" => TokenType::Merge,
+            "ABANDON" => TokenType::Abandon,
+            "OF" => TokenType::Of,
+            "BRANCH" => TokenType::Branch,
+            "REVERT" => TokenType::Revert,
+            "CASCADE" => TokenType::Cascade,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);
@@ -256,6 +270,26 @@ mod tests {
         use TokenType::*;
         let toks = scan("selected user_name _temp col1");
         assert_eq!(toks, vec![Identifier, Identifier, Identifier, Identifier, Eof]);
+    }
+
+    #[test]
+    fn test_agent_keywords() {
+        use TokenType::*;
+        let toks = scan("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';");
+        assert_eq!(toks, vec![Begin, Agent, Session, As, String, Run, String, Semicolon, Eof]);
+        let toks = scan("DIFF; MERGE; ABANDON;");
+        assert_eq!(toks, vec![Diff, Semicolon, Merge, Semicolon, Abandon, Semicolon, Eof]);
+        let toks = scan("SELECT * FROM t AS OF BRANCH b_123;");
+        assert_eq!(toks, vec![Select, Star, From, Identifier, As, Of, Branch, Identifier, Semicolon, Eof]);
+        let toks = scan("REVERT MERGE m_44 CASCADE;");
+        assert_eq!(toks, vec![Revert, Merge, Identifier, Cascade, Semicolon, Eof]);
+    }
+
+    #[test]
+    fn test_agent_keywords_are_case_insensitive() {
+        use TokenType::*;
+        let toks = scan("begin agent session as 'a' run 'r';");
+        assert_eq!(toks, vec![Begin, Agent, Session, As, String, Run, String, Semicolon, Eof]);
     }
 
     #[test]
