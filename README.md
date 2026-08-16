@@ -278,8 +278,11 @@ Three further limits, each found by a test rather than reasoned about:
   inserting, every WAL-described page matched byte-for-byte and every page outside the log did not.
   The practical consequence is that a backup taken while the primary is running does **not** by
   itself give a usable replica — take it when the schema is settled.
-- **Reconnect-and-catch-up is not yet demonstrated end to end.** The applier is idempotent by
-  construction and unit-tested as such, but no test yet kills a replica mid-stream and restarts it.
+- **Reconnect and catch-up works, and its ordering is the replica's half of the durability rule.**
+  A replica records progress only *after* the pages it describes are durable, so a crash leaves its
+  state file behind the pages and never ahead — behind is repaired by idempotent redo, ahead would
+  be a replica claiming an LSN whose pages never reached disk. Tested by aborting a replica at a
+  fixed batch count mid-stream and restarting it.
 
 ## Current progress
 
