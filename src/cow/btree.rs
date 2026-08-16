@@ -502,10 +502,18 @@ impl CowTree {
 pub struct CowPageLinks;
 
 impl crate::branch::PageLinks for CowPageLinks {
-    fn child_pages(&self, page_type: PageType, page: &[u8; crate::storage::disk_manager::PAGE_SIZE]) -> Vec<PageId> {
+    fn child_pages(
+        &self,
+        page_type: PageType,
+        page: &[u8; crate::storage::disk_manager::PAGE_SIZE],
+    ) -> Result<Vec<PageId>, FerroError> {
         match page_type {
-            PageType::BTreeInternal => Node::new(page).all_children().unwrap_or_default(),
-            _ => Vec::new(),
+            // Propagate rather than `unwrap_or_default()`. `all_children` genuinely errors on a
+            // well-formed slot whose cell body is not 4 bytes ("internal cell is not a child
+            // pointer", "node cell overruns the page"). Reporting that as "no children" would let
+            // collapse detach a subtree it never copied.
+            PageType::BTreeInternal => Node::new(page).all_children(),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -522,5 +530,50 @@ impl crate::branch::PageLinks for CowPageLinks {
                 let _ = n.set_child(i, new);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cow_page_links_tests {
+    use super::*;
+    use crate::branch::PageLinks;
+    use crate::cow::node::PAYLOAD_LEN;
+    use crate::cow::PAGE_HEADER_SIZE;
+    use crate::storage::disk_manager::PAGE_SIZE;
+
+    /// S5: an undecodable internal node must be REFUSED, never reported as childless.
+    ///
+    /// `child_pages` used `all_children().unwrap_or_default()`. A well-formed slot whose cell body
+    /// is the wrong size, or whose offset+length runs past the payload, is a real error — and
+    /// answering "no children" makes `TwoTierReaper::deep_copy` copy the internal node without its
+    /// subtree. `collapse` then re-parents the branch and detaches it from its old parent, leaving
+    /// it rooted on ancestor-owned pages the interval rule may reclaim. Silent corruption, from
+    /// the exact walker whose job is to refuse it.
+    #[test]
+    fn an_undecodable_internal_node_is_refused_not_reported_as_childless() {
+        let mut page = [0u8; PAGE_SIZE];
+        let p = PAGE_HEADER_SIZE;
+        // One slot...
+        page[p..p + 4].copy_from_slice(&1u32.to_be_bytes());
+        // ...whose cell starts near the end of the payload and runs off it.
+        let slot = p + 12;
+        page[slot..slot + 4].copy_from_slice(&((PAYLOAD_LEN - 2) as u32).to_be_bytes());
+        page[slot + 4..slot + 8].copy_from_slice(&100u32.to_be_bytes());
+
+        let got = CowPageLinks.child_pages(PageType::BTreeInternal, &page);
+        assert!(
+            got.is_err(),
+            "a corrupt internal node reported {:?} children instead of refusing",
+            got.map(|v| v.len())
+        );
+    }
+
+    /// Control: the refusal above must come from the corruption, not from the walker rejecting
+    /// everything. A leaf still reports no children, and does so without error.
+    #[test]
+    fn a_leaf_reports_no_children_without_erroring() {
+        let page = [0u8; PAGE_SIZE];
+        let got = CowPageLinks.child_pages(PageType::BTreeLeaf, &page);
+        assert_eq!(got.expect("a leaf must not error"), Vec::<PageId>::new());
     }
 }

@@ -44,7 +44,18 @@ use crate::storage::disk_manager::PAGE_SIZE;
 /// supplied, [`TwoTierReaper::collapse`] **refuses** instead of silently corrupting the tree.
 pub trait PageLinks: Send + Sync {
     /// Page ids this page points at. Must return an empty vector for leaves.
-    fn child_pages(&self, page_type: PageType, page: &[u8; PAGE_SIZE]) -> Vec<PageId>;
+    ///
+    /// Returns `Result` deliberately. A page whose links cannot be decoded is NOT a page with no
+    /// links, and collapsing the two is silent corruption: `deep_copy` would copy the internal
+    /// node without its subtree, then `collapse` re-parents the branch to trunk and detaches it
+    /// from its old parent, leaving it rooted on ancestor-owned pages the interval rule is free
+    /// to reclaim. That is precisely the corruption an injected walker exists to refuse, so it
+    /// must be able to say "I cannot read this".
+    fn child_pages(
+        &self,
+        page_type: PageType,
+        page: &[u8; PAGE_SIZE],
+    ) -> Result<Vec<PageId>, FerroError>;
     /// Repoint one link. Called once per child during the post-order copy.
     fn rewrite_child(&self, page: &mut [u8; PAGE_SIZE], old: PageId, new: PageId);
 }
@@ -156,7 +167,7 @@ impl TwoTierReaper {
             (handle.header()?.page_type, handle.read().data)
         };
 
-        let children = links.child_pages(page_type, &data);
+        let children = links.child_pages(page_type, &data)?;
         let mut rewrites = Vec::with_capacity(children.len());
         for child in children {
             let new_child = self.deep_copy(child, arena, epoch, links, seen, budget)?;
@@ -732,17 +743,22 @@ mod tests {
     }
 
     impl PageLinks for ToyLinks {
-        fn child_pages(&self, page_type: PageType, page: &[u8; PAGE_SIZE]) -> Vec<PageId> {
+        fn child_pages(
+            &self,
+            page_type: PageType,
+            page: &[u8; PAGE_SIZE],
+        ) -> Result<Vec<PageId>, FerroError> {
             if page_type != PageType::BTreeInternal {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let n = page[PAGE_HEADER_SIZE] as usize;
-            (0..n)
+            let collected = (0..n)
                 .map(|i| {
                     let at = PAGE_HEADER_SIZE + 1 + i * 4;
                     u32::from_be_bytes(page[at..at + 4].try_into().unwrap())
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            Ok(collected)
         }
 
         fn rewrite_child(&self, page: &mut [u8; PAGE_SIZE], old: PageId, new: PageId) {
@@ -828,7 +844,9 @@ mod tests {
 
         // The copy is a real copy: same payload, new ids, all in the branch's own arena.
         let new_root_handle = h.store.read_page(collapsed.root_page_id).unwrap();
-        let new_children = ToyLinks.child_pages(PageType::BTreeInternal, &new_root_handle.read().data);
+        let new_children = ToyLinks
+            .child_pages(PageType::BTreeInternal, &new_root_handle.read().data)
+            .expect("toy links decode");
         assert_eq!(new_children.len(), 2);
         assert_ne!(new_children[0], leaf_a);
         let owner_arena = *collapsed.arenas.last().unwrap();
