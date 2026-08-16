@@ -843,6 +843,7 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
+        let mirrored = after.clone();
         let frame = {
             let mut state = self.state.lock().unwrap();
             let ws = state.workspaces.get_mut(&branch.id).ok_or_else(|| {
@@ -863,6 +864,29 @@ impl AgentRuntime {
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
         // not idempotent and two copies of one frame would double-count.
         self.log.append(&frame)?;
+
+        // Mirror the staged row onto the branch's OWN copy-on-write tree, when this runtime has a
+        // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
+        // step that makes the branch's state exist as pages, so the isolation between branches is
+        // a property of the page graph rather than of a map that happens not to be shared.
+        //
+        // Done outside the state lock deliberately: `put_row` takes the catalog lock to publish
+        // the branch's new root, and taking the two in the opposite order elsewhere would deadlock.
+        //
+        // Guarded on `storage`, because `AgentRuntime::new()` is still map-backed and has no tree
+        // to write to. A runtime without a page store keeps exactly its old behaviour.
+        if self.storage.is_some() {
+            debug_assert_eq!(
+                table_id(table),
+                tbl,
+                "the caller's TableId disagrees with the table name it passed, so the tree and the \
+                 workspace map would key the same row differently"
+            );
+            match mirrored {
+                RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
+                RowState::Deleted => self.delete_row(branch, table, row.0)?,
+            }
+        }
         Ok(())
     }
 
