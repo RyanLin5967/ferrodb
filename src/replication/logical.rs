@@ -139,10 +139,18 @@ pub struct ColumnSpec {
     /// the same one.
     ///
     /// The last three arrived with the wide types and this list was not extended, which is not a
-    /// cosmetic omission: the Go sink is written against this contract, and it mapped `BIGINT` and
-    /// `TIMESTAMP` onto SQLite TEXT through its unknown-type fallback — where SQLite compares
-    /// lexicographically and `WHERE big > 5` sorts "10" below "5". A consumer cannot be blamed for
-    /// not handling a type the contract does not mention.
+    /// cosmetic omission — it has now misled **both** Go sinks, independently:
+    ///
+    /// - the SQLite sink mapped `BIGINT` and `TIMESTAMP` onto TEXT through its unknown-type
+    ///   fallback, where SQLite compares lexicographically and `WHERE big > 5` sorts "10" below
+    ///   "5";
+    /// - the DuckDB sink, written later and from scratch, made the same four-type assumption and
+    ///   declared them `VARCHAR`, where `WHERE big > 99` does not even compile — DuckDB refuses to
+    ///   compare a VARCHAR with a number rather than mis-ordering it quietly.
+    ///
+    /// Two consumers making the same mistake from the same list is what makes this a defect in the
+    /// contract rather than in either of them: a consumer cannot be blamed for not handling a type
+    /// the contract does not mention.
     ///
     /// `sql_type_contract_is_exhaustive` pins the full mapping against `DataType` with a match the
     /// compiler forces to be exhaustive, so an eighth type cannot be added without this list and

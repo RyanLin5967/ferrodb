@@ -30,6 +30,32 @@ func TestDuckTypeMapping(t *testing.T) {
 		"VARCHAR(32)": "VARCHAR",
 		"VARCHAR(1)":  "VARCHAR",
 		"TEXT":        "VARCHAR",
+
+		// The wide types. These were reaching the `default` arm and being declared VARCHAR by
+		// accident rather than by decision — the same way the SQLite sink was declaring them TEXT,
+		// and for the same root cause: `ColumnSpec::sql_type`'s doc described the wire contract as
+		// four types long after it was seven, and both sinks were written against that list.
+		//
+		// BIGINT is exact in DuckDB, which has a real 64-bit integer, and the feed's
+		// string-encoded digits go into it losslessly — measured, not assumed: inserting
+		// "9223372036854775807" into a BIGINT column stores 9223372036854775807.
+		"BIGINT": "BIGINT",
+
+		// TIMESTAMP is epoch MILLISECONDS as an i64, so it maps to BIGINT and deliberately NOT to
+		// DuckDB's TIMESTAMP, even though TIMESTAMP is in the allowlist and is the tempting
+		// choice. Measured: inserting "1700000000123" into a DuckDB TIMESTAMP column fails with
+		// `Conversion Error: timestamp field value out of range`, because DuckDB reads that string
+		// as a datetime literal rather than a millisecond count. Mapping it there would break
+		// every timestamped feed at the first row.
+		"TIMESTAMP": "BIGINT",
+
+		// DECIMAL stays VARCHAR, and now says so on purpose. DuckDB's bare DECIMAL is
+		// DECIMAL(18,3); the feed's exact-decimal type has no digit cap at all. Measured:
+		// "123456789012345678901234567890.12345678901234567890" fails with
+		// `Could not convert string ... to DECIMAL(18,3)`. VARCHAR is the only destination that
+		// keeps the digits the type exists to preserve.
+		"DECIMAL": "VARCHAR",
+
 		// An unknown type must land somewhere storable rather than produce invalid DDL.
 		"SOMETHING": "VARCHAR",
 	}
@@ -40,10 +66,91 @@ func TestDuckTypeMapping(t *testing.T) {
 	}
 	// Every type this function can produce must be in the allowlist, or ensureDuckTable would refuse
 	// DDL that duckType itself generated. That is the kind of gap a rename opens silently.
-	for _, in := range []string{"INTEGER", "BOOLEAN", "FLOAT", "VARCHAR(32)", "TEXT", "SOMETHING"} {
+	for _, in := range []string{
+		"INTEGER", "BOOLEAN", "FLOAT", "VARCHAR(32)", "TEXT", "SOMETHING",
+		"BIGINT", "DECIMAL", "TIMESTAMP",
+	} {
 		if !duckTypes[duckType(in)] {
 			t.Errorf("duckType(%q) produced %q, which is not in duckTypes", in, duckType(in))
 		}
+	}
+}
+
+// **The wide types, end to end into a real DuckDB file.**
+//
+// `TestDuckTypeMapping` pins the string a type maps to. That is not the same claim as "a wide
+// value survives", because the mapping is only right if DuckDB actually accepts what the feed
+// sends into the column the mapping chose — the feed ships BIGINT, DECIMAL and TIMESTAMP as JSON
+// strings, so every one of these is a string going into a non-VARCHAR column.
+//
+// This drives the real sink and reads the values back, so a mapping that produces valid DDL and
+// then rejects every row cannot pass.
+func TestWideTypesLandExactlyInDuckDB(t *testing.T) {
+	s := newSink(t)
+	create := &Event{Table: "w", Op: "CREATE_TABLE", CommitLSN: 1, CommitEndLSN: 2, After: map[string]any{
+		"columns": []any{
+			map[string]any{"name": "id", "type": "INTEGER", "nullable": false},
+			map[string]any{"name": "big", "type": "BIGINT", "nullable": true},
+			map[string]any{"name": "ts", "type": "TIMESTAMP", "nullable": true},
+			map[string]any{"name": "dec", "type": "DECIMAL", "nullable": true},
+		},
+	}}
+	if err := s.apply(create); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The declared column types must be the ones the mapping chose, or the assertions below could
+	// pass against a table that stored everything as text.
+	for col, want := range map[string]string{"big": "BIGINT", "ts": "BIGINT", "dec": "VARCHAR"} {
+		var got string
+		err := s.db.QueryRow(
+			`SELECT data_type FROM duckdb_columns() WHERE table_name='w' AND column_name=?`, col,
+		).Scan(&got)
+		if err != nil {
+			t.Fatalf("read declared type of %s: %v", col, err)
+		}
+		if got != want {
+			t.Errorf("column %s was declared %s, want %s", col, got, want)
+		}
+	}
+
+	// Exactly as the feed sends them: JSON strings, at the extremes a double could not hold.
+	const bigMax = "9223372036854775807"
+	const decManyDigits = "123456789012345678901234567890.12345678901234567890"
+	const tsMillis = "1700000000123"
+	if err := s.apply(ins("w", 5, map[string]any{
+		"id": int64(1), "big": bigMax, "ts": tsMillis, "dec": decManyDigits,
+	})); err != nil {
+		t.Fatalf("a wide row was refused by the sink: %v", err)
+	}
+
+	// Read back as text so the comparison is on digits rather than on Go's rendering of them.
+	var big, ts, dec string
+	err := s.db.QueryRow(
+		`SELECT CAST(big AS VARCHAR), CAST(ts AS VARCHAR), CAST("dec" AS VARCHAR) FROM w WHERE id=1`,
+	).Scan(&big, &ts, &dec)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if big != bigMax {
+		t.Errorf("BIGINT landed as %s, want %s", big, bigMax)
+	}
+	if ts != tsMillis {
+		t.Errorf("TIMESTAMP landed as %s, want %s", ts, tsMillis)
+	}
+	if dec != decManyDigits {
+		t.Errorf("DECIMAL landed as %s, want %s", dec, decManyDigits)
+	}
+
+	// BIGINT must be a NUMBER in the destination, not digits in a string: the whole reason to map
+	// it onto a real 64-bit column is that ordering and arithmetic work. Under the old VARCHAR
+	// fallthrough this comparison sorted lexicographically and "9223372036854775807" < "99".
+	var above bool
+	if err := s.db.QueryRow(`SELECT big > 99 FROM w WHERE id=1`).Scan(&above); err != nil {
+		t.Fatalf("compare big numerically: %v", err)
+	}
+	if !above {
+		t.Errorf("i64::MAX did not compare greater than 99; the column is not ordering as a number")
 	}
 }
 
