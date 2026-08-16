@@ -32,9 +32,11 @@ use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
 };
+use crate::agent_sql::paged_rows::PagedRows;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
-use crate::branch::types::{BranchId, CommitHash, LeaseDeadline};
+use crate::branch::types::{BranchId, CommitHash, LeaseDeadline, PageId};
+use crate::cow::PageStore;
 use crate::branch::BranchCatalog;
 
 /// Root page the trunk branch starts at. The CoW store publishes a real root over this on the
@@ -193,6 +195,13 @@ pub trait BranchResolver {
 
 pub struct AgentRuntime {
     branches: Arc<dyn BranchCatalog>,
+    /// Rows on copy-on-write pages, when this runtime was built with a page store.
+    ///
+    /// `None` is the historical shape: rows live only in each `Workspace`'s map, which is enough
+    /// for the merge semantics but means exit criteria 1 and 8 — both claims about *data pages* —
+    /// have no pages to be about. `Some` puts a branch's rows behind its own root page, so
+    /// "forking copies zero pages" becomes a measurement rather than a component-level assertion.
+    storage: Option<PagedRows>,
     /// Where captured frames go. One frame per agent task, re-appended as the task grows, so a
     /// merge engine on the other side of this trait sees exactly what the SQL layer captured.
     log: Arc<dyn EffectLog>,
@@ -226,7 +235,106 @@ impl AgentRuntime {
 
     /// Build over any `BranchCatalog` and any `EffectLog`.
     pub fn with_parts(branches: Arc<dyn BranchCatalog>, log: Arc<dyn EffectLog>) -> Self {
-        AgentRuntime { branches, log, state: Mutex::new(State::default()) }
+        AgentRuntime { branches, log, storage: None, state: Mutex::new(State::default()) }
+    }
+
+    /// Build over a real page store, so branch rows live on copy-on-write pages.
+    ///
+    /// The trunk's root is created here rather than assumed: `TRUNK_ROOT_PAGE` is a placeholder
+    /// id for the map-backed runtime, not a B+tree page that exists on disk. Descending from it
+    /// would read whatever happens to occupy page 1.
+    pub fn with_storage(
+        branches: Arc<dyn BranchCatalog>,
+        log: Arc<dyn EffectLog>,
+        store: Arc<dyn PageStore>,
+    ) -> Result<Self, FerroError> {
+        let rows = PagedRows::new(store);
+        let epoch = branches.next_epoch();
+        let root = rows.create_root(BranchId::TRUNK, epoch)?;
+        branches.set_root(BranchId::TRUNK, root)?;
+        Ok(AgentRuntime {
+            branches,
+            log,
+            storage: Some(rows),
+            state: Mutex::new(State::default()),
+        })
+    }
+
+    /// The page-backed row store, if this runtime has one.
+    pub fn storage(&self) -> Option<&PagedRows> {
+        self.storage.as_ref()
+    }
+
+    fn rows(&self) -> Result<&PagedRows, FerroError> {
+        self.storage.as_ref().ok_or_else(|| {
+            FerroError::Bind(
+                "this runtime has no page store; build it with AgentRuntime::with_storage".into(),
+            )
+        })
+    }
+
+    /// The page a branch's rows currently hang off.
+    pub fn root_of(&self, branch: BranchId) -> Result<PageId, FerroError> {
+        Ok(self.branches.get(branch)?.root_page_id)
+    }
+
+    /// Write one row on `branch`.
+    ///
+    /// A copy-on-write update does not write in place, so the new root has to be recorded against
+    /// the branch or the write is unreachable and silently lost.
+    pub fn put_row(
+        &self,
+        branch: BranchId,
+        table: &str,
+        row_id: u64,
+        vals: &[Value],
+    ) -> Result<(), FerroError> {
+        let rows = self.rows()?;
+        let root = self.root_of(branch)?;
+        let epoch = self.branches.next_epoch();
+        let new_root = rows.put(root, branch, epoch, table_id(table).0, row_id, vals)?;
+        if new_root != root {
+            self.branches.set_root(branch, new_root)?;
+        }
+        Ok(())
+    }
+
+    /// Read one row as `branch` sees it. Never consults another branch.
+    pub fn get_row(
+        &self,
+        branch: BranchId,
+        table: &str,
+        row_id: u64,
+    ) -> Result<Option<Vec<Value>>, FerroError> {
+        let rows = self.rows()?;
+        rows.get(self.root_of(branch)?, table_id(table).0, row_id)
+    }
+
+    /// Delete one row on `branch`.
+    pub fn delete_row(
+        &self,
+        branch: BranchId,
+        table: &str,
+        row_id: u64,
+    ) -> Result<(), FerroError> {
+        let rows = self.rows()?;
+        let root = self.root_of(branch)?;
+        let epoch = self.branches.next_epoch();
+        let new_root = rows.delete(root, branch, epoch, table_id(table).0, row_id)?;
+        if new_root != root {
+            self.branches.set_root(branch, new_root)?;
+        }
+        Ok(())
+    }
+
+    /// Every row of `table` as `branch` sees it, in row order.
+    pub fn scan_rows(
+        &self,
+        branch: BranchId,
+        table: &str,
+    ) -> Result<Vec<(u64, Vec<Value>)>, FerroError> {
+        let rows = self.rows()?;
+        rows.scan_table(self.root_of(branch)?, table_id(table).0)
     }
 
     pub fn branches(&self) -> &Arc<dyn BranchCatalog> {
