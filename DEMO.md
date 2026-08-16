@@ -38,15 +38,20 @@ written into it. Read "What this does not do yet" before quoting any of them.
 - **Act I — the branch engine.** Real 4KB pages in a real file on disk. Criteria 1 and 8.
 - **Act II — the agent SQL surface.** Real scanner, parser, binder, executor. Criteria 2–7, 9, 10.
 
-**A row written by SQL in Act II does not live on a copy-on-write page from Act I.** The SQL
-surface keeps a branch's uncommitted rows in an in-memory per-branch workspace
-(`agent_sql::runtime::Workspace`). The copy-on-write page store, the arenas and the reaper are all
-real, all tested, and none of them are underneath the SQL layer yet.
+**A row written by a SQL *statement* in Act II does not live on a copy-on-write page from Act I.**
+`UPDATE` and `INSERT` stage into an in-memory per-branch workspace
+(`agent_sql::runtime::Workspace`), and that is still where a statement's uncommitted rows go.
 
-So Act I proves that forking copies zero pages and that abandoned branches give their pages back.
-It does **not** prove that the rows you see in Act II are the things on those pages. Any reading of
-"criterion 2 is MET" as "branch isolation is enforced by shadow paging" is wrong: in Act II it is
-enforced by a `BTreeMap` in memory.
+**This is no longer the whole story.** The runtime now has a page-backed row path:
+`AgentRuntime::with_storage` builds it over a real `PageStore`, and `put_row` / `get_row` /
+`scan_rows` put a branch's rows behind its own root page. Criteria 1 and 8 are measured through
+that path — on pages the runtime itself wrote — rather than against the branch engine alone. See
+`tests/integration_zero_copy_fork.rs`.
+
+What is still unwired is the *statement* path: `stage()` writes the workspace map, not the tree.
+So reading "criterion 2 is MET" as "branch isolation is enforced by shadow paging" remains wrong
+for Act II — the shadow-paging path now exists and is measured, but statements do not go through
+it yet.
 
 One genuine connection between the acts, worth stating because it is easy to assume the opposite:
 `AgentRuntime::begin_session` really does call `BranchCatalog::fork`, and the runtime's default
@@ -74,6 +79,12 @@ BEFORE FORK                          AFTER FORK
 The child's root page id **is** the parent's, and the demo then reads three keys spread across the
 tree through the child's root to show the data is reached by ordinary descent — not by a
 "not found here, ask my parent" overlay, which `DESIGN.md` rules out outright.
+
+The same claim is measured through the SQL runtime rather than the branch engine in
+`tests/integration_zero_copy_fork.rs`: the trunk is populated with `AgentRuntime::put_row`, and
+`begin_session` is checked to copy zero pages at 200, 400 and 1200 rows, with the forked branch
+then asserted to still read all 400 rows — a fork that copied nothing and saw nothing would pass
+a page count while failing the point.
 
 ### 8 — The thesis
 
@@ -178,11 +189,15 @@ Listed because each one bounds a verdict above.
 
 ### The layers are not wired together
 
-1. **SQL rows do not live on CoW pages.** Act II's isolation is a per-branch `BTreeMap` in memory,
-   not shadow paging. This is the largest gap in the system, and it is why criteria 1 and 8 had to
-   be demonstrated separately from 2–7.
-2. **`BEGIN AGENT SESSION` allocates no pages, but not because it is efficient** — the SQL layer
-   has no pages to allocate. Criterion 1's zero is measured in Act I, where it is meaningful.
+1. **SQL *statements* do not write CoW pages.** `stage()` still writes a per-branch `BTreeMap`, so
+   Act II's isolation is in-memory rather than shadow paging. This remains the largest gap in the
+   system. A page-backed row path exists alongside it (`AgentRuntime::with_storage` + `put_row`),
+   and criteria 1 and 8 are measured on it; what is missing is routing statements through it.
+2. **`BEGIN AGENT SESSION` allocates no pages.** This used to hold only because the SQL layer had
+   no pages to allocate, which made the zero uninteresting. That is no longer so: with
+   `with_storage` the trunk holds real pages written through the runtime, and the fork is measured
+   to copy zero of them at 200, 400 and 1200 rows — with the page counter proven to move while
+   populating, so the zero is a property of forking rather than of an idle counter.
 3. **The SQL surface's branch catalog and effect log are memory-backed by default** — but the two
    are memory-backed for different reasons, and the difference matters:
    - `AgentRuntime::new` uses `LogBranchCatalog::in_memory`. That *is* the durable branch-engine

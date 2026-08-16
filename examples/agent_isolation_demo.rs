@@ -121,8 +121,10 @@ impl Ledger {
         println!("\n  Read the 'What this does not do yet' section of DEMO.md before quoting any");
         println!("  of the above. Two boundaries in particular travel with these numbers, and a");
         println!("  reader who stops at the table above will not have them:");
-        println!("    · The two acts run on layers that are NOT wired to each other, which bounds");
-        println!("      what a MET in Act II can mean about pages.");
+        println!("    · SQL STATEMENTS still stage into an in-memory workspace, which bounds what");
+        println!("      a MET in Act II can mean about pages. A page-backed row path does now");
+        println!("      exist (AgentRuntime::with_storage), and criteria 1 and 8 are measured on");
+        println!("      it in tests/integration_zero_copy_fork.rs; statements do not use it yet.");
         println!("    · Criterion 7 holds for a guard naming the amount taken (`qty >= 12`).");
         println!("      Written as the invariant (`qty >= 0`) the same case is not refused and the");
         println!("      counter reaches -4 — measured above, not argued.");
@@ -1068,11 +1070,14 @@ fn main() -> ExitCode {
     print!("{}", banner);
     rule('=');
     println!(
-        "\nTwo acts, because the system is two layers that are NOT wired to each other:\n\
+        "\nTwo acts, because the SQL statement path and the page layer are not yet joined:\n\
          \n  ACT I  — branch engine. Real 4KB pages in a real file. Criteria 1 and 8.\n\
          ACT II — agent SQL surface. Real scanner/parser/binder/executor. Criteria 2-7, 9, 10.\n\
-         \nA row written by SQL in Act II does NOT live on a page from Act I. That seam is open,\n\
-         and DEMO.md documents exactly what it costs."
+         \nA row written by a SQL STATEMENT in Act II does NOT live on a page from Act I: it is\n\
+         staged in an in-memory workspace. The runtime does now have a page-backed row path\n\
+         (AgentRuntime::with_storage + put_row), and criteria 1 and 8 are measured through it in\n\
+         tests/integration_zero_copy_fork.rs — but statements do not route through it yet.\n\
+         That seam is what remains open, and DEMO.md documents exactly what it costs."
     );
 
     let mut led = Ledger::new();
