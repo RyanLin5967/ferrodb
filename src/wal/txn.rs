@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 use crate::catalog::column::DataType;
-use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
 ///
@@ -61,9 +61,84 @@ pub struct Snapshot {
     pub active: HashSet<u64>,
 }
 
+impl Snapshot {
+    /// Whether a transaction's work is **already reflected in this snapshot**.
+    ///
+    /// The same rule [`ReadView::visible`] applies to a row version, stated over transaction ids
+    /// instead. That restatement is what a change feed needs: an event carries the id of the
+    /// transaction that produced it, not a version header, and the only question a snapshot-to-
+    /// stream cutover has to answer is "did the snapshot already contain this transaction".
+    ///
+    /// Below the high water mark and not in flight means committed before the snapshot was taken,
+    /// so every row that transaction wrote is in the snapshot's rows. In flight, or numbered at or
+    /// above the high water mark, means it was not — and the stream owes the consumer those rows.
+    pub fn includes(&self, txn_id: u64) -> bool {
+        txn_id < self.high_water && !self.active.contains(&txn_id)
+    }
+
+    /// Whether a **change-feed event** attributed to `txn_id` was already delivered by this
+    /// snapshot, and therefore must not be delivered again by the stream.
+    ///
+    /// This differs from [`Snapshot::includes`] in exactly one case, and that case is the reason it
+    /// exists rather than callers being trusted to remember it. **Id 0 is not a transaction.** DDL
+    /// is logged under it and `begin` never hands it out, but the arithmetic in `includes` is about
+    /// timestamps and answers "yes, contained" for 0 — it is below every high water mark and in no
+    /// active set. A stream that asked `includes` would suppress every schema declaration and leave
+    /// a consumer without the shape of any table created after the cutover.
+    ///
+    /// The two questions are not the same question with a special case bolted on. `includes` asks
+    /// about a *version timestamp*, where 0 is a legitimate value meaning "not written by any
+    /// transaction this snapshot has to reason about", and MVCC visibility depends on it staying
+    /// that way. This asks about an *event's author*, where 0 means there is no author to compare.
+    /// Sharing the arithmetic is right; sharing the answer for 0 is not.
+    pub fn already_delivered(&self, txn_id: u64) -> bool {
+        txn_id != 0 && self.includes(txn_id)
+    }
+}
+
+/// A snapshot taken so a change-feed consumer can cut over to the live stream.
+///
+/// The two fields together are what makes the cutover exact, and neither is sufficient alone:
+///
+/// - `resume_lsn` is early enough that **no** excluded transaction's records sit below it, so
+///   nothing can be missed. It is not "the LSN when the scan started" — a transaction that was
+///   already in flight then has records *earlier* than that, and it is excluded from the snapshot,
+///   so a stream starting at the scan's LSN would see its `Commit` with none of its changes and
+///   drop them silently. So the resume point is pulled back to the oldest in-flight transaction's
+///   `Begin`.
+/// - `snapshot` says exactly which transactions the rows already cover, so the stream can drop
+///   their events instead of re-delivering them.
+///
+/// Resume position alone gives at-least-once; the transaction set is what removes the overlap.
+///
+/// **The pin is the third part, and it is here rather than left to the caller because leaving it to
+/// the caller did not work.** A recipe documented in `replication::snapshot` said to call this,
+/// read every table under the one reader, close it, and stream from `resume_lsn` — and omitted the
+/// pin. At the default checkpoint interval of 256 commits nothing truncates in between, so it
+/// passed; at `FERRODB_CHECKPOINT_INTERVAL=1` the very next commit truncates the log out from under
+/// the resume point and the stream is refused with *"cannot pin lsn 2597: the log has already been
+/// truncated to base 4260"*. Handing the claim back with the position it protects is the only shape
+/// in which a caller cannot forget it.
+#[derive(Debug)]
+pub struct SnapshotHandoff {
+    /// The reading transaction. Reads performed under it see exactly `snapshot`.
+    pub txn_id: u64,
+    /// The transactions whose work the read already contains.
+    pub snapshot: Snapshot,
+    /// Where a stream must resume. Durable by the time this is returned.
+    pub resume_lsn: u64,
+    /// A claim on the log at `resume_lsn`, held so a checkpoint cannot discard the records the
+    /// stream is about to ask for. Released when this handoff is dropped, so a caller that intends
+    /// to stream later must keep it alive until the subscription has taken its own.
+    pub pin: WalPin,
+}
+
 pub struct TxnEntry {
     pub status: TxnStatus,
     pub last_lsn: u64,
+    /// LSN of this transaction's `Begin` record — its earliest record, and therefore the earliest
+    /// point a reader would have to resume from in order to see everything it did.
+    pub begin_lsn: u64,
     pub snapshot: Option<Snapshot>,
 }
 
@@ -87,11 +162,171 @@ impl TxnManager {
 
     pub fn begin(&self) -> Result<u64, FerroError> {
         let mut att = self.att.lock().unwrap();
-        let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-        let lsn = self.wal.append(txn_id, 0, &RecKind::Begin)?;
-        let snapshot = Snapshot { high_water: txn_id, active: att.keys().copied().collect()};
-        att.insert(txn_id, TxnEntry { status: TxnStatus::Running, last_lsn: lsn, snapshot: Some(snapshot) });
+        Self::begin_locked(&self.next_txn_id, &self.wal, &mut att)
+    }
+
+    /// The body of `begin`, with the active-transaction table already locked.
+    ///
+    /// Factored out so [`TxnManager::begin_snapshot_read`] can observe the table in the *same*
+    /// critical section that allocates the id and writes the `Begin` — see the comment there for
+    /// why doing it in two steps would be a race rather than a tidiness question.
+    fn begin_locked(
+        next_txn_id: &AtomicU64,
+        wal: &WalManager,
+        att: &mut HashMap<u64, TxnEntry>,
+    ) -> Result<u64, FerroError> {
+        let txn_id = next_txn_id.fetch_add(1, Ordering::SeqCst);
+        let lsn = wal.append(txn_id, 0, &RecKind::Begin)?;
+        let snapshot = Snapshot { high_water: txn_id, active: att.keys().copied().collect() };
+        att.insert(
+            txn_id,
+            TxnEntry {
+                status: TxnStatus::Running,
+                last_lsn: lsn,
+                begin_lsn: lsn,
+                snapshot: Some(snapshot),
+            },
+        );
         Ok(txn_id)
+    }
+
+    /// Open a transaction to take a consistent snapshot from, and report where a stream must
+    /// resume so the two meet **with no gap and no overlap**.
+    ///
+    /// # Why the whole thing is one critical section
+    ///
+    /// Three facts have to be sampled together or the cutover is wrong:
+    ///
+    /// 1. which transactions are in flight (they are excluded from the snapshot, so the stream owes
+    ///    them),
+    /// 2. the high water mark (everything numbered above it is excluded too),
+    /// 3. the earliest `Begin` still in flight (the stream has to start at or before it, or the
+    ///    excluded transactions' changes sit below the resume point and are lost).
+    ///
+    /// Sampling them separately loses rows. Read the in-flight set, then have one of them commit,
+    /// then compute the earliest `Begin` from what is left: the resume point jumps forward past the
+    /// records of a transaction the snapshot does not contain, and its rows reach nobody. Every
+    /// transactional record in this engine is appended under this same lock, so holding it makes
+    /// all three consistent with each other and freezes the log while they are taken.
+    ///
+    /// The `Begin`s of transactions that start *after* this call are necessarily above
+    /// `resume_lsn`, for the same reason: they cannot be appended until this lock is released.
+    ///
+    /// The caller must finish with [`TxnManager::end_read_only`].
+    pub fn begin_snapshot_read(&self) -> Result<SnapshotHandoff, FerroError> {
+        let (txn_id, snapshot, resume_lsn) = {
+            let mut att = self.att.lock().unwrap();
+            let txn_id = Self::begin_locked(&self.next_txn_id, &self.wal, &mut att)?;
+            // Includes this reader's own `Begin`, which is the answer when nothing else is in
+            // flight: there is then nothing below it that the snapshot does not already contain.
+            let resume_lsn = att
+                .values()
+                .map(|e| e.begin_lsn)
+                .min()
+                .expect("the reader was just inserted, so the table cannot be empty");
+            let snapshot = att[&txn_id]
+                .snapshot
+                .clone()
+                .expect("begin_locked always records a snapshot");
+            (txn_id, snapshot, resume_lsn)
+        };
+
+        // **The reader is in `att` from here on, and the caller does not have its id yet.** So a
+        // `?` on either step below would leak it with nobody able to clean it up: `checkpoint`
+        // refuses while `att` is non-empty, which means every later CREATE TABLE, CREATE INDEX and
+        // CLI shutdown fails with "checkpoint with active txns" for the life of the process. One
+        // failed snapshot would take the database with it. Both steps therefore report through
+        // `abandon_reader` rather than through `?`.
+        let prepared = (|| {
+            // A resume point the log has not durably written is not a position anyone can resume
+            // from: a crash moves the frontier backwards underneath it and the consumer is left
+            // pointing into a range that will be rewritten by different records. `flush` drains
+            // everything buffered, and `resume_lsn` is at or below the reader's own `Begin`, so
+            // this covers it.
+            self.wal.flush()?;
+            // Claimed before this returns, so there is no moment at which the resume point is
+            // published and unclaimed. See `SnapshotHandoff::pin` for what leaving this to the
+            // caller cost.
+            self.wal.pin(resume_lsn)
+        })();
+
+        match prepared {
+            Ok(pin) => Ok(SnapshotHandoff { txn_id, snapshot, resume_lsn, pin }),
+            Err(e) => {
+                self.abandon_reader(txn_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drop a snapshot reader nobody can close, because nobody else knows it exists.
+    ///
+    /// **The entry must leave `att`, and that is not negotiable** — a checkpoint refuses while any
+    /// transaction is active, so an entry left behind here blocks every checkpoint for the life of
+    /// the process. It is therefore removed directly if the ordinary close cannot write its
+    /// `TxnEnd`, which is the likely case: the reason this is being called at all is usually that
+    /// the WAL just refused a write.
+    ///
+    /// Removing it without a `TxnEnd` record is safe, and specifically because this is a *reader*.
+    /// Recovery treats a transaction with no `Commit` or `TxnEnd` as a loser and aborts it
+    /// (`wal::recovery`), and an abort walks the undo chain back from its last record — for a
+    /// transaction whose `last_lsn` is still its `begin_lsn` there is nothing on that chain, so the
+    /// abort is a no-op. A reader that had written would not reach this path: `end_read_only`
+    /// refuses and rolls it back.
+    fn abandon_reader(&self, txn_id: u64) {
+        // The ordinary close first, so the common case still records its `TxnEnd` in the log.
+        let _ = self.end_read_only(txn_id);
+        self.att.lock().unwrap().remove(&txn_id);
+    }
+
+    /// Close a transaction that only read.
+    ///
+    /// Not `commit`, and not `abort`, and neither is a stylistic preference:
+    ///
+    /// - `commit` advances the checkpoint counter, and a checkpoint truncates the whole WAL. Ending
+    ///   a snapshot read that way could discard the very records the handoff LSN points at, turning
+    ///   a successful cutover into "cursor is below the log's base" on the consumer's first pump.
+    /// - `abort` would write an `Abort` record, telling every log reader that a transaction rolled
+    ///   back when nothing happened at all.
+    ///
+    /// A reader that turns out to have written is **refused and rolled back** rather than quietly
+    /// ended, because its writes would be invisible to its own snapshot and it is not a snapshot
+    /// reader at all.
+    pub fn end_read_only(&self, txn_id: u64) -> Result<(), FerroError> {
+        let wrote = {
+            let att = self.att.lock().unwrap();
+            let entry = att
+                .get(&txn_id)
+                .ok_or_else(|| FerroError::Txn(format!("txn {txn_id} is not active")))?;
+            entry.last_lsn != entry.begin_lsn
+        };
+        if wrote {
+            self.abort(txn_id)?;
+            return Err(FerroError::Txn(format!(
+                "transaction {txn_id} was opened to take a snapshot and then wrote to the \
+                 database; it has been rolled back"
+            )));
+        }
+        // **The entry leaves `att` whether or not the `TxnEnd` could be written.** Ordering these
+        // the other way round - append with `?`, then remove - returns an error to a caller who has
+        // already handed over responsibility for this transaction and now has nothing useful to do
+        // with it. Retrying calls back into a WAL that just failed; not retrying leaves the reader
+        // active for ever, and an active transaction blocks every checkpoint. The error is still
+        // reported; what changes is that reporting it no longer wedges the database. See
+        // `abandon_reader` for why a reader with no `TxnEnd` record is safe for recovery.
+        //
+        // **Latent, not live, and worth saying so rather than implying a fix for a live bug.**
+        // `append_chained` can fail two ways: the entry is missing from `att`, which cannot happen
+        // here because it was just checked and would mean no leak anyway; or `WalManager::append`
+        // returns `Err`, which it never does today - it extends an in-memory buffer and ends in
+        // `Ok(lsn)` unconditionally (`wal::log`). So this ordering cannot currently be observed to
+        // matter, and there is no test that forces it, because nothing can. It goes in because the
+        // day `append` does any IO - a bounded buffer that flushes when full, a direct write - the
+        // failure becomes reachable and its cost is the whole database, not one transaction.
+        let appended = self.append_chained(txn_id, &RecKind::TxnEnd);
+        self.att.lock().unwrap().remove(&txn_id);
+        appended?;
+        Ok(())
     }
 
     pub fn log_insert(&self, txn_id: u64, dir_root: u32, page_id: u32, slot: u16, tuple: &[u8]) -> Result<u64, FerroError> {
@@ -284,16 +519,19 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
 
 impl ReadView {
     pub fn visible(&self, h: &VersionHeader) -> bool {
-        let created = h.begin_ts == self.txn_id || (h.begin_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.begin_ts));
-        if !created {
+        if !self.is_commited_for_me(h.begin_ts) {
             return false;
         }
-        let ended = h.end_ts != 0 && (h.end_ts == self.txn_id || (h.end_ts < self.snapshot.high_water && !self.snapshot.active.contains(&h.end_ts)));
+        let ended = h.end_ts != 0 && self.is_commited_for_me(h.end_ts);
         !ended
     }
 
+    /// Stated once, and used by [`ReadView::visible`] and by
+    /// [`Snapshot::includes`] rather than spelled out again in either. A cutover that decides
+    /// "the snapshot already has this transaction" by a *different* rule than the one the snapshot
+    /// was read with is a duplicate or a hole, depending on which way the two drift.
     pub fn is_commited_for_me(&self, ts: u64) -> bool {
-        ts == self.txn_id || (ts < self.snapshot.high_water && !self.snapshot.active.contains(&ts))
+        ts == self.txn_id || self.snapshot.includes(ts)
     }
 }
 
@@ -525,6 +763,197 @@ use super::*;
         assert_eq!(snapshot.high_water, t2);
         assert!(snapshot.active.contains(&t1));
         assert!(!snapshot.active.contains(&t2));
+    }
+
+    /// **The resume point must reach back over a transaction that was already in flight.**
+    ///
+    /// Its records sit below the point the read was taken at, and its work is *not* in the
+    /// snapshot, so a stream told to start at the read would meet its `Commit` having never seen
+    /// its changes and drop them without a trace.
+    #[test]
+    fn a_snapshot_read_resumes_at_the_oldest_transaction_it_excluded() {
+        let (bp, wal, txn, _dir) = setup();
+
+        // Committed before anything else: in the snapshot, and behind the resume point.
+        let early = txn.begin().unwrap();
+        txn.commit(early).unwrap();
+
+        // Still open when the snapshot is taken: excluded from it, and its records are older than
+        // the read.
+        let open = txn.begin().unwrap();
+        let open_begin = txn.att.lock().unwrap()[&open].begin_lsn;
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), open);
+        heap.insert(Tuple::new(vec![1, 2, 3])).unwrap();
+
+        let handoff = txn.begin_snapshot_read().unwrap();
+
+        assert_eq!(
+            handoff.resume_lsn, open_begin,
+            "the resume point did not reach back to the open transaction's Begin, so its changes \
+             sit below where the stream would start"
+        );
+        assert!(
+            !handoff.snapshot.includes(open),
+            "an in-flight transaction was reported as already in the snapshot"
+        );
+        assert!(
+            handoff.snapshot.includes(early),
+            "a transaction that committed before the snapshot was not reported as in it"
+        );
+        assert!(
+            !handoff.snapshot.includes(handoff.txn_id + 1),
+            "a transaction that has not started yet was reported as already in the snapshot"
+        );
+        assert!(
+            wal.flushed_lsn.load(Ordering::SeqCst) >= handoff.resume_lsn,
+            "the resume point is not durable, so a crash would move the frontier back over it"
+        );
+
+        txn.end_read_only(handoff.txn_id).unwrap();
+        txn.abort(open).unwrap();
+    }
+
+    /// With nothing in flight there is nothing to reach back for, and the resume point is the
+    /// reader's own `Begin`. Without this, the test above would pass just as well against a resume
+    /// point that always ran to the start of the log.
+    #[test]
+    fn a_quiet_database_resumes_at_the_readers_own_begin() {
+        let (_bp, wal, txn, _dir) = setup();
+        let before = wal.next_lsn.load(Ordering::SeqCst);
+        let handoff = txn.begin_snapshot_read().unwrap();
+        assert_eq!(
+            handoff.resume_lsn, before,
+            "a quiet database resumed somewhere other than the reader's own Begin"
+        );
+        assert!(handoff.snapshot.active.is_empty());
+        txn.end_read_only(handoff.txn_id).unwrap();
+    }
+
+    /// A snapshot reader that writes is refused, and rolled back rather than left open. Its writes
+    /// would be invisible to its own snapshot, so the rows it wrote out would not be the state it
+    /// claims to describe.
+    #[test]
+    fn a_snapshot_reader_that_writes_is_refused_and_rolled_back() {
+        let (bp, _wal, txn, _dir) = setup();
+        let handoff = txn.begin_snapshot_read().unwrap();
+
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), handoff.txn_id);
+        heap.insert(Tuple::new(vec![7, 7])).unwrap();
+
+        let err = txn.end_read_only(handoff.txn_id).expect_err("a writing reader was accepted");
+        assert!(format!("{err}").contains("rolled back"), "wrong reason: {err}");
+        assert!(
+            !txn.att.lock().unwrap().contains_key(&handoff.txn_id),
+            "the refused reader was left open, which blocks every future checkpoint"
+        );
+        let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(rows.is_empty(), "the reader's write survived its rollback");
+    }
+
+    /// **A snapshot read that fails must not leave its reader behind.**
+    ///
+    /// This is the expensive one. The reader is inserted into `att` before anything that can fail,
+    /// and its id is not handed out until the call succeeds — so a failure after the insert leaves
+    /// an active transaction nobody can name, let alone close. `checkpoint` refuses while `att` is
+    /// non-empty, so the database never checkpoints again: every later CREATE TABLE, CREATE INDEX
+    /// and CLI shutdown fails with "checkpoint with active txns" for the life of the process. One
+    /// failed snapshot takes the whole database with it.
+    ///
+    /// Reaching the failure needs the log truncated out from under an open transaction, which
+    /// `checkpoint` will not do — defending `att` is precisely its job — so the WAL is told
+    /// directly. That is fault injection rather than a scenario, and it is the point: this path is
+    /// rare, and a rare path that wedges the process permanently is worth a deliberate test.
+    #[test]
+    fn a_snapshot_reader_is_not_leaked_when_its_handoff_cannot_be_pinned() {
+        let (_bp, wal, txn, _dir) = setup();
+
+        // Its `Begin` is what `begin_snapshot_read` will choose as the resume point, being the
+        // oldest still in flight.
+        let open = txn.begin().unwrap();
+
+        // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
+        // resume point must fail.
+        wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
+        assert!(
+            wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
+            "the log was not truncated past the open transaction, so this test proves nothing"
+        );
+
+        let err = txn.begin_snapshot_read().expect_err("a handoff below the log's base was given out");
+        assert!(format!("{err}").contains("truncated"), "wrong reason: {err}");
+
+        // The failed reader is gone; only the transaction this test opened is still active.
+        let live: Vec<u64> = txn.att.lock().unwrap().keys().copied().collect();
+        assert_eq!(
+            live,
+            vec![open],
+            "the failed snapshot left its reader in the active transaction table"
+        );
+
+        // And the consequence, asserted as a consequence rather than as internal state: with the
+        // reader leaked this refuses for ever. Committed rather than aborted only because an abort
+        // walks its undo chain, and this test just truncated that chain away.
+        txn.commit(open).unwrap();
+        txn.checkpoint()
+            .expect("a failed snapshot left a reader open, so checkpoints are blocked for good");
+    }
+
+    /// **Transaction id 0 is never handed out, and something now depends on that.**
+    ///
+    /// The change feed treats id 0 as "not attributed to a transaction" — DDL is logged under it —
+    /// and the snapshot-to-stream filter exempts those events, because a snapshot's transaction set
+    /// says nothing about a schema declaration. If `begin` ever returned 0, that exemption would
+    /// silently start applying to a real transaction's rows and re-deliver them after a cutover.
+    /// The invariant comes from the WAL header's initial `next_txn_id` of 1, which is a long way
+    /// from here, so it is asserted here rather than assumed.
+    #[test]
+    fn transaction_ids_never_start_at_zero() {
+        let (_bp, _wal, txn, _dir) = setup();
+        let first = txn.begin().unwrap();
+        assert_ne!(first, 0, "the first transaction was given the id the feed reserves for DDL");
+        txn.commit(first).unwrap();
+
+        let handoff = txn.begin_snapshot_read().unwrap();
+        assert_ne!(handoff.txn_id, 0);
+
+        // The raw rule genuinely does say "contained" for 0 — it is arithmetic over timestamps, and
+        // MVCC visibility needs it to keep saying that. The cutover asks a different question.
+        assert!(handoff.snapshot.includes(0));
+        assert!(
+            !handoff.snapshot.already_delivered(0),
+            "an event with no transaction author was treated as already delivered by the snapshot; \
+             a stream would suppress every schema declaration"
+        );
+        assert!(
+            handoff.snapshot.already_delivered(first),
+            "a transaction that committed before the snapshot was not treated as delivered by it"
+        );
+        txn.end_read_only(handoff.txn_id).unwrap();
+    }
+
+    /// **The high water mark is exclusive, and nothing in the matrix below pins that.**
+    ///
+    /// Every case there that sits exactly on the mark is also the view's own transaction, so it
+    /// passes through the `ts == txn_id` branch and an off-by-one in the comparison goes unseen.
+    /// A statement-level view has `txn_id` 0 and `high_water` set to the *next* id to be handed
+    /// out, so making the bound inclusive would show a reader the work of a transaction that had
+    /// not even begun, let alone committed.
+    #[test]
+    fn the_high_water_mark_is_exclusive() {
+        let snapshot = Snapshot { high_water: 10, active: HashSet::new() };
+        assert!(!snapshot.includes(10), "the transaction at the mark was reported as included");
+        assert!(snapshot.includes(9), "the transaction below the mark was reported as excluded");
+
+        // Through a view whose own id is not the mark, so the `ts == txn_id` branch cannot mask it.
+        let view = ReadView { snapshot, txn_id: 0 };
+        let h = |b, e| VersionHeader { begin_ts: b, end_ts: e, prev_page: 0, prev_slot: 0 };
+        assert!(
+            !view.visible(&h(10, 0)),
+            "a version written by the next transaction to begin was visible before it existed"
+        );
+        assert!(view.visible(&h(9, 0)));
     }
 
     #[test]

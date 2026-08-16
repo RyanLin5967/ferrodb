@@ -352,10 +352,26 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   record of a still-open transaction. Clamping it that way re-reads transactions that committed
   afterwards, which is why the delivered position exists to suppress them — read from the low-water
   mark, deliver past the high-water mark.
-- **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
-  the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
-  direction is deliberate: handing off after the scan silently loses concurrent changes, while
-  handing off before re-delivers a few — and duplication is recoverable where loss is not.
+- **Initial snapshot with a handoff, at-least-once.** A consumer joining a database that already has
+  rows reads the current contents as `READ` events, then streams from the LSN captured *before* the
+  scan. That direction is deliberate: handing off after the scan silently loses concurrent changes,
+  while handing off before re-delivers a few — and duplication is recoverable where loss is not.
+  This is `snapshot_table`, kept for callers holding only a WAL.
+- **…or exactly once, given a transaction manager.** `snapshot_table_exact` takes the read *inside a
+  transaction*, so it knows precisely which transactions its rows already contain, and hands back a
+  `SnapshotBoundary` the stream uses to skip exactly those
+  (`FeedStreamer::resuming_after_snapshot`, paired with `Subscription::following` so the resume
+  cursor comes from the boundary rather than from the caller). Every row then appears **exactly
+  once** across the two feeds. Skipping by LSN cannot do this: the resume point has to reach back
+  over any transaction that was already in flight — MVCC excludes its uncommitted work from the
+  snapshot, and its records sit *below* the scan — and reaching back drags in commits the snapshot
+  did contain. Those two sets interleave in the log, so no byte offset separates them; only the
+  transaction id does. The boundary carries the *table set* as well, because a transaction id alone
+  answers *when* and not *what*: a snapshot of `orders` says nothing about `shipments`, and a
+  transaction-only filter would drop `shipments` rows that were in no snapshot at all.
+  `tests/integration_cdc_cutover.rs` asserts exactly-once over a scenario holding one transaction
+  open across the cutover, and its companion test asserts that `snapshot_table` both duplicates and
+  drops on that same scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
 
