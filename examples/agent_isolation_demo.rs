@@ -126,10 +126,13 @@ impl Ledger {
         println!("\n  Read the 'What this does not do yet' section of DEMO.md before quoting any");
         println!("  of the above. Two boundaries in particular travel with these numbers, and a");
         println!("  reader who stops at the table above will not have them:");
-        println!("    · SQL STATEMENTS still stage into an in-memory workspace, which bounds what");
-        println!("      a MET in Act II can mean about pages. A page-backed row path does now");
-        println!("      exist (AgentRuntime::with_storage), and criteria 1 and 8 are measured on");
-        println!("      it in tests/integration_zero_copy_fork.rs; statements do not use it yet.");
+        println!("    · THIS BINARY is map-backed, so a MET in Act II is not a statement about");
+        println!("      pages. The statement path itself is not the limit: with a storage-backed");
+        println!("      runtime, stage() mirrors staged rows onto the branch's CoW tree, and");
+        println!("      tests/integration_branch_pages.rs proves it through the real executor in 9");
+        println!("      tests. What is unjoined is that nothing in src/ builds such a runtime —");
+        println!("      Session::with_runtime has no caller — and with_storage has no reattach");
+        println!("      path, so it cannot simply be switched on for an existing database.");
         println!("    · Criterion 7 holds for a guard naming the amount taken (`qty >= 12`).");
         println!("      Written as the invariant (`qty >= 0`) the same case is not refused and the");
         println!("      counter reaches -4 — measured above, not argued.");
@@ -1151,16 +1154,33 @@ fn main() -> ExitCode {
     rule('=');
     print!("{}", banner);
     rule('=');
-    println!(
-        "\nTwo acts, because the SQL statement path and the page layer are not yet joined:\n\
-         \n  ACT I  — branch engine. Real 4KB pages in a real file. Criteria 1 and 8.\n\
-         ACT II — agent SQL surface. Real scanner/parser/binder/executor. Criteria 2-7, 9, 10.\n\
-         \nA row written by a SQL STATEMENT in Act II does NOT live on a page from Act I: it is\n\
-         staged in an in-memory workspace. The runtime does now have a page-backed row path\n\
-         (AgentRuntime::with_storage + put_row), and criteria 1 and 8 are measured through it in\n\
-         tests/integration_zero_copy_fork.rs — but statements do not route through it yet.\n\
-         That seam is what remains open, and DEMO.md documents exactly what it costs."
-    );
+    println!("");
+    println!("Two acts, because THIS BINARY runs a map-backed runtime:");
+    println!("");
+    println!("  ACT I  - branch engine. Real 4KB pages in a real file. Criteria 1 and 8.");
+    println!("  ACT II - agent SQL surface. Real scanner/parser/binder/executor. Criteria 2-7, 9, 10.");
+    println!("");
+    println!("A row written by a SQL STATEMENT in this demo does NOT live on a page: it is staged");
+    println!("in an in-memory workspace, because this demo builds AgentRuntime::new().");
+    println!("");
+    println!("That is a property of THIS BINARY, not of the statement path. Given a storage-backed");
+    println!("runtime, statements DO write copy-on-write pages: stage() mirrors every staged row");
+    println!("onto the branch's own tree, and tests/integration_branch_pages.rs drives that through");
+    println!("the real scanner, parser, binder and executor in 9 tests - `UPDATE inventory SET");
+    println!("qty = 42 WHERE id = 1;` lands on pages there.");
+    println!("");
+    println!("What is genuinely unjoined is narrower, and worth stating exactly:");
+    println!("");
+    println!("  - Nothing in src/ constructs a storage-backed runtime. Session::new() sets");
+    println!("    storage: None, and Session::with_runtime - the injection point - has no caller");
+    println!("    in src/, so the CLI and the pgwire server are map-backed too.");
+    println!("  - with_storage mints a fresh trunk root (create_root + set_root, unconditionally)");
+    println!("    and has no reattach path, so it is not a flag to flip on a database that already");
+    println!("    holds data.");
+    println!("  - Reads are still served from the heap plus the workspace overlay; the branch tree");
+    println!("    holds the staged DELTA, not the base table.");
+    println!("");
+    println!("DEMO.md documents what that costs.");
 
     let mut led = Ledger::new();
 

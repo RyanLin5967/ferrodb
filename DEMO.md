@@ -42,14 +42,27 @@ written into it. Read "What this does not do yet" before quoting any of them.
 `UPDATE` and `INSERT` stage into an in-memory per-branch workspace
 (`agent_sql::runtime::Workspace`), and that is still where a statement's uncommitted rows go.
 
-**This is no longer the whole story.** The runtime now has a page-backed row path:
-`AgentRuntime::with_storage` builds it over a real `PageStore`, and `put_row` / `get_row` /
-`scan_rows` put a branch's rows behind its own root page. Criteria 1 and 8 are measured through
-that path — on pages the runtime itself wrote — rather than against the branch engine alone. See
-`tests/integration_zero_copy_fork.rs`.
+**This is no longer the whole story, and the correction runs in both directions.**
 
-What is still unwired is the *statement* path: `stage()` writes the workspace map, not the tree.
-So reading "criterion 2 is MET" as "branch isolation is enforced by shadow paging" remains wrong
+The runtime has a page-backed row path: `AgentRuntime::with_storage` builds it over a real
+`PageStore`, and `put_row` / `get_row` / `scan_rows` put a branch's rows behind its own root page.
+`tests/integration_zero_copy_fork.rs` measures criteria 1 and 8 through it — on pages the runtime
+itself wrote. **This demo does not.** Criteria 1 and 8 as printed here are measured against the
+branch engine directly: `criterion_1_fork_copies_zero_pages` builds its own `ArenaPageStore` and
+calls `BranchCatalog::fork`, with no `AgentRuntime`, no `Session`, and no SQL statement executed.
+The `sql>` line printed inside criterion 1 is an echo, not an executed statement.
+
+**And the statement path is not the thing that is unwired.** `stage()` mirrors every staged row
+onto the branch's CoW tree whenever the runtime has a page store
+(`src/agent_sql/runtime.rs:967-978`), and `tests/integration_branch_pages.rs` drives exactly that
+through the real scanner, parser, binder and executor in 9 tests. What is unwired is narrower:
+nothing in `src/` builds a storage-backed runtime — `Session::new()` sets `storage: None` and
+`Session::with_runtime` has no caller — so the CLI, the pgwire server and this demo are all
+map-backed. `with_storage` also mints a fresh trunk root with no reattach path, so it is not a
+switch that can be flipped on a database holding data.
+
+Reading "criterion 2 is MET" as "branch isolation is enforced by shadow paging" is therefore still
+wrong *for this demo*
 for Act II — the shadow-paging path now exists and is measured, but statements do not go through
 it yet.
 
@@ -210,17 +223,23 @@ Listed because each one bounds a verdict above.
 
 ### Criterion 8's mechanism is proven; its scheduling does not exist
 
-4. **There is no background thread anywhere in `src/`.** `grep -rn 'thread::spawn' src/` returns
-   nothing. `Reaper::reap_expired(now_millis)` is a method that something must call, and outside
-   tests and this demo, nothing calls it. The non-cooperative *mechanism* is real and proven — the
+4. **No background thread runs in a shipped ferrodb process.** `grep -rn 'thread::spawn' src/`
+   returns two matches, both inside a `#[cfg(test)]` module in `src/replication/sync.rs`, so they
+   do not exist in a release build — this document previously said the grep returned nothing, which
+   stopped being true when synchronous commit gained its tests. `Reaper::reap_expired(now_millis)`
+   is a method that something must call, and outside tests and this demo, nothing calls it. The non-cooperative *mechanism* is real and proven — the
    demo drives it exactly as a scheduler would — but no scheduler is shipped.
 5. **The demo supplies the clock reading.** `reap_expired` takes `now_millis` explicitly, so the
    demo passes `now + 100s` rather than sleeping through a 10-second lease. The deadlines are real
    and really compared; only the clock reading is injected. This is the reaper's own design, not a
    demo shortcut, but it does mean the demo does not prove wall-clock expiry.
-6. **An abandoned SQL session never frees pages.** `AgentRuntime::abandon` marks the branch reaped
-   through the `BranchCatalog` trait only; it does not invoke `TwoTierReaper`. Since Act II holds no
-   pages, there is nothing to free — but the two halves of abandonment are not connected either.
+6. **An abandoned SQL session never frees pages, and on the page-backed path that now leaks.**
+   `AgentRuntime::abandon` marks the branch reaped through the `BranchCatalog` trait only; it does
+   not invoke `TwoTierReaper`. On the map-backed runtime this demo uses there is nothing to free.
+   On a `with_storage` runtime there is: staging allocates real arena pages, and nothing in `src/`
+   calls `reap_expired`, so those pages stay allocated until some caller outside `src/` reaps them.
+   This document used to say "since Act II holds no pages, there is nothing to free", which is true
+   of this binary and not of the path the tests exercise.
 
 ### Criterion 9 was PARTIAL; what closed it, and what still bounds it
 

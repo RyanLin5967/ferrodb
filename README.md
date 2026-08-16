@@ -208,8 +208,11 @@ criterion makes its verdict change.
   if any self-check fails
 - the thesis criterion is observed firing: 32 branches take a lease, write novel pages, and are
   **never closed** — no `close`, `commit`, `abort` or `ABANDON`. The lease scan reaps them and the
-  allocated page count returns to baseline, with a healthy long-lease branch in the baseline so
-  over-reaping fails the same check.
+  allocated page count returns to baseline. The control is **temporal**: the identical scan run
+  *before* the leases expire reaps 0, which is what shows the reaper frees on expiry rather than
+  freeing whatever it is pointed at. (This bullet previously claimed a healthy long-lease branch
+  sat in the baseline as the control. There is none — the only survivor is trunk, and trunk is
+  excluded by an `is_trunk()` filter rather than by its lease, so it never tested what was claimed.)
 
 Measured rather than asserted:
 
@@ -227,10 +230,16 @@ cannot respond would prove nothing. Raw output is committed at `bench/branch_sca
 
 Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 
-- **SQL statements do not write CoW pages.** `UPDATE`/`INSERT` inside an agent session stage into an
-  in-memory workspace. A page-backed row path exists (`AgentRuntime::with_storage`) and criteria 1
-  and 8 are measured on it, but reading "criterion 2 is MET" as "isolation enforced by shadow
-  paging" is still wrong for the SQL surface. This is the largest remaining gap.
+- **The shipped binaries are map-backed, though the statement path is not the reason.** `UPDATE` /
+  `INSERT` inside an agent session stage into an in-memory workspace *in the CLI, the pgwire server
+  and the demo*, because all three build `Session::new()`, which sets `storage: None`. Given a
+  storage-backed runtime the statement path does write copy-on-write pages — `stage()` mirrors each
+  staged row onto the branch's tree, and `tests/integration_branch_pages.rs` drives that through the
+  real scanner, parser, binder and executor in 9 tests. The gap is that nothing in `src/` constructs
+  such a runtime (`Session::with_runtime` has no caller), and `with_storage` mints a fresh trunk
+  root with no reattach path, so it cannot simply be switched on for a database that already holds
+  data. Reads are also still served from the heap plus the workspace overlay, and a branch's tree
+  holds its staged delta rather than the base table. This is the largest remaining gap.
 - **A guard must name the amount taken.** `qty >= 12` is refused correctly; written as the invariant
   `qty >= 0`, two agents each taking 12 from 20 both merge and the counter reaches **−4**. Guards are
   preconditions evaluated *before* the composed ops apply, so a precondition cannot see a post-op
