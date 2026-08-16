@@ -15,8 +15,9 @@ use std::sync::Arc;
 use ferrodb::agent_sql::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::types::BranchId;
-use ferrodb::branch::BranchCatalog;
+use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::Value;
 use ferrodb::cow::PageStore;
@@ -26,7 +27,7 @@ use ferrodb::tel::MemEffectLog;
 /// Above anything the ordinary heap/index allocator will want; the partition is deliberate.
 const ARENA_BASE: u32 = 1024;
 
-fn runtime(tag: &str) -> (tempfile::TempDir, Arc<ArenaPageStore>, AgentRuntime) {
+fn runtime(tag: &str) -> (tempfile::TempDir, Arc<LogBranchCatalog>, Arc<ArenaPageStore>, AgentRuntime) {
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -40,12 +41,12 @@ fn runtime(tag: &str) -> (tempfile::TempDir, Arc<ArenaPageStore>, AgentRuntime) 
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
     let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
     let rt = AgentRuntime::with_storage(
-        catalog,
+        Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
         Arc::new(MemEffectLog::new()),
         Arc::clone(&store) as Arc<dyn PageStore>,
     )
     .unwrap();
-    (dir, store, rt)
+    (dir, catalog, store, rt)
 }
 
 /// Fill the trunk with enough rows to occupy several pages, so a fork has something to copy.
@@ -63,7 +64,7 @@ fn populate(rt: &AgentRuntime, rows: u64) {
 
 #[test]
 fn beginning_an_agent_session_copies_zero_data_pages() {
-    let (_d, store, rt) = runtime("zerocopy");
+    let (_d, _cat, store, rt) = runtime("zerocopy");
     let empty = store.live_page_count().unwrap();
     populate(&rt, 400);
 
@@ -110,7 +111,7 @@ fn the_fork_stays_zero_copy_as_the_trunk_grows() {
     // fit on a single page, so "the fork copied zero" would have been a fact about the row count
     // rather than about forking. The guard caught that on its first run.
     for rows in [200u64, 400, 1200] {
-        let (_d, store, rt) = runtime(&format!("scale{rows}"));
+        let (_d, _cat, store, rt) = runtime(&format!("scale{rows}"));
         populate(&rt, rows);
         let before = store.live_page_count().unwrap();
         assert!(before > 1, "{rows} rows occupied {before} page(s); measurement would be vacuous");
@@ -125,7 +126,7 @@ fn the_fork_stays_zero_copy_as_the_trunk_grows() {
 
 #[test]
 fn a_write_on_the_branch_is_invisible_to_the_trunk_and_to_a_sibling() {
-    let (_d, _store, rt) = runtime("isolation");
+    let (_d, _cat, _store, rt) = runtime("isolation");
     populate(&rt, 100);
 
     let a = rt.begin_session("agent-a", Some("r_a"), BranchId::TRUNK).unwrap();
@@ -156,7 +157,7 @@ fn a_write_on_the_branch_is_invisible_to_the_trunk_and_to_a_sibling() {
 fn a_branch_write_costs_pages_only_on_the_path_it_touches() {
     // The other half of copy-on-write: writing does allocate, but proportional to the path
     // copied, not to the branch. If this were a full copy the delta would track the trunk size.
-    let (_d, store, rt) = runtime("cowcost");
+    let (_d, _cat, store, rt) = runtime("cowcost");
     populate(&rt, 800);
     let trunk_pages = store.live_page_count().unwrap();
 
@@ -182,4 +183,49 @@ fn a_runtime_without_a_page_store_refuses_row_calls_instead_of_pretending() {
     let e = rt.put_row(BranchId::TRUNK, "inventory", 1, &[Value::Integer(1)]).unwrap_err();
     assert!(format!("{e}").contains("no page store"), "got {e}");
     assert!(rt.storage().is_none());
+}
+
+/// Exit criterion 8, end to end: an agent that simply walks away costs nothing permanently.
+///
+/// This is the non-cooperative half of the design — the branch is never abandoned explicitly, no
+/// client calls anything, the lease just expires and the reaper takes the pages back. Measured on
+/// pages the SQL runtime actually wrote, rather than on pages a test allocated by hand.
+#[test]
+fn an_abandoned_agent_session_returns_its_pages_with_no_client_cooperation() {
+    let (_d, catalog, store, rt) = runtime("reclaim");
+    populate(&rt, 400);
+    let baseline = store.live_page_count().unwrap();
+    assert!(baseline > 1, "trunk occupies {baseline} page(s); the measurement would be vacuous");
+
+    let session = rt.begin_session("runaway-agent", Some("r_x"), BranchId::TRUNK).unwrap();
+    for r in 0..200u64 {
+        rt.put_row(session.branch, "inventory", r, &[Value::Integer(-(r as i32)), Value::Varchar("dirty".into())])
+            .unwrap();
+    }
+    let with_branch = store.live_page_count().unwrap();
+    assert!(
+        with_branch > baseline,
+        "the branch wrote 200 rows but allocated no pages ({baseline} -> {with_branch}); there \
+         would be nothing for the reaper to reclaim and the test would prove nothing"
+    );
+
+    // No abandon(), no cooperation of any kind. The lease simply runs out.
+    let reaper = TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store));
+    let reaped = reaper.reap_expired(u64::MAX).unwrap();
+    assert!(reaped.contains(&session.branch), "the expired session was not reaped: {reaped:?}");
+    reaper.drain_pending().ok();
+
+    assert_eq!(
+        store.live_page_count().unwrap(),
+        baseline,
+        "pages did not return to the pre-session baseline after reaping an abandoned agent"
+    );
+
+    // Reclamation must not have taken the trunk's pages with it.
+    assert_eq!(rt.scan_rows(BranchId::TRUNK, "inventory").unwrap().len(), 400);
+    assert_eq!(
+        rt.get_row(BranchId::TRUNK, "inventory", 7).unwrap(),
+        Some(vec![Value::Integer(7), Value::Varchar("widget-7".into())]),
+        "the trunk's own rows must survive a sibling branch being reclaimed"
+    );
 }
