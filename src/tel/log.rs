@@ -2,11 +2,22 @@
 //!
 //! Design authority: DESIGN.md section 3 ("Log format").
 //!
-//! The log is append-only and keyed by `(branch, txn_id)`. Appending the *same* transaction twice
-//! is a retry, not a second transaction, so the second append is a no-op — `OpKind::Add` is not
-//! idempotent and a log that stores a replayed frame twice has already lost. Appending a
-//! *different* frame under an id that is already present is a hard error rather than a silent
-//! overwrite: one of the two is a bug, and picking a winner would hide it.
+//! The log is keyed by `(branch, txn_id)`, and a second append under a key that is already
+//! present is one of exactly three things. Telling them apart is the whole contract:
+//!
+//! - **A retry** — the identical frame arrives again. Stored once. `OpKind::Add` is not
+//!   idempotent, so a log that keeps a replayed frame twice has already lost.
+//! - **Growth** — the stored frame is a *prefix* of the new one. An agent task accumulates ops
+//!   across several statements under one `TxnId` and re-appends the open frame after each
+//!   (`agent_sql::AgentRuntime::stage` does exactly this), so the frame legitimately grows.
+//!   Accepted, replacing the stored frame with the longer one.
+//! - **A contradiction** — anything else: ops that differ, ops that were dropped, a changed base
+//!   or seq. That is two different transactions wearing one id. Hard error, never a silent
+//!   overwrite; one of the two is a bug and picking a winner would hide it.
+//!
+//! Growth is defined as extension rather than "contents differ, take the newer" precisely so the
+//! third case stays detectable. A truncating or rewriting append is not an extension and still
+//! fails, which is what keeps this from degrading into last-writer-wins.
 //!
 //! Merge de-duplicates by `TxnId` again anyway ([`crate::tel::engine::dedup_by_txn`]) because
 //! frames also arrive from elsewhere — a frame already merged once can reach a later merge from
@@ -56,22 +67,48 @@ impl MemEffectLog {
     }
 }
 
+/// Whether `new` is the same open frame as `old`, grown.
+///
+/// Everything identifying the transaction must match exactly, and every op, guard and claim
+/// already stored must still be present, in the same order, at the same position. A frame that
+/// reorders, rewrites or drops what was logged is not the same transaction continuing — it is a
+/// different one reusing the id, and the caller needs to hear about it.
+fn extends(old: &TxnFrame, new: &TxnFrame) -> bool {
+    fn prefix<T: PartialEq>(old: &[T], new: &[T]) -> bool {
+        old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| a == b)
+    }
+    old.base == new.base
+        && old.seq == new.seq
+        && old.schema_ver == new.schema_ver
+        && prefix(&old.ops, &new.ops)
+        && prefix(&old.guards, &new.guards)
+        && prefix(&old.claims, &new.claims)
+}
+
 impl EffectLog for MemEffectLog {
     fn append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
         let mut frames = self.frames.lock().expect("effect log mutex poisoned");
-        if let Some(existing) =
-            frames.iter().find(|f| f.branch == frame.branch && f.txn_id == frame.txn_id)
+        if let Some(i) = frames
+            .iter()
+            .position(|f| f.branch == frame.branch && f.txn_id == frame.txn_id)
         {
+            let existing = &frames[i];
             if existing == frame {
                 // A retry delivering the identical frame. Storing it again would double every
                 // Add it carries.
                 return Ok(());
             }
-            return Err(FerroError::Merge(format!(
-                "{} on branch {} was already logged with different contents; refusing to \
-                 overwrite it",
-                frame.txn_id, frame.branch
-            )));
+            if !extends(existing, frame) {
+                return Err(FerroError::Merge(format!(
+                    "{} on branch {} was already logged with contents that the new frame does \
+                     not extend; refusing to overwrite it",
+                    frame.txn_id, frame.branch
+                )));
+            }
+            // The open frame grew. Replace it with the longer one rather than storing a second
+            // copy, which would double-count every Add the shorter one already carried.
+            frames[i] = frame.clone();
+            return Ok(());
         }
         frames.push(frame.clone());
         Ok(())

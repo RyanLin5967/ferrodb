@@ -27,7 +27,7 @@ pub mod session;
 
 pub use changeset::{ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome};
 pub use dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
-pub use mem_catalog::{MemBranchCatalog, MemEffectLog};
+pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use runtime::{AgentRuntime, BranchResolver, ExecCtx};
 pub use session::AgentSession;

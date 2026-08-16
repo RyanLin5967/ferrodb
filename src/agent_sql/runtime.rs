@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 use crate::agent_sql::changeset::{
     ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome,
 };
-use crate::agent_sql::mem_catalog::{MemBranchCatalog, MemEffectLog};
+use crate::agent_sql::mem_catalog::MemBranchCatalog;
+use crate::tel::MemEffectLog;
 use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,

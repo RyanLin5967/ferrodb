@@ -21,8 +21,6 @@ use crate::branch::record::BranchRecord;
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
-use crate::tel::frame::TxnFrame;
-use crate::tel::EffectLog;
 
 pub struct MemBranchCatalog {
     epoch: AtomicU64,
@@ -149,71 +147,9 @@ impl BranchCatalog for MemBranchCatalog {
     }
 }
 
-/// An in-memory [`EffectLog`]: frames appended by the SQL layer, read back by merge.
-///
-/// Durability is the WAL's job and is not modelled here. What *is* modelled, because merge
-/// depends on it, is that frames come back in sequence order per branch.
-#[derive(Default)]
-pub struct MemEffectLog {
-    frames: Mutex<Vec<TxnFrame>>,
-}
-
-impl MemEffectLog {
-    pub fn new() -> Self {
-        MemEffectLog::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.frames.lock().unwrap().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl EffectLog for MemEffectLog {
-    fn append(&self, frame: &TxnFrame) -> Result<(), FerroError> {
-        let mut frames = self.frames.lock().unwrap();
-        // Replacing a frame with the same (branch, txn) is an update of the open frame, not a
-        // second copy: Add is not idempotent and two copies would double-count.
-        match frames
-            .iter()
-            .position(|f| f.branch == frame.branch && f.txn_id == frame.txn_id)
-        {
-            Some(i) => frames[i] = frame.clone(),
-            None => frames.push(frame.clone()),
-        }
-        Ok(())
-    }
-
-    fn frames_for(&self, branch: BranchId, from_seq: u64) -> Result<Vec<TxnFrame>, FerroError> {
-        let frames = self.frames.lock().unwrap();
-        let mut out: Vec<TxnFrame> = frames
-            .iter()
-            .filter(|f| f.branch == branch && f.seq >= from_seq)
-            .cloned()
-            .collect();
-        out.sort_by_key(|f| f.seq);
-        Ok(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tel::ids::TxnId;
-
-    #[test]
-    fn a_reappended_frame_replaces_rather_than_duplicates() {
-        let log = MemEffectLog::new();
-        let branch = BranchId::new(3, 0);
-        let mut f = TxnFrame::new(TxnId(1), branch, crate::branch::types::CommitHash::ZERO, 0, 1);
-        log.append(&f).unwrap();
-        f.seq = 0;
-        log.append(&f).unwrap();
-        assert_eq!(log.frames_for(branch, 0).unwrap().len(), 1);
-    }
 
     #[test]
     fn fork_records_the_child_in_the_parent_and_shares_the_root() {
