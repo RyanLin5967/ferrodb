@@ -34,8 +34,27 @@ func TestSQLTypeMapping(t *testing.T) {
 		"FLOAT":       "REAL",
 		"VARCHAR(32)": "TEXT",
 		"VARCHAR(1)":  "TEXT",
+
+		// The wide types. These were reaching the `default` arm and being stored as TEXT by
+		// accident rather than by decision — the feed's schema event has named them for a while,
+		// but `ColumnSpec`'s doc still described the contract as the four types above, and this
+		// consumer was written against that list.
+		//
+		// TEXT is not a harmless place to land a BIGINT. SQLite compares TEXT lexicographically,
+		// so `WHERE big > 5` would put "10" below "5", and the doc's promise that "a consumer
+		// recreating the column gets the same one" would be false in the way that costs a query
+		// its answer. SQLite's INTEGER is 8 bytes, so it holds every i64 exactly, and INTEGER
+		// affinity converts the feed's digit-string losslessly on the way in.
+		"BIGINT": "INTEGER",
+		// Epoch milliseconds, an i64 like any other.
+		"TIMESTAMP": "INTEGER",
+		// DECIMAL must stay TEXT, and for the opposite reason: it is the one type with no bound on
+		// its digits, so REAL would round it and INTEGER would refuse its fraction. Text is what
+		// preserves `123456789012345678901234567890.12345678901234567890` intact.
+		"DECIMAL": "TEXT",
+
 		// An unknown type must land somewhere storable rather than produce invalid DDL.
-		"SOMETHING":   "TEXT",
+		"SOMETHING": "TEXT",
 	}
 	for in, want := range cases {
 		if got := sqlType(in); got != want {

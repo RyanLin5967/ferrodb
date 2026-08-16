@@ -67,15 +67,28 @@ func openSink(path, key string) (*Sink, error) {
 }
 
 // sqlType maps a feed type onto a SQLite storage class.
+//
+// Every type the feed can name is handled explicitly, because the `default` is a fallback for
+// types this consumer has never heard of and not a place to quietly park ones it has. BIGINT and
+// TIMESTAMP were reaching it and being stored as TEXT, which SQLite compares lexicographically —
+// `WHERE big > 5` would sort "10" below "5". SQLite's INTEGER is 8 bytes and holds every i64
+// exactly, and INTEGER affinity converts the feed's digit-string losslessly on the way in.
+//
+// DECIMAL deliberately stays TEXT: it is the one type with no bound on its digits, so REAL would
+// round it and INTEGER would refuse its fraction.
 func sqlType(t string) string {
 	switch {
-	case t == "INTEGER" || t == "BOOLEAN":
+	case t == "INTEGER" || t == "BOOLEAN" || t == "BIGINT" || t == "TIMESTAMP":
 		return "INTEGER"
 	case t == "FLOAT":
 		return "REAL"
+	case t == "DECIMAL":
+		return "TEXT"
 	case strings.HasPrefix(t, "VARCHAR"):
 		return "TEXT"
 	default:
+		// A type added to the feed that nothing here knows. TEXT stores the bytes unchanged, which
+		// is the only choice that cannot corrupt a value it does not understand.
 		return "TEXT"
 	}
 }

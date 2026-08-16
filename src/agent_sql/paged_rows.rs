@@ -96,9 +96,13 @@ fn value_span(bytes: &[u8]) -> Result<usize, FerroError> {
         // wide types were added there, this function was not updated, and the result was worse
         // than a decode error: `encode_row` succeeded, so the write landed, and every later
         // `decode_row` of that row failed with "unknown value tag" — a BIGINT/DECIMAL/TIMESTAMP
-        // cell was write-only on a page-backed agent branch, which `AgentRuntime::page_row_changes`
+        // cell was write-only on a page-backed agent branch, which `AgentRuntime::page_changeset`
         // hits for the before and after image of every changed row. A tag this function does not
         // know is not a cell it can skip, so there is no safe fallback: it has to be exhaustive.
+        //
+        // `wide_typed_cells_survive_a_round_trip_through_a_branchs_pages` in
+        // `tests/integration_branch_pages.rs` drives that path from SQL, so the reachability this
+        // paragraph asserts is checked rather than only claimed.
         1 | 6 => {
             if bytes.len() < 3 {
                 return Err(truncated());

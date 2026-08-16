@@ -845,8 +845,22 @@ impl AgentRuntime {
                     .iter()
                     .position(|c| c.name == name)
                     .ok_or_else(|| FerroError::Bind(format!("unknown column: {}", name)))?;
-                // Type-directed, as on trunk: see `Binder::literal_for_column`.
-                let bound = match Binder::literal_for_column(&expr, &schema.columns[idx].data_type) {
+                // Type-directed, as on trunk — and it must be the WRITE form.
+                //
+                // This is the third of the three sites that bind a literal into a typed column,
+                // alongside INSERT's `bind_row_against` and trunk UPDATE in the planner. Calling
+                // the comparison form here dropped the `FLOAT` widening, so `SET amount = 5`
+                // against a FLOAT column stored `Integer(5)`.
+                //
+                // On trunk that combination is refused by the tuple encoder's width check. A
+                // page-backed branch does not run it — `encode_row` writes whatever variant it is
+                // handed — so the branch took the wrong variant silently and carried it until the
+                // merge. See `Binder::literal_for_written_column` for why comparisons must NOT
+                // share this widening.
+                let bound = match Binder::literal_for_written_column(
+                    &expr,
+                    &schema.columns[idx].data_type,
+                ) {
                     Some(res) => crate::binder::binder::BoundExpr::Literal(res?),
                     None => binder.bind_expr(expr.clone(), &scope)?,
                 };

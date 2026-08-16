@@ -381,3 +381,90 @@ fn a_staged_delete_appears_in_the_page_changeset_as_a_removal() {
          the page diff must report no change for it, got {changes:?}"
     );
 }
+
+/// **A wide-typed cell must be readable back off the branch's own pages.**
+///
+/// This is the end-to-end form of the codec asymmetry that `paged_rows`' unit tests pin at the
+/// byte level. `encode_row` delegates straight to `Value::serialize`, which learned tags 5
+/// (BigInt), 6 (Decimal) and 7 (Timestamp) when the wide types arrived; `value_span`, which
+/// `decode_row` consults for every cell, did not. The result was the worst available failure mode:
+/// the WRITE succeeded and every later READ of that row failed with "unknown value tag".
+///
+/// A unit test on `encode_row`/`decode_row` proves the codec agrees with itself. It does not prove
+/// the path is reachable, and reachability is the whole reason this mattered — so this one drives
+/// it the way a user does: real SQL, on an agent branch, then `page_changeset`, which decodes the
+/// before and after image of every changed row off the pages.
+///
+/// (The review that found this named the entry point `AgentRuntime::page_row_changes`. No such
+/// method exists; the decoding one is `page_changeset`, used here.)
+#[test]
+fn wide_typed_cells_survive_a_round_trip_through_a_branchs_pages() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok(
+        "CREATE TABLE ledger (id INTEGER NOT NULL, big BIGINT, dec DECIMAL, ts TIMESTAMP);",
+        &mut s,
+    );
+    db.ok("INSERT INTO ledger VALUES (1, 9223372036854775807, 1.50, 1700000000123);", &mut s);
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'accountant' RUN 'r_a';", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+
+    // Every wide column, written on the branch. Past 2^53 on purpose: a value that survived by
+    // being routed through an f64 would come back as a neighbour rather than itself.
+    db.ok(
+        "UPDATE ledger SET big = 9007199254740993, dec = 0.00000000000000000001, \
+         ts = -1 WHERE id = 1;",
+        &mut a,
+    );
+
+    // The read that used to fail. Before `value_span` learned tags 5/6/7 this was not a wrong
+    // answer but an Err — "cell N of M: unknown value tag 5" — so the diff errored instead of
+    // returning, and a wide cell was write-only on a page-backed branch.
+    let changes = db
+        .runtime
+        .page_changeset(branch)
+        .expect("page_changeset failed to decode a wide-typed cell off the branch's pages");
+
+    let c = changes
+        .iter()
+        .find(|c| c.row == rid(1))
+        .unwrap_or_else(|| panic!("row 1 is missing from the page changeset: {changes:?}"));
+    let after = c.after.as_ref().expect("row 1 has no after image");
+
+    // The variants as much as the values: a BigInt that came back as Float would compare equal to
+    // plenty of things while having already lost its low bits, because `Value`'s PartialEq is
+    // numeric across the numeric types.
+    assert!(
+        matches!(after[1], Value::BigInt(v) if v == 9007199254740993),
+        "BIGINT did not survive the branch's pages: {:?}",
+        after[1]
+    );
+    assert!(
+        matches!(&after[2], Value::Decimal(d) if d == "0.00000000000000000001"),
+        "DECIMAL did not survive the branch's pages with its digits intact: {:?}",
+        after[2]
+    );
+    assert!(
+        matches!(after[3], Value::Timestamp(v) if v == -1),
+        "TIMESTAMP did not survive the branch's pages: {:?}",
+        after[3]
+    );
+
+    // There is deliberately NO before image, and saying so is part of keeping this file honest.
+    // Per the module note (S2b-3c), the branch's tree holds the staged delta rather than the whole
+    // table: base rows still live in the heap, so the fork-point tree does not hold row 1 and the
+    // page diff correctly reports it as new rather than inventing an image it never stored.
+    //
+    // Asserting this rather than skipping it means that when base tables do move into the tree,
+    // this test fails and has to be extended to cover the before image — which is the point at
+    // which a wide cell would newly need decoding in that position.
+    assert!(
+        c.before.is_none(),
+        "the fork-point tree does not hold base rows yet, so row 1 must diff as new; a before \
+         image here means base tables have moved into the tree and this test now has to prove a \
+         wide cell decodes in that position too: {:?}",
+        c.before
+    );
+}
