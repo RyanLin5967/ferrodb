@@ -15,4 +15,5 @@ pub mod agent_sql;
 pub mod branch;
 pub mod cow;
 pub mod tel;
+pub mod pgwire;
 pub mod provenance;

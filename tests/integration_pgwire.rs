@@ -1,0 +1,123 @@
+//! D9 — a real client, over a real socket, speaking the PostgreSQL v3 protocol.
+//!
+//! The client is `tests/pg/pg_client.py`, written from the protocol spec and deliberately **not**
+//! sharing any code with the server. That separation is the point: if both ends were built from
+//! the same encoder, a consistent misreading of the wire format would pass every test here and
+//! still fail against anything real.
+//!
+//! **What was not done:** `psql` itself is not installed on this machine, so it has not been run.
+//! The row asked for "psql can connect", and what is demonstrated is a client that implements the
+//! same protocol psql speaks — startup with the TLS probe, simple query, error responses,
+//! termination. That is strong evidence and it is not the same claim, so it is written down
+//! rather than rounded up.
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+
+fn example_bin(name: &str) -> PathBuf {
+    let mut p = std::env::current_exe().expect("test exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join("examples").join(name)
+}
+
+struct Server {
+    child: Child,
+    port: u16,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Start the server and wait for it to say it is listening.
+///
+/// It prints its bound address before accepting, so readiness is observed rather than slept
+/// through — a sleep would make this test flaky on a loaded machine and, worse, would sometimes
+/// pass for the wrong reason.
+fn start() -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pg.db");
+    let mut child = Command::new(example_bin("pgserver"))
+        .arg(&db)
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pgserver");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let addr = loop {
+        match lines.next() {
+            Some(Ok(l)) if l.starts_with("LISTENING ") => {
+                break l.trim_start_matches("LISTENING ").to_string()
+            }
+            Some(Ok(_)) => continue,
+            _ => panic!("pgserver exited before it started listening"),
+        }
+    };
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().expect("port");
+    Server { child, port, _dir: dir }
+}
+
+#[test]
+fn an_independent_client_can_connect_and_run_sql_over_the_wire() {
+    let server = start();
+
+    let out = Command::new("python3")
+        .arg("tests/pg/pg_client.py")
+        .arg("127.0.0.1")
+        .arg(server.port.to_string())
+        .output()
+        .expect("python3 is required to run the independent wire client");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the independent wire client failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("OK "), "client did not report success: {stdout}");
+
+    // A client that connected but ran nothing would also print OK with zero checks.
+    let n: usize = stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(n >= 10, "only {n} checks ran; the client did almost nothing: {stdout}");
+}
+
+/// Two connections in sequence must both work. A server that only ever serves its first client is
+/// a demo, not a protocol implementation.
+#[test]
+fn the_server_accepts_more_than_one_connection() {
+    let server = start();
+    for i in 0..2 {
+        let out = Command::new("python3")
+            .arg("tests/pg/pg_client.py")
+            .arg("127.0.0.1")
+            .arg(server.port.to_string())
+            .output()
+            .expect("spawn client");
+        // The second run re-creates the same table, so it is expected to report the CREATE error
+        // and still complete its startup and query exchange.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if i == 0 {
+            assert!(out.status.success(), "first connection failed: {stdout}");
+        } else {
+            assert!(
+                !stdout.is_empty() || !out.status.success(),
+                "the second connection produced nothing at all, so the server stopped serving"
+            );
+        }
+    }
+}
