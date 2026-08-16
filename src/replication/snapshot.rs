@@ -18,26 +18,39 @@
 //!   delivered twice, once in the snapshot and once by the stream. The consumer sees a duplicate,
 //!   which it can absorb with an idempotence key — `commit_lsn`, or the row's own primary key.
 //!
-//! So the LSN is captured **before** the scan begins. That is at-least-once by construction, and it
-//! is the standard CDC contract for exactly this reason: duplication is recoverable and loss is
-//! not. Choosing the other direction would make the numbers look cleaner and the feed wrong.
+//! So the LSN is captured **before** the scan begins, and [`snapshot_table`] still does that.
+//! Duplication is recoverable and loss is not, so of the two it is the right one to choose.
+//!
+//! # **Correction: before the scan is not early enough, and this module used to claim it was**
+//!
+//! The paragraph above framed those as the only two options, which made "too early" sound like the
+//! safe choice rather than the less-bad one. It is not safe. A transaction that was **already in
+//! flight** when the handoff LSN was taken has written records *below* it, and MVCC does not show a
+//! reader another transaction's uncommitted work, so the snapshot does not contain it either. A
+//! stream starting at that LSN meets its `Commit` having never read its changes, stages nothing,
+//! and emits nothing for it. Those rows reach nobody, silently — the same permanent data loss the
+//! "too late" bullet describes, on the option this module presented as loss-free.
+//!
+//! That was found by building [`snapshot_table_exact`] and is demonstrated, not argued:
+//! `tests/integration_cdc_cutover.rs` runs one scenario through both paths and asserts the
+//! at-least-once one loses the in-flight transaction's row while the exact one delivers it once.
+//!
+//! [`snapshot_table`] is kept, with that hole now stated rather than denied, because it needs
+//! nothing but a WAL. A caller that has a [`TxnManager`] should use [`snapshot_table_exact`].
 //!
 //! # Consistency comes from the database, not from this module
 //!
-//! The rows themselves are read by the caller, through the engine's own MVCC snapshot isolation —
-//! a `SELECT` sees one consistent version of the table regardless of what commits during it. This
-//! module does not reimplement a scan, because a hand-rolled page walk would have to re-derive
-//! visibility rules that already exist and are already tested. It brackets the read with LSNs and
-//! reports what it observed.
+//! The rows themselves are read through the engine's own MVCC snapshot isolation — a `SELECT` sees
+//! one consistent version of the table regardless of what commits during it. Neither function
+//! reimplements a scan, because a hand-rolled page walk would have to re-derive visibility rules
+//! that already exist and are already tested.
 //!
-//! [`Snapshot::concurrent_writes`] says whether the log moved during the scan, which is what
-//! distinguishes "this handoff is exact" from "this handoff will re-deliver some changes". Both are
-//! correct; only one is tidy, and a caller that wants to know can ask.
+//! [`Snapshot::concurrent_writes`] says whether the log moved during the scan, which distinguishes
+//! "this handoff will re-deliver nothing" from "this handoff will re-deliver some changes". Note
+//! what it does **not** say: it is silent about the hole above, because a transaction already open
+//! before the scan moves no LSN during it.
 //!
-//! # [`snapshot_table_exact`]: the same handoff with the overlap removed
-//!
-//! Everything above is true of [`snapshot_table`], which brackets a read it knows nothing about and
-//! therefore cannot do better than at-least-once. It is kept because it needs nothing but a WAL.
+//! # [`snapshot_table_exact`]: both directions closed
 //!
 //! [`snapshot_table_exact`] is given the [`TxnManager`] as well, and that one extra thing is enough
 //! to make the cutover **exact in both directions**. It opens the read inside a transaction, so it
@@ -75,6 +88,7 @@
 //!   returns, close it with [`TxnManager::end_read_only`], and use its single boundary for the
 //!   whole stream.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -94,6 +108,11 @@ pub struct Snapshot {
     pub rows: usize,
     /// **Where the consumer resumes streaming.** Captured before the scan, so a change that raced
     /// the scan is re-delivered rather than skipped.
+    ///
+    /// That covers transactions which *began* after this point. It does **not** cover one that was
+    /// already in flight when it was taken: its records are below this LSN and its work is not in
+    /// the snapshot either, so it is lost. See the module docs; [`ExactSnapshot::resume_lsn`] is
+    /// the field that does not have that hole.
     pub lsn: u64,
     /// The durable frontier after the scan finished.
     pub lsn_after: u64,
@@ -166,6 +185,70 @@ where
     })
 }
 
+/// **Everything a stream needs to join a snapshot with no gap and no overlap, as one value.**
+///
+/// The three parts are kept together rather than handed over separately, because each pair of them
+/// is dangerous apart and the danger is silent every time:
+///
+/// - `resume_lsn` without `txns` re-delivers everything between the resume point and the read.
+/// - `txns` without `resume_lsn` lets a caller start the stream anywhere. Start it *above* the
+///   resume point and the suppression still applies in full, while the in-flight transactions the
+///   snapshot deliberately excluded sit below the cursor and are never read at all — the exact gap
+///   the early resume point exists to prevent, reintroduced by supplying a plausible cursor.
+/// - `tables` without either is the one that took a review to find. `txns` describes *when*, not
+///   *what*. A snapshot of table `orders` says nothing about table `shipments`, so a stream whose
+///   decoder also carries `shipments` would suppress every `shipments` event committed before the
+///   cutover — history no snapshot ever delivered — and report it as legitimate suppression.
+///
+/// So a boundary is constructed once, by whoever took the snapshot, and consumed whole by
+/// [`Subscription::following`](super::stream::Subscription::following), which is the only way to
+/// start a filtered stream and therefore the only cursor it can start from.
+#[derive(Debug, Clone)]
+pub struct SnapshotBoundary {
+    tables: BTreeSet<String>,
+    txns: TxnSnapshot,
+    resume_lsn: u64,
+}
+
+impl SnapshotBoundary {
+    /// `tables` must be every table the snapshot actually wrote rows for — no more, and no fewer.
+    ///
+    /// Naming a table the snapshot did not deliver suppresses that table's pre-cutover history.
+    /// Omitting one it did deliver re-delivers it. Neither is detectable downstream, which is why
+    /// the value is built here from what the snapshot did rather than from what a caller intends.
+    pub fn new(tables: BTreeSet<String>, txns: TxnSnapshot, resume_lsn: u64) -> Self {
+        SnapshotBoundary { tables, txns, resume_lsn }
+    }
+
+    /// Where the stream must start. Not a suggestion: see the type docs.
+    pub fn resume_lsn(&self) -> u64 {
+        self.resume_lsn
+    }
+
+    /// The tables this snapshot delivered rows for.
+    pub fn tables(&self) -> &BTreeSet<String> {
+        &self.tables
+    }
+
+    /// The transactions the snapshot's rows already contain.
+    pub fn txns(&self) -> &TxnSnapshot {
+        &self.txns
+    }
+
+    /// **Whether the stream must drop this event because the snapshot already delivered it.**
+    ///
+    /// All three conditions, and each one is a different way to lose or duplicate data:
+    ///
+    /// - the event is for a table this snapshot covered — otherwise the snapshot said nothing about
+    ///   it and dropping it destroys that table's history;
+    /// - it is attributed to a transaction ([`TxnSnapshot::already_delivered`] rejects id 0, which
+    ///   is DDL and belongs to no transaction);
+    /// - that transaction's work is in the snapshot.
+    pub fn suppresses(&self, table: &str, txn_id: u64) -> bool {
+        self.tables.contains(table) && self.txns.already_delivered(txn_id)
+    }
+}
+
 /// A snapshot whose handoff to the stream is exact: no change missed, none delivered twice.
 ///
 /// Not merged into [`Snapshot`] on purpose. The two carry different promises, and a caller holding
@@ -174,14 +257,10 @@ pub struct ExactSnapshot {
     pub table: String,
     /// Rows written out.
     pub rows: usize,
-    /// **Where the stream resumes.** At or before the oldest transaction in flight when the read
-    /// was taken, so nothing the snapshot excluded can sit below it. Durable.
-    pub resume_lsn: u64,
-    /// **The transactions the rows already contain.** Hand this to
-    /// [`FeedStreamer::resuming_after_snapshot`](super::stream::FeedStreamer::resuming_after_snapshot);
-    /// without it the stream re-delivers everything between `resume_lsn` and the read.
-    pub included: TxnSnapshot,
-    /// A claim on the log at `resume_lsn`, held so a checkpoint cannot discard the records the
+    /// **Hand this whole to [`Subscription::following`](super::stream::Subscription::following).**
+    /// See [`SnapshotBoundary`] for why its parts are not separately useful.
+    pub boundary: SnapshotBoundary,
+    /// A claim on the log at the resume point, held so a checkpoint cannot discard the records the
     /// stream is about to ask for.
     ///
     /// Taken here rather than left to the caller because the window between "snapshot returns" and
@@ -195,13 +274,19 @@ pub struct ExactSnapshot {
     pub reader_txn_id: u64,
 }
 
+impl ExactSnapshot {
+    /// Where the stream resumes. Shorthand for `self.boundary.resume_lsn()`.
+    pub fn resume_lsn(&self) -> u64 {
+        self.boundary.resume_lsn()
+    }
+}
+
 impl std::fmt::Debug for ExactSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExactSnapshot")
             .field("table", &self.table)
             .field("rows", &self.rows)
-            .field("resume_lsn", &self.resume_lsn)
-            .field("included", &self.included)
+            .field("boundary", &self.boundary)
             .field("reader_txn_id", &self.reader_txn_id)
             .finish()
     }
@@ -265,8 +350,14 @@ where
     Ok(ExactSnapshot {
         table: table.to_string(),
         rows: n,
-        resume_lsn: handoff.resume_lsn,
-        included: handoff.snapshot,
+        // The table set is exactly the one table this call read. Built from what the snapshot did,
+        // not from what the caller meant: naming a table it did not deliver would suppress that
+        // table's whole pre-cutover history in the stream, silently.
+        boundary: SnapshotBoundary::new(
+            BTreeSet::from([table.to_string()]),
+            handoff.snapshot,
+            handoff.resume_lsn,
+        ),
         pin,
         reader_txn_id: handoff.txn_id,
     })

@@ -41,15 +41,16 @@
 //! # Joining an initial snapshot
 //!
 //! One duplication is *not* left to the consumer: the overlap at a snapshot-to-stream cutover.
-//! [`FeedStreamer::resuming_after_snapshot`] takes the transaction set a snapshot already contained
-//! and drops those transactions' events, so the two feeds meet with no gap and no overlap. See
-//! [`super::snapshot`] for why that has to be decided per transaction and not per LSN.
+//! [`Subscription::following`] takes the boundary a snapshot hands back and drops exactly the
+//! events it already delivered, so the two feeds meet with no gap and no overlap. See
+//! [`super::snapshot`] for why that has to be decided per transaction rather than per LSN, and
+//! [`super::snapshot::SnapshotBoundary`] for why the starting cursor is not the caller's to choose.
 
 use std::io::Write;
 
 use crate::error::FerroError;
 use crate::wal::log::WalManager;
-use crate::wal::txn::Snapshot as TxnSnapshot;
+use super::snapshot::SnapshotBoundary;
 
 use super::jsonl::write_feed;
 use super::logical::{Decoded, LogicalDecoder};
@@ -99,47 +100,26 @@ impl Pumped {
 }
 
 /// Follows a WAL, emitting committed changes as JSON Lines.
+///
+/// A streamer is **stateless about position** on purpose: it decodes whatever range it is asked
+/// for. Following a snapshot is not stateless — it is only correct from one specific starting
+/// cursor — so that lives on [`Subscription`], which owns its cursor, rather than here where a
+/// caller would have to supply one and could supply the wrong one.
 pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
     max_bytes: u64,
-    /// The transactions an initial snapshot already delivered, when this streamer is following one.
-    /// See [`FeedStreamer::resuming_after_snapshot`].
-    already_snapshotted: Option<TxnSnapshot>,
 }
 
 impl FeedStreamer {
     pub fn new(decoder: LogicalDecoder) -> Self {
-        FeedStreamer { decoder, max_bytes: 1 << 20, already_snapshotted: None }
+        FeedStreamer { decoder, max_bytes: 1 << 20 }
     }
 
     /// Bound how much log one pump will decode. A consumer that has been away for a long time
     /// should not cause one unbounded allocation.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes.max(1);
-        self
-    }
-
-    /// Follow on from an initial snapshot **without re-delivering what it already contained**.
-    ///
-    /// The resume LSN a snapshot hands back is deliberately early: it sits at or before the oldest
-    /// transaction that was in flight when the snapshot was taken, so no excluded change can be
-    /// below it. That closes the gap and opens an overlap — the range from there to the snapshot's
-    /// read also contains commits the snapshot *did* see, and re-delivering those is exactly the
-    /// duplication at-least-once tolerates.
-    ///
-    /// The snapshot's transaction set closes it. An event carries the id of the transaction that
-    /// produced it, and [`TxnSnapshot::includes`] answers, by the same visibility rule the rows
-    /// were read with, whether that transaction's work is already in the snapshot. Skipping by
-    /// transaction rather than by LSN is what makes this exact: the two feeds interleave in the
-    /// log, so no single byte offset separates them.
-    ///
-    /// **Only events attributed to a transaction are filtered.** Schema events are logged outside
-    /// any transaction (under id 0, which `begin` never hands out) so the snapshot boundary says
-    /// nothing about them, and suppressing them would leave a consumer without the shape of a table
-    /// created after the cutover.
-    pub fn resuming_after_snapshot(mut self, already_snapshotted: TxnSnapshot) -> Self {
-        self.already_snapshotted = Some(already_snapshotted);
         self
     }
 
@@ -161,6 +141,24 @@ impl FeedStreamer {
         wal: &WalManager,
         cursor: u64,
         w: &mut W,
+    ) -> Result<Pumped, FerroError> {
+        self.pump_within(wal, cursor, w, None)
+    }
+
+    /// The body of `pump`, optionally filtered by a snapshot boundary.
+    ///
+    /// Private, and that is the guard rather than a detail: a boundary is only correct for a stream
+    /// that started at its own `resume_lsn`, and the only caller that can supply one is
+    /// [`Subscription::following`], which fixes that cursor at construction. Exposing this would
+    /// let a caller pair a boundary with a cursor above its resume point, which suppresses
+    /// everything the snapshot held while never reading the transactions it excluded — a silent
+    /// hole that looks like a working feed.
+    fn pump_within<W: Write>(
+        &self,
+        wal: &WalManager,
+        cursor: u64,
+        w: &mut W,
+        boundary: Option<&SnapshotBoundary>,
     ) -> Result<Pumped, FerroError> {
         use std::sync::atomic::Ordering;
 
@@ -199,16 +197,30 @@ impl FeedStreamer {
             .max()
             .unwrap_or(cursor);
 
+        // A batch the byte limit cut short, that decoded nothing, and that is holding a transaction
+        // open, can never make progress: the next pump reads the same window and stops in the same
+        // place, so the feed stalls for ever while reporting success. That is one transaction whose
+        // records do not fit in `max_bytes`. Refused by name rather than spun on — a consumer that
+        // is silently stuck is indistinguishable from one that is caught up.
+        if decoded.events.is_empty() && to < frontier && !decoded.open.is_empty() {
+            return Err(FerroError::Wal(format!(
+                "transaction(s) {:?} have more than max_bytes ({}) of records before their commit, \
+                 so no batch starting at {cursor} can reach it and the cursor can never advance. \
+                 Raise max_bytes above the size of the largest transaction.",
+                decoded.open, self.max_bytes
+            )));
+        }
+
         let mut events = decoded.events;
-        let suppressed = match &self.already_snapshotted {
+        let suppressed = match boundary {
             None => 0,
-            Some(already) => {
+            Some(boundary) => {
                 let before = events.len();
-                // `already_delivered`, not `includes`: the difference is events logged under
-                // transaction id 0 (DDL), which `includes` reports as contained because 0 is below
-                // every high water mark. The exemption lives in that method rather than here so a
-                // second consumer of the boundary cannot omit it.
-                events.retain(|e| !already.already_delivered(e.txn_id));
+                // By table AND transaction. Table, because a snapshot of `orders` says nothing
+                // about `shipments` and dropping `shipments` events would destroy history no
+                // snapshot ever delivered. Transaction, because that is what "already contained"
+                // means. See `SnapshotBoundary::suppresses`.
+                events.retain(|e| !boundary.suppresses(&e.table, e.txn_id));
                 before - events.len()
             }
         };
@@ -245,6 +257,9 @@ pub struct Subscription {
     wal: std::sync::Arc<WalManager>,
     cursor: u64,
     pin: crate::wal::log::WalPin,
+    /// Set when this subscription is following an initial snapshot. See
+    /// [`Subscription::following`].
+    boundary: Option<SnapshotBoundary>,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -262,13 +277,45 @@ impl Subscription {
     /// made at subscription time so a consumer learns immediately rather than on its first read.
     pub fn new(wal: &std::sync::Arc<WalManager>, from: u64) -> Result<Self, FerroError> {
         let pin = wal.pin(from)?;
-        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin })
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin, boundary: None })
     }
 
     /// Subscribe from the start of the retained log.
     pub fn from_start(wal: &std::sync::Arc<WalManager>) -> Result<Self, FerroError> {
         let from = FeedStreamer::start_cursor(wal);
         Self::new(wal, from)
+    }
+
+    /// **Follow on from an initial snapshot: no gap, and no overlap.**
+    ///
+    /// This is the only way to get a snapshot-filtered stream, and the reason is that the filter is
+    /// correct from exactly one starting cursor. The boundary's resume point sits at or before the
+    /// oldest transaction in flight when the snapshot was taken, so nothing the snapshot excluded
+    /// can be below it — and reaching back that far necessarily re-reads commits the snapshot *did*
+    /// contain, which is what the filter removes. Start anywhere above that point and the
+    /// suppression still applies in full while the excluded transactions are never read: a feed
+    /// that looks healthy and is missing rows. So the cursor comes from the boundary rather than
+    /// from the caller, and `pump` on this subscription is the only thing that can apply it.
+    ///
+    /// The subscription pins the log here, so this may replace the snapshot's own pin: take it
+    /// first, then drop the [`ExactSnapshot`](super::snapshot::ExactSnapshot).
+    pub fn following(
+        wal: &std::sync::Arc<WalManager>,
+        boundary: SnapshotBoundary,
+    ) -> Result<Self, FerroError> {
+        let from = boundary.resume_lsn();
+        let pin = wal.pin(from)?;
+        Ok(Subscription {
+            wal: std::sync::Arc::clone(wal),
+            cursor: from,
+            pin,
+            boundary: Some(boundary),
+        })
+    }
+
+    /// The snapshot this subscription is following, if any.
+    pub fn boundary(&self) -> Option<&SnapshotBoundary> {
+        self.boundary.as_ref()
     }
 
     pub fn cursor(&self) -> u64 {
@@ -295,7 +342,7 @@ impl Subscription {
         streamer: &FeedStreamer,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
-        let pumped = streamer.pump(&self.wal, self.cursor, w)?;
+        let pumped = streamer.pump_within(&self.wal, self.cursor, w, self.boundary.as_ref())?;
         if pumped.cursor != self.cursor {
             let next = self.wal.pin(pumped.cursor)?;
             let old = std::mem::replace(&mut self.pin, next);
