@@ -269,16 +269,25 @@ impl DiskManager{
                 global_offset += BITS_PER_BITMAP;
                 continue;
             }
-            // Growing the file would run straight into the arena region, which starts at the
-            // high-water mark. Refuse instead of extending into somebody else's pages.
-            if self.next_page_id.load(Ordering::SeqCst).saturating_add(1) >= floor {
+            // This path runs only when every bit in every chained bitmap is set — i.e. at least
+            // BITS_PER_BITMAP (32736) pages are already allocated. `next_page_id` can still read 1
+            // at that moment, because the fast path above never advances it. Growing from that
+            // counter therefore hands out pages the bitmap already owns, and the floor check based
+            // on it is comparing the wrong number. Grow from the real mark instead.
+            let grow_base = self
+                .scan_bitmap_high_water()?
+                .max(self.next_page_id.load(Ordering::SeqCst));
+            // Two pages are about to be taken: the new bitmap page and the page it serves.
+            if grow_base.saturating_add(1) >= floor {
                 return Err(FerroError::Io(format!(
                     "cannot grow the bitmap past the reserved arena region at {}",
                     floor
                 )));
             }
-            let new_bitmap_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
-            let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
+            let new_bitmap_id = grow_base;
+            let page_id = grow_base + 1;
+            // Keep the counter monotonic and never behind what has actually been handed out.
+            self.next_page_id.fetch_max(page_id + 1, Ordering::SeqCst);
             page_bitmap[0..4].copy_from_slice(&new_bitmap_id.to_le_bytes());
             self.write(current_bitmap_id, &page_bitmap)?;
             let mut new_bitmap = [0u8; PAGE_SIZE];
@@ -321,6 +330,7 @@ mod tests {
     use tempfile::TempDir;
     use crate::storage::disk_manager::DiskManager;
     use std::sync::atomic::Ordering;
+    use super::{BITS_PER_BITMAP, PAGE_SIZE};
     use std::fs::OpenOptions;
     #[test]
     pub fn test_rw() -> Result<(), Box<dyn std::error::Error>>{
@@ -392,6 +402,42 @@ mod tests {
         dm.deallocate(10).unwrap();
         let after = dm.high_water().unwrap();
         assert!(after >= before - 1, "high_water fell from {} to {} after one free", before, after);
+        Ok(())
+    }
+
+    /// S3: growing the bitmap must not allocate from the stale counter.
+    ///
+    /// The grow path runs only when every bit is set — at least BITS_PER_BITMAP pages already
+    /// allocated — yet `next_page_id` can still read 1 there, because the fast path never
+    /// advances it. Growing from it hands out pages the bitmap already owns.
+    ///
+    /// Filling 32736 pages for real would be 260MB of bitmap I/O, so the full bitmap is written
+    /// directly. That is the same state `allocate()` would reach organically, minus the wait.
+    #[test]
+    pub fn growing_the_bitmap_does_not_reuse_owned_pages() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("grow.db"))?;
+        let dm = DiskManager::new(temp_file).unwrap();
+
+        // Every page this bitmap covers is allocated; no next-bitmap pointer yet.
+        let mut full = [0xFFu8; PAGE_SIZE];
+        full[0..4].copy_from_slice(&0u32.to_le_bytes());
+        dm.write(0, &full)?;
+
+        // The counter is still at its initial value and knows nothing about those 32736 pages.
+        let stale = dm.next_page_id.load(Ordering::SeqCst);
+        assert!(stale < BITS_PER_BITMAP, "counter {} was expected to be stale", stale);
+
+        let got = dm.allocate().unwrap();
+        assert!(
+            got >= BITS_PER_BITMAP,
+            "allocate() handed out page {}, which the bitmap already owns (grew from the stale \
+             counter {} instead of the real high-water mark {})",
+            got, stale, BITS_PER_BITMAP
+        );
+        // And the page it served must not be the new bitmap page itself.
+        assert_ne!(got, BITS_PER_BITMAP, "served the new bitmap page as data");
         Ok(())
     }
 
