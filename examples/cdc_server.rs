@@ -98,6 +98,9 @@ fn main() {
             continue;
         }
         let mut cursor: u64 = line.trim().parse().unwrap_or(0);
+        // Delivery progress, distinct from the read position: the cursor is clamped back for open
+        // transactions, so without this every committed transaction after one would be re-sent.
+        let mut emitted_through: u64 = 0;
         if cursor == 0 {
             cursor = FeedStreamer::start_cursor(&wal);
         }
@@ -111,7 +114,7 @@ fn main() {
             // the same check-then-act shape as the cursor rule, and it made this test pass alone
             // and fail under a loaded full suite.
             let finished_before_pump = done.load(Ordering::SeqCst);
-            let pumped = match streamer.pump(&wal, cursor, &mut stream) {
+            let pumped = match streamer.pump(&wal, cursor, emitted_through, &mut stream) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("pump failed: {e}");
@@ -119,6 +122,7 @@ fn main() {
                 }
             };
             cursor = pumped.cursor;
+            emitted_through = pumped.emitted_through;
             if pumped.emitted == 0 {
                 // Caught up. Finish only when the workload is finished too, so a consumer is not
                 // disconnected merely for being faster than the writer.

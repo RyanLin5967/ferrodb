@@ -129,12 +129,14 @@ fn a_consumer_that_snapshots_then_streams_sees_every_row_that_ever_existed() {
     let streamer = FeedStreamer::new(LogicalDecoder::new(catalog));
     let mut stream_out: Vec<u8> = Vec::new();
     let mut cursor = snap.lsn;
+    let mut emitted_through = 0u64;
     for _ in 0..50 {
-        let p = streamer.pump(&d.wal, cursor, &mut stream_out).expect("pump");
+        let p = streamer.pump(&d.wal, cursor, emitted_through, &mut stream_out).expect("pump");
         if p.emitted == 0 {
             break;
         }
         cursor = p.cursor;
+        emitted_through = p.emitted_through;
     }
 
     let snapshot_feed = String::from_utf8(snap_out).unwrap();
