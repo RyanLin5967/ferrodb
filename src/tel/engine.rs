@@ -338,6 +338,7 @@ impl Merger for ThreeWayMerger {
         let mut ours_ix = SideIndex::default();
         let mut theirs_ix = SideIndex::default();
         let mut ours_wrote = false;
+        let mut theirs_wrote = false;
         for (f, side) in &frames {
             for op in &f.ops {
                 let s = StampedOp {
@@ -351,7 +352,10 @@ impl Merger for ThreeWayMerger {
                         ours_wrote = true;
                         ours_ix.push(s);
                     }
-                    Side::Theirs => theirs_ix.push(s),
+                    Side::Theirs => {
+                        theirs_wrote = true;
+                        theirs_ix.push(s);
+                    }
                 }
             }
         }
@@ -423,9 +427,15 @@ impl Merger for ThreeWayMerger {
             // dangerous thing this system can do to an agent.
             return Ok(MergeOutcome::ResolvedWithLoss { applied: composed, discarded });
         }
-        if !ours_wrote {
-            // Main untouched since the fork point: a fast-forward. Only knowable here, after the
-            // constraint pass has run.
+        if !ours_wrote || !theirs_wrote {
+            // `Commuting` is defined as *both* sides having written and their ops composing
+            // (DESIGN.md section 3). When only one side wrote there is nothing to compose
+            // against: the other is untouched since the fork point, so this is a fast-forward
+            // and the outcome is `Clean`. Only knowable here, after the constraint pass.
+            //
+            // Testing `ours_wrote` alone reported every one-sided write as `Commuting`, which
+            // told an agent its write had been reconciled with a concurrent one that did not
+            // exist.
             return Ok(MergeOutcome::Clean);
         }
         Ok(MergeOutcome::Commuting { composed })
@@ -1583,18 +1593,52 @@ mod tests {
 
     #[test]
     fn folding_a_side_applies_its_own_ops_in_order() {
-        // assign 10 then -3 on the same branch: the side's net effect is an absolute 7
+        // assign 10 then -3 on the same branch: the side's net effect is an absolute 7.
+        //
+        // The other side writes a *different* row, so both sides wrote (which is what
+        // `Commuting` means) while our cell still folds on its own. Composing this against an
+        // empty other side would be a fast-forward and therefore `Clean`, which is what
+        // `a_one_sided_write_is_clean_not_commuting` below pins.
         let m = ThreeWayMerger::new();
         let mut ours = frame(1, 1, 0);
         ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(10))));
         ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-3))));
-        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20)).unwrap();
+
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, RowId(2), Some(QTY), OpKind::Assign(Value::Integer(1))));
+
+        let out = m.merge(&lca(), &[ours], &[theirs], &AllReject, &base(20)).unwrap();
         match &out {
             MergeOutcome::Commuting { composed } => {
-                assert_eq!(composed[0].kind, OpKind::Assign(Value::Integer(7)));
+                let ours_op = composed
+                    .iter()
+                    .find(|o| o.row == R1 && o.col == Some(QTY))
+                    .expect("our folded op is missing from the composition");
+                assert_eq!(ours_op.kind, OpKind::Assign(Value::Integer(7)));
             }
             other => panic!("expected Commuting, got {}", other),
         }
+    }
+
+    #[test]
+    fn a_one_sided_write_is_clean_not_commuting() {
+        // DESIGN.md section 3: `Commuting` means *both* sides wrote and their ops compose. With
+        // nothing concurrent to compose against, a merge is a fast-forward and is `Clean`.
+        // Reporting it as `Commuting` told an agent its write had been reconciled with a
+        // concurrent one that never existed.
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(10))));
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-3))));
+
+        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20)).unwrap();
+        assert_eq!(out.name(), "Clean", "got {}", out);
+
+        // ...and symmetrically, with only the other side writing.
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(4))));
+        let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(20)).unwrap();
+        assert_eq!(out.name(), "Clean", "got {}", out);
     }
 
     #[test]
