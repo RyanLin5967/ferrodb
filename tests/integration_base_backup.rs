@@ -404,3 +404,108 @@ fn the_base_backup_carries_pages_the_wal_never_describes() {
          cannot tell the two mechanisms apart"
     );
 }
+
+/// **E5 — kill the replica mid-stream, restart it, and it must resume rather than restart.**
+///
+/// The first replica is aborted at a known point (`FERRODB_REPLICA_ABORT_AFTER_BATCHES`) rather
+/// than by racing it, so the midpoint is deterministic and the test cannot pass by accidentally
+/// finishing before the kill. The second is given **no backup directory at all**: if it did not
+/// genuinely resume from the state the first one left, it would start from LSN 0 against a log
+/// whose base has moved and be refused.
+///
+/// The ordering being tested is the replica's half of the durability rule: progress is recorded
+/// only after the pages it describes are durable, so a crash leaves the state file behind the
+/// pages and never ahead. Behind is repaired by idempotent redo; ahead would be a replica claiming
+/// an LSN whose pages never reached disk.
+///
+/// It uses the **hot** backup, and that is not a detail — the first attempt used the cold one and
+/// its own anti-vacuity guard refused it: a backup taken after the work ends AT the frontier
+/// (`start 364001 end 364001`), so there was nothing left to stream, no batches, and nothing a
+/// kill could interrupt. Only a backup taken early leaves a stream to be interrupted.
+#[test]
+fn a_replica_killed_mid_stream_resumes_from_its_own_lsn_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdb = dir.path().join("primary.db");
+    let rdb = dir.path().join("replica.db");
+    let primary = start_primary(&pdb, ROWS, true);
+
+    // First run: restore the backup, apply two batches, then die like a killed process.
+    let first = Command::new(example_bin("repl_replica"))
+        .arg(&rdb)
+        .arg(&primary.addr)
+        .arg("0")
+        .arg(&primary.backup_dir)
+        .env("FERRODB_REPLICA_ABORT_AFTER_BATCHES", "2")
+        .output()
+        .expect("spawn replica");
+    let first_out = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(
+        !first.status.success(),
+        "the replica was asked to abort after 2 batches and exited cleanly instead, so nothing was \
+         interrupted: {first_out}"
+    );
+    assert!(first_out.contains("ABORTING"), "it did not reach the abort point: {first_out}");
+
+    // Anti-vacuity: it must have got PART of the way. Neither 'nowhere' nor 'all the way' tests a
+    // resume.
+    let state_path = format!("{}.replstate", rdb.display());
+    let recorded: u64 = std::fs::read_to_string(&state_path)
+        .expect("the replica recorded no progress at all, so there is nothing to resume from")
+        .trim()
+        .parse()
+        .expect("replstate is not a number");
+    assert!(
+        recorded > primary.backup_start,
+        "the replica recorded {recorded}, which is no further than the backup it started from ({})",
+        primary.backup_start
+    );
+    assert!(
+        recorded < primary.durable_lsn,
+        "the replica recorded {recorded}, which is already the primary's frontier ({}) — it \
+         finished before the kill, so this is not a mid-stream restart",
+        primary.durable_lsn
+    );
+
+    // Second run: NO backup directory. It must pick up from the state file.
+    let second = Command::new(example_bin("repl_replica"))
+        .arg(&rdb)
+        .arg(&primary.addr)
+        .arg("0")
+        .output()
+        .expect("respawn replica");
+    let out = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(
+        second.status.success(),
+        "the restarted replica failed:\nstdout: {out}\nstderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        out.contains(&format!("RESUMED {recorded}")),
+        "the replica did not resume from {recorded}: {out}"
+    );
+
+    let applied: u64 = out
+        .lines()
+        .find(|l| l.starts_with("APPLIED "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no APPLIED line: {out}"));
+    assert_eq!(applied, primary.durable_lsn, "the resumed replica did not reach the frontier");
+
+    // And it is byte-identical where physical replication can make it so, judged from disk.
+    // The standard is the WAL-described pages, for the reason measured in the hot-backup test
+    // above: pages written outside the log are frozen at backup time and no amount of streaming
+    // moves them.
+    let described = pages_described_by_wal(&dir.path().join("primary.db.wal"));
+    assert!(!described.is_empty(), "the WAL describes no pages; convergence would be vacuous");
+    let (pages, differing) = differing_pages(&pdb, &rdb);
+    assert!(pages >= 2, "only {pages} page(s); near-vacuous");
+    let described_diff: Vec<usize> =
+        differing.into_iter().filter(|id| described.contains(id)).collect();
+    assert!(
+        described_diff.is_empty(),
+        "{} WAL-described page(s) differ after a mid-stream kill and resume: {:?}",
+        described_diff.len(),
+        &described_diff[..described_diff.len().min(12)]
+    );
+}
