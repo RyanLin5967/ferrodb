@@ -76,11 +76,24 @@ struct StampedOp {
 }
 
 impl StampedOp {
-    /// Ordering key for last-writer-wins. Branch-local `seq` first, then `txn_id` as a
-    /// deterministic tie-break across branches — LWW across independent branches has no true
-    /// global clock, and pretending otherwise would be worse than being explicit about it.
+    /// Ordering key for last-writer-wins: **`txn_id` first**, then branch-local `seq`.
+    ///
+    /// `seq` led here once, and that made LWW mean "the chattiest branch wins": `seq` is
+    /// documented on `TxnFrame` as "position of this frame within its branch", so a branch with
+    /// more commits since the fork beat one with fewer regardless of when either actually wrote.
+    /// A caller enabling `Lww` got a commit count, not a clock.
+    ///
+    /// `TxnId` is allocated from one shared counter under a single mutex
+    /// (`AgentRuntime::begin_session`), so it *is* globally ordered across branches, which `seq`
+    /// is not. `seq` remains the within-transaction tie-break.
+    ///
+    /// Still not a true clock, and worth being explicit: `TxnId` orders by when a session was
+    /// *opened*, not when a write landed. A long-running session that writes late still loses to
+    /// a session opened after it. LWW across independent branches has no global write clock, and
+    /// this is the closest honest approximation available — a global order rather than a
+    /// per-branch counter.
     fn stamp(&self) -> (u64, u64) {
-        (self.seq, self.txn.0)
+        (self.txn.0, self.seq)
     }
 }
 
@@ -1962,6 +1975,39 @@ mod tests {
         ours.push_op(Op::new(TBL, R1, None, OpKind::RowCreate(vec![Value::Integer(3)])));
         let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20));
         assert!(out.is_ok(), "a valid RowCreate was refused: {:?}", out.err());
+    }
+
+    /// R8: LWW must not reward the chattier branch.
+    ///
+    /// `seq` is the frame's position within its own branch, so ordering on it first meant a branch
+    /// with more commits since the fork beat one with fewer no matter when either wrote. Here
+    /// ours has seq 10 and txn 1; theirs has seq 0 and txn 2. Theirs opened its transaction later,
+    /// so theirs must win — under the old key ours won purely for being busier.
+    #[test]
+    fn lww_orders_by_global_txn_id_not_branch_local_seq() {
+        let m = ThreeWayMerger::new();
+        let mut ours = TxnFrame::new(TxnId(1), BranchId::new(1, 0), CommitHash::ZERO, 10, 1);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(111))));
+        let mut theirs = TxnFrame::new(TxnId(2), BranchId::new(2, 0), CommitHash::ZERO, 0, 1);
+        theirs.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(222))));
+
+        let out = m
+            .merge(&lca(), &[ours], &[theirs], &Fixed(MergePolicy::Lww), &base(20))
+            .unwrap();
+        let applied = match &out {
+            MergeOutcome::ResolvedWithLoss { applied, .. } => applied.clone(),
+            other => panic!("LWW discarding a write must be ResolvedWithLoss, got {:?}", other),
+        };
+        let won = applied.iter().find_map(|o| match &o.kind {
+            OpKind::Assign(v) => Some(v.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            won,
+            Some(Value::Integer(222)),
+            "the branch with the higher seq won despite the lower txn id - LWW is ordering on a \
+             commit count, not a clock"
+        );
     }
 
     #[test]
