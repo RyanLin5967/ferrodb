@@ -22,6 +22,7 @@
 //! pointer is still correct, and there is nothing to copy above it. A hot branch therefore
 //! shadows a page once and then writes it directly, instead of re-shadowing the root on every key.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::branch::types::{BranchId, Epoch, PageId};
@@ -33,6 +34,21 @@ use crate::error::FerroError;
 /// Descent guard. A well-formed tree is far shallower than this; exceeding it means a cycle, and
 /// looping forever inside a page store is worse than failing.
 const MAX_DESCENT: usize = 64;
+
+/// One key that differs between two roots: `(key, before, after)`.
+///
+/// `before == None` means the key was inserted; `after == None` means it was deleted.
+pub type Delta = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What changed between two roots, and how much of the tree had to be read to find out.
+#[derive(Debug)]
+pub struct TreeDiff {
+    pub deltas: Vec<Delta>,
+    /// Pages whose **entries were decoded**. Subtrees the two roots share are skipped whole,
+    /// by page identity, so this stays proportional to what changed rather than to the tree.
+    pub pages_examined: usize,
+}
+
 
 /// A separator key promoted from a split, together with the page it separates off.
 type Split = Option<(Vec<u8>, PageId)>;
@@ -194,6 +210,94 @@ impl CowTree {
             }
         }
         Ok(out)
+    }
+
+    // ---- diff --------------------------------------------------------------------------------
+
+    /// Structurally diff two roots of the same tree.
+    ///
+    /// This is the operation shadow paging exists to make cheap, and it is sound here **because of
+    /// what DESIGN.md rules out**: there is no content addressing and there are no refcounts, so a
+    /// subtree that did not change is not merely equal to its old self, it *is* the same page id.
+    /// Equal page id therefore implies equal contents, and the whole subtree can be skipped
+    /// without reading it. Under content addressing this shortcut would need a hash comparison;
+    /// under refcounting the page would have been rewritten to bump a count and the identity would
+    /// be lost.
+    ///
+    /// **Cost, stated precisely rather than rounded to "O(changed)":** page *identity* traversal
+    /// is proportional to the tree, because the set of pages each side reaches has to be known
+    /// before either can be pruned against the other. Entry *decoding* — deserialising cells, the
+    /// expensive half — is proportional to what actually changed. `pages_examined` reports the
+    /// second number so the claim can be checked rather than believed.
+    pub fn diff(&self, base_root: PageId, head_root: PageId) -> Result<TreeDiff, FerroError> {
+        // Same root is the common case for an agent that read but never wrote, and it is the
+        // cleanest statement of the invariant: identical pointer, identical tree, nothing read.
+        if base_root == head_root {
+            return Ok(TreeDiff { deltas: Vec::new(), pages_examined: 0 });
+        }
+
+        let base_pages: HashSet<PageId> = self.walk_pages(base_root)?.into_iter().collect();
+        let head_pages: HashSet<PageId> = self.walk_pages(head_root)?.into_iter().collect();
+
+        let mut examined = 0usize;
+        let mut before = BTreeMap::new();
+        self.collect_unshared(base_root, &head_pages, 0, &mut before, &mut examined)?;
+        let mut after = BTreeMap::new();
+        self.collect_unshared(head_root, &base_pages, 0, &mut after, &mut examined)?;
+
+        // A key living in a shared leaf is absent from both maps and correctly reports no change.
+        // A key in a leaf that WAS copied appears in both maps; if its value is untouched the two
+        // sides are equal and it is filtered here, which is what keeps an unchanged neighbour of
+        // an edited row out of the changeset.
+        let keys: BTreeSet<&Vec<u8>> = before.keys().chain(after.keys()).collect();
+        let mut deltas = Vec::new();
+        for k in keys {
+            let b = before.get(k);
+            let a = after.get(k);
+            if b != a {
+                deltas.push((k.clone(), b.cloned(), a.cloned()));
+            }
+        }
+        Ok(TreeDiff { deltas, pages_examined: examined })
+    }
+
+    /// Gather leaf entries from every subtree of `pid` that `other` does not also contain.
+    fn collect_unshared(
+        &self,
+        pid: PageId,
+        other: &HashSet<PageId>,
+        depth: usize,
+        out: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        examined: &mut usize,
+    ) -> Result<(), FerroError> {
+        if depth > MAX_DESCENT {
+            return Err(FerroError::Cow("btree diff exceeded the depth guard".into()));
+        }
+        // The pruning step. Shared page id => shared subtree => nothing in it changed.
+        if other.contains(&pid) {
+            return Ok(());
+        }
+        // Read the node, take what is needed, then drop the handle before recursing so a deep
+        // tree does not pin one frame per level.
+        let children = {
+            let h = self.store.read_page(pid)?;
+            let f = h.read();
+            let ty = PageHeader::read_from(&f.data)?.page_type;
+            let n = Node::new(&f.data);
+            *examined += 1;
+            if ty == PageType::BTreeLeaf {
+                for (k, v) in n.leaf_entries()? {
+                    out.insert(k, v);
+                }
+                Vec::new()
+            } else {
+                n.all_children()?
+            }
+        };
+        for c in children {
+            self.collect_unshared(c, other, depth + 1, out, examined)?;
+        }
+        Ok(())
     }
 
     // ---- write path --------------------------------------------------------------------------
@@ -575,5 +679,185 @@ mod cow_page_links_tests {
         let page = [0u8; PAGE_SIZE];
         let got = CowPageLinks.child_pages(PageType::BTreeLeaf, &page);
         assert_eq!(got.expect("a leaf must not error"), Vec::<PageId>::new());
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use crate::branch::arena::ArenaPageStore;
+    use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::types::LeaseDeadline;
+    use crate::branch::BranchCatalog;
+    use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::storage::disk_manager::DiskManager;
+
+    const ARENA_BASE: u32 = 1024;
+
+    fn tree() -> (tempfile::TempDir, Arc<LogBranchCatalog>, CowTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("diff.db"))
+            .unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(dm));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+        let t = CowTree::new(store as Arc<dyn PageStore>);
+        (dir, catalog, t)
+    }
+
+    fn k(n: u32) -> Vec<u8> {
+        n.to_be_bytes().to_vec()
+    }
+
+    /// A child branch to write on.
+    ///
+    /// Edits have to happen on a *forked* branch, not on the branch that built the tree.
+    /// `cow_page` mutates in place when the page is private to the writing arena, which is what
+    /// keeps a hot branch from shadowing the same page on every write — so writing to trunk right
+    /// after filling trunk rewrites the tree destructively and leaves one version, not two. The
+    /// fork moves the privacy barrier and forces a real copy. This is also the only case that
+    /// matters: a diff exists to compare an agent's branch against its fork point.
+    fn child(cat: &LogBranchCatalog) -> BranchId {
+        cat.fork(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap().branch_id
+    }
+
+    /// Fill a root with `n` keys and return it.
+    fn filled(t: &CowTree, cat: &LogBranchCatalog, n: u32) -> PageId {
+        let e = cat.next_epoch();
+        let mut root = t.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..n {
+            root = t.insert(root, BranchId::TRUNK, e, &k(i), format!("v{i}").as_bytes()).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn identical_roots_diff_to_nothing_without_reading_a_page() {
+        let (_d, cat, t) = tree();
+        let root = filled(&t, &cat, 200);
+        let d = t.diff(root, root).unwrap();
+        assert!(d.deltas.is_empty());
+        assert_eq!(d.pages_examined, 0, "an unchanged branch must cost nothing to diff");
+    }
+
+    #[test]
+    fn an_insert_an_update_and_a_delete_each_report_both_sides() {
+        let (_d, cat, t) = tree();
+        let base = filled(&t, &cat, 50);
+        let b = child(&cat);
+        let e = cat.next_epoch();
+
+        let head = t.insert(base, b, e, &k(999), b"new").unwrap();
+        let d = t.diff(base, head).unwrap();
+        assert_eq!(d.deltas, vec![(k(999), None, Some(b"new".to_vec()))], "insert");
+
+        let head = t.insert(base, b, e, &k(7), b"changed").unwrap();
+        let d = t.diff(base, head).unwrap();
+        assert_eq!(
+            d.deltas,
+            vec![(k(7), Some(b"v7".to_vec()), Some(b"changed".to_vec()))],
+            "update"
+        );
+
+        let head = t.delete(base, b, e, &k(7)).unwrap();
+        let d = t.diff(base, head).unwrap();
+        assert_eq!(d.deltas, vec![(k(7), Some(b"v7".to_vec()), None)], "delete");
+    }
+
+    /// The property that makes the diff usable as a changeset: editing one row must not report
+    /// the rows that happened to share its leaf. Copy-on-write rewrites the whole leaf, so every
+    /// neighbour appears on BOTH sides of the comparison and has to be filtered by value.
+    #[test]
+    fn unchanged_neighbours_of_an_edited_row_are_not_reported() {
+        let (_d, cat, t) = tree();
+        let base = filled(&t, &cat, 300);
+        let b = child(&cat);
+        let e = cat.next_epoch();
+        let head = t.insert(base, b, e, &k(150), b"only-this-one").unwrap();
+
+        let d = t.diff(base, head).unwrap();
+        assert_eq!(
+            d.deltas.len(),
+            1,
+            "one edit reported {} changes; a copied leaf's untouched neighbours leaked in",
+            d.deltas.len()
+        );
+        assert_eq!(d.deltas[0].0, k(150));
+    }
+
+    /// The claim shadow paging is for, measured: one edit in a large tree must not decode the
+    /// tree. Stated as a ratio rather than an absolute so it tracks the tree rather than a
+    /// hand-tuned constant.
+    ///
+    /// 4000 keys, not 400: the vacuity guard below rejected 400, which is only a 4-page tree —
+    /// "decoded less than a quarter of it" is not a claim worth making about 4 pages.
+    #[test]
+    fn one_edit_in_a_large_tree_decodes_only_a_fraction_of_it() {
+        let (_d, cat, t) = tree();
+        let base = filled(&t, &cat, 4000);
+        let total = t.walk_pages(base).unwrap().len();
+        assert!(total > 16, "tree is only {total} pages; the measurement would be vacuous");
+
+        let b = child(&cat);
+        let e = cat.next_epoch();
+        let head = t.insert(base, b, e, &k(2000), b"edited").unwrap();
+
+        let d = t.diff(base, head).unwrap();
+        // Printed, not just asserted: the number is the point of the test.
+        println!(
+            "    diff: {} of {total} pages decoded for a 1-row change in a {}-key tree",
+            d.pages_examined, 4000
+        );
+        assert_eq!(d.deltas.len(), 1);
+        assert!(
+            d.pages_examined * 4 < total,
+            "decoded {} of {total} pages for a one-row change; the shared-subtree pruning is not \
+             working",
+            d.pages_examined
+        );
+        assert!(d.pages_examined > 0, "a real change must have decoded something");
+    }
+
+    /// Diffing is symmetric in structure but not in direction: reversing the roots must turn
+    /// inserts into deletes, not report nothing.
+    #[test]
+    fn reversing_the_roots_reverses_each_delta() {
+        let (_d, cat, t) = tree();
+        let base = filled(&t, &cat, 40);
+        let b = child(&cat);
+        let e = cat.next_epoch();
+        let head = t.insert(base, b, e, &k(500), b"x").unwrap();
+
+        let fwd = t.diff(base, head).unwrap();
+        let rev = t.diff(head, base).unwrap();
+        assert_eq!(fwd.deltas, vec![(k(500), None, Some(b"x".to_vec()))]);
+        assert_eq!(rev.deltas, vec![(k(500), Some(b"x".to_vec()), None)]);
+    }
+
+    #[test]
+    fn many_scattered_edits_are_all_reported_exactly_once() {
+        let (_d, cat, t) = tree();
+        let base = filled(&t, &cat, 300);
+        let b = child(&cat);
+        let e = cat.next_epoch();
+        let mut head = base;
+        let edited: Vec<u32> = (0..300).step_by(37).collect();
+        for i in &edited {
+            head = t.insert(head, b, e, &k(*i), b"E").unwrap();
+        }
+        let d = t.diff(base, head).unwrap();
+        let got: Vec<u32> = d
+            .deltas
+            .iter()
+            .map(|(key, _, _)| u32::from_be_bytes(key[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(got, edited, "scattered edits were dropped, duplicated or reordered");
+        assert!(d.deltas.iter().all(|(_, b, a)| b.is_some() && a.as_deref() == Some(b"E")));
     }
 }
