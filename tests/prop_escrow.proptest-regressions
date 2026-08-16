@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c4c99f4a6ad8756134ab811381502aeca3c6201f45e8a3239708f7e73c3121f0 # shrinks to slack = 5, acts = [Claim(2, 2), Claim(2, 2), Settle(2), Spend(2, 1)]

@@ -226,3 +226,32 @@ fn a_column_with_no_declared_bound_is_not_escrowed() {
     assert_eq!(db.qty(), -480);
     assert_eq!(db.runtime.unclaimed_escrow("inventory", RowId(1), QTY), None);
 }
+
+/// Escrow must bound agents that run one AFTER another, not only concurrent ones.
+///
+/// This was a real hole. `seal` released the claim on merge as well as on abandon, so a MERGED
+/// branch handed its spend back as though the resource had not been consumed. Five sequential
+/// agents each claimed 12 from a pool of 20, each merged, and the counter reached **-40** — the
+/// same failure escrow exists to prevent, arrived at the slow way. Merge now settles instead.
+#[test]
+fn escrow_bounds_sequential_agents_not_just_concurrent_ones() {
+    let mut db = Db::new();
+    db.seed(20);
+    db.runtime.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+
+    let mut granted = 0;
+    for i in 0..5 {
+        let mut s = db.session();
+        db.ok(&format!("BEGIN AGENT SESSION AS 'a{i}' RUN 'r{i}';"), &mut s);
+        let br = s.agent.as_ref().unwrap().branch;
+        if db.runtime.claim_escrow(br, "inventory", RowId(1), QTY, 12).is_ok() {
+            granted += 1;
+            db.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1;", &mut s);
+            db.ok("MERGE;", &mut s);
+        }
+    }
+
+    assert_eq!(granted, 1, "a 20-unit pool granted {granted} claims of 12");
+    assert_eq!(db.qty(), 8, "the counter left its floor: {}", db.qty());
+    assert!(db.qty() >= 0, "escrow let the counter go below its floor");
+}

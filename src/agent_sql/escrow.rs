@@ -149,6 +149,21 @@ impl EscrowLedger {
         }
     }
 
+    /// Settle every cell `branch` spent on: reduce each pool's slack by what was actually spent,
+    /// then drop the branch's entries.
+    ///
+    /// This is the merge counterpart of [`Self::release`], and the distinction is the whole
+    /// mechanism. Releasing a branch whose writes were *published* hands the spend back as though
+    /// it never happened, so the pool refills and the next agent may take the same headroom again.
+    /// That bounds concurrent agents and not sequential ones, which is not a bound at all.
+    pub fn settle_all(&mut self, branch: BranchId) {
+        for pool in self.pools.values_mut() {
+            let spent = pool.spent.remove(&branch.id).unwrap_or(0);
+            pool.slack -= spent;
+            pool.claimed.remove(&branch.id);
+        }
+    }
+
     /// Permanently reduce a cell's slack by what `branch` actually spent, then drop its claim.
     /// Used when a branch's writes are published: the resource really was consumed.
     pub fn settle(&mut self, branch: BranchId, cell: &Cell) {

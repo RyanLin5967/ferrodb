@@ -1408,7 +1408,7 @@ impl AgentRuntime {
         }
         ctx.txn.commit(publish_txn)?;
         self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
-        self.seal(branch)?;
+        self.seal(branch, true)?;
 
         Ok(MergeReport {
             blind_writes: blind,
@@ -1515,15 +1515,29 @@ impl AgentRuntime {
     /// exactly one metadata record. This is the cooperative form of what the lease reaper does
     /// with no client cooperation at all.
     pub fn abandon(&self, branch: BranchId) -> Result<(), FerroError> {
-        self.seal(branch)
+        self.seal(branch, false)
     }
 
-    fn seal(&self, branch: BranchId) -> Result<(), FerroError> {
+    /// Retire a branch. `published` says whether its writes reached the shared tables, which is
+    /// what decides the fate of any escrow it holds.
+    fn seal(&self, branch: BranchId, published: bool) -> Result<(), FerroError> {
         {
             let mut state = self.state.lock().unwrap();
-            // Whether this branch merged or was abandoned, it is done holding headroom. An agent
-            // that dies with a claim outstanding must not strand the resource for everyone else.
-            state.escrow.release(branch);
+            // The escrow outcome depends on whether the writes landed, and conflating the two was
+            // a real hole: releasing a MERGED branch returns its spend to the pool as though the
+            // resource had not been consumed, so five sequential agents each took 12 from a pool
+            // of 20 and drove the counter to -40. Measured, not theorised.
+            //
+            // - published  -> settle: the resource really went, so the pool shrinks by what was spent
+            // - abandoned  -> release: the writes never landed, so every unit goes back
+            //
+            // Either way the branch stops holding headroom, because an agent that dies with a
+            // claim outstanding must not strand the resource for everyone else.
+            if published {
+                state.escrow.settle_all(branch);
+            } else {
+                state.escrow.release(branch);
+            }
             if let Some(ws) = state.workspaces.remove(&branch.id) {
                 state.names.remove(&ws.name);
             }
