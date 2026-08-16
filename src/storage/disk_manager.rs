@@ -131,12 +131,6 @@ impl DiskManager{
         Ok(())
     }
 
-    /// One past the highest page the bitmap has ever handed out.
-    ///
-    /// NOT `next_page_id`: that counter only advances when a whole new bitmap page is chained, so
-    /// it still reads 1 after 500 allocations. Anything deciding where a second allocator's
-    /// region may safely begin has to consult the bitmap itself, or it will place that region on
-    /// top of pages this allocator already owns.
     /// Highest page the **bitmap allocator** has handed out, plus one.
     ///
     /// Distinct from [`DiskManager::high_water`], which additionally clamps with `next_page_id`.
@@ -215,16 +209,33 @@ impl DiskManager{
     pub fn reserve_from(&self, base: u32) -> Result<(), FerroError> {
         let _guard = self.bitmap_lock.lock().unwrap();
         let current = self.arena_floor.load(Ordering::SeqCst);
-        if current != u32::MAX && base < current {
+        if current == u32::MAX {
+            self.arena_floor.store(base, Ordering::SeqCst);
+            return Ok(());
+        }
+        if base == current {
+            // Reattaching to the same region. This is a restart, and the branch module's harness
+            // does it deliberately (`fresh_store()` passes `self.store.base_page()`).
+            return Ok(());
+        }
+        if base < current {
             return Err(FerroError::Io(format!(
                 "page region [{}, inf) is already reserved; cannot lower the floor to {}",
                 current, base
             )));
         }
-        if current == u32::MAX {
-            self.arena_floor.store(base, Ordering::SeqCst);
-        }
-        Ok(())
+        // base > current. The old code returned Ok here and recorded NOTHING, which is the worst
+        // of the three options: the caller is told its region is reserved while the first store's
+        // extent bump pointer has no upper bound and will walk straight into it. Recording it
+        // instead would be just as wrong — raising the floor puts the first store's own extents
+        // back into the bitmap's circulation. There is no correct single-floor answer for two
+        // distinct live regions, so refuse and say why.
+        Err(FerroError::Io(format!(
+            "page region [{}, inf) is already reserved by another store; a second region at {} \
+             cannot be represented by a single floor, and the existing store's extents are \
+             unbounded above",
+            current, base
+        )))
     }
 
     /// First page this allocator must not touch.
@@ -438,6 +449,43 @@ mod tests {
         );
         // And the page it served must not be the new bitmap page itself.
         assert_ne!(got, BITS_PER_BITMAP, "served the new bitmap page as data");
+        Ok(())
+    }
+
+    /// S4: a second reservation at a HIGHER base used to return Ok while recording nothing.
+    ///
+    /// The caller then believes its region is reserved when it is not, and the first store's
+    /// extent bump pointer — which has no upper bound — walks into it. Refusing is the only
+    /// honest answer: a single floor cannot represent two distinct live regions.
+    #[test]
+    pub fn a_second_reservation_at_a_higher_base_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("res.db"))?;
+        let dm = DiskManager::new(temp_file).unwrap();
+
+        dm.reserve_from(1024).expect("first reservation");
+        assert_eq!(dm.arena_floor(), 1024);
+
+        let second = dm.reserve_from(2048);
+        assert!(second.is_err(), "a second region at 2048 was silently accepted");
+        assert_eq!(dm.arena_floor(), 1024, "the floor moved on a refused reservation");
+        Ok(())
+    }
+
+    /// Control: reattaching at the SAME base must still succeed, because that is a restart and
+    /// the branch harness depends on it. Without this, the fix above would break every reopen.
+    #[test]
+    pub fn reattaching_at_the_same_base_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_file = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("res2.db"))?;
+        let dm = DiskManager::new(temp_file).unwrap();
+        dm.reserve_from(1024).expect("first");
+        dm.reserve_from(1024).expect("reattach at the same base must be allowed");
+        assert_eq!(dm.arena_floor(), 1024);
+        // ...and lowering is still refused.
+        assert!(dm.reserve_from(512).is_err(), "lowering the floor was accepted");
         Ok(())
     }
 
