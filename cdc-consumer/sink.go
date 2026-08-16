@@ -8,10 +8,20 @@ package main
 //
 // # The guarantee the feed gives, and what it forces on a sink
 //
-// The feed is at-least-once. A consumer that acts on an event and dies before recording its
-// position sees that event again; a consumer resuming from a snapshot handoff sees changes the
-// snapshot already contained. So a sink WILL be handed the same event twice, and can be handed a
-// stale one after a newer one. Applying either naively is not a small bug:
+// The feed is at-least-once, and a sink cannot assume otherwise even though one of the two sources
+// of duplication has since been closed:
+//
+//   - A consumer that acts on an event and dies before recording its position sees that event
+//     again on restart. Nothing on the source side can prevent this — it is a property of the
+//     consumer's own checkpointing.
+//   - A consumer resuming from a snapshot handoff used to see changes the snapshot already
+//     contained. The exact cutover (`snapshot_table_exact` with
+//     `FeedStreamer::resuming_after_snapshot`) removes that one: the stream skips exactly the
+//     transactions the snapshot held. A consumer that cuts over the older way
+//     (`snapshot_table`, which brackets the read with LSNs and cannot know) still sees them.
+//
+// So a sink WILL be handed the same event twice, and can be handed a stale one after a newer one.
+// Applying either naively is not a small bug:
 //
 //   - Re-applying an old UPDATE overwrites current data with a previous value.
 //   - Re-applying an INSERT after a DELETE resurrects a row the source no longer has.
