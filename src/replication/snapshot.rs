@@ -527,6 +527,46 @@ mod tests {
         txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
     }
 
+    /// **The same, for a failure that happens before the scan is even reached.**
+    ///
+    /// The test above covers a scan that fails; this one covers the setup failing underneath it.
+    /// They were different code paths: this call used to pin the resume point *itself*, on a line
+    /// between `begin_snapshot_read` and `end_read_only`, and a `?` there returned with the reader
+    /// still in `att` and its id known to nobody. `checkpoint` refuses while any transaction is
+    /// active, so the database would never checkpoint again — every later CREATE TABLE, CREATE
+    /// INDEX and CLI shutdown failing with "checkpoint with active txns" from then on.
+    ///
+    /// There is no such line any more: the handoff arrives pinned, so nothing fallible sits between
+    /// opening the reader and closing it. This test pins that structural claim in place by driving
+    /// the failure that used to trigger it.
+    #[test]
+    fn a_snapshot_whose_resume_point_cannot_be_pinned_leaves_no_reader_behind() {
+        use std::sync::atomic::Ordering;
+        let (_d, txn) = engine("exact_pin_fail");
+
+        // An open transaction whose `Begin` becomes the resume point, then the log truncated out
+        // from under it. `checkpoint` would refuse to do this — guarding `att` is its job — so the
+        // WAL is told directly. Fault injection, deliberately: the path is rare and used to be
+        // unrecoverable.
+        let open = txn.begin().unwrap();
+        txn.wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
+
+        let mut buf = Vec::new();
+        let err = snapshot_table_exact("t", &txn, &mut buf, |_reader| Ok(rows()))
+            .expect_err("a snapshot was handed back over a resume point the log no longer holds");
+        assert!(format!("{err}").contains("truncated"), "wrong reason: {err}");
+        assert!(buf.is_empty(), "a snapshot that never read anything wrote rows");
+
+        // Only the transaction this test opened is still active; the reader did not survive.
+        let live: Vec<u64> = txn.att.lock().unwrap().keys().copied().collect();
+        assert_eq!(live, vec![open], "the failed snapshot left its reader open");
+
+        // Committed rather than aborted only because an abort walks an undo chain this test just
+        // truncated away.
+        txn.commit(open).unwrap();
+        txn.checkpoint().expect("a leaked reader is blocking every checkpoint");
+    }
+
     /// A failing read must not produce a handoff. Returning one would tell the consumer to start
     /// streaming from a point whose prior state it never received.
     #[test]

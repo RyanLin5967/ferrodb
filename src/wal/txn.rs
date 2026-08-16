@@ -308,13 +308,21 @@ impl TxnManager {
             )));
         }
         // **The entry leaves `att` whether or not the `TxnEnd` could be written.** Ordering these
-        // the other way round - append with `?`, then remove - meant an IO error on the append
-        // returned to a caller who had already handed over responsibility for this transaction and
-        // now had nothing useful to do with it. Retrying calls back into a WAL that just failed;
-        // not retrying leaves the reader active for ever, and an active transaction blocks every
-        // checkpoint. The error is still reported; what changes is that reporting it no longer
-        // wedges the database. See `abandon_reader` for why a reader with no `TxnEnd` record is
-        // safe for recovery.
+        // the other way round - append with `?`, then remove - returns an error to a caller who has
+        // already handed over responsibility for this transaction and now has nothing useful to do
+        // with it. Retrying calls back into a WAL that just failed; not retrying leaves the reader
+        // active for ever, and an active transaction blocks every checkpoint. The error is still
+        // reported; what changes is that reporting it no longer wedges the database. See
+        // `abandon_reader` for why a reader with no `TxnEnd` record is safe for recovery.
+        //
+        // **Latent, not live, and worth saying so rather than implying a fix for a live bug.**
+        // `append_chained` can fail two ways: the entry is missing from `att`, which cannot happen
+        // here because it was just checked and would mean no leak anyway; or `WalManager::append`
+        // returns `Err`, which it never does today - it extends an in-memory buffer and ends in
+        // `Ok(lsn)` unconditionally (`wal::log`). So this ordering cannot currently be observed to
+        // matter, and there is no test that forces it, because nothing can. It goes in because the
+        // day `append` does any IO - a bounded buffer that flushes when full, a direct write - the
+        // failure becomes reachable and its cost is the whole database, not one transaction.
         let appended = self.append_chained(txn_id, &RecKind::TxnEnd);
         self.att.lock().unwrap().remove(&txn_id);
         appended?;
@@ -842,6 +850,54 @@ use super::*;
         );
         let rows: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
         assert!(rows.is_empty(), "the reader's write survived its rollback");
+    }
+
+    /// **A snapshot read that fails must not leave its reader behind.**
+    ///
+    /// This is the expensive one. The reader is inserted into `att` before anything that can fail,
+    /// and its id is not handed out until the call succeeds — so a failure after the insert leaves
+    /// an active transaction nobody can name, let alone close. `checkpoint` refuses while `att` is
+    /// non-empty, so the database never checkpoints again: every later CREATE TABLE, CREATE INDEX
+    /// and CLI shutdown fails with "checkpoint with active txns" for the life of the process. One
+    /// failed snapshot takes the whole database with it.
+    ///
+    /// Reaching the failure needs the log truncated out from under an open transaction, which
+    /// `checkpoint` will not do — defending `att` is precisely its job — so the WAL is told
+    /// directly. That is fault injection rather than a scenario, and it is the point: this path is
+    /// rare, and a rare path that wedges the process permanently is worth a deliberate test.
+    #[test]
+    fn a_snapshot_reader_is_not_leaked_when_its_handoff_cannot_be_pinned() {
+        let (_bp, wal, txn, _dir) = setup();
+
+        // Its `Begin` is what `begin_snapshot_read` will choose as the resume point, being the
+        // oldest still in flight.
+        let open = txn.begin().unwrap();
+
+        // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
+        // resume point must fail.
+        wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
+        assert!(
+            wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
+            "the log was not truncated past the open transaction, so this test proves nothing"
+        );
+
+        let err = txn.begin_snapshot_read().expect_err("a handoff below the log's base was given out");
+        assert!(format!("{err}").contains("truncated"), "wrong reason: {err}");
+
+        // The failed reader is gone; only the transaction this test opened is still active.
+        let live: Vec<u64> = txn.att.lock().unwrap().keys().copied().collect();
+        assert_eq!(
+            live,
+            vec![open],
+            "the failed snapshot left its reader in the active transaction table"
+        );
+
+        // And the consequence, asserted as a consequence rather than as internal state: with the
+        // reader leaked this refuses for ever. Committed rather than aborted only because an abort
+        // walks its undo chain, and this test just truncated that chain away.
+        txn.commit(open).unwrap();
+        txn.checkpoint()
+            .expect("a failed snapshot left a reader open, so checkpoints are blocked for good");
     }
 
     /// **Transaction id 0 is never handed out, and something now depends on that.**

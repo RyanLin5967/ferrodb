@@ -76,7 +76,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TESTS="integration_checkpoint_pressure integration_cdc_latency integration_truncation_race"
+          # integration_cdc_cutover and its concurrent companion joined this list after both were
+          # found green at the default interval and broken at 1: the snapshot-to-stream handoff was
+          # published without a pin, so the log was truncated out from under the resume point and
+          # the consumer was refused before reading a record. Exactly the class this gate is for.
+          TESTS="integration_checkpoint_pressure integration_cdc_latency integration_truncation_race integration_cdc_cutover integration_cdc_cutover_concurrent"
           # Refuse rather than silently cover nothing: a renamed or deleted test file would
           # otherwise make this step pass by running an empty list, which is the failure mode this
           # whole gate exists to prevent.
