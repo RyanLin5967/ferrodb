@@ -151,6 +151,13 @@ pub struct MergeReport {
     pub into: BranchId,
     pub outcome: MergeOutcome,
     pub rows: Vec<RowMergeOutcome>,
+    /// Rows the branch changed **without ever reading** — DESIGN.md section 4's cheap metric.
+    ///
+    /// Reported for every merge, whatever the outcome. It is a *heuristic*, and DESIGN.md's
+    /// taxonomy sends a heuristic to quarantine rather than to rejection; quarantine does not
+    /// exist yet, so this tier reports and does not decide. A non-empty list is a signal for a
+    /// human or a later tier, never on its own a reason the merge did not apply.
+    pub blind_writes: Vec<(TableId, RowId)>,
     /// True when the merge was published to the target. False means the merge was rejected and
     /// the target was left **untouched** — which is the only honest report for a conflict, since
     /// a half-applied merge is exactly what a merge exists to prevent.

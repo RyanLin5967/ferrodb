@@ -20,7 +20,7 @@
 //!   row ids yet. The design is explicit that the PK is a constraint and not identity; when the
 //!   storage layer mints real surrogates this function is the single place to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_sql::changeset::{
@@ -514,6 +514,15 @@ impl AgentRuntime {
     }
 
     // ---- reads -----------------------------------------------------------------------------
+
+    /// Rows this branch wrote without ever reading. See [`blind_writes_of`].
+    pub fn blind_writes(&self, branch: BranchId) -> Result<Vec<(TableId, RowId)>, FerroError> {
+        let state = self.state.lock().unwrap();
+        let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
+            FerroError::Branch(format!("no agent session on branch {branch}"))
+        })?;
+        Ok(blind_writes_of(&ws.rows, &ws.reads))
+    }
 
     /// The branch's changeset, derived from the PAGES rather than from the workspace map.
     ///
@@ -1026,6 +1035,7 @@ impl AgentRuntime {
                 tables: ws.tables.clone(),
                 ops: ws.frame.ops.clone(),
                 guards: ws.frame.guards.clone(),
+                reads: ws.reads.clone(),
             }
         };
 
@@ -1228,6 +1238,13 @@ impl AgentRuntime {
             }
         }
 
+        // Gate tier: evaluated for every merge, reported whatever the outcome. It is a
+        // *heuristic* check in DESIGN.md's taxonomy, and the outcome for a heuristic is
+        // quarantine rather than rejection — which does not exist yet — so this tier reports and
+        // does not decide. Deciding on it before quarantine exists would mean either rejecting on
+        // a heuristic or silently ignoring it, and both are worse than saying what was seen.
+        let blind = blind_writes_of(&snapshot.rows, &snapshot.reads);
+
         let outcome = MergeReport::aggregate(&row_outcomes);
         let merge_id = {
             let mut state = self.state.lock().unwrap();
@@ -1244,6 +1261,7 @@ impl AgentRuntime {
                 into: target,
                 outcome,
                 rows: row_outcomes,
+                blind_writes: blind,
                 applied_to_target: false,
             });
         }
@@ -1264,6 +1282,7 @@ impl AgentRuntime {
         self.seal(branch)?;
 
         Ok(MergeReport {
+            blind_writes: blind,
             merge_id,
             from: branch,
             into: target,
@@ -1524,6 +1543,44 @@ struct WorkspaceSnapshot {
     tables: BTreeMap<u32, String>,
     ops: Vec<Op>,
     guards: Vec<Guard>,
+    reads: Vec<crate::provenance::readset::ReadSet>,
+}
+
+/// Rows a branch changed **without ever looking at them** — DESIGN.md section 4's cheap metric.
+///
+/// Nobody else in the data-quality literature has this, for the mundane reason that nobody else
+/// retains read-sets. It costs one set difference and has no threshold to tune.
+///
+/// **Deliberately biased toward precision over recall**, because the metric is only useful if a
+/// hit means something. A predicate read (a range or a full scan) suppresses reporting for the
+/// whole table, not just the rows inside the range: computing exact range membership would need
+/// the row's column value at read time, and guessing it would manufacture false positives. So a
+/// blind write reported here really is one; some real ones are missed when the agent scanned the
+/// same table for an unrelated reason. Under-reporting is the safe direction — an operator who
+/// stops trusting the metric gets nothing from it.
+fn blind_writes_of(
+    rows: &BTreeMap<(u32, u64), RowState>,
+    reads: &[crate::provenance::readset::ReadSet],
+) -> Vec<(TableId, RowId)> {
+    use crate::provenance::readset::ReadSet;
+    let mut looked_at: BTreeSet<(u32, u64)> = BTreeSet::new();
+    let mut scanned_tables: BTreeSet<u32> = BTreeSet::new();
+    for r in reads {
+        match r {
+            ReadSet::ExactVersions(vs) => {
+                for v in vs {
+                    looked_at.insert((v.tbl.0, v.row.0));
+                }
+            }
+            ReadSet::Predicate(p) => {
+                scanned_tables.insert(p.tbl.0);
+            }
+        }
+    }
+    rows.keys()
+        .filter(|(t, r)| !looked_at.contains(&(*t, *r)) && !scanned_tables.contains(t))
+        .map(|(t, r)| (TableId(*t), RowId(*r)))
+        .collect()
 }
 
 /// Who to attribute the versions a write produces to. `None` leaves them `ProvId::NONE`.
