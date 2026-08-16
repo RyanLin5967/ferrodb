@@ -762,6 +762,29 @@ use super::*;
         assert!(rows.is_empty(), "the reader's write survived its rollback");
     }
 
+    /// **The high water mark is exclusive, and nothing in the matrix below pins that.**
+    ///
+    /// Every case there that sits exactly on the mark is also the view's own transaction, so it
+    /// passes through the `ts == txn_id` branch and an off-by-one in the comparison goes unseen.
+    /// A statement-level view has `txn_id` 0 and `high_water` set to the *next* id to be handed
+    /// out, so making the bound inclusive would show a reader the work of a transaction that had
+    /// not even begun, let alone committed.
+    #[test]
+    fn the_high_water_mark_is_exclusive() {
+        let snapshot = Snapshot { high_water: 10, active: HashSet::new() };
+        assert!(!snapshot.includes(10), "the transaction at the mark was reported as included");
+        assert!(snapshot.includes(9), "the transaction below the mark was reported as excluded");
+
+        // Through a view whose own id is not the mark, so the `ts == txn_id` branch cannot mask it.
+        let view = ReadView { snapshot, txn_id: 0 };
+        let h = |b, e| VersionHeader { begin_ts: b, end_ts: e, prev_page: 0, prev_slot: 0 };
+        assert!(
+            !view.visible(&h(10, 0)),
+            "a version written by the next transaction to begin was visible before it existed"
+        );
+        assert!(view.visible(&h(9, 0)));
+    }
+
     #[test]
     fn test_visibility_matrix() {
         let view = ReadView { snapshot: Snapshot { high_water: 10, active: HashSet::from([7])}, txn_id: 10};
