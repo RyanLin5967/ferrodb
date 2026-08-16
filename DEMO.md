@@ -146,9 +146,15 @@ Listed because each one bounds a verdict above.
    be demonstrated separately from 2–7.
 2. **`BEGIN AGENT SESSION` allocates no pages, but not because it is efficient** — the SQL layer
    has no pages to allocate. Criterion 1's zero is measured in Act I, where it is meaningful.
-3. **The SQL surface's branch catalog and effect log are memory-backed by default.**
-   `AgentRuntime::new` uses `LogBranchCatalog::in_memory` and `MemEffectLog`. The durable
-   implementations exist and are used elsewhere; the default agent session does not get them.
+3. **The SQL surface's branch catalog and effect log are memory-backed by default** — but the two
+   are memory-backed for different reasons, and the difference matters:
+   - `AgentRuntime::new` uses `LogBranchCatalog::in_memory`. That *is* the durable branch-engine
+     implementation (generation counters, append-only record log, id release on reap); it is simply
+     constructed without a file, because `Session::new` carries no path. `LogBranchCatalog::open`
+     plus `AgentRuntime::with_catalog` gives the same code a disk. `tests/integration_sql_on_durable_branches.rs`
+     runs the surface that way.
+   - The effect log is `MemEffectLog`, which is a memory implementation rather than a durable one
+     configured in memory. Nothing persists captured frames today.
 
 ### Criterion 8's mechanism is proven; its scheduling does not exist
 
