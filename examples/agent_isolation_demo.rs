@@ -119,8 +119,13 @@ impl Ledger {
             }
         }
         println!("\n  Read the 'What this does not do yet' section of DEMO.md before quoting any");
-        println!("  of the above. In particular the two acts below run on layers that are not");
-        println!("  wired to each other, which bounds what a MET in Act II can mean about pages.");
+        println!("  of the above. Two boundaries in particular travel with these numbers, and a");
+        println!("  reader who stops at the table above will not have them:");
+        println!("    · The two acts run on layers that are NOT wired to each other, which bounds");
+        println!("      what a MET in Act II can mean about pages.");
+        println!("    · Criterion 7 holds for a guard naming the amount taken (`qty >= 12`).");
+        println!("      Written as the invariant (`qty >= 0`) the same case is not refused and the");
+        println!("      counter reaches -4 — measured above, not argued.");
     }
 }
 
@@ -856,7 +861,10 @@ as before/after images. Reported as Commuting, not Clean, because both sides wro
 
 /// Criterion 7 — a guard violation is rejected and the predicate is handed back.
 fn criterion_7_guard(led: &mut Ledger) {
-    criterion(7, "A branch violating `qty >= 0` is rejected and THE VIOLATED PREDICATE returned");
+    // The guard below is `qty >= 12`, not `qty >= 0`. That is not a cosmetic choice and the
+    // criterion must not claim otherwise: the `qty >= 0` phrasing is the one this system CANNOT
+    // hold, and it is measured at the end of this function.
+    criterion(7, "A branch violating its own guard is rejected and THE VIOLATED PREDICATE returned");
     let mut db = Db::new();
     db.seed();
     let (mut a, mut b) = (db.session(), db.session());
@@ -887,11 +895,39 @@ fn criterion_7_guard(led: &mut Ledger) {
     led.check(7, "nothing was published, so the counter never went negative", nothing_published);
     note("the agent can now retry with real feedback rather than guessing why it failed");
 
+    // The boundary. Same scenario, but with the guard written as the INVARIANT rather than as the
+    // amount being taken — which is how almost anyone would write "never let stock go below zero".
+    println!("\n    THE BOUNDARY — the same case with the guard written as `qty >= 0`:");
+    let mut db2 = Db::new();
+    db2.seed();
+    let (mut c, mut d) = (db2.session(), db2.session());
+    db2.ok("BEGIN AGENT SESSION AS 'c' RUN 'r3';", &mut c);
+    db2.ok("BEGIN AGENT SESSION AS 'd' RUN 'r4';", &mut d);
+    db2.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 0;", &mut c);
+    db2.ok("UPDATE inventory SET qty = qty - 12 WHERE id = 1 AND qty >= 0;", &mut d);
+    let m1 = report_of(db2.ok("MERGE;", &mut c));
+    println!("      agent-c merges: {}  qty(1) = {}", m1.outcome.name(), db2.qty(1));
+    let m2 = report_of(db2.ok("MERGE;", &mut d));
+    let floor_qty = db2.qty(1);
+    println!("      agent-d merges: {}  qty(1) = {}", m2.outcome.name(), floor_qty);
+    println!(
+        "\n      A guard is a PRECONDITION, re-evaluated against the merged state BEFORE this\n      \
+         branch's ops: 8 >= 0 passes, and only then does the composed -12 cross the bound.\n      \
+         ferrobranch enforces the predicate the agent wrote, not the invariant the schema means,\n      \
+         and there are no declarative CHECK constraints, so nothing else enforces it either."
+    );
+
     led.record(
         7,
         "Guard violation rejected with the violated predicate returned",
         if conflicted && got_predicate && nothing_published { Verdict::Met } else { Verdict::NotMet },
-        format!("Returned predicate: {:?}", predicates),
+        format!(
+            "Returned predicate: {:?}. BOUNDARY: this holds for a guard naming the amount taken \
+             (`qty >= 12`). Written as the invariant (`qty >= 0`) the same case is NOT refused and \
+             main ends at {}. DESIGN.md section 3 uses `qty >= 0` as its worked example and says \
+             re-evaluation yields Conflict; it does not. See DEMO.md criterion 7.",
+            predicates, floor_qty
+        ),
     );
 }
 

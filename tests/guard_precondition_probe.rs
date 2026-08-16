@@ -264,3 +264,52 @@ fn a_guarded_delete_merges_solo() {
         _ => panic!("expected rows"),
     }
 }
+
+/// **C5 — a measured limitation, pinned so it cannot quietly change.**
+///
+/// This test asserts behaviour that is WRONG for a bounded counter. It is here so the boundary is
+/// a fact in the suite rather than a sentence in a doc, and so that whoever fixes it has to delete
+/// this test deliberately instead of discovering the guarantee had silently moved.
+///
+/// A guard is a **precondition**, re-evaluated against the merged state as it stands *before* this
+/// branch's ops. `qty >= 0` is therefore satisfied at `8 >= 0`, and the composed `-12` then drives
+/// the row to `-4`. The predicate that would actually hold the line is `qty >= 12` — the amount
+/// being taken — which the sibling test above shows is correctly refused.
+///
+/// So ferrobranch enforces the precondition the agent wrote, not the invariant the schema means.
+/// There are no declarative CHECK constraints, so nothing else can enforce it either.
+///
+/// DESIGN.md section 3 says bounded counters "need no special merge logic — compose the Adds
+/// normally, then re-evaluate the guard against the merged state. If `qty >= 0` now fails →
+/// Conflict". That is the exact guard used here, and re-evaluating it does NOT fail. The design's
+/// own example does not hold; see ledger row C5. The fix is D5 (escrow claims at fork), which
+/// turns this into a refusal at write time rather than a wrong number in main.
+#[test]
+fn a_floor_guard_does_not_protect_the_floor_and_the_counter_goes_negative() {
+    let mut db = Db::new();
+    db.seed();
+    let (mut a, mut b) = (db.session(), db.session());
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'ra';", &mut a);
+    db.ok("BEGIN AGENT SESSION AS 'agent-b' RUN 'rb';", &mut b);
+    // Each is individually legal against the seeded 20, and each writes the invariant the way a
+    // person naturally would: "never let stock go below zero".
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE qty >= 0 AND id = 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = qty - 12 WHERE qty >= 0 AND id = 1;", &mut b);
+
+    let first = report(db.ok("MERGE;", &mut a));
+    assert!(!first.to_string().to_lowercase().contains("conflict"), "first merge: {}", first);
+    assert_eq!(qty_of(&mut db, 1), 8, "first merge should publish 20 - 12");
+
+    let second = report(db.ok("MERGE;", &mut b));
+    assert!(
+        !second.to_string().to_lowercase().contains("conflict"),
+        "the second merge is NOT refused - that is the whole point of this test: {}",
+        second
+    );
+    assert_eq!(
+        qty_of(&mut db, 1),
+        -4,
+        "if this is no longer -4 the limitation has been fixed; delete this test and update \
+         DEMO.md and ledger C5 rather than adjusting the number"
+    );
+}

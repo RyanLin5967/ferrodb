@@ -130,7 +130,38 @@ PREDICATES HANDED BACK TO THE AGENT:
   id = 1 AND qty >= 12
 ```
 
-Nothing is published, and the counter never goes negative.
+Nothing is published, and with **this** guard the counter never goes negative.
+
+**The measured boundary — and it is the sharpest limitation in the system.** Read `qty >= 12` above
+carefully: the guard names *the amount being taken*, not the invariant. Write the invariant the way
+almost anyone would — `qty >= 0`, "never let stock go below zero" — and the same scenario ends at
+**−4**:
+
+```
+agent-a:  UPDATE inventory SET qty = qty - 12 WHERE qty >= 0 AND id = 1;   -- merges, 20 -> 8
+agent-b:  UPDATE inventory SET qty = qty - 12 WHERE qty >= 0 AND id = 1;   -- ALSO merges
+FINAL qty on main:  -4
+```
+
+A guard is a **precondition**, re-evaluated against the merged state as it stands *before* this
+branch's ops. `8 >= 0` is satisfied, so the merge is admitted, and only then does the composed
+`−12` cross the bound. A precondition does not imply the postcondition, and ferrobranch has no
+declarative `CHECK` constraints, so nothing else enforces the invariant either.
+
+**ferrobranch enforces the predicate the agent wrote, not the invariant the schema means.** That is
+a real limitation, not a phrasing quibble: the correct guard for a bounded counter is
+`qty >= <amount being taken>`, and getting it wrong fails silently and publishes a wrong number.
+
+It is pinned by
+`tests/guard_precondition_probe.rs::a_floor_guard_does_not_protect_the_floor_and_the_counter_goes_negative`,
+which asserts the `−4` so the boundary cannot move without someone deleting that test on purpose.
+
+Worth stating plainly because it contradicts the design: `DESIGN.md` section 3 says bounded counters
+"need no special merge logic — compose the `Add`s normally, then re-evaluate the guard against the
+merged state. If `qty >= 0` now fails → `Conflict`." That is the exact guard above, and
+re-evaluating it does **not** fail. The design's own worked example does not hold. The mechanism
+that would fix it is escrow at fork (`DESIGN.md` section on bounded counters / ledger D5), which
+converts this into a refusal at **write** time instead of a wrong number in main.
 
 ### 10 — causal revert through read-sets
 
@@ -189,6 +220,16 @@ Listed because each one bounds a verdict above.
    first column because no layer mints surrogate row ids yet. `DESIGN.md` is explicit that the PK is
    a *constraint*, not identity, so **updating a primary key would currently look like a delete plus
    an insert**. Every caller goes through that one function, so there is a single place to fix it.
+
+### Not smaller: a floor guard does not protect the floor
+
+9b. **A bounded counter can be driven past its bound by a guard that names the bound.** Two agents
+    each taking 12 from 20 under `WHERE qty >= 0` both merge, and main ends at **−4** — measured,
+    not reasoned about, and pinned by a test. Guards are preconditions re-evaluated against merged
+    state; `8 >= 0` passes and the composed decrement then crosses zero. There are no declarative
+    `CHECK` constraints, so nothing enforces the invariant the schema means. Full working in
+    "7 — the violated predicate comes back" above, including where it contradicts `DESIGN.md`
+    section 3. This is the concrete case for escrow claims at fork.
 
 ### Smaller, but real
 
