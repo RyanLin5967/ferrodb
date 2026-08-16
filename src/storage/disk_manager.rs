@@ -137,6 +137,15 @@ impl DiskManager{
     /// high-water mark. Registering a second, lower floor is refused rather than accepted: the
     /// pages between the two are already inside the first store's extents, and lowering the floor
     /// would put them back in circulation.
+    ///
+    /// **Blind spot, stated deliberately.** This guard separates *this* allocator from the arena
+    /// region. It says nothing about two arena stores sharing that region with each other: a
+    /// second store registered at the same or a higher base is accepted, and if it is live at the
+    /// same time as the first they will hand out the same pages. That is not hypothetical — the
+    /// branch module's own harness constructs a second store at the same base on purpose, to
+    /// simulate a restart. It is safe there only because the first is no longer being written
+    /// through. Nothing here enforces that, so two *concurrent* arena stores over one file remain
+    /// unsafe.
     pub fn reserve_from(&self, base: u32) -> Result<(), FerroError> {
         let _guard = self.bitmap_lock.lock().unwrap();
         let current = self.arena_floor.load(Ordering::SeqCst);
