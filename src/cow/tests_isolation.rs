@@ -481,6 +481,50 @@ fn arenas_roll_over_when_an_extent_fills_and_stay_owned_by_one_branch() {
     }
 }
 
+/// Every other test shrinks the extent to keep the fixtures small, which means the default
+/// constructor — the one the branch engine will actually call — would otherwise be untested.
+#[test]
+fn the_default_one_megabyte_extent_works_end_to_end() {
+    use crate::branch::types::ARENA_EXTENT_PAGES;
+    use crate::storage::disk_manager::PAGE_SIZE;
+    assert_eq!(ARENA_EXTENT_PAGES as usize * PAGE_SIZE, 1 << 20, "an extent is not 1MB");
+
+    let dir = TempDir::new().unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("cow.db"))
+        .unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let store = Arc::new(CowStore::new(pool));
+    let tree = CowTree::new(store.clone() as Arc<dyn PageStore>);
+
+    let mut root = tree.create(BranchId::TRUNK, Epoch(1)).unwrap();
+    for i in 0..600u32 {
+        root = tree
+            .insert(root, BranchId::TRUNK, Epoch(2 + i as u64), format!("k{:05}", i).as_bytes(), b"v")
+            .unwrap();
+    }
+    let baseline = store.live_page_count().unwrap();
+    assert!(baseline > 1);
+
+    store.register_branch(B1, Some(BranchId::TRUNK), Epoch(5000)).unwrap();
+    let mut r1 = root;
+    for i in 0..600u32 {
+        r1 = tree
+            .insert(r1, B1, Epoch(6000 + i as u64), format!("k{:05}", i).as_bytes(), b"child")
+            .unwrap();
+    }
+    assert_eq!(tree.get(root, b"k00300").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(tree.get(r1, b"k00300").unwrap(), Some(b"child".to_vec()));
+
+    store.flush().unwrap();
+    store.forget_branch(B1).unwrap();
+    assert_eq!(store.live_page_count().unwrap(), baseline);
+}
+
 #[test]
 fn freeing_an_arena_is_one_operation_not_a_per_page_scan() {
     let f = Fixture::new(16);
