@@ -137,8 +137,22 @@ impl DiskManager{
     /// it still reads 1 after 500 allocations. Anything deciding where a second allocator's
     /// region may safely begin has to consult the bitmap itself, or it will place that region on
     /// top of pages this allocator already owns.
-    pub fn high_water(&self) -> Result<u32, FerroError> {
+    /// Highest page the **bitmap allocator** has handed out, plus one.
+    ///
+    /// Distinct from [`DiskManager::high_water`], which additionally clamps with `next_page_id`.
+    /// That clamp is right for placing a *new* arena, but wrong for reattaching to an existing
+    /// one: on reopen `next_page_id` is derived from the file length, and an arena's pages extend
+    /// the file without ever setting a bitmap bit, so the clamped mark sits *above* the arena's
+    /// own base and would refuse the arena the very region it owns. This answers the narrower
+    /// question — what does the bitmap allocator itself claim? — which is what an arena reattach
+    /// needs to check against.
+    pub fn bitmap_high_water(&self) -> Result<u32, FerroError> {
         let _guard = self.bitmap_lock.lock().unwrap();
+        self.scan_bitmap_high_water()
+    }
+
+    /// Caller must hold `bitmap_lock`; the mutex is not reentrant.
+    fn scan_bitmap_high_water(&self) -> Result<u32, FerroError> {
         let mut current_bitmap_id = 0;
         let mut global_offset = 0u32;
         let mut highest: Option<u32> = None;
@@ -158,18 +172,28 @@ impl DiskManager{
             current_bitmap_id = next_bitmap_id;
             global_offset += BITS_PER_BITMAP;
         }
-        let from_bitmap = highest.map(|h| h + 1).unwrap_or(0);
-        // Deliberately NOT bounded by the file length, though "every page that exists" sounds
-        // like the safer answer. This function answers a narrower question: how far does THIS
-        // allocator's ownership reach. An arena's pages extend the file without ever setting a
-        // bit here, so folding the file length in makes the mark climb above the arena's own
-        // base — and `ArenaPageStore::new`, which refuses a base below the mark, can then never
-        // reopen a store at the base it already uses. Tried it; it breaks every restart test
-        // (`free_space_map_survives_a_restart`, `checkpoint_round_trips_through_a_file`,
-        // `branches_abandoned_before_a_restart_are_still_reaped_after_it`).
-        //
-        // The file length is the right instrument for "what pages exist" and the wrong one for
-        // "what does the bitmap own". Anything needing the former should ask the file directly.
+        Ok(highest.map(|h| h + 1).unwrap_or(0))
+    }
+
+    /// Where a **new** allocator may start: past everything the bitmap owns, and past the page
+    /// counter as well.
+    ///
+    /// Deliberately NOT bounded by an explicit file-length read, though "every page that exists"
+    /// sounds like the safer answer. An arena's pages extend the file without ever setting a bit
+    /// here, so folding the file length in makes the mark climb above the arena's own base, and
+    /// `ArenaPageStore::new` — which refuses a base below the mark — could then never reopen a
+    /// store at the base it already uses. Tried it; it breaks every restart test
+    /// (`free_space_map_survives_a_restart`, `checkpoint_round_trips_through_a_file`,
+    /// `branches_abandoned_before_a_restart_are_still_reaped_after_it`).
+    ///
+    /// Note the clamp below is not fully free of that effect: `DiskManager::new` seeds
+    /// `next_page_id` from the file length, so on the FIRST call after a reopen this mark does sit
+    /// above any arena pages written by the previous process. That is correct for placing a new
+    /// arena and wrong for reattaching to an existing one, which is why reattach asks
+    /// [`DiskManager::bitmap_high_water`] instead. See `ArenaPageStore::reopen`.
+    pub fn high_water(&self) -> Result<u32, FerroError> {
+        let _guard = self.bitmap_lock.lock().unwrap();
+        let from_bitmap = self.scan_bitmap_high_water()?;
         Ok(from_bitmap.max(self.next_page_id.load(Ordering::SeqCst)))
     }
 

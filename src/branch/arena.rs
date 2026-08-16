@@ -21,6 +21,13 @@
 //! with `DiskManager`'s bitmap allocator, because a bitmap bit and an extent bump pointer would
 //! disagree about who owns a page. [`ArenaPageStore::new`] refuses to start below the disk
 //! manager's high-water mark rather than warning about it.
+//!
+//! That exclusivity is enforced by a floor registered with `DiskManager::reserve_from`, and the
+//! floor is **process-local** — a reopened file starts with none. So the region is only protected
+//! for as long as some store has told this `DiskManager` about it, which means every open must,
+//! not just the first. [`ArenaPageStore::reopen`] is that path; going through
+//! [`ArenaPageStore::new`] a second time cannot work, because after a reopen the high-water mark
+//! counts the arena's own pages and locks it out of its own region.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
@@ -132,6 +139,51 @@ impl ArenaPageStore {
         // not enough on its own: the bitmap's bits are zero from page 0, so without this the very
         // first `DiskManager::allocate` hands out the very first arena page a second time.
         pool.disk_manager.reserve_from(base_page)?;
+        Self::assemble(pool, catalog, base_page)
+    }
+
+    /// Reattach to an arena region this database already owns, after the file has been reopened.
+    ///
+    /// `arena_floor` lives only in memory, so a fresh `DiskManager` starts with no floor at all
+    /// and its bitmap scan sees the whole arena region as free — the second open hands out pages
+    /// the first open already filled. Re-registering the floor is therefore not bookkeeping, it is
+    /// the entire guard, and something has to do it on every open.
+    ///
+    /// [`ArenaPageStore::new`] cannot: it refuses a base below `high_water()`, and after a reopen
+    /// that mark is seeded from the file length, which counts the arena's own pages. So the store
+    /// is locked out of precisely the region it owns — verified by
+    /// `an_arena_region_is_still_off_limits_after_reopening_the_file`, which fails on `new` with
+    /// *"must start at or above the disk manager high-water mark 9 (got 1)"*.
+    ///
+    /// This path asks the narrower question instead: is `base_page` clear of what the **bitmap**
+    /// owns? Arena pages never set bitmap bits, so that mark is unaffected by the region's own
+    /// growth and still refuses a base that would collide with bitmap-owned pages.
+    ///
+    /// The caller supplies `base_page` and it is trusted to be the region this store really owns;
+    /// the checkpoint does not yet record it (see S2a in the ledger). Passing a base belonging to
+    /// a different arena will alias it, and nothing here can currently detect that.
+    pub fn reopen(
+        pool: Arc<BufferPoolManager>,
+        catalog: Arc<LogBranchCatalog>,
+        base_page: PageId,
+    ) -> Result<Self, FerroError> {
+        let bitmap_mark = pool.disk_manager.bitmap_high_water()?;
+        if base_page < bitmap_mark {
+            return Err(BranchError::Arena(format!(
+                "arena region at {} overlaps pages the bitmap allocator owns (up to {})",
+                base_page, bitmap_mark
+            ))
+            .into());
+        }
+        pool.disk_manager.reserve_from(base_page)?;
+        Self::assemble(pool, catalog, base_page)
+    }
+
+    fn assemble(
+        pool: Arc<BufferPoolManager>,
+        catalog: Arc<LogBranchCatalog>,
+        base_page: PageId,
+    ) -> Result<Self, FerroError> {
         Ok(ArenaPageStore {
             pool,
             catalog,
@@ -811,6 +863,90 @@ mod tests {
         let mut frame = handle.write();
         frame.data[PAGE_HEADER_SIZE] = value;
         stamp_checksum(&mut frame.data);
+    }
+
+    // S2. `Harness::fresh_store` says "as if the process had restarted", but it reuses the SAME
+    // DiskManager, so `arena_floor` survives in memory and the reopen path is never exercised.
+    // This closes the file and opens it again, which is what a restart actually is.
+    #[test]
+    fn an_arena_region_is_still_off_limits_after_reopening_the_file() {
+        use std::fs::OpenOptions;
+        use crate::storage::disk_manager::DiskManager;
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-reopen-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let open = || {
+            OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap()
+        };
+
+        // Session 1: give the bitmap allocator a real region of its own with some holes punched
+        // in it, then put an arena above that and hand out real pages from it.
+        let holes = [5u32, 7, 9];
+        let (base, arena_pages) = {
+            let dm = Arc::new(DiskManager::new(open()).unwrap());
+            let pool = Arc::new(BufferPoolManager::new(dm));
+            let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+            for _ in 0..20 {
+                pool.disk_manager.allocate().unwrap();
+            }
+            for h in holes {
+                pool.disk_manager.deallocate(h).unwrap();
+            }
+            let base = pool.disk_manager.high_water().unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let a = store.arena_for(br.branch_id).unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..8 {
+                pages.push(store.alloc_in_arena(a, PageType::Heap, catalog.next_epoch()).unwrap());
+            }
+            (base, pages)
+        }; // file closed here
+
+        assert!(!arena_pages.is_empty());
+        let arena_hi = *arena_pages.iter().max().unwrap();
+
+        // Session 2: reopen the same file. The arena's pages are on disk and owned, but the
+        // bitmap allocator has just been constructed and knows nothing about them.
+        let dm2 = Arc::new(DiskManager::new(open()).unwrap());
+        let pool2 = Arc::new(BufferPoolManager::new(dm2));
+        let catalog2 = Arc::new(LogBranchCatalog::in_memory(1));
+
+        // Half one: the region must be re-claimable at the base it already owns. `new` cannot do
+        // this — after a reopen its high-water mark counts the arena's own pages — so reattach is
+        // what `reopen` exists for.
+        let reattached =
+            ArenaPageStore::reopen(Arc::clone(&pool2), Arc::clone(&catalog2), base);
+        assert!(
+            reattached.is_ok(),
+            "an arena cannot reattach to the region it already owns: {:?}",
+            reattached.err()
+        );
+
+        // Half two, the corruption: the bitmap allocator must not hand out arena-owned pages.
+        // It should refill the holes it left below the floor...
+        let mut handed_out = Vec::new();
+        for _ in 0..holes.len() {
+            let p = pool2.disk_manager.allocate().unwrap();
+            assert!(
+                p < base,
+                "bitmap allocator handed out page {} at or above the arena base {} (arena holds up to {})",
+                p, base, arena_hi
+            );
+            handed_out.push(p);
+        }
+        handed_out.sort();
+        assert_eq!(handed_out, holes, "the freed pages below the floor are what should come back");
+
+        // ...and once they are gone it must REFUSE, not walk into the arena. Refusing is the
+        // correct outcome here; handing back an arena page is the corruption this row is about.
+        let err = pool2.disk_manager.allocate();
+        assert!(
+            err.is_err(),
+            "allocator returned {:?} instead of refusing; that page is inside the arena region [{}, {}]",
+            err.ok(), base, arena_hi
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
