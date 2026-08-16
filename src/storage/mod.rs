@@ -1,3 +1,4 @@
+pub mod db_lock;
 pub mod disk_manager;
 pub mod heap_page;
 pub mod tuple;

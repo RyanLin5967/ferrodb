@@ -16,6 +16,7 @@ use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
+use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -29,6 +30,15 @@ fn main() {
     let db = args.get(1).cloned().unwrap_or_else(|| "ferro.db".into());
     let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:0".into());
 
+    // Before any file is opened: a second writer on one database aliases arena pages, and every
+    // aliased page still checksums correctly, so refusing here is the only detection point.
+    let _lock = match DbLock::acquire(Path::new(&db)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("pgserver: {e}");
+            std::process::exit(1);
+        }
+    };
     let existed = Path::new(&db).exists();
     let file = std::fs::OpenOptions::new()
         .read(true)

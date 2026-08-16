@@ -285,3 +285,54 @@ fn a_deleted_arena_checkpoint_is_refused_rather_than_defaulted() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// **E38 — a second process must not be able to open a database that is already open.**
+///
+/// Two openers both build an `ArenaPageStore` from the same checkpoint, so both read the same
+/// `next_extent_start` and hand the same pages to different branches. Every such page still passes
+/// its checksum, which is what makes this worth a hard refusal rather than a warning: there is no
+/// later point at which the damage announces itself.
+///
+/// Measured before the lock existed: with a server listening on a database, the CLI opened the same
+/// path, read from it and exited cleanly, checkpointing its arena over the server's live view, and
+/// neither process printed anything.
+#[test]
+fn a_database_already_open_is_refused_to_a_second_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("locked.db");
+
+    let setup = ferrodb(&db, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);\n");
+    assert_no_errors(&setup, "the setup session");
+
+    // Hold the database open by taking the lock file the way a live process would.
+    let lock = db.with_extension("db.lock");
+    std::fs::write(&lock, "999999\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrodb"))
+        .arg(&db)
+        .env("FERRODB_ARENA_HEADROOM", HEADROOM.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ferrodb");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a second process opened a database that was already held:\n{text}"
+    );
+    assert!(text.contains("already open"), "the refusal does not say why:\n{text}");
+    assert!(
+        text.contains("999999"),
+        "the refusal does not name the holder, so an operator cannot tell whether it is stale:\n\
+         {text}"
+    );
+
+    // And releasing it lets the next open through — otherwise every clean shutdown would brick the
+    // database, which is a worse failure than the one being prevented.
+    std::fs::remove_file(&lock).unwrap();
+    let after = ferrodb(&db, "SELECT * FROM t;\n");
+    assert_no_errors(&after, "the session after the lock was released");
+}

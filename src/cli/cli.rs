@@ -13,6 +13,7 @@ use crate::branch::arena::ArenaPageStore;
 use crate::branch::catalog::LogBranchCatalog;
 use crate::branch::BranchCatalog;
 use crate::cow::PageStore;
+use crate::storage::db_lock::DbLock;
 use crate::tel::MemEffectLog;
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
@@ -41,6 +42,11 @@ fn arena_headroom() -> u32 {
 
 // super basic cli, make better later
 pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
+    // FIRST, before anything opens a file. Two processes on one database hand out the same arena
+    // pages to different branches, and every such page still passes its checksum — so this refusal
+    // is the only point at which the problem is detectable. Held for the whole session: `_lock`
+    // lives to the end of this function and releases on the way out, including on `?`.
+    let _lock = DbLock::acquire(Path::new(db_path))?;
     let existed = Path::new(db_path).exists();
     let file = OpenOptions::new().read(true).write(true).create(true).open(db_path).map_err(|e|FerroError::Io(e.to_string()))?;
     let dm = Arc::new(DiskManager::new(file)?);
