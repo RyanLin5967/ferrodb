@@ -181,17 +181,20 @@ fn two_agents_writing_different_rows_are_told_apart() {
 
 #[test]
 fn one_run_is_never_split_across_two_provenance_entities() {
-    // The store's contract is that attribution is run-level: one run, one `ProvId`. `begin_session`
-    // honours it by REFUSING a second session for the same `(agent_id, run_id)` rather than by
-    // reusing the id — worth pinning, because "refused" and "reused" are both consistent with the
-    // headline and only one of them is what happens.
+    // The store's contract is that attribution is run-level: one run, one `ProvId`. This pins the
+    // contract itself rather than the mechanism, because the mechanism used to be decided by the
+    // clock.
     //
-    // The discriminator is `RunEntity::same_actor`, which includes `started_at`. Two sessions for
-    // one run necessarily start at different instants, so the re-intern can never match and the
-    // second is rejected. That makes the refusal unconditional in practice: it is not detecting a
-    // client that changed the model mid-run, it fires for any repeat. Recorded because anyone
-    // relaxing `same_actor` would silently turn this refusal into a second entity for one run,
-    // which is the outcome the contract exists to prevent.
+    // The discriminator is `RunEntity::same_actor`. It USED to include `started_at`, which made a
+    // second session for one run refused when the system clock happened to advance between the two
+    // calls and silently accepted when it did not — same input, two outcomes, and the refusal
+    // blamed "a different actor tuple" when nothing about the actor had differed. An earlier
+    // version of this test asserted that refusal and documented it as unconditional; CI disagreed,
+    // passing on macOS and failing on an Ubuntu runner fast enough to fit both sessions in one
+    // tick.
+    //
+    // `started_at` is now excluded, so re-opening a run with the same actor REUSES its id, which is
+    // what "one run, one entity" always meant. A genuine change of model still refuses.
     let (mut db, _s) = seeded();
 
     let mut a = db.session();
@@ -202,23 +205,67 @@ fn one_run_is_never_split_across_two_provenance_entities() {
     let first = db.runtime.provenance().attribute(db.rid_of("inventory", 1)).unwrap();
     assert_ne!(first, ProvId::NONE);
 
+    // Same run, same actor: accepted, and it must resolve to the SAME entity. A second id here is
+    // exactly the split the contract forbids.
     let mut b = db.session();
-    let err = match db.exec("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_same' MODEL 'm/1';", &mut b) {
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_same' MODEL 'm/1';", &mut b);
+    db.ok("UPDATE inventory SET qty = 12 WHERE id = 2;", &mut b);
+    db.ok("MERGE;", &mut b);
+
+    let second = db.runtime.provenance().attribute(db.rid_of("inventory", 2)).unwrap();
+    assert_eq!(
+        second, first,
+        "one run was split across two provenance entities: row 1 is {first:?} and row 2 is \
+         {second:?}. Attribution is run-level, so a second session for the same actor must resolve \
+         to the id already interned for that run."
+    );
+    assert_eq!(db.runtime.provenance().lookup(first).unwrap().run_id, "r_same");
+
+    // And the first session's attribution is untouched.
+    assert_eq!(
+        db.runtime.provenance().attribute(db.rid_of("inventory", 1)).unwrap(),
+        first,
+        "re-interning one run disturbed attribution already recorded for it"
+    );
+}
+
+/// **The refusal that remains, and it is now about the actor rather than about the clock.**
+///
+/// Reusing a run id while changing the model is a client claiming one identity for two different
+/// actors. That must be refused whatever the clock did, which is only decidable once `started_at`
+/// is out of the comparison.
+#[test]
+fn reusing_a_run_id_with_a_different_model_is_refused() {
+    let (mut db, _s) = seeded();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_same' MODEL 'm/1';", &mut a);
+    db.ok("UPDATE inventory SET qty = 11 WHERE id = 1;", &mut a);
+    db.ok("MERGE;", &mut a);
+    let first = db.runtime.provenance().attribute(db.rid_of("inventory", 1)).unwrap();
+
+    let mut b = db.session();
+    let err = match db.exec("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_same' MODEL 'm/2';", &mut b) {
         Err(e) => e,
-        Ok(_) => panic!("a second session for one run must not silently mint a second entity"),
+        Ok(_) => panic!(
+            "the same run id was accepted for a DIFFERENT model, so one run now names two actors"
+        ),
     };
     assert!(
         format!("{err}").contains("refusing to re-intern"),
         "expected the run-level refusal, got: {err}"
     );
 
-    // The refusal must leave the first session's attribution intact rather than half-applied.
+    // A refused re-intern must not disturb what was already recorded.
     assert_eq!(
         db.runtime.provenance().attribute(db.rid_of("inventory", 1)).unwrap(),
         first,
         "a refused re-intern disturbed the attribution already recorded for that run"
     );
-    assert_eq!(db.runtime.provenance().lookup(first).unwrap().run_id, "r_same");
+    // `MODEL 'm/1'` is stored split: model "m", version "1". So the refusal above fired on
+    // `model_version` differing, which is the field that actually changed.
+    let e = db.runtime.provenance().lookup(first).unwrap();
+    assert_eq!((e.model.as_str(), e.model_version.as_str()), ("m", "1"));
 }
 
 #[test]

@@ -51,8 +51,20 @@ use super::logical::{Decoded, LogicalDecoder};
 pub struct Pumped {
     /// Change events written this time.
     pub emitted: usize,
-    /// Where the consumer should resume. Equal to the cursor it passed in when nothing was emitted.
+    /// Where the consumer should resume **reading**.
+    ///
+    /// This is NOT "everything below here has been delivered" - it is clamped back to the earliest
+    /// record of any still-open transaction, so the reader can pick that transaction up when it
+    /// commits. Delivery progress is [`Pumped::emitted_through`], and the two are different numbers
+    /// whenever a transaction is in flight.
     pub cursor: u64,
+    /// The highest `commit_lsn` already delivered.
+    ///
+    /// Pass it back to the next `pump` alongside `cursor`. Without it, clamping `cursor` for an
+    /// open transaction re-delivers every committed transaction after it on EVERY pump, for as long
+    /// as that transaction stays open - measured at 15 events for 3 transactions over 5 rounds
+    /// before this existed, and unbounded in principle.
+    pub emitted_through: u64,
     /// How far the pump was allowed to read — the durable frontier at the time.
     pub frontier: u64,
     /// Transactions seen but withheld because they had not committed yet. They are **not** lost;
@@ -118,6 +130,7 @@ impl FeedStreamer {
         &self,
         wal: &WalManager,
         cursor: u64,
+        emitted_through: u64,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
         use std::sync::atomic::Ordering;
@@ -136,6 +149,7 @@ impl FeedStreamer {
             return Ok(Pumped {
                 emitted: 0,
                 cursor,
+                emitted_through,
                 frontier,
                 withheld: 0,
                 unresolved: 0,
@@ -145,19 +159,56 @@ impl FeedStreamer {
         let to = frontier.min(cursor.saturating_add(self.max_bytes));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
-        let emitted = write_feed(&decoded.events, w)?;
+        // Suppress what has already been delivered. The cursor is a READ position and is clamped
+        // back for open transactions, so a plain re-read would hand the consumer every committed
+        // transaction after that one again, on every pump, forever.
+        let fresh: Vec<_> = decoded
+            .events
+            .iter()
+            .filter(|e| e.commit_lsn > emitted_through)
+            .cloned()
+            .collect();
+        let emitted = write_feed(&fresh, w)?;
+        let delivered_through = fresh
+            .iter()
+            .map(|e| e.commit_lsn)
+            .max()
+            .unwrap_or(emitted_through)
+            .max(emitted_through);
 
-        // **The cursor rule.** Only past a commit that was actually emitted.
-        let next = decoded
+        // **The cursor rule**, and it has two halves. The second was missing and cost real data.
+        //
+        // First: only past a commit that was actually emitted. An empty pump does not move.
+        //
+        // Second: NEVER past the earliest record of a transaction still open. Without this, a
+        // transaction that is in flight while a LATER-started one commits in the same batch gets
+        // stepped over - the cursor jumps to the later commit, and when the open one finally
+        // commits the decoder sees a `Commit` with nothing staged and emits nothing. The rows are
+        // gone, silently, and the feed reports success. Reproduced before fixing:
+        //
+        //   T1 commit, T2 open, T3 commit   ->  pump1 emitted=2 cursor=415 withheld=1
+        //   T2 commits                      ->  pump2 emitted=0
+        //   feed holds T1 and T3; T2's row never arrives.
+        //
+        // Clamping rewinds over T3's already-emitted events, so they are delivered twice. That is
+        // the right trade and it is the contract: this feed is AT-LEAST-ONCE, consumers dedupe on
+        // `commit_lsn`, and duplication is recoverable where loss is not.
+        let emitted_max = decoded
             .events
             .iter()
             .map(|e| e.commit_end_lsn)
             .max()
-            .unwrap_or(cursor);
+            .unwrap_or(cursor)
+            .max(cursor);
+        let next = match decoded.open_from {
+            Some(open_from) => emitted_max.min(open_from),
+            None => emitted_max,
+        };
 
         Ok(Pumped {
             emitted,
             cursor: next,
+            emitted_through: delivered_through,
             frontier,
             withheld: decoded.open.len(),
             unresolved: decoded.unresolved.values().sum::<usize>()
@@ -183,6 +234,10 @@ impl FeedStreamer {
 pub struct Subscription {
     wal: std::sync::Arc<WalManager>,
     cursor: u64,
+    /// Highest `commit_lsn` delivered so far. Held here so a caller using a `Subscription` cannot
+    /// forget it - the bare `pump` makes it the caller's problem, and forgetting it is unbounded
+    /// re-delivery rather than a visible error.
+    emitted_through: u64,
     pin: crate::wal::log::WalPin,
 }
 
@@ -201,13 +256,37 @@ impl Subscription {
     /// made at subscription time so a consumer learns immediately rather than on its first read.
     pub fn new(wal: &std::sync::Arc<WalManager>, from: u64) -> Result<Self, FerroError> {
         let pin = wal.pin(from)?;
-        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, pin })
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor: from, emitted_through: 0, pin })
     }
 
     /// Subscribe from the start of the retained log.
     pub fn from_start(wal: &std::sync::Arc<WalManager>) -> Result<Self, FerroError> {
         let from = FeedStreamer::start_cursor(wal);
         Self::new(wal, from)
+    }
+
+    /// Resume a subscription a previous process was running, restoring BOTH positions.
+    ///
+    /// A consumer must persist both, and persisting only a commit position loses data. Measured
+    /// rather than reasoned: with a transaction in flight, a consumer that stored only its highest
+    /// `commit_lsn` and resumed reading there missed that transaction's rows entirely when it
+    /// committed, because its records sit BELOW the commit that was recorded. Storing
+    /// [`Pumped::cursor`] as well kept them.
+    ///
+    /// `cursor` is where to resume reading; `emitted_through` is what has already been delivered
+    /// and is what stops the replay between them being handed to the consumer twice.
+    pub fn resume(
+        wal: &std::sync::Arc<WalManager>,
+        cursor: u64,
+        emitted_through: u64,
+    ) -> Result<Self, FerroError> {
+        let pin = wal.pin(cursor)?;
+        Ok(Subscription { wal: std::sync::Arc::clone(wal), cursor, emitted_through, pin })
+    }
+
+    /// What this subscription has delivered. Persist alongside [`Subscription::cursor`].
+    pub fn emitted_through(&self) -> u64 {
+        self.emitted_through
     }
 
     pub fn cursor(&self) -> u64 {
@@ -234,7 +313,8 @@ impl Subscription {
         streamer: &FeedStreamer,
         w: &mut W,
     ) -> Result<Pumped, FerroError> {
-        let pumped = streamer.pump(&self.wal, self.cursor, w)?;
+        let pumped = streamer.pump(&self.wal, self.cursor, self.emitted_through, w)?;
+        self.emitted_through = pumped.emitted_through;
         if pumped.cursor != self.cursor {
             let next = self.wal.pin(pumped.cursor)?;
             let old = std::mem::replace(&mut self.pin, next);
@@ -284,6 +364,177 @@ mod tests {
             &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
         )
         .unwrap();
+    }
+
+    /// **A transaction still open while a LATER one commits must not be stepped over.**
+    ///
+    /// This is silent data loss, and it was shipped: the cursor advanced to the later commit, and
+    /// when the open transaction finally committed the decoder saw a `Commit` with nothing staged
+    /// and emitted nothing. The rows never reached the feed and the feed reported success.
+    ///
+    /// The arrangement matters - T2 must open BEFORE T3 and commit AFTER it, all inside one batch.
+    /// An earlier version of the cursor test only covered "nothing emitted", which this passes.
+    #[test]
+    fn an_open_transaction_is_not_stepped_over_when_a_later_one_commits() {
+        let (_d, w) = wal("interleave");
+        let s = streamer();
+        let mut cursor = FeedStreamer::start_cursor(&w);
+
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        // Opens second, commits last.
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+
+        // Opens third, commits before T2.
+        w.append(3, 0, &RecKind::Begin).unwrap();
+        insert(&w, 3, 3, 30);
+        w.append(3, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut feed = Vec::new();
+        let p1 = s.pump(&w, cursor, 0, &mut feed).unwrap();
+        assert!(p1.emitted >= 2, "T1 and T3 should both have been emitted: {p1:?}");
+        assert_eq!(p1.withheld, 1, "T2 should be reported as withheld: {p1:?}");
+        assert!(
+            p1.cursor < p1.frontier,
+            "the cursor reached the frontier while a transaction was still open at {:?}; it has \
+             stepped over T2's records and they can never be emitted",
+            decoded_open_hint()
+        );
+        cursor = p1.cursor;
+
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        let p2 = s.pump(&w, cursor, 0, &mut feed).unwrap();
+        assert!(p2.emitted >= 1, "T2's rows never arrived after it committed: {p2:?}");
+
+        let text = String::from_utf8(feed).unwrap();
+        assert!(
+            text.contains("\"qty\":20"),
+            "T2's row was lost. Feed:\n{text}"
+        );
+        // Every row present at least once. Duplicates are allowed and expected - clamping the
+        // cursor rewinds over T3, and this feed is at-least-once by contract.
+        for q in ["\"qty\":10", "\"qty\":20", "\"qty\":30"] {
+            assert!(text.contains(q), "{q} missing from the feed:\n{text}");
+        }
+    }
+
+    fn decoded_open_hint() -> &'static str {
+        "the decoder reported an open transaction"
+    }
+
+    /// **A restart must restore BOTH positions, or an in-flight transaction is lost.**
+    ///
+    /// This is the failure the resumability contract used to describe: `commit_end_lsn` was
+    /// documented as "where a consumer resumes", and a consumer that did exactly that lost a
+    /// transaction which opened before the recorded commit and committed after the restart. Its
+    /// records sit BELOW the commit that was persisted.
+    #[test]
+    fn resuming_from_a_commit_position_alone_loses_an_in_flight_transaction() {
+        let (_d, w) = wal("restart");
+        let w = std::sync::Arc::new(w);
+        let s = streamer();
+
+        // T9 opens and stays open across the restart. T1 commits after it.
+        w.append(9, 0, &RecKind::Begin).unwrap();
+        insert(&w, 9, 99, 990);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut sub = Subscription::from_start(&w).unwrap();
+        let mut buf = Vec::new();
+        let p = sub.pump(&s, &mut buf).unwrap();
+        assert_eq!(p.emitted, 1, "T1 should have been delivered: {p:?}");
+        let (read_at, delivered) = (sub.cursor(), sub.emitted_through());
+        assert!(
+            read_at < delivered,
+            "the read cursor {read_at} is not behind the delivered position {delivered}, so this \
+             test is not exercising a restart with a transaction in flight"
+        );
+        drop(sub);
+
+        w.append(9, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // The WRONG restart: resume reading at the commit position, as the old doc said to.
+        let mut wrong = Subscription::resume(&w, delivered, delivered).unwrap();
+        let mut wb = Vec::new();
+        wrong.pump(&s, &mut wb).unwrap();
+        assert!(
+            !String::from_utf8(wb).unwrap().contains("\"qty\":990"),
+            "resuming at the commit position happened to keep the row - if that is now true the \
+             hazard is gone and this test should be rewritten rather than relaxed"
+        );
+
+        // The RIGHT restart: both positions.
+        let mut right = Subscription::resume(&w, read_at, delivered).unwrap();
+        let mut rb = Vec::new();
+        right.pump(&s, &mut rb).unwrap();
+        assert!(
+            String::from_utf8(rb).unwrap().contains("\"qty\":990"),
+            "restoring both positions still lost the in-flight transaction"
+        );
+    }
+
+    /// **Clamping the cursor must not turn into unbounded re-delivery.**
+    ///
+    /// The clamp above is required so an in-flight transaction is not stepped over. On its own it
+    /// pins the read position beneath every transaction that commits afterwards, so each pump
+    /// re-reads and re-emits all of them - measured at 15 events for 3 transactions over 5 rounds,
+    /// and unbounded for as long as the open transaction lives. A consumer using `emitted == 0` as
+    /// its caught-up signal never terminates.
+    ///
+    /// `emitted_through` is the second position that makes both properties hold at once: read from
+    /// the low-water mark, deliver only past the high-water mark.
+    #[test]
+    fn a_long_open_transaction_does_not_cause_endless_redelivery() {
+        let (_d, w) = wal("redeliver");
+        let s = streamer();
+
+        // Opens and stays open for the whole test.
+        w.append(9, 0, &RecKind::Begin).unwrap();
+        insert(&w, 9, 99, 990);
+
+        for i in 1..=3u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32 * 10);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+
+        let (mut cursor, mut through) = (FeedStreamer::start_cursor(&w), 0u64);
+        let mut total = 0usize;
+        for round in 1..=5 {
+            let mut buf = Vec::new();
+            let p = s.pump(&w, cursor, through, &mut buf).unwrap();
+            total += p.emitted;
+            cursor = p.cursor;
+            through = p.emitted_through;
+            assert_eq!(p.withheld, 1, "round {round}: the open transaction stopped being reported");
+        }
+        assert_eq!(
+            total, 3,
+            "three committed transactions produced {total} events across five pumps - the clamped \
+             cursor is re-delivering them every round"
+        );
+
+        // And the open one is still picked up when it finally commits, which is the property the
+        // clamp exists for. Suppressing re-delivery must not suppress this.
+        w.append(9, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        let mut buf = Vec::new();
+        let p = s.pump(&w, cursor, through, &mut buf).unwrap();
+        assert_eq!(p.emitted, 1, "the long-open transaction was lost: {p:?}");
+        assert!(
+            String::from_utf8(buf).unwrap().contains("\"qty\":990"),
+            "the wrong row arrived for the long-open transaction"
+        );
     }
 
     /// **A live subscription survives a checkpoint that would otherwise truncate under it.**
@@ -379,11 +630,11 @@ mod tests {
 
         let behind = FeedStreamer::start_cursor(&w);
         let mut buf = Vec::new();
-        let p = s.pump(&w, behind, &mut buf).unwrap();
+        let p = s.pump(&w, behind, 0, &mut buf).unwrap();
         assert!(p.emitted > 0, "nothing was emitted, so lag cannot be judged");
 
         let mut buf2 = Vec::new();
-        let caught_up = s.pump(&w, p.cursor, &mut buf2).unwrap();
+        let caught_up = s.pump(&w, p.cursor, 0, &mut buf2).unwrap();
         assert!(
             caught_up.lag_bytes() < p.frontier - start,
             "lag did not shrink after catching up: {} vs {}",
@@ -406,7 +657,7 @@ mod tests {
         w.flush().unwrap();
 
         let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        let p = s.pump(&w, start, 0, &mut buf).unwrap();
         assert_eq!(p.emitted, 1, "nothing was emitted for a committed insert");
         assert!(p.cursor > start, "the cursor did not advance past a commit");
         assert!(p.is_clean(), "{p:?}");
@@ -430,7 +681,7 @@ mod tests {
         w.flush().unwrap(); // durable, but NOT committed
 
         let mut buf = Vec::new();
-        let first = s.pump(&w, start, &mut buf).unwrap();
+        let first = s.pump(&w, start, 0, &mut buf).unwrap();
         assert_eq!(first.emitted, 0, "an uncommitted change was emitted");
         assert_eq!(
             first.cursor, start,
@@ -447,7 +698,7 @@ mod tests {
         w.flush().unwrap();
 
         let mut buf2 = Vec::new();
-        let second = s.pump(&w, first.cursor, &mut buf2).unwrap();
+        let second = s.pump(&w, first.cursor, 0, &mut buf2).unwrap();
         assert_eq!(second.emitted, 2, "the committed rows did not arrive: {second:?}");
         let text = String::from_utf8(buf2).unwrap();
         assert!(text.contains("\"qty\":70") && text.contains("\"qty\":80"), "{text}");
@@ -469,12 +720,12 @@ mod tests {
         w.flush().unwrap();
 
         let mut all = Vec::new();
-        let first = s.pump(&w, cursor, &mut all).unwrap();
+        let first = s.pump(&w, cursor, 0, &mut all).unwrap();
         assert_eq!(first.emitted, 3);
         cursor = first.cursor;
 
         let mut again = Vec::new();
-        let second = s.pump(&w, cursor, &mut again).unwrap();
+        let second = s.pump(&w, cursor, 0, &mut again).unwrap();
         assert_eq!(second.emitted, 0, "resuming re-delivered events: {}", String::from_utf8_lossy(&again));
         assert_eq!(second.cursor, cursor, "an empty pump moved the cursor");
     }
@@ -492,7 +743,7 @@ mod tests {
         // Deliberately NOT flushed.
 
         let mut buf = Vec::new();
-        let p = s.pump(&w, start, &mut buf).unwrap();
+        let p = s.pump(&w, start, 0, &mut buf).unwrap();
         assert_eq!(
             p.emitted, 0,
             "a change was emitted from a record the primary has not durably written"
@@ -503,7 +754,7 @@ mod tests {
         // about the pump being broken.
         w.flush().unwrap();
         let mut buf2 = Vec::new();
-        assert_eq!(s.pump(&w, start, &mut buf2).unwrap().emitted, 1);
+        assert_eq!(s.pump(&w, start, 0, &mut buf2).unwrap().emitted, 1);
     }
 
     /// A cursor pointing into truncated log must be refused with an explanation, not silently
@@ -522,7 +773,7 @@ mod tests {
         assert!(base > 1, "the log did not truncate, so there is nothing to have lost");
 
         let mut buf = Vec::new();
-        let err = s.pump(&w, base - 1, &mut buf).expect_err("a stale cursor was accepted");
+        let err = s.pump(&w, base - 1, 0, &mut buf).expect_err("a stale cursor was accepted");
         let msg = format!("{err}");
         assert!(msg.contains("truncated away"), "wrong reason: {msg}");
         assert!(msg.contains("skip"), "the message does not say what would go wrong: {msg}");
@@ -547,7 +798,7 @@ mod tests {
         let mut rounds = 0;
         loop {
             let mut buf = Vec::new();
-            let p = s.pump(&w, cursor, &mut buf).unwrap();
+            let p = s.pump(&w, cursor, 0, &mut buf).unwrap();
             if p.emitted == 0 {
                 break;
             }
