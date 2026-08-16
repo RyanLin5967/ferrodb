@@ -10,7 +10,13 @@ use std::sync::Arc;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
+use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::branch::arena::ArenaPageStore;
+use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::BranchCatalog;
+use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
+use ferrodb::tel::MemEffectLog;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::recovery::recover;
@@ -48,6 +54,42 @@ fn main() {
     use std::io::Write;
     std::io::stdout().flush().unwrap();
 
-    let mut ctx = ServerContext { catalog, bp, txn };
+    // Built AFTER the catalog, for the reason `src/cli/cli.rs` spells out: the arena floor has to
+    // sit above what the catalog has already allocated, or the ordinary allocator and the arena hand
+    // out the same page. The floor is persisted in the checkpoint, so a reopen reattaches to the
+    // region it left rather than inventing a new one on top of live pages.
+    let branches_path = format!("{db}.branches");
+    let arena_path = format!("{db}.arena");
+    let branches = Arc::new(
+        LogBranchCatalog::open(Path::new(&branches_path), 1).expect("branch catalog"),
+    );
+    let arena_exists = Path::new(&arena_path).exists();
+    let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
+        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone(), Path::new(&arena_path))
+            .expect("reattach to the arena")
+    } else {
+        let base = bp.disk_manager.high_water().expect("high water") + 32_736;
+        ArenaPageStore::new(bp.clone(), branches.clone(), base).expect("arena")
+    });
+    store.checkpoint_to(std::path::PathBuf::from(&arena_path));
+
+    let runtime = Arc::new(if arena_exists {
+        AgentRuntime::reopen_with_storage(
+            branches.clone() as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            store.clone() as Arc<dyn PageStore>,
+        )
+        .expect("reattach the runtime")
+    } else {
+        AgentRuntime::with_storage(
+            branches.clone() as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            store.clone() as Arc<dyn PageStore>,
+        )
+        .expect("storage-backed runtime")
+    });
+
+    let mut ctx = ServerContext { catalog, bp, txn, runtime };
     serve(listener, &mut ctx).unwrap();
+    store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
 }

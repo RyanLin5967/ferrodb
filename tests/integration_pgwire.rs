@@ -173,3 +173,43 @@ fn the_server_accepts_more_than_one_connection() {
         }
     }
 }
+
+/// **Agent-branch isolation over the wire, across two connections.**
+///
+/// The pgwire server built `Session::new()` until 2026-08-16, so an agent session over the wire
+/// staged rows in a `BTreeMap` while the copy-on-write engine sat unused beside it — the same gap
+/// E31 closed for the CLI. Closing it needs the runtime to be shared by every connection, because
+/// branches belong to the database and not to the socket, and building one per connection is the
+/// obvious way to get that wrong.
+///
+/// The client runs its checks from a second, independent reading of the protocol and returns
+/// non-zero on the first violation. The load-bearing one is `AS OF BRANCH` from the socket that did
+/// NOT open the branch: "B cannot see A's write" passes against a per-connection runtime too, and
+/// against a server that lost the write entirely.
+#[test]
+fn two_wire_clients_see_branch_isolation_and_share_one_runtime() {
+    let server = start();
+
+    let out = Command::new("python3")
+        .arg("pg_agent_client.py")
+        .arg("127.0.0.1")
+        .arg(server.port.to_string())
+        .current_dir("tests/pg")
+        .output()
+        .expect("python3 is required to run the independent wire client");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "agent isolation over the wire failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // A client that connected and asserted nothing would also exit zero.
+    let n: usize = stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(n >= 5, "only {n} checks ran; the client did almost nothing: {stdout}");
+}
