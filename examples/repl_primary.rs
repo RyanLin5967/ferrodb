@@ -16,6 +16,7 @@ use ferrodb::execution::executor::run;
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
+use ferrodb::replication::sync::AckTracker;
 use ferrodb::replication::{read_handshake, write_handshake, Message, ReplicationSource};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -94,31 +95,73 @@ fn main() {
     println!("BACKUP_END {}", label.end_lsn);
     std::io::stdout().flush().unwrap();
 
-    for stream in listener.incoming() {
-        let mut stream = match stream { Ok(s) => s, Err(_) => continue };
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        if read_handshake(&mut reader).is_err() || write_handshake(&mut stream).is_err() {
-            continue;
-        }
-        let src = ReplicationSource::new(&wal);
-        loop {
-            let msg = match Message::read_from(&mut reader) { Ok(m) => m, Err(_) => break };
-            let from = match msg {
-                Message::Hello { from_lsn } => from_lsn,
-                _ => break,
-            };
-            match src.read_from(from, 64 * 1024) {
-                Ok((bytes, _next)) if bytes.is_empty() => {
-                    let _ = Message::UpToDate { durable_lsn: src.durable_lsn() }.write_to(&mut stream);
+    // E6: serving runs on its own thread so the main thread can WAIT for a replica ack. A primary
+    // that only serves after it has finished committing can never demonstrate synchronous commit,
+    // because there is nothing left to wait for.
+    let acks = Arc::new(AckTracker::new());
+    let sync_mode = args.get(4).map(|s| s == "sync").unwrap_or(false);
+    let durable = ReplicationSource::new(&wal).durable_lsn();
+
+    let serve = {
+        let (wal, acks) = (wal.clone(), acks.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if read_handshake(&mut reader).is_err() || write_handshake(&mut stream).is_err() {
+                    continue;
                 }
-                Ok((bytes, _next)) => {
-                    let _ = Message::Records { start_lsn: from, bytes }.write_to(&mut stream);
+                let src = ReplicationSource::new(&wal);
+                loop {
+                    let msg = match Message::read_from(&mut reader) { Ok(m) => m, Err(_) => break };
+                    let from = match msg {
+                        Message::Hello { from_lsn } => from_lsn,
+                        _ => break,
+                    };
+                    // A Hello IS the ack: the replica records its position only after the pages it
+                    // describes are durable, so "send me what follows N" asserts N is safe there.
+                    acks.record(&peer, from);
+                    match src.read_from(from, 64 * 1024) {
+                        Ok((bytes, _next)) if bytes.is_empty() => {
+                            let _ = Message::UpToDate { durable_lsn: src.durable_lsn() }
+                                .write_to(&mut stream);
+                        }
+                        Ok((bytes, _next)) => {
+                            let _ = Message::Records { start_lsn: from, bytes }.write_to(&mut stream);
+                        }
+                        Err(e) => {
+                            let _ = Message::Error { message: e.to_string() }.write_to(&mut stream);
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = Message::Error { message: e.to_string() }.write_to(&mut stream);
-                    break;
-                }
+                acks.forget(&peer);
             }
+        })
+    };
+
+    if sync_mode {
+        // The deadline is the caller's choice, and it is short here on purpose: a test that waits
+        // a minute to observe a refusal is a test nobody runs.
+        let deadline = std::time::Duration::from_secs(
+            std::env::var("FERRODB_SYNC_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        );
+        match acks.wait_for(durable, deadline) {
+            Ok(()) => println!("SYNC_OK {durable}"),
+            // Not a crash and not a silent downgrade: it says exactly what was and was not achieved.
+            Err(e) => println!("SYNC_TIMEOUT {e}"),
         }
+        std::io::stdout().flush().unwrap();
+        // In sync mode the wait IS the point, so exit once it resolves rather than serving forever.
+        std::process::exit(0);
     }
+
+    let _ = serve.join();
 }

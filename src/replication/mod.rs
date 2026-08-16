@@ -33,6 +33,10 @@ use crate::wal::log::WalManager;
 /// its WAL at every checkpoint, so a replica needs a page image plus the LSN it corresponds to.
 pub mod backup;
 
+/// Optional synchronous commit — see [`sync`]. Off by default; turning it on changes the
+/// durability promise and spends availability to do it.
+pub mod sync;
+
 /// `0xFEDB` then a protocol version, so a mismatched peer is rejected at the handshake rather than
 /// misparsed into nonsense several frames later.
 pub const REPL_MAGIC: u32 = 0xFEDB_0001;

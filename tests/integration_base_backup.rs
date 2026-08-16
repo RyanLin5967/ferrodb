@@ -72,6 +72,9 @@ fn example_bin(name: &str) -> PathBuf {
 
 struct Primary {
     child: Child,
+    /// Kept open so a test can go on reading the primary's stdout after startup — E6's `SYNC_OK`
+    /// arrives long after the readiness lines do.
+    lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
     addr: String,
     start_lsn: u64,
     durable_lsn: u64,
@@ -88,10 +91,22 @@ impl Drop for Primary {
 }
 
 fn start_primary(db: &Path, rows: u32, hot: bool) -> Primary {
+    start_primary_mode(db, rows, if hot { Some("hot") } else { None }, &[])
+}
+
+fn start_primary_mode(
+    db: &Path,
+    rows: u32,
+    mode: Option<&str>,
+    env: &[(&str, &str)],
+) -> Primary {
     let mut cmd = Command::new(example_bin("repl_primary"));
     cmd.arg(db).arg("127.0.0.1:0").arg(rows.to_string());
-    if hot {
-        cmd.arg("hot");
+    if let Some(m) = mode {
+        cmd.arg(m);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -135,6 +150,7 @@ fn start_primary(db: &Path, rows: u32, hot: bool) -> Primary {
     }
     Primary {
         child,
+        lines,
         addr: addr.unwrap(),
         start_lsn: start.unwrap(),
         durable_lsn: durable.unwrap(),
@@ -507,5 +523,66 @@ fn a_replica_killed_mid_stream_resumes_from_its_own_lsn_and_converges() {
         "{} WAL-described page(s) differ after a mid-stream kill and resume: {:?}",
         described_diff.len(),
         &described_diff[..described_diff.len().min(12)]
+    );
+}
+
+/// **E6 — synchronous commit: the primary waits for a replica before calling it done.**
+///
+/// Two halves, and the second is the one that matters. A synchronous-commit implementation that
+/// only ever gets tested with a healthy replica has not been tested at all — the interesting
+/// question is what it does when the promise *cannot* be kept, and the wrong answers (block
+/// forever, or quietly commit anyway and report success) are both easy to ship by accident.
+#[test]
+fn synchronous_commit_waits_for_a_replica_and_says_so_when_there_is_none() {
+    // Half one: with a replica, the wait is satisfied.
+    let dir = tempfile::tempdir().unwrap();
+    let pdb = dir.path().join("primary.db");
+    let mut primary = start_primary_mode(&pdb, 300, Some("sync"), &[("FERRODB_SYNC_TIMEOUT_SECS", "30")]);
+    let durable = primary.durable_lsn;
+
+    let rdb = dir.path().join("replica.db");
+    let replica_out = catch_up(&primary, &rdb);
+    assert!(replica_out.contains("APPLIED "), "the replica never caught up: {replica_out}");
+
+    let verdict = primary
+        .lines
+        .by_ref()
+        .filter_map(|l| l.ok())
+        .find(|l| l.starts_with("SYNC_OK") || l.starts_with("SYNC_TIMEOUT"))
+        .expect("the primary never resolved its synchronous commit");
+    assert!(
+        verdict.starts_with("SYNC_OK"),
+        "a replica caught up to the frontier and the commit still was not acknowledged: {verdict}"
+    );
+    assert!(
+        verdict.contains(&durable.to_string()),
+        "the primary acknowledged a different lsn than its frontier {durable}: {verdict}"
+    );
+
+    // Half two: with no replica at all, it must REFUSE rather than report success.
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut alone = start_primary_mode(
+        &dir2.path().join("lonely.db"),
+        50,
+        Some("sync"),
+        &[("FERRODB_SYNC_TIMEOUT_SECS", "1")],
+    );
+    let verdict = alone
+        .lines
+        .by_ref()
+        .filter_map(|l| l.ok())
+        .find(|l| l.starts_with("SYNC_OK") || l.starts_with("SYNC_TIMEOUT"))
+        .expect("the primary never resolved its synchronous commit without a replica");
+    assert!(
+        verdict.starts_with("SYNC_TIMEOUT"),
+        "synchronous commit reported success with no replica connected: {verdict}"
+    );
+    assert!(
+        verdict.contains("asynchronous durability"),
+        "the refusal hides that durability was downgraded: {verdict}"
+    );
+    assert!(
+        verdict.contains("Nothing was rolled back"),
+        "the refusal does not say what happened to the data: {verdict}"
     );
 }
