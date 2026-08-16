@@ -712,3 +712,123 @@ fn ordinary_statements_are_unaffected_by_the_agent_surface() {
     assert!(db.exec("BEGIN AGENT SESSION AS 'a';", &mut s).is_err());
     db.ok("ROLLBACK;", &mut s);
 }
+
+// ---- exit criterion 9: which agent + run + model wrote a given row ---------------------------
+
+#[test]
+fn row_authorship_survives_the_merge_that_published_it() {
+    // The failure this pins: `run_of` reads the branch's workspace and `seal` drops that
+    // workspace the instant a merge succeeds, so authorship used to become unanswerable at
+    // exactly the moment the row became visible to anyone else.
+    use ferrodb::tel::ids::RowId;
+
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok(
+        "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus-5/2026-05';",
+        &mut a,
+    );
+    db.ok("UPDATE inventory SET qty = qty + 30 WHERE id = 1;", &mut a);
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+
+    // The branch is gone. The question is about the row, so it must still answer.
+    let who = db
+        .runtime
+        .who_wrote_row("inventory", RowId(1))
+        .expect("row 1 must still be attributed after its branch merged");
+    assert_eq!(who.agent_id, "restock-agent");
+    assert_eq!(who.run_id, "run-42");
+    assert_eq!(who.model, "claude-opus-5");
+    assert_eq!(who.model_version, "2026-05");
+
+    // A row no agent ever wrote is unattributed, never a guess at the nearest run.
+    assert!(db.runtime.who_wrote_row("inventory", RowId(2)).is_none());
+    assert!(db.runtime.who_wrote_row("inventory", RowId(999)).is_none());
+    // and an unknown table does not resolve to some other table's rows
+    assert!(db.runtime.who_wrote_row("no_such_table", RowId(1)).is_none());
+}
+
+#[test]
+fn two_runs_are_attributed_separately_and_interned_once_each() {
+    use ferrodb::tel::ids::RowId;
+
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'restock' RUN 'r1' MODEL 'claude-opus-5/2026-05';", &mut a);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 1;", &mut a);
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'audit' RUN 'r2' MODEL 'gpt-9/turbo';", &mut b);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut b);
+    assert!(report(db.ok("MERGE;", &mut b)).applied_to_target);
+
+    let one = db.runtime.who_wrote_row("inventory", RowId(1)).unwrap();
+    let two = db.runtime.who_wrote_row("inventory", RowId(2)).unwrap();
+    assert_eq!(one.agent_id, "restock");
+    assert_eq!(two.agent_id, "audit");
+    assert_eq!(two.model, "gpt-9");
+    assert_ne!(one.prov_id, two.prov_id, "two runs must not share one interned slot");
+
+    let table = db.runtime.authors_of("inventory");
+    assert_eq!(table.len(), 2, "only the two written rows are attributed: {:?}", table);
+}
+
+#[test]
+fn a_conflicting_merge_attributes_nothing() {
+    // A merge that publishes nothing must not claim authorship of a row it failed to write.
+    use ferrodb::tel::ids::RowId;
+
+    let mut db = Db::new();
+    db.seed();
+    let (mut a, mut b) = (db.session(), db.session());
+    db.ok("BEGIN AGENT SESSION AS 'winner' RUN 'r1' MODEL 'm/1';", &mut a);
+    db.ok("BEGIN AGENT SESSION AS 'loser' RUN 'r2' MODEL 'm/2';", &mut b);
+    db.ok("UPDATE inventory SET qty = 1 WHERE id = 1;", &mut a);
+    db.ok("UPDATE inventory SET qty = 2 WHERE id = 1;", &mut b);
+
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+    let second = report(db.ok("MERGE;", &mut b));
+    assert!(second.outcome.is_conflict(), "expected a conflict, got {}", second);
+    assert!(!second.applied_to_target);
+
+    // The row belongs to the agent whose write actually landed.
+    let who = db.runtime.who_wrote_row("inventory", RowId(1)).unwrap();
+    assert_eq!(who.agent_id, "winner", "a rejected merge must not take authorship");
+    assert_eq!(who.run_id, "r1");
+}
+
+#[test]
+fn a_session_declaring_no_model_is_recorded_as_unspecified_not_guessed() {
+    use ferrodb::tel::ids::RowId;
+
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'no-model-agent' RUN 'r1';", &mut a);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 1;", &mut a);
+    assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+
+    let who = db.runtime.who_wrote_row("inventory", RowId(1)).unwrap();
+    assert_eq!(who.agent_id, "no-model-agent");
+    assert_eq!(who.model, "unspecified");
+    assert_eq!(who.model_version, "unspecified");
+}
+
+#[test]
+fn a_malformed_model_is_refused_rather_than_recorded_blank() {
+    let mut db = Db::new();
+    db.seed();
+    let mut s = db.session();
+    for sql in [
+        "BEGIN AGENT SESSION AS 'a' MODEL '';",
+        "BEGIN AGENT SESSION AS 'a' MODEL '/2026-05';",
+        "BEGIN AGENT SESSION AS 'a' MODEL 'claude/';",
+    ] {
+        assert!(db.exec(sql, &mut s).is_err(), "{} must not begin a session", sql);
+    }
+    // and a well-formed one still works on the same connection
+    assert!(db.exec("BEGIN AGENT SESSION AS 'a' MODEL 'claude-opus-5/2026-05';", &mut s).is_ok());
+}
