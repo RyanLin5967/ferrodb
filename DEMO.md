@@ -220,11 +220,16 @@ exited non-zero — so "all self-checks passed" is a result, not a default.
 ## Where the criteria are also covered by tests
 
 The demo is not the only evidence; it is the readable evidence. The suite behind it is
-**430 passing, 0 failing** (`cargo test`).
+**435 passing, 0 failing** (`cargo test`) — 430 inherited, plus 5 added here for criterion 9.
+
+Those 5 were mutation-checked: deleting the one line that records authorship
+(`state.row_author.insert(...)`) makes 4 of them fail. A test that cannot fail proves nothing, so
+this was confirmed rather than assumed.
 
 | Area | Tests |
 |---|---|
 | SQL surface, criteria 2–7, 10 | `tests/agent_sql_surface.rs` |
+| Criterion 9 at the SQL surface | `tests/agent_sql_surface.rs` (authorship + `MODEL` clause) |
 | Criterion 8, page counts | `src/branch/reaper.rs` (unit tests, crate-internal harness) |
 | Criterion 9 at the storage layer | `tests/provenance_e2e.rs` |
 | CoW tree over arenas, collapse | `tests/integration_cow_branch.rs` |
