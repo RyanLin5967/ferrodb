@@ -22,6 +22,7 @@ pub mod changeset;
 pub mod dispatch;
 pub mod mem_catalog;
 pub mod merge_engine;
+pub mod paged_rows;
 pub mod runtime;
 pub mod session;
 
@@ -29,5 +30,6 @@ pub use changeset::{ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeK
 pub use dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
+pub use paged_rows::PagedRows;
 pub use runtime::{AgentRuntime, BranchResolver, ExecCtx};
 pub use session::AgentSession;
