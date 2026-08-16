@@ -163,6 +163,83 @@ fn a_genuinely_violated_precondition_is_still_rejected() {
     assert_eq!(qty_of(&mut db, 2), 0, "a conflicting merge published anyway");
 }
 
+/// A7 evidence: **where the precondition/postcondition decision actually lives.**
+///
+/// `tests/integration_merge_agreement.rs` shows the two `Merger` impls agree on six cases. But
+/// both are handed the merged `CellState` by their *caller* — neither picks it. So the difference
+/// between "solo merge succeeds" and "solo merge conflicts with nothing" is not an engine
+/// property at all; it is `runtime.rs:816` choosing `now.or(before)`.
+///
+/// This pins that: hand BOTH engines the post-op state for a solo merge, and both call it a
+/// Conflict. The engines are not what makes the demo path correct — the runtime's state selection
+/// is. Anyone tempted to "fix R1 in tel" or to route the runtime through tel should read this
+/// first: the bug was never in the comparison.
+#[test]
+fn both_engines_conflict_on_post_state_so_correctness_lives_in_the_caller() {
+    use ferrodb::agent_sql::merge_engine::{CellState, PolicyTable, SurfaceMerger};
+    use ferrodb::branch::record::BranchRecord;
+    use ferrodb::branch::types::{BranchId, CommitHash, LeaseDeadline};
+    use ferrodb::tel::engine::ThreeWayMerger;
+    use ferrodb::tel::frame::TxnFrame;
+    use ferrodb::tel::guard::{CmpOp, Guard, GuardExpr};
+    use ferrodb::tel::ids::{ColId, RowId, TableId, TxnId};
+    use ferrodb::tel::merge::{MergePolicy, Merger};
+    use ferrodb::tel::op::{Delta, Op, OpKind};
+    use ferrodb::tel::MemEffectLog;
+
+    const TBL: TableId = TableId(1);
+    const ROW: RowId = RowId(1);
+    const QTY: ColId = ColId(1);
+
+    // One agent takes 5 from a stock of 5. Nobody else touched the row.
+    let mut f = TxnFrame::new(TxnId(1), BranchId::new(1, 0), CommitHash::ZERO, 0, 1);
+    let mut op = Op::new(TBL, ROW, Some(QTY), OpKind::Add(Delta::Int(-5)));
+    op.witness = Some(Value::Integer(5));
+    f.push_op(op);
+    f.push_guard(
+        Guard::holds(GuardExpr::cmp(
+            GuardExpr::col(TBL, ROW, QTY),
+            CmpOp::Ge,
+            GuardExpr::Literal(Value::Integer(5)),
+        ))
+        .with_source("qty >= 5"),
+    );
+    let ours = vec![f];
+
+    let mut policy = PolicyTable::new();
+    policy.set(TBL, QTY, MergePolicy::Additive);
+
+    // The POST-op state: what the row becomes. This is the state the runtime deliberately does
+    // NOT judge the guard against.
+    let mut post = CellState::new();
+    post.set(TBL, ROW, QTY, Value::Integer(0));
+
+    let lca = BranchRecord::trunk(1, LeaseDeadline(u64::MAX));
+    let surface = SurfaceMerger::new(std::sync::Arc::new(MemEffectLog::new()));
+    let tel = ThreeWayMerger::new();
+
+    let name = |r: Result<_, FerroError>| -> String {
+        match r { Ok(o) => o, Err(e) => format!("Err({})", e) }
+    };
+    let a = name(surface.merge(&lca, &ours, &[], &policy, &post).map(|o| o.name().to_string()));
+    let b = name(tel.merge(&lca, &ours, &[], &policy, &post).map(|o| o.name().to_string()));
+    assert_eq!(a, b, "the two engines disagreed: surface={} tel={}", a, b);
+    assert_eq!(
+        a,
+        "Conflict",
+        "given post-op state both engines reject a solo merge - which is exactly why the runtime \
+         must hand them the PRE-op state, and does"
+    );
+
+    // And the pre-op state, which is what the runtime actually supplies, is admitted by both.
+    let mut pre = CellState::new();
+    pre.set(TBL, ROW, QTY, Value::Integer(5));
+    let a2 = name(surface.merge(&lca, &ours, &[], &policy, &pre).map(|o| o.name().to_string()));
+    let b2 = name(tel.merge(&lca, &ours, &[], &policy, &pre).map(|o| o.name().to_string()));
+    assert_eq!(a2, b2, "engines disagreed on pre-op state: {} vs {}", a2, b2);
+    assert_ne!(a2, "Conflict", "the pre-op reading must admit a solo merge");
+}
+
 /// R2 on the demo path: a DELETE carrying a WHERE clause. The guard refers to cells of the row
 /// the merge is removing, so a naive re-check cannot read them and reports `GuardUnevaluable`,
 /// turning every guarded delete into a conflict with nothing.
