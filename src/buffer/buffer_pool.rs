@@ -86,9 +86,13 @@ impl BufferPoolManager {
                 return Ok(frame_i)
             }
             ArcResult::MissEvict(evicted_id) => { // page not cached and pool is full (victim eviction)
-                let pt = self.page_table.read().unwrap();
-                let frame_i = pt[&evicted_id];
-                drop(pt);
+                // The victim can be removed by `delete_page`/`free_page` between the cache
+                // choosing it and this lookup, so `pt[&evicted_id]` would panic on a key that has
+                // gone. Treat a departed victim as a miss with a free frame instead of crashing.
+                let frame_i = match self.page_table.read().unwrap().get(&evicted_id) {
+                    Some(&i) => i,
+                    None => return Err(FerroError::NotEnoughSpace),
+                };
 
                 self.flush_page(evicted_id)?;
                 let new_page_data = self.disk_manager.read(page_id)?;
@@ -181,9 +185,22 @@ impl BufferPoolManager {
 
     // writes a dirty page to disk
     pub fn flush_page(&self, page_id: u32) -> Result<(), FerroError>{
+        // The read lock is held across the frame access on purpose. Reassigning a frame requires
+        // the WRITE lock, so holding this one makes "which frame holds this page" stable for the
+        // duration of the flush. Dropping it first left a window in which the frame could be
+        // handed to another page, and the bytes then written to disk under `page_id` were that
+        // other page's — durable corruption, not a lost write.
+        //
+        // `wal_gate` and `DiskManager::write` take no page-table lock, so holding it here does
+        // not invert the arc_cache -> page_table -> frame order used everywhere in this file.
         let pt = self.page_table.read().unwrap();
-        let frame_i = pt[&page_id];
-        drop(pt);
+
+        // A page that is not resident has nothing buffered to flush. This used to index with
+        // `pt[&page_id]`, which PANICS on a page another thread has already evicted — the same
+        // `no entry found for key` crash D19 fixed in `fetch_page`.
+        let Some(&frame_i) = pt.get(&page_id) else {
+            return Ok(());
+        };
 
         let frame = self.frames[frame_i].read().unwrap();
         if frame.dirty_flag.load(Ordering::Relaxed) {
