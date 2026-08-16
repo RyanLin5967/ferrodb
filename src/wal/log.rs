@@ -1,6 +1,6 @@
 use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::{error::FerroError, storage::disk_manager::{pread, pwrite}};
+use crate::{catalog::column::DataType, error::FerroError, storage::disk_manager::{pread, pwrite}};
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
@@ -59,6 +59,13 @@ pub struct WalBuffer {
     pub start_lsn: u64,
 }
 
+/// What a [`RecKind::Ddl`] record describes.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DdlOp {
+    CreateTable,
+    DropTable,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum RecKind {
     Begin, Commit, Abort, TxnEnd, 
@@ -66,7 +73,22 @@ pub enum RecKind {
     HeapDelete { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8> }, 
     HeapUpdate { dir_root: u32, page_id: u32, slot: u16, old: Vec<u8>, new: Vec<u8> },
     Clr { undone_lsn: u64, undo_next: u64, redo: Box<RecKind> },
-    Checkpoint
+    Checkpoint,
+    /// A schema change, logged so the change feed can carry it.
+    ///
+    /// The catalog itself is written outside the WAL, so this record does not *drive* DDL — recovery
+    /// does not replay it and the catalog is authoritative for the running database. It exists so
+    /// that a **reader of the log** can know what the tables were at each point in it. Without it a
+    /// decoder can only assume today's catalog describes yesterday's rows, which is wrong the moment
+    /// anyone runs `CREATE TABLE` or `DROP TABLE`, and wrong silently.
+    Ddl {
+        op: DdlOp,
+        table: String,
+        dir_root: u32,
+        time_travel_root: u32,
+        /// `(name, type, nullable)` per column. Empty for a drop.
+        columns: Vec<(String, DataType, bool)>,
+    },
 }
 
 pub struct LogRecord {
@@ -74,6 +96,50 @@ pub struct LogRecord {
     pub prev_lsn: u64,
     pub txn_id: u64,
     pub kind: RecKind
+}
+
+/// Length-prefixed string, so a name containing anything at all cannot desync the reader.
+fn write_str(buffer: &mut Vec<u8>, s: &str) {
+    buffer.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    buffer.extend_from_slice(s.as_bytes());
+}
+
+// Bounds-checked readers. These bytes arrive from a disk or a socket, so every read has to be able
+// to refuse: indexing past the end of a truncated record panics the whole process, which is a
+// denial of service triggered by a corrupt log rather than a parse error.
+fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
+    let v = *bytes.get(*at).ok_or_else(|| short(*at, 1, bytes.len()))?;
+    *at += 1;
+    Ok(v)
+}
+
+fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
+    let end = *at + 2;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 2, bytes.len()))?;
+    *at = end;
+    Ok(u16::from_be_bytes(slice.try_into().unwrap()))
+}
+
+fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
+    let end = *at + 4;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 4, bytes.len()))?;
+    *at = end;
+    Ok(u32::from_be_bytes(slice.try_into().unwrap()))
+}
+
+fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
+    let len = take_u16(bytes, at)? as usize;
+    let end = *at + len;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, len, bytes.len()))?;
+    *at = end;
+    String::from_utf8(slice.to_vec())
+        .map_err(|e| FerroError::Wal(format!("ddl record holds a non-utf8 name: {e}")))
+}
+
+fn short(at: usize, want: usize, have: usize) -> FerroError {
+    FerroError::Wal(format!(
+        "log record is truncated: wanted {want} byte(s) at offset {at} but the record is {have} bytes"
+    ))
 }
 
 impl RecKind {
@@ -110,6 +176,29 @@ impl RecKind {
                 buffer.extend_from_slice(&(new.len() as u32).to_be_bytes());
                 buffer.extend_from_slice(new);
             }
+            RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
+                buffer.push(9);
+                buffer.push(match op { DdlOp::CreateTable => 0, DdlOp::DropTable => 1 });
+                buffer.extend_from_slice(&dir_root.to_be_bytes());
+                buffer.extend_from_slice(&time_travel_root.to_be_bytes());
+                write_str(buffer, table);
+                buffer.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+                for (name, ty, nullable) in columns {
+                    write_str(buffer, name);
+                    // Type tag, then any payload the type carries. Varchar's length is part of the
+                    // type, so a consumer that recreates the column gets the same width.
+                    match ty {
+                        DataType::Integer => buffer.push(0),
+                        DataType::Float => buffer.push(1),
+                        DataType::Boolean => buffer.push(2),
+                        DataType::Varchar(n) => {
+                            buffer.push(3);
+                            buffer.extend_from_slice(&n.to_be_bytes());
+                        }
+                    }
+                    buffer.push(if *nullable { 1 } else { 0 });
+                }
+            }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
                 buffer.extend_from_slice(&undone_lsn.to_be_bytes());
@@ -145,6 +234,37 @@ impl RecKind {
                 let new_len = u32::from_be_bytes(bytes[15 + length..19 + length].try_into().unwrap()) as usize;
                 let new = bytes[19 + length.. 19 + length + new_len].to_vec();
                 Ok(RecKind::HeapUpdate { dir_root, page_id, slot, old, new })
+            }
+            9 => {
+                // Every read is bounds-checked against the record's own length: these bytes came
+                // off a disk or a socket, and `deserialize` must refuse a truncated record rather
+                // than index past it and panic the process.
+                let mut at = 1usize;
+                let op = match take_u8(bytes, &mut at)? {
+                    0 => DdlOp::CreateTable,
+                    1 => DdlOp::DropTable,
+                    other => return Err(FerroError::Wal(format!("unknown ddl op {other}"))),
+                };
+                let dir_root = take_u32(bytes, &mut at)?;
+                let time_travel_root = take_u32(bytes, &mut at)?;
+                let table = take_str(bytes, &mut at)?;
+                let count = take_u16(bytes, &mut at)? as usize;
+                let mut columns = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    let name = take_str(bytes, &mut at)?;
+                    let ty = match take_u8(bytes, &mut at)? {
+                        0 => DataType::Integer,
+                        1 => DataType::Float,
+                        2 => DataType::Boolean,
+                        3 => DataType::Varchar(take_u16(bytes, &mut at)?),
+                        other => {
+                            return Err(FerroError::Wal(format!("unknown column type tag {other}")))
+                        }
+                    };
+                    let nullable = take_u8(bytes, &mut at)? != 0;
+                    columns.push((name, ty, nullable));
+                }
+                Ok(RecKind::Ddl { op, table, dir_root, time_travel_root, columns })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());

@@ -44,7 +44,18 @@ type Event struct {
 	After        map[string]any `json:"after"`
 }
 
-var validOps = map[string]bool{"READ": true, "INSERT": true, "UPDATE": true, "DELETE": true}
+var validOps = map[string]bool{
+	"READ": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	// Schema events. Adding an op to the feed is a breaking change for every consumer, and this
+	// program proved it: it rejected CREATE_TABLE with "unknown op" the moment the producer
+	// started emitting one. That is the independent implementation doing its job rather than a
+	// nuisance — a consumer that silently ignored ops it did not recognise would drop schema
+	// changes and never say so.
+	"CREATE_TABLE": true, "DROP_TABLE": true,
+}
+
+// isSchema reports whether an op describes the table's shape rather than a row.
+func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
 
 // checkEnvelope enforces the invariants the feed documents, independently of the producer.
 func checkEnvelope(e *Event, raw string, n int) error {
@@ -56,6 +67,38 @@ func checkEnvelope(e *Event, raw string, n int) error {
 	}
 	// before/after presence must follow from op alone, or a consumer cannot branch on op.
 	switch e.Op {
+	case "CREATE_TABLE":
+		if e.Before != nil {
+			return fmt.Errorf("line %d: CREATE_TABLE carries a before image", n)
+		}
+		// Its payload is the table's shape, keyed under `columns` so it can never be mistaken for
+		// a row of data.
+		if e.After == nil {
+			return fmt.Errorf("line %d: CREATE_TABLE has no schema payload", n)
+		}
+		cols, ok := e.After["columns"]
+		if !ok {
+			return fmt.Errorf("line %d: CREATE_TABLE payload has no columns", n)
+		}
+		list, ok := cols.([]any)
+		if !ok || len(list) == 0 {
+			return fmt.Errorf("line %d: CREATE_TABLE columns is not a non-empty list", n)
+		}
+		for _, c := range list {
+			m, ok := c.(map[string]any)
+			if !ok {
+				return fmt.Errorf("line %d: a column is not an object", n)
+			}
+			for _, want := range []string{"name", "type", "nullable"} {
+				if _, ok := m[want]; !ok {
+					return fmt.Errorf("line %d: a column has no %q", n, want)
+				}
+			}
+		}
+	case "DROP_TABLE":
+		if e.After != nil {
+			return fmt.Errorf("line %d: DROP_TABLE carries an after image", n)
+		}
 	case "READ", "INSERT":
 		if e.Before != nil {
 			return fmt.Errorf("line %d: %s carries a before image", n, e.Op)
@@ -109,8 +152,10 @@ func decodeLine(line string, n int) (*Event, error) {
 
 // Table is the materialised view a consumer builds from the feed.
 type Table struct {
-	key  string
-	rows map[string]map[string]any
+	key string
+	// Column names as last declared by a schema event, so a consumer knows the destination shape.
+	columns []string
+	rows    map[string]map[string]any
 }
 
 func newTable(key string) *Table {
@@ -129,6 +174,23 @@ func (t *Table) keyOf(row map[string]any) (string, error) {
 // getting DELETE wrong shows up as a row that never goes away.
 func (t *Table) apply(e *Event) error {
 	switch e.Op {
+	case "CREATE_TABLE":
+		// Schema evolution: adopt the declared shape. A real sink would issue CREATE/ALTER against
+		// its destination here; the point is that it learns the shape IN BAND and in log order,
+		// rather than being told out of band and having to guess which rows it applies to.
+		t.columns = t.columns[:0]
+		if list, ok := e.After["columns"].([]any); ok {
+			for _, c := range list {
+				if m, ok := c.(map[string]any); ok {
+					t.columns = append(t.columns, fmt.Sprint(m["name"]))
+				}
+			}
+		}
+		return nil
+	case "DROP_TABLE":
+		t.rows = map[string]map[string]any{}
+		t.columns = nil
+		return nil
 	case "READ", "INSERT", "UPDATE":
 		k, err := t.keyOf(e.After)
 		if err != nil {
@@ -229,6 +291,9 @@ func follow(addr, key string, cursor uint64, limit int) error {
 
 	fmt.Fprintf(os.Stderr, "consumed %d event(s), cursor %d\n", n, lastCursor)
 	fmt.Printf("CURSOR %d\n", lastCursor)
+	if len(table.columns) > 0 {
+		fmt.Printf("COLUMNS %s\n", strings.Join(table.columns, ","))
+	}
 	fmt.Print("TABLE ")
 	return table.dump(os.Stdout)
 }

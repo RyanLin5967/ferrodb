@@ -68,11 +68,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::catalog::catalog::Catalog;
-use crate::catalog::column::Value;
+use crate::catalog::column::{Column, DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
 use crate::storage::tuple::Tuple;
-use crate::wal::log::{RecKind, WalManager};
+use crate::wal::log::{DdlOp, RecKind, WalManager};
 
 /// What happened to one row.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +83,13 @@ pub enum ChangeOp {
     /// pre-existing row look like fresh activity, and anything downstream that counts events would
     /// be wrong by the size of the table.
     Read { row: Vec<Value> },
+    /// A schema change, carried in-band and in log order.
+    ///
+    /// In-band matters: a consumer that learns about a new column out of band has to guess when to
+    /// apply it, and every guess is wrong for some row. Arriving in the stream at the position the
+    /// DDL actually occupied means the events before it describe the old shape and the ones after
+    /// describe the new one, with no ambiguity to resolve.
+    Schema { change: SchemaChange, columns: Vec<ColumnSpec> },
     Insert { new: Vec<Value> },
     Update { old: Vec<Value>, new: Vec<Value> },
     Delete { old: Vec<Value> },
@@ -92,11 +99,32 @@ impl ChangeOp {
     pub fn name(&self) -> &'static str {
         match self {
             ChangeOp::Read { .. } => "READ",
+            ChangeOp::Schema { change, .. } => match change {
+                SchemaChange::CreateTable => "CREATE_TABLE",
+                SchemaChange::DropTable => "DROP_TABLE",
+            },
             ChangeOp::Insert { .. } => "INSERT",
             ChangeOp::Update { .. } => "UPDATE",
             ChangeOp::Delete { .. } => "DELETE",
         }
     }
+}
+
+/// Which schema change a `Schema` event describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaChange {
+    CreateTable,
+    DropTable,
+}
+
+/// One column, as the feed describes it to a consumer that must recreate the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSpec {
+    pub name: String,
+    /// `INTEGER`, `FLOAT`, `BOOLEAN`, or `VARCHAR(n)` — the width is part of the type, so a
+    /// consumer recreating the column gets the same one.
+    pub sql_type: String,
+    pub nullable: bool,
 }
 
 /// One row-level change, attributed to the transaction that committed it.
@@ -144,6 +172,8 @@ pub struct Decoded {
     /// One is configuration; the other is a bug or a record that is not a row at all. Reporting
     /// both as "unresolved" sent me looking for the wrong thing.
     pub undecodable: BTreeMap<u32, usize>,
+    /// Schema changes seen, in log order: `(lsn, table, change)`.
+    pub schema_changes: Vec<(u64, String, SchemaChange)>,
     /// Records that belong to a table's time-travel heap: superseded versions archived by MVCC.
     /// Correctly not emitted, and correctly not an error.
     pub internal: usize,
@@ -218,6 +248,16 @@ impl LogicalDecoder {
         LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
     }
 
+    /// A decoder that knows nothing at all.
+    ///
+    /// Useful on its own, because the log now carries `CREATE TABLE`: a blank decoder walking a
+    /// range that begins with the DDL learns the tables as it goes and decodes the rows that follow.
+    /// That is the difference between a feed that needs a catalog handed to it out of band and one
+    /// that is self-describing.
+    pub fn blank() -> Self {
+        LogicalDecoder { tables: HashMap::new(), time_travel: BTreeSet::new() }
+    }
+
     /// Number of tables this decoder can resolve. A decoder that knows no tables would report every
     /// record as unresolved, which is a configuration mistake rather than an empty database.
     pub fn known_tables(&self) -> usize {
@@ -238,8 +278,12 @@ impl LogicalDecoder {
             .unwrap_or(false)
     }
 
-    fn row(&self, dir_root: u32, bytes: &[u8]) -> RowResult {
-        let Some((name, schema, columns)) = self.tables.get(&dir_root) else {
+    fn row_in(
+        tables: &HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
+        dir_root: u32,
+        bytes: &[u8],
+    ) -> RowResult {
+        let Some((name, schema, columns)) = tables.get(&dir_root) else {
             return RowResult::UnknownTable;
         };
         let tuple = Tuple { data: bytes.to_vec() };
@@ -260,6 +304,15 @@ impl LogicalDecoder {
         to_lsn: u64,
     ) -> Result<Decoded, FerroError> {
         let mut out = Decoded::default();
+
+        // The constructor's mapping is a STARTING POINT, not the truth for the whole range. DDL in
+        // the log evolves it as the walk proceeds, so records are decoded against the schema that
+        // was in force where they sit rather than against whatever the catalog looks like now.
+        // Without this, decoding any history that contains a `CREATE TABLE` requires a catalog from
+        // the future, and a `DROP TABLE` makes the past undecodable entirely.
+        let mut tables = self.tables.clone();
+        let mut time_travel = self.time_travel.clone();
+
         // txn_id -> changes staged so far, in the order they were written.
         let mut staged: HashMap<u64, Vec<(u64, String, Arc<Vec<String>>, ChangeOp)>> = HashMap::new();
 
@@ -272,7 +325,9 @@ impl LogicalDecoder {
             let internal_root = match &rec.kind {
                 RecKind::HeapInsert { dir_root, .. }
                 | RecKind::HeapDelete { dir_root, .. }
-                | RecKind::HeapUpdate { dir_root, .. } => self.is_internal(*dir_root),
+                | RecKind::HeapUpdate { dir_root, .. } => {
+                    time_travel.contains(dir_root) && !tables.contains_key(dir_root)
+                }
                 _ => false,
             };
             if internal_root {
@@ -288,7 +343,7 @@ impl LogicalDecoder {
 
             match &rec.kind {
                 RecKind::HeapInsert { dir_root, tuple, .. } => {
-                    match self.row(*dir_root, tuple) {
+                    match Self::row_in(&tables, *dir_root, tuple) {
                         RowResult::Row(table, columns, new) => staged
                             .entry(txn)
                             .or_default()
@@ -301,7 +356,7 @@ impl LogicalDecoder {
                         }
                     }
                 }
-                RecKind::HeapDelete { dir_root, old, .. } => match self.row(*dir_root, old) {
+                RecKind::HeapDelete { dir_root, old, .. } => match Self::row_in(&tables, *dir_root, old) {
                     RowResult::Row(table, columns, old) => staged
                         .entry(txn)
                         .or_default()
@@ -313,7 +368,7 @@ impl LogicalDecoder {
                     // Decided BEFORE the images are turned into values, because it is a property of
                     // the version header rather than of the columns.
                     let killed = Self::is_dead(new);
-                    match (self.row(*dir_root, old), self.row(*dir_root, new)) {
+                    match (Self::row_in(&tables, *dir_root, old), Self::row_in(&tables, *dir_root, new)) {
                         (RowResult::Row(table, columns, old), RowResult::Row(_, _, new)) => {
                             let op = if killed {
                                 // A SQL DELETE. Reporting it as an update would leave a consumer
@@ -352,6 +407,64 @@ impl LogicalDecoder {
                     // Rolled back: the rows never existed, so nothing is emitted.
                     staged.remove(&txn);
                     out.aborted.insert(txn);
+                }
+                RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
+                    let specs: Vec<ColumnSpec> = columns
+                        .iter()
+                        .map(|(name, ty, nullable)| ColumnSpec {
+                            name: name.clone(),
+                            sql_type: match ty {
+                                DataType::Integer => "INTEGER".to_string(),
+                                DataType::Float => "FLOAT".to_string(),
+                                DataType::Boolean => "BOOLEAN".to_string(),
+                                DataType::Varchar(n) => format!("VARCHAR({n})"),
+                            },
+                            nullable: *nullable,
+                        })
+                        .collect();
+
+                    let change = match op {
+                        DdlOp::CreateTable => {
+                            let schema = Schema::new(
+                                columns
+                                    .iter()
+                                    .map(|(name, ty, nullable)| Column {
+                                        name: name.clone(),
+                                        data_type: ty.clone(),
+                                        nullable: *nullable,
+                                    })
+                                    .collect(),
+                            );
+                            let names: Vec<String> =
+                                columns.iter().map(|(n, _, _)| n.clone()).collect();
+                            tables.insert(
+                                *dir_root,
+                                (table.clone(), schema, Arc::new(names)),
+                            );
+                            time_travel.insert(*time_travel_root);
+                            SchemaChange::CreateTable
+                        }
+                        DdlOp::DropTable => {
+                            tables.remove(dir_root);
+                            SchemaChange::DropTable
+                        }
+                    };
+                    out.schema_changes.push((lsn, table.clone(), change));
+
+                    // Emitted immediately rather than staged: DDL is refused inside a transaction
+                    // (`executor.rs`, "DDL not allowed in txn"), so there is no commit to wait for
+                    // and holding it back would place it after changes that actually followed it.
+                    out.events.push(ChangeEvent {
+                        txn_id: txn,
+                        lsn,
+                        commit_lsn: lsn,
+                        commit_end_lsn: next,
+                        table: table.clone(),
+                        columns: Arc::new(
+                            columns.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
+                        ),
+                        op: ChangeOp::Schema { change, columns: specs },
+                    });
                 }
                 // `Clr` records are undo work, and undo only happens on the way to an `Abort`,
                 // whose buffer is discarded whole. `Begin`, `TxnEnd` and `Checkpoint` carry no row

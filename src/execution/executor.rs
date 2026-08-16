@@ -1,3 +1,6 @@
+use crate::catalog::column::DataType;
+use crate::wal::log::DdlOp;
+use crate::wal::txn::DdlRecord;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -89,8 +92,36 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             if session.current.is_some() {
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
             }
+            let name = table.clone();
+            let spec: Vec<(String, DataType, bool)> = columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                .collect();
             catalog.create_table(table, Schema{columns})?;
             txn.checkpoint()?;
+
+            // Logged AFTER the checkpoint, and that ordering is not stylistic: `checkpoint`
+            // truncates the WAL, so a DDL record written before it would be discarded by the very
+            // call that follows it — the record would exist for microseconds and no reader would
+            // ever see one.
+            //
+            // This record does not drive recovery; the catalog is still authoritative for the
+            // running database. It exists so a reader of the log knows what the tables were, which
+            // is what lets the change feed carry schema instead of assuming today's catalog
+            // describes yesterday's rows.
+            if let Some(entry) = catalog.get_table(&name) {
+                // Through `log_ddl`, not a bare append: the record must be RETAINED, because the
+                // next checkpoint truncates the log and would otherwise erase it. Creating a second
+                // table is itself a checkpoint, so a bare append meant the first table's schema
+                // survived exactly until the second one was created.
+                txn.log_ddl(DdlRecord {
+                    op: DdlOp::CreateTable,
+                    table: name.clone(),
+                    dir_root: entry.first_directory_page_id,
+                    time_travel_root: entry.time_travel_root,
+                    columns: spec,
+                })?;
+            }
             return Ok(Outcome::Ok)
         }
         Stmt::Analyze { table } => {

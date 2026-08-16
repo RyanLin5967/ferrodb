@@ -137,8 +137,10 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
     // `op` is not.
     out.push_str(",\"before\":");
     match &e.op {
-        // A snapshot row has no prior state to report, the same as an insert.
-        ChangeOp::Read { .. } | ChangeOp::Insert { .. } => out.push_str("null"),
+        // A snapshot row and a schema change have no prior state to report, the same as an insert.
+        ChangeOp::Read { .. } | ChangeOp::Insert { .. } | ChangeOp::Schema { .. } => {
+            out.push_str("null")
+        }
         ChangeOp::Update { old, .. } | ChangeOp::Delete { old } => {
             row_into(&e.columns, old, &mut out)
         }
@@ -146,6 +148,24 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
 
     out.push_str(",\"after\":");
     match &e.op {
+        // A schema event's payload is the table's shape, not a row. Keyed under `columns` so a
+        // consumer never confuses it with data.
+        ChangeOp::Schema { columns, .. } => {
+            out.push_str("{\"columns\":[");
+            for (i, c) in columns.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"name\":");
+                escape_json_into(&c.name, &mut out);
+                out.push_str(",\"type\":");
+                escape_json_into(&c.sql_type, &mut out);
+                out.push_str(",\"nullable\":");
+                out.push_str(if c.nullable { "true" } else { "false" });
+                out.push('}');
+            }
+            out.push_str("]}");
+        }
         ChangeOp::Read { row } => row_into(&e.columns, row, &mut out),
         ChangeOp::Insert { new } | ChangeOp::Update { new, .. } => {
             row_into(&e.columns, new, &mut out)
