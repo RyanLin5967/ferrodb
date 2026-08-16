@@ -277,10 +277,19 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   reconnects there and the halves join with no gap and no overlap. The cursor advances only past a
   commit that was actually emitted — never to the durable frontier, which would step over an
   in-flight transaction's records permanently.
-- **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
-  the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
-  direction is deliberate: handing off after the scan silently loses concurrent changes, while
-  handing off before re-delivers a few — and duplication is recoverable where loss is not.
+- **Initial snapshot, cutting over to the stream with no gap and no overlap.** A consumer joining a
+  database that already has rows reads the current contents as `READ` events and then follows the
+  live feed, and every row appears **exactly once** across the two. `snapshot_table_exact` takes the
+  read inside a transaction, so it knows precisely which transactions its rows already contain, and
+  the stream skips exactly those (`FeedStreamer::resuming_after_snapshot`). Skipping by LSN cannot
+  do this: the resume point has to reach back over any transaction that was already in flight —
+  MVCC excludes its uncommitted work from the snapshot, and its records sit *below* the scan — and
+  reaching back drags in commits the snapshot did contain. Those two sets interleave in the log, so
+  no byte offset separates them; only the transaction id does.
+  `tests/integration_cdc_cutover.rs` asserts exactly-once over a scenario holding one transaction
+  open across the cutover, and its companion test asserts that the older at-least-once path
+  (`snapshot_table`, kept for callers with only a WAL) both duplicates and drops on that same
+  scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
 

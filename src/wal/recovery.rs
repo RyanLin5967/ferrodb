@@ -20,12 +20,18 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
 
     let mut max_txn = 0u64;
     let mut last_lsn = HashMap::new();
+    // The earliest record each transaction still has in the retained log. For a loser this is its
+    // `Begin` unless a truncation cut above it, in which case it is the oldest record that
+    // survives — which is the same thing the field means: the earliest point a reader would have
+    // to start from to see everything this transaction did.
+    let mut first_lsn: HashMap<u64, u64> = HashMap::new();
     let mut ended: HashSet<u64> = HashSet::new();
     let mut touched = HashSet::new();
     // analysis
     for rec in &records {
         max_txn = max_txn.max(rec.txn_id);
         last_lsn.insert(rec.txn_id, rec.lsn);
+        first_lsn.entry(rec.txn_id).or_insert(rec.lsn);
         match &rec.kind {
             RecKind::Commit | RecKind::TxnEnd => {
                 ended.insert(rec.txn_id);
@@ -69,6 +75,7 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
         txn.att.lock().unwrap().insert(id, TxnEntry {
             status: TxnStatus::Aborting,
             last_lsn: last_lsn[&id],
+            begin_lsn: first_lsn[&id],
             snapshot: None
         });
         txn.abort(id)?;

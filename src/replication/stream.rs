@@ -37,11 +37,19 @@
 //! consumer that acts on an event and dies before recording its position will see it again. That
 //! is the usual CDC contract and it is why events carry `commit_lsn`: it is a natural idempotence
 //! key.
+//!
+//! # Joining an initial snapshot
+//!
+//! One duplication is *not* left to the consumer: the overlap at a snapshot-to-stream cutover.
+//! [`FeedStreamer::resuming_after_snapshot`] takes the transaction set a snapshot already contained
+//! and drops those transactions' events, so the two feeds meet with no gap and no overlap. See
+//! [`super::snapshot`] for why that has to be decided per transaction and not per LSN.
 
 use std::io::Write;
 
 use crate::error::FerroError;
 use crate::wal::log::WalManager;
+use crate::wal::txn::Snapshot as TxnSnapshot;
 
 use super::jsonl::write_feed;
 use super::logical::{Decoded, LogicalDecoder};
@@ -61,6 +69,14 @@ pub struct Pumped {
     /// Records the decoder could not attribute to a table. Non-zero means the feed is incomplete
     /// and a caller should say so rather than present it as a clean run.
     pub unresolved: usize,
+    /// Events decoded and deliberately **not** written, because the initial snapshot this streamer
+    /// was handed already contained the transaction that produced them. Always zero on a streamer
+    /// with no snapshot boundary.
+    ///
+    /// Reported rather than merely done: a consumer that sees a stream advance a long way while
+    /// emitting nothing should be able to tell "the snapshot already had all of it" from "the feed
+    /// is dropping records", and those look identical from the emitted count alone.
+    pub suppressed: usize,
 }
 
 impl Pumped {
@@ -87,17 +103,43 @@ pub struct FeedStreamer {
     decoder: LogicalDecoder,
     /// Largest batch of log to decode in one pump, in bytes.
     max_bytes: u64,
+    /// The transactions an initial snapshot already delivered, when this streamer is following one.
+    /// See [`FeedStreamer::resuming_after_snapshot`].
+    already_snapshotted: Option<TxnSnapshot>,
 }
 
 impl FeedStreamer {
     pub fn new(decoder: LogicalDecoder) -> Self {
-        FeedStreamer { decoder, max_bytes: 1 << 20 }
+        FeedStreamer { decoder, max_bytes: 1 << 20, already_snapshotted: None }
     }
 
     /// Bound how much log one pump will decode. A consumer that has been away for a long time
     /// should not cause one unbounded allocation.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes.max(1);
+        self
+    }
+
+    /// Follow on from an initial snapshot **without re-delivering what it already contained**.
+    ///
+    /// The resume LSN a snapshot hands back is deliberately early: it sits at or before the oldest
+    /// transaction that was in flight when the snapshot was taken, so no excluded change can be
+    /// below it. That closes the gap and opens an overlap — the range from there to the snapshot's
+    /// read also contains commits the snapshot *did* see, and re-delivering those is exactly the
+    /// duplication at-least-once tolerates.
+    ///
+    /// The snapshot's transaction set closes it. An event carries the id of the transaction that
+    /// produced it, and [`TxnSnapshot::includes`] answers, by the same visibility rule the rows
+    /// were read with, whether that transaction's work is already in the snapshot. Skipping by
+    /// transaction rather than by LSN is what makes this exact: the two feeds interleave in the
+    /// log, so no single byte offset separates them.
+    ///
+    /// **Only events attributed to a transaction are filtered.** Schema events are logged outside
+    /// any transaction (under id 0, which `begin` never hands out) so the snapshot boundary says
+    /// nothing about them, and suppressing them would leave a consumer without the shape of a table
+    /// created after the cutover.
+    pub fn resuming_after_snapshot(mut self, already_snapshotted: TxnSnapshot) -> Self {
+        self.already_snapshotted = Some(already_snapshotted);
         self
     }
 
@@ -139,21 +181,37 @@ impl FeedStreamer {
                 frontier,
                 withheld: 0,
                 unresolved: 0,
+                suppressed: 0,
             });
         }
 
         let to = frontier.min(cursor.saturating_add(self.max_bytes));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
-        let emitted = write_feed(&decoded.events, w)?;
-
-        // **The cursor rule.** Only past a commit that was actually emitted.
+        // **The cursor rule.** Only past a commit that was actually decoded — computed over every
+        // decoded event, *before* the snapshot filter runs. A commit whose events were suppressed
+        // has still been seen and decided about, so the cursor must move past it; leaving it behind
+        // would make a fully-suppressed batch return the same cursor for ever and hang the loop.
         let next = decoded
             .events
             .iter()
             .map(|e| e.commit_end_lsn)
             .max()
             .unwrap_or(cursor);
+
+        let mut events = decoded.events;
+        let suppressed = match &self.already_snapshotted {
+            None => 0,
+            Some(already) => {
+                let before = events.len();
+                // Transaction id 0 means "not attributed to a transaction" — DDL, which the
+                // snapshot boundary says nothing about. `begin` starts handing out ids at 1.
+                events.retain(|e| e.txn_id == 0 || !already.includes(e.txn_id));
+                before - events.len()
+            }
+        };
+
+        let emitted = write_feed(&events, w)?;
 
         Ok(Pumped {
             emitted,
@@ -162,6 +220,7 @@ impl FeedStreamer {
             withheld: decoded.open.len(),
             unresolved: decoded.unresolved.values().sum::<usize>()
                 + decoded.undecodable.values().sum::<usize>(),
+            suppressed,
         })
     }
 }
@@ -526,6 +585,136 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("truncated away"), "wrong reason: {msg}");
         assert!(msg.contains("skip"), "the message does not say what would go wrong: {msg}");
+    }
+
+    /// A boundary that already contains transactions 1 and 2 but not 3.
+    fn boundary() -> TxnSnapshot {
+        TxnSnapshot { high_water: 3, active: std::collections::HashSet::new() }
+    }
+
+    /// **The overlap the cutover exists to remove.** Events from transactions the snapshot already
+    /// contained are decoded and then dropped; everything else is delivered.
+    #[test]
+    fn events_the_snapshot_already_contained_are_not_re_delivered() {
+        let (_d, w) = wal("suppress");
+        let start = FeedStreamer::start_cursor(&w);
+        for i in 1..=3u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32 * 10);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+
+        // Without the boundary the same range delivers all three, which is what makes the
+        // difference below attributable to the filter and not to the range.
+        let mut all = Vec::new();
+        assert_eq!(streamer().pump(&w, start, &mut all).unwrap().emitted, 3);
+
+        let s = streamer().resuming_after_snapshot(boundary());
+        let mut buf = Vec::new();
+        let p = s.pump(&w, start, &mut buf).unwrap();
+
+        assert_eq!(p.emitted, 1, "the snapshot's own transactions were re-delivered: {p:?}");
+        assert_eq!(p.suppressed, 2, "the suppression was not reported: {p:?}");
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"qty\":30"), "the transaction after the snapshot was lost: {text}");
+        assert!(!text.contains("\"qty\":10"), "a snapshotted row came back: {text}");
+        assert!(!text.contains("\"qty\":20"), "a snapshotted row came back: {text}");
+    }
+
+    /// A transaction still in flight when the snapshot was taken is **not** in it, so its events
+    /// must survive the filter. This is the half a naive "skip everything older" rule gets wrong.
+    #[test]
+    fn a_transaction_that_was_in_flight_at_snapshot_time_is_still_delivered() {
+        let (_d, w) = wal("inflight_at_snapshot");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // Transaction 1 is below the high water mark but was open when the snapshot was taken.
+        let boundary =
+            TxnSnapshot { high_water: 3, active: std::collections::HashSet::from([1u64]) };
+        let s = streamer().resuming_after_snapshot(boundary);
+        let mut buf = Vec::new();
+        let p = s.pump(&w, start, &mut buf).unwrap();
+        assert_eq!(
+            p.emitted, 1,
+            "an in-flight transaction's changes were suppressed as though the snapshot had them, \
+             which loses them permanently: {p:?}"
+        );
+        assert_eq!(p.suppressed, 0);
+    }
+
+    /// **A fully suppressed batch must still move the cursor**, or a consumer whose backlog is
+    /// entirely pre-snapshot pumps the same range for ever and never reaches the live edge.
+    #[test]
+    fn a_batch_that_is_entirely_suppressed_still_advances_the_cursor() {
+        let (_d, w) = wal("all_suppressed");
+        let start = FeedStreamer::start_cursor(&w);
+        for i in 1..=2u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+
+        let s = streamer().resuming_after_snapshot(boundary());
+        let mut buf = Vec::new();
+        let p = s.pump(&w, start, &mut buf).unwrap();
+        assert_eq!(p.emitted, 0);
+        assert_eq!(p.suppressed, 2);
+        assert!(p.cursor > start, "the cursor stuck on a batch it had decided about: {p:?}");
+        assert!(buf.is_empty(), "something was written despite emitting nothing");
+    }
+
+    /// **Schema events are never suppressed.** They are logged outside any transaction, under id 0,
+    /// so the boundary says nothing about them — and a table created after the cutover would
+    /// otherwise reach the consumer with no shape at all.
+    #[test]
+    fn a_schema_event_survives_the_snapshot_filter() {
+        use crate::catalog::column::DataType;
+        use crate::wal::log::DdlOp;
+
+        let (_d, w) = wal("schema_filter");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: "later".into(),
+                dir_root: 41,
+                time_travel_root: 42,
+                columns: vec![("id".into(), DataType::Integer, false)],
+            },
+        )
+        .unwrap();
+        w.flush().unwrap();
+
+        // A boundary that would "include" transaction 0 if the rule were applied blindly.
+        let s = streamer().resuming_after_snapshot(boundary());
+        let mut buf = Vec::new();
+        let p = s.pump(&w, start, &mut buf).unwrap();
+        assert_eq!(p.suppressed, 0, "a schema event was filtered by a transaction boundary");
+        assert_eq!(p.emitted, 1, "the schema event never arrived: {p:?}");
+        assert!(String::from_utf8(buf).unwrap().contains("CREATE_TABLE"));
+    }
+
+    /// A streamer with no boundary behaves exactly as it did before there was one.
+    #[test]
+    fn a_streamer_without_a_snapshot_boundary_suppresses_nothing() {
+        let (_d, w) = wal("nofilter");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut buf = Vec::new();
+        let p = streamer().pump(&w, start, &mut buf).unwrap();
+        assert_eq!((p.emitted, p.suppressed), (1, 0));
     }
 
     /// A long-absent consumer must not cause one unbounded decode. The batch stops early and the

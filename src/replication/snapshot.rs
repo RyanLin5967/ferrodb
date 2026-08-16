@@ -33,13 +33,45 @@
 //! [`Snapshot::concurrent_writes`] says whether the log moved during the scan, which is what
 //! distinguishes "this handoff is exact" from "this handoff will re-deliver some changes". Both are
 //! correct; only one is tidy, and a caller that wants to know can ask.
+//!
+//! # [`snapshot_table_exact`]: the same handoff with the overlap removed
+//!
+//! Everything above is true of [`snapshot_table`], which brackets a read it knows nothing about and
+//! therefore cannot do better than at-least-once. It is kept because it needs nothing but a WAL.
+//!
+//! [`snapshot_table_exact`] is given the [`TxnManager`] as well, and that one extra thing is enough
+//! to make the cutover **exact in both directions**. It opens the read inside a transaction, so it
+//! knows precisely which transactions the rows it wrote out already contain, and it hands that set
+//! back alongside the resume LSN. A stream built with
+//! [`FeedStreamer::resuming_after_snapshot`](super::stream::FeedStreamer::resuming_after_snapshot)
+//! drops events from those transactions and delivers everything else, so every change appears
+//! exactly once across snapshot and stream.
+//!
+//! Two things had to change for that, and both are corrections rather than additions:
+//!
+//! - **The resume point moved earlier, not later.** Taking it "just before the scan" is not early
+//!   enough. A transaction already in flight at that moment is excluded from the snapshot — MVCC
+//!   does not show a reader another transaction's uncommitted work — and its records sit *below*
+//!   that LSN. A stream starting there meets its `Commit` having never read its changes, emits
+//!   nothing for it, and the rows reach nobody, silently. So the resume point is pulled back to the
+//!   oldest in-flight transaction's `Begin`. That is a **gap** the at-least-once path also has, and
+//!   it is the more serious of the two failures.
+//! - **The overlap that pulling back creates is closed by transaction id, not by LSN.** Between the
+//!   new resume point and the read there are commits the snapshot *did* see, interleaved in the log
+//!   with ones it did not. No byte offset separates those two sets, which is the whole reason
+//!   skipping by LSN alone cannot be exact.
+//!
+//! What this still does not promise is end-to-end exactly-once *delivery*: a consumer that acts on
+//! an event and dies before recording its cursor will see that event again on restart. That is a
+//! property of the consumer's checkpointing, not of the cutover, and no source can supply it.
 
 use std::io::Write;
 use std::sync::Arc;
 
 use crate::catalog::column::Value;
 use crate::error::FerroError;
-use crate::wal::log::WalManager;
+use crate::wal::log::{WalManager, WalPin};
+use crate::wal::txn::{Snapshot as TxnSnapshot, TxnManager};
 
 use super::jsonl::write_feed;
 use super::logical::{ChangeEvent, ChangeOp};
@@ -121,6 +153,112 @@ where
         lsn,
         lsn_after,
         concurrent_writes: lsn_after != lsn,
+    })
+}
+
+/// A snapshot whose handoff to the stream is exact: no change missed, none delivered twice.
+///
+/// Not merged into [`Snapshot`] on purpose. The two carry different promises, and a caller holding
+/// one should not be able to read it as the other by looking at a field name.
+pub struct ExactSnapshot {
+    pub table: String,
+    /// Rows written out.
+    pub rows: usize,
+    /// **Where the stream resumes.** At or before the oldest transaction in flight when the read
+    /// was taken, so nothing the snapshot excluded can sit below it. Durable.
+    pub resume_lsn: u64,
+    /// **The transactions the rows already contain.** Hand this to
+    /// [`FeedStreamer::resuming_after_snapshot`](super::stream::FeedStreamer::resuming_after_snapshot);
+    /// without it the stream re-delivers everything between `resume_lsn` and the read.
+    pub included: TxnSnapshot,
+    /// A claim on the log at `resume_lsn`, held so a checkpoint cannot discard the records the
+    /// stream is about to ask for.
+    ///
+    /// Taken here rather than left to the caller because the window between "snapshot returns" and
+    /// "consumer subscribes" is exactly where a checkpoint would land — the same failure a base
+    /// backup hit before it started pinning, where the copy was refused with "below the log's base"
+    /// before applying a single record. Dropping this releases the claim, so keep it until the
+    /// [`Subscription`](super::stream::Subscription) that replaces it exists.
+    pub pin: WalPin,
+    /// The reading transaction's id. Reported so a caller can tell one cutover from another in a
+    /// log; nothing downstream needs it.
+    pub reader_txn_id: u64,
+}
+
+impl std::fmt::Debug for ExactSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExactSnapshot")
+            .field("table", &self.table)
+            .field("rows", &self.rows)
+            .field("resume_lsn", &self.resume_lsn)
+            .field("included", &self.included)
+            .field("reader_txn_id", &self.reader_txn_id)
+            .finish()
+    }
+}
+
+/// Take a consistent snapshot of one table and report a handoff the stream can join **exactly**.
+///
+/// `read_rows` is handed the id of a transaction that has already been opened, and must perform its
+/// read under it — that is what ties the rows to the transaction set this returns. It must not
+/// commit or roll that transaction back, and must not write through it; a reader that writes is
+/// rolled back and the call fails, because its own writes would be invisible to its own snapshot.
+///
+/// The read is *not* bracketed by LSNs here. Bracketing is what the at-least-once path does because
+/// it cannot see inside the read; this one knows the snapshot exactly, so the log's position while
+/// the scan runs is no longer part of the answer.
+pub fn snapshot_table_exact<W, F>(
+    table: &str,
+    txn: &TxnManager,
+    w: &mut W,
+    read_rows: F,
+) -> Result<ExactSnapshot, FerroError>
+where
+    W: Write,
+    F: FnOnce(u64) -> Result<(Vec<String>, Vec<Vec<Value>>), FerroError>,
+{
+    let handoff = txn.begin_snapshot_read()?;
+
+    // Pinned before the reader is closed, so there is no moment at which the resume point is both
+    // published and unclaimed. Nothing can truncate before this anyway — a checkpoint refuses while
+    // a transaction is open, and the reader is one — but that is a property of `checkpoint` today
+    // rather than a promise, and the pin does not depend on it.
+    let pin = txn.wal.pin(handoff.resume_lsn)?;
+
+    let read = read_rows(handoff.txn_id);
+
+    // Closed whatever the read did. A snapshot reader left open blocks every checkpoint for the
+    // life of the process, so an error path that skipped this would turn one failed snapshot into a
+    // WAL that never shrinks again.
+    let closed = txn.end_read_only(handoff.txn_id);
+    let (columns, rows) = read?;
+    closed?;
+
+    let columns = Arc::new(columns);
+    let events: Vec<ChangeEvent> = rows
+        .into_iter()
+        .map(|values| ChangeEvent {
+            txn_id: handoff.txn_id,
+            lsn: handoff.resume_lsn,
+            commit_lsn: handoff.resume_lsn,
+            commit_end_lsn: handoff.resume_lsn,
+            table: table.to_string(),
+            columns: Arc::clone(&columns),
+            // `READ`, for the same reason as above: a row that already existed is not news of a
+            // change, and a consumer counting inserts must not count the size of the table.
+            op: ChangeOp::Read { row: values },
+        })
+        .collect();
+
+    let n = write_feed(&events, w)?;
+
+    Ok(ExactSnapshot {
+        table: table.to_string(),
+        rows: n,
+        resume_lsn: handoff.resume_lsn,
+        included: handoff.snapshot,
+        pin,
+        reader_txn_id: handoff.txn_id,
     })
 }
 
@@ -218,6 +356,69 @@ mod tests {
         assert_eq!(snap.rows, 0);
         assert!(buf.is_empty(), "an empty table wrote lines: {:?}", String::from_utf8_lossy(&buf));
         assert!(snap.lsn > 0, "the handoff point is unusable");
+    }
+
+    fn engine(tag: &str) -> (tempfile::TempDir, std::sync::Arc<crate::wal::txn::TxnManager>) {
+        use crate::buffer::buffer_pool::BufferPoolManager;
+        use crate::storage::disk_manager::DiskManager;
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join(format!("{tag}.db")))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let wal = Arc::new(WalManager::new(dir.path().join(format!("{tag}.wal"))).unwrap());
+        let txn = Arc::new(crate::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal.clone());
+        (dir, txn)
+    }
+
+    /// The exact path writes the same rows and reports a resume point that is durable and pinned.
+    #[test]
+    fn an_exact_snapshot_writes_its_rows_and_pins_its_resume_point() {
+        use std::sync::atomic::Ordering;
+        let (_d, txn) = engine("exact_basic");
+        let mut buf = Vec::new();
+        let snap =
+            snapshot_table_exact("inventory", &txn, &mut buf, |_reader| Ok(rows())).unwrap();
+
+        assert_eq!(snap.rows, 2);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("\"op\":\"READ\""), "{text}");
+        assert!(
+            txn.wal.flushed_lsn.load(Ordering::SeqCst) >= snap.resume_lsn,
+            "the resume point is not durable"
+        );
+        assert_eq!(snap.pin.lsn(), snap.resume_lsn, "the pin is not on the resume point");
+        assert_eq!(
+            txn.wal.min_pinned_lsn(),
+            Some(snap.resume_lsn),
+            "the log was not claimed at the resume point, so a checkpoint could discard it"
+        );
+        // The reader is closed: it must not go on blocking checkpoints.
+        assert!(txn.att.lock().unwrap().is_empty(), "the snapshot reader was left open");
+        txn.checkpoint().expect("a closed reader should not block a checkpoint");
+    }
+
+    /// A failed scan must still close the reader. A transaction left open blocks every checkpoint
+    /// for the life of the process, which turns one failed snapshot into a WAL that never shrinks.
+    #[test]
+    fn a_failed_exact_scan_closes_its_reader_and_yields_no_handoff() {
+        let (_d, txn) = engine("exact_fail");
+        let mut buf = Vec::new();
+        let r = snapshot_table_exact("t", &txn, &mut buf, |_reader| {
+            Err(FerroError::Io("table vanished".into()))
+        });
+        assert!(r.is_err(), "a failed scan produced a snapshot");
+        assert!(buf.is_empty(), "a failed scan wrote rows");
+        assert!(
+            txn.att.lock().unwrap().is_empty(),
+            "the reader was left open after a failed scan"
+        );
+        txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
     }
 
     /// A failing read must not produce a handoff. Returning one would tell the consumer to start
