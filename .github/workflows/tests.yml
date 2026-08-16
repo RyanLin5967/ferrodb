@@ -64,9 +64,10 @@ jobs:
         run: choco install sqlite --no-progress -y
 
       # The duckdb CLI ships with no runner image, so it is fetched. Two steps rather than one
-      # because the extraction tool differs: `unzip` is absent from Git-for-Windows bash, and
-      # PowerShell's Expand-Archive does not exist on the unix runners. One step spanning both
-      # would have to guess, and a guess here degrades to "no CLI", which is the silent skip.
+      # because the extraction tool differs: `unzip` is on the ubuntu and macos images but is NOT in
+      # Git-for-Windows bash, which is what `shell: bash` gets on the Windows runner. (pwsh is in
+      # fact present on all three images, so a single pwsh step would work; these stay split so each
+      # platform uses its own native tooling and neither path is exercised only by the other's CI.)
       - name: Install the duckdb CLI (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -146,23 +147,33 @@ jobs:
             echo "cgo needs a C compiler but '$cc' (go env CC) is not on PATH" >&2
             exit 1
           }
-          "$cc" --version | head -1
+          # Captured, not piped. Under `set -o pipefail` a `| head -1` or `| grep -q` exits as soon
+          # as it has what it wants, the writer gets SIGPIPE, and the pipeline reports 141 - a red
+          # step with nothing wrong. Rare, load-dependent, and exactly the kind of flake nobody can
+          # reproduce on demand.
+          cc_version="$("$cc" --version)"
+          printf '%s\n' "$cc_version" | sed -n 1p
           # The duckdb CLI is now INSTALLED on every runner (see the steps above) and
           # FERRODB_REQUIRE_DUCKDB_CLI=1 makes the sink tests refuse the fallback reader rather
           # than quietly using it. Both halves are asserted here, because the failure this catches
           # is the one that produces a green run: an install step that stopped working would
           # otherwise just move the tests back onto the weaker reader without saying anything.
-          duckdb --version
-          duckdb --version | grep -qF "${DUCKDB_VERSION}" || {
-            echo "duckdb on PATH is '$(duckdb --version)', not the pinned ${DUCKDB_VERSION}." >&2
-            echo "A different CLI may render values differently, which reads as a data mismatch." >&2
-            exit 1
-          }
-          test "${FERRODB_REQUIRE_DUCKDB_CLI}" = "1" || {
-            echo "FERRODB_REQUIRE_DUCKDB_CLI is not 1, so the sink tests may silently fall back" >&2
-            exit 1
-          }
-          echo "toolchain OK (duckdb CLI ${DUCKDB_VERSION} present and required)"
+          # Captured rather than piped into grep, for the SIGPIPE reason given above.
+          duckdb_version="$(duckdb --version)"
+          echo "$duckdb_version"
+          case "$duckdb_version" in
+            *"${DUCKDB_VERSION}"*) ;;
+            *)
+              echo "duckdb on PATH is '$duckdb_version', not the pinned ${DUCKDB_VERSION}." >&2
+              echo "A different CLI may render values differently, which reads as a data mismatch." >&2
+              exit 1 ;;
+          esac
+          # There is deliberately NO assertion here that FERRODB_REQUIRE_DUCKDB_CLI is 1. Reading a
+          # variable this same file sets a dozen lines above proves nothing about anything - it
+          # cannot fail unless someone edits both halves, and someone editing both halves meant to.
+          # What actually enforces it is the test suites: they refuse to run on the fallback reader
+          # when it is set, which is a check on the real behaviour rather than on a string.
+          echo "toolchain OK (duckdb CLI ${DUCKDB_VERSION} present; sink tests refuse the fallback)"
 
       # cgo, proven per platform and attributed to its own step.
       #
