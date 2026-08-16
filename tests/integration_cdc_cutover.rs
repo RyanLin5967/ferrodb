@@ -38,7 +38,7 @@ use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact};
-use ferrodb::replication::stream::FeedStreamer;
+use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
@@ -123,21 +123,27 @@ fn id_counts_for(feed: &str, table: &str) -> BTreeMap<u64, usize> {
 
 /// Drain a streamer to the end of the durable log, returning the feed it wrote.
 ///
+/// Through a [`Subscription`] rather than raw pumps, because that is the path a real consumer
+/// takes: it claims the log at the resume point so a checkpoint cannot discard what it is about to
+/// read. Subscribing is also the first thing that would fail if a handoff pointed below the log's
+/// base, and this asserts it does not.
+///
 /// Stops when a pump neither emits anything **nor moves the cursor**. `emitted == 0` alone is not
 /// the end: a batch whose every event was suppressed as already-snapshotted emits nothing and still
 /// advances, and treating that as the end would stop the feed at the first such batch.
-fn drain(streamer: &FeedStreamer, wal: &WalManager, from: u64) -> (String, usize) {
+fn drain(streamer: &FeedStreamer, wal: &Arc<WalManager>, from: u64) -> (String, usize) {
+    let mut sub = Subscription::new(wal, from)
+        .unwrap_or_else(|e| panic!("the handoff at {from} is not subscribable: {e}"));
     let mut out: Vec<u8> = Vec::new();
-    let mut cursor = from;
     let mut suppressed = 0;
     for round in 0..200 {
-        let p = streamer.pump(wal, cursor, &mut out).expect("pump");
+        let before = sub.cursor();
+        let p = sub.pump(streamer, &mut out).expect("pump");
         suppressed += p.suppressed;
         assert!(p.is_clean(), "the stream dropped records it could not decode: {p:?}");
-        if p.emitted == 0 && p.cursor == cursor {
+        if p.emitted == 0 && p.cursor == before {
             break;
         }
-        cursor = p.cursor;
         assert!(round < 199, "the stream did not terminate");
     }
     (String::from_utf8(out).unwrap(), suppressed)
