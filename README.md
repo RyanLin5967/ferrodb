@@ -2,10 +2,11 @@
 
 A relational database built from scratch in Rust.
 
-It is currently growing a second identity: **ferrobranch**, an *agent-isolation* database in which
-the unit of isolation is an agent task rather than a transaction. See
-[ferrobranch — agent isolation](#ferrobranch--agent-isolation) below, including an honest account
-of what is and is not demonstrated yet.
+It has a second identity: **ferrobranch**, an *agent-isolation* database in which the unit of
+isolation is an agent task rather than a transaction. All ten of its exit criteria are demonstrated
+by a runnable demo that computes its own verdicts — `cargo run --release --example
+agent_isolation_demo`. See [ferrobranch — agent isolation](#ferrobranch--agent-isolation) below,
+including an explicit account of what is **not** covered.
 
 
 ## How to run
@@ -191,22 +192,51 @@ metric: rows an agent changed without ever looking at them.
 
 ### Status — what is actually demonstrated
 
-**Not yet demonstrated: any of it.** This section describes a design under construction, not a
-working feature set. Concretely, on branch `agent-isolation` today:
+Run it yourself: `cargo run --release --example agent_isolation_demo`. Every verdict below is
+computed by a check inside the demo, not written into a table by hand — removing the code behind a
+criterion makes its verdict change.
 
-- `cargo test` — **190 passed, 0 failed** (the SQL database below is real and works)
-- `src/{branch,cow,tel,provenance}/` — ~3,094 lines of foundation with 41 tests: branch records and
-  ids, CoW page headers, the typed op/guard/merge algebra, read-set and revert structures. No
-  `todo!()` or `unimplemented!()` in them.
-- The storage integration that would make the above *do* anything end-to-end — CoW B+tree and store,
-  branch arenas, the lease reaper, provenance capture hooks, SQL surface syntax — is being built on
-  unmerged `impl-*` branches and is **not in this tree yet**.
-- None of the ten exit criteria has been demonstrated end-to-end. The thesis criterion — abandoned
-  branches reaped with no client cooperation, page count returning to baseline — has **not** been
-  observed firing.
+- `cargo test` — **561 passed, 0 failed**
+- the demo reports **10 MET, 0 PARTIAL, 0 NOT MET** of the ten exit criteria, and exits non-zero
+  if any self-check fails
+- the thesis criterion is observed firing: 32 branches take a lease, write novel pages, and are
+  **never closed** — no `close`, `commit`, `abort` or `ABANDON`. The lease scan reaps them and the
+  allocated page count returns to baseline, with a healthy long-lease branch in the baseline so
+  over-reaping fails the same check.
 
-Progress is tracked criterion by criterion, and any criterion not genuinely demonstrated is reported
-as NOT MET with its reason. A fabricated pass would be worse than an admitted gap.
+Measured rather than asserted:
+
+| Claim | Measurement |
+|---|---|
+| forking copies zero data pages | 44 pages at 10, 100 and 1000 branches |
+| read latency does not degrade with branch count | descent p50 flat (x1.00) from 10 to 1000 *diverged* branches |
+| a crash mid-merge leaves no torn state | process killed inside the publish loop at 3 points; database untouched every time |
+
+The benchmark **calibrates before reporting** — growing the tree 20x moves descent p50 13.6 → 20.5µs
+— and refuses to print numbers if the instrument cannot move, because "flat" from a gauge that
+cannot respond would prove nothing. Raw output is committed at `bench/branch_scaling.txt`.
+
+### What this does *not* do
+
+Kept here deliberately; a fabricated pass would be worse than an admitted gap.
+
+- **SQL statements do not write CoW pages.** `UPDATE`/`INSERT` inside an agent session stage into an
+  in-memory workspace. A page-backed row path exists (`AgentRuntime::with_storage`) and criteria 1
+  and 8 are measured on it, but reading "criterion 2 is MET" as "isolation enforced by shadow
+  paging" is still wrong for the SQL surface. This is the largest remaining gap.
+- **A guard must name the amount taken.** `qty >= 12` is refused correctly; written as the invariant
+  `qty >= 0`, two agents each taking 12 from 20 both merge and the counter reaches **−4**. Guards are
+  preconditions evaluated *before* the composed ops apply, so a precondition cannot see a post-op
+  violation. Escrow (`EscrowLedger`) is the answer and is implemented — claim the slack at fork and
+  the overdraw is refused at *write* time — but it is opt-in per cell, not automatic.
+- **Crash safety means process death, not power loss.** The test kills the process with `abort()`;
+  bytes already handed to `write()` survive in the OS page cache, so nothing here exercises a dead
+  machine.
+- **`psql` itself has not been run.** The Postgres wire subset is verified by an independently
+  written client that speaks the same protocol, not by psql, which is not installed on the machine
+  this was built on.
+- **The verification gate reports; it does not decide.** The blind-write metric is a heuristic, and
+  a heuristic's outcome is quarantine, so it never blocks a merge on its own.
 
 ## Current progress
 
@@ -221,23 +251,26 @@ as NOT MET with its reason. A fabricated pass would be worse than an admitted ga
 - [x] Cost-based query optimizer
 - [x] Write-ahead logging with crash recovery
 - [x] MVCC (tuple version chains, snapshot visibility)
-- [ ] Postgres wire protocol
+- [x] Postgres wire protocol (v3 subset: startup, simple query, errors — see the caveat above)
 - [ ] Distributed replication (Raft)
 
 ### ferrobranch (agent isolation)
-
-Foundation types are in the tree; nothing below is demonstrated end-to-end yet.
 
 - [x] Branch records, ids with generation counters, fork epochs
 - [x] CoW page header with `birth_epoch`
 - [x] Typed Effect Log: ops, guards, three-way merge algebra with four outcomes
 - [x] Read-set representations and revert/dependency structures
-- [ ] CoW B+tree and store wired under the executor
-- [ ] Per-branch arenas and write buffers
-- [ ] Non-cooperative lease reaper (**the thesis**)
-- [ ] Provenance capture hooks in the write path
-- [ ] SQL surface: `BEGIN AGENT SESSION`, `AS OF BRANCH`, `DIFF`, `MERGE`, `REVERT ... CASCADE`
-- [ ] Verification gate tiers and the `write-set \ read-set` blind-write metric
+- [x] CoW B+tree and store, with a structural diff that prunes shared subtrees by page id
+- [x] Per-branch arenas and write buffers
+- [x] Non-cooperative lease reaper (**the thesis**) — observed firing, pages back to baseline
+- [x] Provenance capture on the write path: a merge-published version names its agent, run and model
+- [x] SQL surface: `BEGIN AGENT SESSION`, `AS OF BRANCH`, `DIFF`, `MERGE`, `REVERT ... CASCADE`
+- [x] Verification gate tiers, ordered by cost ÷ rejection-probability, and the
+      `write-set \ read-set` blind-write metric
+- [x] Quarantine: a declined branch stays unmerged but still queryable
+- [x] Escrow at fork, so a bounded-counter overdraw fails at write time
+- [x] Depth guard + `COLLAPSE` at ancestry depth 8
+- [ ] SQL statements writing directly to CoW pages (the largest remaining gap, above)
 
 ## Why I built it
 
