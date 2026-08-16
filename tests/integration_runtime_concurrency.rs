@@ -175,7 +175,6 @@ fn concurrent_sessions_get_distinct_branches_and_runs() {
 /// It is `#[ignore]`d rather than deleted or weakened — the assertions are untouched — so that
 /// the suite's green stays meaningful while the bug stays visible. Remove the attribute to
 /// reproduce. Tracked as D17 in the ledger.
-#[ignore = "known bug: writes lost under 8-way concurrency; see the doc comment and ledger D17"]
 #[test]
 fn concurrent_writers_each_read_back_only_their_own_row() {
     let (_d, rt) = runtime("writers");

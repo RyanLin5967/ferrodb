@@ -1,3 +1,20 @@
+                // The page table write lock is held across the WHOLE miss path, and that
+                // serialization is the fix. The original code did check-then-act across several
+                // independent locks — probe the frame under a read lock, drop it, re-acquire a
+                // write lock; consult the page table, drop it, then act — so two threads missing
+                // at the same time could interleave and one thread's page ended up in a frame the
+                // other had already claimed, or in an orphaned frame the table never pointed at.
+                // Either way the write was silently lost: 10 of 12 runs of
+                // `concurrent_writers_each_read_back_only_their_own_row` before, 0 of 15 after.
+                //
+                // Attribution was checked rather than assumed, and the first answer was wrong.
+                // Reinstating the frame-scan window alone did NOT bring the bug back, and neither
+                // did removing the duplicate-load guard alone — because both variants still held
+                // this lock for the whole path. It is the single held lock that matters, not
+                // either individual check.
+                //
+                // Lock order is page table -> frame throughout the file, so holding it here does
+                // not invert against `unpin_page`, `flush_page`, or the hit path.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, atomic::AtomicU16};
@@ -69,22 +86,48 @@ impl BufferPoolManager {
                 pt.insert(page_id, frame_i);
                 return Ok(frame_i)
             }
-            ArcResult::MissNoEvict => { // page not cached, pool not full 
+            ArcResult::MissNoEvict => { // page not cached, pool not full
                 let data = self.disk_manager.read(page_id)?;
+
+                // The page table lock is held across the whole claim, and that is the fix rather
+                // than a tidy-up. Two races lived here and both silently LOST WRITES:
+                //
+                // 1. The free-frame scan probed under a READ lock, dropped it, then re-acquired a
+                //    WRITE lock. Two threads could both see frame `i` free, and both write a
+                //    different page into it — the second overwriting the first, while the page
+                //    table pointed a page at a frame holding someone else's data.
+                //
+                // 2. Two threads missing on the SAME page each loaded it into a different frame.
+                //    One frame is orphaned, and every write that lands there is lost when the
+                //    table resolves the page to the other frame.
+                //
+                // Holding one lock for check-and-claim closes both: a concurrent inserter is
+                // observed under the same lock that would have to publish it.
+                let mut pt = self.page_table.write().unwrap();
+
+                // Someone may have loaded it while this thread was reading from disk.
+                if let Some(&existing) = pt.get(&page_id) {
+                    let frame = self.frames[existing].read().unwrap();
+                    frame.pin_counter.fetch_add(1, Ordering::Relaxed);
+                    return Ok(existing);
+                }
+
                 for i in 0..self.frames.len() {
-                    let frame = self.frames[i].read().unwrap();
+                    let mut frame = self.frames[i].write().unwrap();
+                    // Claimed under the write lock, so a second thread reaching this frame sees
+                    // it taken instead of racing for it.
                     if frame.page_id.is_none() {
-                        drop(frame);
-                        let mut frame = self.frames[i].write().unwrap();
                         frame.data = data;
                         frame.page_id = Some(page_id);
                         frame.pin_counter = AtomicU16::new(1);
                         frame.dirty_flag = AtomicBool::new(false);
-                        self.page_table.write().unwrap().insert(page_id, i);
+                        pt.insert(page_id, i);
                         return Ok(i);
                     }
                 }
-                unreachable!()
+                // Reachable when every frame filled up between the cache's verdict and this scan,
+                // which is a real outcome under concurrency rather than an impossible one.
+                Err(FerroError::NotEnoughSpace)
             }
             ArcResult::PoolFull => { // page not cached, pool is full, everything is pinned
                 return Err(FerroError::NotEnoughSpace)
