@@ -78,9 +78,22 @@ impl BufferPoolManager {
         });
 
         match result {
-            ArcResult::Hit => { // page was already cached 
-                let pt = self.page_table.read().unwrap();
-                let frame_i = pt[&page_id];
+            ArcResult::Hit => { // page was already cached
+                // `.get()`, not `[]`. The cache saying "resident" and the page table disagreeing
+                // is a contradiction, and indexing on it PANICS the process — reproduced by
+                // reading a page that does not exist twice, because the failed first load left the
+                // page in the cache. The load paths below now undo their cache entry on failure,
+                // so this should be unreachable; it reports rather than crashes if it ever is,
+                // because a panic in a buffer pool takes down everything holding a page.
+                let frame_i = match self.page_table.read().unwrap().get(&page_id) {
+                    Some(&i) => i,
+                    None => {
+                        let _ = cache.remove(page_id);
+                        return Err(FerroError::Io(format!(
+                            "buffer pool inconsistency: the replacement cache says page {page_id}                              is resident but the page table has no frame for it. The cache entry                              has been dropped; retry the fetch."
+                        )));
+                    }
+                };
                 let frame = self.frames[frame_i].read().unwrap();
                 frame.pin_counter.fetch_add(1, Ordering::Relaxed);
                 return Ok(frame_i)
@@ -91,11 +104,28 @@ impl BufferPoolManager {
                 // gone. Treat a departed victim as a miss with a free frame instead of crashing.
                 let frame_i = match self.page_table.read().unwrap().get(&evicted_id) {
                     Some(&i) => i,
-                    None => return Err(FerroError::NotEnoughSpace),
+                    None => {
+                        // `request` already moved `page_id` into the cache. Leaving it there while
+                        // returning an error makes the cache claim a page is resident that was
+                        // never loaded, and the NEXT fetch of it takes the Hit path above.
+                        let _ = cache.remove(page_id);
+                        return Err(FerroError::NotEnoughSpace);
+                    }
                 };
 
-                self.flush_page(evicted_id)?;
-                let new_page_data = self.disk_manager.read(page_id)?;
+                if let Err(e) = self.flush_page(evicted_id) {
+                    let _ = cache.remove(page_id);
+                    return Err(e);
+                }
+                let new_page_data = match self.disk_manager.read(page_id) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // The commonest way to get here is asking for a page past the end of the
+                        // file, which is exactly what probing for a page's existence does.
+                        let _ = cache.remove(page_id);
+                        return Err(e);
+                    }
+                };
                 let mut frame = self.frames[frame_i].write().unwrap();
                 frame.data = new_page_data;
                 frame.page_id = Some(page_id);
@@ -109,7 +139,17 @@ impl BufferPoolManager {
                 return Ok(frame_i)
             }
             ArcResult::MissNoEvict => { // page not cached, pool not full
-                let data = self.disk_manager.read(page_id)?;
+                let data = match self.disk_manager.read(page_id) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Undo the cache's claim before surfacing the error. Without this, reading
+                        // a page that does not exist TWICE panicked the process: the first call
+                        // left page_id in the cache, the second got Hit, and the page table had no
+                        // frame for it.
+                        let _ = cache.remove(page_id);
+                        return Err(e);
+                    }
+                };
 
                 // The page table lock is held across the whole claim, and that is the fix rather
                 // than a tidy-up. Two races lived here and both silently LOST WRITES:
@@ -149,6 +189,8 @@ impl BufferPoolManager {
                 }
                 // Reachable when every frame filled up between the cache's verdict and this scan,
                 // which is a real outcome under concurrency rather than an impossible one.
+                drop(pt);
+                let _ = cache.remove(page_id);
                 Err(FerroError::NotEnoughSpace)
             }
             ArcResult::PoolFull => { // page not cached, pool is full, everything is pinned

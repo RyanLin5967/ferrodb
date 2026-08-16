@@ -261,16 +261,49 @@ impl AgentRuntime {
         }
     }
 
-    /// Build over a real page store, so branch rows live on copy-on-write pages.
+    /// Does `root` hold a page this branch engine actually wrote?
+    ///
+    /// **The strength of this check is `read_page`'s, not this function's, and saying so matters.**
+    /// `ArenaPageStore::read_page` verifies the page's crc32 before returning it
+    /// (`src/branch/arena.rs:684`), so a page written by something else fails there. An earlier
+    /// version of this function re-verified the checksum itself, which read as though that call
+    /// were what made the guard safe; it was dead weight, and a fire-check proved it — removing it
+    /// changed no test outcome, because the store had already refused the page.
+    ///
+    /// This matters because a page *type* byte can collide by coincidence: `PageHeader::read_from`
+    /// will parse `2` out of arbitrary bytes and report a BTreeLeaf. In the CLI, page 1 is the
+    /// first catalog page and `TRUNK_ROOT_PAGE` is 1, so that collision is reachable rather than
+    /// theoretical. A crc32 over the whole page does not collide by accident.
+    ///
+    /// **Stated limit:** the runtime takes an `Arc<dyn PageStore>`, and this inherits whatever
+    /// validation that store performs. A `PageStore` implementation that does not checksum its
+    /// pages makes this probe as weak as a type check.
+    fn trunk_tree_exists(store: &Arc<dyn PageStore>, root: PageId) -> bool {
+        // An unreadable page — absent, or failing its checksum — is not a tree. A fresh database
+        // has nothing at the placeholder.
+        store.read_page(root).is_ok()
+    }
+
+    /// Build over a real page store **for a database that has no trunk tree yet**, creating one.
     ///
     /// The trunk's root is created here rather than assumed: `TRUNK_ROOT_PAGE` is a placeholder
     /// id for the map-backed runtime, not a B+tree page that exists on disk. Descending from it
     /// would read whatever happens to occupy page 1.
+    ///
+    /// **Refuses if a trunk tree already exists**, because creating a second one would leave the
+    /// first unreachable — every row in it silently gone, with the database looking empty and
+    /// perfectly healthy. Use [`AgentRuntime::reopen_with_storage`] to attach to it instead.
     pub fn with_storage(
         branches: Arc<dyn BranchCatalog>,
         log: Arc<dyn EffectLog>,
         store: Arc<dyn PageStore>,
     ) -> Result<Self, FerroError> {
+        let existing = branches.get(BranchId::TRUNK)?.root_page_id;
+        if Self::trunk_tree_exists(&store, existing) {
+            return Err(FerroError::Branch(format!(
+                "this database already has a trunk tree at page {existing}; `with_storage` would                  create a second one and orphan every row in the first. Use                  `AgentRuntime::reopen_with_storage` to attach to the existing tree."
+            )));
+        }
         let rows = PagedRows::new(store);
         let epoch = branches.next_epoch();
         let root = rows.create_root(BranchId::TRUNK, epoch)?;
@@ -280,6 +313,43 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(rows),
+            state: Mutex::new(State::default()),
+        })
+    }
+
+    /// Attach to the trunk tree an earlier process already created.
+    ///
+    /// This is the other half of [`AgentRuntime::with_storage`], and the two exist as separate
+    /// constructors on purpose rather than as one function that guesses. A single "create it if
+    /// it is missing" call has to decide, from an ambiguous page, whether it is looking at a fresh
+    /// database or an existing one — and the failure mode of guessing wrong is silent: it mints a
+    /// new empty trunk root, the old tree becomes unreachable, and the database reports itself
+    /// healthy and empty. Two constructors that each refuse the other's case cannot do that.
+    ///
+    /// Refuses when trunk's recorded root does not hold a page this engine wrote, because the only
+    /// alternatives are to invent a tree (losing whatever is really there) or to descend into
+    /// unrelated bytes.
+    pub fn reopen_with_storage(
+        branches: Arc<dyn BranchCatalog>,
+        log: Arc<dyn EffectLog>,
+        store: Arc<dyn PageStore>,
+    ) -> Result<Self, FerroError> {
+        let root = branches.get(BranchId::TRUNK)?.root_page_id;
+        if !Self::trunk_tree_exists(&store, root) {
+            return Err(FerroError::Branch(format!(
+                "the catalog records trunk's rows at page {root}, but that page could not be read as one \
+                 this branch engine wrote: it is absent, or it fails the checksum the page \
+                 store verifies on read. This is a database with no trunk tree, so there is \
+                 nothing to reopen - use `AgentRuntime::with_storage`, which creates one. \
+                 Refusing rather than inventing a root, because inventing one would hide \
+                 whatever is actually on that page."
+            )));
+        }
+        Ok(AgentRuntime {
+            branches,
+            log,
+            prov_store: Arc::new(MemProvenanceStore::new()),
+            storage: Some(PagedRows::new(store)),
             state: Mutex::new(State::default()),
         })
     }

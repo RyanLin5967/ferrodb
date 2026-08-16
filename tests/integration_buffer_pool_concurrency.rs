@@ -194,3 +194,42 @@ fn every_frame_agrees_with_the_page_table_about_which_page_it_holds() {
         );
     }
 }
+
+/// **Reading a page that does not exist must be repeatable, not fatal.**
+///
+/// It was not. `ArcCache::request` inserts the requested page into its resident set *before*
+/// `fetch_page` tries to load it, so a failed load left the cache claiming the page was resident
+/// while the page table had no frame for it. The second read took the `Hit` branch, indexed the
+/// page table with `[]`, and **panicked the whole process** with `no entry found for key`.
+///
+/// Three lines reproduce it, and probing whether a page exists is an ordinary thing to do — it is
+/// exactly what attaching to an existing branch tree has to do before descending into a root.
+#[test]
+fn reading_a_page_that_does_not_exist_twice_errors_twice_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("absent.db"))
+        .unwrap();
+    let bp = BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap()));
+
+    let first = bp.fetch_page(1);
+    assert!(first.is_err(), "an empty file returned a page 1: {:?}", first.is_ok());
+
+    // The line that used to abort the process.
+    let second = bp.fetch_page(1);
+    assert!(second.is_err(), "the second read succeeded where the first failed");
+
+    // And a third, because the fix is that the cache no longer accumulates a false claim — one
+    // retry passing by luck would not show that.
+    assert!(bp.fetch_page(1).is_err());
+
+    // A page that DOES exist must still be readable afterwards, or the fix would be "break the
+    // cache" rather than "keep it honest".
+    let real = bp.new_page().expect("allocate");
+    assert!(bp.fetch_page(real).is_ok(), "a real page became unreadable after failed probes");
+    bp.unpin_page(real, false);
+}
