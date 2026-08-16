@@ -123,8 +123,14 @@ fn cli_required() -> bool {
 /// hence an Option and a documented fallback, not a panic.
 ///
 /// Where `FERRODB_REQUIRE_DUCKDB_CLI=1` says otherwise, that same absence is a broken environment
-/// and this refuses. The check lives HERE rather than in each caller so that every path to the
-/// weaker reader inherits it — including one added later by someone who did not read this comment.
+/// and this refuses. The check lives HERE rather than in each caller so that every path which SELECTS
+/// a reader inherits it — `Reader::get` is the only such path, so no test can be handed the fallback
+/// by accident.
+///
+/// It does not, and cannot, stop code from naming `Reader::Fallback` directly: that is a variant of
+/// a plain enum. `both_readers_agree` does exactly that on purpose, because comparing the two
+/// readers means constructing both. The guard's claim is about which reader a test gets when it
+/// asks for one, not about what an author can write deliberately.
 fn duckdb_cli() -> Option<String> {
     // Parsed FIRST, and on every call, rather than only in the not-found branch below. A typo like
     // `FERRODB_REQUIRE_DUCKDB_CLI=true` would otherwise sit unnoticed on every machine that happens

@@ -474,12 +474,38 @@ func (s *DuckSink) Close() error {
 //   - A DOUBLE holding an integral value prints as `2.0`; `fmt.Sprint(float64(2))` gives `2`.
 //   - A TIMESTAMP prints as `2024-01-02 03:04:05`, with fractional seconds only when it has them;
 //     Go's `time.Time` stringer appends a zone (`+0000 UTC`) the CLI never shows.
+// renderBlob formats a BLOB the way the `duckdb` CLI does.
+//
+// This returned the raw bytes until it was measured against the CLI, which does not: a BLOB holding
+// 0x00 0xFF printed as two unprintable bytes here and as the eight characters `\x00\xFF` there. Two
+// ways that mattered, neither of them cosmetic. A raw 0x00 or 0x0A inside a cell corrupts the
+// `|`-joined, one-row-per-line format this reader and the CLI both claim to emit — a newline in a
+// value silently becomes an extra row. And any test comparing the two readers over a BLOB would
+// report a rendering difference as a DATA disagreement, which is the exact failure this file exists
+// to prevent.
+//
+// The rule, measured byte by byte against `duckdb -noheader -list` v1.5.5 rather than assumed:
+// 0x20..0x7E pass through, everything else becomes `\xHH` with UPPERCASE hex, and the backslash
+// itself is escaped despite being printable — without that, a literal `\x41` in the data would read
+// back as the byte 0x41.
+func renderBlob(b []byte) string {
+	var sb strings.Builder
+	for _, c := range b {
+		if c >= 0x20 && c <= 0x7E && c != '\\' {
+			sb.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&sb, `\x%02X`, c)
+	}
+	return sb.String()
+}
+
 func renderCell(c any) string {
 	switch v := c.(type) {
 	case nil:
 		return "NULL"
 	case []byte:
-		return string(v)
+		return renderBlob(v)
 	case bool:
 		if v {
 			return "true"
