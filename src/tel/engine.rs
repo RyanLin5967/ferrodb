@@ -258,6 +258,22 @@ impl SideIndex {
             || self.cells.keys().any(|(t, r, _)| (*t, *r) == *key)
     }
 
+    /// The latest op this side applied anywhere on `key`, row-level or cell-level.
+    fn last_op_on(&self, key: &RowKey) -> Option<StampedOp> {
+        self.rows
+            .get(key)
+            .into_iter()
+            .flatten()
+            .chain(
+                self.cells
+                    .iter()
+                    .filter(|((t, r, _), _)| (*t, *r) == *key)
+                    .flat_map(|(_, v)| v.iter()),
+            )
+            .max_by_key(|s| s.stamp())
+            .cloned()
+    }
+
     fn sort(&mut self) {
         for v in self.cells.values_mut() {
             v.sort_by_key(|s| s.stamp());
@@ -346,7 +362,40 @@ impl Merger for ThreeWayMerger {
         let comp = compose(&ours_ix, &theirs_ix, policy, merged_state)?;
         let Composition { composed, mut conflicts, discarded, cells, created, deleted } = comp;
 
-        // ---- pass 3: re-evaluate guards and escrow bounds against the COMPOSED state ----
+        // ---- pass 3a: guards, as PRECONDITIONS, against the merged order ----
+        //
+        // A guard is the `WHERE qty >= 5` that made the write legal: a claim about the state the
+        // write lands on, not about the state it leaves behind. So it is re-checked against the
+        // merged state *as of that frame's position in the merge order* — ours, then theirs —
+        // rather than against the final image.
+        //
+        // Checking a precondition against the final image is not a stricter test, it is a
+        // different and wrong one: an uncontended `qty = qty - 5` guarded by `qty >= 5` would
+        // fail against its own result whenever it took the counter below five, so every ordinary
+        // decrement would self-conflict. The concurrent case still conflicts, which is the case
+        // that matters: the second taker's `qty >= 5` is evaluated after the first taker's
+        // decrement has landed.
+        let mut running = ComposedState::new(merged_state);
+        for (f, _side) in &frames {
+            // Run every predicate rather than short-circuiting on the first: an agent that learns
+            // one violation per round trip pays N round trips for N defects (DESIGN.md §4).
+            for g in &f.guards {
+                match g.check(&running) {
+                    Ok(true) => {}
+                    Ok(false) => conflicts.push(guard_conflict(g, f)),
+                    Err(e) => conflicts.push(unevaluable_conflict(g, f, &e)),
+                }
+            }
+            for op in &f.ops {
+                apply_op(&mut running, op)?;
+            }
+        }
+
+        // ---- pass 3b: escrow bounds, as POST-state invariants, against the merged result ----
+        //
+        // This is the half that catches the bounded counter: the `Add`s compose without anything
+        // going wrong, and only the bound re-checked against the *merged* value notices that the
+        // composition drove the resource through its floor.
         let mut state = ComposedState::new(merged_state);
         for (key, v) in cells {
             state.set_cell(key.0, key.1, key.2, v);
@@ -357,17 +406,7 @@ impl Merger for ThreeWayMerger {
         for key in deleted {
             state.delete_row(key.0, key.1);
         }
-
-        // Run every predicate rather than short-circuiting on the first: an agent that learns one
-        // violation per round trip pays N round trips for N defects (DESIGN.md section 4).
         for (f, _side) in &frames {
-            for g in &f.guards {
-                match g.check(&state) {
-                    Ok(true) => {}
-                    Ok(false) => conflicts.push(guard_conflict(g, f)),
-                    Err(e) => conflicts.push(unevaluable_conflict(g, f, &e)),
-                }
-            }
             for c in &f.claims {
                 if let Some(report) = check_claim(c, &state) {
                     conflicts.push(report);
@@ -416,6 +455,45 @@ impl Merger for ThreeWayMerger {
         }
         Ok(Diff { from, to, ops, guards })
     }
+}
+
+/// Apply one op to the running state, so that the next frame's guards see what that frame would
+/// actually land on.
+///
+/// Set operations have no scalar form and are skipped; a guard reading a set-valued column
+/// therefore sees the LCA value, which is the limitation stated at the top of this module.
+fn apply_op(state: &mut ComposedState, op: &Op) -> Result<(), FerroError> {
+    match &op.kind {
+        OpKind::RowCreate(image) => {
+            state.create_row(op.tbl, op.row, image.clone());
+            return Ok(());
+        }
+        OpKind::RowDelete => {
+            state.delete_row(op.tbl, op.row);
+            return Ok(());
+        }
+        _ => {}
+    }
+    let Some(col) = op.col else {
+        return Ok(());
+    };
+    let current = state.column(op.tbl, op.row, col).ok();
+    let next = match (&op.kind, current) {
+        (OpKind::Assign(v), _) => Some(v.clone()),
+        // A delta with nothing to apply to leaves the cell unset, so a later guard reading it
+        // reports "could not be evaluated" instead of inventing a value.
+        (OpKind::Add(d), Some(c)) => Some(d.apply(&c)?),
+        (OpKind::Add(_), None) => None,
+        (OpKind::Max(v), Some(c)) => Some(if c > *v { c } else { v.clone() }),
+        (OpKind::Max(v), None) => Some(v.clone()),
+        (OpKind::Min(v), Some(c)) => Some(if c < *v { c } else { v.clone() }),
+        (OpKind::Min(v), None) => Some(v.clone()),
+        _ => None,
+    };
+    if let Some(v) = next {
+        state.set_cell(op.tbl, op.row, col, v);
+    }
+    Ok(())
 }
 
 fn schema_mismatch(frames: &[(&TxnFrame, Side)]) -> Option<ConflictReport> {
@@ -600,22 +678,29 @@ fn compose_row(
     // conflict — `RowDelete` is idempotent — so the check is only for a side that still expects
     // the row to exist.
     let clash = if o_deletes && !t_deletes && theirs.touches_row(&key) {
-        o_last.clone()
+        Some((o_last.clone(), theirs.last_op_on(&key), Side::Ours))
     } else if t_deletes && !o_deletes && ours.touches_row(&key) {
-        t_last.clone()
+        Some((t_last.clone(), ours.last_op_on(&key), Side::Theirs))
     } else {
         None
     };
-    if let Some(d) = clash {
+    if let Some((deleter, writer, deleting_side)) = clash {
         poisoned.insert(key);
+        let d = deleter.expect("the deleting side has a last row op");
+        // `ours` and `theirs` name the sides, not the roles: putting the deleter in `ours`
+        // regardless of which branch deleted would misattribute the conflict to main.
+        let (ours_op, theirs_op) = match deleting_side {
+            Side::Ours => (Some(d.op.clone()), writer.map(|s| s.op)),
+            Side::Theirs => (writer.map(|s| s.op), Some(d.op.clone())),
+        };
         out.conflicts.push(ConflictReport {
             kind: ConflictKind::DeleteVsWrite,
             tbl: key.0,
             row: key.1,
             col: None,
             violated_guard: None,
-            ours: Some(d.op.clone()),
-            theirs: None,
+            ours: ours_op,
+            theirs: theirs_op,
             detail: format!(
                 "branch {} deleted {} while the other side wrote to it",
                 d.branch, key.1
@@ -797,23 +882,30 @@ fn emit_single(
         }
         other => {
             let v = other.resolve(base)?;
-            out.composed.push(canonical_op(key, other));
+            if let Some(op) = canonical_op(key, other) {
+                out.composed.push(op);
+            }
             out.cells.push((key, v));
         }
     }
     Ok(())
 }
 
-fn canonical_op(key: CellKey, e: &SideEffect) -> Op {
+/// The single op that expresses a side's folded net effect on a cell.
+///
+/// `None` for set-valued effects, which have no single-op form — they are emitted op-wise by
+/// [`compose_sets`]. Returning `None` rather than panicking matters: a set op meeting a scalar op
+/// on one cell is a capture bug, and a capture bug must not take the process down.
+fn canonical_op(key: CellKey, e: &SideEffect) -> Option<Op> {
     let (tbl, row, col) = key;
     let kind = match e {
         SideEffect::Assign(v) => OpKind::Assign(v.clone()),
         SideEffect::Add(d) => OpKind::Add(*d),
         SideEffect::Max(v) => OpKind::Max(v.clone()),
         SideEffect::Min(v) => OpKind::Min(v.clone()),
-        SideEffect::Set(_) => unreachable!("set effects are emitted op-wise"),
+        SideEffect::Set(_) => return None,
     };
-    Op::new(tbl, row, Some(col), kind)
+    Some(Op::new(tbl, row, Some(col), kind))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -913,11 +1005,17 @@ fn compose_two(
                 };
                 let v = winner.resolve(base)?;
                 out.cells.push((key, v));
-                out.composed.push(canonical_op(key, winner));
+                if let Some(op) = canonical_op(key, winner) {
+                    out.composed.push(op);
+                }
                 if let Some(lost) = loser_ops.last() {
+                    // The *net* effect of the losing side, not merely its last op: a side that
+                    // did `Assign(10); Add(-3)` lost the whole `Assign(7)`, and naming only the
+                    // `Add(-3)` would understate what the policy threw away.
+                    let loser_net = if ours_wins { &b } else { &a };
                     out.discarded.push(DiscardedWrite {
                         branch: lost.branch,
-                        op: lost.op.clone(),
+                        op: canonical_op(key, loser_net).unwrap_or_else(|| lost.op.clone()),
                         policy: MergePolicy::Lww,
                         reason: format!(
                             "LWW on {}.{}[{}] kept the write from the {:?} side",
@@ -927,13 +1025,12 @@ fn compose_two(
                 }
             }
             MergePolicy::MultiValue => {
-                // Nothing is discarded: both ops are retained and surfaced. The scalar used for
-                // guard re-evaluation is the later of the two.
-                if let Some(s) = o.last() {
-                    out.composed.push(s.op.clone());
-                }
-                if let Some(s) = t.last() {
-                    out.composed.push(s.op.clone());
+                // Nothing is discarded: both sides' net effects are retained and surfaced. Net
+                // effects, not last ops — `Assign(10); Add(-3)` must surface as `Assign(7)`.
+                for side in [&a, &b] {
+                    if let Some(op) = canonical_op(key, side) {
+                        out.composed.push(op);
+                    }
                 }
                 let o_stamp = o.last().map(|s| s.stamp()).unwrap_or((0, 0));
                 let t_stamp = t.last().map(|s| s.stamp()).unwrap_or((0, 0));
@@ -1060,14 +1157,15 @@ mod tests {
         f
     }
 
-    /// `qty - n >= 0`, the classic bounded decrement, expressed over the merged state.
+    /// `WHERE qty >= n`: the precondition that admits a decrement of `n`. A guard is a claim
+    /// about the state the write lands on, so this is what the SQL layer actually captures.
     fn floor_guard(n: i32) -> Guard {
         Guard::holds(GuardExpr::cmp(
             GuardExpr::col(TBL, R1, QTY),
             CmpOp::Ge,
-            GuardExpr::Literal(Value::Integer(0)),
+            GuardExpr::Literal(Value::Integer(n)),
         ))
-        .with_source(format!("qty >= 0 (after -{})", n))
+        .with_source(format!("qty >= {}", n))
     }
 
     fn merged_qty(outcome: &MergeOutcome) -> Option<Delta> {
@@ -1167,8 +1265,8 @@ mod tests {
         assert!(reports.iter().all(|r| r.kind == ConflictKind::GuardFailed));
         // The violated predicate itself must come back, not a boolean.
         let g = reports[0].violated_guard.as_ref().expect("guard returned");
-        assert!(g.violated_predicate().contains("qty >= 0"));
-        assert!(reports[0].feedback().contains("qty >= 0"));
+        assert!(g.violated_predicate().contains("qty >= 5"));
+        assert!(reports[0].feedback().contains("qty >= 5"));
     }
 
     #[test]
@@ -1215,8 +1313,46 @@ mod tests {
             ))
             .with_source("qty > 100"),
         );
+        // 8 on hand: `qty >= 30` and `qty > 100` both fail, and both must be reported.
         let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(8)).unwrap();
         assert_eq!(out.conflicts().len(), 2, "{}", out);
+    }
+
+    #[test]
+    fn an_uncontended_decrement_does_not_conflict_with_its_own_result() {
+        // The guard is a PRECONDITION. Six on hand, one agent takes five under `qty >= 5`:
+        // legal, and the merge must not re-check `qty >= 5` against the 1 it leaves behind.
+        let m = ThreeWayMerger::new();
+        let mut theirs = decrement(2, 2, 5);
+        theirs.push_guard(floor_guard(5));
+        let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(6)).unwrap();
+        assert_eq!(out, MergeOutcome::Clean, "{}", out);
+    }
+
+    #[test]
+    fn a_drawdown_that_exactly_exhausts_the_resource_is_allowed() {
+        // Ten on hand, two takes of five: both preconditions hold in the merged order, and the
+        // resource lands exactly on zero. Rejecting this would be a false conflict.
+        let m = ThreeWayMerger::new();
+        let mut ours = decrement(1, 1, 5);
+        ours.push_guard(floor_guard(5));
+        let mut theirs = decrement(2, 2, 5);
+        theirs.push_guard(floor_guard(5));
+        let out = m.merge(&lca(), &[ours], &[theirs], &AllReject, &base(10)).unwrap();
+        assert_eq!(out.name(), "Commuting", "{}", out);
+        assert_eq!(merged_qty(&out), Some(Delta::Int(-10)));
+    }
+
+    #[test]
+    fn a_delete_does_not_invalidate_its_own_where_clause() {
+        // `DELETE FROM inv WHERE qty >= 0` captures a guard over the row it removes. Checking
+        // that guard after the delete would make every guarded delete self-conflict.
+        let m = ThreeWayMerger::new();
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, None, OpKind::RowDelete));
+        theirs.push_guard(floor_guard(0));
+        let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(6)).unwrap();
+        assert_eq!(out, MergeOutcome::Clean, "{}", out);
     }
 
     // ---- escrow / bounded counters ----
@@ -1475,18 +1611,23 @@ mod tests {
             OpKind::RowCreate(vec![Value::Integer(77), Value::Null, Value::Integer(10)]),
         ));
         theirs.push_op(Op::new(TBL, fresh, Some(QTY), OpKind::Add(Delta::Int(-4))));
-        theirs.push_guard(Guard::holds(GuardExpr::cmp(
-            GuardExpr::col(TBL, fresh, QTY),
-            CmpOp::Ge,
-            GuardExpr::Literal(Value::Integer(0)),
-        )));
+        // A post-state bound on the new row: an escrow floor, checked against the merged result.
+        theirs.push_claim(EscrowClaim {
+            tbl: TBL,
+            row: fresh,
+            col: QTY,
+            amount: Delta::Int(-4),
+            floor: Some(Value::Integer(0)),
+            ceiling: None,
+        });
 
-        // main untouched, and the guard sees 10 - 4 = 6
+        // main untouched, and the delta lands on the RowCreate image: 10 - 4 = 6
         let out = m.merge(&lca(), &[], &[theirs.clone()], &AllReject, &base(20)).unwrap();
         assert_eq!(out, MergeOutcome::Clean, "{}", out);
 
-        // and the same shape overdrawn is caught
+        // and the same shape overdrawn is caught, so the base really is the created image
         theirs.ops[1] = Op::new(TBL, fresh, Some(QTY), OpKind::Add(Delta::Int(-40)));
+        theirs.claims[0].amount = Delta::Int(-40);
         let out = m.merge(&lca(), &[], &[theirs], &AllReject, &base(20)).unwrap();
         assert_eq!(out.conflicts()[0].kind, ConflictKind::GuardFailed, "{}", out);
     }
@@ -1559,12 +1700,106 @@ mod tests {
     }
 
     #[test]
-    fn a_guard_reading_a_row_this_merge_deleted_is_unevaluable() {
+    fn a_guard_reading_a_row_the_other_side_deleted_is_unevaluable() {
+        // Main deleted the row; the incoming branch's precondition reads it. That predicate
+        // genuinely cannot be evaluated, which is a hard reject rather than a retry.
         let m = ThreeWayMerger::new();
         let mut ours = frame(1, 1, 0);
         ours.push_op(Op::new(TBL, R1, None, OpKind::RowDelete));
-        ours.push_guard(floor_guard(0));
-        let out = m.merge(&lca(), &[ours], &[], &AllReject, &base(20)).unwrap();
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_guard(floor_guard(0));
+        let out = m.merge(&lca(), &[ours], &[theirs], &AllReject, &base(20)).unwrap();
         assert_eq!(out.conflicts()[0].kind, ConflictKind::GuardUnevaluable);
+    }
+
+    #[test]
+    fn a_delete_versus_a_write_names_the_right_side_in_the_report() {
+        // `ours` and `theirs` name sides, not roles. Attributing the incoming branch's delete
+        // to main would point a retrying agent at the wrong branch.
+        let m = ThreeWayMerger::new();
+        let ours = decrement(1, 1, 1);
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, None, OpKind::RowDelete));
+        let out = m.merge(&lca(), &[ours], &[theirs], &AllReject, &base(20)).unwrap();
+        let r = &out.conflicts()[0];
+        assert_eq!(r.kind, ConflictKind::DeleteVsWrite);
+        assert_eq!(r.theirs.as_ref().map(|o| o.kind.clone()), Some(OpKind::RowDelete));
+        assert_eq!(
+            r.ours.as_ref().map(|o| o.kind.clone()),
+            Some(OpKind::Add(Delta::Int(-1)))
+        );
+    }
+
+    #[test]
+    fn a_discarded_write_is_reported_as_the_side_s_net_effect() {
+        // The losing side did `Assign(10); Add(-3)`. What LWW threw away is the net Assign(7),
+        // not merely the trailing Add(-3).
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(10))));
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-3))));
+        let mut theirs = frame(2, 2, 9);
+        theirs.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(99))));
+        let out = m
+            .merge(&lca(), &[ours], &[theirs], &Fixed(MergePolicy::Lww), &base(20))
+            .unwrap();
+        match out {
+            MergeOutcome::ResolvedWithLoss { discarded, .. } => {
+                assert_eq!(discarded[0].op.kind, OpKind::Assign(Value::Integer(7)));
+            }
+            other => panic!("expected ResolvedWithLoss, got {}", other),
+        }
+    }
+
+    #[test]
+    fn multi_value_surfaces_each_side_s_net_effect() {
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(10))));
+        ours.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Add(Delta::Int(-3))));
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, Some(QTY), OpKind::Assign(Value::Integer(99))));
+        let out = m
+            .merge(&lca(), &[ours], &[theirs], &Fixed(MergePolicy::MultiValue), &base(20))
+            .unwrap();
+        match &out {
+            MergeOutcome::Commuting { composed } => {
+                assert!(composed.contains(&Op::new(
+                    TBL,
+                    R1,
+                    Some(QTY),
+                    OpKind::Assign(Value::Integer(7))
+                )));
+                assert!(composed.contains(&Op::new(
+                    TBL,
+                    R1,
+                    Some(QTY),
+                    OpKind::Assign(Value::Integer(99))
+                )));
+            }
+            other => panic!("expected Commuting, got {}", other),
+        }
+    }
+
+    #[test]
+    fn a_set_op_meeting_a_scalar_op_conflicts_rather_than_panicking() {
+        // A capture bug, but it must not take the process down.
+        let m = ThreeWayMerger::new();
+        let mut ours = frame(1, 1, 0);
+        ours.push_op(Op::new(
+            TBL,
+            R1,
+            Some(NAME),
+            OpKind::SetInsert {
+                elem: Value::Varchar("tag".into()),
+                dot: Dot { branch: BranchId::new(1, 0), seq: 1 },
+            },
+        ));
+        let mut theirs = frame(2, 2, 0);
+        theirs.push_op(Op::new(TBL, R1, Some(NAME), OpKind::Assign(Value::Varchar("x".into()))));
+        for policy in [MergePolicy::Reject, MergePolicy::Lww, MergePolicy::MultiValue] {
+            let out = m.merge(&lca(), &[ours.clone()], &[theirs.clone()], &Fixed(policy), &base(20));
+            assert!(out.is_ok(), "policy {} panicked or errored: {:?}", policy, out.err());
+        }
     }
 }
