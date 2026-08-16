@@ -7,9 +7,15 @@
 //! version costs roughly 3.4x density for nothing. Each version carries a small [`ProvId`] into a
 //! page-local dictionary that points at one reified [`RunEntity`].
 
+pub mod capture;
 pub mod readset;
 pub mod revert;
+pub mod store;
 
+pub use capture::{
+    CapturingScan, ProvenanceLog, RowIdSource, SurrogateColumn, TimedPredicate, TxnCapture,
+    TxnProvenance, VersionSource, WriteRecord,
+};
 pub use readset::{
     blind_writes, AccessShape, Bound, PredicateSummary, ReadSet, ReadSetBuilder, ReadSetForm,
     VersionRef,
@@ -17,6 +23,7 @@ pub use readset::{
 pub use revert::{
     DependencyEdge, DependencyGraph, DependencyGraphBuilder, RevertMode, RevertPlan,
 };
+pub use store::{MemProvenanceStore, PageProvDict, MAX_PAGE_DICT_ENTRIES, PROV_SLOT_BYTES};
 
 use std::fmt::{Display, Formatter};
 
@@ -92,6 +99,33 @@ impl RunEntity {
             "agent={} run={} model={}/{} branch={}",
             self.agent_id, self.run_id, self.model, self.model_version, self.parent_branch
         )
+    }
+
+    /// Whether two entities describe the same actor. `prov_id` is excluded deliberately: it is
+    /// the store's assigned slot, not part of the run's identity, so a caller may present an
+    /// entity carrying [`ProvId::NONE`] and still be recognised.
+    pub fn same_actor(&self, other: &RunEntity) -> bool {
+        self.agent_id == other.agent_id
+            && self.run_id == other.run_id
+            && self.model == other.model
+            && self.model_version == other.model_version
+            && self.prompt_hash == other.prompt_hash
+            && self.started_at == other.started_at
+            && self.parent_branch == other.parent_branch
+    }
+
+    /// Bytes this tuple would cost if it were written literally into every version header — the
+    /// thing the interned slot exists to avoid. Strings counted as their bytes plus a 2-byte
+    /// length prefix each.
+    pub fn literal_footprint(&self) -> usize {
+        let s = |x: &String| x.len() + 2;
+        s(&self.agent_id)
+            + s(&self.run_id)
+            + s(&self.model)
+            + s(&self.model_version)
+            + self.prompt_hash.len()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<BranchId>()
     }
 }
 

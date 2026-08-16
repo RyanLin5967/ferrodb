@@ -6,8 +6,9 @@
 //! and show the tree; cascade only on explicit request. Silently cascading a revert through an
 //! agent's downstream work is not recoverable by the agent.
 
-use crate::provenance::readset::{ReadSet, VersionRef};
-use crate::tel::ids::TxnId;
+use crate::catalog::column::Value;
+use crate::provenance::readset::{PredicateSummary, ReadSet, VersionRef};
+use crate::tel::ids::{ColId, TxnId};
 
 /// What to do when the target of a revert has dependents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -91,6 +92,45 @@ impl DependencyGraph {
             }
         }
     }
+
+    /// The tree a halted revert shows the caller. Cycle-safe: a transaction already printed on
+    /// the current path is marked rather than followed, so a read-write cycle cannot loop.
+    pub fn render_tree(&self, root: TxnId) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("{} (revert target)\n", root));
+        let mut path = vec![root];
+        self.render_children(root, "", &mut path, &mut out);
+        out
+    }
+
+    fn render_children(
+        &self,
+        node: TxnId,
+        prefix: &str,
+        path: &mut Vec<TxnId>,
+        out: &mut String,
+    ) {
+        let kids = self.dependents_of(node);
+        for (i, k) in kids.iter().enumerate() {
+            let last = i + 1 == kids.len();
+            let branch = if last { "`-- " } else { "|-- " };
+            let via: Vec<String> = self
+                .edges
+                .iter()
+                .filter(|e| e.from == node && e.to == *k)
+                .map(|e| format!("{}@{}", e.via.row, e.via.begin_ts))
+                .collect();
+            if path.contains(k) {
+                out.push_str(&format!("{}{}{} (cycle)\n", prefix, branch, k));
+                continue;
+            }
+            out.push_str(&format!("{}{}{} read {}\n", prefix, branch, k, via.join(",")));
+            let child_prefix = format!("{}{}", prefix, if last { "    " } else { "|   " });
+            path.push(*k);
+            self.render_children(*k, &child_prefix, path, out);
+            path.pop();
+        }
+    }
 }
 
 /// Assembles a [`DependencyGraph`] from the writes and reads each transaction retained.
@@ -98,6 +138,26 @@ impl DependencyGraph {
 pub struct DependencyGraphBuilder {
     writes: Vec<(TxnId, VersionRef)>,
     reads: Vec<(TxnId, VersionRef)>,
+    valued_writes: Vec<ValuedWrite>,
+    predicate_reads: Vec<PredicateRead>,
+}
+
+/// A write with the value it produced. Needed only for predicate-derived edges, where the
+/// question is "did what you wrote fall inside the region I scanned".
+#[derive(Debug, Clone, PartialEq)]
+struct ValuedWrite {
+    txn: TxnId,
+    version: VersionRef,
+    col: Option<ColId>,
+    value: Value,
+}
+
+/// A retained range/scan read, with the snapshot it read at.
+#[derive(Debug, Clone, PartialEq)]
+struct PredicateRead {
+    txn: TxnId,
+    summary: PredicateSummary,
+    observed_at: u64,
 }
 
 impl DependencyGraphBuilder {
@@ -131,12 +191,64 @@ impl DependencyGraphBuilder {
         }
     }
 
+    /// Record a write together with the value it wrote, so predicate reads can be checked
+    /// against it. Also records the plain write, so exact-version edges still form.
+    pub fn record_write_value(
+        &mut self,
+        txn: TxnId,
+        v: VersionRef,
+        col: Option<ColId>,
+        value: Option<Value>,
+    ) {
+        self.record_write(txn, v);
+        if let Some(value) = value {
+            self.valued_writes.push(ValuedWrite { txn, version: v, col, value });
+        }
+    }
+
+    /// Record that `txn` scanned a region at snapshot `observed_at`.
+    ///
+    /// This is the pass [`DependencyGraphBuilder::record_read_sets`] deliberately refuses to do
+    /// inline: a predicate read names a region, not versions, so its edges have to be derived by
+    /// re-evaluating [`PredicateSummary::covers`] against the values that were actually written.
+    /// The timestamp is load-bearing — coverage alone would make a scan depend on writes that
+    /// landed after it looked.
+    pub fn record_predicate_read(
+        &mut self,
+        txn: TxnId,
+        summary: PredicateSummary,
+        observed_at: u64,
+    ) {
+        self.predicate_reads.push(PredicateRead { txn, summary, observed_at });
+    }
+
     pub fn build(&self) -> DependencyGraph {
         let mut g = DependencyGraph::new();
         for (writer, wv) in &self.writes {
             for (reader, rv) in &self.reads {
                 if reader != writer && rv == wv {
                     g.add_edge(DependencyEdge { from: *writer, to: *reader, via: *wv });
+                }
+            }
+        }
+        for w in &self.valued_writes {
+            for r in &self.predicate_reads {
+                if r.txn == w.txn {
+                    continue;
+                }
+                // The scan can only have seen a version its snapshot admitted. Strictly less
+                // than, matching the engine's own rule in `ReadView::is_commited_for_me`
+                // (`ts < snapshot.high_water`): a version stamped exactly at the high water mark
+                // is not yet visible.
+                if w.version.begin_ts >= r.observed_at {
+                    continue;
+                }
+                if r.summary.covers(w.version.tbl, w.col, &w.value) {
+                    let edge =
+                        DependencyEdge { from: w.txn, to: r.txn, via: w.version };
+                    if !g.edges.contains(&edge) {
+                        g.add_edge(edge);
+                    }
                 }
             }
         }
@@ -218,6 +330,91 @@ mod tests {
         b.record_write(TxnId(1), v);
         b.record_read(TxnId(1), v);
         assert!(b.build().dependents_of(TxnId(1)).is_empty());
+    }
+
+    #[test]
+    fn a_predicate_read_depends_on_a_write_that_landed_inside_its_range() {
+        use crate::provenance::readset::{Bound, PredicateSummary};
+        let mut b = DependencyGraphBuilder::new();
+        // txn1 sets col0 of row1 to 15 at ts 10.
+        b.record_write_value(
+            TxnId(1),
+            vref(1, 10),
+            Some(ColId(0)),
+            Some(Value::Integer(15)),
+        );
+        // txn2 scans col0 in [10, 20) at snapshot 30, so it saw that write.
+        b.record_predicate_read(
+            TxnId(2),
+            PredicateSummary {
+                tbl: TableId(1),
+                col: Some(ColId(0)),
+                lo: Bound::Included(Value::Integer(10)),
+                hi: Bound::Excluded(Value::Integer(20)),
+                residual: None,
+                rows_observed: 1,
+            },
+            30,
+        );
+        let g = b.build();
+        assert_eq!(g.dependents_of(TxnId(1)), vec![TxnId(2)]);
+    }
+
+    #[test]
+    fn a_write_outside_the_scanned_range_creates_no_edge() {
+        use crate::provenance::readset::{Bound, PredicateSummary};
+        let mut b = DependencyGraphBuilder::new();
+        b.record_write_value(
+            TxnId(1),
+            vref(1, 10),
+            Some(ColId(0)),
+            Some(Value::Integer(99)),
+        );
+        b.record_predicate_read(
+            TxnId(2),
+            PredicateSummary {
+                tbl: TableId(1),
+                col: Some(ColId(0)),
+                lo: Bound::Included(Value::Integer(10)),
+                hi: Bound::Excluded(Value::Integer(20)),
+                residual: None,
+                rows_observed: 0,
+            },
+            30,
+        );
+        assert!(b.build().edges.is_empty());
+    }
+
+    #[test]
+    fn a_scan_does_not_depend_on_a_write_it_could_not_have_seen() {
+        use crate::provenance::readset::PredicateSummary;
+        let mut b = DependencyGraphBuilder::new();
+        // Write lands at ts 40; the scan read at snapshot 30.
+        b.record_write_value(TxnId(1), vref(1, 40), None, Some(Value::Integer(15)));
+        b.record_predicate_read(TxnId(2), PredicateSummary::full_scan(TableId(1), 3), 30);
+        assert!(b.build().edges.is_empty());
+    }
+
+    #[test]
+    fn the_halt_tree_shows_the_whole_downstream_chain() {
+        let tree = chain().render_tree(TxnId(1));
+        assert!(tree.contains("txn1 (revert target)"), "{}", tree);
+        assert!(tree.contains("txn2 read row1@10"), "{}", tree);
+        assert!(tree.contains("txn3 read row2@20"), "{}", tree);
+    }
+
+    #[test]
+    fn the_tree_terminates_on_a_read_write_cycle() {
+        let (v, w) = (vref(1, 10), vref(2, 20));
+        let mut b = DependencyGraphBuilder::new();
+        b.record_write(TxnId(1), v);
+        b.record_read(TxnId(2), v);
+        b.record_write(TxnId(2), w);
+        b.record_read(TxnId(1), w);
+        let g = b.build();
+        let tree = g.render_tree(TxnId(1));
+        assert!(tree.contains("cycle"), "{}", tree);
+        assert_eq!(g.transitive_dependents(TxnId(1)), vec![TxnId(2)]);
     }
 
     #[test]
