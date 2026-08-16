@@ -69,6 +69,33 @@ impl TwoTierReaper {
         self
     }
 
+    /// Finish every reap that a crash interrupted.
+    ///
+    /// `reap` marks the record `Reaping` durably *before* it frees anything, precisely so that a
+    /// crash in the middle leaves evidence rather than a leak. Without this call that evidence is
+    /// never acted on: the branch is unreadable (`check_readable` rejects `Reaping`) but its
+    /// extents are still charged to it, so the space is lost until the file is rebuilt. Call it
+    /// on startup, before the first lease scan.
+    ///
+    /// `reap` is re-entrant, which is what makes resuming safe: freeing an already-freed extent
+    /// returns zero, the interval rule over an extent that has gone finds no pages, and detaching
+    /// from a parent that has already forgotten this child is a no-op.
+    pub fn resume_interrupted_reaps(&self) -> Result<Vec<BranchId>, FerroError> {
+        let interrupted: Vec<BranchId> = self
+            .catalog
+            .all_records()
+            .into_iter()
+            .filter(|r| r.state == BranchState::Reaping && !r.branch_id.is_trunk())
+            .map(|r| BranchId::new(r.branch_id.id, r.generation))
+            .collect();
+        let mut done = Vec::with_capacity(interrupted.len());
+        for b in interrupted {
+            self.reap(b)?;
+            done.push(b);
+        }
+        Ok(done)
+    }
+
     /// Remove this branch's fork epoch from its parent's live-children array. This is the single
     /// event that can make a parked page reclaimable, which is why `reap` always follows it with
     /// a `drain_pending`.
@@ -567,6 +594,38 @@ mod tests {
         // A handle from the future is equally refused.
         let err = reaper.reap(BranchId::new(b.branch_id.id, b.branch_id.generation + 5)).unwrap_err();
         assert!(err.to_string().contains("reaped"), "got {}", err);
+    }
+
+    #[test]
+    fn a_reap_interrupted_by_a_crash_is_resumed_not_leaked() {
+        let (h, reaper) = setup();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(&h, b.branch_id, 9);
+        let live = h.store.live_page_count().unwrap();
+        assert_eq!(live, 9);
+
+        // Crash exactly where `reap` is most exposed: after the durable Reaping mark, before a
+        // single page went back.
+        let mut rec = h.catalog.get(b.branch_id).unwrap();
+        rec.state = BranchState::Reaping;
+        h.catalog.put(&rec).unwrap();
+        assert!(h.catalog.get(b.branch_id).is_err(), "a half-reaped branch is not readable");
+        assert_eq!(h.store.live_page_count().unwrap(), 9, "and its space is still charged to it");
+
+        // A lease scan alone will never find it: it is no longer Live.
+        assert!(reaper.reap_expired(far_future()).unwrap().is_empty());
+        assert_eq!(h.store.live_page_count().unwrap(), 9, "so the leak survives a scan");
+
+        let resumed = reaper.resume_interrupted_reaps().unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(h.store.live_page_count().unwrap(), 0, "the interrupted reap completed");
+        assert_eq!(h.store.reserved_page_count(), 0);
+        assert_eq!(
+            h.catalog.get_raw(b.branch_id.id).unwrap().state,
+            BranchState::Reaped
+        );
+        // Nothing left to resume, and resuming again frees nothing twice.
+        assert!(reaper.resume_interrupted_reaps().unwrap().is_empty());
     }
 
     #[test]
