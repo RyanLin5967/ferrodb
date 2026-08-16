@@ -162,13 +162,19 @@ pub enum Stmt {
     Begin, Commit, Rollback,
 
     // ---- agent-isolation surface (DESIGN.md section 5) --------------------------------------
-    /// `BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';`
+    /// `BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2' MODEL 'claude-opus-5/2026-05';`
     ///
     /// Forks a branch for one agent task. The fork copies zero data pages (exit criterion 1);
-    /// the agent identity and run id are what provenance interns (exit criterion 9).
+    /// the agent identity, run id and model are what provenance interns (exit criterion 9).
+    ///
+    /// `MODEL` is optional because a non-agent client has no model to declare, but criterion 9
+    /// names the model explicitly, so leaving it out is recorded as the literal string
+    /// `unspecified` rather than silently attributed to anything.
     BeginAgentSession {
         agent: String,
         run: Option<String>,
+        /// `name/version`; the version half is optional.
+        model: Option<String>,
     },
     /// `DIFF;` — the structured changeset this session's branch would merge (exit criterion 4).
     Diff {
@@ -464,7 +470,7 @@ impl Parser {
         Ok(stmt)
     }
 
-    // BEGIN AGENT SESSION AS 'agent-id' [RUN 'run-id']
+    // BEGIN AGENT SESSION AS 'agent-id' [RUN 'run-id'] [MODEL 'name/version']
     pub fn parse_begin_agent_session(&mut self) -> Result<Stmt, FerroError> {
         self.consume(TokenType::Session, "expected SESSION after BEGIN AGENT")?;
         self.consume(TokenType::As, "expected AS after BEGIN AGENT SESSION")?;
@@ -474,8 +480,13 @@ impl Parser {
         } else {
             None
         };
+        let model = if self.match_token(&[TokenType::Model]) {
+            Some(self.consume(TokenType::String, "expected a quoted model after MODEL")?.lexeme)
+        } else {
+            None
+        };
         self.consume(TokenType::Semicolon, "expected ;")?;
-        Ok(Stmt::BeginAgentSession { agent, run })
+        Ok(Stmt::BeginAgentSession { agent, run, model })
     }
 
     // REVERT MERGE m_44 [CASCADE]
@@ -749,17 +760,34 @@ mod tests {
     #[test]
     fn test_parse_begin_agent_session() {
         match one("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';") {
-            Stmt::BeginAgentSession { agent, run } => {
+            Stmt::BeginAgentSession { agent, run, model } => {
                 assert_eq!(agent, "pricing-agent");
                 assert_eq!(run.as_deref(), Some("r_8fk2"));
+                assert!(model.is_none());
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),
         }
         // RUN is optional
         match one("BEGIN AGENT SESSION AS 'pricing-agent';") {
-            Stmt::BeginAgentSession { agent, run } => {
+            Stmt::BeginAgentSession { agent, run, model } => {
                 assert_eq!(agent, "pricing-agent");
                 assert!(run.is_none());
+                assert!(model.is_none());
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // MODEL is optional too, and follows RUN
+        match one("BEGIN AGENT SESSION AS 'a' RUN 'r' MODEL 'claude-opus-5/2026-05';") {
+            Stmt::BeginAgentSession { model, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-opus-5/2026-05"));
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // and MODEL without RUN
+        match one("BEGIN AGENT SESSION AS 'a' MODEL 'gpt-9';") {
+            Stmt::BeginAgentSession { run, model, .. } => {
+                assert!(run.is_none());
+                assert_eq!(model.as_deref(), Some("gpt-9"));
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),
         }

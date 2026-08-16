@@ -91,7 +91,7 @@ pub fn run_agent_stmt(
     let mut ctx = ExecCtx { catalog, bp, txn };
 
     match bound {
-        BoundAgentStmt::BeginAgentSession { agent_id, run_id, parent } => {
+        BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, parent } => {
             if session.agent.is_some() {
                 return Err(FerroError::Txn(
                     "an agent session is already open on this connection".into(),
@@ -102,7 +102,8 @@ pub fn run_agent_stmt(
                     "cannot begin an agent session inside a transaction block".into(),
                 ));
             }
-            let s = runtime.begin_session(&agent_id, run_id.as_deref(), parent)?;
+            let model = model.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
+            let s = runtime.begin_session_with_model(&agent_id, run_id.as_deref(), model, parent)?;
             session.agent = Some(s.clone());
             Ok(Outcome::Agent(AgentOutput::SessionStarted(s)))
         }
