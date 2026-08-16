@@ -12,6 +12,7 @@
 //
 //	validate <feed.jsonl>          check a feed file's format, exit non-zero on any violation
 //	follow <addr> [-key id]        stream a live feed, materialise it, print the resulting table
+//	sink <feed.jsonl> -db f.sqlite land the feed in SQLite with idempotent, order-guarded upserts
 //
 // `follow` is the interesting one. It maintains the table the feed describes — applying READ,
 // INSERT, UPDATE and DELETE to a local map — and prints the result. A caller can then compare that
@@ -298,9 +299,66 @@ func follow(addr, key string, cursor uint64, limit int) error {
 	return table.dump(os.Stdout)
 }
 
+// runSink lands a feed file into SQLite.
+//
+// Deliberately not transactional across the whole file. A sink that only becomes visible at the end
+// of a batch is a sink that loses everything when it dies mid-batch, and the per-row guard already
+// makes re-applying safe — so crashing part-way and being restarted is a normal, correct thing to
+// do here rather than a recovery problem.
+func runSink(feedPath, dbPath, key string) error {
+	raw, err := os.ReadFile(feedPath)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return errors.New("feed is empty; a sink that landed nothing has not succeeded")
+	}
+	sink, err := openSink(dbPath, key)
+	if err != nil {
+		return err
+	}
+	defer sink.Close()
+
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	applied, skipped := 0, 0
+	var lastTable string
+	var cursor uint64
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		e, err := decodeLine(line, i+1)
+		if err != nil {
+			return err
+		}
+		// Events at or below what this table has already absorbed are re-deliveries. Counted rather
+		// than hidden: "skipped 40" is how an operator sees a replay happening at all.
+		if e.CommitLSN <= sink.cursor(e.Table) && !isSchema(e.Op) {
+			skipped++
+			continue
+		}
+		if err := sink.apply(e); err != nil {
+			return err
+		}
+		applied++
+		lastTable = e.Table
+		if e.CommitEndLSN > cursor {
+			cursor = e.CommitEndLSN
+		}
+		if !isSchema(e.Op) {
+			if err := sink.saveCursor(e.Table, e.CommitLSN); err != nil {
+				return err
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "applied %d, skipped %d re-delivered\n", applied, skipped)
+	fmt.Printf("APPLIED %d SKIPPED %d CURSOR %d TABLE %s\n", applied, skipped, cursor, lastTable)
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | sink <feed.jsonl> -db <file>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -310,6 +368,20 @@ func main() {
 			os.Exit(2)
 		}
 		if err := validate(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "sink":
+		fs := flag.NewFlagSet("sink", flag.ExitOnError)
+		dbPath := fs.String("db", "cdc.sqlite", "destination SQLite file")
+		key := fs.String("key", "id", "primary key column")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer sink <feed.jsonl> -db <file>")
+			os.Exit(2)
+		}
+		feed := os.Args[2]
+		_ = fs.Parse(os.Args[3:])
+		if err := runSink(feed, *dbPath, *key); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

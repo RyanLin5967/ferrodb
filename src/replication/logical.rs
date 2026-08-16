@@ -264,11 +264,6 @@ impl LogicalDecoder {
         self.tables.len()
     }
 
-    /// True when this `dir_root` is a time-travel heap rather than a user table.
-    fn is_internal(&self, dir_root: u32) -> bool {
-        self.time_travel.contains(&dir_root) && !self.tables.contains_key(&dir_root)
-    }
-
     /// Whether a tuple's version has been killed. Non-zero `end_ts` means a later transaction
     /// ended this version, which for the LIVE row is what a `DELETE` looks like.
     fn is_dead(bytes: &[u8]) -> bool {
