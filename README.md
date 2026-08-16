@@ -50,8 +50,15 @@ FROM table [AS] [alias]
 [WHERE expr];
 ```
 
-- **Types:** INTEGER, FLOAT, BOOLEAN, VARCHAR(n)
-- **Literals:** integers, floats, single quoted strings, TRUE, FALSE, NULL
+- **Types:** INTEGER (i32), BIGINT (i64), DECIMAL / NUMERIC (exact, unbounded digits),
+  TIMESTAMP (epoch milliseconds, i64), FLOAT (f64), BOOLEAN, VARCHAR(n)
+- **Literals:** integers, floats, single quoted strings, TRUE, FALSE, NULL. A bare numeric literal
+  is read as the declared type of the column it is written to or compared against, so
+  `123456789012345678901234567890.5` reaches a DECIMAL column with every digit intact instead of
+  being rounded to an f64 on the way.
+- **DECIMAL** has no declared precision or scale. It stores the digits you wrote — `1.50` stays
+  `1.50` — and there is no decimal arithmetic: this engine stores and ships decimals, it does not
+  add them. Comparison is numeric, so `1.50` and `1.5` are equal.
 - **Operators:** = != <= > >= + - * / AND OR NOT
 - **Columns:** *, qualified references, table aliases, qualified star
 
@@ -304,9 +311,37 @@ The tests judge the feed by comparing that materialised table against the source
 well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
 author's idea of the format agrees with itself about any shared misreading.
 
-**Limits:** the catalog lives outside the WAL, so DDL is not carried by the feed — a consumer sees
-rows and not the schema change that preceded them. There is no wire framing beyond newline
-delimiting, and the feed is JSON rather than a compact binary format.
+### Wide values ship as strings, on purpose
+
+JSON has one number type and no stated precision, and the overwhelmingly common consumer
+behaviour is to parse every JSON number into an **IEEE 754 double** — that is what JavaScript's
+`JSON.parse` does, and what Go's `encoding/json` does into `interface{}`. A double carries a 53-bit
+significand, so `9223372036854775807` comes back as `9223372036854775808`, `9007199254740993` comes
+back as `9007199254740992`, and a decimal past 17 significant digits comes back rounded. **No error
+is raised** for any of it: the parse succeeds and the number is simply wrong.
+
+So `BIGINT`, `DECIMAL` and `TIMESTAMP` are emitted as JSON **strings**, which no parser coerces
+(envelope fields elided here — a real line also carries `txn`, `lsn`, `commit_lsn`,
+`commit_end_lsn` and `before`):
+
+```json
+{"op":"INSERT","table":"wide","after":{"id":1,"big":"9223372036854775807","dec":"1.50","ts":"1700000000123"}}
+```
+
+`INTEGER` deliberately stays a bare number — it is `i32`, three orders of magnitude inside what a
+double holds exactly, and stringifying it would break every consumer reading that column today.
+`FLOAT` stays a number too, since it *is* a double.
+
+`cdc-consumer precision <feed.jsonl>` reports the JSON type of every column and flags any whose
+digits a default float64 decode would corrupt. `tests/integration_cdc_wide_types.rs` runs it over a
+feed produced by real SQL (expecting zero corrupted columns) and then over a hand-built feed
+carrying the same values as bare numbers, requiring it to report the corruption — so a clean result
+means the checker works rather than that it never fires.
+
+**Limits:** there is no wire framing beyond newline delimiting, and the feed is JSON rather than a
+compact binary format. `TIMESTAMP` is epoch milliseconds with no calendar formatting, and over
+pgwire it is announced as `int8` rather than `timestamp` for that reason. `DECIMAL` supports no
+arithmetic, and its text cannot exceed 65535 bytes (the row encoding's length prefix).
 
 ## Replication — what it gives you, and what it cannot
 
