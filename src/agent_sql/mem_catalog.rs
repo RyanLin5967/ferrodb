@@ -138,6 +138,10 @@ impl BranchCatalog for MemBranchCatalog {
             .collect())
     }
 
+    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+        Ok(self.records.lock().unwrap().values().cloned().collect())
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut records = self.records.lock().unwrap();
         let mut rec = Self::lookup(&records, branch)?;

@@ -130,6 +130,9 @@ impl BranchRecord {
         }
         match self.state {
             BranchState::Live => Ok(()),
+            // Queryable by design. A quarantined branch is being held for inspection, and a hold
+            // you cannot read is a deletion with extra steps.
+            BranchState::Quarantined => Ok(()),
             BranchState::Reaping => Err(BranchError::Reaping(self.branch_id)),
             BranchState::Reaped => Err(BranchError::Reaped {
                 requested,

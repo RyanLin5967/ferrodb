@@ -60,6 +60,14 @@ pub trait BranchCatalog: Send + Sync {
     /// Every live branch, for the lease scan.
     fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError>;
 
+    /// Every branch record the catalog still holds, whatever its state.
+    ///
+    /// Distinct from [`Self::live_branches`], which filters to `Live` — so it cannot see a
+    /// quarantined branch, which is precisely the state someone asking this question is looking
+    /// for. No default implementation: falling back to `live_branches` would silently under-report
+    /// exactly the branches that matter here.
+    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError>;
+
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;
 }

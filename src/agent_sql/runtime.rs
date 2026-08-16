@@ -35,7 +35,7 @@ use crate::agent_sql::merge_engine::{
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
-use crate::branch::types::{BranchId, CommitHash, LeaseDeadline, PageId};
+use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
 use crate::branch::BranchCatalog;
 
@@ -182,6 +182,8 @@ struct State {
     apply_seq: u64,
     applied: Vec<AppliedOp>,
     merges: BTreeMap<String, MergeRecord>,
+    /// Why each quarantined branch is being held, keyed by branch id slot.
+    quarantine_reasons: BTreeMap<u64, String>,
     /// Which run last published each row, surviving the merge that published it.
     ///
     /// Without this, criterion 9 could only be answered for a row on a *live* branch: `run_of`
@@ -1019,7 +1021,70 @@ impl AgentRuntime {
     ///
     /// Composition first, guards second, verdict third. A conflicting merge publishes **nothing**
     /// and leaves the branch alive so the agent can retry with the returned predicate.
+    /// Hold a branch a verification gate declined: **unmerged, still queryable**.
+    ///
+    /// Both halves matter. Not merging is the point of declining; staying queryable is what makes
+    /// quarantine different from rejection — a branch that tripped a *heuristic* has not been
+    /// shown to be wrong, and throwing it away destroys the evidence needed to decide whether it
+    /// was. `BranchState::Quarantined` reads as readable for exactly that reason.
+    ///
+    /// This is the mechanism, not a policy. Nothing decides on its own to call it: which findings
+    /// warrant a hold is the gate's business, and the blind-write tier deliberately reports
+    /// without deciding.
+    pub fn quarantine(&self, branch: BranchId, reason: &str) -> Result<(), FerroError> {
+        let mut rec = self.branches.get(branch)?;
+        if rec.state == BranchState::Quarantined {
+            return Ok(());
+        }
+        rec.state = BranchState::Quarantined;
+        self.branches.put(&rec)?;
+        self.state
+            .lock()
+            .unwrap()
+            .quarantine_reasons
+            .insert(branch.id, reason.to_string());
+        Ok(())
+    }
+
+    /// Why this branch is being held, if it is.
+    pub fn quarantine_reason(&self, branch: BranchId) -> Option<String> {
+        self.state.lock().unwrap().quarantine_reasons.get(&branch.id).cloned()
+    }
+
+    /// Every branch currently held for inspection.
+    pub fn quarantined_branches(&self) -> Result<Vec<BranchId>, FerroError> {
+        // `all_branches`, not `live_branches`: the latter filters to `Live` and therefore can
+        // never return a quarantined branch, which is the only thing this function is looking for.
+        Ok(self
+            .branches
+            .all_branches()?
+            .into_iter()
+            .filter(|r| r.state == BranchState::Quarantined)
+            .map(|r| r.branch_id)
+            .collect())
+    }
+
+    /// Return a held branch to normal service.
+    pub fn release_from_quarantine(&self, branch: BranchId) -> Result<(), FerroError> {
+        let mut rec = self.branches.get(branch)?;
+        if rec.state != BranchState::Quarantined {
+            return Err(FerroError::Branch(format!("{branch} is not quarantined")));
+        }
+        rec.state = BranchState::Live;
+        self.branches.put(&rec)?;
+        self.state.lock().unwrap().quarantine_reasons.remove(&branch.id);
+        Ok(())
+    }
+
     pub fn merge(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<MergeReport, FerroError> {
+        // A held branch is held. Letting a merge through would make quarantine advisory, and an
+        // advisory hold is not a hold.
+        if self.branches.get(branch)?.state == BranchState::Quarantined {
+            return Err(FerroError::Branch(format!(
+                "{branch} is quarantined and cannot be merged: {}",
+                self.quarantine_reason(branch).unwrap_or_else(|| "no reason recorded".into())
+            )));
+        }
         let target = self.branches.get(branch)?.parent_id.unwrap_or(BranchId::TRUNK);
         let snapshot = {
             let state = self.state.lock().unwrap();

@@ -162,6 +162,10 @@ impl LeaseDeadline {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BranchState {
     Live,
+    /// Held after a verification gate declined to merge it. **Unmerged but still queryable** —
+    /// that pairing is the whole point: a branch that failed a heuristic check has not been shown
+    /// to be wrong, so discarding it destroys the evidence needed to decide whether it was.
+    Quarantined,
     Reaping,
     Reaped,
 }
@@ -172,6 +176,8 @@ impl BranchState {
             BranchState::Live => 0,
             BranchState::Reaping => 1,
             BranchState::Reaped => 2,
+            // Appended, so every tag already on disk keeps its meaning.
+            BranchState::Quarantined => 3,
         }
     }
 
@@ -180,6 +186,7 @@ impl BranchState {
             0 => Ok(BranchState::Live),
             1 => Ok(BranchState::Reaping),
             2 => Ok(BranchState::Reaped),
+            3 => Ok(BranchState::Quarantined),
             other => Err(BranchError::Corrupt(format!("unknown branch state {}", other))),
         }
     }

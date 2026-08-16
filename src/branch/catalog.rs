@@ -260,6 +260,11 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(st.records.values().filter(|r| r.state == BranchState::Live).cloned().collect())
     }
 
+    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+        let st = self.state.read().unwrap();
+        Ok(st.records.values().cloned().collect())
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut rec = self.get(branch)?;
         rec.lease_deadline = lease;
