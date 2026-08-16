@@ -89,7 +89,13 @@ live branches           1           33          1
 branches reaped                                32 of 32
 ```
 
-Two things make this stronger than the numbers alone:
+Three things make this stronger than the numbers alone:
+
+- **A control scan runs first, before the leases expire.** A reaper that simply freed every branch
+  it was pointed at would produce exactly the same "returns to baseline" numbers, and would be
+  catastrophic. The identical scan run at the current time reaps **0 branches** and leaves the page
+  count at 230. So it is the *lease* that frees pages, not the act of scanning — the detector is
+  shown not to fire spuriously before it is trusted when it does fire.
 
 - **The baseline is deliberately non-zero.** Trunk is seeded with 400 rows *first*. "Returns to
   baseline" is trivially satisfiable by freeing everything, so the demo re-reads trunk's data after

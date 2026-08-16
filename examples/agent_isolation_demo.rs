@@ -378,11 +378,29 @@ fn criterion_8_lease_reaping(led: &mut Ledger) {
     // `abandoned` is kept only so the reap can be checked against it afterwards. Nothing in this
     // demo ever calls anything on those branches again before the reaper runs.
 
-    // The reaper takes `now_millis` explicitly so the demo advances the lease clock without
-    // sleeping for the lease duration. The deadlines are real; only the clock reading is supplied.
+    // FIRST: prove the lease is load-bearing. A reaper that simply frees every branch it is
+    // pointed at would also make the numbers below return to baseline, and would be catastrophic.
+    // So run the identical scan while the leases are still valid and show it takes nothing.
+    println!("\n  CONTROL — the same scan, run BEFORE the leases expire:");
+    let early = reaper
+        .reap_expired(LeaseDeadline::now_millis())
+        .expect("early lease scan");
+    let control_live = env.store.live_page_count().expect("live");
+    println!("    branches reaped ................... {}  (must be 0)", early.len());
+    println!("    live pages ........................ {}  (unchanged from {})", control_live, during_live);
+    note("so the reaper is honouring the deadline, not simply freeing whatever it is shown");
+    led.check(
+        8,
+        "a scan before expiry reaps nothing — the lease, not the scan, is what frees pages",
+        early.is_empty() && control_live == during_live,
+    );
+
+    // THEN advance the clock past every lease. The reaper takes `now_millis` explicitly so the
+    // demo does not have to sleep through a real lease. The deadlines are real and really
+    // compared; only the clock reading is supplied.
     let now = LeaseDeadline::now_millis() + 10 * LEASE_MS;
     note(&format!(
-        "background lease scan runs with the clock at now+{}ms, past every lease",
+        "background lease scan runs again with the clock at now+{}ms, past every lease",
         10 * LEASE_MS
     ));
     let reaped = reaper.reap_expired(now).expect("lease scan");
