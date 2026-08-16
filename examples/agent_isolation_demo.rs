@@ -126,13 +126,14 @@ impl Ledger {
         println!("\n  Read the 'What this does not do yet' section of DEMO.md before quoting any");
         println!("  of the above. Two boundaries in particular travel with these numbers, and a");
         println!("  reader who stops at the table above will not have them:");
-        println!("    · THIS BINARY is map-backed, so a MET in Act II is not a statement about");
-        println!("      pages. The statement path itself is not the limit: with a storage-backed");
-        println!("      runtime, stage() mirrors staged rows onto the branch's CoW tree, and");
-        println!("      tests/integration_branch_pages.rs proves it through the real executor in 9");
-        println!("      tests. What is unjoined is that nothing in src/ builds such a runtime —");
-        println!("      Session::with_runtime has no caller — and with_storage has no reattach");
-        println!("      path, so it cannot simply be switched on for an existing database.");
+        println!("    · Act II is page-backed, but only the branch side of it. This binary now");
+        println!("      builds its runtime the way src/cli/cli.rs does, and criterion 2 reads the");
+        println!("      branch's own copy-on-write tree rather than trusting the SELECTs above —");
+        println!("      run it against AgentRuntime::new() and criterion 2 reports NOT MET.");
+        println!("      What remains true is narrower than what this said until 2026-08-16, when");
+        println!("      it still claimed nothing in src/ built such a runtime: TRUNK's rows live");
+        println!("      in the heap, so the branch tree carries the staged DELTA and not the base");
+        println!("      table, and reads are served from the heap plus the workspace overlay.");
         println!("    · Criterion 7 holds for a guard naming the amount taken (`qty >= 12`).");
         println!("      Written as the invariant (`qty >= 0`) the same case is not refused and the");
         println!("      counter reaches -4 — measured above, not argued.");
@@ -529,7 +530,35 @@ impl Db {
         );
         let txn = Arc::new(ferrodb::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
         bp.attach_wal(wal);
-        Db { catalog, bp, txn, runtime: Arc::new(AgentRuntime::new()), _dir: dir }
+
+        // **Storage-backed, exactly as `src/cli/cli.rs` builds it.** Until the CLI was wired to the
+        // branch engine this could not be done here either, and Act II ran on `AgentRuntime::new()`
+        // — a runtime with `storage: None` that stages rows in a `BTreeMap`. Every criterion below
+        // still passed, which is the point: a map isolates a write from trunk just as well as a
+        // copy-on-write page does, so those passes were true statements about visibility and NOT
+        // statements about pages, and the demo said so at length.
+        //
+        // They are statements about pages now. The arena floor sits above what the catalog has
+        // already allocated, because the region below it belongs to the ordinary allocator and
+        // handing the same page to both is how two writers end up sharing one.
+        let branches = Arc::new(
+            ferrodb::branch::catalog::LogBranchCatalog::open(&dir.path().join("agent.branches"), 1)
+                .expect("branch catalog"),
+        );
+        let base = bp.disk_manager.high_water().expect("high water") + 256;
+        let store = Arc::new(
+            ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone(), base)
+                .expect("arena"),
+        );
+        let runtime = Arc::new(
+            AgentRuntime::with_storage(
+                branches as Arc<dyn ferrodb::branch::BranchCatalog>,
+                Arc::new(ferrodb::tel::MemEffectLog::new()),
+                store as Arc<dyn ferrodb::cow::PageStore>,
+            )
+            .expect("storage-backed runtime"),
+        );
+        Db { catalog, bp, txn, runtime, _dir: dir }
     }
 
     /// A connection sharing this database's agent runtime, so branches are mutually visible.
@@ -667,6 +696,39 @@ fn criterion_2_isolation(led: &mut Ledger) {
         && seen_b[0][0] == Value::Integer(20);
     led.check(2, "writer sees 15 while main and sibling both still see 20", ok);
 
+    // **The same isolation, measured on pages instead of on reads.** The three numbers above are
+    // exactly what a runtime staging rows in a `BTreeMap` would print — this demo used to run on
+    // one, and this criterion passed then too. Hiding a row is not the claim; putting it on a
+    // copy-on-write page that trunk's tree does not share is. So the tree is read directly.
+    let branch = a.agent.as_ref().expect("agent-a has no agent session").branch;
+    println!("\n    the same isolation, measured on pages rather than on reads:");
+    // Reported as a failed criterion rather than a panic. A runtime with `storage: None` returns an
+    // error here, and that is a legitimate configuration to run this demo against — it is what the
+    // demo ran on until the CLI was wired — so the honest output is "this criterion is not met on
+    // pages", not a crash that says nothing about the other nine.
+    let paged = match (
+        db.runtime.scan_rows(branch, "inventory"),
+        db.runtime.scan_rows(BranchId::TRUNK, "inventory"),
+    ) {
+        (Ok(on_branch), Ok(on_trunk)) => {
+            println!("      rows in agent-a's copy-on-write tree ... {}", on_branch.len());
+            println!("      rows in trunk's tree .................. {}", on_trunk.len());
+            println!("      (trunk is heap-backed; a fork's writes land on pages in its own tree)");
+            !on_branch.is_empty()
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            println!("      the branch tree could not be read: {e}");
+            println!("      this runtime has no page storage, so the isolation above is a");
+            println!("      statement about visibility only - a map hides a row just as well.");
+            false
+        }
+    };
+    led.check(
+        2,
+        "the staged write is on a page in the branch's own tree, not only in a workspace",
+        paged,
+    );
+
     // And after merge it becomes visible — otherwise "until merge" is unproven.
     let r = report_of(db.ok("MERGE;", &mut a));
     let after_main = rows_of(db.ok("SELECT qty FROM inventory WHERE id = 1;", &mut main));
@@ -678,9 +740,9 @@ fn criterion_2_isolation(led: &mut Ledger) {
     led.record(
         2,
         "Branch writes invisible to main and siblings until merge",
-        if ok && became_visible { Verdict::Met } else { Verdict::NotMet },
-        "Isolation is at the row level in the SQL surface's per-branch workspace, not at the page \
-level — see 'What this does not do yet' in DEMO.md.",
+        if ok && became_visible && paged { Verdict::Met } else { Verdict::NotMet },
+        "Enforced on pages: the staged row is in the branch's own copy-on-write tree while trunk's \
+tree does not hold it. This binary now builds its runtime the way src/cli/cli.rs does.",
     );
 }
 
@@ -1161,7 +1223,7 @@ fn main() -> ExitCode {
     println!("  ACT II - agent SQL surface. Real scanner/parser/binder/executor. Criteria 2-7, 9, 10.");
     println!("");
     println!("A row written by a SQL STATEMENT in this demo does NOT live on a page: it is staged");
-    println!("in an in-memory workspace, because this demo builds AgentRuntime::new().");
+    println!("in an in-memory workspace, and are ALSO mirrored onto the branch's own tree.");
     println!("");
     println!("That is a property of THIS BINARY, not of the statement path. Given a storage-backed");
     println!("runtime, statements DO write copy-on-write pages: stage() mirrors every staged row");
@@ -1171,14 +1233,14 @@ fn main() -> ExitCode {
     println!("");
     println!("What is genuinely unjoined is narrower, and worth stating exactly:");
     println!("");
-    println!("  - Nothing in src/ constructs a storage-backed runtime. Session::new() sets");
-    println!("    storage: None, and Session::with_runtime - the injection point - has no caller");
-    println!("    in src/, so the CLI and the pgwire server are map-backed too.");
-    println!("  - with_storage mints a fresh trunk root (create_root + set_root, unconditionally)");
-    println!("    and has no reattach path, so it is not a flag to flip on a database that already");
-    println!("    holds data.");
+    println!("  - CORRECTED 2026-08-16. This used to say that nothing in src/ constructs a");
+    println!("    storage-backed runtime and that Session::with_runtime had no caller. Both are");
+    println!("    now false: src/cli/cli.rs builds LogBranchCatalog + ArenaPageStore and calls");
+    println!("    with_storage on create and reopen_with_storage on reattach, so `cargo run` puts");
+    println!("    you on the branch engine. The pgwire server is still map-backed.");
     println!("  - Reads are still served from the heap plus the workspace overlay; the branch tree");
-    println!("    holds the staged DELTA, not the base table.");
+    println!("    holds the staged DELTA, not the base table. Trunk is heap-backed, which is why");
+    println!("    criterion 2 prints 0 rows in trunk's tree and 1 in the branch's.");
     println!("");
     println!("DEMO.md documents what that costs.");
 

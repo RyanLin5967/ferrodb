@@ -298,16 +298,18 @@ cannot respond would prove nothing. Raw output is committed at `bench/branch_sca
 
 Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 
-- **The shipped binaries are map-backed, though the statement path is not the reason.** `UPDATE` /
-  `INSERT` inside an agent session stage into an in-memory workspace *in the CLI, the pgwire server
-  and the demo*, because all three build `Session::new()`, which sets `storage: None`. Given a
-  storage-backed runtime the statement path does write copy-on-write pages — `stage()` mirrors each
-  staged row onto the branch's tree, and `tests/integration_branch_pages.rs` drives that through the
-  real scanner, parser, binder and executor in 9 tests. The gap is that nothing in `src/` constructs
-  such a runtime (`Session::with_runtime` has no caller), and `with_storage` mints a fresh trunk
-  root with no reattach path, so it cannot simply be switched on for a database that already holds
-  data. Reads are also still served from the heap plus the workspace overlay, and a branch's tree
-  holds its staged delta rather than the base table. This is the largest remaining gap.
+- **The pgwire server is still map-backed.** It builds `Session::new()`, which sets
+  `storage: None`, so an agent session there stages rows in memory. The CLI and the demo no longer
+  do: `src/cli/cli.rs` builds a `LogBranchCatalog` and an `ArenaPageStore` and calls `with_storage`
+  on create / `reopen_with_storage` on reattach, and `examples/agent_isolation_demo.rs` builds its
+  runtime the same way. *This entry said until 2026-08-16 that nothing in `src/` constructed such a
+  runtime and that `Session::with_runtime` had no caller; both were true when written and are now
+  false, which is why the correction is recorded rather than the sentence quietly replaced.*
+- **Trunk is heap-backed, so a branch tree holds a delta rather than a table.** Reads are served
+  from the heap plus the workspace overlay, and a fork's copy-on-write tree carries its staged
+  delta, not a copy of the base table. `tests/integration_trunk_tree_authority.rs` pins this by
+  measurement — trunk's tree reads back empty while the branch's holds the staged row — and
+  criterion 2 of the demo prints both counts rather than asserting the arrangement.
 - **A guard must name the amount taken.** `qty >= 12` is refused correctly; written as the invariant
   `qty >= 0`, two agents each taking 12 from 20 both merge and the counter reaches **−4**. Guards are
   preconditions evaluated *before* the composed ops apply, so a precondition cannot see a post-op
