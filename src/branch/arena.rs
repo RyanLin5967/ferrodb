@@ -371,7 +371,8 @@ impl ArenaPageStore {
     // live child can still see. So the whole map is checkpointed, not reconstructed by guesswork.
     //
     // Format (big-endian, matching the rest of ferrodb):
-    //   version u8 | next_extent_start u32 | next_arena_id u32 | live u32 | reserved u32
+    //   version u8 | base_page u32 | next_extent_start u32 | next_arena_id u32 | live u32
+    //       | reserved u32
     //   free_starts: u32 count, u32 each
     //   extents: u32 count, then per extent
     //       arena u32 | owner.id u64 | owner.gen u32 | start u32 | page_count u32 | next_free u32
@@ -381,13 +382,17 @@ impl ArenaPageStore {
     //       | owner.gen u32
     //   crc32 u32
 
-    const STATE_VERSION: u8 = 1;
+    /// v2 added `base_page` immediately after the version byte. It is what makes a checkpoint
+    /// self-describing: before it, the region's base existed only as an argument the caller
+    /// remembered to pass, and reattaching at the wrong base aliased another arena silently.
+    const STATE_VERSION: u8 = 2;
 
     /// Serialize the free-space map and pending-free log.
     pub fn state_bytes(&self) -> Vec<u8> {
         let st = self.state.lock().unwrap();
         let mut b = Vec::new();
         b.push(Self::STATE_VERSION);
+        b.extend_from_slice(&self.space.base_page.to_be_bytes());
         b.extend_from_slice(&self.space.next_extent_start.load(Ordering::SeqCst).to_be_bytes());
         b.extend_from_slice(&self.space.next_arena_id.load(Ordering::SeqCst).to_be_bytes());
         b.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
@@ -456,6 +461,17 @@ impl ArenaPageStore {
                 "unknown arena state version {} (expected {})",
                 version,
                 Self::STATE_VERSION
+            ))
+            .into());
+        }
+        // The checkpoint names the region it describes. Loading a map whose base is not this
+        // store's would silently graft another arena's extents onto this one's space, and every
+        // page id in the rest of the image would refer to somebody else's pages.
+        let base = c.u32()?;
+        if base != self.space.base_page {
+            return Err(BranchError::Arena(format!(
+                "arena state describes the region at {} but this store owns {}",
+                base, self.space.base_page
             ))
             .into());
         }
@@ -544,6 +560,57 @@ impl ArenaPageStore {
         let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
         self.load_state(&bytes)?;
         Ok(true)
+    }
+
+    /// Read `base_page` out of a checkpoint image, without loading it.
+    ///
+    /// Validates the checksum and version first: a base read out of a corrupt image is worse than
+    /// no base at all, because it is the number the floor gets registered from.
+    pub fn base_page_in_state(bytes: &[u8]) -> Result<PageId, FerroError> {
+        let body = bytes
+            .len()
+            .checked_sub(4)
+            .ok_or_else(|| BranchError::Arena("arena state shorter than its checksum".into()))?;
+        let stored = u32::from_be_bytes(bytes[body..].try_into().unwrap());
+        if crc32(&bytes[..body]) != stored {
+            return Err(BranchError::Arena("arena state checksum mismatch".into()).into());
+        }
+        let mut c = StateCursor { b: &bytes[..body], at: 0 };
+        let version = c.u8()?;
+        if version != Self::STATE_VERSION {
+            return Err(BranchError::Arena(format!(
+                "unknown arena state version {} (expected {})",
+                version,
+                Self::STATE_VERSION
+            ))
+            .into());
+        }
+        c.u32()
+    }
+
+    /// Reattach to a checkpointed arena, taking the region's base **from the checkpoint** rather
+    /// than from the caller.
+    ///
+    /// This is the difference between [`ArenaPageStore::reopen`] and a guard. `reopen` registers
+    /// a floor at whatever base it is handed; hand it another arena's base and it will claim that
+    /// arena's region, and nothing downstream can tell. Here the base is read from the durable
+    /// image that describes the region, so the caller cannot get it wrong — there is no argument
+    /// to get wrong. `load_state` then re-checks the same field against the assembled store, so a
+    /// mismatch is refused twice over.
+    ///
+    /// A missing checkpoint is an error rather than a fresh start: this constructor exists to
+    /// reattach, and "there is nothing to reattach to" is something the caller must handle
+    /// deliberately with [`ArenaPageStore::new`], not something to paper over with a default base.
+    pub fn reopen_from_checkpoint(
+        pool: Arc<BufferPoolManager>,
+        catalog: Arc<LogBranchCatalog>,
+        path: &std::path::Path,
+    ) -> Result<Self, FerroError> {
+        let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
+        let base = Self::base_page_in_state(&bytes)?;
+        let store = Self::reopen(pool, catalog, base)?;
+        store.load_state(&bytes)?;
+        Ok(store)
     }
 }
 
@@ -945,6 +1012,78 @@ mod tests {
             err.is_err(),
             "allocator returned {:?} instead of refusing; that page is inside the arena region [{}, {}]",
             err.ok(), base, arena_hi
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // S2a. `reopen` takes the base on trust. This one takes it from the durable image that
+    // describes the region, so there is no argument left for a caller to get wrong.
+    #[test]
+    fn reopen_from_checkpoint_takes_the_base_from_the_image_not_the_caller() {
+        use std::fs::OpenOptions;
+        use crate::storage::disk_manager::DiskManager;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ferro-s2a-{}.db", std::process::id()));
+        let ckpt = dir.join(format!("ferro-s2a-{}.ckpt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ckpt);
+        let open = || OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+
+        let (base, live_before) = {
+            let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+            let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+            // Push the base off 1 so a wrong base is actually distinguishable from the right one.
+            for _ in 0..12 { pool.disk_manager.allocate().unwrap(); }
+            let base = pool.disk_manager.high_water().unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let a = store.arena_for(br.branch_id).unwrap();
+            for _ in 0..4 {
+                store.alloc_in_arena(a, PageType::Heap, catalog.next_epoch()).unwrap();
+            }
+            store.checkpoint(&ckpt).unwrap();
+            (base, store.live_page_count().unwrap())
+        };
+        assert!(base > 1, "fixture: base must not be the trivial 1");
+
+        let pool2 = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+        let catalog2 = Arc::new(LogBranchCatalog::in_memory(1));
+        let restored =
+            ArenaPageStore::reopen_from_checkpoint(pool2, catalog2, &ckpt).unwrap();
+
+        assert_eq!(restored.base_page(), base, "the base came from the image");
+        assert_eq!(restored.live_page_count().unwrap(), live_before, "the map came with it");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ckpt);
+    }
+
+    // Grafting one region's free-space map onto another store would make every page id in the
+    // image refer to somebody else's pages. The checkpoint names its region so that is refusable.
+    #[test]
+    fn a_checkpoint_describing_another_region_is_refused() {
+        use std::fs::OpenOptions;
+        use crate::storage::disk_manager::DiskManager;
+        let a = Harness::new();
+
+        // A second store on its OWN file — one DiskManager cannot carry two regions, which is
+        // what S4 now refuses. Allocating first pushes this base clear of a's.
+        let path = std::env::temp_dir().join(format!("ferro-s2a-other-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let pool_b = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog_b = Arc::new(LogBranchCatalog::in_memory(1));
+        for _ in 0..12 { pool_b.disk_manager.allocate().unwrap(); }
+        let base_b = pool_b.disk_manager.high_water().unwrap();
+        let b_other = ArenaPageStore::new(pool_b, catalog_b, base_b).unwrap();
+        assert_ne!(a.store.base_page(), b_other.base_page(), "fixture: bases must differ");
+
+        let err = b_other.load_state(&a.store.state_bytes());
+        assert!(err.is_err(), "a store loaded a map describing a region it does not own");
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("describes the region at"),
+            "wrong error, got: {}",
+            msg
         );
         let _ = std::fs::remove_file(&path);
     }
