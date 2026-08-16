@@ -76,3 +76,37 @@ jobs:
       - run: cargo build --examples
 
       - run: cargo test
+
+      # THE CHECKPOINT GATE.
+      #
+      # A checkpoint truncates the WAL. At the default interval of 256 commits that almost never
+      # happens mid-test, and four separate features have now shipped a test that passed only
+      # because of it - each one failing for real once it crossed the threshold. E17 added
+      # FERRODB_CHECKPOINT_INTERVAL so the rare thing could be made constant; providing the knob
+      # did not stop the class recurring, because nothing obliged anyone to turn it.
+      #
+      # This turns it. The list below is tests that CLAIM to hold regardless of when a checkpoint
+      # lands, and the convention is: if you write a test that claims checkpoint-independence, add
+      # it here. Tests NOT listed are checkpoint-dependent on purpose - an unpinned consumer races
+      # the checkpointer by design, and integration_cdc_stream, integration_cdc_snapshot and
+      # integration_base_backup all fail at interval=1 for that documented reason.
+      - name: Checkpoint gate (every commit truncates)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TESTS="integration_checkpoint_pressure integration_cdc_latency integration_truncation_race"
+          # Refuse rather than silently cover nothing: a renamed or deleted test file would
+          # otherwise make this step pass by running an empty list, which is the failure mode this
+          # whole gate exists to prevent.
+          for t in $TESTS; do
+            if [ ! -f "tests/$t.rs" ]; then
+              echo "checkpoint gate names tests/$t.rs, which does not exist."
+              echo "If it was renamed, update this list; if it was deleted, say so here."
+              exit 1
+            fi
+          done
+          for t in $TESTS; do
+            echo "::group::$t at FERRODB_CHECKPOINT_INTERVAL=1"
+            FERRODB_CHECKPOINT_INTERVAL=1 cargo test --test "$t"
+            echo "::endgroup::"
+          done

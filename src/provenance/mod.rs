@@ -104,13 +104,29 @@ impl RunEntity {
     /// Whether two entities describe the same actor. `prov_id` is excluded deliberately: it is
     /// the store's assigned slot, not part of the run's identity, so a caller may present an
     /// entity carrying [`ProvId::NONE`] and still be recognised.
+    /// Is `other` the same actor as this one — same agent, same run, same model and prompt?
+    ///
+    /// **`started_at` is deliberately excluded, and that exclusion is a bug fix rather than a
+    /// simplification.** It is when a particular session began, not part of who the actor is. While
+    /// it was included, `intern` behaved differently depending on whether the system clock happened
+    /// to advance between two calls: a second session for one run was REFUSED when the clock moved
+    /// (its `started_at` differed) and silently ACCEPTED when it did not. Same input, two
+    /// behaviours, decided by clock granularity — and the refusal blamed "a different actor tuple"
+    /// when nothing about the actor had differed.
+    ///
+    /// CI found it: the test asserting the refusal passed on macOS and failed on an Ubuntu runner
+    /// where both sessions landed inside one tick. It was never a platform difference, only a
+    /// faster machine making the coincidence likely.
+    ///
+    /// With `started_at` out, the contract is what it always claimed to be and is now decidable
+    /// from the values alone: one run is one entity, a repeat with the same actor reuses its id,
+    /// and only a genuine change of model, prompt or parent is refused.
     pub fn same_actor(&self, other: &RunEntity) -> bool {
         self.agent_id == other.agent_id
             && self.run_id == other.run_id
             && self.model == other.model
             && self.model_version == other.model_version
             && self.prompt_hash == other.prompt_hash
-            && self.started_at == other.started_at
             && self.parent_branch == other.parent_branch
     }
 

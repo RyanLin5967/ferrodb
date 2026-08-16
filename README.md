@@ -39,6 +39,59 @@ cd ferrodb
 cargo run
 ```
 You can add an argument if you want a custom name. For example, `cargo run -- customname.db` will persist tables in `customname.db`.
+### Agent isolation, in the binary you just built
+
+The branch engine is not a library sitting beside the CLI — `cargo run` puts you on it. This is a
+real transcript, not an illustration:
+
+```
+$ cargo run -- shop.db
+ferrodb=> CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);
+ok
+ferrodb=> INSERT INTO inv VALUES (1, 10);
+(1 row affected)
+
+ferrodb=> BEGIN AGENT SESSION AS 'pricing' RUN 'r_1';
+agent session b_1 on b1@g0 (agent=pricing run=r_1)
+ferrodb=> INSERT INTO inv VALUES (2, 20);
+(1 row affected)
+ferrodb=> SELECT * FROM inv;            -- the agent sees its own write
+1 | 10
+2 | 20
+(2 rows)
+ferrodb=> DIFF;
+diff b0@g0 -> b1@g0: 1 row(s)
+  INSERT inv.row2 [pending]
+    op RowCreate on <row>
+```
+
+In **another** terminal, against the same database, the row does not exist:
+
+```
+ferrodb=> SELECT * FROM inv;
+1 | 10
+(1 row)
+```
+
+`MERGE;` publishes it, reports the outcome per row, and the result survives a restart:
+
+```
+ferrodb=> MERGE;
+m_1 b1@g0 -> b0@g0: Clean
+  inv.row2: Clean
+```
+
+The isolation is enforced by shadow paging, not by staging rows somewhere: the agent's write copies
+pages into a reserved arena above the ordinary table region, which is what
+`tests/integration_cli_agent_isolation.rs` checks by watching the database file grow past the arena
+floor. Those tests drive the built binary over a pipe, so they cannot pass by calling a constructor
+the binary does not call — reverting the wiring fails three of the five.
+
+`FERRODB_ARENA_HEADROOM` sets how many pages of ordinary table growth are reserved below the arena
+floor (default 32736, about 128 MB). It is read once, when a database's arena is first created, and
+then persisted: changing it later cannot move an existing database's floor, because moving the floor
+would put pages the arena already owns back into the ordinary allocator's circulation.
+
 ### Supported SQL
 
 Here is the SQL syntax that has been implemented so far:
@@ -280,10 +333,17 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
   than emitted. A consumer shown an aborted transaction's rows has been told about data that never
   existed.
-- **Resumable.** Each event carries `commit_end_lsn`, the position to resume from. A consumer
-  reconnects there and the halves join with no gap and no overlap. The cursor advances only past a
-  commit that was actually emitted — never to the durable frontier, which would step over an
-  in-flight transaction's records permanently.
+- **Resumable, from two positions rather than one.** A consumer persists where to resume *reading*
+  and what it has already been *delivered*, and they are different numbers whenever a transaction is
+  in flight. Persisting only a commit position loses data: a transaction that opened before that
+  commit has records *below* it, so a restart reads past them and never sees that transaction at
+  all. Measured, not reasoned — a consumer resuming from its highest `commit_lsn` lost an in-flight
+  transaction's row, while one restoring both positions kept it.
+
+  The read cursor advances only past a commit that was actually emitted, and never past the earliest
+  record of a still-open transaction. Clamping it that way re-reads transactions that committed
+  afterwards, which is why the delivered position exists to suppress them — read from the low-water
+  mark, deliver past the high-water mark.
 - **Initial snapshot with a handoff.** A consumer joining a database that already has rows reads
   the current contents as `READ` events, then streams from the LSN captured *before* the scan. That
   direction is deliberate: handing off after the scan silently loses concurrent changes, while

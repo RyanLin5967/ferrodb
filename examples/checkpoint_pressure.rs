@@ -124,15 +124,19 @@ fn main() {
     sql(&mut d2, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
     let streamer2 = FeedStreamer::new(LogicalDecoder::new(&d2.catalog));
     let mut cursor = FeedStreamer::start_cursor(&d2.wal);
+    // The unpinned consumer tracks delivery progress separately from its read position, exactly
+    // as the pinned one does inside its Subscription.
+    let mut unpinned_through = 0u64;
     let mut unpinned_events = 0usize;
     let mut unpinned_inserts = 0usize;
     let mut unpinned_err: Option<String> = None;
     for i in 1..=commits {
         sql(&mut d2, &format!("INSERT INTO t VALUES ({i}, {});", i * 10));
         let mut buf = Vec::new();
-        match streamer2.pump(&d2.wal, cursor, &mut buf) {
+        match streamer2.pump(&d2.wal, cursor, unpinned_through, &mut buf) {
             Ok(p) => {
                 cursor = p.cursor;
+                unpinned_through = p.emitted_through;
                 unpinned_events += p.emitted;
                 unpinned_inserts += count_inserts(&buf);
             }
