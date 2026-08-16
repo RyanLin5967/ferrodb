@@ -152,7 +152,7 @@ keep a predicate summary. Retaining reads is what makes causal rollback possible
 can find the write B that *read* A. It halts and shows the tree by default; cascade is explicit.
 
 **3. Typed Effect Log, merge, and verification gate.** Writes are logged as typed operations
-(`Assign`, `Add`, `Max`, `Min`, `SetInsert`, `SetRemove`) alongside the **guards** that made them
+(`RowCreate`, `RowDelete`, `Assign`, `Add`, `Max`, `Min`, `SetInsert`, `SetRemove`) alongside the **guards** that made them
 legal. Guards are the part that genuinely cannot be reconstructed from a byte WAL — numeric deltas
 can be, but `WHERE qty >= 5` cannot. Merge is three-way against the fork point, which is strictly
 stronger than CRDT replication: no per-replica vectors that grow without bound.

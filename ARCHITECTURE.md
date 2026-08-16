@@ -139,8 +139,8 @@ its old self, it *is* the same page id, so it can be skipped unread. A one-row c
 
 ### Typed Effect Log (`src/tel`)
 
-Writes are logged as typed operations — `Assign`, `Add`, `Max`, `Min`, `SetInsert`, `SetRemove` —
-alongside the **guards** that made them legal. Guards are the part that cannot be reconstructed
+Writes are logged as typed operations — `RowCreate`, `RowDelete`, `Assign`, `Add`, `Max`, `Min`,
+`SetInsert`, `SetRemove` — alongside the **guards** that made them legal. Guards are the part that cannot be reconstructed
 from a byte WAL: a numeric delta can be, `WHERE qty >= 5` cannot.
 
 Merge is three-way against the fork point and reports four outcomes, the fourth being the point:
