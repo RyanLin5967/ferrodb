@@ -53,7 +53,8 @@ use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, Plan};
 use crate::provenance::readset::{AccessShape, PredicateSummary, VersionRef};
 use crate::provenance::revert::{DependencyGraphBuilder, RevertMode, RevertPlan};
-use crate::provenance::{ProvId, RunEntity};
+use crate::provenance::store::MemProvenanceStore;
+use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::tel::frame::TxnFrame;
 use crate::tel::guard::{ArithOp, CmpOp, Guard, GuardExpr};
@@ -195,6 +196,12 @@ pub trait BranchResolver {
 
 pub struct AgentRuntime {
     branches: Arc<dyn BranchCatalog>,
+    /// Interned runs, and which run wrote each version the executor writes.
+    ///
+    /// This is the id authority for attribution. Attribution is run-level, so two sessions for
+    /// the same `(agent_id, run_id)` must share one `ProvId`; a local counter cannot honour that
+    /// and would split one run across two entities.
+    prov_store: Arc<dyn ProvenanceStore>,
     /// Rows on copy-on-write pages, when this runtime was built with a page store.
     ///
     /// `None` is the historical shape: rows live only in each `Workspace`'s map, which is enough
@@ -235,7 +242,13 @@ impl AgentRuntime {
 
     /// Build over any `BranchCatalog` and any `EffectLog`.
     pub fn with_parts(branches: Arc<dyn BranchCatalog>, log: Arc<dyn EffectLog>) -> Self {
-        AgentRuntime { branches, log, storage: None, state: Mutex::new(State::default()) }
+        AgentRuntime {
+            branches,
+            log,
+            prov_store: Arc::new(MemProvenanceStore::new()),
+            storage: None,
+            state: Mutex::new(State::default()),
+        }
     }
 
     /// Build over a real page store, so branch rows live on copy-on-write pages.
@@ -255,9 +268,15 @@ impl AgentRuntime {
         Ok(AgentRuntime {
             branches,
             log,
+            prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(rows),
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// The provenance store: interned runs, and the author of each version the executor wrote.
+    pub fn provenance(&self) -> &Arc<dyn ProvenanceStore> {
+        &self.prov_store
     }
 
     /// The page-backed row store, if this runtime has one.
@@ -388,12 +407,24 @@ impl AgentRuntime {
         let branch = record.branch_id;
         let mut state = self.state.lock().unwrap();
 
-        state.next_prov += 1;
-        let prov = ProvId(state.next_prov);
         state.next_txn += 1;
         let txn = TxnId(state.next_txn);
         let run = run_id.unwrap_or("<unnamed>").to_string();
         let (model_name, model_version) = model.unwrap_or(("unspecified", "unspecified"));
+        // Intern first so the store assigns the id, then rebuild the entity carrying it. The
+        // store returns the SAME id for a repeated (agent, run), which is what makes attribution
+        // run-level; it also refuses a re-intern whose actor tuple disagrees.
+        let started = LeaseDeadline::now_millis();
+        let prov = self.prov_store.intern(&RunEntity::new(
+            ProvId::NONE,
+            agent_id,
+            run.clone(),
+            model_name,
+            model_version,
+            [0u8; 32],
+            started,
+            parent,
+        ))?;
         let entity = RunEntity::new(
             prov,
             agent_id,
@@ -401,7 +432,7 @@ impl AgentRuntime {
             model_name,
             model_version,
             [0u8; 32],
-            LeaseDeadline::now_millis(),
+            started,
             parent,
         );
         state.runs.insert(prov.0, entity);
@@ -1156,7 +1187,8 @@ impl AgentRuntime {
         // avoid: the report says the merge landed or it says it did not.
         let publish_txn = ctx.txn.begin()?;
         for w in pending_writes {
-            if let Err(e) = w.apply_in(ctx, publish_txn) {
+            let author = Some((Arc::clone(self.provenance()), snapshot.prov));
+            if let Err(e) = w.apply_in(ctx, publish_txn, author) {
                 ctx.txn.abort(publish_txn)?;
                 return Err(e);
             }
@@ -1337,6 +1369,12 @@ impl AgentRuntime {
         Ok(plan)
     }
 
+    /// Undo one task's published writes.
+    ///
+    /// The versions this produces are deliberately **unattributed**. A revert is not a write by
+    /// the agent whose work is being undone, and stamping it with that agent's `ProvId` would
+    /// make the provenance query answer "this agent wrote this row" about a row the agent never
+    /// wrote — the exact question criterion 9 exists to answer correctly.
     fn undo_txn(&self, ctx: &mut ExecCtx, txn: TxnId) -> Result<(), FerroError> {
         let ops: Vec<AppliedOp> = {
             let state = self.state.lock().unwrap();
@@ -1354,13 +1392,13 @@ impl AgentRuntime {
             match (&a.kind, a.col) {
                 (OpKind::RowCreate(row), _) => {
                     PendingWrite::Delete { table: a.table.clone(), key: row[0].clone() }
-                        .apply(ctx)?;
+                        .apply(ctx, None)?;
                 }
                 (OpKind::RowDelete, _) => {
                     let row = a.before_row.clone().ok_or_else(|| {
                         FerroError::Merge("cannot revert a delete with no before-image".into())
                     })?;
-                    PendingWrite::Insert { table: a.table.clone(), row }.apply(ctx)?;
+                    PendingWrite::Insert { table: a.table.clone(), row }.apply(ctx, None)?;
                 }
                 (kind, Some(col)) => {
                     let inverse = invert(kind, a.before.as_ref())?;
@@ -1385,7 +1423,7 @@ impl AgentRuntime {
                         row: new_row,
                         before: cur,
                     }
-                    .apply(ctx)?;
+                    .apply(ctx, None)?;
                 }
                 (kind, None) => {
                     return Err(FerroError::Merge(format!(
@@ -1422,6 +1460,9 @@ struct WorkspaceSnapshot {
     guards: Vec<Guard>,
 }
 
+/// Who to attribute the versions a write produces to. `None` leaves them `ProvId::NONE`.
+type Author = Option<(Arc<dyn ProvenanceStore>, ProvId)>;
+
 /// A write the merge will publish to the shared tables, expressed as ordinary SQL so it goes
 /// through the same executor, WAL and indexes as any other write.
 enum PendingWrite {
@@ -1432,22 +1473,22 @@ enum PendingWrite {
 
 impl PendingWrite {
     /// Publish inside an already-open transaction.
-    fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64) -> Result<usize, FerroError> {
+    fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64, author: Author) -> Result<usize, FerroError> {
         let stmt = self.into_stmt(ctx)?;
         let stmt = match stmt {
             Some(s) => s,
             None => return Ok(0),
         };
-        apply_dml_in(stmt, ctx, txn_id)
+        apply_dml_in(stmt, ctx, txn_id, author)
     }
 
     /// Publish in a transaction of its own.
-    fn apply(self, ctx: &mut ExecCtx) -> Result<usize, FerroError> {
+    fn apply(self, ctx: &mut ExecCtx, author: Author) -> Result<usize, FerroError> {
         let stmt = match self.into_stmt(ctx)? {
             Some(s) => s,
             None => return Ok(0),
         };
-        apply_dml(stmt, ctx)
+        apply_dml(stmt, ctx, author)
     }
 
     /// `None` when the write turned out to be a no-op.
@@ -1502,9 +1543,9 @@ impl PendingWrite {
 }
 
 /// Run a DML statement against the shared tables in its own transaction.
-fn apply_dml(stmt: Stmt, ctx: &mut ExecCtx) -> Result<usize, FerroError> {
+fn apply_dml(stmt: Stmt, ctx: &mut ExecCtx, author: Author) -> Result<usize, FerroError> {
     let txn_id = ctx.txn.begin()?;
-    match apply_dml_in(stmt, ctx, txn_id) {
+    match apply_dml_in(stmt, ctx, txn_id, author) {
         Ok(n) => {
             ctx.txn.commit(txn_id)?;
             Ok(n)
@@ -1517,11 +1558,21 @@ fn apply_dml(stmt: Stmt, ctx: &mut ExecCtx) -> Result<usize, FerroError> {
 }
 
 /// Run a DML statement inside an already-open transaction. The caller owns commit and abort.
-fn apply_dml_in(stmt: Stmt, ctx: &mut ExecCtx, txn_id: u64) -> Result<usize, FerroError> {
+fn apply_dml_in(
+    stmt: Stmt,
+    ctx: &mut ExecCtx,
+    txn_id: u64,
+    author: Author,
+) -> Result<usize, FerroError> {
     let snapshot = ctx.txn.snapshot_of(txn_id)?;
     let view = Arc::new(ReadView { snapshot, txn_id });
     match plan(stmt, ctx.catalog, ctx.bp.clone(), Some((ctx.txn.clone(), txn_id)), view)? {
-        Plan::Write(mut op) => op.execute(ctx.catalog),
+        Plan::Write(mut op) => {
+            if let Some((prov, id)) = author {
+                op.set_author(prov, id);
+            }
+            op.execute(ctx.catalog)
+        }
         Plan::Read(_) => Err(FerroError::Bind("expected a write plan".into())),
     }
 }

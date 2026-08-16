@@ -30,7 +30,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
                 None => None
             };
             let scan = build_scan(entry, bound_where, bp, view.clone())?;
-            let delete = Delete {table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
+            let delete = Delete {author: None, table, child: scan, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
             return Ok(Plan::Write(Box::new(delete)))
         }
         Stmt::Insert { table, values } => {
@@ -43,7 +43,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             for v in values {
                 bound_vals.push(binder.bind_expr(v, &empty)?);
             }
-            let insert = Insert {table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
+            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {
@@ -64,7 +64,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let child = build_scan(entry, bound_where, bp.clone(), view.clone())?;
             let mut tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
             tt_heap.set_transaction(txn, txn_id);
-            let update = Update {table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, view: view.clone(), tt_heap};
+            let update = Update {author: None, table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, view: view.clone(), tt_heap};
             return Ok(Plan::Write(Box::new(update)))
         }
         _ => return Err(FerroError::OnlyDML)

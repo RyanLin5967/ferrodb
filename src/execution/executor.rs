@@ -5,6 +5,7 @@ use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, 
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
 use crate::execution::index_handle::IndexHandle;
@@ -23,6 +24,14 @@ pub trait Executor {
 
 pub trait Modify {
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>;
+
+    /// Attribute every version this statement writes to `id`.
+    ///
+    /// Default is a no-op, which leaves versions unattributed — `ProvId::NONE`, the honest answer
+    /// for a write made outside any agent session. Only statements run inside an agent session
+    /// get an author, and it is attached here rather than threaded through `plan()` so the
+    /// planner keeps knowing nothing about sessions.
+    fn set_author(&mut self, _prov: Arc<dyn ProvenanceStore>, _id: ProvId) {}
 }
 
 pub enum Outcome {
@@ -135,6 +144,12 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     }
                 };
                 match planned {
+                    // No author is attached here, and that is not an omission. DML inside an
+                    // agent session returns above at `run_in_session`, so a write reaching this
+                    // arm is by definition outside every session and has no agent to name — the
+                    // version stays `ProvId::NONE`. Rows an agent wrote are stamped where they
+                    // actually reach shared storage: the merge publish path in
+                    // `agent_sql::runtime`, which carries the run down to `Modify::set_author`.
                     Plan::Write(mut op) => match op.execute(catalog) {
                         Ok(count) => {
                             if implicit { txn.commit(txn_id)? };
