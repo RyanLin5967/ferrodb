@@ -147,13 +147,33 @@ impl FeedStreamer {
 
         let emitted = write_feed(&decoded.events, w)?;
 
-        // **The cursor rule.** Only past a commit that was actually emitted.
-        let next = decoded
+        // **The cursor rule**, and it has two halves. The second was missing and cost real data.
+        //
+        // First: only past a commit that was actually emitted. An empty pump does not move.
+        //
+        // Second: NEVER past the earliest record of a transaction still open. Without this, a
+        // transaction that is in flight while a LATER-started one commits in the same batch gets
+        // stepped over - the cursor jumps to the later commit, and when the open one finally
+        // commits the decoder sees a `Commit` with nothing staged and emits nothing. The rows are
+        // gone, silently, and the feed reports success. Reproduced before fixing:
+        //
+        //   T1 commit, T2 open, T3 commit   ->  pump1 emitted=2 cursor=415 withheld=1
+        //   T2 commits                      ->  pump2 emitted=0
+        //   feed holds T1 and T3; T2's row never arrives.
+        //
+        // Clamping rewinds over T3's already-emitted events, so they are delivered twice. That is
+        // the right trade and it is the contract: this feed is AT-LEAST-ONCE, consumers dedupe on
+        // `commit_lsn`, and duplication is recoverable where loss is not.
+        let emitted_max = decoded
             .events
             .iter()
             .map(|e| e.commit_end_lsn)
             .max()
             .unwrap_or(cursor);
+        let next = match decoded.open_from {
+            Some(open_from) => emitted_max.min(open_from),
+            None => emitted_max,
+        };
 
         Ok(Pumped {
             emitted,
@@ -284,6 +304,67 @@ mod tests {
             &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
         )
         .unwrap();
+    }
+
+    /// **A transaction still open while a LATER one commits must not be stepped over.**
+    ///
+    /// This is silent data loss, and it was shipped: the cursor advanced to the later commit, and
+    /// when the open transaction finally committed the decoder saw a `Commit` with nothing staged
+    /// and emitted nothing. The rows never reached the feed and the feed reported success.
+    ///
+    /// The arrangement matters - T2 must open BEFORE T3 and commit AFTER it, all inside one batch.
+    /// An earlier version of the cursor test only covered "nothing emitted", which this passes.
+    #[test]
+    fn an_open_transaction_is_not_stepped_over_when_a_later_one_commits() {
+        let (_d, w) = wal("interleave");
+        let s = streamer();
+        let mut cursor = FeedStreamer::start_cursor(&w);
+
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+
+        // Opens second, commits last.
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert(&w, 2, 2, 20);
+
+        // Opens third, commits before T2.
+        w.append(3, 0, &RecKind::Begin).unwrap();
+        insert(&w, 3, 3, 30);
+        w.append(3, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let mut feed = Vec::new();
+        let p1 = s.pump(&w, cursor, &mut feed).unwrap();
+        assert!(p1.emitted >= 2, "T1 and T3 should both have been emitted: {p1:?}");
+        assert_eq!(p1.withheld, 1, "T2 should be reported as withheld: {p1:?}");
+        assert!(
+            p1.cursor < p1.frontier,
+            "the cursor reached the frontier while a transaction was still open at {:?}; it has \
+             stepped over T2's records and they can never be emitted",
+            decoded_open_hint()
+        );
+        cursor = p1.cursor;
+
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+        let p2 = s.pump(&w, cursor, &mut feed).unwrap();
+        assert!(p2.emitted >= 1, "T2's rows never arrived after it committed: {p2:?}");
+
+        let text = String::from_utf8(feed).unwrap();
+        assert!(
+            text.contains("\"qty\":20"),
+            "T2's row was lost. Feed:\n{text}"
+        );
+        // Every row present at least once. Duplicates are allowed and expected - clamping the
+        // cursor rewinds over T3, and this feed is at-least-once by contract.
+        for q in ["\"qty\":10", "\"qty\":20", "\"qty\":30"] {
+            assert!(text.contains(q), "{q} missing from the feed:\n{text}");
+        }
+    }
+
+    fn decoded_open_hint() -> &'static str {
+        "the decoder reported an open transaction"
     }
 
     /// **A live subscription survives a checkpoint that would otherwise truncate under it.**

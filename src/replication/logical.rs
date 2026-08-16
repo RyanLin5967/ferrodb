@@ -190,6 +190,13 @@ pub struct Decoded {
     /// Transactions still open when the scan ended. Their changes are **withheld, not lost** — a
     /// later decode covering their commit will emit them.
     pub open: BTreeSet<u64>,
+    /// The earliest record belonging to any still-open transaction.
+    ///
+    /// A caller advancing a cursor MUST NOT go past this, or those records are stepped over and the
+    /// transaction's changes are lost when it finally commits — the decoder would see a `Commit`
+    /// with nothing staged and emit nothing at all. `open` alone cannot express that, because it
+    /// names the transactions without saying where they began.
+    pub open_from: Option<u64>,
 }
 
 impl Decoded {
@@ -486,6 +493,12 @@ impl LogicalDecoder {
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
         // and said so.
         out.open = staged.keys().copied().collect();
+        // The earliest STAGED record, not the `Begin`: `Begin` stages nothing, so resuming at the
+        // first row record loses no information and rewinds less.
+        out.open_from = staged
+            .values()
+            .flat_map(|changes| changes.iter().map(|(lsn, _, _, _)| *lsn))
+            .min();
         Ok(out)
     }
 }
