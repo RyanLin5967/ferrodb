@@ -242,17 +242,42 @@ func exactFloat(v float64) string {
 	if r.IsInt() {
 		return r.Num().String()
 	}
-	// Enough fractional digits to distinguish any two doubles; trailing zeros are trimmed below.
-	s := strings.TrimRight(r.FloatString(40), "0")
+	// A finite non-integer double is m/2^k in lowest terms with m odd, so m/2^k = m*5^k/10^k: its
+	// exact decimal expansion TERMINATES after exactly k fractional digits. Asking `FloatString`
+	// for exactly k is therefore lossless.
+	//
+	// A fixed 40 was not. `FloatString` ROUNDS to the requested places, so every double smaller
+	// than 1e-40 came out as "0" — including every subnormal, and including pairs that are
+	// provably different numbers. Printing two distinct corrupted values identically, as zero, is
+	// the same understatement this function's doc exists to forbid.
+	prec := r.Denom().BitLen() - 1
+	s := strings.TrimRight(r.FloatString(prec), "0")
 	return strings.TrimSuffix(s, ".")
 }
 
-// sameNumber reports whether the digits on the wire denote exactly the value the double holds.
+// sameNumber reports whether a consumer decoding this JSON number as a float64 ends up holding the
+// number that was actually sent.
 //
-// The comparison is numeric rather than textual, via exact rationals: `1.50` on the wire and the
-// double 1.5 are the same number, and calling that a precision loss would be false. What it does
-// catch is the real thing — wire digits that no double can represent, so the value a consumer ends
-// up holding is a different number from the one that was sent.
+// Two ways that can be true, and BOTH are needed:
+//
+//  1. The wire digits denote exactly the value the double holds. `1.50` on the wire and the double
+//     1.5 are one number, and so is `-9223372036854775808`, which is exactly -2^63. Calling either
+//     a precision loss would be false.
+//
+//  2. The wire digits are the double's own SHORTEST ROUND-TRIP form. Rust prints an `f64` with
+//     `{}`, which emits the fewest digits that parse back to the identical double — so `0.1` is
+//     not the wire being sloppy about one tenth, it is the exact NAME of the double that was sent,
+//     and the consumer recovers it bit for bit. Nothing was lost end to end.
+//
+// Testing only (1) is what this function used to do, and it made a FLOAT column unreportable: no
+// finite decimal fraction except a dyadic one equals its double exactly, so `"f":0.1` — an
+// ordinary, perfectly faithful value — was reported LOSSY. A detector that fires on the common
+// case teaches its reader to ignore it, which is worse than not shipping one.
+//
+// What survives both tests is the real thing: wire digits that no double can represent AND that
+// are not any double's canonical name, so the value a consumer holds is a different number from
+// the one that was sent. `9223372036854775807` is that: it is not -2^63, and the double it lands
+// on is named `9.223372036854776e+18`, a third number again.
 func sameNumber(wire string, held float64) bool {
 	w, ok := new(big.Rat).SetString(wire)
 	if !ok {
@@ -262,7 +287,11 @@ func sameNumber(wire string, held float64) bool {
 	if h == nil {
 		return false
 	}
-	return w.Cmp(h) == 0
+	if w.Cmp(h) == 0 {
+		return true
+	}
+	canon, ok := new(big.Rat).SetString(strconv.FormatFloat(held, 'g', -1, 64))
+	return ok && canon.Cmp(w) == 0
 }
 
 // precision reports, for every row column in the feed, the JSON type it arrived as and what a

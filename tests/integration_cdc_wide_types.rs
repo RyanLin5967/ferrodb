@@ -41,6 +41,21 @@ const BIG_PAST_2_53: &str = "9007199254740993"; // 2^53 + 1, the first integer a
 const DEC_MANY_DIGITS: &str = "123456789012345678901234567890.12345678901234567890";
 const TS_MILLIS: &str = "1700000000123";
 
+/// Ordinary `FLOAT` values, and the reason the seeded table carries a FLOAT column at all.
+///
+/// `lossy=0` from the Go precision checker was a vacuous pass while every JSON *number* in the feed
+/// was a small `INTEGER`: the one type whose digits a float64 always holds exactly. The checker's
+/// number path was never reached, so the gate could not have failed however wrong that path was —
+/// and it WAS wrong, reporting every ordinary float as corrupted.
+///
+/// None of these three is a dyadic rational, so none equals its own double exactly. That is the
+/// point: they are precisely the values a naive exact-rational comparison flags as LOSSY, and
+/// precisely the values that in fact survive the round trip perfectly, because Rust prints an f64
+/// in shortest-round-trip form.
+const F_TENTH: &str = "0.1";
+const F_NEG: &str = "-0.3";
+const F_ROUND: &str = "2.675";
+
 struct Db {
     dir: tempfile::TempDir,
     catalog: Catalog,
@@ -126,13 +141,17 @@ impl Db {
 fn seeded(tag: &str) -> Db {
     let mut d = db(tag);
     d.sql(
-        "CREATE TABLE wide (id INTEGER NOT NULL, big BIGINT, dec DECIMAL, ts TIMESTAMP, note VARCHAR(16));",
+        "CREATE TABLE wide (id INTEGER NOT NULL, big BIGINT, dec DECIMAL, ts TIMESTAMP, note VARCHAR(16), f FLOAT);",
     );
     d.sql(&format!(
-        "INSERT INTO wide VALUES (1, {BIG_MAX}, {DEC_MANY_DIGITS}, {TS_MILLIS}, 'max');"
+        "INSERT INTO wide VALUES (1, {BIG_MAX}, {DEC_MANY_DIGITS}, {TS_MILLIS}, 'max', {F_TENTH});"
     ));
-    d.sql(&format!("INSERT INTO wide VALUES (2, {BIG_MIN}, -0.00000000000000000001, -1, 'min');"));
-    d.sql(&format!("INSERT INTO wide VALUES (3, {BIG_PAST_2_53}, 1.50, 0, 'edge');"));
+    d.sql(&format!(
+        "INSERT INTO wide VALUES (2, {BIG_MIN}, -0.00000000000000000001, -1, 'min', {F_NEG});"
+    ));
+    d.sql(&format!(
+        "INSERT INTO wide VALUES (3, {BIG_PAST_2_53}, 1.50, 0, 'edge', {F_ROUND});"
+    ));
     d
 }
 
@@ -334,6 +353,7 @@ fn the_declared_types_and_their_rows_survive_a_catalog_reload() {
             ("dec", &DataType::Decimal),
             ("ts", &DataType::Timestamp),
             ("note", &DataType::Varchar(16)),
+            ("f", &DataType::Float),
         ],
         "the reloaded schema is not the declared one"
     );
@@ -474,6 +494,37 @@ fn an_independent_go_consumer_receives_the_wide_columns_as_exact_strings() {
         "INTEGER should still arrive as a JSON number:\n{report}"
     );
 
+    // **The FLOAT column is what makes `lossy=0` below mean anything.**
+    //
+    // While every JSON number in this feed was a small INTEGER, the checker's number path handled
+    // only values a float64 holds exactly, so `lossy=0` was true no matter how that path behaved.
+    // A FLOAT is the case it is actually there to judge: it ships as a bare number by design,
+    // because f64 is exactly what a float64 decode produces.
+    //
+    // One line per seeded row, and NOT ONE of them flagged. `precision` prints the exact value the
+    // double holds rather than the wire text — `0.1` is reported as
+    // 0.1000000000000000055511151231257827021181583404541015625, which is genuinely what a float64
+    // contains — so the assertion is on the absence of the LOSSY marker, not on the digits.
+    let float_lines: Vec<&str> =
+        report.lines().filter(|l| l.contains(" f number ")).collect();
+    assert_eq!(
+        float_lines.len(),
+        3,
+        "expected the three seeded FLOAT cells to be inspected as numbers:\n{report}"
+    );
+    for line in &float_lines {
+        assert!(
+            !line.contains("LOSSY"),
+            "an ordinary FLOAT was reported as a precision loss, which is a false alarm — the \
+             digits on the wire are exactly the double's shortest round-trip form: {line}"
+        );
+    }
+    // And it must be a *number*, not quoted: FLOAT deliberately does not take the string encoding.
+    assert!(
+        !report.lines().any(|l| l.contains(&format!(" f string {F_TENTH}"))),
+        "FLOAT should ship as a bare JSON number, not a string:\n{report}"
+    );
+
     let summary = report
         .lines()
         .find(|l| l.starts_with("SUMMARY "))
@@ -484,6 +535,7 @@ fn an_independent_go_consumer_receives_the_wide_columns_as_exact_strings() {
     );
     // A run that inspected nothing is not a pass.
     assert!(!summary.contains("strings=0"), "no string columns were inspected: {summary}");
+    assert!(!summary.contains("numbers=0"), "no number columns were inspected: {summary}");
 }
 
 /// **The detector is forced to fire.** `lossy=0` above is only evidence if `precision` is capable
