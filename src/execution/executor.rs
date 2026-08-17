@@ -733,6 +733,74 @@ use crate::wal::log::WalManager;
         assert!(exec("INSERT INTO users VALUES (1, 'dup');", &mut c, bp.clone(), txn).is_err());
     }
 
+    /// **A deleted primary key can be used again.**
+    ///
+    /// It could not, and the error said "use UPDATE to change the existing row" while `SELECT`
+    /// showed no such row. An index entry outlives the row it points at - DELETE stamps `end_ts` on
+    /// the version in place and leaves the entry alone - so the uniqueness check was asking the
+    /// index a question only the heap can answer.
+    ///
+    /// Reachable in three statements, which is how a reader would have found it.
+    #[test]
+    fn a_deleted_primary_key_can_be_inserted_again() {
+        let (mut c, bp, _d, txn) = seed();
+
+        // The seed already holds id 1, so removing it must free the key.
+        exec("DELETE FROM users WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO users VALUES (1, 'reused');", &mut c, bp.clone(), txn.clone())
+            .expect("a deleted primary key was still reported as taken");
+
+        // Exactly one row with that key, and it is the new one - not two entries in a unique index.
+        let r = exec("SELECT * FROM users WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap();
+        let rows = rows(r);
+        assert_eq!(rows.len(), 1, "expected one row for the reused key, got {rows:?}");
+        assert!(
+            format!("{rows:?}").contains("reused"),
+            "the reused key returned the old row rather than the new one: {rows:?}"
+        );
+    }
+
+    /// **The stale entry has to be removed, not shadowed.**
+    ///
+    /// `insert_entry` appends at the binary-search position; it does not overwrite. So reusing a key
+    /// without removing the dead entry first leaves two entries for one key in a unique index, and
+    /// `search` returns whichever one binary search lands on - here, the dead one. The next insert of
+    /// that key then reads `end_ts != 0`, concludes the row is gone, and accepts a genuine duplicate.
+    ///
+    /// Measured through the shipped binary with the removal commented out: `INSERT (1,10); DELETE
+    /// id=1; INSERT (1,99); INSERT (1,777)` left `1 | 99` and `1 | 777` both live under a unique
+    /// primary key. That is why this test exists and why the fix deletes rather than shadows - a
+    /// point the other two tests in this group do not reach, since one reuse is all they perform.
+    #[test]
+    fn reusing_a_key_does_not_let_the_next_duplicate_through() {
+        let (mut c, bp, _d, txn) = seed();
+
+        exec("DELETE FROM users WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO users VALUES (1, 'reused');", &mut c, bp.clone(), txn.clone()).unwrap();
+
+        // Key 1 is live again, so this must be refused exactly as any other duplicate is.
+        assert!(
+            exec("INSERT INTO users VALUES (1, 'third');", &mut c, bp.clone(), txn.clone()).is_err(),
+            "a duplicate was accepted after the key had been reused; the index is holding a dead \
+             entry alongside the live one"
+        );
+
+        let r = exec("SELECT * FROM users WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap();
+        let got = rows(r);
+        assert_eq!(got.len(), 1, "a unique primary key ended up with several live rows: {got:?}");
+    }
+
+    /// Anti-vacuity for the above: a key whose row is still there is still refused. Without this, an
+    /// insert that never checked uniqueness at all would satisfy the test above.
+    #[test]
+    fn a_live_primary_key_is_still_refused() {
+        let (mut c, bp, _d, txn) = seed();
+        assert!(
+            exec("INSERT INTO users VALUES (1, 'dup');", &mut c, bp.clone(), txn).is_err(),
+            "a duplicate of a LIVE primary key was accepted"
+        );
+    }
+
     #[test]
     fn not_null_violation_errors() {
         let (mut c, bp, _d, txn) = seed();
@@ -936,6 +1004,43 @@ use crate::wal::log::WalManager;
         assert_eq!(h.begin_ts, expected);
         assert_eq!(h.end_ts, 0);
         assert_eq!(h.prev(), None);
+    }
+
+    /// **The third arm: a delete that has not committed does not free the key.**
+    ///
+    /// `deleted_for_me` is `end_ts != 0 && view.is_commited_for_me(end_ts)`, and the two tests above
+    /// only ever reach the first conjunct - they delete and reuse in one autocommit view, where the
+    /// deletion is always the reader's own. Dropping the visibility half entirely would leave both of
+    /// them passing while any `end_ts` at all freed the key, including one stamped by a transaction
+    /// that goes on to roll back.
+    ///
+    /// The safe direction is the strict one: a reader who cannot see the deletion must not be allowed
+    /// to take the key, because the deleting transaction may still abort and get its row back.
+    #[test]
+    fn an_uncommitted_delete_does_not_free_the_primary_key() {
+        let (mut catalog, bp, _dir, txn) = setup();
+        let mut s1 = Session::new();
+        let mut s2 = Session::new();
+        exec_s("CREATE TABLE t (id INTEGER NOT NULL);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("INSERT INTO t VALUES (1);", &mut catalog, &bp, &txn, &mut s1).unwrap();
+
+        // s1 deletes and holds the transaction open, so nobody else can see the deletion yet.
+        exec_s("BEGIN;", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("DELETE FROM t WHERE id = 1;", &mut catalog, &bp, &txn, &mut s1).unwrap();
+
+        // s2 must still be refused: for s2 the row is there.
+        let r = exec_s("INSERT INTO t VALUES (1);", &mut catalog, &bp, &txn, &mut s2);
+        assert!(
+            r.is_err(),
+            "an uncommitted delete freed the primary key for another session; if s1 rolls back, two \
+             live rows share it"
+        );
+
+        // Anti-vacuity: once it commits, the key is free. Without this the test above is satisfied by
+        // an insert that refuses every duplicate regardless of visibility - the old behaviour.
+        exec_s("COMMIT;", &mut catalog, &bp, &txn, &mut s1).unwrap();
+        exec_s("INSERT INTO t VALUES (1);", &mut catalog, &bp, &txn, &mut s2)
+            .expect("the key was still held after the delete committed");
     }
 
     #[test]
