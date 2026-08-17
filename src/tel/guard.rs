@@ -421,7 +421,6 @@ mod tests {
         assert!(g.check(&empty).is_err());
     }
 
-    #[test]
     /// **A composite guard with an unknown operand is unknown, not satisfied.**
     ///
     /// Found by a mutation sweep. `null_operand_makes_the_guard_unknown_not_true` covers a SIMPLE
@@ -487,6 +486,17 @@ mod tests {
         assert!(!negated.check(&ctx).unwrap(), "an unknown precondition was treated as satisfied");
     }
 
+    /// The simple-comparison case, and **it stopped being a test for one commit**.
+    ///
+    /// E60 inserted the two composite tests above between this function's `#[test]` and its body, so
+    /// the attribute landed on the new test - `duplicate_macro_attributes`, which is a warning and not
+    /// an error - and this one silently became an ordinary private function that nothing called. The
+    /// test count still went UP that pass, which is exactly why nobody looked: a suite that gains two
+    /// tests and loses one reads as a suite that gained tests.
+    ///
+    /// Found 2026-08-17 by reading a `dead_code` warning about a `fn` whose name starts with a
+    /// behaviour claim. That warning is the only evidence there was.
+    #[test]
     fn null_operand_makes_the_guard_unknown_not_true() {
         let ctx = Fixed(vec![((TableId(1), RowId(1), ColId(2)), Value::Null)]);
         let g = qty_ge_5();

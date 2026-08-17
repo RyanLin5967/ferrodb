@@ -40,6 +40,31 @@ jobs:
       # comparison would go back to running nowhere but a developer's laptop - which is the state
       # this variable exists to end, and which no test failure would have revealed.
       FERRODB_REQUIRE_DUCKDB_CLI: "1"
+      # THE DISABLED-TEST GATE — two lints, promoted to errors.
+      #
+      # On 2026-08-17 a `#[test]` in src/tel/guard.rs was found attached to the wrong function. E60
+      # had inserted two new tests between an existing test's attribute and its body, so the
+      # attribute landed on a new test that already had one and the original became an ordinary
+      # private fn. It had not run since. `cargo test` said nothing, because rustc reports both
+      # halves as WARNINGS: `duplicate_macro_attributes` on the doubled attribute and `dead_code` on
+      # the orphaned function.
+      #
+      # The test COUNT cannot catch this and it is worth saying why, because counting is the obvious
+      # instrument and it is useless here: a doubled `#[test]` registers the same test twice, so the
+      # suite reported one extra run to replace the one it lost. Measured on the replanted defect -
+      # 840 attributes, 840 registered, and a test silently not running. E60's ledger row records
+      # 823 -> 825 for a pass that added two tests and disabled one; the number went UP.
+      #
+      # So the guard is the lint, not the count. These two are narrow and long-stable, deliberately
+      # NOT `-D warnings`: the toolchain here floats on `stable`, and a blanket deny turns any new
+      # lint in a future release into a red build on an unrelated pull request, which is how a guard
+      # gets switched off. Measured before turning it on: zero rustc warnings across all three
+      # runners on run 32006658708.
+      #
+      # The cost is real and accepted: a helper used under only one `#[cfg]` now fails the build on
+      # the other platforms rather than warning. That is a legible failure with a clear fix, and it
+      # is the same shape as the defect being prevented.
+      RUSTFLAGS: "-D duplicate_macro_attributes -D dead_code"
       # Pinned, not "latest": an unpinned CLI upgrade that changed a rendering would turn
       # `both_readers_agree` red on an unrelated pull request, and this is also the version the
       # rendering expectations in sink_duckdb_test.go were measured against.

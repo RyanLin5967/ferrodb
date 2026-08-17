@@ -801,6 +801,45 @@ use crate::wal::log::WalManager;
         );
     }
 
+    /// **E65 — refusing to move a primary key says so as a constraint, and says what to do.**
+    ///
+    /// It was `FerroError::Parse("can't update primary key")`: the wrong class for a statement that
+    /// parses perfectly and is refused on a data-model rule, and no alternative offered. Nothing in
+    /// the repo asserted either the class or the text, so this refusal - reachable from any UPDATE -
+    /// had never been tested at all.
+    #[test]
+    fn updating_a_primary_key_is_refused_as_a_constraint_and_names_the_remedy() {
+        let (mut c, bp, _d, txn) = seed();
+        let e = match exec("UPDATE users SET id = 9 WHERE id = 1;", &mut c, bp.clone(), txn.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("moving a primary key was accepted"),
+        };
+
+        assert!(
+            matches!(e, FerroError::Constraint(_)),
+            "a statement that parses and is refused on a data-model rule must not be reported as a \
+             parse error; anyone triaging by error kind files it with malformed SQL: {e:?}"
+        );
+        let msg = format!("{e}");
+        assert!(msg.contains("'id'") && msg.contains("'users'"), "it names neither column nor table: {msg}");
+        assert!(
+            msg.contains("DELETE") && msg.contains("INSERT"),
+            "the refusal offers no way forward, and since E63 there is one: {msg}"
+        );
+
+        // Anti-vacuity, in two halves. Updating a NON-key column still works, so the refusal is about
+        // the key and not about UPDATE; and the remedy the message names actually runs.
+        exec("UPDATE users SET name = 'moved' WHERE id = 1;", &mut c, bp.clone(), txn.clone())
+            .expect("updating a non-key column was refused too");
+        exec("DELETE FROM users WHERE id = 1;", &mut c, bp.clone(), txn.clone()).unwrap();
+        exec("INSERT INTO users VALUES (9, 'moved');", &mut c, bp.clone(), txn.clone())
+            .expect("the DELETE-then-INSERT remedy this error recommends does not work");
+        let ids = sorted_ids(&rows(
+            exec("SELECT * FROM users;", &mut c, bp.clone(), txn.clone()).unwrap(),
+        ));
+        assert_eq!(ids, vec![2, 3, 9], "the row did not end up under its new key: {ids:?}");
+    }
+
     #[test]
     fn not_null_violation_errors() {
         let (mut c, bp, _d, txn) = seed();
