@@ -290,6 +290,42 @@ mod tests {
     use crate::catalog::schema::Schema;
     use crate::catalog::column::{Column, DataType, Value};
     use crate::storage::tuple::Tuple;
+
+    /// **A row whose arity does not match its schema is refused.**
+    ///
+    /// Found by a mutation sweep, not by reading: deleting this check left all 820 tests green. It
+    /// sits on a live path — `insert.rs` and `update.rs` both call `serialize` and propagate the
+    /// error — and serialising a row with the wrong number of values writes a tuple that the
+    /// deserialiser will later read against a schema it does not match, which is corruption that
+    /// surfaces far from its cause.
+    ///
+    /// The binder rejects a wrong-arity `INSERT` before it gets here, so this is a defensive check
+    /// on an internal API rather than a live bug. That is exactly the kind that rots: it is only
+    /// load-bearing for a caller that does not exist yet, and nothing would have told that caller's
+    /// author it had stopped working.
+    #[test]
+    fn serialising_a_row_that_does_not_match_its_schema_is_refused() {
+        let schema = Schema::new(vec![
+            Column::new(String::from("id"), DataType::Integer, false),
+            Column::new(String::from("v"), DataType::Integer, true),
+        ]);
+        let short = vec![Value::Integer(1)];
+        let long = vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)];
+
+        assert!(
+            Tuple::serialize(&short, &schema, 0).is_err(),
+            "a row with too few values was serialised against a 2-column schema"
+        );
+        assert!(
+            Tuple::serialize(&long, &schema, 0).is_err(),
+            "a row with too many values was serialised against a 2-column schema"
+        );
+
+        // Anti-vacuity: the matching arity serialises, so the refusals are about the count and not
+        // about `serialize` rejecting everything.
+        let ok = vec![Value::Integer(1), Value::Integer(2)];
+        Tuple::serialize(&ok, &schema, 0).expect("a correctly shaped row was refused");
+    }
     
     #[test]
     pub fn test_se_and_deserialize() { 
