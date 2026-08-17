@@ -398,8 +398,10 @@ impl<'a> Binder<'a> {
                         | TokenType::Greater
                         | TokenType::GreaterEqual
                 );
-                let left_ty = if comparison { Self::column_type_of(&left, scope) } else { None };
-                let right_ty = if comparison { Self::column_type_of(&right, scope) } else { None };
+                let left_col = if comparison { Self::column_of(&left, scope) } else { None };
+                let right_col = if comparison { Self::column_of(&right, scope) } else { None };
+                let left_ty = left_col.as_ref().map(|(_, t)| t.clone());
+                let right_ty = right_col.as_ref().map(|(_, t)| t.clone());
                 let l = match right_ty.as_ref().and_then(|t| Self::literal_for_column(&left, t)) {
                     Some(res) => BoundExpr::Literal(res?),
                     None => self.bind_expr(*left, scope)?,
@@ -408,6 +410,47 @@ impl<'a> Binder<'a> {
                     Some(res) => BoundExpr::Literal(res?),
                     None => self.bind_expr(*right, scope)?,
                 };
+                // **E68 — comparing a column to a literal of an unrelated type is refused here.**
+                //
+                // `Value::cmp` is a TOTAL order across types, because `Value` is a B+tree key and an
+                // index needs one. Its cross-type arm is `type_rank(a).cmp(&type_rank(b))`, a fixed
+                // answer that never looks at the values, so `Integer(10) == Varchar("abc")` is simply
+                // false. Measured: `SELECT * FROM t WHERE v = 'abc'` on an INTEGER column returned
+                // `(0 rows)` while `INSERT INTO t VALUES ('abc', 1)` refused the identical mismatch -
+                // the type system enforced on write and ignored on read.
+                //
+                // Refused at BIND time rather than in `compare`, and that placement is the point. A
+                // point lookup that the optimizer routes through an index has no `Filter` node at all -
+                // `build_index_scan` removes the conjunct it turned into bounds - so `compare` is never
+                // called and a check living there would be silently skipped on exactly the plans most
+                // likely to be chosen. Here it covers SELECT, UPDATE and DELETE, index or heap, before
+                // a plan exists.
+                //
+                // The ordering itself is untouched: this refuses a QUERY, it does not change how two
+                // values sort.
+                if let (Some((name, ty)), BoundExpr::Literal(v)) = (&left_col, &r) {
+                    Self::check_comparable(name, ty, v)?;
+                }
+                if let (Some((name, ty)), BoundExpr::Literal(v)) = (&right_col, &l) {
+                    Self::check_comparable(name, ty, v)?;
+                }
+                // **Column against column, which the literal-only check above missed.**
+                //
+                // Found by re-auditing this fix rather than by a test: `WHERE s = id` on a VARCHAR and
+                // an INTEGER column answered `(0 rows)`, which is the same silent wrong answer the
+                // literal case was, one substitution away and not covered. `id = f` is NOT this - an
+                // INTEGER against a FLOAT is one category and comparing them is exact and meaningful.
+                if let (Some((ln, lt)), Some((rn, rt))) = (&left_col, &right_col) {
+                    if Self::category(lt) != Self::category(rt) {
+                        return Err(FerroError::Bind(format!(
+                            "cannot compare {ln} to {rn}: {ln} holds a {} and {rn} holds a {}. No row \
+                             can satisfy this, so it is refused rather than answered with an empty \
+                             result.",
+                            Self::category(lt),
+                            Self::category(rt)
+                        )));
+                    }
+                }
                 return Ok(BoundExpr::BinaryOp { left: Box::new(l), operator, right: Box::new(r) })
             }
             Expr::UnaryOp { operator, right } => {
@@ -498,14 +541,64 @@ impl<'a> Binder<'a> {
     /// An unresolvable name is `None` rather than an error: this is only ever used to *decide how
     /// to read a literal on the other side*, and the real resolution error is raised by
     /// `bind_expr` a moment later with its own message.
-    fn column_type_of(expr: &Expr, scope: &Scope) -> Option<DataType> {
+    /// The column a comparison side refers to, as `(table.column, declared type)`.
+    ///
+    /// Same lookup as [`Binder::column_type_of`], keeping the name so E68's refusal can say which
+    /// column it is talking about rather than only which type.
+    fn column_of(expr: &Expr, scope: &Scope) -> Option<(String, DataType)> {
         match Self::unwrap_grouping(expr) {
-            Expr::ColumnRef { table, column } => scope
-                .resolve(table.as_deref(), column)
-                .ok()
-                .map(|i| scope.columns[i].data_type.clone()),
+            Expr::ColumnRef { table, column } => scope.resolve(table.as_deref(), column).ok().map(|i| {
+                let c = &scope.columns[i];
+                (format!("{}.{}", c.qualifier, c.name), c.data_type.clone())
+            }),
             _ => None,
         }
+    }
+
+    /// Refuse a comparison between a column and a literal whose types have no meaningful order.
+    ///
+    /// The categories are the ones `Value::cmp` actually defines arms for. Every numeric type compares
+    /// with every other numeric type - `cmp_i64_f64` and `decimal_cmp` exist precisely so `BIGINT`
+    /// against `FLOAT` is exact - so the whole numeric band is one category. Everything else compares
+    /// only with itself, and `NULL` compares with anything (three-valued logic handles it in
+    /// `compare`, which returns `Value::Null` rather than a boolean).
+    ///
+    /// A category mismatch is not a query with no matches; it is a query that cannot have matches, and
+    /// saying so is the difference between a bug the operator finds and one they do not.
+    /// The comparison category of a declared type: what it can meaningfully be ordered against.
+    ///
+    /// The whole numeric band is ONE category, because `Value::cmp` defines an arm for every pair in it
+    /// and `cmp_i64_f64`/`decimal_cmp` exist so those comparisons are exact rather than approximate.
+    /// Everything else compares only with itself.
+    fn category(ty: &DataType) -> &'static str {
+        match ty {
+            DataType::Integer | DataType::BigInt | DataType::Float | DataType::Decimal => "number",
+            DataType::Varchar(_) => "text",
+            DataType::Boolean => "boolean",
+            DataType::Timestamp => "timestamp",
+        }
+    }
+
+    fn check_comparable(name: &str, ty: &DataType, v: &Value) -> Result<(), FerroError> {
+        fn given(v: &Value) -> Option<&'static str> {
+            Some(match v {
+                Value::Null => return None,
+                Value::Integer(_) | Value::BigInt(_) | Value::Float(_) | Value::Decimal(_) => "number",
+                Value::Varchar(_) => "text",
+                Value::Boolean(_) => "boolean",
+                Value::Timestamp(_) => "timestamp",
+            })
+        }
+        let Some(got) = given(v) else { return Ok(()) };
+        let want = Self::category(ty);
+        if got == want {
+            return Ok(());
+        }
+        Err(FerroError::Bind(format!(
+            "cannot compare {name} to {v:?}: {name} holds a {want} and that literal is {got}. This \
+             comparison can never match any row, so it is refused rather than answered with an empty \
+             result. Compare it to a {want} instead."
+        )))
     }
 
     /// Look through redundant parentheses, so `WHERE ts = (1700000000123)` binds like the
