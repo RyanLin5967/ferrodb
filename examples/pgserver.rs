@@ -60,9 +60,15 @@ fn main() {
 
     let listener = std::net::TcpListener::bind(&addr).expect("bind");
     // Readiness, not a guess: the test reads this line rather than sleeping.
-    println!("LISTENING {}", listener.local_addr().unwrap());
+    // Writes that tolerate a closed pipe. `println!` PANICS on EPIPE, and a harness that reads the
+    // readiness line and then drops its reader closes this pipe underneath us. Proven on
+    // `cdc_server`: closing stdout before the first write kills it with `failed printing to stdout:
+    // Broken pipe (os error 32)` and exit 101, which is the status an intermittent CI failure
+    // reported. A server has no business dying because nobody is reading its log.
     use std::io::Write;
-    std::io::stdout().flush().unwrap();
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "LISTENING {}", listener.local_addr().unwrap());
+    let _ = out.flush();
 
     // Built AFTER the catalog, for the reason `src/cli/cli.rs` spells out: the arena floor has to
     // sit above what the catalog has already allocated, or the ordinary allocator and the arena hand
