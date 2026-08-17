@@ -104,3 +104,59 @@ func TestDuckSinkRefusesWithoutAKeyColumn(t *testing.T) {
 	}
 	_ = s.Close()
 }
+
+// The two malformed-source-dump guards, which the pipeline cannot produce and so cannot force.
+//
+// `table_dump` always emits one object per live row with the primary key present, so a Rust
+// integration test driving the real pipeline can never reach either of these. They matter because the
+// source dump is the diff's expected side: if it silently accepted a dump with two rows for one key,
+// whichever row happened to land last in the map would become "the source" and half the comparison
+// would be against a value nobody wrote.
+func TestDiffRefusesAMalformedSourceDump(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.jsonl")
+	if err := os.WriteFile(feed, []byte(goodLine), 0o644); err != nil {
+		t.Fatalf("write feed: %v", err)
+	}
+
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+
+	// Two rows claiming the same key: not a table state.
+	dup := write("dup.json", `[{"id":1,"v":10},{"id":1,"v":11}]`)
+	err := diffAgainstSource(feed, dup, "id")
+	if err == nil {
+		t.Fatal("a source dump with two rows for one key was accepted")
+	}
+	if !strings.Contains(err.Error(), "two rows with key") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+
+	// A row with no key column at all: there is nothing to compare it by.
+	nokey := write("nokey.json", `[{"v":10}]`)
+	err = diffAgainstSource(feed, nokey, "id")
+	if err == nil {
+		t.Fatal("a source row with no key column was accepted")
+	}
+	if !strings.Contains(err.Error(), "no key column") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+
+	// Not an array at all.
+	notarray := write("notarray.json", `{"id":1}`)
+	if err := diffAgainstSource(feed, notarray, "id"); err == nil {
+		t.Fatal("a source dump that is not an array of rows was accepted")
+	}
+
+	// Anti-vacuity: the well-formed dump matching that feed passes, so the three refusals above are
+	// about the dumps and not about `diff` rejecting everything.
+	good := write("good.json", `[{"id":1}]`)
+	if err := diffAgainstSource(feed, good, "id"); err != nil {
+		t.Fatalf("a well-formed source dump matching the feed was refused: %v", err)
+	}
+}

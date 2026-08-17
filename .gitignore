@@ -67,3 +67,5 @@ __pycache__/
 # the plan for a different project than the one here.
 order.txt
 plan.txt
+# The source-side dump the README diff writes at the repository root.
+source.json

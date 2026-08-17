@@ -30,6 +30,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -555,10 +556,143 @@ func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64
 	return applied, skipped, cursor, lastTable, nil
 }
 
+// diffAgainstSource re-materializes a table from the change events and compares it, row by row and
+// column by column, against a dump of the source table.
+//
+// # Why this is a subcommand and not a test
+//
+// The consumer could already re-materialize a table and print it; the comparison was done by a Rust
+// integration test holding the expected rows as a literal. That verifies the pipeline against what
+// somebody typed, not against the database - and if the workload changes, the literal is what breaks.
+// Here the expected side is produced by `table_dump`, which asks the source database the same
+// `SELECT * FROM <table>` a user would.
+//
+// # Compared semantically, not byte for byte
+//
+// Both sides are decoded with `UseNumber()`, so numeric text is preserved exactly - which is the whole
+// point for an int64 past 2^53 - and then compared per column. Comparing the two JSON documents as
+// bytes would fail on key order and on any formatting difference between a Rust writer and a Go
+// writer, neither of which is a data problem. What is compared is the values.
+//
+// The `_deleted` and `_commit_lsn` bookkeeping columns a sink adds are not part of the source table, so
+// they are ignored on the re-materialized side rather than reported as extra columns.
+func diffAgainstSource(feedPath, sourcePath, key string) error {
+	raw, err := os.ReadFile(feedPath)
+	if err != nil {
+		return err
+	}
+	// Re-materialize with the SAME Table.apply every other mode uses. A second fold written for the
+	// diff could disagree with the sink about what a DELETE means and the diff would certify it.
+	table := newTable(key)
+	n := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		n++
+		e, derr := decodeLine(line, n)
+		if derr != nil {
+			return derr
+		}
+		if aerr := table.apply(e); aerr != nil {
+			return aerr
+		}
+	}
+	if n == 0 {
+		return fmt.Errorf("%s carried no events; a diff against an empty feed proves nothing", feedPath)
+	}
+
+	srcBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(srcBytes))
+	dec.UseNumber()
+	var srcRows []map[string]any
+	if err := dec.Decode(&srcRows); err != nil {
+		return fmt.Errorf("%s is not a JSON array of rows: %w", sourcePath, err)
+	}
+
+	// **Both sides empty is not agreement.** Two empty tables match trivially, and a pipeline that
+	// delivered nothing would pass. Refuse instead, naming which side is empty.
+	if len(srcRows) == 0 && len(table.rows) == 0 {
+		return fmt.Errorf("both the source dump and the re-materialized table are empty; " +
+			"there is nothing to agree about")
+	}
+
+	src := make(map[string]map[string]any, len(srcRows))
+	for i, r := range srcRows {
+		v, ok := r[key]
+		if !ok {
+			return fmt.Errorf("source row %d has no key column %q: %v", i, key, r)
+		}
+		k := fmt.Sprint(v)
+		if _, dup := src[k]; dup {
+			return fmt.Errorf("source dump has two rows with key %s; it is not a table state", k)
+		}
+		src[k] = r
+	}
+
+	// Sorted so a failure reads the same way twice.
+	keys := map[string]bool{}
+	for k := range src {
+		keys[k] = true
+	}
+	for k := range table.rows {
+		keys[k] = true
+	}
+	ordered := make([]string, 0, len(keys))
+	for k := range keys {
+		ordered = append(ordered, k)
+	}
+	sort.Strings(ordered)
+
+	var problems []string
+	for _, k := range ordered {
+		s, inSource := src[k]
+		d, inFeed := table.rows[k]
+		switch {
+		case inSource && !inFeed:
+			problems = append(problems, fmt.Sprintf("%s=%s: in the source, missing from the feed", key, k))
+		case !inSource && inFeed:
+			problems = append(problems, fmt.Sprintf("%s=%s: rebuilt from the feed, absent from the source", key, k))
+		default:
+			for col, want := range s {
+				got, present := d[col]
+				if !present {
+					problems = append(problems, fmt.Sprintf("%s=%s column %q: source has %v, the feed never carried it", key, k, col, want))
+					continue
+				}
+				if fmt.Sprint(want) != fmt.Sprint(got) {
+					problems = append(problems, fmt.Sprintf("%s=%s column %q: source %v, feed %v", key, k, col, want, got))
+				}
+			}
+			for col := range d {
+				// A sink's own bookkeeping is not a column of the source table.
+				if col == "_deleted" || col == "_commit_lsn" {
+					continue
+				}
+				if _, present := s[col]; !present {
+					problems = append(problems, fmt.Sprintf("%s=%s column %q: rebuilt from the feed, not in the source", key, k, col))
+				}
+			}
+		}
+	}
+
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		return fmt.Errorf("the table rebuilt from %d event(s) does not match %s:\n  %s",
+			n, sourcePath, strings.Join(problems, "\n  "))
+	}
+	fmt.Printf("MATCH %d row(s) from %d event(s)\n", len(src), n)
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | "+
-			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | duckdb-sql <file.duckdb> <sql>")
+			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | "+
+			"diff <feed.jsonl> <source.json> [-key col] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -568,6 +702,20 @@ func main() {
 			os.Exit(2)
 		}
 		if err := validate(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "diff":
+		fs := flag.NewFlagSet("diff", flag.ExitOnError)
+		key := fs.String("key", "id", "primary key column shared by the feed and the source dump")
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer diff <feed.jsonl> <source.json> [-key col]")
+			os.Exit(2)
+		}
+		if err := fs.Parse(os.Args[4:]); err != nil {
+			os.Exit(2)
+		}
+		if err := diffAgainstSource(os.Args[2], os.Args[3], *key); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
