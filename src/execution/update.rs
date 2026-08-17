@@ -98,11 +98,27 @@ impl Modify for Update {
                 self.primary_index.insert(pk.clone(), new_rid)?;
             }
 
+            // **E66 — one entry per (value, key) pair, however many times history visits it.**
+            //
+            // The old entry deliberately STAYS. A secondary entry is how a reader finds a row by
+            // value, and a transaction whose snapshot predates this update must still find this row
+            // under its old value - `SecondaryIndexScan` resolves the entry through the primary index
+            // and `resolve_visibility` hands back the version that reader can see. Delete the old
+            // entry and that lookup finds nothing, which is a lost row rather than a stale one.
+            //
+            // What must not happen is a SECOND identical entry. `insert_entry` appends at the
+            // binary-search position rather than overwriting, so moving a value away and back gave
+            // the index two copies of one pair, and the scan yields a row per entry: measured before
+            // this guard, `UPDATE v=999 WHERE id=4; UPDATE v=40 WHERE id=4;` then a lookup for 40
+            // returned `[[4, 40], [4, 40]]` - the same row twice, from write history alone.
             for handle in &self.secondary_indexes {
                 let old_v = &old_values[handle.col_index];
                 let new_v = &new_values[handle.col_index];
                 if old_v != new_v {
-                    handle.tree.insert((new_v.clone(), pk.clone()), ())?;
+                    let key = (new_v.clone(), pk.clone());
+                    if handle.tree.search(&key)?.is_none() {
+                        handle.tree.insert(key, ())?;
+                    }
                 }
             }
             count += 1;
