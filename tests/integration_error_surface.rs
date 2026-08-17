@@ -257,3 +257,112 @@ fn a_missing_table_is_not_reported_as_a_parse_error() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// E68 — a comparison that cannot match is refused, not answered with an empty result.
+// ---------------------------------------------------------------------------------------------
+//
+// `Value::cmp` is a TOTAL order across types, because `Value` is a B+tree key and an index needs
+// one. Its cross-type arm is `type_rank(a).cmp(&type_rank(b))` - a fixed answer that never looks at
+// the values - so `Integer(10) == Varchar("abc")` is simply false. Measured before the fix:
+//
+//   SELECT * FROM t WHERE v = 'abc';   -> (0 rows)
+//   INSERT INTO t VALUES ('abc', 1);   -> column 'id' is declared Integer but was given Varchar("abc")
+//
+// The type system enforced on write and ignored on read, and the read path is the one where getting
+// it wrong is silent. An operator asking "why is this query empty" has no signal at all.
+//
+// Refused at BIND time, not in `compare`: a point lookup the optimizer routes through an index has no
+// `Filter` node - `build_index_scan` folds the conjunct into bounds - so `compare` is never called on
+// exactly the plans most likely to be chosen.
+
+/// Mismatches that must be refused, and the pairs that must still work.
+#[test]
+fn a_comparison_that_cannot_match_is_refused() {
+    let mut d = db();
+    d.sql(
+        "CREATE TABLE w (id INTEGER NOT NULL, f FLOAT, dec DECIMAL, s VARCHAR(20), b BIGINT, \
+         ts TIMESTAMP);",
+    );
+    d.sql("INSERT INTO w VALUES (1, 1.5, 2.5, 'hi', 9007199254740993, 1700000000123);");
+
+    for (sql, want) in [
+        // number column, text literal - the original report.
+        ("SELECT * FROM w WHERE id = 'abc';", "w.id"),
+        // text column, number literal - the mirror image.
+        ("SELECT * FROM w WHERE s = 5;", "w.s"),
+        // a timestamp is not a string.
+        ("SELECT * FROM w WHERE ts = 'yesterday';", "w.ts"),
+        // it is a predicate, so DELETE and UPDATE inherit it.
+        ("DELETE FROM w WHERE id = 'abc';", "w.id"),
+        ("UPDATE w SET f = 1 WHERE id = 'abc';", "w.id"),
+        // **Column against column.** Found by re-auditing the fix, not by writing it: the
+        // literal-only check left `WHERE s = id` answering (0 rows), one substitution away from the
+        // defect being fixed and just as silent.
+        ("SELECT * FROM w WHERE s = id;", "w.s"),
+        ("SELECT * FROM w WHERE ts = id;", "w.ts"),
+    ] {
+        let msg = d.refusal(sql);
+        assert!(
+            msg.contains("cannot compare") && msg.contains(want),
+            "`{sql}` was not refused with a message naming {want}: {msg}"
+        );
+    }
+}
+
+/// **Anti-vacuity, and it is the more important half.**
+///
+/// A check that refused every comparison would satisfy the test above completely. These are the pairs
+/// that must keep working, including the two the wide-type work exists for.
+#[test]
+fn comparisons_that_can_match_still_do() {
+    let mut d = db();
+    d.sql(
+        "CREATE TABLE w (id INTEGER NOT NULL, f FLOAT, dec DECIMAL, s VARCHAR(20), b BIGINT, \
+         ts TIMESTAMP);",
+    );
+    d.sql("INSERT INTO w VALUES (1, 1.5, 2.5, 'hi', 9007199254740993, 1700000000123);");
+
+    // Same category, and the whole numeric band is one category: INTEGER against FLOAT, BIGINT and
+    // DECIMAL all compare exactly rather than being refused or rounded.
+    for sql in [
+        "SELECT * FROM w WHERE id = 1;",
+        "SELECT * FROM w WHERE f = 1.5;",
+        "SELECT * FROM w WHERE dec = 2.5;",
+        "SELECT * FROM w WHERE b = 9007199254740993;",
+        "SELECT * FROM w WHERE ts = 1700000000123;",
+        "SELECT * FROM w WHERE s = 'hi';",
+        "SELECT * FROM w WHERE id = f;",
+        "SELECT * FROM w WHERE id = b;",
+        "SELECT * FROM w WHERE id < b;",
+        // NULL is comparable with anything; three-valued logic handles it in `compare`, which
+        // returns Value::Null rather than a boolean.
+        "SELECT * FROM w WHERE id = NULL;",
+        "SELECT * FROM w WHERE s = NULL;",
+    ] {
+        d.try_sql(sql).unwrap_or_else(|e| panic!("`{sql}` was refused but can match: {e}"));
+    }
+
+    // And the exactness the wide types exist for is untouched: 2^53+1 is not representable as an f64,
+    // so no stored FLOAT can equal it and the answer is an empty result rather than a refusal - the
+    // one case where "no rows" is the correct answer to a cross-type comparison.
+    d.try_sql("SELECT * FROM w WHERE f = 9007199254740993;")
+        .expect("a FLOAT compared against an exact i64 must be answered, not refused");
+}
+
+/// **A deliberate incompatibility, recorded as one rather than described as an improvement.**
+///
+/// `WHERE dec = '2.5'` used to return `(0 rows)` and is now refused. Several SQL dialects accept a
+/// quoted numeric against a numeric column, so this is stricter than they are - a choice, not a
+/// bug fix. It is the right side to err on here: the alternative is the silent empty answer this whole
+/// row exists to remove, and the message names the column and says to use a number.
+#[test]
+fn a_quoted_number_against_a_numeric_column_is_refused_deliberately() {
+    let mut d = db();
+    d.sql("CREATE TABLE n (id INTEGER NOT NULL, dec DECIMAL);");
+    d.sql("INSERT INTO n VALUES (1, 2.5);");
+    let msg = d.refusal("SELECT * FROM n WHERE dec = '2.5';");
+    assert!(msg.contains("cannot compare"), "expected the E68 refusal: {msg}");
+    // The unquoted form is the way through, and it works.
+    d.try_sql("SELECT * FROM n WHERE dec = 2.5;").expect("the unquoted literal must still match");
+}
