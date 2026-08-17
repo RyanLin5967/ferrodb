@@ -66,8 +66,20 @@ fn example_bin(name: &str) -> PathBuf {
 
 struct Server {
     child: Child,
+    /// Where this server's stderr landed, so a failure can quote its last words instead of
+    /// reporting an unexplained connection error.
+    stderr_path: std::path::PathBuf,
     addr: String,
     _dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// Whatever the server wrote to stderr. Empty when it wrote nothing, which is
+    /// itself information: it means the process did not report why it stopped.
+    #[allow(dead_code)]
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
 }
 
 impl Drop for Server {
@@ -79,12 +91,22 @@ impl Drop for Server {
 
 fn start(rows: u32) -> Server {
     let dir = tempfile::tempdir().unwrap();
+    let stderr_path = dir.path().join("cdc.stderr");
     let mut child = Command::new(example_bin("cdc_server"))
         .arg(dir.path().join("cdc.db"))
         .arg("127.0.0.1:0")
         .arg(rows.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured to a FILE, not discarded and not a pipe.
+        //
+        // Discarded is how a server-side panic reaches a reader as nothing but `connection
+        // refused`: on 2026-08-16 that cost two passes hypothesising a dial race that did not
+        // exist, while the process's own `failed printing to stdout: Broken pipe` sat in
+        // /dev/null. A pipe would be worse than a file — nothing reads it until the child is
+        // over, and an unread pipe fills its buffer and blocks the writer.
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr sink"),
+        ))
         .spawn()
         .expect("spawn cdc_server");
     let stdout = child.stdout.take().expect("piped");
@@ -95,10 +117,16 @@ fn start(rows: u32) -> Server {
                 break l.trim_start_matches("LISTENING ").to_string()
             }
             Some(Ok(_)) => continue,
-            _ => panic!("cdc_server exited before it started listening"),
+            _ => panic!(
+                // The whole reason stderr is captured: this used to be the entire failure
+                // report, and it says everything except why.
+                "{} exited before it started listening. Its stderr:\n{}",
+                "cdc_server",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            ),
         }
     };
-    Server { child, addr, _dir: dir }
+    Server { child, addr, stderr_path, _dir: dir }
 }
 
 /// Connect from `cursor` and read at most `limit` lines. Returns them.

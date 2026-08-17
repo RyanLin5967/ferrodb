@@ -78,8 +78,20 @@ fn example_bin(name: &str) -> PathBuf {
 
 struct Server {
     child: Child,
+    /// Where this server's stderr landed, so a failure can quote its last words instead of
+    /// reporting an unexplained connection error.
+    stderr_path: std::path::PathBuf,
     port: u16,
     _dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// Whatever the server wrote to stderr. Empty when it wrote nothing, which is
+    /// itself information: it means the process did not report why it stopped.
+    #[allow(dead_code)]
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
 }
 
 impl Drop for Server {
@@ -97,11 +109,21 @@ impl Drop for Server {
 fn start() -> Server {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pg.db");
+    let stderr_path = db.with_extension("stderr");
     let mut child = Command::new(example_bin("pgserver"))
         .arg(&db)
         .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured to a FILE, not discarded and not a pipe.
+        //
+        // Discarded is how a server-side panic reaches a reader as nothing but `connection
+        // refused`: on 2026-08-16 that cost two passes hypothesising a dial race that did not
+        // exist, while the process's own `failed printing to stdout: Broken pipe` sat in
+        // /dev/null. A pipe would be worse than a file — nothing reads it until the child is
+        // over, and an unread pipe fills its buffer and blocks the writer.
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr sink"),
+        ))
         .spawn()
         .expect("spawn pgserver");
 
@@ -113,11 +135,17 @@ fn start() -> Server {
                 break l.trim_start_matches("LISTENING ").to_string()
             }
             Some(Ok(_)) => continue,
-            _ => panic!("pgserver exited before it started listening"),
+            _ => panic!(
+                // The whole reason stderr is captured: this used to be the entire failure
+                // report, and it says everything except why.
+                "{} exited before it started listening. Its stderr:\n{}",
+                "pgserver",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            ),
         }
     };
     let port: u16 = addr.rsplit(':').next().unwrap().parse().expect("port");
-    Server { child, port, _dir: dir }
+    Server { child, port, stderr_path, _dir: dir }
 }
 
 #[test]
