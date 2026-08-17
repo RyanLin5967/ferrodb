@@ -243,6 +243,28 @@ impl DiskManager{
         self.arena_floor.load(Ordering::SeqCst)
     }
 
+
+/// The message a caller meets when ordinary tables have grown into the arena floor.
+///
+/// Shared by both exhaustion paths so they cannot drift, and worded around the fact that makes this
+/// error different from an ordinary "disk full": **the floor is chosen once, when the database is
+/// created, and then persisted in the arena checkpoint.** Raising `FERRODB_ARENA_HEADROOM` afterwards
+/// changes nothing for this database, because moving the floor would put pages the arena already
+/// owns back into the ordinary allocator's circulation. A message that named the knob without
+/// saying that would send the reader to set a variable and watch it not work.
+fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
+    FerroError::Io(format!(
+        "{what} the reserved arena region at page {floor}. Ordinary tables occupy [0, {floor}) and \
+         the copy-on-write branch arena owns everything from {floor} up, so the table region is \
+         full even though the file can still grow.\n\
+         This floor was fixed when the database was created and is stored in the arena checkpoint: \
+         raising FERRODB_ARENA_HEADROOM now will NOT move it, because pages at or above {floor} are \
+         already owned by the arena and re-issuing them would corrupt live branches.\n\
+         To get more table space, create a new database with a larger FERRODB_ARENA_HEADROOM and \
+         copy the data across."
+    ))
+}
+
     //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
     pub fn allocate(&self) -> Result<u32, FerroError>{
         let _guard = self.bitmap_lock.lock().unwrap();
@@ -261,10 +283,10 @@ impl DiskManager{
                             // Everything at or above the floor belongs to the arena store, whose
                             // pages are not tracked here. Handing one out would alias it.
                             if candidate >= floor {
-                                return Err(FerroError::Io(format!(
-                                    "no free page below the reserved arena region at {}",
-                                    floor
-                                )));
+                                return Err(Self::arena_floor_exhausted(
+                                    "no free page below",
+                                    floor,
+                                ));
                             }
                             page_bitmap[byte_index] |= 1 << bit_index;
                             self.write(current_bitmap_id, &page_bitmap)?;
@@ -290,10 +312,7 @@ impl DiskManager{
                 .max(self.next_page_id.load(Ordering::SeqCst));
             // Two pages are about to be taken: the new bitmap page and the page it serves.
             if grow_base.saturating_add(1) >= floor {
-                return Err(FerroError::Io(format!(
-                    "cannot grow the bitmap past the reserved arena region at {}",
-                    floor
-                )));
+                return Err(Self::arena_floor_exhausted("cannot grow the bitmap past", floor));
             }
             let new_bitmap_id = grow_base;
             let page_id = grow_base + 1;
@@ -402,6 +421,40 @@ mod tests {
     }
 
     /// A page freed and reused must not push the high-water mark backwards.
+    #[test]
+    fn exhausting_the_table_region_says_the_knob_will_not_help_this_database() {
+        use std::fs::OpenOptions;
+        let temp_dir = TempDir::new().unwrap();
+        let f = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join("full.db")).unwrap();
+        let dm = DiskManager::new(f).unwrap();
+        dm.reserve_from(12).expect("reserve");
+
+        // Allocate until the region below the floor is gone.
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = dm.allocate() {
+                err = Some(e);
+                break;
+            }
+        }
+        let msg = format!("{}", err.expect("the table region never filled, so nothing was tested"));
+
+        // The number alone is what this used to say, and it sent the reader nowhere.
+        assert!(msg.contains("FERRODB_ARENA_HEADROOM"), "the message does not name the knob: {msg}");
+        // The load-bearing sentence. Naming the knob without this is worse than not naming it: the
+        // reader sets the variable, reopens, and meets the identical error with no idea why.
+        assert!(
+            msg.contains("will NOT move it"),
+            "the message does not say the floor is fixed for this database, so it invites the \
+             reader to set a variable that cannot help them: {msg}"
+        );
+        assert!(
+            msg.contains("copy the data across"),
+            "the message states the problem but not the remedy: {msg}"
+        );
+    }
+
     #[test]
     pub fn high_water_does_not_regress_after_a_free() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new().unwrap();

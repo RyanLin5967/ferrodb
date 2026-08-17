@@ -298,6 +298,15 @@ cannot respond would prove nothing. Raw output is committed at `bench/branch_sca
 
 Kept here deliberately; a fabricated pass would be worse than an admitted gap.
 
+- **Table space is capped when the database is created.** The copy-on-write arena owns every page
+  from a fixed floor upward and ordinary tables own everything below it, so tables stop growing at
+  that floor even though the file can. `FERRODB_ARENA_HEADROOM` sets it (default 32736 pages, about
+  128 MB of table space) and is read **once, at creation**, then persisted — raising it later cannot
+  move an existing database's floor, because pages above it already belong to live branches. The
+  error says so, and names the remedy, rather than reporting a page number and leaving the reader to
+  set a variable that will not help. The default is a trade: a distant floor costs nothing on a
+  filesystem with sparse files and materialises the whole gap on one without, which is what CI's
+  Windows runner has.
 - **The pgwire server is still map-backed.** It builds `Session::new()`, which sets
   `storage: None`, so an agent session there stages rows in memory. The CLI and the demo no longer
   do: `src/cli/cli.rs` builds a `LogBranchCatalog` and an `ArenaPageStore` and calls `with_storage`
