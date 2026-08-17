@@ -55,7 +55,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
             for (name, expr) in assignments {
-                let idx = entry.schema.columns.iter().position(|c| c.name == name).ok_or(FerroError::Parse(format!("unknown column: {}", name)))?;
+                let idx = entry.schema.columns.iter().position(|c| c.name == name).ok_or_else(|| FerroError::Bind(format!("unknown column '{name}' in '{table}'; its columns are: {}", entry.schema.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))))?;
                 // `SET big = 9223372036854775807` gets the same type-directed reading as INSERT;
                 // without it the assignment would land as a rounded f64 or a rejected i32.
                 let ty = &entry.schema.columns[idx].data_type;
@@ -117,7 +117,7 @@ fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPo
 }
 
 fn single_table_scope(catalog: &Catalog, table: &str) -> Result<Scope, FerroError> {
-    let entry = catalog.get_table(table).ok_or(FerroError::Parse(format!("unknown table: {}", table)))?;
+    let entry = catalog.require_table(table)?;
     let mut scope = Scope::new();
     scope.add_table(table, &entry.schema)?;
     Ok(scope)

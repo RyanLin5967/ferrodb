@@ -79,7 +79,7 @@ use std::io::Write;
 use crate::catalog::column::Value;
 use crate::error::FerroError;
 
-use super::logical::{ChangeEvent, ChangeOp};
+use super::logical::{ChangeEvent, ChangeOp, SchemaChange};
 
 /// Append `s` to `out` as a quoted, escaped JSON string.
 ///
@@ -186,6 +186,16 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
 
     out.push_str(",\"after\":");
     match &e.op {
+        // **A DROP carries no shape.** E69: this matched every `Schema` event and emitted
+        // `{"columns":[]}` for a drop, which the Go consumer refuses outright - `line 3: DROP_TABLE
+        // carries an after image`. Producer and validator had never been reconciled because until
+        // `DROP TABLE` reached the SQL surface no feed could contain one, so the first real drop
+        // failed the whole run.
+        //
+        // The consumer's rule is the right one: the table is gone, there is no shape to report, and
+        // its DROP branch never reads `after`. An empty column list is not "no columns", it is a
+        // table with zero columns, and those are different claims.
+        ChangeOp::Schema { change: SchemaChange::DropTable, .. } => out.push_str("null"),
         // A schema event's payload is the table's shape, not a row. Keyed under `columns` so a
         // consumer never confuses it with data.
         ChangeOp::Schema { columns, .. } => {

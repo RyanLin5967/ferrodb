@@ -145,7 +145,7 @@ impl CatalogPage {
         for _ in 0..num_entries {
             let name_len = bytes[offset] as usize;
             offset += 1;
-            let name = std::str::from_utf8(&bytes[offset..offset + name_len]).map_err(|_| FerroError::Parse(String::from("deserializing error")))?.to_string();
+            let name = std::str::from_utf8(&bytes[offset..offset + name_len]).map_err(|_| FerroError::Corruption(String::from("deserializing error")))?.to_string();
             offset += name_len;
 
             let first_directory_page_id = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
@@ -161,7 +161,7 @@ impl CatalogPage {
             for _ in 0..num_columns {
                 let col_name_len = bytes[offset] as usize;
                 offset += 1;
-                let col_name = std::str::from_utf8(&bytes[offset..offset + col_name_len]).map_err(|_| FerroError::Parse(String::from("deserializing error")))?;
+                let col_name = std::str::from_utf8(&bytes[offset..offset + col_name_len]).map_err(|_| FerroError::Corruption(String::from("deserializing error")))?;
                 offset += col_name_len;
 
                 let tag = bytes[offset];
@@ -178,7 +178,7 @@ impl CatalogPage {
                     4 => DataType::BigInt,
                     5 => DataType::Decimal,
                     6 => DataType::Timestamp,
-                    _ => return Err(FerroError::Parse(String::from("invalid tag")))
+                    _ => return Err(FerroError::Corruption(String::from("invalid tag")))
                 };
                 let nullable = bytes[offset] != 0;
                 offset += 1;
@@ -192,7 +192,7 @@ impl CatalogPage {
             for _ in 0..num_indexes {
                 let ind_name_len = bytes[offset] as usize;
                 offset += 1;
-                let column_name = std::str::from_utf8(&bytes[offset..offset + ind_name_len]).map_err(|_| FerroError::Parse(String::from("deserialization error")))?.to_string();
+                let column_name = std::str::from_utf8(&bytes[offset..offset + ind_name_len]).map_err(|_| FerroError::Corruption(String::from("deserialization error")))?.to_string();
                 offset += ind_name_len;
                 let root_page_id = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
                 offset += 4;

@@ -63,7 +63,7 @@ pub fn table_hi(table_id: u32) -> Vec<u8> {
 /// Split an encoded key back into its parts.
 pub fn split_row_key(key: &[u8]) -> Result<(u32, u64), FerroError> {
     if key.len() != ROW_KEY_LEN {
-        return Err(FerroError::Parse(format!(
+        return Err(FerroError::Corruption(format!(
             "row key must be {ROW_KEY_LEN} bytes, got {}",
             key.len()
         )));
@@ -81,7 +81,7 @@ pub fn split_row_key(key: &[u8]) -> Result<(u32, u64), FerroError> {
 /// and the existing decoder is only ever handed a slice it can read.
 fn value_span(bytes: &[u8]) -> Result<usize, FerroError> {
     let truncated =
-        || FerroError::Parse("row value ends mid-cell; the encoded page is truncated".into());
+        || FerroError::Corruption("row value ends mid-cell; the encoded page is truncated".into());
     let tag = *bytes.first().ok_or_else(truncated)?;
     let span = match tag {
         0 => 5,                    // Integer:   tag + i32
@@ -110,7 +110,7 @@ fn value_span(bytes: &[u8]) -> Result<usize, FerroError> {
             3 + u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize
         }
         other => {
-            return Err(FerroError::Parse(format!(
+            return Err(FerroError::Corruption(format!(
                 "unknown value tag {other} in an encoded row"
             )))
         }
@@ -124,7 +124,7 @@ fn value_span(bytes: &[u8]) -> Result<usize, FerroError> {
 /// Encode a row as `count` (u16 big-endian) followed by each cell.
 pub fn encode_row(vals: &[Value]) -> Result<Vec<u8>, FerroError> {
     let count = u16::try_from(vals.len()).map_err(|_| {
-        FerroError::Parse(format!("a row of {} cells exceeds the u16 count", vals.len()))
+        FerroError::Internal(format!("a row of {} cells exceeds the u16 count", vals.len()))
     })?;
     let mut buf = Vec::with_capacity(2 + vals.len() * 5);
     buf.extend_from_slice(&count.to_be_bytes());
@@ -141,7 +141,7 @@ pub fn encode_row(vals: &[Value]) -> Result<Vec<u8>, FerroError> {
 /// silently lost cells.
 pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>, FerroError> {
     if bytes.len() < 2 {
-        return Err(FerroError::Parse("encoded row is missing its cell count".into()));
+        return Err(FerroError::Corruption("encoded row is missing its cell count".into()));
     }
     let count = u16::from_be_bytes(bytes[0..2].try_into().unwrap()) as usize;
     let mut out = Vec::with_capacity(count);
@@ -149,7 +149,7 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>, FerroError> {
     for i in 0..count {
         let rest = &bytes[at..];
         let span = value_span(rest).map_err(|e| {
-            FerroError::Parse(format!("cell {i} of {count}: {e}"))
+            FerroError::Corruption(format!("cell {i} of {count}: {e}"))
         })?;
         let (v, used) = Value::deserialize(rest)?;
         debug_assert_eq!(used, span, "value_span disagrees with Value::deserialize");
@@ -157,7 +157,7 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>, FerroError> {
         at += span;
     }
     if at != bytes.len() {
-        return Err(FerroError::Parse(format!(
+        return Err(FerroError::Corruption(format!(
             "encoded row has {} trailing byte(s) after {count} cells; reader and writer disagree \
              about the layout",
             bytes.len() - at
@@ -258,7 +258,7 @@ impl PagedRows {
             // A key outside the requested table means the range bounds are wrong, which would
             // otherwise show up as one table quietly reading another's rows.
             if t != table_id {
-                return Err(FerroError::Parse(format!(
+                return Err(FerroError::Internal(format!(
                     "range scan for table {table_id} returned a key from table {t}"
                 )));
             }

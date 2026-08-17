@@ -206,7 +206,7 @@ impl BTreeSerialize for Value { // primary
             }
             1 => {
                 let len = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
-                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Parse("bad utf8".into()))?;
+                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Corruption("bad utf8".into()))?;
                 Ok((Value::Varchar(s), 3 + len))
             }
             2 => {
@@ -226,7 +226,7 @@ impl BTreeSerialize for Value { // primary
             }
             6 => {
                 let len = u16::from_be_bytes(bytes[1..3].try_into().unwrap()) as usize;
-                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Parse("bad utf8".into()))?;
+                let s = String::from_utf8(bytes[3..3+len].to_vec()).map_err(|_| FerroError::Corruption("bad utf8".into()))?;
                 Ok((Value::Decimal(s), 3 + len))
             }
             7 => {

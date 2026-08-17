@@ -142,6 +142,15 @@ pub enum Stmt {
         table: String,
         where_clause: Option<Expr>
     },
+    /// `DROP TABLE t` — E69.
+    ///
+    /// The WAL has carried a `DdlOp::DropTable` record type, the decoder has turned it into a
+    /// `DROP_TABLE` event, and the Go sink has had a branch for it since E15 — but nothing could ever
+    /// write one, because `DdlOp::CreateTable` was the only op any code path logged. The README says
+    /// "`CREATE_TABLE` and `DROP_TABLE` are" carried; half of that was untrue.
+    DropTable {
+        table: String,
+    },
     CreateTable {
         table: String,
         columns: Vec<Column>,
@@ -254,6 +263,11 @@ impl Parser {
             return self.parse_txn_stmt(Stmt::Commit)
         } else if self.match_token(&[TokenType::Rollback]) {
             return self.parse_txn_stmt(Stmt::Rollback)
+        } else if self.match_token(&[TokenType::Drop]) {
+            self.consume(TokenType::Table, "expected TABLE after DROP")?;
+            let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::DropTable { table })
         } else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
@@ -323,7 +337,6 @@ impl Parser {
             "OFFSET" => "OFFSET",
             "UNION" => "UNION",
             "DISTINCT" => "DISTINCT",
-            "DROP" => "DROP",
             "ALTER" => "ALTER",
             "TRUNCATE" => "TRUNCATE",
             _ => return None,

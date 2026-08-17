@@ -21,7 +21,7 @@ impl Tuple {
     }
     pub fn serialize(values: &[Value], schema: &Schema, begin_ts: u64) -> Result<Self, FerroError>{
         if values.len() != schema.columns.len() {
-            return Err(FerroError::Parse(String::from("values is not the same length as columns")))
+            return Err(FerroError::Internal(format!("serialize was given {} values for a {}-column schema; a tuple written against the wrong schema is unreadable later", values.len(), schema.columns.len())))
         }
         let mut null_bitmap = vec![0u8; (schema.columns.len() + 7)/8];
         let mut bytes: Vec<u8> = Vec::new();
@@ -91,7 +91,7 @@ impl Tuple {
                 Value::Decimal(d) => {
                     let str_bytes = d.as_bytes();
                     if str_bytes.len() > u16::MAX as usize {
-                        return Err(FerroError::Parse(format!("decimal is {} bytes, over the {} the length prefix can hold", str_bytes.len(), u16::MAX)))
+                        return Err(FerroError::Constraint(format!("decimal is {} bytes, over the {} the length prefix can hold", str_bytes.len(), u16::MAX)))
                     }
                     bytes.extend_from_slice(&(str_bytes.len() as u16).to_be_bytes());
                     bytes.extend_from_slice(str_bytes);
@@ -101,7 +101,7 @@ impl Tuple {
                     let str_bytes = c.as_bytes();
                     if let DataType::Varchar(max) = &schema.columns[i].data_type {
                         if str_bytes.len() > *max as usize {
-                            return Err(FerroError::Parse(format!("varchar exceeds declared len: {}", max)))
+                            return Err(FerroError::Constraint(format!("varchar exceeds declared len: {}", max)))
                         }
                     }
                     bytes.extend_from_slice(&(str_bytes.len() as u16).to_be_bytes());
@@ -223,7 +223,7 @@ impl Tuple {
                         continue;
                     }
                     let str_bytes = &self.data[offset..offset + len];
-                    let text = std::str::from_utf8(str_bytes).map_err(|_| FerroError::Parse("decimal column held invalid utf8".into()))?;
+                    let text = std::str::from_utf8(str_bytes).map_err(|_| FerroError::Corruption("decimal column held invalid utf8".into()))?;
                     values.push(Value::Decimal(text.to_string()));
                     offset += len;
                 },
