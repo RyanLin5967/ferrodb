@@ -273,11 +273,41 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         self.buffer_pool.free_page(page_id)
     }
 
-    // try to borrow from sibling else merge with a sibling and remove separator key from parent, recursing up. if the root is internal
-    // and drops to one child, make that child the new root
-    #[allow(warnings)]
-    pub fn handle_underflow(&self, path: &mut Vec<u32>, node_id: u32) -> Result<(), FerroError> {
-        todo!()
+    /// Rebalance an underfull node — **unimplemented, and E70 measured why that is currently safe.**
+    ///
+    /// The intent was: borrow from a sibling, else merge with one and drop the separator from the
+    /// parent, recursing up; and if the root is internal and falls to a single child, make that child
+    /// the new root. None of it is written.
+    ///
+    /// **Nothing can reach this, because no code path net-removes a key from a tree.** Measured
+    /// 2026-08-17 (`tests/integration_index_debt.rs`):
+    ///
+    /// - `execution::delete` holds a `primary_index` field and never calls `delete` on it. A SQL
+    ///   `DELETE` stamps `end_ts` on the version in place and leaves the entry, because a reader whose
+    ///   snapshot predates the delete still has to find the row through the index.
+    /// - `execution::insert` removes an entry only to put the same key straight back — that is what
+    ///   E63's key reuse is.
+    /// - `execution::update` removes and re-adds the same key when a row's `RecordId` moves.
+    ///
+    /// So leaf occupancy never dips: 350 deletes over a 400-key index left the entry count, the leaf
+    /// count and the minimum keys-per-leaf all unchanged. `no_workload_drives_a_leaf_underfull` pins
+    /// that, and it is the test that fails if this ever becomes reachable.
+    ///
+    /// **An error rather than `todo!()`.** This function returns `Result` so a caller can handle
+    /// failure; `todo!()` aborts the process instead, and it was reachable-in-principle from `delete`,
+    /// which is on a live path. Same argument as E62's seven binder panics. Implementing a real
+    /// rebalance was considered and rejected for now: code that cannot execute would read as a working
+    /// feature and be trusted as one, which is worse than an honest refusal. What the missing rebalance
+    /// actually costs is not underfull nodes but dead entries nothing reclaims — 8x read amplification
+    /// on a full index scan at 50 live rows in 400 entries, scaling with the dead-to-live ratio.
+    pub fn handle_underflow(&self, _path: &mut Vec<u32>, node_id: u32) -> Result<(), FerroError> {
+        Err(FerroError::Io(format!(
+            "B+tree node {node_id} is underfull and rebalancing is not implemented. This should be \
+             unreachable: no write path removes a key without re-inserting it, so occupancy never \
+             drops (see tests/integration_index_debt.rs). If you are reading this, that invariant \
+             broke - a new caller removes entries outright - and borrow-or-merge now has to be \
+             written."
+        )))
     }
 }
 
