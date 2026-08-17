@@ -57,9 +57,20 @@ fn main() {
     // before, it would resolve nothing and every change would be reported unresolved.
     let streamer = Arc::new(FeedStreamer::new(LogicalDecoder::new(&catalog)));
     let listener = TcpListener::bind(&addr).expect("bind");
-    println!("LISTENING {}", listener.local_addr().unwrap());
-    println!("START {}", FeedStreamer::start_cursor(&wal));
-    std::io::stdout().flush().unwrap();
+    // **Writes that tolerate a closed pipe.** `println!` PANICS on EPIPE — proven, not assumed:
+    // closing this process's stdout before its first write kills it with
+    // `failed printing to stdout: Broken pipe (os error 32)` and exit 101, which is exactly the
+    // status CI reported (`unix_wait_status(25856)`, 25856 >> 8 = 101).
+    //
+    // The window is small and real: a harness that reads the LISTENING line and then drops its
+    // reader closes the pipe between these two lines. A server has no business dying because
+    // nobody is reading its log, so these report failure by being ignored rather than by aborting
+    // the process mid-serve.
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "LISTENING {}", listener.local_addr().unwrap());
+    let _ = out.flush();
+    let _ = writeln!(out, "START {}", FeedStreamer::start_cursor(&wal));
+    let _ = out.flush();
 
     let done = Arc::new(AtomicBool::new(false));
 

@@ -81,6 +81,15 @@ fn go_bin() -> String {
 
 struct Server {
     child: Child,
+    stderr_path: std::path::PathBuf,
+    /// Held for the server's whole life, and that is the point rather than an accident.
+    ///
+    /// This used to be a local in `start()`, so the read end of the pipe closed the moment `start`
+    /// returned. If the server's next `println!` landed after that it died of EPIPE — exit 101,
+    /// reproduced deterministically — which is what made this test fail on ubuntu and windows while
+    /// macOS won the race. Keeping the reader alive removes the window; the server no longer
+    /// panics either, so both ends are fixed rather than one relying on the other.
+    _stdout: BufReader<std::process::ChildStdout>,
     addr: String,
     _dir: tempfile::TempDir,
 }
@@ -99,21 +108,30 @@ fn start(rows: u32) -> Server {
         .arg("127.0.0.1:0")
         .arg(rows.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured to a file, not discarded. On 2026-08-16 this server was proven to die with exit
+        // 101 - a panic - and because stderr went to /dev/null the panic's own message was gone.
+        // A file rather than a pipe: nothing reads it until the process is over, and an unread pipe
+        // fills its buffer and blocks the writer, which would turn a diagnostic into a deadlock.
+        .stderr(Stdio::from(
+            std::fs::File::create(dir.path().join("server.stderr")).expect("create stderr sink"),
+        ))
         .spawn()
         .expect("spawn cdc_server");
     let stdout = child.stdout.take().expect("piped");
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
     let addr = loop {
-        match lines.next() {
-            Some(Ok(l)) if l.starts_with("LISTENING ") => {
+        let mut line = String::new();
+        let got = reader.read_line(&mut line);
+        match got.map(|n| (n, line.trim_end().to_string())) {
+            Ok((n, l)) if n > 0 && l.starts_with("LISTENING ") => {
                 break l.trim_start_matches("LISTENING ").to_string()
             }
-            Some(Ok(_)) => continue,
+            Ok((n, _)) if n > 0 => continue,
             _ => panic!("cdc_server exited before it started listening"),
         }
     };
-    Server { child, addr, _dir: dir }
+    let stderr_path = dir.path().join("server.stderr");
+    Server { child, addr, stderr_path, _stdout: reader, _dir: dir }
 }
 
 /// Run the Go consumer once, returning its output and exit status.
@@ -158,11 +176,14 @@ fn materialise(server: &mut Server) -> String {
     if !ok {
         // Ask the one question the original failure could not answer.
         let status = server.child.try_wait().expect("query the server process");
+        let server_stderr = std::fs::read_to_string(&server.stderr_path).unwrap_or_default();
         assert!(
             status.is_none(),
             "the Go consumer could not reach the server, and the server had already exited \
              ({status:?}). This is not a dial race — the server died between printing LISTENING \
-             and being connected to, and retrying would only hide it.\nstderr: {stderr}"
+             and being connected to, and retrying would only hide it.\n\
+             --- server stderr ---\n{server_stderr}\n\
+             --- consumer stderr ---\n{stderr}"
         );
         eprintln!(
             "NOTE: the Go consumer failed to reach a server that is still alive; retrying once. \
@@ -266,4 +287,69 @@ fn a_dead_server_is_reported_as_dead_rather_than_retried() {
         "the failure did not identify a dead server, so the next occurrence is as undiagnosable \
          as the one that prompted this: {msg}"
     );
+}
+
+/// **A server must not die because nobody is reading its stdout.**
+///
+/// This is the bug behind an intermittent CI failure on ubuntu and windows that macOS never showed.
+/// `start()` used to hold its stdout reader in a local, so the read end of the pipe closed the
+/// moment `start` returned — and if the server's next `println!` landed after that, it panicked with
+/// `failed printing to stdout: Broken pipe (os error 32)` and exit 101. CI reported exactly that
+/// status, `unix_wait_status(25856)`, and 25856 >> 8 = 101.
+///
+/// The race is microseconds wide, so this does not try to hit it. It closes the pipe *before* the
+/// server's first write, which makes the failure deterministic: against the old code the server dies
+/// every time. Both ends were fixed — the harness now holds the reader open, and the server ignores
+/// stdout write errors — and this pins the half that does not depend on the harness behaving.
+#[test]
+fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
+    use std::io::{Read, Write as _};
+    use std::net::{TcpListener, TcpStream};
+
+    // A port to hand the server, so this test never needs to read its stdout for the address.
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(example_bin("cdc_server"))
+        .arg(dir.path().join("cdc.db"))
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("12")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cdc_server");
+
+    // Close the read end before the server has written anything.
+    drop(child.stdout.take().expect("piped"));
+
+    // Give it a moment to reach its first write, then require it to still be serving.
+    // A real delay between attempts. The first version of this loop had none, and `connect` to an
+    // unbound port fails instantly, so 600 attempts elapsed in 0.02s and the test reported that the
+    // server "never accepted a connection" when it simply had not finished starting.
+    let mut stream = None;
+    for _ in 0..200 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Some(st) = child.try_wait().expect("query the server") {
+            let mut err = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+            panic!(
+                "the server died ({st:?}) because its stdout pipe was closed. A closed log pipe \
+                 must not be fatal to a server that is otherwise healthy.\nstderr: {err}"
+            );
+        }
+    }
+    let mut stream = stream.expect("the server never accepted a connection");
+
+    // Alive is not enough — it has to still deliver a feed.
+    stream.write_all(b"0\n").expect("send cursor");
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).expect("read the feed");
+    assert!(n > 0, "the server accepted the connection but sent nothing");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
