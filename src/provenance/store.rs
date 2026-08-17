@@ -377,6 +377,28 @@ mod tests {
     /// So both quantities are pinned. Exact equality on the tuple size is deliberate: it is a
     /// number the prose quotes, so changing `RunEntity` should fail here and force the prose to be
     /// updated rather than silently becoming false.
+    /// Stamping a version with `ProvId::NONE` is refused rather than stored.
+    ///
+    /// `NONE` is the value `prov_of` returns for a version that carries no attribution, so storing
+    /// it would make "this row was written by nobody" and "this row has no record of who wrote it"
+    /// the same bytes — and criterion 9 is the ability to tell who wrote a given row.
+    #[test]
+    fn stamping_a_version_with_no_provenance_is_refused() {
+        let s = MemProvenanceStore::new();
+        let err = s
+            .stamp(rid(1, 0), ProvId::NONE)
+            .expect_err("a version was stamped with ProvId::NONE");
+        assert!(
+            format!("{err}").contains("refusing to stamp"),
+            "refused, but not by this guard: {err}"
+        );
+
+        // Anti-vacuity: a real id stamps fine, so the refusal is about NONE and not about stamping.
+        let id = s.intern(&run("a", "r")).unwrap();
+        s.stamp(rid(1, 0), id).expect("a real provenance id was refused");
+        assert_eq!(s.attribute(rid(1, 0)).unwrap(), id, "the stamp did not land");
+    }
+
     #[test]
     fn the_density_numbers_the_docs_quote_are_the_numbers_this_computes() {
         let e = run("restock-agent", "run-42");
