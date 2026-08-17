@@ -331,9 +331,14 @@ fn the_destination_ddl_comes_from_the_create_table_event() {
         "SELECT column_name, data_type FROM duckdb_columns() \
          WHERE table_name='inventory' ORDER BY column_index;",
     );
+    // `_lsn` joined `_commit_lsn` deliberately: the idempotence key is the composite
+    // (commit_lsn, record lsn), because a commit_lsn identifies a TRANSACTION and a transaction
+    // carries many rows. Keyed on commit_lsn alone, the first row of a commit advanced the cursor to
+    // that commit and every sibling was then discarded as a re-delivery - measured on a 3-row commit:
+    // one row landed and the run exited 0. This assertion is pinning the wider key, not tolerating it.
     assert_eq!(
         schema,
-        "id|BIGINT\nitem|VARCHAR\nqty|BIGINT\n_commit_lsn|BIGINT\n_deleted|BOOLEAN",
+        "id|BIGINT\nitem|VARCHAR\nqty|BIGINT\n_commit_lsn|BIGINT\n_lsn|BIGINT\n_deleted|BOOLEAN",
         "the destination DDL does not match the CREATE_TABLE event"
     );
 

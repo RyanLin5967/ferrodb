@@ -65,7 +65,7 @@ type DuckSink struct {
 // bookkeeping names the columns this sink adds to every destination table. They are prefixed so
 // they cannot collide with a source column unless the source deliberately chose a leading
 // underscore, and they are listed here so the catalog reader can tell them from real ones.
-var bookkeeping = map[string]bool{"_commit_lsn": true, "_deleted": true}
+var bookkeeping = map[string]bool{"_commit_lsn": true, "_lsn": true, "_deleted": true}
 
 func openDuckSink(path, key string) (*DuckSink, error) {
 	if key == "" {
@@ -86,9 +86,12 @@ func openDuckSink(path, key string) (*DuckSink, error) {
 	// The checkpoint travels with the data, in the same database, so a restored backup of the
 	// destination resumes from where that backup actually was rather than from wherever a separate
 	// state file happens to have got to.
+	// `record_lsn`: the second half of the composite resume point. commit_lsn alone cannot order two
+	// rows of the same commit, and treating them as equal discarded every sibling after the first.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS _cdc_checkpoint (
 		table_name VARCHAR PRIMARY KEY,
-		"cursor"   BIGINT NOT NULL
+		"cursor"   BIGINT NOT NULL,
+		record_lsn BIGINT NOT NULL DEFAULT 0
 	)`); err != nil {
 		db.Close()
 		return nil, err
@@ -217,7 +220,8 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		// degraded, and the destination would corrupt silently on the first replay.
 		return fmt.Errorf("table %s has no key column %q; the ordering guard needs one", table, s.key)
 	}
-	defs = append(defs, `"_commit_lsn" BIGINT NOT NULL`, `"_deleted" BOOLEAN NOT NULL DEFAULT false`)
+	defs = append(defs, `"_commit_lsn" BIGINT NOT NULL`, `"_lsn" BIGINT NOT NULL DEFAULT 0`,
+		`"_deleted" BOOLEAN NOT NULL DEFAULT false`)
 
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
 	if _, err := s.db.Exec(stmt); err != nil {
@@ -392,9 +396,9 @@ func (s *DuckSink) apply(e *Event) error {
 		placeholders = append(placeholders, "?")
 		values = append(values, normalise(row[c]))
 	}
-	names = append(names, `"_commit_lsn"`, `"_deleted"`)
-	placeholders = append(placeholders, "?", "?")
-	values = append(values, int64(e.CommitLSN), deleted)
+	names = append(names, `"_commit_lsn"`, `"_lsn"`, `"_deleted"`)
+	placeholders = append(placeholders, "?", "?", "?")
+	values = append(values, int64(e.CommitLSN), int64(e.LSN), deleted)
 
 	// The ordering guard lives HERE, in the statement, not in Go control flow above it. Every write
 	// path that goes through this function inherits it, and there is no path that does not.
@@ -410,17 +414,21 @@ func (s *DuckSink) apply(e *Event) error {
 		}
 		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(c), quoteIdent(c)))
 	}
-	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_deleted"=excluded."_deleted"`)
+	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_lsn"=excluded."_lsn"`,
+		`"_deleted"=excluded."_deleted"`)
 
 	stmt := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
 		 ON CONFLICT(%s) DO UPDATE SET %s
-		 WHERE excluded."_commit_lsn" > %s."_commit_lsn"`,
+		 WHERE excluded."_commit_lsn" > %s."_commit_lsn"
+		    OR (excluded."_commit_lsn" = %s."_commit_lsn" AND excluded."_lsn" > %s."_lsn")`,
 		quoteIdent(e.Table),
 		strings.Join(names, ", "),
 		strings.Join(placeholders, ", "),
 		quoteIdent(s.key),
 		strings.Join(sets, ", "),
+		quoteIdent(e.Table),
+		quoteIdent(e.Table),
 		quoteIdent(e.Table),
 	)
 	if _, err := s.db.Exec(stmt, values...); err != nil {
@@ -431,22 +439,25 @@ func (s *DuckSink) apply(e *Event) error {
 
 // saveCursor advances a table's resume point, and never moves it backwards — the same strictly-
 // greater test as the row guard, in SQL, for the same reason.
-func (s *DuckSink) saveCursor(table string, cursor uint64) error {
+func (s *DuckSink) saveCursor(table string, commitLSN, recordLSN uint64) error {
 	_, err := s.db.Exec(
-		`INSERT INTO _cdc_checkpoint (table_name, "cursor") VALUES (?, ?)
-		 ON CONFLICT(table_name) DO UPDATE SET "cursor"=excluded."cursor"
-		 WHERE excluded."cursor" > _cdc_checkpoint."cursor"`,
-		table, int64(cursor))
+		`INSERT INTO _cdc_checkpoint (table_name, "cursor", record_lsn) VALUES (?, ?, ?)
+		 ON CONFLICT(table_name) DO UPDATE SET "cursor"=excluded."cursor", record_lsn=excluded.record_lsn
+		 WHERE excluded."cursor" > _cdc_checkpoint."cursor"
+		    OR (excluded."cursor" = _cdc_checkpoint."cursor"
+		        AND excluded.record_lsn > _cdc_checkpoint.record_lsn)`,
+		table, int64(commitLSN), int64(recordLSN))
 	return err
 }
 
-func (s *DuckSink) cursor(table string) uint64 {
-	var c int64
-	if err := s.db.QueryRow(`SELECT "cursor" FROM _cdc_checkpoint WHERE table_name = ?`, table).
-		Scan(&c); err != nil {
-		return 0
+func (s *DuckSink) cursor(table string) (uint64, uint64) {
+	var c, r int64
+	if err := s.db.QueryRow(
+		`SELECT "cursor", record_lsn FROM _cdc_checkpoint WHERE table_name = ?`, table).
+		Scan(&c, &r); err != nil {
+		return 0, 0
 	}
-	return uint64(c)
+	return uint64(c), uint64(r)
 }
 
 // Close checkpoints before closing, so the database file is complete on its own and an outside
@@ -474,6 +485,7 @@ func (s *DuckSink) Close() error {
 //   - A DOUBLE holding an integral value prints as `2.0`; `fmt.Sprint(float64(2))` gives `2`.
 //   - A TIMESTAMP prints as `2024-01-02 03:04:05`, with fractional seconds only when it has them;
 //     Go's `time.Time` stringer appends a zone (`+0000 UTC`) the CLI never shows.
+//
 // renderBlob formats a BLOB the way the `duckdb` CLI does.
 //
 // This returned the raw bytes until it was measured against the CLI, which does not: a BLOB holding

@@ -53,8 +53,8 @@ import (
 
 // Sink writes change events into a SQLite database.
 type Sink struct {
-	db      *sql.DB
-	key     string
+	db  *sql.DB
+	key string
 	// Columns known per table, learned from CREATE_TABLE events or inferred from the first row.
 	columns map[string][]string
 }
@@ -67,11 +67,22 @@ func openSink(path, key string) (*Sink, error) {
 	// The checkpoint travels with the data, in the same database, so a restored backup of the
 	// destination resumes from where that backup actually was rather than from wherever a separate
 	// state file happens to have got to.
+	// `record_lsn` is the second half of the composite resume point. A commit_lsn identifies a
+	// transaction and a transaction carries many rows, so it cannot order siblings within one commit.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS _cdc_checkpoint (
 		table_name TEXT PRIMARY KEY,
-		cursor     INTEGER NOT NULL
+		cursor     INTEGER NOT NULL,
+		record_lsn INTEGER NOT NULL DEFAULT 0
 	)`); err != nil {
 		return nil, err
+	}
+	// Upgrade a destination written before the column existed, rather than failing on it. A sink that
+	// refused to open an older destination would strand exactly the backups this checkpoint design
+	// exists to make resumable.
+	if _, err := db.Exec(`ALTER TABLE _cdc_checkpoint ADD COLUMN record_lsn INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return nil, err
+		}
 	}
 	return &Sink{db: db, key: key, columns: map[string][]string{}}, nil
 }
@@ -130,7 +141,8 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 	}
 	// Bookkeeping columns, prefixed so they cannot collide with a source column of the same name
 	// without the source having chosen a leading underscore deliberately.
-	defs = append(defs, `"_commit_lsn" INTEGER NOT NULL`, `"_deleted" INTEGER NOT NULL DEFAULT 0`)
+	defs = append(defs, `"_commit_lsn" INTEGER NOT NULL`, `"_lsn" INTEGER NOT NULL DEFAULT 0`,
+		`"_deleted" INTEGER NOT NULL DEFAULT 0`)
 
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
 	if _, err := s.db.Exec(stmt); err != nil {
@@ -202,26 +214,30 @@ func (s *Sink) apply(e *Event) error {
 		placeholders = append(placeholders, "?")
 		values = append(values, normalise(row[c]))
 	}
-	names = append(names, `"_commit_lsn"`, `"_deleted"`)
-	placeholders = append(placeholders, "?", "?")
-	values = append(values, int64(e.CommitLSN), deleted)
+	names = append(names, `"_commit_lsn"`, `"_lsn"`, `"_deleted"`)
+	placeholders = append(placeholders, "?", "?", "?")
+	values = append(values, int64(e.CommitLSN), int64(e.LSN), deleted)
 
 	// The ordering guard lives HERE, in the statement, not in Go control flow above it.
 	sets := make([]string, 0, len(cols)+2)
 	for _, c := range cols {
 		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(c), quoteIdent(c)))
 	}
-	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_deleted"=excluded."_deleted"`)
+	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_lsn"=excluded."_lsn"`,
+		`"_deleted"=excluded."_deleted"`)
 
 	stmt := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
 		 ON CONFLICT(%s) DO UPDATE SET %s
-		 WHERE excluded."_commit_lsn" > %s."_commit_lsn"`,
+		 WHERE excluded."_commit_lsn" > %s."_commit_lsn"
+		    OR (excluded."_commit_lsn" = %s."_commit_lsn" AND excluded."_lsn" > %s."_lsn")`,
 		quoteIdent(e.Table),
 		strings.Join(names, ", "),
 		strings.Join(placeholders, ", "),
 		quoteIdent(s.key),
 		strings.Join(sets, ", "),
+		quoteIdent(e.Table),
+		quoteIdent(e.Table),
 		quoteIdent(e.Table),
 	)
 	if _, err := s.db.Exec(stmt, values...); err != nil {
@@ -246,22 +262,27 @@ func normalise(v any) any {
 	return v
 }
 
-func (s *Sink) saveCursor(table string, cursor uint64) error {
+// saveCursor advances a table's resume point and never moves it backwards, comparing the composite
+// (commit_lsn, record_lsn) lexicographically in the statement rather than in Go.
+func (s *Sink) saveCursor(table string, commitLSN, recordLSN uint64) error {
 	_, err := s.db.Exec(
-		`INSERT INTO _cdc_checkpoint (table_name, cursor) VALUES (?, ?)
-		 ON CONFLICT(table_name) DO UPDATE SET cursor=excluded.cursor
-		 WHERE excluded.cursor > _cdc_checkpoint.cursor`,
-		table, int64(cursor))
+		`INSERT INTO _cdc_checkpoint (table_name, cursor, record_lsn) VALUES (?, ?, ?)
+		 ON CONFLICT(table_name) DO UPDATE SET cursor=excluded.cursor, record_lsn=excluded.record_lsn
+		 WHERE excluded.cursor > _cdc_checkpoint.cursor
+		    OR (excluded.cursor = _cdc_checkpoint.cursor
+		        AND excluded.record_lsn > _cdc_checkpoint.record_lsn)`,
+		table, int64(commitLSN), int64(recordLSN))
 	return err
 }
 
-func (s *Sink) cursor(table string) uint64 {
-	var c int64
-	if err := s.db.QueryRow(`SELECT cursor FROM _cdc_checkpoint WHERE table_name = ?`, table).
-		Scan(&c); err != nil {
-		return 0
+func (s *Sink) cursor(table string) (uint64, uint64) {
+	var c, r int64
+	if err := s.db.QueryRow(
+		`SELECT cursor, record_lsn FROM _cdc_checkpoint WHERE table_name = ?`, table).
+		Scan(&c, &r); err != nil {
+		return 0, 0
 	}
-	return uint64(c)
+	return uint64(c), uint64(r)
 }
 
 func (s *Sink) Close() error { return s.db.Close() }
