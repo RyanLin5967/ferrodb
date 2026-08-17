@@ -296,3 +296,92 @@ fn the_readmes_agent_isolation_transcript_replays_as_written() {
         assert!(!expected.is_empty(), "block {marker:?} documents no output to check");
     }
 }
+
+/// **DEMO.md's verdict table must equal what the demo actually prints — and the demo must run.**
+///
+/// Two gaps, one test.
+///
+/// The table in DEMO.md is a transcription of output the demo computes. A copy of a computed result
+/// is stale the moment the computation changes, and this particular copy is the artifact's headline:
+/// ten criteria, all MET.
+///
+/// And until this existed **nothing ran the demo in CI**. `cargo build --examples` compiles it, so a
+/// demo whose self-checks had begun failing would still show a green build — its `ExitCode::FAILURE`
+/// path had never once been reached by the test suite. It costs 1.3 seconds to actually run it.
+#[test]
+fn demo_md_matches_what_the_demo_prints_and_the_demo_still_passes() {
+    let root = repo_root();
+    let out = Command::new(root.join("target").join(if cfg!(debug_assertions) { "debug" } else { "release" })
+            .join("examples")
+            .join(format!("agent_isolation_demo{}", std::env::consts::EXE_SUFFIX)))
+        .output()
+        .expect("run the demo; `cargo build --examples` must have run first");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // The demo grades itself and reports the grade in its exit status. Running it is the point.
+    assert!(
+        out.status.success(),
+        "the demo reported failure. Its verdicts are computed, so this is a real regression in one \
+         of the ten criteria, not a formatting change:\n{text}"
+    );
+
+    // `   3. AS OF BRANCH reads ...    MET`
+    let mut printed: Vec<(u32, String)> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some((num, rest)) = t.split_once('.') else { continue };
+        let Ok(n) = num.trim().parse::<u32>() else { continue };
+        if !(1..=10).contains(&n) {
+            continue;
+        }
+        for verdict in ["NOT MET", "PARTIAL", "MET"] {
+            if rest.trim_end().ends_with(verdict) {
+                printed.push((n, verdict.to_string()));
+                break;
+            }
+        }
+    }
+    assert_eq!(printed.len(), 10, "the demo did not print ten verdicts:\n{text}");
+
+    // `| 3 | ... | **MET** |`
+    let demo_md = std::fs::read_to_string(root.join("DEMO.md")).expect("read DEMO.md");
+    let mut documented: Vec<(u32, String)> = Vec::new();
+    for line in demo_md.lines() {
+        if !line.starts_with("| ") {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() < 4 {
+            continue;
+        }
+        let Ok(n) = cells[1].parse::<u32>() else { continue };
+        let verdict = cells[3].trim_matches('*').trim().to_string();
+        if !verdict.is_empty() {
+            documented.push((n, verdict));
+        }
+    }
+    assert_eq!(
+        documented.len(),
+        10,
+        "DEMO.md's table no longer has ten rows this test can read. If the table moved or changed \
+         shape, update this test rather than leaving it matching nothing."
+    );
+
+    printed.sort();
+    documented.sort();
+    assert_eq!(
+        documented, printed,
+        "DEMO.md's table disagrees with what the demo prints. The table is a transcription of a \
+         computed result, so the demo is right and the document is stale.\n--- demo ---\n{text}"
+    );
+
+    // The totals sentence is a second copy of the same result and drifts independently of the rows.
+    let met = printed.iter().filter(|(_, v)| v == "MET").count();
+    let partial = printed.iter().filter(|(_, v)| v == "PARTIAL").count();
+    let not_met = printed.iter().filter(|(_, v)| v == "NOT MET").count();
+    let totals = format!("**{met} MET, {partial} PARTIAL, {not_met} NOT MET.**");
+    assert!(
+        demo_md.contains(&totals),
+        "DEMO.md does not state the totals the demo computed. Expected to find {totals:?}"
+    );
+}
