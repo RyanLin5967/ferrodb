@@ -34,8 +34,27 @@ impl Modify for Update {
     }
 
     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>{
-        if self.assignments.iter().any(|(col, _)| *col == 0) {
-            return Err(FerroError::Parse("can't update primary key".into()));
+        // **E65 — a semantic refusal, reported as one, with a way forward.**
+        //
+        // This said `FerroError::Parse("can't update primary key")`, which was wrong twice. The
+        // statement parses fine and is refused on a rule about the data model, so anyone triaging
+        // logs by error kind filed it with malformed SQL; and the message named no alternative.
+        //
+        // The restriction itself stays. Rewriting a primary key means moving every index entry that
+        // points at the row and checking uniqueness against two keys at once - the old one being
+        // vacated and the new one being claimed - and this executor does neither. Refusing is the
+        // correct trade. Refusing without saying what to do instead is not, especially now that
+        // there IS something to do: as of E63 a deleted key can be used again, so DELETE-then-INSERT
+        // is a real remedy rather than advice that would have failed.
+        if let Some((col, _)) = self.assignments.iter().find(|(col, _)| *col == 0) {
+            return Err(FerroError::Constraint(format!(
+                "column '{}' of '{}' is the primary key and cannot be updated: moving a key means \
+                 moving every index entry that points at the row and checking uniqueness against \
+                 both the old and the new key at once. DELETE the row and INSERT it under the new \
+                 key instead.",
+                self.schema.columns.get(*col).map(|c| c.name.as_str()).unwrap_or("?"),
+                self.table
+            )));
         }
         let mut res = Vec::new();
         loop {
