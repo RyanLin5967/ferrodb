@@ -138,8 +138,19 @@ impl Modify for Insert {
             prov.stamp(rid, *id)?;
         }
         self.primary_index.insert(vals[0].clone(), rid)?;
+        // **E66 — the same de-duplication UPDATE needs, on the path E63 opened.**
+        //
+        // DELETE leaves a secondary entry behind on purpose (see `execution::update`: an older
+        // snapshot still has to find the row by its value). Reusing the primary key with the SAME
+        // indexed value therefore lands on an entry that already exists, and `insert_entry` appends
+        // rather than overwrites - so the index gained a second identical pair and every lookup
+        // through it returned the row twice. Measured before this guard: `DELETE id=4; INSERT (4,40)`
+        // gave two `(40, 4)` entries and a lookup for 40 returned `[[4, 40], [4, 40]]`.
         for sec_idx in &self.secondary_indexes {
-            sec_idx.tree.insert((vals[sec_idx.col_index].clone(), vals[0].clone()), ())?;
+            let key = (vals[sec_idx.col_index].clone(), vals[0].clone());
+            if sec_idx.tree.search(&key)?.is_none() {
+                sec_idx.tree.insert(key, ())?;
+            }
         }
         sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
         Ok(1)
