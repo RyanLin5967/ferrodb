@@ -4,8 +4,14 @@
 //!
 //! **Provenance is an interned slot, not a fat header.** The actor tuple has *run-level*
 //! cardinality — it is constant across every row a run writes — so storing it literally per
-//! version costs roughly 3.4x density for nothing. Each version carries a small [`ProvId`] into a
-//! page-local dictionary that points at one reified [`RunEntity`].
+//! version is pure waste. Each version carries a small [`ProvId`] into a page-local dictionary that
+//! points at one reified [`RunEntity`].
+//!
+//! The cost is measured rather than quoted, by
+//! `store::tests::the_density_numbers_the_docs_quote_are_the_numbers_this_computes`: the tuple is
+//! **101 bytes** against a **1-byte** slot, so 200 versions cost 20,200 bytes literal against 204
+//! interned — **99x**. This header previously said "roughly 3.4x density", which was the
+//! row-inflation figure for an unstated ~40-byte row, and was measured nowhere.
 
 pub mod capture;
 pub mod readset;

@@ -220,7 +220,12 @@ no client cooperation whatsoever**. `BranchId` carries a generation counter, so 
 never be mistaken for a live one — reading a reaped branch is a hard error, never stale data.
 
 **2. Provenance and read-sets.** The actor tuple (agent, run, model, model version, prompt hash) has
-*run-level* cardinality, so storing it per row version is ~3.4x density loss for nothing. It is
+*run-level* cardinality — it is constant across every row a run writes — so storing it literally per
+version is pure waste. **Measured, not asserted** (`store.rs::the_density_numbers_the_docs_quote_are_the_numbers_this_computes`):
+the tuple is **101 bytes**, against a **1-byte** slot plus a one-entry page dictionary, so 200
+versions cost **20,200 bytes literal against 204 interned — 99x**. The figure this section used to
+quote (~3.4x) was the *row-inflation* number and depended on a row size nobody stated: the same
+tuple inflates a 24-byte version by 5.2x, a 40-byte one by 3.5x and a 100-byte one by 2.0x. It is
 interned: a page-local dictionary slot points at a reified `RunEntity`. Read-sets are retained too,
 in a form chosen by **access shape** rather than size — point lookups keep exact version ids, scans
 keep a predicate summary. Retaining reads is what makes causal rollback possible: reverting write A

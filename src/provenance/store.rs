@@ -367,6 +367,55 @@ mod tests {
         assert_eq!(s.page_dictionary_len(1), 1);
     }
 
+    /// **The numbers the docs quote, computed here so they cannot drift into folklore.**
+    ///
+    /// `~3.4x density loss` was asserted in three places — this module's header, the README and the
+    /// demo — and measured in none. It is not wrong, but it is the *row-inflation* figure and it
+    /// silently depends on a row size nobody stated: the same tuple inflates a 24-byte version by
+    /// 5.2x and a 100-byte one by 2.0x. A reader could not have checked it.
+    ///
+    /// So both quantities are pinned. Exact equality on the tuple size is deliberate: it is a
+    /// number the prose quotes, so changing `RunEntity` should fail here and force the prose to be
+    /// updated rather than silently becoming false.
+    #[test]
+    fn the_density_numbers_the_docs_quote_are_the_numbers_this_computes() {
+        let e = run("restock-agent", "run-42");
+        assert_eq!(
+            e.literal_footprint(),
+            101,
+            "the actor tuple's literal size changed. The README, this module's header and the demo \
+             all quote it - update them together with this number."
+        );
+
+        let s = MemProvenanceStore::new();
+        let id = s.intern(&e).unwrap();
+        for slot in 0..200u16 {
+            s.stamp(rid(1, slot), id).unwrap();
+        }
+        let interned = s.footprint_bytes();
+        let literal = s.literal_footprint_bytes().unwrap();
+        assert_eq!(interned, 204, "1 byte per version plus a one-entry dictionary");
+        assert_eq!(literal, 20_200, "101 bytes repeated 200 times");
+        assert_eq!(literal / interned, 99, "the ratio the docs quote for provenance bytes");
+
+        // The row-inflation figure, with the row size it depends on made explicit.
+        //
+        // Bounded rather than pinned to two decimals: the exact value is 141/40 = 3.525, and the
+        // first version of this assertion disagreed with the probe that produced it because Python
+        // rounds half-to-even (3.52) and Rust half-up (3.53). A test that encodes a rounding
+        // convention tests the convention. The prose says ~3.5x, which both agree on.
+        let inflate = |row: usize| (row + e.literal_footprint()) as f64 / row as f64;
+        assert!(
+            (inflate(40) - 3.525).abs() < 1e-9,
+            "the ~3.5x figure is a 40-byte version, and only that: {}",
+            inflate(40)
+        );
+        assert!(
+            inflate(24) > inflate(100),
+            "inflation must fall as rows grow, or the figure is not about row size at all"
+        );
+    }
+
     #[test]
     fn the_interned_slot_beats_a_literal_header_by_a_wide_margin() {
         let s = MemProvenanceStore::new();
