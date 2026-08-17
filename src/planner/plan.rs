@@ -44,7 +44,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let column_types: Vec<&crate::catalog::column::DataType> =
                 entry.schema.columns.iter().map(|c| &c.data_type).collect();
             let bound_vals = binder.bind_row_against(values, &column_types, &empty)?;
-            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles};
+            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {
