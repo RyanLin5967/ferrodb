@@ -15,7 +15,6 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::branch::types::BranchId;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;

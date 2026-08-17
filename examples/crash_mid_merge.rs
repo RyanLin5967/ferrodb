@@ -70,7 +70,7 @@ fn main() {
     let runtime = Arc::new(AgentRuntime::new());
     let mut session = Session::with_runtime(runtime);
 
-    let mut exec = |sql: &str, s: &mut Session, cat: &mut Catalog| -> Outcome {
+    let exec = |sql: &str, s: &mut Session, cat: &mut Catalog| -> Outcome {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut parser = Parser::new(tokens);
         let mut stmts = parser.parse();

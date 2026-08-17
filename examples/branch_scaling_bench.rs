@@ -40,9 +40,15 @@ const TRUNK_ROWS: u64 = 2_000;
 const READ_SAMPLES: usize = 2_000;
 
 struct Stats {
+    /// Computed and deliberately not reported, which is why it carries an allow rather than being
+    /// deleted: this benchmark reports p50 and p99 because a mean hides exactly the tail that
+    /// matters here — one slow descent in a thousand is the thing worth knowing, and averaging it
+    /// away would make a regression look like noise. Kept so a reader can see the choice was made.
+    #[allow(dead_code)]
     mean: Duration,
     p50: Duration,
     p99: Duration,
+    #[allow(dead_code)]
     max: Duration,
 }
 

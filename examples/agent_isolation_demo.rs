@@ -43,7 +43,7 @@ use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Executor, Outcome};
 use ferrodb::optimizer::optimizer::lower;
 use ferrodb::planner::physical_plan::PhysicalPlan;
-use ferrodb::provenance::{ProvId, ProvenanceStore};
+use ferrodb::provenance::{ProvId};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;

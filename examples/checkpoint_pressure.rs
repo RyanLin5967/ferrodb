@@ -26,7 +26,6 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
-use std::io::Write;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
