@@ -517,6 +517,40 @@ silently wrong *and self-consistent*, which is the worst failure a pipeline can 
   reject a stale re-insert arriving afterwards. The tombstone is what makes "gone" stick.
 - `CREATE_TABLE` events drive the destination DDL, learned in band and in log order.
 
+### Proving the feed reproduces the source, without a hardcoded expectation
+
+Everything above checks the destination against rows written into a test as a literal. That verifies
+the pipeline against what somebody typed: change the workload and the literal is what breaks, and a
+literal cannot notice a difference nobody anticipated.
+
+So the source states its own case. `table_dump` asks the source database `SELECT * FROM <table>` — the
+same question a user would ask, MVCC visibility and all — and prints the answer as JSON.
+`cdc-consumer diff` folds the feed with the same `Table.apply` the sink uses, then compares the two
+per row and per column.
+
+Run this after the sink commands above, from `cdc-consumer/`:
+
+```
+$ cargo run --example table_dump cdc_demo.db inventory > source.json
+$ go run . diff ../feed.jsonl ../source.json -key id
+MATCH 2 row(s) from 6 event(s)
+```
+
+Two rows rather than the three the sink lands, because the sink keeps a **tombstone** for the deleted
+row and the source simply does not have it — the diff compares live state to live state.
+
+The comparison is semantic, not byte for byte. Both sides decode with `UseNumber()`, so an int64 past
+2^53 keeps its exact digits; comparing the documents as bytes would fail on key order or on any
+formatting difference between a Rust writer and a Go writer, neither of which is a data problem, and a
+check that cries wolf gets switched off. The two renderers are shared rather than parallel —
+`write_table_json` uses the same `value_into` as the feed writer — so a `DECIMAL` or `TIMESTAMP` is a
+string on both sides without either tool having to know that.
+
+What it refuses, because a diff that cannot fail is decoration: an empty feed, and both sides empty.
+Two empty tables agree trivially, which is exactly the state a pipeline that delivered nothing leaves
+behind. `tests/integration_cdc_diff.rs` forces all three real failures — a wrong value, a lost
+`DELETE` leaving a row the source dropped, and a lost `INSERT` — and requires each to be named.
+
 The DuckDB destination is checked with the **`duckdb` CLI** — a different binary and a different
 build of DuckDB from the one the Go driver links — for the same reason the feed is validated by a
 separate program. On a machine with no CLI the tests fall back to a second process through the Go

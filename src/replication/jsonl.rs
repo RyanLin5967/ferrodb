@@ -229,6 +229,41 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
 ///
 /// Returns how many lines were written, so a caller can tell "wrote nothing" from "wrote
 /// something" without re-reading its own output.
+/// Render a table's live rows as one JSON array of objects — the **source** side of a diff.
+///
+/// # Why this lives here and not in the example that calls it
+///
+/// The Go consumer re-materializes a table from the change events and can dump what it built. Until
+/// now nothing produced the other half of that comparison, so "diff the re-materialized table against
+/// the source" had to be done by a test harness holding a hardcoded expectation. This is the source
+/// half, and it is in this module on purpose: it reuses [`value_into`], the **same** renderer the feed
+/// itself uses, so the two sides agree by construction rather than by two functions happening to make
+/// the same choices.
+///
+/// That matters most for the types a JSON number cannot hold. A `BigInt` past 2^53, a `Decimal` and a
+/// `Timestamp` all ship as strings in the feed; a second renderer written for this function would
+/// have had to rediscover that, and the first divergence would have looked like a data mismatch in
+/// the pipeline rather than a formatting difference in the tooling.
+///
+/// Row order is by the rows as given and is **not** part of the contract: the consumer indexes both
+/// sides by primary key before comparing, so ordering cannot produce a false difference.
+pub fn write_table_json<W: Write>(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    w: &mut W,
+) -> Result<usize, FerroError> {
+    let mut out = String::from("[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        row_into(columns, row, &mut out);
+    }
+    out.push(']');
+    writeln!(w, "{out}").map_err(|e| FerroError::Io(format!("write table json: {e}")))?;
+    Ok(rows.len())
+}
+
 pub fn write_feed<W: Write>(events: &[ChangeEvent], w: &mut W) -> Result<usize, FerroError> {
     let mut n = 0;
     for e in events {
