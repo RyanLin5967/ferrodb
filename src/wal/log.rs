@@ -703,6 +703,83 @@ mod tests {
         (WalManager::new(path).unwrap(), dir)
     }
 
+    /// **A corrupted record is refused, not returned.**
+    ///
+    /// Found by a mutation sweep: replacing this CRC check with `if false` left all 821 tests green.
+    /// The page checksum's equivalent mutation was caught, so the gap was specifically the WAL — the
+    /// substrate durability rests on. Nothing in the suite had ever handed the reader a damaged
+    /// record, so the database's ability to notice damage at all was unverified.
+    #[test]
+    fn a_record_whose_bytes_were_corrupted_is_refused() {
+        let (w, dir) = setup();
+        let lsn = w.append(1, 0, &RecKind::Begin).unwrap();
+        w.flush().unwrap();
+
+        // Anti-vacuity: it reads back cleanly before the corruption, so the refusal below is about
+        // the damage and not about this record being unreadable in the first place.
+        w.read_record(lsn).expect("an intact record was refused");
+
+        // Flip one bit inside the frame, leaving its length prefix intact so the reader still
+        // believes it has a whole record — which is precisely the case a checksum exists for.
+        let path = dir.path().join("test.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = HEADER_SIZE + 24;
+        assert!(at < bytes.len(), "the wal is too small to corrupt at a fixed offset");
+        bytes[at] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // The SAME manager, deliberately: after `flush` its buffer is drained and `start_lsn` has
+        // advanced past this record, so `read_record` takes the file path — which is the one the
+        // CRC check lives on. Reopening instead lands in the buffer branch and fails for an
+        // unrelated reason, which is how the first version of this test "passed" the wrong way.
+        let err = match w.read_record(lsn) {
+            Err(e) => e,
+            Ok(_) => panic!("a record with a corrupted body was returned as if it were valid"),
+        };
+        assert!(
+            format!("{err}").contains("crc"),
+            "it failed, but not because the checksum caught it: {err}"
+        );
+    }
+
+    /// **A torn tail truncates the log rather than being replayed.**
+    ///
+    /// The other survivor of the same sweep. `scan_valid_end` decides how much of the log recovery
+    /// is allowed to trust; if its CRC check stops working, recovery replays whatever bytes happen
+    /// to be there — which after a crash is exactly the half-written record the check exists to
+    /// stop.
+    #[test]
+    fn the_recovery_scan_stops_at_a_corrupted_record() {
+        let (w, dir) = setup();
+        for _ in 0..4 {
+            w.append(1, 0, &RecKind::Begin).unwrap();
+        }
+        w.flush().unwrap();
+
+        let path = dir.path().join("test.wal");
+        let base = w.base_lsn.load(Ordering::SeqCst);
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let clean_end = scan_valid_end(&file, base, len).unwrap();
+        assert!(clean_end > HEADER_SIZE as u64, "the undamaged scan trusted no records at all");
+        drop(file);
+
+        // Corrupt a record in the middle. Everything after it must be treated as untrustworthy,
+        // because a log is only meaningful as a prefix.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = HEADER_SIZE + 24;
+        bytes[at] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let torn_end = scan_valid_end(&file, base, len).unwrap();
+        assert!(
+            torn_end < clean_end,
+            "the scan trusted {torn_end} bytes of a log corrupted at {at}; it trusted the same \
+             {clean_end} as an undamaged one, so recovery would replay the damage"
+        );
+    }
+
     #[test]
     fn test_crc32_val() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
