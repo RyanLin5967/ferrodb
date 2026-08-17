@@ -39,3 +39,10 @@ target
 # Python bytecode from the independent wire clients in tests/pg.
 __pycache__/
 *.pyc
+
+# Personal planning and study notes. Kept on disk, out of the repository: neither is referenced by
+# any source file, test or CI step, and `plan.txt` predates the agent-isolation work entirely -
+# searching all 276 lines for "branch", "agent" or "copy-on-write" returns nothing, so it reads as
+# the plan for a different project than the one here.
+order.txt
+plan.txt
