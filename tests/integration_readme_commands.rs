@@ -30,6 +30,60 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+
+/// Refuse to test a binary older than the source it was built from.
+///
+/// `cargo test` does not rebuild examples, so a test that spawns one can silently exercise a
+/// previous build. That fooled three fire-checks in a single session; twice it reported a PASS,
+/// because a guard deleted from the source was still present in the stale binary. A check that
+/// certifies a guard at the moment it stops existing is worse than no check.
+///
+/// Both `src/` and `examples/` — watching only `src/` is what made those three invisible, since a
+/// fire-check on an example touches neither.
+fn assert_example_is_fresh(bin: &std::path::Path) {
+    let bin_time = std::fs::metadata(bin)
+        .unwrap_or_else(|e| panic!("{} is missing ({e}); run: cargo build --examples", bin.display()))
+        .modified()
+        .expect("mtime");
+    // This example's OWN source, plus `src/` because every example links the library. NOT all of
+    // `examples/`: that marked every other example's binary stale whenever any one was edited,
+    // because `cargo build --examples` only relinks what changed, and a guard that fails on
+    // unrelated edits gets switched off.
+    let own_src = bin
+        .file_stem()
+        .map(|s| std::path::Path::new("examples").join(format!("{}.rs", s.to_string_lossy())))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+    let newest = [newest_under("src"), own_src].into_iter().flatten().max();
+    if let Some(src_time) = newest {
+        assert!(
+            bin_time >= src_time,
+            "{} is older than src/ or examples/ - cargo test does not rebuild examples, so this \
+             would test a stale binary. Run: cargo build --examples",
+            bin.display()
+        );
+    }
+}
+
+fn newest_under(dir: &str) -> Option<std::time::SystemTime> {
+    fn walk(p: &std::path::Path) -> Option<std::time::SystemTime> {
+        let mut newest = None;
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            let path = e.path();
+            let t = if path.is_dir() {
+                walk(&path)
+            } else {
+                std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+            };
+            if t > newest {
+                newest = t;
+            }
+        }
+        newest
+    }
+    walk(std::path::Path::new(dir))
+}
+
 /// The repository root, from the test binary's own location.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -311,9 +365,13 @@ fn the_readmes_agent_isolation_transcript_replays_as_written() {
 #[test]
 fn demo_md_matches_what_the_demo_prints_and_the_demo_still_passes() {
     let root = repo_root();
-    let out = Command::new(root.join("target").join(if cfg!(debug_assertions) { "debug" } else { "release" })
-            .join("examples")
-            .join(format!("agent_isolation_demo{}", std::env::consts::EXE_SUFFIX)))
+    let demo = root
+        .join("target")
+        .join(if cfg!(debug_assertions) { "debug" } else { "release" })
+        .join("examples")
+        .join(format!("agent_isolation_demo{}", std::env::consts::EXE_SUFFIX));
+    assert_example_is_fresh(&demo);
+    let out = Command::new(&demo)
         .output()
         .expect("run the demo; `cargo build --examples` must have run first");
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -396,9 +454,7 @@ fn the_benchmark_refuses_to_report_debug_numbers() {
     let bin = repo_root()
         .join("target/debug/examples")
         .join(format!("branch_scaling_bench{}", std::env::consts::EXE_SUFFIX));
-    if !bin.exists() {
-        panic!("{} was not built; run cargo build --examples first", bin.display());
-    }
+    assert_example_is_fresh(&bin);
     let out = Command::new(&bin).output().expect("run the benchmark");
     let text = format!(
         "{}{}",
@@ -472,7 +528,7 @@ fn the_wal_diagnostic_refuses_without_a_wal_and_reads_a_real_one() {
     let bin = repo_root()
         .join("target/debug/examples")
         .join(format!("wal_pages{}", std::env::consts::EXE_SUFFIX));
-    assert!(bin.exists(), "{} was not built; run cargo build --examples", bin.display());
+    assert_example_is_fresh(&bin);
 
     let bare = Command::new(&bin).output().expect("run wal_pages");
     assert!(!bare.status.success(), "wal_pages accepted no arguments; it needs a WAL path");
