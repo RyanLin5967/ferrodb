@@ -9,7 +9,7 @@ pub enum TokenType {
     Identifier, String, Number, 
 
     And, Not, False, Null, Or, True, 
-    Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain,
+    Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain, Drop,
     Begin, Commit, Rollback,
 
     // agent-isolation surface (DESIGN.md section 5)
@@ -183,6 +183,9 @@ impl Scanner {
             "INTO" => TokenType::Into,
             "VALUES" => TokenType::Values,
             "CREATE" => TokenType::Create,
+            // E69: `DROP` is a real keyword now. It was an ordinary identifier, which is why
+            // `DROP TABLE t` reported "expected a statement" - the parser never saw a DROP at all.
+            "DROP" => TokenType::Drop,
             "TABLE" => TokenType::Table,
             "AND" => TokenType::And,
             "OR" => TokenType::Or,
@@ -265,9 +268,9 @@ mod tests {
     #[test]
     fn test_all_keywords() {
         use TokenType::*;
-        let toks = scan("CREATE TABLE INSERT INTO VALUES UPDATE SET DELETE INDEX ON AND OR NOT NULL TRUE FALSE");
+        let toks = scan("CREATE DROP TABLE INSERT INTO VALUES UPDATE SET DELETE INDEX ON AND OR NOT NULL TRUE FALSE");
         assert_eq!(toks, vec![
-            Create, Table, Insert, Into, Values, Update, Set, Delete, Index, On,
+            Create, Drop, Table, Insert, Into, Values, Update, Set, Delete, Index, On,
             And, Or, Not, Null, True, False, Eof
         ]);
     }

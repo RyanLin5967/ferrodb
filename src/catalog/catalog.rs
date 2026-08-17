@@ -42,7 +42,7 @@ impl Catalog {
         // reader that something is missing when the problem is that something is present.
         if self.tables.contains_key(&name) {
             return Err(FerroError::Constraint(format!(
-                "table '{name}' already exists; DROP it first or choose another name"
+                "table '{name}' already exists; DROP TABLE {name} first, or choose another name"
             )));
         }
         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
@@ -129,17 +129,40 @@ impl Catalog {
         Ok(())
     }
 
+    /// Remove a table and give back every page it allocated.
+    ///
+    /// **E69 found three gaps in this, all of them because nothing had ever called it.** It has existed
+    /// since the catalog did, and until `DROP TABLE` reached the SQL surface there was no caller at
+    /// all - so a page leak and a stale-stats bug sat here unexercised:
+    ///
+    /// - the **time-travel heap was never freed**. Every table has one (`time_travel_root`), `UPDATE`
+    ///   and `DELETE` push old versions into it, and dropping the table left all of it allocated. On a
+    ///   table with any update history that is the larger leak of the two heaps.
+    /// - `self.stats` kept the dropped table's row counts, so a table recreated under the same name
+    ///   inherited the old table's statistics and the optimizer planned against a stranger's data.
+    /// - the missing-table error was a bare `KeyNotFound`, rendering as "key wasn't found" - the exact
+    ///   contentless message E67 removed everywhere else.
+    ///
+    /// Roots are read out of the entry BEFORE it is removed, because the entry is the only record of
+    /// where those pages are.
     pub fn drop_table(&mut self, name: &str) -> Result<(), FerroError> {
-        let (heap_dir, primary_root, sec_roots) = {
-            let entry = self.tables.get(name).ok_or(FerroError::KeyNotFound)?;
-            (entry.first_directory_page_id, entry.primary_index_root, entry.indexes.iter().map(|i| i.root_page_id).collect::<Vec<_>>())
+        let (heap_dir, tt_root, primary_root, sec_roots) = {
+            let entry = self.require_table(name)?;
+            (
+                entry.first_directory_page_id,
+                entry.time_travel_root,
+                entry.primary_index_root,
+                entry.indexes.iter().map(|i| i.root_page_id).collect::<Vec<_>>(),
+            )
         };
         HeapFileManager::open(heap_dir, self.buffer_pool.clone()).free_all()?;
+        HeapFileManager::open(tt_root, self.buffer_pool.clone()).free_all()?;
         BPlusTreeManager::<Value, RecordId>::open(primary_root, self.buffer_pool.clone()).free_all()?;
         for root in sec_roots {
             BPlusTreeManager::<(Value, Value), ()>::open(root, self.buffer_pool.clone()).free_all()?;
         }
         self.tables.remove(name);
+        self.stats.remove(name);
         self.persist()?;
         Ok(())
     }
@@ -290,10 +313,15 @@ mod tests {
     use crate::catalog::column::DataType;
 
     fn setup_catalog() -> Catalog {
+        setup_catalog_with_disk().0
+    }
+
+    /// As [`setup_catalog`], keeping the `DiskManager` so a test can watch the high-water mark.
+    fn setup_catalog_with_disk() -> (Catalog, Arc<DiskManager>) {
         let file = tempfile().expect("Failed to create temporary test file");
         let disk_manager = Arc::new(DiskManager::new(file).expect("Failed to create DiskManager"));
-        let bp = Arc::new(BufferPoolManager::new(disk_manager));
-        Catalog::create(bp).unwrap()
+        let bp = Arc::new(BufferPoolManager::new(disk_manager.clone()));
+        (Catalog::create(bp).unwrap(), disk_manager)
     }
     fn create_test_schema() -> Schema {
         Schema::new(vec![
@@ -354,6 +382,70 @@ mod tests {
         catalog.create_table("users".to_string(), create_test_schema()).unwrap();
         catalog.drop_table("users").unwrap();
         assert!(catalog.get_table("users").is_none());
+    }
+
+    /// **A dropped table gives its pages back — including the time-travel heap.**
+    ///
+    /// E69: `drop_table` freed the data heap, the primary tree and every secondary tree, and **not the
+    /// time-travel heap**. Every table has one, `UPDATE` and `DELETE` push old versions into it, and
+    /// dropping the table leaked all of it. Nothing had noticed because nothing called `drop_table`
+    /// until `DROP TABLE` reached the SQL surface: it had no caller outside its own unit test, and that
+    /// test only asserted the catalog entry was gone.
+    ///
+    /// **The instrument is file growth, not a counter**, because freeing a page does not lower the
+    /// high-water mark - `high_water_does_not_regress_after_a_free` in `disk_manager` pins that
+    /// deliberately. What a leak changes is whether the NEXT table can reuse those pages. So this
+    /// builds a table, drops it, builds an identical one, and requires the file not to have grown: on
+    /// the second pass every page it needs is one the first pass returned.
+    #[test]
+    fn dropping_a_table_returns_its_pages_including_the_time_travel_heap() {
+        let (mut catalog, disk) = setup_catalog_with_disk();
+
+        // Cycle once to absorb any one-off growth (bitmap pages, the catalog's own page), so the
+        // comparison below is between two steady-state cycles rather than against a cold file.
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("t", "age").unwrap();
+        catalog.drop_table("t").unwrap();
+
+        let baseline = disk.bitmap_high_water().unwrap();
+        assert!(baseline > 0, "no pages were ever allocated, so this measures nothing");
+
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("t", "age").unwrap();
+        let peak = disk.bitmap_high_water().unwrap();
+        catalog.drop_table("t").unwrap();
+
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        catalog.create_index("t", "age").unwrap();
+        let after = disk.bitmap_high_water().unwrap();
+
+        assert_eq!(
+            after, peak,
+            "rebuilding an identical table after a DROP pushed the high-water mark from {peak} to \
+             {after}, so the drop did not return every page it took. The time-travel heap is the one \
+             that used to be missed."
+        );
+    }
+
+    /// A dropped table must not leave its statistics behind for the next table of the same name.
+    ///
+    /// E69: `drop_table` removed the entry from `self.tables` and left `self.stats` alone, so a table
+    /// recreated under the same name inherited a stranger's row counts and the optimizer planned
+    /// against them. `build_index_scan` chooses between an index and a sequential scan on exactly those
+    /// numbers.
+    #[test]
+    fn dropping_a_table_forgets_its_statistics() {
+        let mut catalog = setup_catalog();
+        catalog.create_table("t".to_string(), create_test_schema()).unwrap();
+        catalog.analyze("t").unwrap();
+        assert!(catalog.stats.contains_key("t"), "ANALYZE recorded nothing, so this is vacuous");
+
+        catalog.drop_table("t").unwrap();
+        assert!(
+            !catalog.stats.contains_key("t"),
+            "the dropped table's statistics survived it; a table recreated under this name would be \
+             planned against the old table's row counts"
+        );
     }
 
     #[test]

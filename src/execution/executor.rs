@@ -124,6 +124,38 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             }
             return Ok(Outcome::Ok)
         }
+        // E69 — the statement that makes the `DROP_TABLE` half of the feed reachable.
+        //
+        // Same shape as `CreateTable` above and for the same reasons: DDL outside a transaction, a
+        // checkpoint, then the record logged AFTER the checkpoint through `log_ddl` so it is retained
+        // rather than truncated away by the next one.
+        //
+        // The record is logged even though the catalog is already authoritative for the running
+        // database, because a consumer reading the log has no other way to learn the table is gone -
+        // and a feed that silently stops mentioning a table is indistinguishable from a table with no
+        // further changes.
+        Stmt::DropTable { table } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
+            // Read the roots before the drop: afterwards the catalog no longer knows them, and the
+            // DDL record has to name the same `dir_root` the CREATE did or a consumer cannot match
+            // the two events to one table.
+            let (dir_root, tt_root) = {
+                let entry = catalog.require_table(&table)?;
+                (entry.first_directory_page_id, entry.time_travel_root)
+            };
+            catalog.drop_table(&table)?;
+            txn.checkpoint()?;
+            txn.log_ddl(DdlRecord {
+                op: DdlOp::DropTable,
+                table: table.clone(),
+                dir_root,
+                time_travel_root: tt_root,
+                columns: Vec::new(),
+            })?;
+            return Ok(Outcome::Ok)
+        }
         Stmt::Analyze { table } => {
             catalog.analyze(&table)?;
             return Ok(Outcome::Ok)

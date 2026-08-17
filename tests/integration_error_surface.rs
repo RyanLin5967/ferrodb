@@ -23,7 +23,7 @@
 //! CREATE TABLE t (...);         -> key wasn't found                     (t already exists)
 //! CREATE INDEX ix ON t (nope);  -> key wasn't found
 //! CREATE INDEX ix ON nosuch(v); -> key wasn't found
-//! DROP TABLE t;                 -> 1 at ' DROP ' expected a statement
+//! DROP TABLE t;                 -> 1 at ' DROP ' expected a statement   (E69 implemented it)
 //! SELECT COUNT(id) FROM t;      -> 1 at ' ( ' expected FROM
 //! SELECT * FROM t ORDER BY v;   -> 1 at ' BY ' expected ;
 //! SELECT * FROM t LIMIT 1;      -> 1 at ' 1 ' expected ;
@@ -132,12 +132,16 @@ const CASES: &[(&str, &[&str])] = &[
     // Unknown column: name it, and say what is in scope.
     ("SELECT nosuchcol FROM t;", &["unknown column", "nosuchcol", "t.id", "t.v"]),
     // Something is PRESENT, not missing.
-    ("CREATE TABLE t (id INTEGER NOT NULL);", &["already exists", "'t'"]),
+    ("CREATE TABLE t (id INTEGER NOT NULL);", &["already exists", "'t'", "DROP TABLE t"]),
     // Two different mistakes that used to share one contentless message.
     ("CREATE INDEX ix2 ON t (nosuchcol);", &["nosuchcol", "no such column", "id", "v"]),
     ("CREATE INDEX ix2 ON nosuch (v);", &["unknown table", "nosuch"]),
+    // `DROP TABLE` used to be here, asserting `["DROP", "not supported"]`. E69 implemented it - the
+    // WAL, the decoder and the Go sink had carried a DROP_TABLE path all along that nothing could
+    // produce - so the case moved to what a DROP can still get wrong: an unknown table, answered by
+    // the same shared refusal as every other statement.
+    ("DROP TABLE nosuch;", &["unknown table", "nosuch", "known tables"]),
     // Valid SQL this database does not implement. Each must say so and name the feature.
-    ("DROP TABLE t;", &["DROP", "not supported"]),
     ("SELECT COUNT(id) FROM t;", &["COUNT", "not supported"]),
     ("SELECT * FROM t ORDER BY v;", &["ORDER BY", "not supported"]),
     ("SELECT * FROM t LIMIT 1;", &["LIMIT", "not supported"]),
@@ -229,6 +233,11 @@ fn the_statements_next_to_the_refusals_still_work() {
     d.sql("SELECT id FROM t;");
     d.sql("SELECT t.v FROM t;");
     d.sql("CREATE INDEX ix3 ON t (id);");
+    d.sql("CREATE TABLE t2 (id INTEGER NOT NULL);");
+    // E69: DROP is a statement now, and the duplicate-table message above recommends it - so the
+    // recommendation is executed here rather than merely asserted, the same way E65's DELETE-then-
+    // INSERT remedy is.
+    d.sql("DROP TABLE t2;");
     d.sql("CREATE TABLE t2 (id INTEGER NOT NULL);");
     // And the writes.
     d.sql("INSERT INTO t VALUES (2, 20);");
