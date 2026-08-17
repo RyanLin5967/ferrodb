@@ -372,6 +372,37 @@ mod tests {
         assert_eq!(BackupLabel::decode(&l.encode()).unwrap(), l);
     }
 
+    /// **The version header specifically.** `a_label_that_is_not_one_is_refused` covers a missing
+    /// field and a backwards window, but nothing forced the header check — and that is the one that
+    /// decides whether this parser is allowed to interpret the bytes at all.
+    ///
+    /// A backup label is durable and outlives the code that wrote it. Guessing the format of a file
+    /// whose header does not match is how a future v2 label gets read as a v1 one, with fields that
+    /// happen to parse and mean something else.
+    #[test]
+    fn a_label_without_the_version_header_is_refused_rather_than_guessed_at() {
+        // Every field present and valid; only the header is wrong. Without this the parser has all
+        // the information it needs to "succeed", which is exactly the temptation being refused.
+        let body = "start_lsn 1\nend_lsn 2\npage_count 3\n";
+        let err = BackupLabel::decode(body).expect_err("a headerless label was accepted");
+        assert!(
+            format!("{err}").contains("refusing to guess"),
+            "it was refused, but not for the reason this guard exists: {err}"
+        );
+
+        let wrong_version = format!("ferrodb backup_label v2\n{body}");
+        assert!(
+            BackupLabel::decode(&wrong_version).is_err(),
+            "a v2 label was read as a v1 one; the header check is not comparing the version"
+        );
+
+        // Anti-vacuity: the same body WITH the header decodes, so the refusals above are about the
+        // header and not about the parser rejecting everything.
+        let ok = BackupLabel::decode(&format!("ferrodb backup_label v1\n{body}"))
+            .expect("a well-formed label was refused");
+        assert_eq!((ok.start_lsn, ok.end_lsn, ok.page_count), (1, 2, 3));
+    }
+
     /// Garbage must be refused, not guessed at.
     #[test]
     fn a_label_that_is_not_one_is_refused() {

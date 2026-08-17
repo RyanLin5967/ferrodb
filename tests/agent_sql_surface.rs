@@ -713,6 +713,39 @@ fn ordinary_statements_are_unaffected_by_the_agent_surface() {
     db.ok("ROLLBACK;", &mut s);
 }
 
+/// **A second agent session on one connection is refused.**
+///
+/// Nothing forced this guard. Allowing it would silently rebind the connection to a new branch
+/// while the first one is still open and unmerged: the earlier session's writes stay on a branch
+/// nothing can now name from here, so `MERGE` would publish the wrong work and `ABANDON` would
+/// throw away the wrong branch. A caller that meant to start over should say so.
+#[test]
+fn a_second_agent_session_on_one_connection_is_refused() {
+    let mut db = Db::new();
+    db.seed();
+    let mut s = db.session();
+
+    db.ok("BEGIN AGENT SESSION AS 'first' RUN 'r1';", &mut s);
+    // Outcome has no Debug, so match rather than expect_err.
+    let err = match db.exec("BEGIN AGENT SESSION AS 'second' RUN 'r2';", &mut s) {
+        Err(e) => e,
+        Ok(_) => panic!("a second agent session opened over the first"),
+    };
+    assert!(
+        format!("{err}").contains("already open"),
+        "refused, but not by this guard: {err}"
+    );
+
+    // Anti-vacuity: the first session is still usable and still its own. A guard that left the
+    // connection in a broken state would pass the assertion above and still be wrong.
+    db.ok("INSERT INTO inventory VALUES (42, 1);", &mut s);
+    let seen = rows(db.ok("SELECT * FROM inventory;", &mut s));
+    assert!(
+        seen.iter().any(|r| format!("{r:?}").contains("42")),
+        "the surviving session could not write: {seen:?}"
+    );
+}
+
 // ---- wide and narrow numeric literals on a branch --------------------------------------------
 
 /// **The third write site.**
