@@ -81,12 +81,28 @@ ferrodb=> SELECT * FROM inv;
 (1 row)
 ```
 
-`MERGE;` publishes it, reports the outcome per row, and the result survives a restart:
+To publish it the agent has to still be in its session — a branch abandoned with its connection
+cannot be merged afterwards, and `MERGE;` on its own answers `no agent session in this connection`.
+So this is a fresh session that redoes the write and merges it. The branch is `b2` rather than `b1`
+because branch ids come from the durable catalog and do not restart:
 
 ```
+ferrodb=> BEGIN AGENT SESSION AS 'pricing' RUN 'r_2';
+agent session b_2 on b2@g0 (agent=pricing run=r_2)
+ferrodb=> INSERT INTO inv VALUES (2, 20);
+(1 row affected)
 ferrodb=> MERGE;
-m_1 b1@g0 -> b0@g0: Clean
+m_1 b2@g0 -> b0@g0: Clean
   inv.row2: Clean
+```
+
+The result survives a restart — open the database once more and both rows are there:
+
+```
+ferrodb=> SELECT * FROM inv;
+1 | 10
+2 | 20
+(2 rows)
 ```
 
 The isolation is enforced by shadow paging, not by staging rows somewhere: the agent's write copies
