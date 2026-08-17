@@ -84,9 +84,21 @@ fn example_bin(name: &str) -> PathBuf {
 
 struct Primary {
     child: Child,
+    /// Where this server's stderr landed, so a failure can quote its last words instead of
+    /// reporting an unexplained connection error.
+    stderr_path: std::path::PathBuf,
     addr: String,
     start_lsn: u64,
     durable_lsn: u64,
+}
+
+impl Primary {
+    /// Whatever the server wrote to stderr. Empty when it wrote nothing, which is
+    /// itself information: it means the process did not report why it stopped.
+    #[allow(dead_code)]
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
 }
 
 impl Drop for Primary {
@@ -98,12 +110,22 @@ impl Drop for Primary {
 
 /// Start a primary, wait for it to announce readiness rather than sleeping and hoping.
 fn start_primary(db: &Path, rows: u32) -> Primary {
+    let stderr_path = db.with_extension("stderr");
     let mut child = Command::new(example_bin("repl_primary"))
         .arg(db)
         .arg("127.0.0.1:0")
         .arg(rows.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured to a FILE, not discarded and not a pipe.
+        //
+        // Discarded is how a server-side panic reaches a reader as nothing but `connection
+        // refused`: on 2026-08-16 that cost two passes hypothesising a dial race that did not
+        // exist, while the process's own `failed printing to stdout: Broken pipe` sat in
+        // /dev/null. A pipe would be worse than a file — nothing reads it until the child is
+        // over, and an unread pipe fills its buffer and blocks the writer.
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr sink"),
+        ))
         .spawn()
         .expect("spawn primary");
 
@@ -127,6 +149,7 @@ fn start_primary(db: &Path, rows: u32) -> Primary {
     }
     Primary {
         child,
+        stderr_path,
         addr: addr.unwrap(),
         start_lsn: start.unwrap(),
         durable_lsn: durable.unwrap(),

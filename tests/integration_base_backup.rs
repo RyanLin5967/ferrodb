@@ -75,6 +75,9 @@ fn example_bin(name: &str) -> PathBuf {
 
 struct Primary {
     child: Child,
+    /// Where this server's stderr landed, so a failure can quote its last words instead of
+    /// reporting an unexplained connection error.
+    stderr_path: std::path::PathBuf,
     /// Kept open so a test can go on reading the primary's stdout after startup — E6's `SYNC_OK`
     /// arrives long after the readiness lines do.
     lines: std::io::Lines<BufReader<std::process::ChildStdout>>,
@@ -84,6 +87,15 @@ struct Primary {
     backup_dir: String,
     backup_start: u64,
     backup_end: u64,
+}
+
+impl Primary {
+    /// Whatever the server wrote to stderr. Empty when it wrote nothing, which is
+    /// itself information: it means the process did not report why it stopped.
+    #[allow(dead_code)]
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
 }
 
 impl Drop for Primary {
@@ -103,6 +115,7 @@ fn start_primary_mode(
     mode: Option<&str>,
     env: &[(&str, &str)],
 ) -> Primary {
+    let stderr_path = db.with_extension("stderr");
     let mut cmd = Command::new(example_bin("repl_primary"));
     cmd.arg(db).arg("127.0.0.1:0").arg(rows.to_string());
     if let Some(m) = mode {
@@ -113,7 +126,16 @@ fn start_primary_mode(
     }
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Captured to a FILE, not discarded and not a pipe.
+        //
+        // Discarded is how a server-side panic reaches a reader as nothing but `connection
+        // refused`: on 2026-08-16 that cost two passes hypothesising a dial race that did not
+        // exist, while the process's own `failed printing to stdout: Broken pipe` sat in
+        // /dev/null. A pipe would be worse than a file — nothing reads it until the child is
+        // over, and an unread pipe fills its buffer and blocks the writer.
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create stderr sink"),
+        ))
         .spawn()
         .expect("spawn primary");
 
@@ -153,6 +175,7 @@ fn start_primary_mode(
     }
     Primary {
         child,
+        stderr_path,
         lines,
         addr: addr.unwrap(),
         start_lsn: start.unwrap(),
