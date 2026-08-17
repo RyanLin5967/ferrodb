@@ -50,6 +50,13 @@ target
 # Cargo.lock, which is tracked and must stay that way.
 *.db.lock
 
+# Artifacts of the README's own CDC walkthrough. `out.duckdb` was already covered by `*.duckdb`,
+# added for the tests, which is the only reason it was not left lying in a clean clone alongside
+# these two. Verified no tracked file matches either pattern before adding them.
+feed.jsonl
+*.jsonl
+*.sqlite
+
 # Python bytecode from the independent wire clients in tests/pg.
 __pycache__/
 *.pyc
