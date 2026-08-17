@@ -104,7 +104,7 @@ impl Db {
         let mut p = Parser::new(tokens);
         let mut stmts = p.parse();
         if !p.errors.is_empty() {
-            return Err(ferrodb::error::FerroError::Parse(format!("{:?}", p.errors)));
+            return Err(ferrodb::error::FerroError::SqlParseError(format!("{:?}", p.errors)));
         }
         run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut self.session)
     }

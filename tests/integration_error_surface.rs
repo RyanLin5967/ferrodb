@@ -375,3 +375,104 @@ fn a_quoted_number_against_a_numeric_column_is_refused_deliberately() {
     // The unquoted form is the way through, and it works.
     d.try_sql("SELECT * FROM n WHERE dec = 2.5;").expect("the unquoted literal must still match");
 }
+
+// ---------------------------------------------------------------------------------------------
+// E71 — one error class per kind of fault, so triage by class is possible.
+// ---------------------------------------------------------------------------------------------
+//
+// `FerroError::Parse` had 41 construction sites and, once each was classified by who could cause it,
+// **not one of them was a parse failure** - real SQL problems have always used `SqlParseError`. What it
+// actually held was four unrelated things, all rendering as `parsing error:`:
+//
+//   arithmetic a user's expression could not evaluate ... "div by 0", "can't add non numbers"
+//   invariants this code maintains ................... "invalid comparison op", "row missing column at 3"
+//   bytes on disk that are wrong ..................... "invalid tag", "bad utf8", "truncated"
+//   catalog lookups belonging in Bind ................ planner::plan's "unknown table: {}"
+//
+// The third is why this is not tidying. A corrupted catalog page reported as `parsing error` is a
+// corruption nobody pages on, sitting in a log next to somebody's typo.
+//
+// Now: `Eval` for a well-formed expression whose values fail, `Internal` for a ferrodb bug, and
+// `Corruption` - deliberately loud - for damage. `Parse` is deleted rather than left empty, because a
+// variant meaning "one of four unrelated things" is how the grab-bag formed.
+
+/// **Arithmetic a user can reach is an evaluation error, not a parse error.**
+#[test]
+fn a_user_expression_that_cannot_be_evaluated_is_an_eval_error() {
+    let mut d = seeded();
+    for sql in [
+        "SELECT id / 0 FROM t;",
+        "SELECT id + v FROM t WHERE id = 1 AND (v / 0) = 1;",
+    ] {
+        let err = d.try_sql(sql).expect_err("division by zero was accepted");
+        assert!(
+            matches!(err, FerroError::Eval(_)),
+            "`{sql}` reported a value problem as {err:?}; the statement parses fine"
+        );
+        assert!(
+            format!("{err}").contains("division by zero"),
+            "the message does not say what went wrong: {err}"
+        );
+    }
+
+    // Anti-vacuity: the same shape of expression with a non-zero divisor evaluates.
+    d.try_sql("SELECT id / 1 FROM t;").expect("a valid division was refused");
+}
+
+/// **Bytes that came back wrong are reported as corruption, loudly.**
+///
+/// Driven through `decode_row` directly, which is what reads a stored row value back. Reaching it by
+/// corrupting a real page would test the buffer pool as well and would not make the class any clearer.
+#[test]
+fn bad_stored_bytes_are_reported_as_corruption() {
+    use ferrodb::agent_sql::paged_rows::{decode_row, split_row_key};
+    use ferrodb::catalog::column::Value;
+
+    // An unknown value tag, a row that ends mid-cell, and a row key of the wrong length: three ways
+    // stored bytes can be wrong, all previously "parsing error".
+    let cases: Vec<(&str, FerroError)> = vec![
+        ("unknown tag", decode_row(&[0, 1, 0xEE]).expect_err("an unknown tag decoded")),
+        ("truncated cell", decode_row(&[0, 1, 2, 0, 9]).expect_err("a truncated row decoded")),
+        ("missing cell count", decode_row(&[0]).expect_err("a row with no count decoded")),
+        ("short row key", split_row_key(&[1, 2, 3]).expect_err("a short row key split")),
+    ];
+    for (what, err) in cases {
+        assert!(
+            matches!(err, FerroError::Corruption(_)),
+            "{what} was reported as {err:?} rather than corruption"
+        );
+        assert!(
+            format!("{err}").starts_with("DATA CORRUPTION"),
+            "{what} does not read as damage: {err}"
+        );
+    }
+
+    // Anti-vacuity: a well-formed encoded row still decodes, so the above is about the bad bytes.
+    let good = ferrodb::agent_sql::paged_rows::encode_row(&[Value::Integer(7)]).expect("encode");
+    assert_eq!(decode_row(&good).expect("decode a good row"), vec![Value::Integer(7)]);
+}
+
+/// **The property that matters: nothing a user types produces `Internal` or `Corruption`.**
+///
+/// Those two classes are claims - "ferrodb has a bug" and "your data is damaged". A well-formed but
+/// wrong query must never raise either, or the classes become as meaningless as the variant they
+/// replaced. This runs the whole reachable battery and checks the class of every refusal.
+#[test]
+fn no_reachable_refusal_blames_ferrodb_or_the_disk() {
+    for (sql, _) in CASES {
+        let mut d = seeded();
+        let err = match d.try_sql(sql) {
+            Err(e) => e,
+            Ok(()) => panic!("`{sql}` was accepted"),
+        };
+        assert!(
+            !matches!(err, FerroError::Internal(_)),
+            "`{sql}` is a user mistake and was reported as a ferrodb bug: {err}"
+        );
+        assert!(
+            !matches!(err, FerroError::Corruption(_)),
+            "`{sql}` is a user mistake and was reported as data corruption - which is a page-me \
+             class: {err}"
+        );
+    }
+}

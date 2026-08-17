@@ -259,7 +259,7 @@ pub fn evaluate(expr: &BoundExpr, row: &[Value]) -> Result<Value, FerroError> {
                 TokenType::Equal | TokenType::BangEqual | TokenType::Less | TokenType::LessEqual
                 | TokenType::Greater | TokenType::GreaterEqual => compare(&l, &r, operator),
                 TokenType::And | TokenType::Or => logical(&l, &r, operator),
-                _ => Err(FerroError::Parse("invalid binary op".into()))
+                _ => Err(FerroError::Internal(format!("evaluate reached a binary operator it does not handle: {operator:?}")))
             }
         }
         BoundExpr::UnaryOp { operator, right } => {
@@ -272,25 +272,25 @@ pub fn evaluate(expr: &BoundExpr, row: &[Value]) -> Result<Value, FerroError> {
                     // wrapping it back to itself would turn the most negative timestamp in the
                     // table into itself with the opposite meaning.
                     Value::BigInt(i) => i.checked_neg().map(Value::BigInt)
-                        .ok_or_else(|| FerroError::Parse(format!("negating {i} overflows BIGINT"))),
+                        .ok_or_else(|| FerroError::Eval(format!("negating {i} overflows BIGINT"))),
                     Value::Timestamp(ms) => ms.checked_neg().map(Value::Timestamp)
-                        .ok_or_else(|| FerroError::Parse(format!("negating {ms} overflows TIMESTAMP"))),
+                        .ok_or_else(|| FerroError::Eval(format!("negating {ms} overflows TIMESTAMP"))),
                     Value::Decimal(d) => Ok(Value::Decimal(match d.strip_prefix('-') {
                         Some(rest) => rest.to_string(),
                         None => format!("-{d}"),
                     })),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(FerroError::Parse("unary minus non numeric".into()))
+                    _ => Err(FerroError::Eval(format!("unary minus needs a number, got {v:?}")))
                 },
                 TokenType::Not => match v {
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(FerroError::Parse("not on non boolean".into()))
+                    _ => Err(FerroError::Eval(format!("NOT needs a boolean, got {v:?}")))
                 },
-                _ => Err(FerroError::Parse("invalid unary op".into()))
+                _ => Err(FerroError::Internal(format!("evaluate reached a unary operator it does not handle: {operator:?}")))
             }
         }
-        BoundExpr::Column(idx) => row.get(*idx).cloned().ok_or_else(|| FerroError::Parse(format!("row missing column at {}", idx)))
+        BoundExpr::Column(idx) => row.get(*idx).cloned().ok_or_else(|| FerroError::Internal(format!("a bound expression references column {} of a row that has {}", idx, row.len())))
     }
 }
 
@@ -303,10 +303,10 @@ fn arithmetic(l: &Value, r: &Value, op: &TokenType) -> Result<Value, FerroError>
                 TokenType::Minus => a - b,
                 TokenType::Star => a * b,
                 TokenType::Slash => {
-                    if *b == 0 {return Err(FerroError::Parse("div by 0".into()))}
+                    if *b == 0 {return Err(FerroError::Eval("division by zero".into()))}
                     a/b
                 }
-                _ => return Err(FerroError::Parse("invalid arithmetic op".into()))
+                _ => return Err(FerroError::Internal(format!("`arithmetic` reached an operator it does not handle: {op:?}")))
             };
             Ok(Value::Integer(res))
         }
@@ -362,14 +362,14 @@ fn arithmetic(l: &Value, r: &Value, op: &TokenType) -> Result<Value, FerroError>
         // adding them. Routing it through f64 to make an answer appear would round exactly the
         // digits the type exists to keep, so the refusal is deliberate and says which type it is
         // refusing instead of claiming a DECIMAL is not a number.
-        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => Err(FerroError::Parse(
+        (Value::Decimal(_), _) | (_, Value::Decimal(_)) => Err(FerroError::Eval(
             "DECIMAL arithmetic is not supported: this engine stores and ships exact decimals \
              rather than computing on them, and evaluating one as a float would round away the \
              digits the type exists to preserve"
                 .into(),
         )),
 
-        _ => Err(FerroError::Parse("can't add non numbers".into()))
+        _ => Err(FerroError::Eval(format!("{op:?} needs numbers, got {l:?} and {r:?}")))
     }
 }
 
@@ -385,19 +385,19 @@ fn is_shift(op: &TokenType) -> bool {
 /// i64 extremes, `9223372036854775807 + 1` is reachable from ordinary SQL, and silently answering
 /// `-9223372036854775808` would be a wrong number reported as a success.
 fn int_arith(a: i64, b: i64, op: &TokenType) -> Result<i64, FerroError> {
-    let overflow = || FerroError::Parse(format!("64-bit integer overflow in `{a} {op:?} {b}`"));
+    let overflow = || FerroError::Eval(format!("64-bit integer overflow in `{a} {op:?} {b}`"));
     match op {
         TokenType::Plus => a.checked_add(b).ok_or_else(overflow),
         TokenType::Minus => a.checked_sub(b).ok_or_else(overflow),
         TokenType::Star => a.checked_mul(b).ok_or_else(overflow),
         TokenType::Slash => {
             if b == 0 {
-                return Err(FerroError::Parse("div by 0".into()));
+                return Err(FerroError::Eval("division by zero".into()));
             }
             // i64::MIN / -1 is the one division that overflows.
             a.checked_div(b).ok_or_else(overflow)
         }
-        _ => Err(FerroError::Parse("invalid arithmetic op".into())),
+        _ => Err(FerroError::Internal(format!("`arithmetic` reached an operator it does not handle: {op:?}"))),
     }
 }
 
@@ -407,10 +407,10 @@ fn float_arith(a: f64, b: f64, op: TokenType) -> Result<f64, FerroError> {
         TokenType::Minus => a-b,
         TokenType::Star => a * b,
         TokenType::Slash => {
-            if b == 0.0 {return Err(FerroError::Parse("div by 0".into()));}
+            if b == 0.0 {return Err(FerroError::Eval("division by zero".into()));}
             a/b
         }
-        _ => return Err(FerroError::Parse("invalid arithmetic op".into()))
+        _ => return Err(FerroError::Internal(format!("`arithmetic` reached an operator it does not handle: {op:?}")))
     })
 }
 
@@ -425,7 +425,7 @@ fn compare(l: &Value, r: &Value, op: &TokenType) -> Result<Value, FerroError> {
         TokenType::LessEqual => l <= r,
         TokenType::Greater => l > r,
         TokenType::GreaterEqual => l >= r,
-        _ => return Err(FerroError::Parse("invalid comparison op".into()))
+        _ => return Err(FerroError::Internal(format!("`compare` reached an operator it does not handle: {op:?}")))
     };
     Ok(Value::Boolean(res))
 }
@@ -444,7 +444,7 @@ fn logical(l: &Value, r: &Value, op: &TokenType) -> Result<Value, FerroError> {
             (Some(false), Some(false)) => Some(false),
             _ => None
         }
-        _ => return Err(FerroError::Parse("invalid logical op".into()))
+        _ => return Err(FerroError::Internal(format!("`logical` reached an operator it does not handle: {op:?}")))
     };
     Ok(res.map_or(Value::Null, Value::Boolean))
 }
@@ -453,7 +453,7 @@ fn as_bool_opt(v: &Value) -> Result<Option<bool>, FerroError> {
     match v {
         Value::Boolean(b) => Ok(Some(*b)),
         Value::Null => Ok(None),
-        _ => Err(FerroError::Parse("expected bool".into()))
+        _ => Err(FerroError::Eval(format!("expected a boolean, got {v:?}")))
     }
 }
 
