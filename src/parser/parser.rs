@@ -263,11 +263,73 @@ impl Parser {
                 return Err(Parser::error(self.peek(), "expected TABLE or INDEX after CREATE".into()));
             }
         } else {
+            if let Some(e) = self.unsupported_here() {
+                return Err(e);
+            }
             return Err(Parser::error(self.peek(), "expected a statement".into()));
         }
     }
 
     // SELECT vals FROM table1 AS t INNER JOIN table2 AS s ON t.x = s.y WHERE expr
+    /// **E67 — a feature this parser does not have must not read as a typo.**
+    ///
+    /// Measured 2026-08-17, through the shipped binary:
+    ///
+    /// ```text
+    /// SELECT COUNT(*) FROM t;              -> 1 at ' ( ' expected FROM
+    /// SELECT * FROM t ORDER BY v;          -> 1 at ' BY ' expected ;
+    /// SELECT * FROM t LIMIT 1;             -> 1 at ' 1 ' expected ;
+    /// DROP TABLE t;                        -> 1 at ' DROP ' expected a statement
+    /// ```
+    ///
+    /// Every one of those is valid SQL that this database does not implement, and every message says
+    /// the reader mistyped something. "expected ;" after `ORDER` is the worst of them: it points at
+    /// `BY`, which is not the problem, and invites the reader to hunt for a punctuation error in a
+    /// statement whose punctuation is correct.
+    ///
+    /// The keywords are matched by uppercased lexeme rather than by token type because none of them is
+    /// a token - the scanner has no `ORDER`, `LIMIT` or `DROP` - and that is the same idiom
+    /// `parse_select` already uses for `INNER`/`LEFT`/`RIGHT`/`FULL` just above.
+    ///
+    /// This is an ALLOWLIST of things known to be missing, so it can only ever improve a message; a
+    /// word not on it falls through to the ordinary syntax error, which is the right answer for an
+    /// actual typo. Add to it when a feature is asked for and refused.
+    fn unsupported_here(&self) -> Option<FerroError> {
+        let tok = self.peek();
+        let what = Self::unsupported_keyword(&tok.lexeme)?;
+        Some(FerroError::SqlParseError(format!(
+            "{} at ' {} ': {what} is not supported by this database",
+            tok.line, tok.lexeme
+        )))
+    }
+
+    /// SQL this parser does not implement, keyed by the word that starts it.
+    ///
+    /// **One list, two consumers, and that is the point.** `parse_table_ref` had its own denylist of
+    /// words that must not be taken as a table alias - `JOIN`, `WHERE`, `ON`, the join words - and
+    /// `ORDER`/`LIMIT`/`GROUP` were not on it. So `SELECT * FROM t ORDER BY v` parsed as "table `t`,
+    /// aliased `ORDER`" and then complained about `BY`: the reason the error pointed at a word that
+    /// was not the problem, and the reason a refusal added at the end of `parse_select` never fired,
+    /// because the keyword had already been eaten three functions earlier.
+    ///
+    /// A word added here now fixes the alias guard and the message together. Keeping them separate is
+    /// what produced a denylist missing three entries in the first place.
+    fn unsupported_keyword(lexeme: &str) -> Option<&'static str> {
+        Some(match lexeme.to_uppercase().as_str() {
+            "ORDER" => "ORDER BY",
+            "GROUP" => "GROUP BY",
+            "HAVING" => "HAVING",
+            "LIMIT" => "LIMIT",
+            "OFFSET" => "OFFSET",
+            "UNION" => "UNION",
+            "DISTINCT" => "DISTINCT",
+            "DROP" => "DROP",
+            "ALTER" => "ALTER",
+            "TRUNCATE" => "TRUNCATE",
+            _ => return None,
+        })
+    }
+
     pub fn parse_select(&mut self) -> Result<Stmt, FerroError>{
         let mut columns = Vec::new();
         loop {
@@ -277,6 +339,17 @@ impl Parser {
                 columns.push(self.expression()?);
             }
             if !self.match_token(&[TokenType::Comma]) {break;}
+        }
+        // `SELECT COUNT(id) FROM t` stops with the expression parsed as a bare column reference and
+        // the `(` still unread, so the failure surfaced as "expected FROM" - a message about the wrong
+        // token entirely. There are no functions or aggregates in this SQL surface; say that.
+        if self.check(TokenType::LeftParen) {
+            return Err(FerroError::SqlParseError(format!(
+                "{} at ' {} ': function calls and aggregates such as COUNT, SUM and AVG are not \
+                 supported by this database",
+                self.peek().line,
+                self.peek().lexeme
+            )));
         }
         self.consume(TokenType::From, "expected FROM")?;
         let main_table = self.parse_table_ref()?;
@@ -327,6 +400,11 @@ impl Parser {
         } else {
             None
         };
+        if !self.check(TokenType::Semicolon) {
+            if let Some(e) = self.unsupported_here() {
+                return Err(e);
+            }
+        }
         self.consume(TokenType::Semicolon, "expected ;")?;
         Ok(Stmt::Select { from: main_table, columns, where_clause, joins})
     }
@@ -534,7 +612,12 @@ impl Parser {
             alias = Some(self.consume(TokenType::Identifier, "expected alias")?.lexeme);
         } else if self.check(TokenType::Identifier) {
             let lexeme_upper = self.peek().lexeme.to_uppercase();
-            if !["JOIN", "WHERE", "ON", "INNER", "LEFT", "RIGHT", "FULL", "OUTER"].contains(&lexeme_upper.as_str()) {
+            // Clause keywords, plus everything `unsupported_keyword` knows about. Without the second
+            // half, `FROM t ORDER BY v` aliased the table `ORDER` and reported a problem with `BY`.
+            let is_clause_word =
+                ["JOIN", "WHERE", "ON", "INNER", "LEFT", "RIGHT", "FULL", "OUTER"]
+                    .contains(&lexeme_upper.as_str());
+            if !is_clause_word && Self::unsupported_keyword(&lexeme_upper).is_none() {
                 alias = Some(self.advance().lexeme);
             }
         }

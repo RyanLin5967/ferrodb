@@ -18,7 +18,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             Ok(Plan::Read(lower(physical, catalog, bp, view)?))
         }
         Stmt::Delete { table, where_clause } => {
-            let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
+            let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
             let (heap, tree, handles) = open_table(entry, bp.clone(), txn, txn_id)?;
             let bound_where = match where_clause {
@@ -34,7 +34,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             return Ok(Plan::Write(Box::new(delete)))
         }
         Stmt::Insert { table, values } => {
-            let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
+            let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
             let (heap, tree, handles) = open_table(entry, bp, txn, txn_id)?;
             let binder = Binder::new(catalog);
@@ -48,7 +48,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {
-            let entry = catalog.get_table(&table).ok_or(FerroError::Parse("table not found".into()))?;
+            let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
             let (heap, tree, handles) = open_table(entry, bp.clone(), txn.clone(), txn_id)?;
             let binder = Binder::new(catalog);
