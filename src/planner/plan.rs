@@ -81,7 +81,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
 
 pub fn explain(stmt: Stmt, catalog: &Catalog) -> Result<String, FerroError> {
     if !matches!(stmt, Stmt::Select { .. }) {
-        return Err(FerroError::Bind("EXPLAIN only suports SELECT".into()));
+        return Err(FerroError::Bind("EXPLAIN only supports SELECT".into()));
     }
     let logical = Binder::new(catalog).bind(stmt)?;
     let logical = pushdown(logical);
