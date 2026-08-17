@@ -87,13 +87,22 @@ fn main() {
     };
 
     let listener = TcpListener::bind(&addr).expect("bind");
-    println!("LISTENING {}", listener.local_addr().unwrap());
-    println!("DURABLE {}", ReplicationSource::new(&wal).durable_lsn());
-    println!("START {}", ReplicationSource::new(&wal).start_lsn());
-    println!("BACKUP {backup_dir}");
-    println!("BACKUP_START {}", label.start_lsn);
-    println!("BACKUP_END {}", label.end_lsn);
-    std::io::stdout().flush().unwrap();
+    // Writes that tolerate a closed pipe. `println!` PANICS on EPIPE, and a harness that reads the
+    // readiness line and then drops its reader closes this pipe underneath us. Proven on
+    // `cdc_server`: closing stdout before the first write kills it with `failed printing to stdout:
+    // Broken pipe (os error 32)` and exit 101, which is the status an intermittent CI failure
+    // reported. A server has no business dying because nobody is reading its log.
+    //
+    // Six writes here, so the exposure is the widest of the three servers: a harness that stops at
+    // LISTENING leaves five more writes to fail.
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "LISTENING {}", listener.local_addr().unwrap());
+    let _ = writeln!(out, "DURABLE {}", ReplicationSource::new(&wal).durable_lsn());
+    let _ = writeln!(out, "START {}", ReplicationSource::new(&wal).start_lsn());
+    let _ = writeln!(out, "BACKUP {backup_dir}");
+    let _ = writeln!(out, "BACKUP_START {}", label.start_lsn);
+    let _ = writeln!(out, "BACKUP_END {}", label.end_lsn);
+    let _ = out.flush();
 
     // E6: serving runs on its own thread so the main thread can WAIT for a replica ack. A primary
     // that only serves after it has finished committing can never demonstrate synchronous commit,
