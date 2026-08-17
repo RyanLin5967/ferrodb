@@ -385,3 +385,122 @@ fn demo_md_matches_what_the_demo_prints_and_the_demo_still_passes() {
         "DEMO.md does not state the totals the demo computed. Expected to find {totals:?}"
     );
 }
+
+/// **The benchmark refuses to print numbers from a debug build.**
+///
+/// That refusal is the guard standing between this repository and a quoted measurement that means
+/// nothing — debug timings are dominated by unoptimised code, and a number in a README gets quoted
+/// whether or not it was meaningful when produced. It is a behaviour, so it is pinned like one.
+#[test]
+fn the_benchmark_refuses_to_report_debug_numbers() {
+    let bin = repo_root()
+        .join("target/debug/examples")
+        .join(format!("branch_scaling_bench{}", std::env::consts::EXE_SUFFIX));
+    if !bin.exists() {
+        panic!("{} was not built; run cargo build --examples first", bin.display());
+    }
+    let out = Command::new(&bin).output().expect("run the benchmark");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "the debug build printed benchmark numbers instead of refusing:\n{text}"
+    );
+    assert!(
+        text.contains("REFUSING"),
+        "it failed, but not by refusing - so the guard may be gone and something else broke:\n{text}"
+    );
+}
+
+/// **The README's quoted benchmark number must match the committed raw output it came from.**
+///
+/// Two copies of one measurement in the repository: a sentence in the README and
+/// `bench/branch_scaling.txt`. Editing either alone is silent, and the README's own framing is
+/// "Measured rather than asserted" — a claim that only holds while the two agree.
+///
+/// This does not re-run the benchmark. The invariant it demonstrates (a fork copies no pages) is
+/// already covered by `integration_zero_copy_fork` and by the demo's criterion 1; what nothing
+/// checked was that the number in the prose is the number in the artifact.
+#[test]
+fn the_readmes_benchmark_number_matches_the_committed_raw_output() {
+    let root = repo_root();
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+    let raw = std::fs::read_to_string(root.join("bench/branch_scaling.txt"))
+        .expect("bench/branch_scaling.txt is the artifact the README quotes; it must be committed");
+
+    // `| forking copies zero data pages | 44 pages at 10, 100 and 1000 branches |`
+    let row = readme
+        .lines()
+        .find(|l| l.contains("forking copies zero data pages"))
+        .expect("the README no longer states the zero-copy fork claim; update this test");
+    let quoted: u32 = row
+        .split_whitespace()
+        .find_map(|w| w.parse::<u32>().ok())
+        .expect("no number in the README's zero-copy row");
+
+    // The idle rows of the raw table: `   10 |      idle |      44 | ...`
+    let mut idle_pages = Vec::new();
+    for line in raw.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if cells.len() > 2 && cells[1] == "idle" {
+            if let Ok(p) = cells[2].parse::<u32>() {
+                idle_pages.push(p);
+            }
+        }
+    }
+    assert_eq!(
+        idle_pages.len(),
+        3,
+        "expected three idle rows in bench/branch_scaling.txt, found {idle_pages:?}. If the \
+         benchmark's table changed shape, update this test rather than leaving it reading nothing."
+    );
+    assert!(
+        idle_pages.iter().all(|&p| p == quoted),
+        "the README says {quoted} pages but the committed benchmark output says {idle_pages:?}. \
+         One of the two was edited without the other, and the README's claim to be measured rather \
+         than asserted only holds while they agree."
+    );
+}
+
+/// `wal_pages` is a diagnostic, not a demonstration: it needs a WAL to read. Nothing ran it, so
+/// nothing would have noticed it breaking. Both halves of its contract are cheap to state.
+#[test]
+fn the_wal_diagnostic_refuses_without_a_wal_and_reads_a_real_one() {
+    let bin = repo_root()
+        .join("target/debug/examples")
+        .join(format!("wal_pages{}", std::env::consts::EXE_SUFFIX));
+    assert!(bin.exists(), "{} was not built; run cargo build --examples", bin.display());
+
+    let bare = Command::new(&bin).output().expect("run wal_pages");
+    assert!(!bare.status.success(), "wal_pages accepted no arguments; it needs a WAL path");
+
+    // A real WAL, produced by the shipped binary rather than hand-built.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("d.db");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferrodb"))
+        .arg(&db)
+        .env("FERRODB_ARENA_HEADROOM", "256")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ferrodb");
+    {
+        use std::io::Write;
+        let mut si = child.stdin.take().unwrap();
+        writeln!(si, "CREATE TABLE t (id INTEGER NOT NULL);").unwrap();
+        writeln!(si, "INSERT INTO t VALUES (1);").unwrap();
+    }
+    child.wait().expect("ferrodb");
+
+    let wal = format!("{}.wal", db.display());
+    let out = Command::new(&bin).arg(&wal).output().expect("run wal_pages on a real wal");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "wal_pages failed on a WAL this repository just wrote:\n{text}");
+    assert!(
+        text.contains("kinds:"),
+        "wal_pages produced no record-kind summary, so it read nothing:\n{text}"
+    );
+}
