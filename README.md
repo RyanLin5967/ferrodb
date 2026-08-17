@@ -410,9 +410,26 @@ double-counts every update as an insert).
 against the documented envelope using Go's `encoding/json` — which rejects `NaN` and `Infinity`
 outright — and, in `follow` mode, materialises the stream into a local table:
 
+Start a source on that port first — `cdc_server` takes the address to bind, and announces it so a
+script can wait for readiness rather than sleeping:
+
+```
+$ cargo run --example cdc_server -- follow.db 127.0.0.1:5555 20
+LISTENING 127.0.0.1:5555
+```
+
+then, from `cdc-consumer/`:
+
 ```
 $ go run . follow 127.0.0.1:5555 -key id
+CURSOR 5162
+COLUMNS id,item,qty
+TABLE [{"id":1,"item":"item1","qty":10}, ... {"id":20,"item":"item20","qty":2000}]
 ```
+
+The workload inserts 20 rows and updates every fifth, so `qty` is `id * 10` except at 5, 10, 15 and
+20, where it is `id * 100` — which is what makes the materialised table checkable rather than merely
+well-formed.
 
 The tests judge the feed by comparing that materialised table against the source, so a feed that is
 well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
@@ -454,10 +471,21 @@ arithmetic, and its text cannot exceed 65535 bytes (the row encoding's length pr
 A change feed nobody lands anywhere is a demo. `cdc-consumer sink` writes it into a destination
 database — SQLite for an operational replica, DuckDB for the analysts' copy:
 
+Produce a feed first, then land it. Note the `../`: the feed is written at the repository root and
+`go run .` runs inside `cdc-consumer/`, so the path a reader needs is not the bare `feed.jsonl` this
+section used to show — that command fails with `open feed.jsonl: no such file or directory`.
+
 ```
-$ go run . sink feed.jsonl -db out.sqlite -key id                  # default engine
-$ go run . sink feed.jsonl -db out.duckdb -key id -engine duckdb
+$ cargo run --example cdc_feed > feed.jsonl        # at the repository root
+$ cd cdc-consumer
+$ go run . sink ../feed.jsonl -db out.sqlite -key id                  # default engine
+applied 6, skipped 0 re-delivered
+APPLIED 6 SKIPPED 0 CURSOR 1187 TABLE inventory
+$ go run . sink ../feed.jsonl -db out.duckdb -key id -engine duckdb
 ```
+
+Six events land three rows, because the workload updates rows it already inserted — a sink that
+appended instead of upserting would leave six.
 
 Both carry the same four properties, and they are the whole point, because the feed is
 **at-least-once**: a sink will be handed the same event twice, and can be handed a stale one after a
