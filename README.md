@@ -480,7 +480,7 @@ $ cargo run --example cdc_feed > feed.jsonl        # at the repository root
 $ cd cdc-consumer
 $ go run . sink ../feed.jsonl -db out.sqlite -key id                  # default engine
 applied 6, skipped 0 re-delivered
-APPLIED 6 SKIPPED 0 CURSOR 1187 TABLE inventory
+APPLIED 6 SKIPPED 0 CURSOR <byte offset> TABLE inventory
 $ go run . sink ../feed.jsonl -db out.duckdb -key id -engine duckdb
 ```
 
