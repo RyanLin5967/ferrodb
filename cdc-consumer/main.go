@@ -464,8 +464,15 @@ type changeSink interface {
 	// apply writes one event, ignoring it if the destination already holds a newer one. The
 	// ordering guard belongs in the implementation's SQL, not in any caller.
 	apply(e *Event) error
-	saveCursor(table string, cursor uint64) error
-	cursor(table string) uint64
+	// The resume point is the COMPOSITE (commit_lsn, record lsn), not commit_lsn alone.
+	//
+	// A commit_lsn identifies a transaction, and a transaction can carry many rows — every row of a
+	// multi-row statement, and every row of a backfill snapshot, shares one. Keying idempotence on it
+	// alone made the first row of a commit advance the cursor to that commit, so every sibling then
+	// compared `<=` and was discarded as a re-delivery. Measured on a 3-row commit: one row landed,
+	// the run printed APPLIED 2 SKIPPED 2 and exited 0.
+	saveCursor(table string, commitLSN, recordLSN uint64) error
+	cursor(table string) (uint64, uint64)
 	Close() error
 }
 
@@ -535,7 +542,11 @@ func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64
 		}
 		// Events at or below what this table has already absorbed are re-deliveries. Counted rather
 		// than hidden: "skipped 40" is how an operator sees a replay happening at all.
-		if e.CommitLSN <= sink.cursor(e.Table) && !isSchema(e.Op) {
+		//
+		// Compared LEXICOGRAPHICALLY on (commit_lsn, lsn). commit_lsn alone cannot order two rows of
+		// the same commit, and treating them as equal meant discarding all but the first.
+		cc, cl := sink.cursor(e.Table)
+		if !isSchema(e.Op) && (e.CommitLSN < cc || (e.CommitLSN == cc && e.LSN <= cl)) {
 			skipped++
 			continue
 		}
@@ -548,7 +559,7 @@ func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64
 			cursor = e.CommitEndLSN
 		}
 		if !isSchema(e.Op) {
-			if serr := sink.saveCursor(e.Table, e.CommitLSN); serr != nil {
+			if serr := sink.saveCursor(e.Table, e.CommitLSN, e.LSN); serr != nil {
 				return applied, skipped, cursor, lastTable, serr
 			}
 		}

@@ -27,6 +27,28 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::catalog::catalog::Catalog;
+use ferrodb::execution::executor::run;
+use ferrodb::execution::session::Session;
+use ferrodb::parser::parser::Parser;
+use ferrodb::parser::scanner::Scanner;
+use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::wal::log::WalManager;
+use ferrodb::wal::txn::TxnManager;
+
+fn sqlite_bin() -> String {
+    for c in ["sqlite3", "/usr/bin/sqlite3", "/opt/homebrew/bin/sqlite3"] {
+        if Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            return c.to_string();
+        }
+    }
+    panic!("sqlite3 is required to read the destination independently of the driver that wrote it");
+}
 
 fn go_bin() -> String {
     for c in ["go", "/opt/homebrew/bin/go", "/usr/local/go/bin/go"] {
@@ -338,5 +360,136 @@ fn the_readmes_diff_block_runs_as_written() {
         text.contains(&documented[0]),
         "the README documents `{}` but the diff printed:\n{text}",
         documented[0]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A commit carries many rows — and that shape was missing from every sink test in the repo.
+// ---------------------------------------------------------------------------------------------
+//
+// `cdc_feed`'s workload is autocommit, so its six events have six distinct commit_lsn values: one
+// row per commit. Measured on the feed this file already produces — `{1:1, 203:1, 393:1, 587:1,
+// 916:1, 1154:1}`. So no test in the repo, including the diff above, ever landed two rows sharing a
+// commit_lsn, and the sink's idempotence key was `commit_lsn` alone.
+//
+// The consequence, measured on the shipped consumer: a 3-row commit landed ONE row, printed
+// `APPLIED 2 SKIPPED 2`, and exited 0. The first row advanced the cursor to its commit and both
+// siblings then compared `commit_lsn <= cursor` and were discarded as re-deliveries. That is the
+// backfill path too — `snapshot_table` emits its whole scan at one LSN — so the loss scaled with the
+// size of the table.
+//
+// This test exists so the shape is reachable from REAL SQL rather than only from hand-written JSON:
+// a `BEGIN; INSERT; INSERT; INSERT; COMMIT;` really does produce three events under one commit_lsn,
+// and the sink really does land all three.
+
+struct Src {
+    _dir: tempfile::TempDir,
+    catalog: Catalog,
+    wal: Arc<WalManager>,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    session: Session,
+}
+
+fn src(dir: &Path) -> Src {
+    let path = dir.join("multi.db");
+    let file = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(&path).unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let catalog = Catalog::create(bp.clone()).unwrap();
+    let wal = Arc::new(WalManager::new(dir.join("multi.wal")).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    Src {
+        _dir: tempfile::tempdir().unwrap(),
+        catalog, wal, bp, txn, session: Session::new(),
+    }
+}
+
+impl Src {
+    fn sql(&mut self, sql: &str) {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut self.session)
+            .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+    }
+}
+
+#[test]
+fn every_row_of_a_multi_row_commit_reaches_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = src(dir.path());
+
+    d.sql("CREATE TABLE m (id INTEGER NOT NULL, v INTEGER);");
+    d.sql("BEGIN;");
+    d.sql("INSERT INTO m VALUES (1, 10);");
+    d.sql("INSERT INTO m VALUES (2, 20);");
+    d.sql("INSERT INTO m VALUES (3, 30);");
+    d.sql("COMMIT;");
+
+    use std::sync::atomic::Ordering;
+    d.wal.flush().unwrap();
+    let decoder = LogicalDecoder::new(&d.catalog);
+    let out = decoder
+        .decode(&d.wal, d.wal.base_lsn.load(Ordering::SeqCst), d.wal.next_lsn.load(Ordering::SeqCst))
+        .expect("decode");
+
+    let mut buf: Vec<u8> = Vec::new();
+    write_feed(&out.events, &mut buf).expect("write feed");
+    let text = String::from_utf8(buf).unwrap();
+
+    // The premise: three row events really do share one commit_lsn. If ferrodb ever stopped batching
+    // a transaction this way, this test would silently stop testing the defect - so it is asserted.
+    let mut per_commit: std::collections::BTreeMap<u64, usize> = Default::default();
+    for line in text.lines() {
+        if !line.contains("\"op\":\"INSERT\"") {
+            continue;
+        }
+        let c = line
+            .split("\"commit_lsn\":").nth(1).expect("commit_lsn")
+            .split(|ch: char| !ch.is_ascii_digit()).next().expect("digits")
+            .parse::<u64>().expect("parse");
+        *per_commit.entry(c).or_default() += 1;
+    }
+    let widest = per_commit.values().copied().max().unwrap_or(0);
+    assert_eq!(
+        widest, 3,
+        "a BEGIN/COMMIT block did not put three inserts under one commit_lsn ({per_commit:?}), so \
+         this test is no longer exercising a multi-row commit"
+    );
+
+    let feed = dir.path().join("multi.jsonl");
+    std::fs::write(&feed, &text).unwrap();
+    let out_db = dir.path().join("multi.sqlite");
+
+    let sink = Command::new(go_bin())
+        .current_dir("cdc-consumer")
+        .args(["run", ".", "sink"])
+        .arg(&feed)
+        .arg("-db").arg(&out_db)
+        .args(["-key", "id"])
+        .output()
+        .expect("run the sink");
+    assert!(
+        sink.status.success(),
+        "the sink failed: {}{}",
+        String::from_utf8_lossy(&sink.stdout),
+        String::from_utf8_lossy(&sink.stderr)
+    );
+
+    let rows = Command::new(sqlite_bin())
+        .arg(&out_db)
+        .arg("SELECT id,v FROM m ORDER BY id;")
+        .output()
+        .expect("sqlite3");
+    let landed = String::from_utf8_lossy(&rows.stdout).replace("\r\n", "\n").trim().to_string();
+    assert_eq!(
+        landed, "1|10\n2|20\n3|30",
+        "not every row of the commit reached the destination. Rows sharing a commit_lsn are being \
+         discarded as re-deliveries, and the run still exits 0:\n  landed: {landed}\n  sink said: {}",
+        String::from_utf8_lossy(&sink.stdout).trim()
     );
 }

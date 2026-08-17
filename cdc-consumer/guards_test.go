@@ -14,6 +14,7 @@ package main
 // everything.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,5 +159,134 @@ func TestDiffRefusesAMalformedSourceDump(t *testing.T) {
 	good := write("good.json", `[{"id":1}]`)
 	if err := diffAgainstSource(feed, good, "id"); err != nil {
 		t.Fatalf("a well-formed source dump matching the feed was refused: %v", err)
+	}
+}
+
+// **A commit carries many rows, and every one of them has to land.**
+//
+// The idempotence key was `commit_lsn` alone. A commit_lsn identifies a TRANSACTION, so every row of
+// a multi-row statement — and every row of a backfill snapshot, which emits its whole scan at one
+// LSN — shares it. The first row applied and advanced the cursor to that commit; every sibling then
+// compared `commit_lsn <= cursor` and was discarded as a re-delivery.
+//
+// Measured on the shipped binary before the fix: a 3-row commit landed ONE row, printed
+// `APPLIED 2 SKIPPED 2`, and exited 0. Silent, self-consistent data loss in the direction a CDC
+// pipeline must never fail — and it is the backfill path, so it scaled with the size of the table.
+//
+// The key is now the composite (commit_lsn, record lsn), compared lexicographically.
+func TestEveryRowOfOneCommitLands(t *testing.T) {
+	dir := t.TempDir()
+	// Three rows, one transaction: same txn and commit_lsn, distinct record lsn.
+	var b strings.Builder
+	b.WriteString(`{"op":"CREATE_TABLE","txn":1,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,"table":"t","before":null,` +
+		`"after":{"columns":[{"name":"id","type":"INTEGER","nullable":false},{"name":"v","type":"INTEGER","nullable":true}]}}` + "\n")
+	for i, lsn := range []int{100, 101, 102} {
+		fmt.Fprintf(&b, `{"op":"INSERT","txn":9,"lsn":%d,"commit_lsn":100,"commit_end_lsn":103,"table":"t",`+
+			`"before":null,"after":{"id":%d,"v":%d}}`+"\n", lsn, i+1, (i+1)*10)
+	}
+	feed := filepath.Join(dir, "feed.jsonl")
+	if err := os.WriteFile(feed, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write feed: %v", err)
+	}
+
+	db := filepath.Join(dir, "out.sqlite")
+	if err := runSink(feed, db, "id", "sqlite"); err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+
+	s, err := openSink(db, "id")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("a 3-row commit landed %d row(s); rows sharing one commit_lsn are being discarded as "+
+			"re-deliveries", n)
+	}
+
+	// Replaying the same feed must still change nothing — the fix must not have bought row coverage by
+	// giving up idempotence, which is the whole reason the cursor exists.
+	if err := runSink(feed, db, "id", "sqlite"); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("recount: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("replaying the feed changed the row count to %d", n)
+	}
+
+	// And the cursor advanced to the LAST record of the commit, not the first.
+	cc, cl := s.cursor("t")
+	if cc != 100 || cl != 102 {
+		t.Fatalf("cursor is (%d, %d); expected (100, 102) — the resume point must be the last record "+
+			"absorbed, or a restart re-reads rows it already applied", cc, cl)
+	}
+}
+
+// **Two writes to ONE key inside one commit: the later record must win.**
+//
+// The cursor filter cannot decide this — both events pass it — so the answer rests entirely on the
+// `ON CONFLICT ... WHERE` clause, and a guard of `excluded._commit_lsn > _commit_lsn` is FALSE when
+// the two share a commit. The row then keeps its first value and the second write is silently
+// dropped.
+//
+// Found by mutation: deleting the lexicographic half of that clause left the whole Go suite green,
+// because every other test writes each key in its own commit. This is the case that fires.
+func TestTheLaterRecordInOneCommitWinsForTheSameKey(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.jsonl")
+	body := `{"op":"CREATE_TABLE","txn":1,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,"table":"t","before":null,` +
+		`"after":{"columns":[{"name":"id","type":"INTEGER","nullable":false},{"name":"v","type":"INTEGER","nullable":true}]}}` + "\n" +
+		`{"op":"INSERT","txn":9,"lsn":100,"commit_lsn":100,"commit_end_lsn":103,"table":"t","before":null,` +
+		`"after":{"id":1,"v":10}}` + "\n" +
+		`{"op":"UPDATE","txn":9,"lsn":101,"commit_lsn":100,"commit_end_lsn":103,"table":"t",` +
+		`"before":{"id":1,"v":10},"after":{"id":1,"v":99}}` + "\n"
+	if err := os.WriteFile(feed, []byte(body), 0o644); err != nil {
+		t.Fatalf("write feed: %v", err)
+	}
+
+	db := filepath.Join(dir, "out.sqlite")
+	if err := runSink(feed, db, "id", "sqlite"); err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	s, err := openSink(db, "id")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+
+	var v int
+	if err := s.db.QueryRow(`SELECT v FROM t WHERE id = 1`).Scan(&v); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if v != 99 {
+		t.Fatalf("the row holds v=%d; the second write of the same key in one commit was rejected "+
+			"because the ordering guard compares commit_lsn only", v)
+	}
+
+	// Anti-vacuity: a genuinely STALE write - lower commit_lsn entirely - is still rejected, so the
+	// widened guard did not simply become last-write-wins.
+	stale := filepath.Join(dir, "stale.jsonl")
+	staleBody := `{"op":"UPDATE","txn":8,"lsn":50,"commit_lsn":50,"commit_end_lsn":51,"table":"t",` +
+		`"before":{"id":1,"v":99},"after":{"id":1,"v":7}}` + "\n"
+	if err := os.WriteFile(stale, []byte(staleBody), 0o644); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM _cdc_checkpoint`); err != nil {
+		t.Fatalf("clear cursor: %v", err)
+	}
+	if _, _, _, _, err := applyFeed(s, staleBody); err != nil {
+		t.Fatalf("apply stale: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT v FROM t WHERE id = 1`).Scan(&v); err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if v != 99 {
+		t.Fatalf("a stale write from an older commit landed: v=%d", v)
 	}
 }

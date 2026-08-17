@@ -14,11 +14,11 @@ func TestQuoteIdentDoublesEmbeddedQuotes(t *testing.T) {
 	// A column named `we"ird` is a column name, not an attack, and it must round-trip. Doubling the
 	// embedded quote is the whole of SQLite's escape; getting it wrong turns a name into syntax.
 	cases := map[string]string{
-		`id`:        `"id"`,
-		`we"ird`:    `"we""ird"`,
-		`"; DROP`:   `"""; DROP"`,
-		``:          `""`,
-		`a""b`:      `"a""""b"`,
+		`id`:      `"id"`,
+		`we"ird`:  `"we""ird"`,
+		`"; DROP`: `"""; DROP"`,
+		``:        `""`,
+		`a""b`:    `"a""""b"`,
 	}
 	for in, want := range cases {
 		if got := quoteIdent(in); got != want {
@@ -72,16 +72,16 @@ func TestDecodeLineRejectsMalformedEnvelopes(t *testing.T) {
 	}
 
 	bad := map[string]string{
-		"bare NaN is not JSON":        `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"x":NaN}}`,
-		"bare Infinity is not JSON":   `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"x":Infinity}}`,
-		"unknown op":                  `{"table":"t","op":"FROBNICATE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
-		"empty table name":            `{"table":"","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
-		"INSERT carrying a before":    `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":{"id":1},"after":{"id":1}}`,
-		"DELETE carrying an after":    `{"table":"t","op":"DELETE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":{"id":1},"after":{"id":1}}`,
-		"UPDATE missing an image":     `{"table":"t","op":"UPDATE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
+		"bare NaN is not JSON":         `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"x":NaN}}`,
+		"bare Infinity is not JSON":    `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"x":Infinity}}`,
+		"unknown op":                   `{"table":"t","op":"FROBNICATE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
+		"empty table name":             `{"table":"","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
+		"INSERT carrying a before":     `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":{"id":1},"after":{"id":1}}`,
+		"DELETE carrying an after":     `{"table":"t","op":"DELETE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":{"id":1},"after":{"id":1}}`,
+		"UPDATE missing an image":      `{"table":"t","op":"UPDATE","txn":1,"lsn":1,"commit_lsn":2,"commit_end_lsn":3,"before":null,"after":{"id":1}}`,
 		"resume point not past commit": `{"table":"t","op":"INSERT","txn":1,"lsn":1,"commit_lsn":5,"commit_end_lsn":5,"before":null,"after":{"id":1}}`,
-		"trailing content":            valid + `{"extra":1}`,
-		"not an object":               `["nope"]`,
+		"trailing content":             valid + `{"extra":1}`,
+		"not an object":                `["nope"]`,
 		"CREATE_TABLE with no columns": `{"table":"t","op":"CREATE_TABLE","txn":0,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,"before":null,"after":{"columns":[]}}`,
 	}
 	for name, line := range bad {
