@@ -138,24 +138,35 @@ impl<'a> Binder<'a> {
             Stmt::Select { from, columns, where_clause, joins } => {
                 self.bind_select(from, joins, columns, where_clause)
             }
-            Stmt::Insert { .. } => {
-                todo!()
-            }
-            Stmt::Delete { .. } => {
-                todo!() 
-            }
-            Stmt::Update { .. } => {
-                todo!()
-            }
-            Stmt::CreateIndex { .. } => {
-                todo!()
-            }
-            Stmt::CreateTable { .. } => {
-                todo!()
-            }
-            Stmt::Analyze { .. } => { unreachable!() }
-            Stmt::Join { .. } => todo!(),
-            Stmt::Explain { .. } | Stmt::Begin | Stmt::Commit | Stmt::Rollback => unreachable!(),
+            // **Errors, not `todo!()`.** These arms were five `todo!()`s and two `unreachable!()`s.
+            // All seven are unreachable today - `bind` is reached only through the SELECT and
+            // EXPLAIN paths, and EXPLAIN of a non-SELECT is refused before it gets here - but a
+            // `todo!()` is a process abort, and the reason this function returns `Result` is so a
+            // caller can handle failure. The next person to route a statement kind through it
+            // should get an error like every other failure here, not a panic.
+            //
+            // DML and DDL do not become logical plans at all: the executor applies them directly,
+            // because there is nothing to optimise about "write this row here".
+            Stmt::Insert { .. }
+            | Stmt::Delete { .. }
+            | Stmt::Update { .. }
+            | Stmt::CreateIndex { .. }
+            | Stmt::CreateTable { .. } => Err(FerroError::Bind(
+                "DML and DDL are applied directly by the executor and have no logical plan; \
+                 Binder::bind takes SELECT".into(),
+            )),
+            // `Join` is not a top-level statement - a join arrives inside `Stmt::Select`'s `joins`
+            // and is bound by `bind_select`. Reaching it here means a parser change, not a query.
+            Stmt::Join { .. } => Err(FerroError::Bind(
+                "a join is bound as part of the SELECT that contains it, not on its own".into(),
+            )),
+            Stmt::Analyze { .. }
+            | Stmt::Explain { .. }
+            | Stmt::Begin
+            | Stmt::Commit
+            | Stmt::Rollback => Err(FerroError::Bind(
+                "this statement is handled by the executor, not bound into a plan".into(),
+            )),
             // Agent statements do not describe a relational plan; they are bound by
             // `bind_agent`, which resolves branch names and merge ids instead of columns.
             Stmt::BeginAgentSession { .. }
@@ -696,6 +707,36 @@ mod tests {
         assert_eq!(s.expand_star(Some("u")).unwrap(), vec![0, 1]);
         assert_eq!(s.expand_star(Some("p")).unwrap(), vec![2,3]);
         assert!(matches!(s.expand_star(Some("idk")), Err(FerroError::Bind(_))));
+    }
+
+    #[test]
+    fn every_statement_bind_does_not_plan_returns_an_error_rather_than_panicking() {
+        // These arms were `todo!()` and `unreachable!()`. Both abort the process, and `bind` returns
+        // `Result` precisely so a caller does not have to. They are unreachable through today's
+        // callers; this pins the behaviour for the next one, because a panic reached by a refactor
+        // is discovered in production and an error is discovered at the call site.
+        let (catalog, _dir) = setup();
+        let b = Binder::new(&catalog);
+        let cases = [
+            "INSERT INTO users VALUES (1, 'a');",
+            "DELETE FROM users WHERE id = 1;",
+            "UPDATE users SET name = 'b' WHERE id = 1;",
+            "CREATE TABLE t (id INTEGER NOT NULL);",
+            "CREATE INDEX ix ON users(id);",
+            "BEGIN;",
+            "COMMIT;",
+            "ROLLBACK;",
+        ];
+        for sql in cases {
+            match b.bind(parse_one(sql)) {
+                Err(_) => {}
+                Ok(_) => panic!("`{sql}` produced a logical plan; bind takes SELECT only"),
+            }
+        }
+
+        // Anti-vacuity: a SELECT still binds. Otherwise a `bind` that rejected everything would
+        // satisfy the loop above.
+        b.bind(parse_one("SELECT * FROM users;")).expect("SELECT no longer binds");
     }
 
     #[test]
