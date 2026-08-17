@@ -188,3 +188,111 @@ fn the_readmes_documented_cdc_sequence_runs_as_written() {
         "the block documents no output, so this test checked only that the commands exit zero"
     );
 }
+
+/// Pull a `ferrodb=> ` REPL transcript out of the fenced block that follows `marker`.
+///
+/// A different shape from the `$` blocks: `ferrodb=> ` lines are SQL typed at the prompt and
+/// everything else is what the prompt printed back.
+///
+/// The trailing `-- comment` on a documented line is stripped, and that is not cosmetic: the CLI
+/// splits input on `;`, so a comment sitting after the semicolon would be prepended to the NEXT
+/// statement and break the replay in a way that looks like a database bug.
+fn documented_repl(readme: &str, marker: &str) -> (Vec<String>, Vec<String>) {
+    let at = readme
+        .find(marker)
+        .unwrap_or_else(|| panic!("README no longer contains {marker:?}; update or remove this test \
+                                   rather than letting it cover nothing"));
+    let rest = &readme[at..];
+    let open = rest.find("```").expect("no fenced block after the marker");
+    let body_start = rest[open + 3..].find('\n').expect("unterminated fence") + open + 4;
+    let close = rest[body_start..].find("```").expect("unterminated fenced block") + body_start;
+
+    let mut sql = Vec::new();
+    let mut out = Vec::new();
+    for line in rest[body_start..close].lines() {
+        match line.strip_prefix("ferrodb=> ") {
+            Some(stmt) => {
+                let stmt = match stmt.find(';') {
+                    Some(i) => &stmt[..=i],
+                    None => stmt,
+                };
+                sql.push(stmt.trim().to_string());
+            }
+            None if !line.trim().is_empty() && !line.starts_with('$') => {
+                out.push(line.trim().to_string())
+            }
+            None => {}
+        }
+    }
+    assert!(!sql.is_empty(), "the block after {marker:?} contains no statements");
+    (sql, out)
+}
+
+/// **The transcript that carries the project's central claim.** Four blocks, one narrative: an
+/// agent's write is visible to itself, invisible to the next session, and lands on trunk only when
+/// a session merges it.
+///
+/// The third block was wrong when this was written, and had been since the prose around it was
+/// rewritten: it showed a bare `MERGE;` after the reader had been told to leave *without* merging,
+/// which abandons the branch. Run as documented it answered `no agent session in this connection`.
+/// Nothing caught it because nothing ran it.
+#[test]
+fn the_readmes_agent_isolation_transcript_replays_as_written() {
+    let root = repo_root();
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("shop.db");
+
+    // Each block is one CLI session, in order, against the same database — which is the narrative.
+    let blocks = [
+        // Prose, not the `$` line: that sits INSIDE the fence, so searching from it
+        // finds the CLOSING backticks and reads past the block entirely.
+        "real transcript, not an illustration",
+        "The agent's row is not there",
+        "To publish it the agent has to still be in its session",
+        "The result survives a restart",
+    ];
+
+    for marker in blocks {
+        let (sql, expected) = documented_repl(&readme, marker);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrodb"))
+            .arg(&db)
+            // A small arena floor purely so this is cheap on a filesystem without sparse files;
+            // the transcript's output does not depend on it.
+            .env("FERRODB_ARENA_HEADROOM", "256")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn ferrodb");
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            for stmt in &sql {
+                writeln!(stdin, "{stmt}").expect("write sql");
+            }
+        }
+        let out = child.wait_with_output().expect("wait for ferrodb");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            !text.contains("error:"),
+            "a statement in the documented transcript {marker:?} errored:\n{text}"
+        );
+        let mut rest = text.as_str();
+        for line in &expected {
+            match rest.find(line.as_str()) {
+                Some(i) => rest = &rest[i + line.len()..],
+                None => panic!(
+                    "the README documents this line in {marker:?} and the session did not print \
+                     it, in order:\n  {line}\n--- actual ---\n{text}"
+                ),
+            }
+        }
+        assert!(!expected.is_empty(), "block {marker:?} documents no output to check");
+    }
+}
