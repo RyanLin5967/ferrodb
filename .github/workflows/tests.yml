@@ -1,10 +1,25 @@
 name: CI
 
 on:
+  # `agent-isolation` is listed deliberately and should not be tidied away: it is the branch this
+  # project is actually developed on, and with `main` alone a push there ran NOTHING unless a pull
+  # request happened to be open at that moment. On 2026-08-16 two commits sat pushed and entirely
+  # untested because the previous PR had just been merged.
+  #
+  # That failure mode is worse than it sounds. A branch with no run for its commit does not look
+  # red — it looks like whatever the most recent unrelated run was, so a check that asks "what is
+  # the latest run on this branch" reports somebody else's success. Silence read as green.
   push:
-    branches: ["main"]
+    branches: ["main", "agent-isolation"]
   pull_request:
   workflow_dispatch: {}
+
+# One run per event per ref, newest wins. Pushing three times in a minute should not queue three
+# full matrix builds. `event_name` is in the key on purpose: without it a push would cancel the pull
+# request run for the same branch, and the PR run is the one that gates the merge.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
