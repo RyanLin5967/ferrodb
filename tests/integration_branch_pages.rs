@@ -18,7 +18,6 @@ use ferrodb::agent_sql::runtime::{row_id_of, AgentRuntime};
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::types::BranchId;
-use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;

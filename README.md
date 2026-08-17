@@ -66,7 +66,14 @@ diff b0@g0 -> b1@g0: 1 row(s)
     op RowCreate on <row>
 ```
 
-In **another** terminal, against the same database, the row does not exist:
+Now leave that session — **without** merging — and open the database again. ferrodb is
+single-writer, so this is a second session rather than a second terminal: opening the same database
+twice at once is refused, because two processes writing one database would hand the same
+copy-on-write pages to different branches. (Concurrent clients connect to the pgwire server instead,
+which shares one runtime across connections; see the branch-isolation test in
+`tests/pg/pg_agent_client.py`.)
+
+The agent's row is not there — its branch was abandoned along with the session that opened it:
 
 ```
 ferrodb=> SELECT * FROM inv;

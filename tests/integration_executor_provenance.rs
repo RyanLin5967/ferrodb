@@ -28,7 +28,7 @@ use ferrodb::optimizer::optimizer::lower;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::planner::physical_plan::PhysicalPlan;
-use ferrodb::provenance::{ProvId, ProvenanceStore};
+use ferrodb::provenance::{ProvId};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::wal::log::WalManager;
@@ -111,7 +111,7 @@ fn seeded() -> (Db, Session) {
 
 #[test]
 fn a_row_published_by_a_merge_names_the_agent_run_and_model_that_wrote_it() {
-    let (mut db, mut s) = seeded();
+    let (mut db, s) = seeded();
 
     // Unattributed before any agent touches it — and asserted, so the later attribution cannot be
     // something that was already there.

@@ -21,7 +21,6 @@
 //! because the green run tells you nothing about which kind you got. The anti-vacuity assertions at
 //! the end fail the test rather than let it pass having checked nothing.
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -196,7 +195,7 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
 
     wal.flush().unwrap();
 
-    let resume_lsn = handoff.resume_lsn;
+    let _resume_lsn = handoff.resume_lsn;
 
     // Stream from the handoff, skipping what the snapshot already had. This snapshot read `t` by
     // scanning the heap directly rather than by writing a feed, so the table is asserted through

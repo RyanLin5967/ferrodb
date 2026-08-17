@@ -46,7 +46,7 @@ fn main() {
     bp.attach_wal(wal.clone());
 
     let mut session = Session::new();
-    let mut exec = |sql: &str, cat: &mut Catalog, s: &mut Session| {
+    let exec = |sql: &str, cat: &mut Catalog, s: &mut Session| {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
         let mut p = Parser::new(tokens);
         let mut stmts = p.parse();
