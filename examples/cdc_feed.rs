@@ -28,6 +28,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let db = args.get(1).cloned().unwrap_or_else(|| "cdc_demo.db".into());
 
+    // Single-writer lock, taken before the file is opened. Two processes on one database both build
+    // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
+    // every such page still passes its checksum - so refusing here is the only detection point.
+    //
+    // Held for the whole run: `_db_lock` releases on the way out, including on an early return.
+    let _db_lock = ferrodb::storage::db_lock::DbLock::acquire(std::path::Path::new(&db))
+        .unwrap_or_else(|e| { eprintln!("cdc_feed: {e}"); std::process::exit(1); });
+
     let file = std::fs::OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
         .open(&db).expect("open db");

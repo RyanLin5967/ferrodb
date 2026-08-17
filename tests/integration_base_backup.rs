@@ -485,6 +485,15 @@ fn a_replica_killed_mid_stream_resumes_from_its_own_lsn_and_converges() {
         primary.durable_lsn
     );
 
+    // **Clear the single-writer lock the aborted run left behind.** The first replica exits without
+    // running destructors — that is what "die like a killed process" means here — so its lock file
+    // survives exactly as it would after a real kill -9, and the second run would be refused.
+    //
+    // This is the documented recovery, performed at the one moment it is provably safe: `.output()`
+    // has returned, so the child is reaped and nothing holds this database. Doing it here rather
+    // than weakening the guard keeps the guard meaning what it says.
+    let _ = std::fs::remove_file(format!("{}.lock", rdb.display()));
+
     // Second run: NO backup directory. It must pick up from the state file.
     let second = Command::new(example_bin("repl_replica"))
         .arg(&rdb)
