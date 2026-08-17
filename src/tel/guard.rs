@@ -422,6 +422,71 @@ mod tests {
     }
 
     #[test]
+    /// **A composite guard with an unknown operand is unknown, not satisfied.**
+    ///
+    /// Found by a mutation sweep. `null_operand_makes_the_guard_unknown_not_true` covers a SIMPLE
+    /// comparison, so replacing the three-valued arms of `And` and `Or` with plain booleans left the
+    /// whole suite green — the composite paths had never been exercised with a NULL.
+    ///
+    /// A guard is a PRECONDITION. `And([qty >= 5, other])` collapsing unknown to `true` admits a
+    /// write whose condition nobody could evaluate, which is the one outcome the guard exists to
+    /// prevent: "the precondition held" and "we could not tell" must not be the same answer.
+    #[test]
+    fn an_and_with_an_unknown_operand_is_unknown_not_true() {
+        // `qty` is NULL, so `qty >= 5` is unknown; the other operand is plainly true.
+        let ctx = Fixed(vec![((TableId(1), RowId(1), ColId(2)), Value::Null)]);
+        let g = Guard::holds(GuardExpr::And(vec![
+            GuardExpr::cmp(
+                GuardExpr::col(TableId(1), RowId(1), ColId(2)),
+                CmpOp::Ge,
+                GuardExpr::Literal(Value::Integer(5)),
+            ),
+            GuardExpr::Literal(Value::Boolean(true)),
+        ]));
+        assert_eq!(
+            g.expr.eval(&ctx).unwrap(),
+            Value::Null,
+            "an AND with an unevaluable operand reported a definite answer"
+        );
+        assert!(!g.check(&ctx).unwrap(), "an unknown precondition was treated as satisfied");
+
+        // Anti-vacuity: with a real value the same guard is definite, so the above is about the
+        // NULL and not about this AND never being true.
+        let known = Fixed(vec![((TableId(1), RowId(1), ColId(2)), Value::Integer(7))]);
+        assert_eq!(g.expr.eval(&known).unwrap(), Value::Boolean(true));
+        assert!(g.check(&known).unwrap());
+    }
+
+    /// The `Or` arm, and the composition that shows why conflating unknown with `false` is not
+    /// harmless: `NOT(unknown)` is unknown, but `NOT(false)` is **true**. Collapsing the two turns a
+    /// guard nobody could evaluate into one that passes.
+    #[test]
+    fn an_or_with_an_unknown_operand_is_unknown_and_not_negatable_into_true() {
+        let ctx = Fixed(vec![((TableId(1), RowId(1), ColId(2)), Value::Null)]);
+        let or = GuardExpr::Or(vec![
+            GuardExpr::cmp(
+                GuardExpr::col(TableId(1), RowId(1), ColId(2)),
+                CmpOp::Ge,
+                GuardExpr::Literal(Value::Integer(5)),
+            ),
+            GuardExpr::Literal(Value::Boolean(false)),
+        ]);
+        assert_eq!(
+            or.eval(&ctx).unwrap(),
+            Value::Null,
+            "an OR whose only non-false operand is unknown reported a definite false"
+        );
+
+        // The consequence: negating it must stay unknown rather than becoming a pass.
+        let negated = Guard::holds(GuardExpr::Not(Box::new(or)));
+        assert_eq!(
+            negated.expr.eval(&ctx).unwrap(),
+            Value::Null,
+            "NOT of an unknown became definite - a guard nobody could evaluate now passes"
+        );
+        assert!(!negated.check(&ctx).unwrap(), "an unknown precondition was treated as satisfied");
+    }
+
     fn null_operand_makes_the_guard_unknown_not_true() {
         let ctx = Fixed(vec![((TableId(1), RowId(1), ColId(2)), Value::Null)]);
         let g = qty_ge_5();
