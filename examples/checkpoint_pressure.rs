@@ -38,10 +38,25 @@ struct Db {
     bp: Arc<BufferPoolManager>,
     txn: Arc<TxnManager>,
     session: Session,
+    /// Held for as long as this database is open. Dropping it early reopens the window it exists
+    /// to close, so it lives in the struct rather than in `open`.
+    _lock: ferrodb::storage::db_lock::DbLock,
 }
 
 fn open(dir: &str, tag: &str) -> Db {
     let path = format!("{dir}/{tag}.db");
+    // Single-writer lock, taken before the file is opened. Two processes on one database both build
+    // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
+    // every such page still passes its checksum - so refusing here is the only detection point.
+    //
+    // Held for the whole run: `_db_lock` releases on the way out, including on an early return.
+    // The DATABASE, not the directory it lives in: `open` is called more than once with different
+    // tags, and a lock on the directory would refuse the second call. And the handle is returned in
+    // `Db` rather than held here, because a local would release the moment `open` returns and guard
+    // nothing at all.
+    let db_lock = ferrodb::storage::db_lock::DbLock::acquire(std::path::Path::new(&path))
+        .unwrap_or_else(|e| { eprintln!("checkpoint_pressure: {e}"); std::process::exit(1); });
+
     let file = std::fs::OpenOptions::new()
         .read(true).write(true).create(true).truncate(true)
         .open(&path).expect("open db");
@@ -50,7 +65,7 @@ fn open(dir: &str, tag: &str) -> Db {
     let wal = Arc::new(WalManager::new(format!("{path}.wal").into()).unwrap());
     let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
     bp.attach_wal(wal.clone());
-    Db { catalog, wal, bp, txn, session: Session::new() }
+    Db { catalog, wal, bp, txn, session: Session::new(), _lock: db_lock }
 }
 
 fn sql(d: &mut Db, s: &str) {

@@ -97,6 +97,20 @@ fn run(db: &Path, phase: &str, crash_after: Option<usize>) -> (bool, String) {
     };
     let out = cmd.output().expect("failed to spawn the crash harness");
     let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // **Clear the single-writer lock, because this harness simulates crashes.** `crash_mid_merge`
+    // exits with `process::exit`, which skips destructors, so its lock file survives exactly as it
+    // would after a real kill -9 — and this test reuses one database across many runs, so without
+    // this the second run of every scenario would be refused.
+    //
+    // Removing it here is not a workaround for the guard; it is the documented recovery, performed
+    // at the one moment it is provably safe. `cmd.output()` has returned, so the child is reaped and
+    // no process holds this database. That is precisely the condition the error message asks an
+    // operator to establish before deleting the file.
+    let mut lock = db.as_os_str().to_os_string();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(std::path::PathBuf::from(lock));
+
     (out.status.success(), text)
 }
 

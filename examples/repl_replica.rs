@@ -67,6 +67,14 @@ fn main() {
         }
     }
 
+    // Single-writer lock, taken before the file is opened. Two processes on one database both build
+    // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
+    // every such page still passes its checksum - so refusing here is the only detection point.
+    //
+    // Held for the whole run: `_db_lock` releases on the way out, including on an early return.
+    let _db_lock = ferrodb::storage::db_lock::DbLock::acquire(std::path::Path::new(&db))
+        .unwrap_or_else(|e| { eprintln!("repl_replica: {e}"); std::process::exit(1); });
+
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true);
     // Truncate ONLY when there is genuinely nothing to keep.

@@ -136,3 +136,86 @@ fn repl_primary_survives_a_closed_stdout() {
         &["primary.db".into(), "127.0.0.1:0".into(), "10".into()],
     );
 }
+
+/// **E45 — every binary that opens a user-named database refuses one that is already held.**
+///
+/// The single-writer lock started life on two entry points, which made it a denylist: it caught the
+/// two binaries that happened to be open in the editor that day. Measured before this test existed:
+/// with a lock file present the CLI was correctly refused while `cdc_server` opened the same
+/// database and began serving.
+///
+/// Listing them here is what turns it back into an allowlist. A new example that takes a database
+/// path and forgets the lock does not fail this test — nothing can make it — but the list is the
+/// place a reviewer looks, and every name on it is checked rather than assumed.
+#[test]
+fn every_user_path_binary_refuses_a_database_that_is_already_open() {
+    const BINARIES: &[(&str, &[&str])] = &[
+        ("cdc_server", &["127.0.0.1:0", "4"]),
+        ("repl_primary", &["127.0.0.1:0", "4"]),
+        ("repl_replica", &["127.0.0.1:0"]),
+        ("cdc_feed", &[]),
+        ("cdc_latency", &[]),
+        ("crash_mid_merge", &["seed"]),
+    ];
+
+    for (name, extra) in BINARIES {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("held.db");
+        // A lock left by a process that is not us. The pid is deliberately one nothing owns.
+        std::fs::write(format!("{}.lock", db.display()), "999999\n").unwrap();
+
+        let mut args: Vec<String> = vec![db.display().to_string()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        // **Bounded, not `.output()`.** Half of these are servers: if one fails to refuse it starts
+        // serving and never exits, and `.output()` waits for that forever. The first version of
+        // this test did exactly that — removing the lock from `cdc_server` to check the test could
+        // fail made the whole run hang instead, which is the one thing a detector must never do.
+        // Still running after the deadline IS the failure, and it is reported as one.
+        let mut child = Command::new(example_bin(name))
+            .args(&args)
+            .current_dir(dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            status = child.try_wait().expect("query the child");
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let still_running = status.is_none();
+        if still_running {
+            let _ = child.kill();
+        }
+        let mut text = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut text);
+        }
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_string(&mut text);
+        }
+        let _ = child.wait();
+
+        assert!(
+            !still_running,
+            "{name} did not refuse a database that is already held - it was still running after \
+             10s, which for a server means it opened it and started serving:\n{text}"
+        );
+        assert!(
+            !status.unwrap().success(),
+            "{name} opened a database that is already held. Two writers hand the same arena pages \
+             to different branches and every one of them still passes its checksum, so nothing \
+             downstream can detect it:\n{text}"
+        );
+        assert!(
+            text.contains("already open"),
+            "{name} failed, but not for the reason this test is about - it must refuse because the \
+             database is held, not because of an unrelated error:\n{text}"
+        );
+    }
+}
