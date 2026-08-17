@@ -21,11 +21,17 @@ fn assert_example_is_fresh(bin: &Path) {
         .unwrap_or_else(|e| panic!("{} is missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
         .expect("mtime");
-    if let Some(src_time) = walk_newest(Path::new("src")) {
+    let own_src = bin
+        .file_stem()
+        .map(|s| Path::new("examples").join(format!("{}.rs", s.to_string_lossy())))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+    let newest_source = [walk_newest(Path::new("src")), own_src].into_iter().flatten().max();
+    if let Some(src_time) = newest_source {
         assert!(
             bin_time >= src_time,
-            "{} is older than src/ — cargo test does not rebuild examples, so this would test a \
-             stale binary. Run: cargo build --examples",
+            "{} is older than src/ or examples/ — cargo test does not rebuild examples, so \
+             this would test a stale binary. Run: cargo build --examples",
             bin.display()
         );
     }

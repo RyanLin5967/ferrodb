@@ -38,9 +38,63 @@ fn example_bin(name: &str) -> PathBuf {
     }
     p.push("examples");
     p.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    assert!(p.exists(), "{} was not built; run cargo build --examples", p.display());
+    assert_example_is_fresh(&p);
     p
 }
+
+/// Refuse to test a binary older than the source it was built from.
+///
+/// `cargo test` does not rebuild examples, so a test that spawns one can silently exercise a
+/// previous build. That fooled three fire-checks in a single session; twice it reported a PASS,
+/// because a guard deleted from the source was still present in the stale binary. A check that
+/// certifies a guard at the moment it stops existing is worse than no check.
+///
+/// Both `src/` and `examples/` — watching only `src/` is what made those three invisible, since a
+/// fire-check on an example touches neither.
+fn assert_example_is_fresh(bin: &std::path::Path) {
+    let bin_time = std::fs::metadata(bin)
+        .unwrap_or_else(|e| panic!("{} is missing ({e}); run: cargo build --examples", bin.display()))
+        .modified()
+        .expect("mtime");
+    // This example's OWN source, plus `src/` because every example links the library. NOT all of
+    // `examples/`: that marked every other example's binary stale whenever any one was edited,
+    // because `cargo build --examples` only relinks what changed, and a guard that fails on
+    // unrelated edits gets switched off.
+    let own_src = bin
+        .file_stem()
+        .map(|s| std::path::Path::new("examples").join(format!("{}.rs", s.to_string_lossy())))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+    let newest = [newest_under("src"), own_src].into_iter().flatten().max();
+    if let Some(src_time) = newest {
+        assert!(
+            bin_time >= src_time,
+            "{} is older than src/ or examples/ - cargo test does not rebuild examples, so this \
+             would test a stale binary. Run: cargo build --examples",
+            bin.display()
+        );
+    }
+}
+
+fn newest_under(dir: &str) -> Option<std::time::SystemTime> {
+    fn walk(p: &std::path::Path) -> Option<std::time::SystemTime> {
+        let mut newest = None;
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            let path = e.path();
+            let t = if path.is_dir() {
+                walk(&path)
+            } else {
+                std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+            };
+            if t > newest {
+                newest = t;
+            }
+        }
+        newest
+    }
+    walk(std::path::Path::new(dir))
+}
+
 
 /// Spawn `name`, close its stdout before it writes anything, and require it not to die of EPIPE.
 ///

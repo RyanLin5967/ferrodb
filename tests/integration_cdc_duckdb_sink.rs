@@ -165,8 +165,14 @@ fn example_bin(name: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("{} missing ({e}); run: cargo build --examples", bin.display()))
         .modified()
         .unwrap();
-    if let Some(src) = walk_newest(Path::new("src")) {
-        assert!(bin_time >= src, "{} is older than src/; run: cargo build --examples", bin.display());
+        let own_src = bin
+        .file_stem()
+        .map(|s| Path::new("examples").join(format!("{}.rs", s.to_string_lossy())))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+    let newest_source = [walk_newest(Path::new("src")), own_src].into_iter().flatten().max();
+    if let Some(src) = newest_source {
+        assert!(bin_time >= src, "{} is older than src/ or examples/; run: cargo build --examples", bin.display());
     }
     bin
 }
