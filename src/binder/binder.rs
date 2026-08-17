@@ -79,25 +79,61 @@ impl Scope {
         Ok(())
     }
 
+    /// Every column in scope, as `table.column`, for an error that has to say what IS available.
+    ///
+    /// E67: the three refusals below used to read `unknown column`, `ambiguous column` and - the worst
+    /// message in the whole SQL surface - `not found`. Measured 2026-08-17: `SELECT nosuchcol FROM t`
+    /// answered `error: binding error: not found`, naming neither the column, nor the table, nor
+    /// anything a reader could act on, while the sibling refusal one level up already said
+    /// `unknown table 'nosuch'; known tables are: t`. Same shape of mistake, opposite quality.
+    fn in_scope(&self) -> String {
+        if self.columns.is_empty() {
+            return "none".into();
+        }
+        self.columns
+            .iter()
+            .map(|c| format!("{}.{}", c.qualifier, c.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     // qualified (Some) or bare (None) column -> index, checks for unknown table/column
     pub fn resolve(&self, table: Option<&str>, column: &str) -> Result<usize, FerroError>{
-        if table.is_some() {
-            if let Some(idx) = self.columns.iter().position(|c| c.qualifier == table.expect("") && c.name == column) {
+        if let Some(qualifier) = table {
+            if let Some(idx) = self.columns.iter().position(|c| c.qualifier == qualifier && c.name == column) {
                 Ok(idx)
             } else {
-                return Err(FerroError::Bind("unknown column".into()))
+                return Err(FerroError::Bind(format!(
+                    "unknown column '{qualifier}.{column}'; columns in scope are: {}",
+                    self.in_scope()
+                )))
             }
         } else {
             let mut found = None;
             for (i, col) in self.columns.iter().enumerate() {
                 if col.name == column {
                     if found.is_some() {
-                        return Err(FerroError::Bind("ambiguous column".into()))
-                    } 
+                        // Naming the candidates is the whole point here: the fix is to qualify the
+                        // reference, and the reader needs to know which qualifiers to choose between.
+                        let candidates = self
+                            .columns
+                            .iter()
+                            .filter(|c| c.name == column)
+                            .map(|c| format!("{}.{}", c.qualifier, c.name))
+                            .collect::<Vec<_>>()
+                            .join(" and ");
+                        return Err(FerroError::Bind(format!(
+                            "column '{column}' is ambiguous - it could be {candidates}; qualify it \
+                             with the table name"
+                        )))
+                    }
                     found = Some(i)
                 }
             }
-            found.ok_or(FerroError::Bind("not found".into()))
+            found.ok_or_else(|| FerroError::Bind(format!(
+                "unknown column '{column}'; columns in scope are: {}",
+                self.in_scope()
+            )))
         }
     }
 
@@ -313,28 +349,11 @@ impl<'a> Binder<'a> {
                 b.name
             )));
         }
-        let table_entry = match self.catalog.get_table(&table.name) {
-            Some(t) => t,
-            None => {
-                // This said `"unknown table: {}"` as a LITERAL — no `format!`, so it printed the
-                // braces and never named the table. Every other site in the codebase formats it.
-                let mut known: Vec<&str> = self.catalog.tables.keys().map(|s| s.as_str()).collect();
-                known.sort_unstable();
-                return Err(FerroError::Bind(if known.is_empty() {
-                    format!(
-                        "unknown table '{}'; this database has no tables yet — CREATE TABLE one \
-                         first",
-                        table.name
-                    )
-                } else {
-                    format!(
-                        "unknown table '{}'; known tables are: {}",
-                        table.name,
-                        known.join(", ")
-                    )
-                }));
-            }
-        };
+        // This said `"unknown table: {}"` as a LITERAL - no `format!`, so it printed the braces and
+        // never named the table. It was then fixed here and nowhere else, which is how INSERT, UPDATE
+        // and DELETE ended up answering the SAME condition with `parsing error: table not found`
+        // (E67). The message now lives on `Catalog`, next to the list it has to print.
+        let table_entry = self.catalog.require_table(&table.name)?;
         let qualifier = table.alias.clone().unwrap_or_else(|| table.name.clone());
         scope.add_table(&qualifier, &table_entry.schema)?;
         let output = table_entry.schema.columns.iter().map(|c| BoundColumn {

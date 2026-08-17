@@ -37,8 +37,13 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
+        // E67: this was `FerroError::KeyNotFound`, so creating a table that already exists answered
+        // `error: key wasn't found` - a storage-layer message, for a name collision, telling the
+        // reader that something is missing when the problem is that something is present.
         if self.tables.contains_key(&name) {
-            return Err(FerroError::KeyNotFound);
+            return Err(FerroError::Constraint(format!(
+                "table '{name}' already exists; DROP it first or choose another name"
+            )));
         }
         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
         let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
@@ -60,17 +65,48 @@ impl Catalog {
         self.tables.get(name)
     }
 
+    /// The one refusal for "there is no such table", so every statement gives the same answer.
+    ///
+    /// E67 measured the alternative. `SELECT * FROM nosuch` said
+    /// `unknown table 'nosuch'; known tables are: t`, while `INSERT INTO nosuch`, `UPDATE nosuch` and
+    /// `DELETE FROM nosuch` all said `parsing error: table not found` - wrong error class for a
+    /// catalog lookup, and naming nothing. One condition, two qualities of answer, because the good
+    /// message lived in the binder and the planner had its own literal. This is that message, moved
+    /// to where the table list actually is so there is nothing left to reimplement.
+    pub fn unknown_table(&self, name: &str) -> FerroError {
+        let mut known: Vec<&str> = self.tables.keys().map(|s| s.as_str()).collect();
+        known.sort_unstable();
+        FerroError::Bind(if known.is_empty() {
+            format!("unknown table '{name}'; this database has no tables yet — CREATE TABLE one first")
+        } else {
+            format!("unknown table '{name}'; known tables are: {}", known.join(", "))
+        })
+    }
+
+    /// `table` if it exists, or the shared refusal above.
+    pub fn require_table(&self, name: &str) -> Result<&TableEntry, FerroError> {
+        self.get_table(name).ok_or_else(|| self.unknown_table(name))
+    }
+
     // create a secondary B+ tree, push an IndexInfo onto the table, persist
     pub fn create_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
         let (schema, first_dir_page_id, col_index) = {
-            let entry = self.tables.get(table).ok_or(FerroError::KeyNotFound)?;
+            // E67: both of these were bare `KeyNotFound`, so `CREATE INDEX ix ON nosuch (v)` and
+            // `CREATE INDEX ix ON t (nosuchcol)` - two different mistakes - produced the identical
+            // contentless `error: key wasn't found`. The table case now reuses the shared refusal, so
+            // it lists the tables that do exist exactly as SELECT does.
+            let entry = self.tables.get(table).ok_or_else(|| self.unknown_table(table))?;
 
             if entry.indexes.iter().any(|ind| ind.column_name == column) {
                 return Err(FerroError::IndexAlreadyExists);
             }
             let col_index = entry.schema.columns.iter()
                 .position(|c| c.name == column)
-                .ok_or(FerroError::KeyNotFound)?;  // column must exist
+                .ok_or_else(|| FerroError::Bind(format!(
+                    "cannot index '{table}.{column}': no such column. '{table}' has: {}",
+                    entry.schema.columns.iter()
+                        .map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                )))?;
 
             (entry.schema.clone(), entry.first_directory_page_id, col_index)
         };
@@ -297,8 +333,19 @@ mod tests {
         assert!(table.first_directory_page_id > 0);
         assert!(table.primary_index_root > 0);
         assert!(table.indexes.is_empty());
+        // E67 changed this variant deliberately: creating a table that exists used to answer
+        // `KeyNotFound`, which renders as "key wasn't found" - something is MISSING - for a condition
+        // where something is present. The assertion is stronger than it was, not weaker: it now pins
+        // the class AND requires the message to name the table the caller collided with.
         let duplicate_res = catalog.create_table("users".to_string(), create_test_schema());
-        assert!(matches!(duplicate_res, Err(FerroError::KeyNotFound)));
+        let err = duplicate_res.expect_err("a duplicate table name was accepted");
+        assert!(
+            matches!(err, FerroError::Constraint(_)),
+            "a name collision must not be reported as a missing key: {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("'users'"), "the refusal does not name the table: {msg}");
+        assert!(msg.contains("already exists"), "the refusal does not say what is wrong: {msg}");
     }
 
     #[test]
