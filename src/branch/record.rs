@@ -651,6 +651,14 @@ impl From<CapabilityRefusal> for FerroError {
 /// full-text index, and drop it. Demonstrated verb by verb, against a forbidden table, by
 /// `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap`.
 ///
+/// **None of that is a read escalation, because there is nothing to escalate.** The envelope has no
+/// read dimension at all — [`Verb`] is `Insert | Update | Delete`, [`CapabilityEnvelope::admit`]
+/// decides on row images, and it is consulted on the write path only. A governed branch can already
+/// `SELECT` every row of a table it may not write. What the ungoverned DDL adds is authority over
+/// shared *structure*, and, through `DROP TABLE` + `CREATE TABLE`, authority over what the
+/// branch's own grant points at — see
+/// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns`.
+///
 /// That single funnel is also a premise rather than a guarantee, and B11's branch-scoped
 /// `ALTER TABLE` breaks it: it reaches a branch's own staged state through `stage_schema_edit`, not
 /// through `stage_all`, so no envelope check runs. `ALTER` is not in this tree yet;
