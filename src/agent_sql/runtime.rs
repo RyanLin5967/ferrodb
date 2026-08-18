@@ -33,7 +33,9 @@ use crate::agent_sql::merge_engine::{
     CellState, PolicyTable,
 };
 use crate::agent_sql::escrow::EscrowLedger;
-use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::gate::{AssertionResult, GateOutcome};
+use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
@@ -90,7 +92,11 @@ pub fn table_id(name: &str) -> TableId {
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv64_update(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+/// FNV-1a, resumable, so a fingerprint can be folded over many pieces without concatenating them.
+fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -388,6 +394,18 @@ impl AgentRuntime {
                 "this runtime has no page store; build it with AgentRuntime::with_storage".into(),
             )
         })
+    }
+
+    /// Pages the store currently holds, when this runtime is page-backed.
+    ///
+    /// `None` — no page store — is deliberately not `Some(0)`. Exit criteria 1 and 8 are both
+    /// stated as page counts, and a measurement of a store that does not exist reading as zero is
+    /// how "the fork copied nothing" becomes a fact about the instrument instead of the database.
+    pub fn live_page_count(&self) -> Result<Option<u32>, FerroError> {
+        match &self.storage {
+            Some(rows) => Ok(Some(rows.tree().store().live_page_count()?)),
+            None => Ok(None),
+        }
     }
 
     /// The page a branch's rows currently hang off.
@@ -1334,6 +1352,19 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Three-way merge of a branch into its parent, published if the gate admits it. Exit
+    /// criteria 5, 6 and 7.
+    ///
+    /// **This function is policy; the mechanism is [`AgentRuntime::evaluate_merge`].** Scoring a
+    /// merge — composing the ops, re-checking the guards, running the verification gate — touches
+    /// nothing at all, and lives there. What is left here is the two decisions only a production
+    /// merge makes: hold a branch the gate declined, and leave a conflicting branch alive so the
+    /// agent can retry against the predicate it was handed.
+    ///
+    /// A caller that wants the verdict without the consequences (`SIMULATE` scoring K candidate
+    /// branches against one base) calls `evaluate_merge` directly and never reaches this function
+    /// for the candidates it does not admit. That is the whole point of the split: the score of
+    /// candidate 2 must not have been computed against a base candidate 1 already moved.
     pub fn merge(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<MergeReport, FerroError> {
         // A held branch is held. Letting a merge through would make quarantine advisory, and an
         // advisory hold is not a hold.
@@ -1343,6 +1374,77 @@ impl AgentRuntime {
                 self.quarantine_reason(branch).unwrap_or_else(|| "no reason recorded".into())
             )));
         }
+
+        // No assertions: a production merge is scored by the gate's own checks. `SIMULATE` adds
+        // declared invariants to this same list rather than scoring anywhere else.
+        let eval = self.evaluate_merge(ctx, branch, &[])?;
+        let merge_id = self.next_merge_id();
+
+        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
+        //
+        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
+        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
+        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
+        // retrying blindly would recompute against a base that may move again.
+        //
+        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
+        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
+        // the safe response to not knowing is to hold, not to throw away.
+        if !eval.gate.is_pass() {
+            let reason = eval.gate_reason();
+            self.quarantine(branch, &reason)?;
+            return Ok(eval.into_report(merge_id, false));
+        }
+
+        if eval.outcome.is_conflict() {
+            // Nothing is published and the branch stays alive: the agent has the violated
+            // predicate and can retry.
+            return Ok(eval.into_report(merge_id, false));
+        }
+
+        self.publish_evaluation_as(ctx, eval, merge_id)
+    }
+
+    /// The next merge id. One per `MERGE` statement and one per admitted candidate, whatever the
+    /// outcome, so an id names an admission attempt rather than only a success.
+    fn next_merge_id(&self) -> String {
+        let mut state = self.state.lock().unwrap();
+        state.next_merge += 1;
+        format!("m_{}", state.next_merge)
+    }
+
+    /// **Score a merge without performing it.**
+    ///
+    /// Everything a merge decides — three-way composition against the target, the guard re-check,
+    /// the blind-write metric, the read-premise check, any declared assertions, and the
+    /// verification gate's verdict over all of them — computed against the target as it stands
+    /// now, publishing nothing and mutating no shared state.
+    ///
+    /// # Why this is a separate function
+    ///
+    /// `SIMULATE` forks K sibling branches off one base and scores every one of them. If scoring
+    /// were merging, candidate 1 would land on the target before candidate 2 was scored, and every
+    /// score after the first would be a score against a different database. The evaluations are
+    /// therefore all computed against one base, and admission is a second pass that re-evaluates.
+    ///
+    /// # The staleness the split creates, and the guard on it
+    ///
+    /// An evaluation is an **optimistic read**: DESIGN.md section 4 says the gate "must run as an
+    /// optimistic transaction — it reads the base snapshot to reach a verdict, so if base moves
+    /// before merge the verdict is stale. Textbook TOCTOU." Splitting evaluate from publish opens
+    /// exactly that window, so the evaluation carries a fingerprint of every row it read and
+    /// [`AgentRuntime::publish_evaluation`] refuses to publish against a base that no longer
+    /// matches it. The window is closed by refusing, not by hoping it is short.
+    ///
+    /// `assertions` are declared invariants, checked against the state this merge would leave
+    /// behind — see [`crate::agent_sql::gate::AssertionResult`] for why that is not what a guard
+    /// does. A production `MERGE` passes none and is scored by the gate's own checks alone.
+    pub fn evaluate_merge(
+        &self,
+        ctx: &mut ExecCtx,
+        branch: BranchId,
+        assertions: &[Assertion],
+    ) -> Result<MergeEvaluation, FerroError> {
         let target = self.branches.get(branch)?.parent_id.unwrap_or(BranchId::TRUNK);
         let snapshot = {
             let state = self.state.lock().unwrap();
@@ -1365,21 +1467,41 @@ impl AgentRuntime {
         // Current shared state for every table this branch touched.
         let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
-        for (t, name) in &snapshot.tables {
-            let entry = ctx
-                .catalog
-                .get_table(name)
-                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
+        let mut table_names: BTreeMap<u32, String> = snapshot.tables.clone();
+        // ...and for every table an assertion ranges over, which need not be one this branch
+        // wrote to. An assertion over a table the candidate never touched is still a claim about
+        // the state the merge would leave behind, and it is read here so the fingerprint below
+        // covers it: the evaluation depended on those rows, so a change to them invalidates it.
+        for a in assertions {
+            table_names.entry(table_id(&a.table).0).or_insert_with(|| a.table.clone());
+        }
+        for (t, name) in &table_names {
+            let Some(entry) = ctx.catalog.get_table(name) else {
+                // An unknown table is not an empty one. A table this branch wrote to must exist;
+                // a table only an assertion names is reported by the assertion itself as
+                // unevaluable, which the gate hard-rejects.
+                if snapshot.tables.contains_key(t) {
+                    return Err(FerroError::Bind(format!("unknown table: {}", name)));
+                }
+                continue;
+            };
             schemas.insert(*t, entry.schema.clone());
             for row in scan_table(name, ctx)? {
                 current.insert((*t, row_id_of(&row).0), row);
             }
         }
 
+        // The base this evaluation is about, as one number. See `publish_evaluation`.
+        let base_fingerprint = fingerprint_rows(&current)?;
+
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
         // The state guards are re-checked against; see the comment where it is filled in.
         let mut admit_state = CellState::new();
+        // The image this merge would LEAVE for each row it touches — `None` where it would remove
+        // the row. Distinct from `admit_state` on purpose: guards are preconditions and read the
+        // image before the ops land, assertions are claims about the result and read this one.
+        let mut produced: BTreeMap<(u32, u64), Option<Vec<Value>>> = BTreeMap::new();
         let policy_snapshot = { self.state.lock().unwrap().policy.clone() };
 
         for ((t, r), after) in &snapshot.rows {
@@ -1428,6 +1550,7 @@ impl AgentRuntime {
                             table: table.clone(),
                             row: v.clone(),
                         });
+                        produced.insert((*t, *r), Some(v.clone()));
                     }
                 }
                 // delete
@@ -1448,6 +1571,9 @@ impl AgentRuntime {
                             table: table.clone(),
                             key: b[0].clone(),
                         });
+                        // `None` is the row being GONE, which is not the same as the row being
+                        // unchanged: an assertion must be scored over the table without it.
+                        produced.insert((*t, *r), None);
                     }
                     None => {
                         // already gone on the target: nothing to publish
@@ -1506,6 +1632,12 @@ impl AgentRuntime {
                             row: new_row.clone(),
                             before: now.clone().unwrap_or_else(|| b.clone()),
                         });
+                        // The COMPOSED image, not the branch's own after-image: a cell the target
+                        // also moved resolves to `target + ours`, and that is what an assertion has
+                        // to be scored against. Scoring the branch's after-image would test a state
+                        // no merge produces — and it is exactly the composed one that goes negative
+                        // when a third candidate lands on a pair that already composed.
+                        produced.insert((*t, *r), Some(new_row.clone()));
                     }
                 }
                 (None, RowState::Deleted) => {}
@@ -1543,6 +1675,10 @@ impl AgentRuntime {
         // Guards are re-checked **after** composition, against the state the merge would produce.
         let guard_conflicts = check_guards(&snapshot.guards, &admit_state);
         for c in guard_conflicts {
+            // A row whose guard failed publishes nothing, so it must not appear in the image the
+            // assertions are scored against either — scoring a candidate against a row it was
+            // refused permission to write is scoring a state that will never exist.
+            produced.remove(&(c.tbl.0, c.row.0));
             match row_outcomes.iter_mut().find(|r| r.tbl == c.tbl && r.row == c.row) {
                 Some(r) => {
                     r.conflicts.push(c);
@@ -1567,6 +1703,12 @@ impl AgentRuntime {
         // a heuristic is quarantine "which does not exist yet". Quarantine has existed end to end
         // since `integration_quarantine.rs`; the comment outlived it. So the gate now runs here, and
         // its outcome is honoured.
+        //
+        // **This is the only place a `VerificationGate` is built on the merge path**, and that is
+        // what makes "a simulated candidate is scored by the same gate a production merge uses" a
+        // property of the code rather than a claim about it: `SIMULATE` reaches this line through
+        // `evaluate_merge` exactly as `MERGE` does, and the only difference between them is the
+        // list of declared assertions handed in.
         let blind = blind_writes_of(&snapshot.rows, &snapshot.reads);
 
         // The premise check: every version this branch READ, against the version the base holds now.
@@ -1604,7 +1746,11 @@ impl AgentRuntime {
             (moved, approximate)
         };
 
-        // **Only the premise check gates the merge, and the blind-write metric deliberately does not.**
+        // Declared invariants, scored against the image this merge would leave behind.
+        let assertion_results = evaluate_assertions(assertions, &schemas, &current, &produced);
+
+        // **Only the premise check and the declared assertions gate the merge; the blind-write
+        // metric deliberately does not.**
         //
         // `BlindWriteCheck` is `Heuristic`, and its own documentation says why: "a blind write is
         // genuinely suspicious and genuinely not proof of anything — the agent may have had every right
@@ -1614,67 +1760,102 @@ impl AgentRuntime {
         // starts blocking merges has been promoted without anyone deciding to promote it.
         //
         // So it stays where it was, reported on `MergeReport::blind_writes`, and the gate carries the
-        // check that is actually decidable.
-        let gate = crate::agent_sql::gate::VerificationGate::new()
-            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)))
-            .run();
+        // checks that are actually decidable.
+        let mut gate = crate::agent_sql::gate::VerificationGate::new()
+            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)));
+        for r in &assertion_results {
+            // One check per assertion, not one check for all of them: the gate runs every check in
+            // a tier even after one has fired, so a caller with three broken assertions learns all
+            // three in one round trip.
+            gate = gate.with(Box::new(crate::agent_sql::gate::AssertionCheck::new(r.clone())));
+        }
+        let gate = gate.run();
 
         let outcome = MergeReport::aggregate(&row_outcomes);
-        let merge_id = {
-            let mut state = self.state.lock().unwrap();
-            state.next_merge += 1;
-            format!("m_{}", state.next_merge)
-        };
 
-        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
-        //
-        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
-        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
-        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
-        // retrying blindly would recompute against a base that may move again.
-        //
-        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
-        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
-        // the safe response to not knowing is to hold, not to throw away.
-        if !gate.is_pass() {
-            let detail: Vec<String> = gate
-                .findings()
-                .iter()
-                .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
-                .collect();
-            let reason = format!("{} at merge admission — {}", gate.name(), detail.join("; "));
-            self.quarantine(branch, &reason)?;
-            return Ok(MergeReport {
-                merge_id,
-                from: branch,
-                into: target,
-                outcome,
-                rows: row_outcomes,
-                blind_writes: blind,
-                applied_to_target: false,
-            });
+        Ok(MergeEvaluation {
+            from: branch,
+            into: target,
+            outcome,
+            rows: row_outcomes,
+            blind_writes: blind,
+            gate,
+            assertions: assertion_results,
+            produced,
+            base_fingerprint,
+            tables_read: table_names,
+            snapshot,
+            pending: pending_writes,
+        })
+    }
+
+    /// Publish an evaluation the gate admitted, under a fresh merge id.
+    pub fn publish_evaluation(
+        &self,
+        ctx: &mut ExecCtx,
+        eval: MergeEvaluation,
+    ) -> Result<MergeReport, FerroError> {
+        let merge_id = self.next_merge_id();
+        self.publish_evaluation_as(ctx, eval, merge_id)
+    }
+
+    /// The publishing half of the split, with the two refusals that make the split safe.
+    ///
+    /// **1. An evaluation the gate did not admit cannot be published.** Otherwise the split would
+    /// have moved the decision from the gate to whoever remembered to look at its verdict.
+    ///
+    /// **2. An evaluation whose base has moved cannot be published.** This is the TOCTOU window
+    /// that splitting evaluate from publish creates, and DESIGN.md section 4 names it: the gate is
+    /// an optimistic read, so a verdict computed against a base that has since changed is a
+    /// verdict about a database that no longer exists. The fingerprint covers every row of every
+    /// table the evaluation read — the tables the branch wrote to and the tables its assertions
+    /// ranged over — so any change to them refuses here rather than publishing a stale merge.
+    ///
+    /// The refusal is the point. `SIMULATE` never trips it, because it re-evaluates each candidate
+    /// against the base as it stands at that candidate's turn; a caller that holds an evaluation
+    /// across another merge gets an error instead of a silently wrong publication.
+    fn publish_evaluation_as(
+        &self,
+        ctx: &mut ExecCtx,
+        eval: MergeEvaluation,
+        merge_id: String,
+    ) -> Result<MergeReport, FerroError> {
+        if !eval.gate.is_pass() {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {}: the verification gate returned {} — {}",
+                eval.from,
+                eval.gate.name(),
+                eval.gate_reason()
+            )));
+        }
+        if eval.outcome.is_conflict() {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {}: the merge conflicts — {}",
+                eval.from,
+                eval.violated_predicates().join("; ")
+            )));
         }
 
-        if outcome.is_conflict() {
-            // Nothing is published and the branch stays alive: the agent has the violated
-            // predicate and can retry.
-            return Ok(MergeReport {
-                merge_id,
-                from: branch,
-                into: target,
-                outcome,
-                rows: row_outcomes,
-                blind_writes: blind,
-                applied_to_target: false,
-            });
+        let now = self.fingerprint_tables(ctx, &eval.tables_read)?;
+        if now != eval.base_fingerprint {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {} against a base that moved after it was scored: this \
+                 evaluation was computed against fingerprint {:x} and the base is now {:x}. \
+                 Re-evaluate; publishing would apply a merge decided against a state that no \
+                 longer exists.",
+                eval.from, eval.base_fingerprint, now
+            )));
         }
+
+        let MergeEvaluation { from, into, outcome, rows, blind_writes, snapshot, pending, .. } =
+            eval;
 
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
         let publish_txn = ctx.txn.begin()?;
         let mut published = 0usize;
-        for w in pending_writes {
+        for w in pending {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
             let author = Some((Arc::clone(self.provenance()), snapshot.prov));
@@ -1685,18 +1866,36 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
-        self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
-        self.seal(branch, true)?;
+        self.record_applied(from, snapshot.txn, &rows, &snapshot, &merge_id);
+        self.seal(from, true)?;
 
         Ok(MergeReport {
-            blind_writes: blind,
+            blind_writes,
             merge_id,
-            from: branch,
-            into: target,
+            from,
+            into,
             outcome,
-            rows: row_outcomes,
+            rows,
             applied_to_target: true,
         })
+    }
+
+    /// Fingerprint of every row of `tables`, as the shared tables hold them right now.
+    fn fingerprint_tables(
+        &self,
+        ctx: &mut ExecCtx,
+        tables: &BTreeMap<u32, String>,
+    ) -> Result<u64, FerroError> {
+        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        for (t, name) in tables {
+            if ctx.catalog.get_table(name).is_none() {
+                continue;
+            }
+            for row in scan_table(name, ctx)? {
+                current.insert((*t, row_id_of(&row).0), row);
+            }
+        }
+        fingerprint_rows(&current)
     }
 
     /// The composed effect the target absorbed on this cell since we forked, if any.
@@ -1955,6 +2154,245 @@ impl BranchResolver for AgentRuntime {
             .copied()
             .ok_or_else(|| FerroError::Branch(format!("unknown branch: {}", name)))
     }
+}
+
+/// **Everything a merge decided, against a base it did not touch.**
+///
+/// Produced by [`AgentRuntime::evaluate_merge`] and consumed by
+/// [`AgentRuntime::publish_evaluation`]. Between those two calls the target is untouched, which is
+/// what lets K candidate branches be scored against one identical base.
+///
+/// It is deliberately not `Clone`: an evaluation names a specific base state, and two copies of
+/// one evaluation invite publishing it twice.
+pub struct MergeEvaluation {
+    pub from: BranchId,
+    pub into: BranchId,
+    /// The aggregate outcome this merge would report: `Clean`, `Commuting`, `Conflict` or
+    /// `ResolvedWithLoss`.
+    pub outcome: MergeOutcome,
+    pub rows: Vec<RowMergeOutcome>,
+    /// Rows the branch changed without ever reading. Reported, never decisive — see the gate.
+    pub blind_writes: Vec<(TableId, RowId)>,
+    /// The verdict of the one verification gate on the merge path.
+    pub gate: GateOutcome,
+    /// One result per declared assertion, in declaration order. Empty for a production `MERGE`,
+    /// which declares none.
+    pub assertions: Vec<AssertionResult>,
+    /// The image this merge would leave for each row it touches; `None` where it would remove the
+    /// row. Rows that conflict are absent, because a conflicting merge publishes nothing.
+    produced: BTreeMap<(u32, u64), Option<Vec<Value>>>,
+    /// Fingerprint of every row this evaluation read, so publishing can refuse a base that moved.
+    base_fingerprint: u64,
+    /// The tables that fingerprint covers.
+    tables_read: BTreeMap<u32, String>,
+    snapshot: WorkspaceSnapshot,
+    pending: Vec<PendingWrite>,
+}
+
+impl MergeEvaluation {
+    /// Would this merge be admitted? The gate passed **and** nothing conflicted.
+    ///
+    /// Both halves are load-bearing and neither implies the other: a conflicting merge can pass a
+    /// gate that has nothing to say about it, and a clean merge can be stopped by the gate.
+    pub fn is_admissible(&self) -> bool {
+        self.gate.is_pass() && !self.outcome.is_conflict()
+    }
+
+    /// Assertions that held, over assertions declared. `None` when none were declared — a merge
+    /// nothing asserted about has no score, which is not the same as a perfect one.
+    pub fn score(&self) -> Option<f64> {
+        if self.assertions.is_empty() {
+            return None;
+        }
+        let held = self.assertions.iter().filter(|a| a.holds()).count();
+        Some(held as f64 / self.assertions.len() as f64)
+    }
+
+    /// Every declared assertion that did not hold, by the predicate as it was written.
+    pub fn failed_assertions(&self) -> Vec<String> {
+        self.assertions.iter().filter(|a| !a.holds()).map(|a| a.source.clone()).collect()
+    }
+
+    /// The gate's verdict as the sentence a quarantine reason is written from.
+    pub fn gate_reason(&self) -> String {
+        let detail: Vec<String> = self
+            .gate
+            .findings()
+            .iter()
+            .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
+            .collect();
+        format!("{} at merge admission — {}", self.gate.name(), detail.join("; "))
+    }
+
+    /// Every violated predicate this merge would report, verbatim.
+    pub fn violated_predicates(&self) -> Vec<String> {
+        self.rows.iter().flat_map(|r| r.violated_predicates()).collect()
+    }
+
+    /// The image this merge would leave for one row: `Some(None)` means it would delete the row,
+    /// `None` means this merge does not touch it.
+    pub fn produced_row(&self, tbl: TableId, row: RowId) -> Option<Option<&Vec<Value>>> {
+        self.produced.get(&(tbl.0, row.0)).map(|v| v.as_ref())
+    }
+
+    /// The base state this evaluation was computed against, as one number.
+    pub fn base_fingerprint(&self) -> u64 {
+        self.base_fingerprint
+    }
+
+    /// Turn an evaluation that will NOT be published into the report for it.
+    fn into_report(self, merge_id: String, applied_to_target: bool) -> MergeReport {
+        MergeReport {
+            merge_id,
+            from: self.from,
+            into: self.into,
+            outcome: self.outcome,
+            rows: self.rows,
+            blind_writes: self.blind_writes,
+            applied_to_target,
+        }
+    }
+}
+
+/// Score declared assertions against the state a merge would leave behind.
+///
+/// The row set is the asserted table **as the merge would leave it**: the shared table now,
+/// overlaid with the images this merge would produce, minus the rows it would delete. Scoring only
+/// the rows the candidate touched was the first shape and it is weaker in a way that matters — a
+/// candidate that changes nothing would then satisfy every assertion by touching nothing.
+///
+/// Each row is checked through [`check_guards`], which is the same evaluator the production merge
+/// re-checks its guards with, so an assertion and a guard cannot disagree about what a predicate
+/// means.
+fn evaluate_assertions(
+    assertions: &[Assertion],
+    schemas: &BTreeMap<u32, Schema>,
+    current: &BTreeMap<(u32, u64), Vec<Value>>,
+    produced: &BTreeMap<(u32, u64), Option<Vec<Value>>>,
+) -> Vec<AssertionResult> {
+    let mut out = Vec::with_capacity(assertions.len());
+    for a in assertions {
+        let tbl = table_id(&a.table);
+        let source = a.source();
+        let mut result = AssertionResult {
+            source: source.clone(),
+            table: a.table.clone(),
+            tbl,
+            rows_checked: 0,
+            violations: Vec::new(),
+            unevaluable: Vec::new(),
+        };
+        let Some(schema) = schemas.get(&tbl.0) else {
+            // Not "no rows, therefore true": a predicate over a table this database does not have
+            // could not be evaluated, and the gate hard-rejects that rather than passing it.
+            result.unevaluable.push((RowId(0), format!("unknown table: {}", a.table)));
+            out.push(result);
+            continue;
+        };
+        // Compiled once against the schema rather than per row: a predicate naming a column that
+        // does not exist fails for every row for the same reason, and reporting it once says so.
+        if let Err(e) = guard_from_expr(&a.predicate, tbl, RowId(0), schema) {
+            result.unevaluable.push((RowId(0), e.to_string()));
+            out.push(result);
+            continue;
+        }
+
+        let mut rows: BTreeMap<u64, Vec<Value>> = current
+            .iter()
+            .filter(|((t, _), _)| *t == tbl.0)
+            .map(|((_, r), row)| (*r, row.clone()))
+            .collect();
+        for ((t, r), image) in produced {
+            if *t != tbl.0 {
+                continue;
+            }
+            match image {
+                Some(row) => {
+                    rows.insert(*r, row.clone());
+                }
+                None => {
+                    rows.remove(r);
+                }
+            }
+        }
+
+        result.rows_checked = rows.len();
+        for (rid, row) in rows {
+            let row_id = RowId(rid);
+            let guard = match guard_from_expr(&a.predicate, tbl, row_id, schema) {
+                Ok(g) => g,
+                Err(e) => {
+                    result.unevaluable.push((row_id, e.to_string()));
+                    continue;
+                }
+            };
+            let mut state = CellState::new();
+            for (idx, v) in row.iter().enumerate() {
+                state.set(tbl, row_id, ColId(idx as u32), v.clone());
+            }
+            for c in check_guards(&[guard.clone()], &state) {
+                match c.kind {
+                    ConflictKind::GuardUnevaluable => {
+                        result.unevaluable.push((row_id, c.detail.clone()))
+                    }
+                    _ => result.violations.push((row_id, cells_text(&guard, schema, &row))),
+                }
+            }
+        }
+        out.push(result);
+    }
+    out
+}
+
+/// The cells a predicate referred to, rendered for the caller who has to act on the violation.
+///
+/// `qty >= 0` failing is not actionable on its own; `qty >= 0 (qty = -4)` is.
+fn cells_text(guard: &Guard, schema: &Schema, row: &[Value]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (_, _, col) in guard.expr.referenced_cells() {
+        let idx = col.0 as usize;
+        let name = schema.columns.get(idx).map(|c| c.name.clone()).unwrap_or_else(|| format!("col{idx}"));
+        if parts.iter().any(|p| p.starts_with(&format!("{name} = "))) {
+            continue;
+        }
+        match row.get(idx) {
+            Some(v) => parts.push(format!("{name} = {}", cell_text(v))),
+            None => parts.push(format!("{name} = <absent>")),
+        }
+    }
+    parts.join(", ")
+}
+
+/// One cell as text. Deliberately not a float rendering of a decimal: the digits are the value.
+fn cell_text(v: &Value) -> String {
+    match v {
+        Value::Boolean(b) => b.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Varchar(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::Decimal(d) => d.clone(),
+        Value::Timestamp(ms) => ms.to_string(),
+        Value::Null => "NULL".to_string(),
+    }
+}
+
+/// A fingerprint over every row handed in, for detecting that a base moved under an evaluation.
+///
+/// Row *content* and not a counter: an update that leaves the row count alone is exactly the kind
+/// of movement a stale evaluation must not be published against. The bytes come from `encode_row`,
+/// which is the same encoding the branch trees store, so two values that differ only in variant
+/// (`Integer(5)` against `Float(5.0)`) do not collide.
+fn fingerprint_rows(rows: &BTreeMap<(u32, u64), Vec<Value>>) -> Result<u64, FerroError> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for ((t, r), row) in rows {
+        h = fnv64_update(h, &t.to_be_bytes());
+        h = fnv64_update(h, &r.to_be_bytes());
+        let bytes = encode_row(row)?;
+        h = fnv64_update(h, &(bytes.len() as u64).to_be_bytes());
+        h = fnv64_update(h, &bytes);
+    }
+    Ok(h)
 }
 
 struct WorkspaceSnapshot {

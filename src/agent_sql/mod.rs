@@ -27,6 +27,7 @@ pub mod merge_engine;
 pub mod paged_rows;
 pub mod runtime;
 pub mod session;
+pub mod simulate;
 
 pub use changeset::{ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome};
 pub use dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
@@ -38,5 +39,8 @@ pub use gate::{
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use paged_rows::PagedRows;
-pub use runtime::{AgentRuntime, BranchResolver, ExecCtx};
+pub use runtime::{AgentRuntime, BranchResolver, ExecCtx, MergeEvaluation};
+pub use simulate::{
+    AdmitPolicy, Assertion, Candidate, CandidateScore, SimulationPlan, SimulationReport, Verdict,
+};
 pub use session::AgentSession;
