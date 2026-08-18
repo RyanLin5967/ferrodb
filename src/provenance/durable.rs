@@ -101,6 +101,18 @@ pub struct DurableProvenanceStore {
     /// rather than continuing to look healthy while building a file that cannot be reopened. Reads
     /// keep working — what is already known is still true.
     poisoned: AtomicBool,
+    /// **Test-only: make the next append fail once.**
+    ///
+    /// `append_locked` cannot fail on its own in any test — it writes a few dozen bytes to a temp
+    /// file and fsyncs — which makes the poison guard above unreachable, and an unreachable guard is
+    /// one nobody can show works. Its cost if it were wrong is the whole point of this module: a
+    /// store that kept accepting stamps after an append failed would build a file whose next `open`
+    /// must refuse outright, so every row it had attributed would come back unattributed.
+    ///
+    /// The same lever exists on `WalManager` for the same reason, with the same `#[cfg(test)]`
+    /// scope: it does not exist in any shipped build, nor in integration tests.
+    #[cfg(test)]
+    pub(crate) fail_next_append: AtomicBool,
 }
 
 impl DurableProvenanceStore {
@@ -139,6 +151,8 @@ impl DurableProvenanceStore {
             path,
             recovery,
             poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_append: AtomicBool::new(false),
         })
     }
 
@@ -306,6 +320,11 @@ impl DurableProvenanceStore {
     /// The cost is one fsync per interned run and per stamped version, which is the price of the
     /// guarantee rather than an oversight.
     fn append_locked(&self, file: &File, body: &[u8]) -> Result<(), FerroError> {
+        // One-shot, and it disarms itself, so a test can fail exactly the append it means to.
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, Ordering::SeqCst) {
+            return Err(FerroError::Provenance("injected provenance append failure".into()));
+        }
         let end = file
             .metadata()
             .map_err(|e| FerroError::Provenance(e.to_string()))?
@@ -694,6 +713,56 @@ mod tests {
         let fresh = dir.path().join("fresh.log");
         let s = DurableProvenanceStore::open(&fresh).expect("a fresh store was refused");
         assert_eq!(s.run_count(), 0);
+    }
+
+    /// **A store whose file has fallen behind it refuses further writes rather than looking healthy.**
+    ///
+    /// When an append fails, the in-memory index has already changed: the store knows an
+    /// attribution its file does not. Every later write deepens the disagreement, and a stamp
+    /// appended for a run whose record never landed produces a file the next `open` must refuse
+    /// outright — so every row this store had attributed comes back unattributed. Refusing now, and
+    /// saying why, is the only outcome that does not turn one failed write into a whole store.
+    ///
+    /// Breaking shape: an I/O failure on the append path. It cannot happen against a temp file,
+    /// which is exactly why the failure is injected — the guard is otherwise unreachable and
+    /// therefore unverifiable.
+    #[test]
+    fn a_failed_append_poisons_the_store_instead_of_leaving_it_looking_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        let id = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp(rid(1, 0), id).unwrap();
+
+        s.fail_next_append.store(true, Ordering::SeqCst);
+        let err = s.stamp(rid(1, 1), id).expect_err("the injected append failure was swallowed");
+        assert!(format!("{err}").contains("injected"), "{err}");
+
+        // Every later write refuses, and names the reason rather than failing obscurely.
+        let err = s.stamp(rid(1, 2), id).expect_err("a poisoned store accepted another stamp");
+        assert!(
+            format!("{err}").contains("refusing further writes"),
+            "it refused, but not by this guard: {err}"
+        );
+        let err = s
+            .intern(&run("auditor", "run-2"))
+            .expect_err("a poisoned store interned another run");
+        assert!(format!("{err}").contains("refusing further writes"), "{err}");
+
+        // Reads still answer: what was already recorded is still true.
+        assert_eq!(s.attribute(rid(1, 0)).unwrap(), id);
+        assert_eq!(s.who_wrote(rid(1, 0)).unwrap().agent_id, "restock");
+
+        // And the file is still one a later process can open — which is the outcome the refusal
+        // bought. The stamp that failed is simply absent, rather than present without its run.
+        drop(s);
+        let s = DurableProvenanceStore::open(&path).expect("the file became unopenable anyway");
+        assert_eq!(s.attribute(rid(1, 0)).unwrap(), id);
+        assert_eq!(s.attribute(rid(1, 1)).unwrap(), ProvId::NONE);
+
+        // Anti-vacuity: the reopened store is NOT poisoned, so the refusals above were about the
+        // failure and not about this store never having accepted anything.
+        s.stamp(rid(1, 1), id).expect("a freshly opened store refused a stamp");
     }
 
     /// **File order is not id order, and replaying in file order would renumber every run.**
