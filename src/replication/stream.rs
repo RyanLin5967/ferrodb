@@ -139,6 +139,17 @@ pub struct Pumped {
     /// because "emitted 0" is what a caught-up consumer looks like too, and an operator cannot tell
     /// a stalled feed from a quiet one without being told which it is.
     pub refusal: Option<Refusal>,
+    /// Row changes written this pump that named **no writer**.
+    ///
+    /// Reported for the same reason `unresolved` is: a feed shipping rows attributed to nobody
+    /// looks identical, event by event, to one where nobody happened to be an agent — every line
+    /// simply carries `\"writer\":null`. Snapshot `READ` rows and schema declarations are excluded,
+    /// because neither is a run's write and counting them would drown the number that matters.
+    ///
+    /// Counted over what was actually WRITTEN, not over what was decoded: events suppressed by the
+    /// snapshot boundary or already delivered were not shipped by this pump and are not this
+    /// pump's problem.
+    pub unattributed: usize,
 }
 
 impl Pumped {
@@ -147,6 +158,8 @@ impl Pumped {
     /// A refusal makes this false. The feed is not corrupt and nothing is lost, but it has stopped
     /// making progress and will not resume on its own, and a caller that reported that as a clean
     /// run would be reporting a stalled pipeline as a healthy one.
+    /// Says nothing about attribution on purpose: a database nobody runs agents against ships rows
+    /// with no writer and is not thereby unclean. [`Pumped::unattributed`] is the separate question.
     pub fn is_clean(&self) -> bool {
         self.unresolved == 0 && self.refused == 0
     }
@@ -277,6 +290,7 @@ impl FeedStreamer {
                 excluded: 0,
                 refused: 0,
                 refusal: None,
+                unattributed: 0,
             });
         }
 
@@ -393,6 +407,11 @@ impl FeedStreamer {
         // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
         // does, it errors rather than writing a denied column, which is the right way round.
         let owned: Vec<ChangeEvent> = candidates.into_iter().cloned().collect();
+        // B5: rows shipped with no writer, counted over exactly what this pump writes.
+        // `owned` is post-exclusion and post-truncation, so an excluded or refused event
+        // is never counted as unattributed - it was not shipped at all.
+        let unattributed =
+            owned.iter().filter(|e| e.op.is_write() && e.writer.is_none()).count();
         let emitted = write_feed(&owned, &self.publication, w)?;
         let delivered_through = owned
             .iter()
@@ -413,6 +432,7 @@ impl FeedStreamer {
             excluded,
             refused,
             refusal,
+            unattributed,
         })
     }
 }

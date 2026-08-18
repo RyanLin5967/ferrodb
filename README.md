@@ -470,6 +470,11 @@ enforces its own copy of the rule rather than trusting the producer's.
   drops on that same scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
+- **Every change can carry its writer.** The event envelope names the agent run behind it — agent,
+  run, model, `model_version` and a SHA-256 of the prompt — or `null` where no agent run produced it,
+  and the commits that ship with no writer are **counted and reported** rather than assumed absent.
+  *Nothing on the SQL path binds a run yet*, so a feed from the shipped binary carries `null` for
+  every event; see *Run identity* below for what is connected and what is not.
 
 Two things the log says that a naive decoder gets wrong, both found by decoding real executor
 output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
@@ -508,6 +513,81 @@ The tests judge the feed by comparing that materialised table against the source
 well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
 author's idea of the format agrees with itself about any shared misreading.
 
+### Run identity: which agent wrote each row, after a restart and after the wire
+
+Provenance answers *which agent + run + model wrote this row*. Two things used to end that answer
+early, and both were silent.
+
+**It did not survive the process.** `MemProvenanceStore` was the only implementation, and every
+`AgentRuntime` constructor built one — including `reopen_with_storage`, whose whole job is to attach
+to a tree another process wrote. So a database reopened with every row intact answered *nothing*
+about any of them. `DurableProvenanceStore` is an append-only file replayed on open: one record per
+interned run, one small record per stamped version, a torn tail healed and **reported** rather than
+swallowed. It wraps the in-memory store rather than reimplementing it, so the same guards and the
+same `footprint_bytes` / `literal_footprint_bytes` density instruments apply unchanged.
+
+> **Not yet wired.** `AgentRuntime`'s three constructors still build a `MemProvenanceStore`, and
+> nothing on the SQL path calls `TxnManager::bind_run`. So on every path a shipped binary takes,
+> restarting still loses attribution and every feed event carries `"writer":null`. What is done is
+> the store, the log record, the wire format and the consumer — each proven by tests — and the
+> remaining hop is one line in each of `runtime.rs:276`, `:332`, `:369` plus a `bind_run` call where
+> a session's transaction is opened. Stated here rather than left for a reader to infer from a
+> feature that appears to be on.
+
+**It stopped at the database boundary.** `ChangeEvent` carried no writer, so a consumer holding a
+million rows from a model since found unsound could not ask which of them came from it. Now every
+event carries one:
+
+```json
+{"op":"INSERT","table":"inventory","writer":{"prov_id":1,"agent":"restock-agent","run":"run-42",
+ "model":"claude-opus","model_version":"2026-05","prompt_sha256":"e3b0c442…","started_at":"1700000000000",
+ "branch":"b1@g0"},"after":{"id":1,"qty":10}}
+```
+
+The prompt travels as a digest and never as text — that is the field's purpose, so a prompt holding
+customer data does not become a durable copy of it in every consumer's destination table. The Go
+consumer enforces it with an **allowlist** of the eight keys a `writer` object may carry, checked
+against the raw JSON rather than the decoded struct, because `encoding/json` silently drops keys it
+has no field for and a leak would decode cleanly.
+
+**The hard part is where the record sits in the log.** The feed cursor may never advance past the
+earliest *staged* record of a still-open transaction. An identity record written when the session
+begins stages nothing, so it sits *below* that clamp: read once, stepped over, never read again —
+and when the transaction finally commits, every one of its rows ships attributed to nobody while the
+pump reports a clean run. It is therefore written in the append **immediately before the `Commit`
+record**, where a clamp cannot separate the two.
+`tests/integration_run_identity_feed.rs` streams the same workload under both placements; the early
+one loses the attribution and the count catches it.
+
+Retention needs its own answer because `checkpoint()` discards the WAL **whole** rather than by
+prefix, exactly as it does for DDL. `TxnManager` re-declares its retained run table at the head of
+the new log, so a reader starting at the new base can still name the database's writers.
+
+#### Retract by model version
+
+Every destination row the sink lands carries its writer, which makes the operational question
+answerable at the destination — with no source database and no untruncated log:
+
+```
+$ cdc-consumer sink feed.jsonl -db dest.sqlite -key id
+$ cdc-consumer retract dest.sqlite -table inventory -model-version 2026-07
+RETRACTED 3 OF 6 table=inventory model_version=2026-07 mode=quarantine
+$ cdc-consumer scan dest.sqlite -table inventory      # ground truth, from a full scan
+ROW id=1 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+…
+```
+
+`-mode delete` tombstones as well as marks, and `-engine duckdb` targets the analytical destination
+— both sinks land the same attribution columns, pinned by
+`TestBothSinksLandTheSameWriterColumnNames` because `retract` addresses them by name. A retraction
+naming a version nothing wrote is **refused**, not reported as a clean run of zero rows — the likely
+cause is a typo, and the error names the versions that are present. Rows with no writer at all are
+never swept up, whatever string is passed, and a destination landed before attribution existed is
+upgraded in place rather than refused. `tests/integration_cdc_retract_by_model.rs` runs the whole
+pipeline and checks the 100%-of-one / 0%-of-any-other property from `scan`, which did not do the
+retracting.
+
 ### Wide values ship as strings, on purpose
 
 JSON has one number type and no stated precision, and the overwhelmingly common consumer
@@ -519,7 +599,7 @@ is raised** for any of it: the parse succeeds and the number is simply wrong.
 
 So `BIGINT`, `DECIMAL` and `TIMESTAMP` are emitted as JSON **strings**, which no parser coerces
 (envelope fields elided here — a real line also carries `txn`, `lsn`, `commit_lsn`,
-`commit_end_lsn` and `before`):
+`commit_end_lsn`, `writer` and `before`):
 
 ```json
 {"op":"INSERT","table":"wide","after":{"id":1,"big":"9223372036854775807","dec":"1.50","ts":"1700000000123"}}

@@ -332,8 +332,26 @@ fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
     // A real delay between attempts. The first version of this loop had none, and `connect` to an
     // unbound port fails instantly, so 600 attempts elapsed in 0.02s and the test reported that the
     // server "never accepted a connection" when it simply had not finished starting.
+    //
+    // **1200 x 50ms = 60s, and the number is measured rather than picked.** The other three tests
+    // in this binary shell out to `go run .`, which COMPILES AND STATICALLY LINKS DuckDB on any run
+    // whose Go build cache is cold for that package — adding one file under `cdc-consumer/` is
+    // enough to make it cold, and content-identical files stay warm, so it happens exactly once per
+    // change and then never again. They run in parallel with this test, which does not use Go at
+    // all; it just competes with them for the machine.
+    //
+    // Measured on this machine (18 cores) by forcing a genuine relink five times, this binary took
+    // 7.5s, 8.9s, 12.3s, 20.0s and 27.5s wall-clock. The previous budget was 10s — inside that
+    // spread rather than outside it — and it failed exactly once, on the first run after a new Go
+    // file was added, with `the server never accepted a connection` and the server still alive.
+    //
+    // The budget is a liveness bound and not an assertion: the loop exits the instant `connect`
+    // succeeds, so a healthy run costs what it always did, and a server that DIES still fails
+    // immediately through the `try_wait` branch below rather than waiting the timeout out. Raising
+    // it weakens nothing that is being tested — the property is "a closed stdout pipe is not fatal",
+    // and every check of that is below.
     let mut stream = None;
-    for _ in 0..200 {
+    for _ in 0..1200 {
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
             stream = Some(s);
             break;
@@ -348,7 +366,13 @@ fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
             );
         }
     }
-    let mut stream = stream.expect("the server never accepted a connection");
+    let mut stream = stream.expect(
+        "the server never accepted a connection within 60s, and it was still alive every time it \
+         was asked. That is not the failure this test is about — a server killed by a closed stdout \
+         pipe is caught by the `try_wait` branch above — so either the machine is far more loaded \
+         than the 27.5s worst case measured for this binary, or the server is wedged before its \
+         `TcpListener::bind`.",
+    );
 
     // Alive is not enough — it has to still deliver a feed.
     stream.write_all(b"0\n").expect("send cursor");

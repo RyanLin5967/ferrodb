@@ -71,6 +71,7 @@ use crate::catalog::catalog::Catalog;
 use crate::catalog::column::{Column, DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
+use crate::provenance::RunEntity;
 use crate::storage::tuple::Tuple;
 use crate::wal::log::{DdlOp, RecKind, WalManager};
 
@@ -104,6 +105,18 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
+    /// Whether this event is a **write some run performed** — the events that are supposed to name
+    /// a writer.
+    ///
+    /// `Insert`/`Update`/`Delete` are. `Read` is a snapshot observation: the row existed before the
+    /// feed began and the snapshot reader has no idea who wrote it, so counting one as unattributed
+    /// would make every backfill look like an attribution failure. `Schema` is a declaration about a
+    /// table, not a change to a row. The distinction is what keeps the unattributed count meaning
+    /// "a row shipped with no author" rather than "something in the feed lacks a writer field".
+    pub fn is_write(&self) -> bool {
+        matches!(self, ChangeOp::Insert { .. } | ChangeOp::Update { .. } | ChangeOp::Delete { .. })
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             ChangeOp::Read { .. } => "READ",
@@ -207,6 +220,22 @@ pub struct ChangeEvent {
     /// the names are per-table, not per-row, and a busy table produces a great many rows.
     pub columns: Arc<Vec<String>>,
     pub op: ChangeOp,
+    /// **Who wrote this change.**
+    ///
+    /// Attribution used to stop at the database boundary: the provenance store could say which run
+    /// wrote a version, and the moment that change left as a feed event the answer was gone. A
+    /// consumer holding a million rows from a model that has since been found to hallucinate prices
+    /// had no way to ask which of them came from it — the very question provenance exists to
+    /// answer, unanswerable one layer downstream.
+    ///
+    /// `None` is a real and legitimate value, not a placeholder: a transaction written by no agent
+    /// run has no writer to name. It is deliberately not defaulted to something plausible, and
+    /// commits that produce `None` for a row change are **counted** in
+    /// [`Decoded::unattributed_commits`] rather than assumed absent.
+    ///
+    /// `Arc` because a writer is per *run* and a run writes a great many rows — the same reason
+    /// `columns` is shared.
+    pub writer: Option<Arc<RunEntity>>,
 }
 
 /// The result of a decode, including what could **not** be decoded.
@@ -238,6 +267,22 @@ pub struct Decoded {
     /// Transactions still open when the scan ended. Their changes are **withheld, not lost** — a
     /// later decode covering their commit will emit them.
     pub open: BTreeSet<u64>,
+    /// Every run this range declared, by `prov_id`.
+    ///
+    /// Populated from the identity records in the log itself, so a decoder walking an archived log
+    /// can name its writers with no provenance store to consult — the same self-describing property
+    /// `schema_changes` gives for tables.
+    pub runs: BTreeMap<u32, RunEntity>,
+    /// Transactions whose row changes were emitted with **no writer**.
+    ///
+    /// Never assumed to be empty. A feed that ships rows attributed to nobody is not a feed with
+    /// nothing to report, and the difference is invisible from the events alone — every one of them
+    /// simply has `writer: null`. Counted for the same reason [`Decoded::undecodable`] is counted
+    /// rather than dropped: a caller that ignores this has chosen to, and has not been misled.
+    pub unattributed_commits: BTreeSet<u64>,
+    /// How many row changes those commits carried. The commits say how many actors are missing;
+    /// this says how much data shipped without one.
+    pub unattributed_events: usize,
     /// The earliest record belonging to any still-open transaction.
     ///
     /// A caller advancing a cursor MUST NOT go past this, or those records are stepped over and the
@@ -249,8 +294,17 @@ pub struct Decoded {
 
 impl Decoded {
     /// True when something was seen that did not become an event, for any reason.
+    ///
+    /// Deliberately says nothing about attribution: a database nobody runs agents against has no
+    /// writers to name, and folding that into "complete" would report every ordinary transaction as
+    /// a defect. Ask [`Decoded::fully_attributed`] for that question, which is a different one.
     pub fn is_complete(&self) -> bool {
         self.unresolved.is_empty() && self.undecodable.is_empty() && self.open.is_empty()
+    }
+
+    /// True when every row change emitted named the run that wrote it.
+    pub fn fully_attributed(&self) -> bool {
+        self.unattributed_commits.is_empty()
     }
 }
 
@@ -373,6 +427,10 @@ impl LogicalDecoder {
 
         // txn_id -> changes staged so far, in the order they were written.
         let mut staged: HashMap<u64, Vec<(u64, String, Arc<Vec<String>>, ChangeOp)>> = HashMap::new();
+        // Runs the walk has learned, and which transaction each one is bound to. Both are built
+        // from the log, not handed in: see `RecKind::RunIdentity`.
+        let mut runs: HashMap<u32, Arc<RunEntity>> = HashMap::new();
+        let mut bound: HashMap<u64, Arc<RunEntity>> = HashMap::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -447,7 +505,23 @@ impl LogicalDecoder {
                 RecKind::Commit => {
                     // Release, stamped with this commit's LSN. Ordering by commit is what gives a
                     // consumer the sequence the database itself made visible.
+                    //
+                    // The writer is resolved HERE, at the commit, because this is the only point
+                    // where the decoder holds both the identity and the complete set of changes it
+                    // produced. It is `take`n rather than read: one identity record binds one
+                    // transaction, and leaving it behind would attribute a later transaction with
+                    // the same id — after a restart, transaction ids restart from the log header —
+                    // to a run that did not write it.
+                    let writer = bound.remove(&txn);
                     if let Some(changes) = staged.remove(&txn) {
+                        if writer.is_none() && !changes.is_empty() {
+                            // **Never assumed to be zero.** Rows shipping with no author is a fact
+                            // about this feed, and it is invisible in the events themselves — they
+                            // simply carry `writer: null`. Counted exactly as an undecodable record
+                            // is counted rather than being passed off as a clean run.
+                            out.unattributed_commits.insert(txn);
+                            out.unattributed_events += changes.len();
+                        }
                         for (change_lsn, table, columns, op) in changes {
                             out.events.push(ChangeEvent {
                                 txn_id: txn,
@@ -457,13 +531,58 @@ impl LogicalDecoder {
                                 table,
                                 columns,
                                 op,
+                                writer: writer.clone(),
                             });
                         }
                     }
                 }
+                RecKind::RunIdentity { run } => {
+                    // Learned as the walk proceeds, exactly as DDL is: a decoder must be able to
+                    // answer from the log alone, including one reading an archive whose database is
+                    // long gone.
+                    let key = run.prov_id.0;
+                    match runs.get(&key) {
+                        // `same_actor`, NOT `==`. Derived equality compares `started_at`, which is
+                        // when a session began and deliberately not part of who the actor is —
+                        // `MemProvenanceStore::intern` hands two sessions of one run the same
+                        // `ProvId` for exactly that reason, so their identity records differ in that
+                        // one field and in no other. A full-equality test refused them as "two
+                        // different actors" and, because this arm returns `Err`, made the entire log
+                        // range permanently undecodable: `FeedStreamer::pump` propagates it and the
+                        // consumer can never get past those bytes. `RunEntity::same_actor`'s own doc
+                        // records this same mistake being made once before.
+                        Some(known) if !known.same_actor(run) => {
+                            // The same slot naming two different actors means the log disagrees
+                            // with itself. Picking one would attribute rows to an actor the
+                            // database never recorded, which is worse than refusing.
+                            return Err(FerroError::Wal(format!(
+                                "the log declares provenance slot {key} twice with different \
+                                 actors: {} and {}. Refusing to guess which wrote what.",
+                                known.describe(),
+                                run.describe()
+                            )));
+                        }
+                        _ => {}
+                    }
+                    let shared = runs
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(run.clone()))
+                        .clone();
+                    // First wins, matching `MemProvenanceStore`: a re-declaration of the same
+                    // actor with a later `started_at` must not rewrite what the slot means.
+                    out.runs.entry(key).or_insert_with(|| run.clone());
+                    // Transaction 0 never commits: a record carrying it is a DECLARATION replayed
+                    // after a checkpoint, not a binding. Binding it would attach a run to a
+                    // transaction id that every DDL record also uses.
+                    if txn != 0 {
+                        bound.insert(txn, shared);
+                    }
+                }
                 RecKind::Abort => {
-                    // Rolled back: the rows never existed, so nothing is emitted.
+                    // Rolled back: the rows never existed, so nothing is emitted — and the identity
+                    // bound to this transaction described work that did not happen.
                     staged.remove(&txn);
+                    bound.remove(&txn);
                     out.aborted.insert(txn);
                 }
                 RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
@@ -517,6 +636,9 @@ impl LogicalDecoder {
                             columns.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
                         ),
                         op: ChangeOp::Schema { change, columns: specs },
+                        // A schema declaration is not a run's write. `is_write` is what keeps it
+                        // out of the unattributed count as well.
+                        writer: None,
                     });
                 }
                 // `Clr` records are undo work, and undo only happens on the way to an `Abort`,
@@ -660,6 +782,133 @@ mod tests {
         let base = w.base_lsn.load(Ordering::SeqCst);
         let end = w.next_lsn.load(Ordering::SeqCst);
         d.decode(w, base, end).unwrap()
+    }
+
+    fn a_run(prov: u32, agent: &str) -> RunEntity {
+        RunEntity::new(
+            crate::provenance::ProvId(prov),
+            agent,
+            "run-1",
+            "claude-opus",
+            "2026-05",
+            [0xab; 32],
+            1_700_000_000_000,
+            crate::branch::types::BranchId::new(1, 0),
+        )
+    }
+
+    /// **One provenance slot, two actors, is a log that disagrees with itself.**
+    ///
+    /// The slot is the reference every stamped version carries, so two meanings for it make every
+    /// attribution downstream ambiguous. Guessing which one wrote a given row would produce
+    /// confident wrong attribution — worse than refusing, because nothing downstream can tell.
+    ///
+    /// Breaking shape: two identity records with the same `prov_id` and different actor tuples in
+    /// one decode range. A log where each slot appears once — which is every well-formed log —
+    /// passes with or without the check.
+    #[test]
+    fn one_provenance_slot_naming_two_actors_is_refused() {
+        use std::sync::atomic::Ordering;
+        let (_d, w) = wal("conflicting-runs");
+
+        // Anti-vacuity first: the SAME declaration twice is exactly what a checkpoint replay
+        // produces, and must be accepted.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "a repeated declaration became two runs");
+
+        // Now the same slot with a different actor.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "auditor-agent") }).unwrap();
+        w.flush().unwrap();
+        let err = decoder()
+            .decode(&w, w.base_lsn.load(Ordering::SeqCst), w.next_lsn.load(Ordering::SeqCst))
+            .expect_err("a slot naming two actors was accepted");
+        assert!(
+            format!("{err}").contains("different"),
+            "it failed, but not by this guard: {err}"
+        );
+    }
+
+    /// **Two sessions of one run differ in `started_at` and are the same actor.**
+    ///
+    /// `MemProvenanceStore::intern` hands both sessions the same `ProvId` because `same_actor`
+    /// deliberately excludes `started_at` — its doc records that including it made the same input
+    /// refused or accepted depending on whether the clock had ticked. So a log legitimately holds two
+    /// identity records for one slot differing in exactly that field.
+    ///
+    /// The conflict check compared with derived `==`, which does compare `started_at`, and this arm
+    /// returns `Err` — so a perfectly ordinary second session made `decode` fail, `pump` propagate,
+    /// and the whole log range permanently undecodable. A feed that cannot get past a byte offset is
+    /// worse than one that loses a row.
+    ///
+    /// **Breaking shape:** any agent that opens a second session, with the clock advancing between
+    /// them. A workload where each run commits exactly once never produces it, and neither does one
+    /// fast enough to land both sessions inside a single clock tick — which is how the same mistake
+    /// passed on macOS and failed on an Ubuntu runner the first time it was made.
+    #[test]
+    fn a_second_session_of_one_run_is_not_a_conflicting_actor() {
+        let (_d, w) = wal("second-session");
+        let first = a_run(1, "restock-agent");
+        let mut later = a_run(1, "restock-agent");
+        later.started_at = first.started_at + 5_000;
+        assert_ne!(first, later, "the two entities must differ, or this test proves nothing");
+
+        w.append(0, 0, &RecKind::RunIdentity { run: first.clone() }).unwrap();
+        w.append(7, 0, &RecKind::Begin).unwrap();
+        insert(&w, 7, 7, 70);
+        w.append(7, 0, &RecKind::RunIdentity { run: later }).unwrap();
+        w.append(7, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "one run became two: {:?}", out.runs);
+        assert_eq!(
+            out.runs[&1].started_at, first.started_at,
+            "the later session rewrote what the slot means; the first declaration must win"
+        );
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
+    }
+
+    /// A declaration (transaction 0) names a run without binding one, and a binding attributes the
+    /// transaction it rides with. Told apart by `txn_id` alone.
+    ///
+    /// Breaking shape: a declaration followed by an unrelated transaction's commit. If declarations
+    /// bound, that commit would be attributed to whichever run was declared last — and after a
+    /// checkpoint, every table's declarations are replayed at the head of the log, so the first
+    /// commit after any checkpoint would be attributed to a run that did not write it.
+    #[test]
+    fn a_declaration_names_a_run_without_attributing_anybodys_commit() {
+        let (_d, w) = wal("declaration-only");
+        // Declared, not bound.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w, 5, 7, 70);
+        w.append(5, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "the declaration was not learned");
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].writer.is_none(),
+            "a declaration attributed a commit it had nothing to do with: {:?}",
+            rows[0].writer
+        );
+        assert_eq!(out.unattributed_commits.iter().copied().collect::<Vec<_>>(), vec![5]);
+
+        // Anti-vacuity: the same record carrying that transaction's id DOES attribute it.
+        let (_d2, w2) = wal("declaration-bound");
+        w2.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w2, 5, 7, 70);
+        w2.append(5, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w2.append(5, 0, &RecKind::Commit).unwrap();
+        let out = decode_all(&decoder(), &w2);
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
     }
 
     #[test]

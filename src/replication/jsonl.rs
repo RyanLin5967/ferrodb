@@ -12,8 +12,26 @@
 //!
 //! ```text
 //! {"table":"inventory","op":"INSERT","txn":2,"lsn":216,"commit_lsn":422,"commit_end_lsn":455,
+//!  "writer":{"prov_id":1,"agent":"restock-agent","run":"run-42","model":"claude-opus",
+//!            "model_version":"2026-05","prompt_sha256":"9f86d0...","started_at":"1700000000000",
+//!            "branch":"b4@g0"},
 //!  "before":null,"after":{"id":1,"qty":10}}
 //! ```
+//!
+//! # `writer`, and why it is always present
+//!
+//! Attribution used to stop at this boundary. The database could say which agent run wrote a
+//! version and the feed could not, so a consumer holding a million rows from a model that has since
+//! been found unsound had no way to ask which of them came from it.
+//!
+//! `writer` is `null` for a change no agent run produced, and for the snapshot `READ` rows and
+//! schema declarations that have no writer to name. It is **always present**, null included, for
+//! the same reason `before`/`after` are: a consumer that branches on which keys exist breaks the
+//! first time a key is added, and one that branches on the value does not.
+//!
+//! The prompt travels as `prompt_sha256`, a hex digest, and never as text. That is the field's
+//! whole purpose — a prompt containing customer data must not become a durable copy of it in every
+//! consumer's destination table.
 //!
 //! `before`/`after` are objects keyed by column name, not arrays. A positional array would require
 //! the consumer to hold this database's catalog to know what column three is, which defeats the
@@ -105,6 +123,8 @@ use std::io::Write;
 
 use crate::catalog::column::Value;
 use crate::error::FerroError;
+use crate::provenance::sha256::to_hex;
+use crate::provenance::RunEntity;
 
 use super::logical::{ChangeEvent, ChangeOp, SchemaChange};
 use super::publication::{Mask, Publication, Refusal};
@@ -237,6 +257,34 @@ fn row_into(
     Ok(())
 }
 
+/// Append a run's identity as a JSON object.
+///
+/// `started_at` ships as a **string**, following the same rule this module applies to `TIMESTAMP`
+/// columns: epoch milliseconds are an integer whose consumer decides the width, and a JSON number
+/// is a double in most of them. It is well inside 2^53 today, which is exactly the reasoning that
+/// made every other epoch field wrong eventually.
+///
+/// The prompt is a hex `prompt_sha256` and never text; see the module header.
+pub fn writer_into(w: &RunEntity, out: &mut String) {
+    out.push_str("{\"prov_id\":");
+    out.push_str(&w.prov_id.0.to_string());
+    out.push_str(",\"agent\":");
+    escape_json_into(&w.agent_id, out);
+    out.push_str(",\"run\":");
+    escape_json_into(&w.run_id, out);
+    out.push_str(",\"model\":");
+    escape_json_into(&w.model, out);
+    out.push_str(",\"model_version\":");
+    escape_json_into(&w.model_version, out);
+    out.push_str(",\"prompt_sha256\":");
+    escape_json_into(&to_hex(&w.prompt_hash), out);
+    out.push_str(",\"started_at\":");
+    escape_json_into(&w.started_at.to_string(), out);
+    out.push_str(",\"branch\":");
+    escape_json_into(&w.parent_branch.to_string(), out);
+    out.push('}');
+}
+
 /// One change event as a single line of JSON, **without** the trailing newline.
 ///
 /// Refuses rather than returns bytes when the publication has not decided about the event's table,
@@ -262,6 +310,12 @@ fn line_with_mask(e: &ChangeEvent, mask: &Mask<'_>) -> Result<String, Refusal> {
         ",\"txn\":{},\"lsn\":{},\"commit_lsn\":{},\"commit_end_lsn\":{}",
         e.txn_id, e.lsn, e.commit_lsn, e.commit_end_lsn
     ));
+
+    out.push_str(",\"writer\":");
+    match &e.writer {
+        Some(w) => writer_into(w, &mut out),
+        None => out.push_str("null"),
+    }
 
     // `before` and `after` are always present, null where they do not apply. A consumer branching
     // on which keys exist is a consumer that breaks the first time a key is added; one branching on
@@ -463,6 +517,7 @@ mod tests {
             table: "inventory".into(),
             columns: Arc::new(vec!["id".into(), "qty".into()]),
             op,
+            writer: None,
         }
     }
 
@@ -551,6 +606,7 @@ mod tests {
             table: "odd\"table".into(),
             columns: Arc::new(vec!["we\"ird".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
+            writer: None,
         };
         let line = line(&e);
         assert!(line.contains("\"we\\\"ird\":1"), "column name was not escaped: {line}");
@@ -568,6 +624,7 @@ mod tests {
             table: "t".into(),
             columns: Arc::new(vec!["a".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1), Value::Integer(2)] },
+            writer: None,
         };
         let line = line(&e);
         assert!(line.contains("\"a\":1"), "{line}");
@@ -711,6 +768,7 @@ mod tests {
                     Value::Timestamp(1_700_000_000_123),
                 ],
             },
+            writer: None,
         };
         let line = line(&e);
         assert!(line.contains("\"i\":42"), "INTEGER must stay a bare number: {line}");
@@ -760,6 +818,7 @@ mod tests {
             table: "t".into(),
             columns: Arc::new(vec!["a".into(), "b".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1), Value::Null] },
+            writer: None,
         };
         let line = line(&e);
         assert!(line.contains("\"b\":null"), "the null column was omitted entirely: {line}");

@@ -198,6 +198,11 @@ where
             // every existing row look like new activity, and anything counting events would be
             // wrong by the size of the table.
             op: ChangeOp::Read { row: values },
+            // A snapshot row has no writer this reader can name. It existed before the feed began,
+            // and the scan that produced it consults no provenance store — so `None` here is
+            // "unknown to this reader", which is why `ChangeOp::is_write` keeps `Read` out of the
+            // unattributed count rather than reporting a whole backfill as unattributed.
+            writer: None,
         })
         .collect();
 
@@ -400,6 +405,9 @@ fn read_events(
             // `READ`, not `INSERT`: a row that already existed is not news of a change, and a
             // consumer counting inserts must not count the size of the table.
             op: ChangeOp::Read { row: values },
+            // See the note at the other snapshot site: a pre-existing row has no writer this
+            // reader can name.
+            writer: None,
         })
         .collect()
 }

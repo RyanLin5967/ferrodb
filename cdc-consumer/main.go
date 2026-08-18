@@ -19,6 +19,8 @@
 //	                                 the publication does not publish rather than printing it
 //	follow <addr> [-key id]          stream a live feed, materialise it, print the resulting table
 //	sink <feed.jsonl> -db f [-engine] land the feed with idempotent, order-guarded upserts
+//	retract <db> -table t -model-version v [-engine]  withdraw everything one model version wrote
+//	scan <db> -table t [-key id] [-engine]           print every row's writer and retraction flag
 //	duckdb-sql <file> <sql>          run one statement against a DuckDB destination, separate process
 //
 // `sink` speaks to two destinations, chosen with `-engine`: `sqlite` (the default, and what the
@@ -56,8 +58,86 @@ type Event struct {
 	LSN          uint64         `json:"lsn"`
 	CommitLSN    uint64         `json:"commit_lsn"`
 	CommitEndLSN uint64         `json:"commit_end_lsn"`
+	Writer       *Writer        `json:"writer"`
 	Before       map[string]any `json:"before"`
 	After        map[string]any `json:"after"`
+}
+
+// Writer is the agent run that produced a change.
+//
+// Nil for a change no agent run produced, for the snapshot READ rows that existed before the feed
+// began, and for schema declarations. Nil is a legitimate value and not an error — but a consumer
+// that cannot count how often it happens cannot tell "this database has no agents" from "this feed
+// lost its attribution", so `validate` reports the number.
+//
+// `PromptSHA256` is a digest and never the prompt. That is enforced rather than trusted: see
+// `writerKeys`.
+type Writer struct {
+	ProvID       uint64 `json:"prov_id"`
+	Agent        string `json:"agent"`
+	Run          string `json:"run"`
+	Model        string `json:"model"`
+	ModelVersion string `json:"model_version"`
+	PromptSHA256 string `json:"prompt_sha256"`
+	StartedAt    string `json:"started_at"`
+	Branch       string `json:"branch"`
+}
+
+// writerKeys is an ALLOWLIST of the keys a writer object may carry, and it is an allowlist on
+// purpose.
+//
+// `prompt_hash` exists precisely so that a prompt containing customer data does not become a
+// durable copy of it in every consumer's destination table. A denylist of forbidden key names only
+// catches the spellings somebody already thought of — `prompt`, `prompt_text`, `instructions`,
+// `system_prompt` — and a producer that adds a ninth field for any reason would land it in the sink
+// unnoticed. A closed set cannot be talked around.
+var writerKeys = map[string]bool{
+	"prov_id": true, "agent": true, "run": true, "model": true, "model_version": true,
+	"prompt_sha256": true, "started_at": true, "branch": true,
+}
+
+// isHex64 reports whether s is exactly 64 lowercase-or-uppercase hex digits: a SHA-256 digest.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// checkWriter enforces the writer contract against the RAW object, not the decoded struct.
+//
+// The struct is the wrong instrument for this: `encoding/json` silently drops keys it has no field
+// for, so a producer leaking the prompt text would decode cleanly into a Writer that looks perfect.
+func checkWriter(raw map[string]json.RawMessage, w *Writer, n int) error {
+	for k := range raw {
+		if !writerKeys[k] {
+			return fmt.Errorf("line %d: the writer object carries an unknown key %q. The writer "+
+				"contract is a closed set, and `prompt_hash` exists so a prompt never becomes a "+
+				"durable copy of itself downstream", n, k)
+		}
+	}
+	if w.ProvID == 0 {
+		return fmt.Errorf("line %d: the writer names prov_id 0, which is the slot meaning "+
+			"'unattributed'; an event claiming a writer must name one", n)
+	}
+	for name, v := range map[string]string{
+		"agent": w.Agent, "run": w.Run, "model": w.Model, "model_version": w.ModelVersion,
+	} {
+		if v == "" {
+			return fmt.Errorf("line %d: the writer has an empty %s", n, name)
+		}
+	}
+	if !isHex64(w.PromptSHA256) {
+		return fmt.Errorf("line %d: prompt_sha256 %q is not 64 hex digits; a prompt digest that is "+
+			"not a digest is either missing or is the prompt itself", n, w.PromptSHA256)
+	}
+	return nil
 }
 
 var validOps = map[string]bool{
@@ -196,6 +276,18 @@ func decodeLine(line string, n int) (*Event, error) {
 	}
 	if err := activePublication.checkShape(&e, n); err != nil {
 		return nil, err
+	if e.Writer != nil {
+		// Re-read the writer as raw keys. The struct above cannot answer "what else was in there",
+		// and that is exactly the question the prompt-leak guard has to ask.
+		var probe struct {
+			Writer map[string]json.RawMessage `json:"writer"`
+		}
+		if err := json.Unmarshal([]byte(line), &probe); err != nil {
+			return nil, fmt.Errorf("line %d: re-reading the writer object: %w", n, err)
+		}
+		if err := checkWriter(probe.Writer, e.Writer, n); err != nil {
+			return nil, err
+		}
 	}
 	return &e, nil
 }
@@ -443,6 +535,7 @@ func validate(path string) error {
 	}
 	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
 	var last uint64
+	attributed, unattributed := 0, 0
 	for i, line := range lines {
 		e, err := decodeLine(line, i+1)
 		if err != nil {
@@ -452,9 +545,29 @@ func validate(path string) error {
 			return fmt.Errorf("line %d: commit_lsn went backwards", i+1)
 		}
 		last = e.CommitLSN
+		// Row WRITES only. A snapshot READ describes a row that existed before the feed began and a
+		// schema event describes a table, so counting either would drown the number that matters.
+		if isRowWrite(e.Op) {
+			if e.Writer != nil {
+				attributed++
+			} else {
+				unattributed++
+			}
+		}
 	}
+	// `OK <n>` stays the first line and stays exactly parseable: it is read by
+	// `tests/integration_cdc_feed.rs`. The attribution census is a second line, because a feed that
+	// ships rows attributed to nobody looks identical, line by line, to one written by no agent —
+	// every record simply carries `"writer":null`, and only a count tells them apart.
 	fmt.Printf("OK %d\n", len(lines))
+	fmt.Printf("WRITERS attributed=%d unattributed=%d\n", attributed, unattributed)
 	return nil
+}
+
+// isRowWrite reports whether an op is a change some run performed, as opposed to a snapshot
+// observation or a declaration about a table's shape.
+func isRowWrite(op string) bool {
+	return op == "INSERT" || op == "UPDATE" || op == "DELETE"
 }
 
 func follow(addr, key string, cursor uint64, limit int) error {
@@ -787,6 +900,8 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> [-publication f] | follow <addr> [flags] | "+
 			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | "+
+			"retract <db> -table <t> -model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb] | "+
+			"scan <db> -table <t> [-key col] [-engine sqlite|duckdb] | "+
 			"diff <feed.jsonl> <source.json> [-key col] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
@@ -890,6 +1005,47 @@ func main() {
 		refuseTrailingArgs(fs, "follow <addr> [-key col] [-cursor n] [-limit n] [-publication <file>]")
 		mustUsePublication(*pub)
 		if err := follow(addr, *key, *cursor, *limit); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "retract":
+		fs := flag.NewFlagSet("retract", flag.ExitOnError)
+		table := fs.String("table", "", "destination table to retract from")
+		version := fs.String("model-version", "", "the model_version whose rows to withdraw")
+		mode := fs.String("mode", string(quarantine), "quarantine (mark only) or delete (mark and tombstone)")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer retract <db> -table <t> "+
+				"-model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb]")
+			os.Exit(2)
+		}
+		dbPath := os.Args[2]
+		_ = fs.Parse(os.Args[3:])
+		if *table == "" {
+			fmt.Fprintln(os.Stderr, "retract needs -table")
+			os.Exit(2)
+		}
+		if err := runRetract(dbPath, *table, *version, retractMode(*mode), *engine); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "scan":
+		fs := flag.NewFlagSet("scan", flag.ExitOnError)
+		table := fs.String("table", "", "destination table to scan")
+		key := fs.String("key", "id", "primary key column")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr,
+				"usage: cdc-consumer scan <db> -table <t> [-key id] [-engine sqlite|duckdb]")
+			os.Exit(2)
+		}
+		dbPath := os.Args[2]
+		_ = fs.Parse(os.Args[3:])
+		if *table == "" {
+			fmt.Fprintln(os.Stderr, "scan needs -table")
+			os.Exit(2)
+		}
+		if err := runScan(dbPath, *table, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
