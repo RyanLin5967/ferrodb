@@ -230,9 +230,16 @@ fn a_denied_column_appears_in_zero_events_across_a_workload_that_writes_it() {
     assert!(create.contains("\"name\":\"id\"") && create.contains("\"name\":\"name\""), "{create}");
     assert!(!create.contains("ssn"), "the shape declared the denied column: {create}");
 
-    // And an independently written consumer, holding the same policy, accepts it.
+    // **Asserted again on the FILE**, after it has left the process. The buffer above is a renderer's
+    // output; this is what a consumer actually opens, and an auditor was right that only the second
+    // one supports the sentence at the top of this file.
     let path = dir.path().join("guarded.jsonl");
     std::fs::write(&path, &feed).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    for v in [SSN_FIRST, SSN_UPDATED, "111-22-3333", "ssn"] {
+        assert!(!on_disk.contains(v), "`{v}` is in the feed FILE:\n{on_disk}");
+    }
+    assert!(on_disk.contains("\"name\":\"ada\""), "the file lost a published column:\n{on_disk}");
     let policy_file = write_policy(dir.path());
     let (ok, stdout, stderr) = consumer(&[
         "validate",
@@ -312,6 +319,118 @@ fn the_independent_consumer_refuses_a_feed_the_producer_should_not_have_written(
         !stdout.contains("APPLIED 0"),
         "the sink landed nothing at all, so accepting it proves nothing: {stdout}"
     );
+}
+
+/// **Two columns with one name, through real SQL, all the way to the destination.**
+///
+/// This database accepts `CREATE TABLE patients (id INTEGER, name VARCHAR(32), name VARCHAR(32))` and
+/// `SELECT *` returns all three values. The mask is keyed by NAME and applied per POSITION, so
+/// publishing `name` shipped both — and an adversarial review followed the denied value into a SQLite
+/// destination, where Go's `encoding/json` keeps the LAST duplicate key and the withheld column's value
+/// overwrote the published one. No declaration distinguishes the two positions: `patients: id, name,
+/// name` is refused as a duplicate and `patients: id` withholds both.
+///
+/// Both halves are asserted here because both were broken: the producer refuses the event, and the
+/// consumer refuses a feed carrying the duplicate even when the producer did not.
+#[test]
+fn two_columns_with_one_name_are_refused_by_the_producer_and_by_the_consumer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = db(dir.path(), "dup");
+    d.sql("CREATE TABLE patients (id INTEGER NOT NULL, name VARCHAR(32), name VARCHAR(32));");
+    d.sql(&format!("INSERT INTO patients VALUES (1, 'ada', '{SSN_FIRST}');"));
+    let events = d.decode_all();
+
+    // The premise: the database really did accept two columns of one name, and really does carry
+    // three values. Without this the test could pass against a database that rejected the DDL.
+    let insert = events
+        .iter()
+        .find(|e| matches!(e.op, ferrodb::replication::logical::ChangeOp::Insert { .. }))
+        .expect("no INSERT was decoded");
+    assert_eq!(
+        insert.columns.iter().filter(|c| *c == "name").count(),
+        2,
+        "the table does not have two columns named `name`, so this test proves nothing: {:?}",
+        insert.columns
+    );
+
+    let policy = Publication::parse("publication analytics\npatients: id, name\n").unwrap();
+    let mut buf: Vec<u8> = Vec::new();
+    let err = write_feed(&events, &policy, &mut buf)
+        .expect_err("a table with two columns of one name was published");
+    let msg = format!("{err}");
+    assert!(msg.contains("two columns named name"), "wrong reason: {msg}");
+    assert!(buf.is_empty(), "bytes were written: {}", String::from_utf8_lossy(&buf));
+
+    // The consumer's half, on the shipped binary: the feed a producer without this guard would have
+    // written. Rendered with no policy, which is exactly what that producer does.
+    let mut leaky: Vec<u8> = Vec::new();
+    write_feed(&events, &Publication::unrestricted(), &mut leaky).unwrap();
+    let text = String::from_utf8(leaky).unwrap();
+    assert!(
+        text.matches("\"name\":").count() >= 2,
+        "the unguarded feed does not carry the duplicate key, so the consumer half proves nothing:\n{text}"
+    );
+    let leaky_path = dir.path().join("dup.jsonl");
+    std::fs::write(&leaky_path, &text).unwrap();
+    let pol = dir.path().join("dup_pol.txt");
+    std::fs::write(&pol, "publication analytics\npatients: id, name\n").unwrap();
+    let (ok, _, stderr) = consumer(&[
+        "validate",
+        leaky_path.to_str().unwrap(),
+        "-publication",
+        pol.to_str().unwrap(),
+    ]);
+    assert!(!ok, "the consumer validated a line with two keys of one name");
+    assert!(stderr.contains("twice"), "the refusal does not name the duplicate: {stderr}");
+}
+
+/// **A misplaced argument must not switch the consumer's guard off.**
+///
+/// Breaking shape: `validate feed.jsonl junk -publication pol.txt`. Go's `flag` package stops at the
+/// first positional argument and reports no error, so the policy was never read: the run enforced
+/// nothing and printed `OK`. That is precisely the failure the design claims to prevent by making the
+/// flag the only way to switch the check on — the flag was on the command line and not in force. Found
+/// by an adversarial review; asserted here on the real binary because the guard exits the process.
+#[test]
+fn a_misplaced_argument_is_refused_rather_than_silently_disabling_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = db(dir.path(), "flags");
+    workload(&mut d);
+    let events = d.decode_all();
+    let mut buf: Vec<u8> = Vec::new();
+    write_feed(&events, &Publication::unrestricted(), &mut buf).expect("write feed");
+    let leaky = dir.path().join("leaky.jsonl");
+    std::fs::write(&leaky, &buf).unwrap();
+    let pol = write_policy(dir.path());
+
+    let (ok, stdout, stderr) = consumer(&[
+        "validate",
+        leaky.to_str().unwrap(),
+        "junk",
+        "-publication",
+        pol.to_str().unwrap(),
+    ]);
+    assert!(
+        !ok,
+        "a leaky feed validated with the policy silently ignored; stdout was {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("OK"),
+        "the run reported success while enforcing nothing: {stdout}"
+    );
+    assert!(stderr.contains("unexpected argument"), "refused for the wrong reason: {stderr}");
+
+    // Anti-vacuity: the same invocation without the stray argument reaches the publication check and
+    // refuses for the RIGHT reason - so the guard above is about argument order, not about refusing
+    // everything.
+    let (ok, _, stderr) = consumer(&[
+        "validate",
+        leaky.to_str().unwrap(),
+        "-publication",
+        pol.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("ssn"), "{stderr}");
 }
 
 /// **Exit criterion 3, in the shape the unit tests cannot reach.**
