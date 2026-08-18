@@ -460,24 +460,39 @@ fn run_activity_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroErr
 /// read it.
 ///
 /// Exists so a view's `WHERE` and projection run through [`Filter`] and [`Projection`] verbatim
-/// rather than through a second evaluator written for views. The `RecordId` is synthetic — there is
-/// no heap slot behind these rows — and nothing downstream of a projection consumes it.
+/// rather than through a second evaluator written for views.
+///
+/// The `RecordId` is synthetic — there is no heap slot behind these rows — but it is **unique per
+/// row**, and that is a guard rather than a nicety. `RecordId.slot_num` is a `u16`, so a counter kept
+/// in that field alone repeats after 65,536 rows, and `ferro_row_authors` returns one row per
+/// attributed row per table, which passes 65,536 on any real database. Nothing downstream of a
+/// projection reads the rid today, so a repeat would be invisible — right up until something does,
+/// at which point two different rows would claim one identity and the bug would look like a
+/// deduplication fault a long way from here. Spreading one `u64` counter across `page_id` and
+/// `slot_num` gives 2^48 distinct ids and costs a shift, so the state is unrepresentable instead of
+/// documented.
 struct MaterialisedRows {
     rows: std::vec::IntoIter<Vec<Value>>,
-    at: u16,
+    at: u64,
 }
 
 impl MaterialisedRows {
     fn new(rows: Vec<Vec<Value>>) -> Self {
         MaterialisedRows { rows: rows.into_iter(), at: 0 }
     }
+
+    /// The `n`th synthetic id. Split so `slot_num`'s 16 bits are the low end and `page_id`'s 32 the
+    /// high, which makes ids distinct for the first 2^48 rows.
+    fn rid_of(n: u64) -> RecordId {
+        RecordId { page_id: (n >> 16) as u32, slot_num: (n & 0xffff) as u16 }
+    }
 }
 
 impl Executor for MaterialisedRows {
     fn next(&mut self) -> Option<Result<(RecordId, Vec<Value>), FerroError>> {
         let row = self.rows.next()?;
-        let rid = RecordId { page_id: 0, slot_num: self.at };
-        self.at = self.at.wrapping_add(1);
+        let rid = MaterialisedRows::rid_of(self.at);
+        self.at += 1;
         Some(Ok((rid, row)))
     }
 }
@@ -737,6 +752,30 @@ mod tests {
         for name in ["inventory", "ferro", "ferro_branchesx", "t"] {
             assert!(reject_view_name_collision(name).is_ok(), "{name} was refused");
         }
+    }
+
+    /// The breaking shape: more than 65,536 rows. A counter living in `RecordId.slot_num` alone is a
+    /// `u16`, so row 0 and row 65,536 would carry the same synthetic id — invisible today because
+    /// nothing downstream of a projection reads it, and a deduplication fault far from here the moment
+    /// something does. `ferro_row_authors` is one row per attributed row per table, so this is
+    /// reachable rather than theoretical.
+    #[test]
+    fn synthetic_row_ids_stay_distinct_past_the_slot_number_width() {
+        let boundary = [0u64, 1, 65_535, 65_536, 65_537, 131_071, 131_072, u32::MAX as u64 + 1];
+        let mut seen: Vec<RecordId> = Vec::new();
+        for n in boundary {
+            let rid = MaterialisedRows::rid_of(n);
+            assert!(!seen.contains(&rid), "row {n} reused the id of an earlier row: {rid:?}");
+            seen.push(rid);
+        }
+        // The specific collision a u16 counter produces, named so the test cannot pass vacuously.
+        assert_ne!(
+            MaterialisedRows::rid_of(0),
+            MaterialisedRows::rid_of(65_536),
+            "the 65,536th row collided with the first"
+        );
+        assert_eq!(MaterialisedRows::rid_of(65_536).page_id, 1);
+        assert_eq!(MaterialisedRows::rid_of(65_536).slot_num, 0);
     }
 
     #[test]
