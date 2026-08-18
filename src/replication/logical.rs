@@ -773,6 +773,91 @@ mod tests {
         d.decode(w, base, end).unwrap()
     }
 
+    fn a_run(prov: u32, agent: &str) -> RunEntity {
+        RunEntity::new(
+            crate::provenance::ProvId(prov),
+            agent,
+            "run-1",
+            "claude-opus",
+            "2026-05",
+            [0xab; 32],
+            1_700_000_000_000,
+            crate::branch::types::BranchId::new(1, 0),
+        )
+    }
+
+    /// **One provenance slot, two actors, is a log that disagrees with itself.**
+    ///
+    /// The slot is the reference every stamped version carries, so two meanings for it make every
+    /// attribution downstream ambiguous. Guessing which one wrote a given row would produce
+    /// confident wrong attribution — worse than refusing, because nothing downstream can tell.
+    ///
+    /// Breaking shape: two identity records with the same `prov_id` and different actor tuples in
+    /// one decode range. A log where each slot appears once — which is every well-formed log —
+    /// passes with or without the check.
+    #[test]
+    fn one_provenance_slot_naming_two_actors_is_refused() {
+        use std::sync::atomic::Ordering;
+        let (_d, w) = wal("conflicting-runs");
+
+        // Anti-vacuity first: the SAME declaration twice is exactly what a checkpoint replay
+        // produces, and must be accepted.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "a repeated declaration became two runs");
+
+        // Now the same slot with a different actor.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "auditor-agent") }).unwrap();
+        w.flush().unwrap();
+        let err = decoder()
+            .decode(&w, w.base_lsn.load(Ordering::SeqCst), w.next_lsn.load(Ordering::SeqCst))
+            .expect_err("a slot naming two actors was accepted");
+        assert!(
+            format!("{err}").contains("different"),
+            "it failed, but not by this guard: {err}"
+        );
+    }
+
+    /// A declaration (transaction 0) names a run without binding one, and a binding attributes the
+    /// transaction it rides with. Told apart by `txn_id` alone.
+    ///
+    /// Breaking shape: a declaration followed by an unrelated transaction's commit. If declarations
+    /// bound, that commit would be attributed to whichever run was declared last — and after a
+    /// checkpoint, every table's declarations are replayed at the head of the log, so the first
+    /// commit after any checkpoint would be attributed to a run that did not write it.
+    #[test]
+    fn a_declaration_names_a_run_without_attributing_anybodys_commit() {
+        let (_d, w) = wal("declaration-only");
+        // Declared, not bound.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w, 5, 7, 70);
+        w.append(5, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "the declaration was not learned");
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].writer.is_none(),
+            "a declaration attributed a commit it had nothing to do with: {:?}",
+            rows[0].writer
+        );
+        assert_eq!(out.unattributed_commits.iter().copied().collect::<Vec<_>>(), vec![5]);
+
+        // Anti-vacuity: the same record carrying that transaction's id DOES attribute it.
+        let (_d2, w2) = wal("declaration-bound");
+        w2.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w2, 5, 7, 70);
+        w2.append(5, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w2.append(5, 0, &RecKind::Commit).unwrap();
+        let out = decode_all(&decoder(), &w2);
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
+    }
+
     #[test]
     fn a_committed_insert_becomes_a_typed_row_event() {
         let (_d, w) = wal("insert");

@@ -696,6 +696,58 @@ mod tests {
         assert_eq!(s.run_count(), 0);
     }
 
+    /// **File order is not id order, and replaying in file order would renumber every run.**
+    ///
+    /// `MemProvenanceStore` hands out ids sequentially, so replay has to present the runs in the
+    /// order that reproduces them. Two threads can be assigned ids 1 and 2 and reach the file in the
+    /// other order — the id is assigned under the lock, the `pwrite` is not ordered with respect to
+    /// another thread's — so the file genuinely can hold them backwards.
+    ///
+    /// Breaking shape: exactly that, a file whose run records are out of `prov_id` order. Every file
+    /// written by a single-threaded caller is already in order and passes either way, which is why
+    /// this is built by hand rather than hoped for from a concurrent workload.
+    #[test]
+    fn run_records_out_of_order_in_the_file_still_replay_to_their_recorded_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+        // Equal-length names, so the two run frames are byte-identical in length and can be swapped
+        // without re-framing anything.
+        let first = RunEntity::new(ProvId::NONE, "aaa", "r1", "claude-opus", "2026-05",
+            prompt_digest("one"), 1, BranchId::new(1, 0));
+        let second = RunEntity::new(ProvId::NONE, "bbb", "r2", "claude-opus", "2026-05",
+            prompt_digest("two"), 1, BranchId::new(1, 0));
+        {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let a = s.intern(&first).unwrap();
+            let b = s.intern(&second).unwrap();
+            assert_eq!((a, b), (ProvId(1), ProvId(2)));
+            s.stamp(rid(1, 1), a).unwrap();
+            s.stamp(rid(1, 2), b).unwrap();
+        }
+
+        // Swap the two run frames, which are the first two after the header.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let h = HEADER_SIZE as usize;
+        let len_a = u32::from_be_bytes(bytes[h..h + 4].try_into().unwrap()) as usize;
+        let len_b =
+            u32::from_be_bytes(bytes[h + len_a..h + len_a + 4].try_into().unwrap()) as usize;
+        assert_eq!(len_a, len_b, "the two run frames must be the same length to swap them");
+        let frame_a = bytes[h..h + len_a].to_vec();
+        let frame_b = bytes[h + len_a..h + len_a + len_b].to_vec();
+        bytes[h..h + len_b].copy_from_slice(&frame_b);
+        bytes[h + len_b..h + len_b + len_a].copy_from_slice(&frame_a);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let s = DurableProvenanceStore::open(&path)
+            .expect("a file whose run records are out of order was refused");
+        assert_eq!(s.run_count(), 2);
+        assert_eq!(s.lookup(ProvId(1)).unwrap().agent_id, "aaa", "the ids were renumbered");
+        assert_eq!(s.lookup(ProvId(2)).unwrap().agent_id, "bbb");
+        // And the stamps still resolve to the runs that made them, which is the point.
+        assert_eq!(s.who_wrote(rid(1, 1)).unwrap().agent_id, "aaa");
+        assert_eq!(s.who_wrote(rid(1, 2)).unwrap().agent_id, "bbb");
+    }
+
     /// **The density claim, measured with the instrument that already exists for it.**
     ///
     /// `footprint_bytes` against `literal_footprint_bytes` — the pair
