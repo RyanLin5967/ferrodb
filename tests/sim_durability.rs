@@ -40,7 +40,9 @@ use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use ferrodb::storage::heap_file_manager::HeapFileManager;
 use ferrodb::storage::heap_page::Page;
-use ferrodb::storage::sim::{Durability, FaultKind, FaultPlan, OpKind, SimFabric, TraceOp};
+use ferrodb::storage::sim::{
+    Durability, FaultKind, FaultPlan, OpKind, SimFabric, TraceOp, WriteShape,
+};
 use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::{RecKind, WalManager};
 use ferrodb::wal::recovery::{rebuild_indexes, recover};
@@ -120,7 +122,22 @@ fn fabric(plan: Option<FaultPlan>, durability: Durability) -> Arc<SimFabric> {
         None => SimFabric::clean(durability),
     };
     f.set_write_atomicity(DB, PAGE_SIZE as u64);
+    // The log's records are checksummed and may be garbled; its header is not, and garbling that is a
+    // restatement of a gap rather than a test — see
+    // `a_garbled_wal_header_takes_the_database_down_with_its_data_intact`.
+    f.set_verified_from(WAL, wal_header_len());
     f
+}
+
+/// The length of the WAL header, taken from the log itself rather than hardcoded: a brand-new log is
+/// exactly its header, so this cannot drift if `HEADER_SIZE` changes. It is a *model parameter*, not
+/// an expected value, which is why deriving it from the subject is the right thing to do here.
+fn wal_header_len() -> u64 {
+    let f = SimFabric::clean(Durability::WriteThrough);
+    let _ = WalManager::with_storage(f.open(WAL), WAL.into()).expect("create a log");
+    let len = f.durable_image().get(WAL).map(|v| v.len() as u64).unwrap_or(0);
+    assert!(len >= 8 && len < PAGE_SIZE as u64, "a fresh WAL is {len} bytes, which is not a header");
+    len
 }
 
 struct Db {
@@ -475,33 +492,47 @@ fn recovery_itself_writes_the_same_sequence_three_times() {
     let census = fabric(None, Durability::SyncOnly);
     let base = workload(&census).expect("census");
 
-    // Find a crash whose recovery writes several pages. Deterministic search, first hit wins.
-    let mut chosen: Option<(BTreeMap<String, Vec<u8>>, usize)> = None;
+    // **Score every crash point and take the best, rather than the first that writes enough pages.**
+    //
+    // Taking the first hit was a mistake worth recording: the earliest points leave an empty database
+    // file, so recovery writes plenty of pages — but they are also *before* the uncommitted
+    // transactions exist, so recovery has nothing to undo and the loser ORDER cannot differ. Measured:
+    // reverting `recover`'s `losers` sort survived this test 5 times out of 5 while it picked such a
+    // point. The image this test needs is one where recovery both rebuilds pages AND compensates
+    // several transactions.
+    let mut best: Option<(usize, usize, BTreeMap<String, Vec<u8>>)> = None;
     for &n in census.faultable_ops().iter() {
         let live = fabric(Some(FaultPlan::at(n, 0x0B10_5EED)), Durability::SyncOnly);
         let _ = workload(&live);
-        let rebooted = live.restart();
-        let before = rebooted.op_count();
-        let after = reboot_and_recover(&rebooted, base.dir_root);
-        if after.outcome.is_err() {
+        let image = live.durable_image();
+
+        let probe = SimFabric::from_images(image.clone(), None, Durability::SyncOnly);
+        probe.set_write_atomicity(DB, PAGE_SIZE as u64);
+        let Ok(db) = open(&probe) else { continue };
+        let first_new_lsn = db.wal.next_lsn.load(Ordering::SeqCst);
+        let before = probe.op_count();
+        if recover(&db.txn).is_err() {
             continue;
         }
-        let writes = rebooted
+        let undone = compensated_transactions(&db.wal, first_new_lsn).len();
+        let writes = probe
             .trace()
             .into_iter()
-            .filter(|t| t.index >= before && t.kind == OpKind::Pwrite && t.file == DB)
+            .filter(|t| t.index >= before && t.kind == OpKind::Pwrite)
             .count();
-        if writes >= 4 {
-            chosen = Some((live.durable_image(), writes));
-            break;
+        if best.as_ref().is_none_or(|(u, w, _)| (undone, writes) > (*u, *w)) {
+            best = Some((undone, writes, image));
         }
     }
-    let (image, writes) = chosen.expect(
-        "no crash point left recovery more than three page writes to do, so an ordering bug in \
-         `recover` could not show here and this test would be vacuous",
+    let (undone, _, image) = best.expect("no crash point produced a recoverable image at all");
+    assert!(
+        undone >= 2,
+        "the best crash point left recovery only {undone} transaction(s) to compensate; with fewer \
+         than two there is no undo order to get wrong and this test cannot see one"
     );
 
     let mut sequences = Vec::new();
+    let mut db_write_counts = Vec::new();
     for _ in 0..3 {
         let rebooted = SimFabric::from_images(image.clone(), None, Durability::SyncOnly);
         rebooted.set_write_atomicity(DB, PAGE_SIZE as u64);
@@ -510,21 +541,45 @@ fn recovery_itself_writes_the_same_sequence_three_times() {
         assert!(after.outcome.is_ok(), "recovery of a fixed image failed: {:?}", after.outcome);
         check_invariants(&after, "fixed image");
         // Every operation, both files. Filtering to the database file alone would miss the undo
-        // ordering entirely: two losers produce their compensation records in the WAL, and it is the
-        // WAL bytes that differ when the loser order does.
+        // ordering entirely: the losers' compensation records go to the WAL, and it is the WAL bytes
+        // that differ when the loser order does.
         let seq: Vec<(String, OpKind, u64, usize, u32)> = rebooted
             .trace()
             .into_iter()
             .filter(|t| t.index >= before)
             .map(|t| (t.file, t.kind, t.offset, t.len, t.data_crc))
             .collect();
-        let db_writes =
-            seq.iter().filter(|(f, k, ..)| f == DB && *k == OpKind::Pwrite).count();
-        assert_eq!(db_writes, writes, "the same image produced a different number of page writes");
+        db_write_counts
+            .push(seq.iter().filter(|(f, k, ..)| f == DB && *k == OpKind::Pwrite).count());
         sequences.push(seq);
     }
+    assert!(
+        db_write_counts[0] >= 3,
+        "recovery wrote only {} page(s), so a page ordering bug could not show either: {db_write_counts:?}",
+        db_write_counts[0]
+    );
     assert_eq!(sequences[0], sequences[1], "recovery wrote a different sequence on run 2");
     assert_eq!(sequences[1], sequences[2], "recovery wrote a different sequence on run 3");
+}
+
+/// The transactions recovery compensated, in the order its records appear in the log, starting at
+/// `from_lsn`. Consecutive records for one transaction collapse to a single entry, so the result is
+/// the order undo ran them in.
+fn compensated_transactions(wal: &WalManager, from_lsn: u64) -> Vec<u64> {
+    let mut groups: Vec<u64> = Vec::new();
+    let end = wal.next_lsn.load(Ordering::SeqCst);
+    let mut lsn = from_lsn;
+    while lsn < end {
+        let Ok((rec, next)) = wal.read_record(lsn) else { break };
+        if matches!(rec.kind, RecKind::Clr { .. } | RecKind::Abort) && groups.last() != Some(&rec.txn_id) {
+            groups.push(rec.txn_id);
+        }
+        if next <= lsn {
+            break;
+        }
+        lsn = next;
+    }
+    groups
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -606,6 +661,7 @@ struct Tally {
     empty: usize,
     refused: usize,
     torn: usize,
+    corrupted: usize,
     dropped: usize,
     failed_sync: usize,
     dropped_set_len: usize,
@@ -623,13 +679,15 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
     );
 
     let mut tally = Tally::default();
-    // **Both shapes at every point**, not whichever one the seed happened to pick. With a single
+    // **Every shape at every point**, not whichever one the seed happened to pick. With a single
     // shape per point a 60-point sweep produced 50 dropped writes and zero torn ones, so the fault
     // kind that most needs testing — a write that landed halfway — was absent from a sweep that
-    // reported success.
+    // reported success. `Corrupt` is the third because a tear and a drop both leave a *short* record,
+    // which a bounds check catches on its own: with only those two, removing every CRC check from the
+    // WAL read path left this sweep green.
     for &n in &points {
-        for tear in [false, true] {
-            let plan = FaultPlan::at_shaped(n, seed, tear);
+        for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
+            let plan = FaultPlan::at_shaped(n, seed, shape);
             let live = fabric(Some(plan), durability);
             let ran = std::panic::catch_unwind(AssertUnwindSafe(|| workload(&live)));
             assert!(
@@ -660,6 +718,15 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
                         fired.len
                     );
                 }
+                FaultKind::CorruptWrite => {
+                    tally.corrupted += 1;
+                    assert!(
+                        fired.kept < fired.len,
+                        "a garbled write at operation {n} claims to have altered byte {} of {}",
+                        fired.kept,
+                        fired.len
+                    );
+                }
                 FaultKind::DropWrite => tally.dropped += 1,
                 FaultKind::FailSync => tally.failed_sync += 1,
                 FaultKind::DropSetLen => tally.dropped_set_len += 1,
@@ -667,7 +734,7 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
 
             // The machine reboots with only what survived, and nothing faults from here on.
             let rebooted = live.restart();
-            let what = format!("fault at op {n} ({}): {fired:?}", if tear { "tearing" } else { "dropping" });
+            let what = format!("fault at op {n} ({shape:?}): {fired:?}");
             let after = match std::panic::catch_unwind(AssertUnwindSafe(|| {
                 reboot_and_recover(&rebooted, base.dir_root)
             })) {
@@ -717,6 +784,10 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
     // short to hold the table at all. Refusing everything is impossible under that rule without
     // also failing `tally.all_rows > 0` below.
     assert!(tally.torn > 0, "no write was ever torn: {tally:?}");
+    assert!(
+        tally.corrupted > 0,
+        "no write was ever garbled, so nothing here needed a checksum to catch it: {tally:?}"
+    );
     assert!(tally.dropped > 0, "no write was ever dropped: {tally:?}");
     assert!(tally.failed_sync > 0, "no sync ever failed: {tally:?}");
     assert!(
@@ -992,13 +1063,14 @@ impl std::fmt::Debug for Tally {
         write!(
             f,
             "Tally {{ all_rows: {}, first_only: {}, empty: {}, refused: {}, commit_durable: {}, \
-             torn: {}, dropped: {}, failed_sync: {}, dropped_set_len: {} }}",
+             torn: {}, corrupted: {}, dropped: {}, failed_sync: {}, dropped_set_len: {} }}",
             self.all_rows,
             self.first_only,
             self.empty,
             self.refused,
             self.commit_durable,
             self.torn,
+            self.corrupted,
             self.dropped,
             self.failed_sync,
             self.dropped_set_len
@@ -1052,7 +1124,7 @@ fn a_torn_table_page_is_served_as_a_row_that_was_never_written() {
 
     let mut corrupted: Option<(u64, usize)> = None;
     for &n in census.faultable_ops().iter() {
-        let live = SimFabric::with_fault(FaultPlan::at_shaped(n, 0x0B10_5EED, true), Durability::WriteThrough);
+        let live = SimFabric::with_fault(FaultPlan::at_shaped(n, 0x0B10_5EED, WriteShape::Tear), Durability::WriteThrough);
         let _ = workload(&live);
         let Some(fired) = live.fired() else { continue };
         if fired.kind != FaultKind::TearWrite || fired.file != DB {
@@ -1241,20 +1313,11 @@ fn undo_compensates_the_losers_in_ascending_transaction_id_order() {
     let first_new_lsn = db.wal.next_lsn.load(Ordering::SeqCst);
     assert!(recover(&db.txn).expect("recover"), "recovery found nothing to do");
 
-    let end = db.wal.next_lsn.load(Ordering::SeqCst);
-    assert!(end > first_new_lsn, "recovery appended no records, so there is no order to check");
-    let mut groups: Vec<u64> = Vec::new();
-    let mut lsn = first_new_lsn;
-    while lsn < end {
-        let (rec, next) = db.wal.read_record(lsn).expect("read a record recovery wrote");
-        if matches!(rec.kind, RecKind::Clr { .. } | RecKind::Abort) && groups.last() != Some(&rec.txn_id) {
-            groups.push(rec.txn_id);
-        }
-        if next <= lsn {
-            break;
-        }
-        lsn = next;
-    }
+    assert!(
+        db.wal.next_lsn.load(Ordering::SeqCst) > first_new_lsn,
+        "recovery appended no records, so there is no order to check"
+    );
+    let groups = compensated_transactions(&db.wal, first_new_lsn);
 
     // Anti-vacuity: every loser really was undone, so this is an assertion about all five and not
     // about whichever one happened to be first.
@@ -1271,5 +1334,90 @@ fn undo_compensates_the_losers_in_ascending_transaction_id_order() {
         groups, ascending,
         "undo ran the uncommitted transactions in the order {groups:?}, not ascending transaction \
          id. Recovery is a sequence of durable writes and this is the sequence."
+    );
+}
+
+/// **A known gap, pinned: 24 unchecksummed bytes can take the whole database down while every row it
+/// ever committed is safe on disk.**
+///
+/// Breaking shape: a garbled — not lost, not truncated — write to the WAL's header. The header holds
+/// magic, version, base LSN and next transaction id, it is rewritten in place by
+/// `WalManager::truncate` on every checkpoint, and it carries **no checksum**. One wrong byte inside
+/// the version field and `WalManager::new` refuses with `incorrect wal version`; `run_cli` cannot get
+/// past it, so the database will not open at all.
+///
+/// What makes it worth pinning rather than shrugging at is the ordering. A checkpoint flushes the log,
+/// writes the pages, **fsyncs the pages**, and only then rewrites this header — so at the moment the
+/// header is damaged every committed row is already durable. This test proves that: it drops a
+/// brand-new empty log next to the surviving database file and gets all 210 rows back.
+///
+/// The fix is a checksum over the header and a way to rebuild or refuse-and-continue when it fails;
+/// that is a WAL format change, and it is not in this branch. **If this test ever fails**, someone has
+/// made the header verifiable, and it should become the assertion that the database still opens.
+#[test]
+fn a_garbled_wal_header_takes_the_database_down_with_its_data_intact() {
+    let census = fabric(None, Durability::WriteThrough);
+    let base = workload(&census).expect("census");
+    let clean_db_len = census.durable_image().get(DB).map(|v| v.len()).unwrap_or(0);
+    assert!(clean_db_len > 0, "the census wrote no database file");
+
+    // A fabric that WILL garble the header: no `verified_from` floor at all.
+    let mut found = None;
+    for &n in census.faultable_ops().iter() {
+        let live = SimFabric::with_fault(
+            FaultPlan::at_shaped(n, 0x0B10_5EED, WriteShape::Corrupt),
+            Durability::WriteThrough,
+        );
+        live.set_write_atomicity(DB, PAGE_SIZE as u64);
+        let _ = workload(&live);
+        let Some(fired) = live.fired() else { continue };
+        if fired.kind != FaultKind::CorruptWrite
+            || fired.file != WAL
+            || fired.offset >= wal_header_len()
+        {
+            continue;
+        }
+        // Does the log now refuse to open?
+        let rebooted = live.restart();
+        if open(&rebooted).is_err() {
+            found = Some((n, fired, live.durable_image()));
+            break;
+        }
+    }
+    let (op, fired, image) = found.expect(
+        "no garbled header byte stopped the log from opening. Either the header is verified now — in \
+         which case this test should assert that the database still opens — or the corruption model \
+         stopped reaching offset 0 of the log.",
+    );
+
+    // The database file is untouched and still holds everything.
+    let db_len = image.get(DB).map(|v| v.len()).unwrap_or(0);
+    assert_eq!(
+        db_len, clean_db_len,
+        "the database file is a different length from the fault-free run, so this is not purely a \
+         log-header problem"
+    );
+
+    // Same pages, brand-new empty log: every committed row comes back. So the data was never at risk
+    // and 24 bytes were.
+    let mut repaired = image.clone();
+    repaired.insert(WAL.to_string(), Vec::new());
+    let fresh = SimFabric::from_images(repaired, None, Durability::WriteThrough);
+    fresh.set_write_atomicity(DB, PAGE_SIZE as u64);
+    let after = reboot_and_recover(&fresh, base.dir_root);
+    let rows = after.outcome.as_ref().expect("the pages alone must open with a fresh log");
+    assert_eq!(
+        rows.len(),
+        ROWS + ROWS2,
+        "with a fresh log the pages gave back {} of {} rows, so the data was NOT already durable and \
+         this test is describing the wrong failure",
+        rows.len(),
+        ROWS + ROWS2
+    );
+    println!(
+        "known gap: byte {} of the WAL header, garbled at operation {op} ({fired:?}), makes the \
+         database unopenable while all {} rows are durable in the data file",
+        fired.kept,
+        ROWS + ROWS2
     );
 }

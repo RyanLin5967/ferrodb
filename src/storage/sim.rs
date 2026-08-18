@@ -86,17 +86,39 @@ pub enum Durability {
 }
 
 /// What kind of break to stage. Chosen from the operation's type, not guessed, so a plan always
-/// fires: a write gets torn or dropped, a flush gets failed, a truncate gets skipped.
+/// fires: a write gets torn, dropped or garbled, a flush gets failed, a truncate gets skipped.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum FaultKind {
     /// The first `kept` bytes of the write land, the rest never do.
     TearWrite,
     /// The write lands nowhere.
     DropWrite,
+    /// The write lands at full length with one byte **wrong**.
+    ///
+    /// A different fault from a tear, and the distinction is the whole reason a checksum exists. A
+    /// torn write leaves a *short* record, which a length or bounds check can catch on its own; a
+    /// garbled write leaves a record of exactly the right length whose bytes are not what was
+    /// written, and nothing but a checksum can tell. Measured: removing every CRC check from the WAL
+    /// read path left the sweep GREEN while only tears were modelled, because
+    /// `scan_valid_end`'s `offset + total > file_len` bound caught the short tail by itself.
+    CorruptWrite,
     /// The flush returns an error.
     FailSync,
     /// The truncate/extend does not happen.
     DropSetLen,
+}
+
+/// How a faulted write misbehaves. The sweep puts all three at every write, rather than taking
+/// whichever the seed happened to pick.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum WriteShape {
+    /// Nothing lands.
+    Drop,
+    /// A prefix lands.
+    Tear,
+    /// Everything lands, one byte wrong. Only offered to files whose writer can actually detect it —
+    /// see [`SimFabric::set_write_atomicity`].
+    Corrupt,
 }
 
 /// Which operation to break, and how. Everything here is derived from a seed and is `Copy`, so a
@@ -107,9 +129,9 @@ pub struct FaultPlan {
     /// The fault fires at the first *faultable* operation whose index is at or above this. Reads are
     /// counted in the index space but are never faultable, so the fired index can be higher.
     pub at_op: u64,
-    /// Seed-derived: tear a write rather than dropping it.
-    pub tear: bool,
-    /// Seed-derived: where inside the buffer the tear lands.
+    /// Seed-derived: how a faulted write misbehaves.
+    pub shape: WriteShape,
+    /// Seed-derived: where inside the buffer the tear boundary, or the garbled byte, falls.
     pub tear_pick: u64,
 }
 
@@ -122,9 +144,9 @@ impl FaultPlan {
     pub fn from_seed(seed: u64, op_count: u64) -> FaultPlan {
         let mut rng = Rng::new(seed);
         let at_op = rng.below(op_count.max(1));
-        let tear = rng.next_u64() % 2 == 0;
+        let shape = shape_from(rng.next_u64());
         let tear_pick = rng.next_u64();
-        FaultPlan { seed, at_op, tear, tear_pick }
+        FaultPlan { seed, at_op, shape, tear_pick }
     }
 
     /// A plan at a caller-chosen operation index; the seed still chooses the shape of the break.
@@ -135,16 +157,24 @@ impl FaultPlan {
     /// ones, which quietly removed a whole fault kind from the range being swept.
     pub fn at(at_op: u64, seed: u64) -> FaultPlan {
         let mut rng = Rng::new(seed ^ at_op.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5DEE_CE66_D0D1_6E01);
-        let tear = rng.next_u64() % 2 == 0;
+        let shape = shape_from(rng.next_u64());
         let tear_pick = rng.next_u64();
-        FaultPlan { seed, at_op, tear, tear_pick }
+        FaultPlan { seed, at_op, shape, tear_pick }
     }
 
-    /// A plan at a chosen operation with a chosen shape, so a sweep can put **both** shapes at every
+    /// A plan at a chosen operation with a chosen shape, so a sweep can put **every** shape at every
     /// point instead of taking whichever one the seed happened to pick. The seed still chooses where
-    /// inside the buffer a tear lands.
-    pub fn at_shaped(at_op: u64, seed: u64, tear: bool) -> FaultPlan {
-        FaultPlan { tear, ..Self::at(at_op, seed) }
+    /// inside the buffer the tear boundary or the garbled byte falls.
+    pub fn at_shaped(at_op: u64, seed: u64, shape: WriteShape) -> FaultPlan {
+        FaultPlan { shape, ..Self::at(at_op, seed) }
+    }
+}
+
+fn shape_from(n: u64) -> WriteShape {
+    match n % 3 {
+        0 => WriteShape::Drop,
+        1 => WriteShape::Tear,
+        _ => WriteShape::Corrupt,
     }
 }
 
@@ -240,6 +270,9 @@ struct FabricState {
     /// whose writer is entitled to assume page-atomic writes. See
     /// [`SimFabric::set_write_atomicity`].
     atomic_unit: BTreeMap<String, u64>,
+    /// Per file, the first offset at or above which a write may be *garbled* rather than merely lost.
+    /// 0 by default. See [`SimFabric::set_verified_from`].
+    verified_from: BTreeMap<String, u64>,
     trace: Vec<TraceOp>,
     trace_digest_bytes: Vec<u8>,
     fired: Option<FiredFault>,
@@ -295,6 +328,7 @@ impl SimFabric {
                 next_op: 0,
                 files: BTreeMap::new(),
                 atomic_unit: BTreeMap::new(),
+                verified_from: BTreeMap::new(),
                 trace: Vec::new(),
                 trace_digest_bytes: Vec::new(),
                 fired: None,
@@ -345,6 +379,21 @@ impl SimFabric {
     pub fn set_write_atomicity(&self, name: &str, unit: u64) {
         let unit = unit.max(1);
         self.lock().atomic_unit.insert(name.to_string(), unit);
+    }
+
+    /// Declare that writes to `name` may be **garbled** — full length, wrong bytes — only from
+    /// `offset` onwards. Below it a garbled write degrades to a lost one.
+    ///
+    /// One file is not uniformly protected. The WAL puts a CRC32 on every *record*, so garbling a
+    /// record is a fault it is built to detect and worth injecting. Its 24-byte **header** —
+    /// magic, version, base LSN, next transaction id — carries no checksum of any kind, so garbling
+    /// that is not a test of anything: it is a restatement of a gap, and it is pinned by
+    /// `a_garbled_wal_header_takes_the_database_down_with_its_data_intact` in
+    /// `tests/sim_durability.rs`. Same question as [`SimFabric::set_write_atomicity`] — does this
+    /// file's reader verify what it reads? — asked per region rather than per file, because the answer
+    /// genuinely differs within the log.
+    pub fn set_verified_from(&self, name: &str, offset: u64) {
+        self.lock().verified_from.insert(name.to_string(), offset);
     }
 
     /// A handle on one file. Creating it is not an operation — a real `open` is not part of the
@@ -416,8 +465,15 @@ impl SimFabric {
     /// same write-atomicity model — rebooting does not change the hardware.
     pub fn restart(&self) -> Arc<SimFabric> {
         let fresh = SimFabric::from_images(self.durable_image(), None, self.durability);
-        let units = self.lock().atomic_unit.clone();
-        fresh.lock().atomic_unit = units;
+        let (units, verified) = {
+            let st = self.lock();
+            (st.atomic_unit.clone(), st.verified_from.clone())
+        };
+        {
+            let mut st = fresh.lock();
+            st.atomic_unit = units;
+            st.verified_from = verified;
+        }
         fresh
     }
 
@@ -446,27 +502,41 @@ impl SimFabric {
             let plan = self.plan.expect("checked by `fire`");
             fired = Some(match kind {
                 OpKind::Pwrite => {
-                    // A tear needs at least one byte on each side of the boundary. A one-byte write
-                    // cannot be torn, so it is dropped instead — and `kept` records which happened,
-                    // so a test compares the fault that fired, not the one that was planned.
-                    let raw = if plan.tear && len >= 2 {
-                        1 + (plan.tear_pick % (len as u64 - 1)) as usize
-                    } else {
-                        0
-                    };
-                    // Round the boundary down to this file's atomic unit, measured in absolute file
-                    // offsets: a device tears at a sector boundary, not at a boundary relative to
-                    // whatever the caller happened to pass. With the default unit of 1 this is a no-op.
                     let unit = *st.atomic_unit.get(name).unwrap_or(&1);
-                    let kept = if unit <= 1 {
-                        raw
+                    // A garbled write is only offered to a file whose writer can detect one; on any
+                    // other it degrades to a drop. See `set_write_atomicity`: the same one question
+                    // ("does this file's reader verify what it reads?") decides both knobs, so there
+                    // is one answer per file and not two that can disagree.
+                    let verified_from = *st.verified_from.get(name).unwrap_or(&0);
+                    if plan.shape == WriteShape::Corrupt
+                        && unit <= 1
+                        && len > 0
+                        && offset >= verified_from
+                    {
+                        return_corrupt(index, name, offset, len, plan.tear_pick)
                     } else {
-                        let abs_end = offset + raw as u64;
-                        let aligned = abs_end - (abs_end % unit);
-                        aligned.saturating_sub(offset) as usize
-                    };
-                    let fk = if kept > 0 { FaultKind::TearWrite } else { FaultKind::DropWrite };
-                    FiredFault { op_index: index, file: name.to_string(), kind: fk, offset, len, kept }
+                        // A tear needs at least one byte on each side of the boundary. A one-byte
+                        // write cannot be torn, so it is dropped instead — and `kept` records which
+                        // happened, so a test compares the fault that fired, not the one planned.
+                        let raw = if plan.shape == WriteShape::Tear && len >= 2 {
+                            1 + (plan.tear_pick % (len as u64 - 1)) as usize
+                        } else {
+                            0
+                        };
+                        // Round the boundary down to this file's atomic unit, measured in absolute
+                        // file offsets: a device tears at a sector boundary, not at a boundary
+                        // relative to whatever the caller happened to pass. With unit 1 this is a
+                        // no-op.
+                        let kept = if unit <= 1 {
+                            raw
+                        } else {
+                            let abs_end = offset + raw as u64;
+                            let aligned = abs_end - (abs_end % unit);
+                            aligned.saturating_sub(offset) as usize
+                        };
+                        let fk = if kept > 0 { FaultKind::TearWrite } else { FaultKind::DropWrite };
+                        FiredFault { op_index: index, file: name.to_string(), kind: fk, offset, len, kept }
+                    }
                 }
                 OpKind::SyncAll | OpKind::SyncData => FiredFault {
                     op_index: index,
@@ -521,8 +591,16 @@ impl SimFabric {
             // Apply the partial write, if any, then close the machine down. Everything the workload
             // would have done next happened to a process that no longer exists.
             if let (OpKind::Pwrite, Req::Pwrite(buf)) = (kind, &req) {
-                if f.kept > 0 {
-                    write_into(img, durability, offset, &buf[..f.kept]);
+                match f.kind {
+                    FaultKind::TearWrite => write_into(img, durability, offset, &buf[..f.kept]),
+                    FaultKind::CorruptWrite => {
+                        // Full length, one byte wrong. `kept` carries which byte, so the reproducer
+                        // is exact rather than "somewhere in there".
+                        let mut garbled = buf.to_vec();
+                        garbled[f.kept] ^= 0xFF;
+                        write_into(img, durability, offset, &garbled);
+                    }
+                    _ => {}
                 }
             }
             let err = fault_err(f.kind, f.op_index);
@@ -592,6 +670,18 @@ impl Req<'_> {
             Req::Pread(b) => b.len(),
             _ => 0,
         }
+    }
+}
+
+/// A garbled write, with `kept` reused to carry the index of the byte that came out wrong.
+fn return_corrupt(index: u64, name: &str, offset: u64, len: usize, pick: u64) -> FiredFault {
+    FiredFault {
+        op_index: index,
+        file: name.to_string(),
+        kind: FaultKind::CorruptWrite,
+        offset,
+        len,
+        kept: (pick % len as u64) as usize,
     }
 }
 
