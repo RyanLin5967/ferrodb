@@ -205,6 +205,40 @@ pub enum Stmt {
         merge_id: String,
         cascade: bool,
     },
+    /// ```text
+    /// SIMULATE AS 'pricing-agent' RUN 'r_9'
+    ///   CANDIDATE 'cut-5'  ( UPDATE inventory SET qty = qty - 5 WHERE id = 1; )
+    ///   CANDIDATE 'cut-8'  ( UPDATE inventory SET qty = qty - 8 WHERE id = 1; )
+    ///   ASSERT ON inventory (qty >= 0)
+    ///   ADMIT ALL;
+    /// ```
+    ///
+    /// Fork one branch per candidate off the current base, run each candidate on its own branch,
+    /// score every one against the declared assertions through the gate a production `MERGE`
+    /// uses, and admit the winners. The losers are left for the lease reaper.
+    Simulate {
+        agent: String,
+        run: Option<String>,
+        /// `name/version`; the version half is optional, as on `BEGIN AGENT SESSION`.
+        model: Option<String>,
+        /// `(name, body)` in declaration order. A body may be empty — "change nothing" is a
+        /// legitimate candidate to compare the others against.
+        candidates: Vec<(String, Vec<Stmt>)>,
+        /// `(table, predicate)`. The predicate is checked against every row of that table as the
+        /// merge would leave it.
+        assertions: Vec<(String, Expr)>,
+        admit: AdmitSpec,
+    },
+}
+
+/// How many winners `SIMULATE` may admit. There is no default: how much of a simulation's output
+/// to publish is the caller's decision, and guessing it wrong publishes work nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitSpec {
+    /// Every candidate still admissible when its turn comes.
+    All,
+    /// At most `n`. `ADMIT 0` scores everything and publishes nothing.
+    AtMost(usize),
 }
 
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
@@ -259,6 +293,8 @@ impl Parser {
             return Ok(Stmt::Abandon { branch })
         } else if self.match_token(&[TokenType::Revert]) {
             return self.parse_revert()
+        } else if self.match_token(&[TokenType::Simulate]) {
+            return self.parse_simulate()
         } else if self.match_token(&[TokenType::Commit]) {
             return self.parse_txn_stmt(Stmt::Commit)
         } else if self.match_token(&[TokenType::Rollback]) {
@@ -598,6 +634,97 @@ impl Parser {
         Ok(Stmt::RevertMerge { merge_id, cascade })
     }
 
+    // SIMULATE AS 'agent' [RUN 'r'] [MODEL 'm/v']
+    //   CANDIDATE 'name' ( <stmt>; ... )   (one or more)
+    //   ASSERT ON <table> ( <predicate> )  (one or more)
+    //   ADMIT (ALL | <n>)
+    //
+    // The candidate bodies are ordinary statements, parsed by `parse_statement` rather than by a
+    // second grammar: a candidate is a program this database can already run, and giving it its
+    // own dialect is how the two drift apart.
+    pub fn parse_simulate(&mut self) -> Result<Stmt, FerroError> {
+        self.consume(TokenType::As, "expected AS after SIMULATE")?;
+        let agent = self.consume(TokenType::String, "expected a quoted agent id")?.lexeme;
+        let run = if self.match_token(&[TokenType::Run]) {
+            Some(self.consume(TokenType::String, "expected a quoted run id after RUN")?.lexeme)
+        } else {
+            None
+        };
+        let model = if self.match_token(&[TokenType::Model]) {
+            Some(self.consume(TokenType::String, "expected a quoted model after MODEL")?.lexeme)
+        } else {
+            None
+        };
+
+        let mut candidates: Vec<(String, Vec<Stmt>)> = Vec::new();
+        while self.match_token(&[TokenType::Candidate]) {
+            let name = self
+                .consume(TokenType::String, "expected a quoted candidate name after CANDIDATE")?
+                .lexeme;
+            self.consume(TokenType::LeftParen, "expected ( to open the candidate body")?;
+            let mut body: Vec<Stmt> = Vec::new();
+            while !self.check(TokenType::RightParen) {
+                if self.is_at_end() {
+                    return Err(Parser::error(
+                        self.peek(),
+                        format!("unterminated body for candidate '{}': expected )", name),
+                    ));
+                }
+                body.push(self.parse_statement()?);
+            }
+            self.consume(TokenType::RightParen, "expected ) to close the candidate body")?;
+            candidates.push((name, body));
+        }
+        if candidates.is_empty() {
+            return Err(Parser::error(
+                self.peek(),
+                "SIMULATE needs at least one CANDIDATE 'name' ( ... )".into(),
+            ));
+        }
+
+        let mut assertions: Vec<(String, Expr)> = Vec::new();
+        while self.match_token(&[TokenType::Assert]) {
+            self.consume(TokenType::On, "expected ON after ASSERT")?;
+            let table =
+                self.consume(TokenType::Identifier, "expected a table name after ASSERT ON")?.lexeme;
+            self.consume(TokenType::LeftParen, "expected ( around the asserted predicate")?;
+            let predicate = self.expression()?;
+            self.consume(TokenType::RightParen, "expected ) after the asserted predicate")?;
+            assertions.push((table, predicate));
+        }
+        if assertions.is_empty() {
+            // Refused in the grammar as well as in the runtime, because the message can be better
+            // here: a simulation with nothing declared scores every candidate perfectly against no
+            // evidence, and that reads as a result.
+            return Err(Parser::error(
+                self.peek(),
+                "SIMULATE needs at least one ASSERT ON <table> ( <predicate> ): with nothing \
+                 declared every candidate scores perfectly against no evidence"
+                    .into(),
+            ));
+        }
+
+        self.consume(
+            TokenType::Admit,
+            "expected ADMIT ALL or ADMIT <n> after the candidates and assertions",
+        )?;
+        let admit = if self.check(TokenType::Number) {
+            let tok = self.advance();
+            let n: usize = tok.lexeme.parse().map_err(|_| {
+                Parser::error(tok.clone(), format!("ADMIT needs a whole number, got '{}'", tok.lexeme))
+            })?;
+            AdmitSpec::AtMost(n)
+        } else if self.check(TokenType::Identifier) && self.peek().lexeme.eq_ignore_ascii_case("all")
+        {
+            self.advance();
+            AdmitSpec::All
+        } else {
+            return Err(Parser::error(self.peek(), "expected ALL or a number after ADMIT".into()));
+        };
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::Simulate { agent, run, model, candidates, assertions, admit })
+    }
+
     // optional `BRANCH b_1` argument on DIFF / MERGE / ABANDON; absent means "this session's branch"
     pub fn parse_optional_branch_arg(&mut self) -> Result<Option<BranchRef>, FerroError> {
         if self.match_token(&[TokenType::Branch]) {
@@ -860,6 +987,105 @@ mod tests {
         let mut s = parse_sql(sql).expect("should parse");
         assert_eq!(s.len(), 1, "expected exactly one statement from {}", sql);
         s.remove(0)
+    }
+
+    /// The whole statement, parsed once, because every clause of it is load-bearing: the
+    /// candidates are programs, the assertions are what they are scored against, and ADMIT is how
+    /// much of the result gets published.
+    #[test]
+    fn test_parse_simulate() {
+        let sql = "SIMULATE AS 'pricing-agent' RUN 'r_9' MODEL 'claude-opus-5/2026-05' \
+                   CANDIDATE 'cut-5' ( UPDATE inventory SET qty = qty - 5 WHERE id = 1; ) \
+                   CANDIDATE 'cut-8' ( UPDATE inventory SET qty = qty - 8 WHERE id = 1; \
+                                       INSERT INTO audit VALUES (1, 'cut-8'); ) \
+                   ASSERT ON inventory (qty >= 0) \
+                   ASSERT ON inventory (qty <= 100) \
+                   ADMIT ALL;";
+        match one(sql) {
+            Stmt::Simulate { agent, run, model, candidates, assertions, admit } => {
+                assert_eq!(agent, "pricing-agent");
+                assert_eq!(run.as_deref(), Some("r_9"));
+                assert_eq!(model.as_deref(), Some("claude-opus-5/2026-05"));
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].0, "cut-5");
+                assert_eq!(candidates[0].1.len(), 1);
+                assert_eq!(candidates[1].0, "cut-8");
+                assert_eq!(candidates[1].1.len(), 2, "a candidate body is a program, not one statement");
+                assert!(matches!(candidates[1].1[1], Stmt::Insert { .. }));
+                assert_eq!(assertions.len(), 2);
+                assert_eq!(assertions[0].0, "inventory");
+                assert_eq!(assertions[0].1.to_sql(), "qty >= 0");
+                assert_eq!(admit, AdmitSpec::All);
+            }
+            other => panic!("expected Simulate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn simulate_admits_all_or_a_count() {
+        let head = "SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1; ) ASSERT ON t (qty >= 0) ";
+        for (clause, expect) in [
+            ("ADMIT 2;", AdmitSpec::AtMost(2)),
+            // A dry run: score everything, publish nothing. Explicit rather than a mode flag.
+            ("ADMIT 0;", AdmitSpec::AtMost(0)),
+            ("ADMIT all;", AdmitSpec::All),
+        ] {
+            match one(&format!("{head}{clause}")) {
+                Stmt::Simulate { admit, .. } => assert_eq!(admit, expect, "for {clause}"),
+                other => panic!("expected Simulate, got {:?}", other),
+            }
+        }
+        let err = parse_sql(&format!("{head}ADMIT sometimes;")).unwrap_err();
+        assert!(err.contains("expected ALL or a number"), "got {err}");
+        let err = parse_sql(&format!("{head}ADMIT;")).unwrap_err();
+        assert!(err.contains("expected ALL or a number"), "got {err}");
+    }
+
+    /// **The reason `ALL` is not a reserved word.** Reserving one costs everybody who used it as a
+    /// column name, forever, and `ADMIT` is the only position where `ALL` can appear. If someone
+    /// later adds it to the scanner's keyword table this test fails and says why.
+    #[test]
+    fn all_is_still_an_ordinary_identifier_everywhere_else() {
+        match one("SELECT all FROM t;") {
+            Stmt::Select { columns, .. } => assert_eq!(columns.len(), 1),
+            other => panic!("a column named `all` stopped parsing: {:?}", other),
+        }
+        assert!(parse_sql("CREATE TABLE all (id INTEGER NOT NULL);").is_ok());
+    }
+
+    #[test]
+    fn simulate_refuses_a_run_with_nothing_to_compare_or_nothing_to_check() {
+        // No candidates: nothing to compare.
+        let err = parse_sql("SIMULATE AS 'a' ASSERT ON t (qty >= 0) ADMIT ALL;").unwrap_err();
+        assert!(err.contains("at least one CANDIDATE"), "got {err}");
+        // No assertions: every candidate would score perfectly against no evidence.
+        let err =
+            parse_sql("SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1; ) ADMIT ALL;")
+                .unwrap_err();
+        assert!(err.contains("at least one ASSERT"), "got {err}");
+    }
+
+    /// A body that runs off the end of the token stream is reported against the CANDIDATE.
+    ///
+    /// Two failures, deliberately kept apart, because the first version of this test conflated
+    /// them and could not fail. Asserting only `err.contains("expected")` was worthless: delete
+    /// the `is_at_end` guard and `parse_statement` reports "expected a statement" at EOF, which
+    /// contains "expected", so the test stayed green with the guard it names in its own
+    /// doc-comment gone. Each case now asserts the message only its own path produces.
+    #[test]
+    fn an_unterminated_candidate_body_names_the_candidate_it_belongs_to() {
+        // Runs to EOF inside the body: only the `is_at_end` guard can produce this message.
+        let err = parse_sql("SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1;")
+            .unwrap_err();
+        assert!(err.contains("unterminated body for candidate 'c'"), "got {err}");
+
+        // A body containing something that is not a statement stops at that token instead, and
+        // says so — the `)` was never reached but the stream did not end either.
+        let err = parse_sql(
+            "SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1; ASSERT ON t (qty >= 0) ADMIT ALL;",
+        )
+        .unwrap_err();
+        assert!(err.contains("expected a statement"), "got {err}");
     }
 
     #[test]

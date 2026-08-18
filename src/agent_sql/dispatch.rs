@@ -9,6 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use crate::agent_sql::changeset::{ChangeSet, MergeReport};
+use crate::agent_sql::simulate::SimulationReport;
 use crate::agent_sql::runtime::ExecCtx;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundAgentStmt};
@@ -28,6 +29,8 @@ pub enum AgentOutput {
     SessionStarted(AgentSession),
     Diff(ChangeSet),
     Merge(MergeReport),
+    /// `SIMULATE` — every candidate's score and what became of it.
+    Simulation(Box<SimulationReport>),
     Abandoned { branch: String },
     Revert(RevertPlan),
     Affected(usize),
@@ -39,6 +42,7 @@ impl Display for AgentOutput {
             AgentOutput::SessionStarted(s) => write!(f, "{}", s),
             AgentOutput::Diff(d) => write!(f, "{}", d),
             AgentOutput::Merge(m) => write!(f, "{}", m),
+            AgentOutput::Simulation(s) => write!(f, "{}", s),
             AgentOutput::Abandoned { branch } => write!(f, "abandoned {}", branch),
             AgentOutput::Revert(p) => {
                 if p.is_blocked() {
@@ -71,7 +75,8 @@ pub fn is_agent_stmt(stmt: &Stmt) -> bool {
         | Stmt::Diff { .. }
         | Stmt::Merge { .. }
         | Stmt::Abandon { .. }
-        | Stmt::RevertMerge { .. } => true,
+        | Stmt::RevertMerge { .. }
+        | Stmt::Simulate { .. } => true,
         Stmt::Select { from, .. } => from.as_of.is_some(),
         _ => false,
     }
@@ -136,6 +141,23 @@ pub fn run_agent_stmt(
             let plan = runtime.revert_merge(&mut ctx, &merge_id, mode)?;
             debug_assert!(matches!(plan.mode, RevertMode::Halt | RevertMode::Cascade));
             Ok(Outcome::Agent(AgentOutput::Revert(plan)))
+        }
+        BoundAgentStmt::Simulate { base, plan } => {
+            // **The same refusal `BEGIN AGENT SESSION` makes, for a sharper reason: SIMULATE
+            // PUBLISHES.** `executor::run` dispatches agent statements before it reaches the
+            // transaction arms, and admitting a candidate publishes it in `publish_evaluation`'s
+            // OWN transaction. So inside `BEGIN ... ROLLBACK` the admissions would commit and the
+            // ROLLBACK could not undo them: the client would see a rolled-back block that
+            // permanently changed the database. A statement that quietly escapes the enclosing
+            // transaction is worse than one that refuses to run inside it.
+            if session.current.is_some() {
+                return Err(FerroError::Txn(
+                    "cannot SIMULATE inside a transaction block: admitting a candidate publishes                      it in its own transaction, so a ROLLBACK here would not undo it. COMMIT or                      ROLLBACK first."
+                        .into(),
+                ));
+            }
+            let report = runtime.simulate(&mut ctx, base, &plan)?;
+            Ok(Outcome::Agent(AgentOutput::Simulation(Box::new(report))))
         }
         BoundAgentStmt::SelectAsOf { branch, stmt } => {
             let rows = runtime.select(&mut ctx, branch, &stmt, current)?;

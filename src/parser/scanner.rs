@@ -14,6 +14,13 @@ pub enum TokenType {
 
     // agent-isolation surface (DESIGN.md section 5)
     Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
+    // SIMULATE: K candidate branches off one base, scored, the winners admitted.
+    //
+    // `ALL` is deliberately NOT reserved here even though `ADMIT ALL` reads like it should be.
+    // `all` is a plausible column name and reserving a word costs every user of it forever, so
+    // the parser matches it as an identifier in the one position it can appear. The four below
+    // are rare enough as identifiers to be worth the reservation.
+    Simulate, Candidate, Assert, Admit,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     // wide numeric and temporal types
@@ -226,6 +233,10 @@ impl Scanner {
             "BRANCH" => TokenType::Branch,
             "REVERT" => TokenType::Revert,
             "CASCADE" => TokenType::Cascade,
+            "SIMULATE" => TokenType::Simulate,
+            "CANDIDATE" => TokenType::Candidate,
+            "ASSERT" => TokenType::Assert,
+            "ADMIT" => TokenType::Admit,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);
