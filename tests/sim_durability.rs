@@ -33,7 +33,8 @@ use std::sync::atomic::Ordering;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::{Column, DataType};
+use ferrodb::catalog::catalog_page::CatalogPage;
+use ferrodb::catalog::column::{Column, DataType, Value};
 use ferrodb::catalog::schema::Schema;
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
@@ -54,12 +55,15 @@ const WAL: &str = "sim.wal";
 const ROWS: usize = 150;
 /// Rows in the second committed transaction, the one followed by a checkpoint.
 const ROWS2: usize = 60;
-/// Rows in each of the **two** transactions that never commit.
+/// Transactions that never commit, and rows in each.
 ///
-/// Two, not one, and that is the point: `recover`'s undo loop took its losers straight from
-/// `last_lsn.keys()`, a `HashMap`, and undo writes — a compensation record per action and the page it
-/// repairs. With a single loser there is no order to get wrong and the sort that fixes it cannot be
-/// fire-checked. With two, reverting the sort changes the byte sequence.
+/// **Five, not one, and the count is load-bearing.** `recover`'s undo loop took its losers straight
+/// from `last_lsn.keys()`, a `HashMap`, and undo writes — a compensation record per action, plus the
+/// page it repairs. With one loser there is no order to get wrong; with two, reverting the sort is
+/// detected only about half the time, and a fire-check that fails half the time certifies nothing.
+/// Measured: with two losers the reverted sort SURVIVED a three-run comparison. Five gives 120
+/// possible orders, of which exactly one is the sorted one.
+const LOSER_TXNS: usize = 5;
 const LOSER_ROWS: usize = 3;
 
 /// Distinct length *and* distinct content per row, so a row that survives can be identified and a
@@ -80,15 +84,21 @@ fn committed2_payload(i: usize) -> Vec<u8> {
     v
 }
 
-/// Recognisably from the first transaction that never committed.
-fn loser_payload(i: usize) -> Vec<u8> {
-    vec![0x5A; 80 + i * 5]
+/// Recognisably from uncommitted transaction `txn`, row `i`. Distinct content and distinct length per
+/// pair, and no length shared with a committed payload, so a row that survives can be attributed.
+fn loser_payload(txn: usize, i: usize) -> Vec<u8> {
+    let mut v = vec![0x50 | (txn as u8 & 0x0F); 80 + txn * 4 + i];
+    v[0] = 0x5A;
+    v[1] = txn as u8;
+    v[2] = i as u8;
+    v
 }
 
-/// From the second uncommitted transaction. Distinct bytes and distinct lengths from the first, so a
-/// row that survives can be attributed to the right loser.
-fn loser2_payload(i: usize) -> Vec<u8> {
-    vec![0x6B; 110 + i * 7]
+/// Every row any uncommitted transaction wrote. None of these may survive recovery.
+fn all_loser_rows() -> BTreeSet<Vec<u8>> {
+    (0..LOSER_TXNS)
+        .flat_map(|t| (0..LOSER_ROWS).map(move |i| loser_payload(t, i)))
+        .collect()
 }
 
 /// Every fabric in this file is built here, so the fault model is stated once.
@@ -185,20 +195,17 @@ fn workload_inner(fabric: &Arc<SimFabric>, do_checkpoint: bool) -> Result<Writte
         db.txn.checkpoint()?;
     }
 
-    // Two losers, interleaved in the same pages. Undo has to run for both at recovery and remove
-    // every one of these rows, and the ORDER it runs them in is what the sort in `recover` fixes.
-    let t3 = db.txn.begin()?;
-    heap.set_transaction(db.txn.clone(), t3);
-    for i in 0..LOSER_ROWS {
-        heap.insert(Tuple::new(loser_payload(i)))?;
+    // Five losers, interleaved in the same pages. Undo has to run for every one of them at recovery
+    // and remove every one of these rows, and the ORDER it runs them in is what the sort in `recover`
+    // fixes. See `undo_compensates_the_losers_in_ascending_transaction_id_order`.
+    for t in 0..LOSER_TXNS {
+        let loser = db.txn.begin()?;
+        heap.set_transaction(db.txn.clone(), loser);
+        for i in 0..LOSER_ROWS {
+            heap.insert(Tuple::new(loser_payload(t, i)))?;
+        }
+        db.wal.flush()?;
     }
-    db.wal.flush()?;
-    let t4 = db.txn.begin()?;
-    heap.set_transaction(db.txn.clone(), t4);
-    for i in 0..LOSER_ROWS {
-        heap.insert(Tuple::new(loser2_payload(i)))?;
-    }
-    db.wal.flush()?;
 
     Ok(Written { dir_root, committed_txn: t1 })
 }
@@ -315,10 +322,7 @@ fn check_invariants(after: &AfterRecovery, what: &str) -> &'static str {
     };
 
     let expected: BTreeSet<Vec<u8>> = all_committed_rows().into_iter().collect();
-    let losers: BTreeSet<Vec<u8>> = (0..LOSER_ROWS)
-        .map(loser_payload)
-        .chain((0..LOSER_ROWS).map(loser2_payload))
-        .collect();
+    let losers = all_loser_rows();
     let first_txn: BTreeSet<Vec<u8>> = (0..ROWS).map(committed_payload).collect();
 
     // 1. No row from either transaction that never committed. Undo must have run, for both.
@@ -1044,7 +1048,7 @@ fn a_torn_table_page_is_served_as_a_row_that_was_never_written() {
     let census = SimFabric::clean(Durability::WriteThrough); // unit 1: bytes, not pages
     let base = workload(&census).expect("census");
     let known: BTreeSet<Vec<u8>> = all_committed_rows().into_iter().collect();
-    let losers: BTreeSet<Vec<u8>> = (0..LOSER_ROWS).map(loser_payload).collect();
+    let losers = all_loser_rows();
 
     let mut corrupted: Option<(u64, usize)> = None;
     for &n in census.faultable_ops().iter() {
@@ -1085,37 +1089,77 @@ fn three_column_schema() -> Schema {
     ])
 }
 
-/// **Breaking shape: more than one table.**
+/// **Breaking shape: several tables whose index trees are different sizes.**
 ///
 /// `Catalog::persist` iterated `tables.values()` and `rebuild_indexes` iterated `tables.values_mut()`,
-/// both `HashMap`s. With one table there is nothing to reorder. With three there is, and the second
-/// case is the worse one: `rebuild_indexes` frees every index tree and builds a fresh one, so the
-/// iteration order decides **which page id each table's index gets**, and therefore every byte written
-/// from that point on. Recovery ran it, so two recoveries of one crash produced two different
-/// databases — both correct, neither comparable with the other, which is what a crash sweep has to do.
+/// both `HashMap`s. Three *empty* tables were not enough to catch the second one, and the reason is
+/// worth writing down: `rebuild_indexes` frees each table's old index tree and immediately allocates a
+/// new one, and when every tree is a single page the allocator hands the same page straight back —
+/// free-then-allocate is order-invariant, so no order is observable. Measured: the reverted sort
+/// SURVIVED that version of this test. With row counts of 3, 250, 40, 7, 120 and 1 the trees are
+/// different sizes, the page ids each one lands on depend on the order, and the order becomes visible
+/// in what is written.
 ///
-/// Three separate runs here means three separately-seeded `HashMap`s in three separate processes'
-/// worth of state, which is what makes the comparison capable of failing.
+/// The catalog half is asserted directly rather than by comparison: the entries on the persisted page
+/// must be in ascending name order, which is a property of one run and does not rely on two runs
+/// disagreeing.
 #[test]
 fn the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run() {
+    const TABLES: [(&str, usize); 6] =
+        [("zulu", 3), ("alpha", 250), ("mike", 40), ("delta", 7), ("papa", 120), ("bravo", 1)];
+
     let mut traces = Vec::new();
     let mut digests = Vec::new();
-    for run in 0..3 {
+    for run in 0..4 {
         let f = fabric(None, Durability::WriteThrough);
         let first_catalog_page = {
             let db = open(&f).expect("open");
             let mut catalog = Catalog::create(db.bp.clone()).expect("catalog");
             // Deliberately not in name order, so a sort has something to do.
-            for name in ["zulu", "alpha", "mike"] {
+            for (name, _) in TABLES {
                 catalog
                     .create_table(name.to_string(), three_column_schema())
                     .expect("create table");
+            }
+            for (name, rows) in TABLES {
+                let entry = catalog.require_table(name).expect("table").clone();
+                let heap = HeapFileManager::open(entry.first_directory_page_id, db.bp.clone());
+                for i in 0..rows {
+                    let t = Tuple::serialize(
+                        &[Value::Integer(i as i32), Value::Integer((i as i32) * 2)],
+                        &entry.schema,
+                        1,
+                    )
+                    .expect("serialize");
+                    heap.insert(t).expect("insert");
+                }
             }
             catalog.create_index("alpha", "age").expect("index on alpha");
             catalog.create_index("mike", "age").expect("index on mike");
             catalog.persist().expect("persist");
             db.bp.flush_all().expect("flush");
             db.bp.disk_manager.sync().expect("sync");
+
+            // Direct, single-run assertion for `persist`: the page lists its entries in name order.
+            let frame_i = db.bp.fetch_page(catalog.first_catalog_page_id).expect("fetch");
+            let page = {
+                let frame = db.bp.frames[frame_i].read().unwrap();
+                CatalogPage::deserialize(frame.data).expect("deserialize catalog page")
+            };
+            db.bp.unpin_page(catalog.first_catalog_page_id, false);
+            let names: Vec<String> = page.entries.iter().map(|e| e.name.clone()).collect();
+            assert!(
+                names.len() >= 2,
+                "run {run}: the catalog page holds {} entries, so an ordering bug could not show",
+                names.len()
+            );
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(
+                names, sorted,
+                "run {run}: the persisted catalog page lists its tables out of order: {names:?}"
+            );
+
             catalog.first_catalog_page_id
         };
 
@@ -1124,7 +1168,11 @@ fn the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run() {
         let db = open(&rebooted).expect("reopen");
         let before = rebooted.op_count();
         let mut catalog = Catalog::open(db.bp.clone(), first_catalog_page).expect("reopen catalog");
-        assert_eq!(catalog.tables.len(), 3, "the catalog did not come back with its three tables");
+        assert_eq!(
+            catalog.tables.len(),
+            TABLES.len(),
+            "the catalog did not come back with all its tables"
+        );
         rebuild_indexes(&mut catalog, &db.bp).expect("rebuild_indexes");
         db.bp.flush_all().expect("flush");
         db.bp.disk_manager.sync().expect("sync");
@@ -1136,19 +1184,92 @@ fn the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run() {
             .map(|t| (t.file, t.offset, t.len, t.data_crc))
             .collect();
         assert!(
-            seq.len() >= 6,
-            "run {run}: rebuilding three tables' indexes wrote only {} pages, so an ordering bug \
+            seq.len() >= 20,
+            "run {run}: rebuilding six tables' indexes wrote only {} pages, so an ordering bug \
              could not show and this assertion would be vacuous",
             seq.len()
         );
         traces.push(seq);
-        digests.push(rebooted.image_digest());
+        // Which page each table's index landed on. With the sort this is a function of the names and
+        // the row counts; without it, of a hash seed.
+        let mut roots: Vec<(String, u32, Vec<u32>)> = catalog
+            .tables
+            .values()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.primary_index_root,
+                    e.indexes.iter().map(|i| i.root_page_id).collect(),
+                )
+            })
+            .collect();
+        roots.sort();
+        digests.push((rebooted.image_digest(), roots));
     }
+    for run in 1..traces.len() {
+        assert_eq!(
+            traces[0], traces[run],
+            "run {run} wrote the rebuilt catalog and indexes in a different order from run 0"
+        );
+        assert_eq!(
+            digests[0], digests[run],
+            "run {run} put the rebuilt indexes on different pages from run 0"
+        );
+    }
+}
+
+/// **Undo runs the losers in ascending transaction id, and the log itself says so.**
+///
+/// Breaking shape: more than one uncommitted transaction at the crash. `recover` took its losers
+/// straight from `last_lsn.keys()` — a `HashMap` — and undo *writes*: an `Abort` and a compensation
+/// record per action, flushed per transaction. So two recoveries of one crash appended the same
+/// records in different orders and produced different WAL bytes.
+///
+/// This asserts the order **directly**, from the records recovery appended, rather than by comparing
+/// two runs. That matters: comparing runs only catches the bug when the hash order happens to differ,
+/// and with two losers that is about half the time — measured, and it is why the reverted sort survived
+/// a three-run comparison. With five losers, exactly one of the 120 possible orders passes this
+/// assertion, so a reverted sort has one chance in 120 of getting through, per run.
+#[test]
+fn undo_compensates_the_losers_in_ascending_transaction_id_order() {
+    let f = fabric(None, Durability::WriteThrough);
+    let _ = workload(&f).expect("workload");
+    let rebooted = f.restart();
+    let db = open(&rebooted).expect("reopen");
+
+    // Everything from here on is what recovery appended.
+    let first_new_lsn = db.wal.next_lsn.load(Ordering::SeqCst);
+    assert!(recover(&db.txn).expect("recover"), "recovery found nothing to do");
+
+    let end = db.wal.next_lsn.load(Ordering::SeqCst);
+    assert!(end > first_new_lsn, "recovery appended no records, so there is no order to check");
+    let mut groups: Vec<u64> = Vec::new();
+    let mut lsn = first_new_lsn;
+    while lsn < end {
+        let (rec, next) = db.wal.read_record(lsn).expect("read a record recovery wrote");
+        if matches!(rec.kind, RecKind::Clr { .. } | RecKind::Abort) && groups.last() != Some(&rec.txn_id) {
+            groups.push(rec.txn_id);
+        }
+        if next <= lsn {
+            break;
+        }
+        lsn = next;
+    }
+
+    // Anti-vacuity: every loser really was undone, so this is an assertion about all five and not
+    // about whichever one happened to be first.
     assert_eq!(
-        traces[0], traces[1],
-        "run 1 wrote the rebuilt catalog and indexes in a different order from run 0"
+        groups.len(),
+        LOSER_TXNS,
+        "recovery compensated {} transactions, expected the {LOSER_TXNS} that never committed: \
+         {groups:?}",
+        groups.len()
     );
-    assert_eq!(traces[1], traces[2], "run 2 differed from run 1");
-    assert_eq!(digests[0], digests[1], "run 1 produced a different database image from run 0");
-    assert_eq!(digests[1], digests[2], "run 2 produced a different image from run 1");
+    let mut ascending = groups.clone();
+    ascending.sort_unstable();
+    assert_eq!(
+        groups, ascending,
+        "undo ran the uncommitted transactions in the order {groups:?}, not ascending transaction \
+         id. Recovery is a sequence of durable writes and this is the sequence."
+    );
 }
