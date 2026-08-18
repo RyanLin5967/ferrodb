@@ -36,6 +36,7 @@ use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
+use crate::branch::record::{CapabilityEnvelope, ColumnCapability, RowImage, TableCapability};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
 use crate::branch::BranchCatalog;
@@ -87,6 +88,12 @@ pub fn table_id(name: &str) -> TableId {
         h = h.wrapping_mul(0x0100_0193);
     }
     TableId(h)
+}
+
+/// A [`TableCapability`] for a table named in SQL, so a caller building an envelope does not have
+/// to hash the name itself and get a different answer than the write funnel does.
+pub fn table_capability(name: &str, columns: Vec<ColumnCapability>) -> TableCapability {
+    TableCapability::new(table_id(name).0, columns)
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
@@ -1037,6 +1044,33 @@ impl AgentRuntime {
         self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
     }
 
+    // ---- the capability envelope ------------------------------------------------------------
+
+    /// Narrow what `branch` is permitted to write, durably.
+    ///
+    /// **Narrow, not set.** A branch already carrying an envelope cannot be granted authority it
+    /// did not have — [`BranchRecord::restrict`] refuses any widening — because an envelope a
+    /// governed party can widen is a suggestion. A branch with no envelope is ungoverned, so the
+    /// first call installs freely; every child forked afterwards inherits it.
+    ///
+    /// Installing one on [`BranchId::TRUNK`] is how every future agent session becomes governed,
+    /// since `BEGIN AGENT SESSION` forks out of trunk by default.
+    pub fn restrict_branch(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        let mut record = self.branches.get(branch)?;
+        record.restrict(envelope)?;
+        self.branches.put(&record)
+    }
+
+    /// What `branch` is currently permitted to write, read from its durable record. `None` means
+    /// no envelope was ever installed, which is ungoverned.
+    pub fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        Ok(self.branches.get(branch)?.envelope)
+    }
+
     /// Stage every row of ONE statement, or none of them.
     ///
     /// # The defect this shape exists to prevent
@@ -1072,6 +1106,56 @@ impl AgentRuntime {
         // straight past the bound and landed the counter at -100 against a floor of 0. A float decrement
         // slipped through the same gap. Comparing before against after catches every op that lowers the
         // value, including ones not yet invented.
+
+        // The session has to exist before the branch record is consulted, so that writing to a
+        // sealed branch still reports "no agent session" rather than "reaped". Same refusal, same
+        // place in the order, just hoisted ahead of the record read.
+        if !self.state.lock().unwrap().workspaces.contains_key(&branch.id) {
+            return Err(FerroError::Branch(format!("no agent session on branch {}", branch)));
+        }
+
+        // **The capability envelope, read from the branch's own DURABLE record.**
+        //
+        // This is the one policy in this runtime that does not live in `Mutex<State>`. Merge
+        // policy, escrow claims and quarantine reasons all do, which means a restart silently
+        // un-governs every running agent — the envelope is in the record precisely so a reopen
+        // finds it still in force.
+        //
+        // It is evaluated on the same before/after images the escrow check below uses, and for
+        // the same reason, spelled out on `CapabilityEnvelope`: an allowlist keyed on the shape of
+        // the op is walked around by any other shape with the same effect. An INSERT is the live
+        // example — its `Op` carries `col: None`, so a column check reading the ops would see it
+        // write no column while it writes every one of them.
+        let mut record = self.branches.get(branch)?;
+        let charge = match &record.envelope {
+            None => 0,
+            Some(envelope) => {
+                let images: Vec<RowImage> = items
+                    .iter()
+                    .map(|i| RowImage {
+                        row: i.row.0,
+                        before: i.before.as_deref(),
+                        after: match &i.after {
+                            RowState::Present(v) => Some(v.as_slice()),
+                            RowState::Deleted => None,
+                        },
+                    })
+                    .collect();
+                // The whole statement, before a single row is recorded — the same batch rule the
+                // escrow check follows two blocks down, and for the same reason.
+                envelope.admit(tbl.0, table, &images)?
+            }
+        };
+        if charge > 0 {
+            // Charged durably, and charged BEFORE anything is applied. A budget spent only in
+            // memory is a budget a restart hands back, which is the whole defect this field
+            // exists to close. Nothing below this line can fail on a per-row basis, so the charge
+            // cannot outlive a statement that was then refused.
+            let envelope = record.envelope.as_mut().expect("a charge implies an envelope");
+            envelope.row_writes += charge;
+            self.branches.put(&record)?;
+        }
+
         let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
         {
             let state = self.state.lock().unwrap();
