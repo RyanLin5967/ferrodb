@@ -62,6 +62,15 @@ pub enum FerroError {
     /// Deliberately loud in `Display`. Every other error here describes something a caller did; this one
     /// describes damage, and it must not read like a syntax complaint.
     Corruption(String),
+    /// A publication refused to let something out of the database, or its declaration is not usable
+    /// — see `replication::publication`.
+    ///
+    /// Its own variant rather than `Constraint`, for the reason E71 gave for splitting `Parse`: a
+    /// constraint is about whether data is *valid*, and this is about whether data may *leave*. They
+    /// have different audiences — one is answered by fixing a row, the other by an operator deciding
+    /// what a consumer is allowed to see — and a log reader filtering by class must be able to tell
+    /// an egress refusal from a bad insert.
+    Publication(String),
 }
 
 impl Display for FerroError {
@@ -70,6 +79,7 @@ impl Display for FerroError {
             FerroError::Eval(e) => write!(f, "evaluation error: {}", e),
             FerroError::Internal(e) => write!(f, "internal error (this is a bug in ferrodb): {}", e),
             FerroError::Corruption(e) => write!(f, "DATA CORRUPTION: {}", e),
+            FerroError::Publication(e) => write!(f, "publication refused: {}", e),
             FerroError::Io(e) => write!(f, "io error: {}", e),
             FerroError::NotEnoughSpace => write!(f, "not enough space in page"),
             FerroError::SlotDeleted => write!(f, "the slot is delted"),
