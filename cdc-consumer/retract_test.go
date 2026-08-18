@@ -506,3 +506,40 @@ func TestAMalformedWriterIsRefused(t *testing.T) {
 		t.Errorf("a line with no writer key was refused: %v", err)
 	}
 }
+
+// A scan that collected nothing has not passed: an empty destination and a scan pointed at the
+// wrong table are indistinguishable from a zero.
+func TestScanRefusesAnEmptyTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty.sqlite")
+	sink, err := openSink(dbPath, "id")
+	if err != nil {
+		t.Fatalf("open sink: %v", err)
+	}
+	// A CREATE_TABLE and nothing else: the destination table exists, with its attribution columns,
+	// and holds no rows.
+	feed := line(t, map[string]any{
+		"table": "inv", "op": "CREATE_TABLE", "txn": 0, "lsn": 1, "commit_lsn": 1,
+		"commit_end_lsn": 2, "writer": nil, "before": nil,
+		"after": map[string]any{"columns": []map[string]any{
+			{"name": "id", "type": "INTEGER", "nullable": false},
+		}},
+	}) + "\n"
+	if _, _, _, _, err := applyFeed(sink, feed); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	sink.Close()
+
+	err = runScan(dbPath, "inv", "id")
+	if err == nil {
+		t.Fatal("a scan of an empty table reported success")
+	}
+	if !strings.Contains(err.Error(), "holds no rows") {
+		t.Fatalf("it failed, but not by this guard: %v", err)
+	}
+
+	// Anti-vacuity: a table with rows scans fine.
+	ok := landFeed(t, mixedFeed(t))
+	if err := runScan(ok, "inv", "id"); err != nil {
+		t.Fatalf("a populated table was refused: %v", err)
+	}
+}

@@ -717,6 +717,88 @@ use super::*;
         out
     }
 
+    fn a_run(prov: u32, agent: &str) -> RunEntity {
+        RunEntity::new(
+            crate::provenance::ProvId(prov),
+            agent,
+            "run-1",
+            "claude-opus",
+            "2026-05",
+            [0xcd; 32],
+            1_700_000_000_000,
+            crate::branch::types::BranchId::new(1, 0),
+        )
+    }
+
+    /// **The identity record is the append immediately before `Commit`, with nothing between.**
+    ///
+    /// Its position is a correctness property of the change feed rather than a matter of taste —
+    /// see [`TxnManager::bind_run`] — so it is asserted on the log's own record order and not only
+    /// through the decoder that reads it.
+    #[test]
+    fn the_run_identity_record_sits_immediately_before_the_commit() {
+        let (bp, wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        txn.bind_run(t1, a_run(1, "restock-agent")).unwrap();
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        heap.insert(Tuple::new(vec![1, 2, 3, 4])).unwrap();
+        txn.commit(t1).unwrap();
+
+        let recs = walk_log(&wal);
+        let commit_at = recs
+            .iter()
+            .position(|r| matches!(r.kind, RecKind::Commit))
+            .expect("no commit record");
+        assert!(commit_at > 0, "the commit is the first record; nothing could precede it");
+        match &recs[commit_at - 1].kind {
+            RecKind::RunIdentity { run } => {
+                assert_eq!(run.agent_id, "restock-agent");
+                assert_eq!(recs[commit_at - 1].txn_id, t1, "the record must name the committing txn");
+            }
+            other => panic!(
+                "the record before the commit is {other:?}, not the run identity. Anything between \
+                 them can be separated from the commit by a batch boundary, and the feed then ships \
+                 the rows attributed to nobody."
+            ),
+        }
+
+        // Anti-vacuity: an unbound transaction writes no identity record at all, so the assertion
+        // above is about the binding and not about some record that is always there.
+        let t2 = txn.begin().unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.insert(Tuple::new(vec![5, 6])).unwrap();
+        txn.commit(t2).unwrap();
+        let identities = walk_log(&wal)
+            .iter()
+            .filter(|r| matches!(r.kind, RecKind::RunIdentity { .. }))
+            .count();
+        assert_eq!(identities, 1, "an unbound transaction wrote an identity record");
+    }
+
+    /// One provenance slot cannot mean two actors. The slot is the reference every stamped version
+    /// carries, so two meanings for it make every attribution ambiguous, and a checkpoint would
+    /// replay both declarations into the log for a decoder to choose between.
+    #[test]
+    fn declaring_one_slot_as_two_actors_is_refused() {
+        let (_bp, _wal, txn, _dir) = setup();
+        txn.declare_run(a_run(1, "restock-agent")).unwrap();
+        // Anti-vacuity: the same declaration again is a no-op, which is what a checkpoint replay
+        // and a repeated session both produce.
+        txn.declare_run(a_run(1, "restock-agent")).unwrap();
+        assert_eq!(txn.retained_runs(), 1);
+
+        let err = txn
+            .declare_run(a_run(1, "auditor-agent"))
+            .expect_err("one slot was declared as two actors");
+        assert!(format!("{err}").contains("already declared"), "{err}");
+        assert_eq!(txn.retained_runs(), 1, "the refused declaration was retained anyway");
+
+        // A different slot is fine, so the refusal is about the collision and not about declaring.
+        txn.declare_run(a_run(2, "auditor-agent")).unwrap();
+        assert_eq!(txn.retained_runs(), 2);
+    }
+
     #[test]
     fn test_commit_writes_chain_and_flushes() {
         let (bp, wal, txn, _dir) = setup();
