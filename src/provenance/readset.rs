@@ -73,6 +73,56 @@ pub enum Bound {
     Excluded(Value),
 }
 
+impl Bound {
+    /// The endpoint's value, or `None` for [`Bound::Unbounded`].
+    pub fn value(&self) -> Option<&Value> {
+        match self {
+            Bound::Unbounded => None,
+            Bound::Included(v) | Bound::Excluded(v) => Some(v),
+        }
+    }
+
+    /// The tighter of two **lower** bounds: the region satisfying both.
+    ///
+    /// Used to intersect a conjunction — `qty >= 20 AND qty > 25` looked at `qty > 25`. Unbounded
+    /// always loses, because "no floor" cannot be the tighter of two floors; on the same endpoint
+    /// the excluding bound wins, because it admits strictly less.
+    pub fn tighter_lo(self, other: Bound) -> Bound {
+        let keep_self = match (self.value(), other.value()) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => match a.cmp(b) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => matches!(self, Bound::Excluded(_)),
+            },
+        };
+        if keep_self {
+            self
+        } else {
+            other
+        }
+    }
+
+    /// The tighter of two **upper** bounds: the region satisfying both.
+    pub fn tighter_hi(self, other: Bound) -> Bound {
+        let keep_self = match (self.value(), other.value()) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => match a.cmp(b) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal => matches!(self, Bound::Excluded(_)),
+            },
+        };
+        if keep_self {
+            self
+        } else {
+            other
+        }
+    }
+}
+
 /// A retained predicate: what a range or scan *looked at*, including the rows that were not
 /// there. This is what gives phantom coverage; an exact set of the rows that happened to exist
 /// cannot detect an insert into the range.
@@ -296,6 +346,57 @@ mod tests {
         assert!(p.covers(TableId(1), Some(ColId(0)), &Value::Integer(19)));
         assert!(!p.covers(TableId(1), Some(ColId(0)), &Value::Integer(20)));
         assert!(!p.covers(TableId(2), Some(ColId(0)), &Value::Integer(11)));
+    }
+
+    /// The breaking shape: a conjunction whose two conjuncts bound the SAME column. Keeping either
+    /// one alone leaves the region wider than what the scan looked at, and a region wider than the
+    /// truth names dependents that are not dependents.
+    #[test]
+    fn intersecting_two_lower_bounds_keeps_the_tighter_one() {
+        let a = Bound::Included(Value::Integer(20));
+        let b = Bound::Excluded(Value::Integer(25));
+        assert_eq!(a.clone().tighter_lo(b.clone()), Bound::Excluded(Value::Integer(25)));
+        assert_eq!(b.clone().tighter_lo(a.clone()), Bound::Excluded(Value::Integer(25)));
+        // Unbounded is not a floor at all, so it never wins against one.
+        assert_eq!(Bound::Unbounded.tighter_lo(a.clone()), a);
+        assert_eq!(a.clone().tighter_lo(Bound::Unbounded), a);
+        assert_eq!(Bound::Unbounded.tighter_lo(Bound::Unbounded), Bound::Unbounded);
+        // Same endpoint: excluding it admits strictly less, so it is the tighter.
+        assert_eq!(
+            Bound::Included(Value::Integer(20)).tighter_lo(Bound::Excluded(Value::Integer(20))),
+            Bound::Excluded(Value::Integer(20))
+        );
+    }
+
+    #[test]
+    fn intersecting_two_upper_bounds_keeps_the_tighter_one() {
+        let a = Bound::Excluded(Value::Integer(50));
+        let b = Bound::Included(Value::Integer(40));
+        assert_eq!(a.clone().tighter_hi(b.clone()), Bound::Included(Value::Integer(40)));
+        assert_eq!(b.clone().tighter_hi(a.clone()), Bound::Included(Value::Integer(40)));
+        assert_eq!(Bound::Unbounded.tighter_hi(a.clone()), a);
+        assert_eq!(a.clone().tighter_hi(Bound::Unbounded), a);
+        assert_eq!(
+            Bound::Included(Value::Integer(50)).tighter_hi(Bound::Excluded(Value::Integer(50))),
+            Bound::Excluded(Value::Integer(50))
+        );
+    }
+
+    /// Intersection is only worth anything if `covers` then answers over the narrowed region: the
+    /// interval `[20, 50) ∩ (25, ∞)` must reject 22, which either conjunct alone accepts.
+    #[test]
+    fn the_intersected_region_is_what_covers_answers_over() {
+        let p = PredicateSummary {
+            tbl: TableId(1),
+            col: Some(ColId(1)),
+            lo: Bound::Included(Value::Integer(20)).tighter_lo(Bound::Excluded(Value::Integer(25))),
+            hi: Bound::Excluded(Value::Integer(50)).tighter_hi(Bound::Unbounded),
+            residual: None,
+            rows_observed: 2,
+        };
+        assert!(!p.covers(TableId(1), Some(ColId(1)), &Value::Integer(22)));
+        assert!(p.covers(TableId(1), Some(ColId(1)), &Value::Integer(26)));
+        assert!(!p.covers(TableId(1), Some(ColId(1)), &Value::Integer(50)));
     }
 
     #[test]
