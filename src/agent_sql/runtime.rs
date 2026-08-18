@@ -1745,11 +1745,11 @@ impl AgentRuntime {
         // Not reachable through today's server, which serves one connection at a time
         // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
         // numbering is unchanged: the same ops, in the same order, get the same sequence values.
-        let reserved_base = {
+        let reserved: std::ops::Range<u64> = {
             let mut state = self.state.lock().unwrap();
             let base = state.apply_seq;
             state.apply_seq += row_outcomes.iter().map(|r| r.applied.len() as u64).sum::<u64>();
-            base
+            base..state.apply_seq
         };
 
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
@@ -1775,7 +1775,7 @@ impl AgentRuntime {
             &snapshot,
             &merge_id,
             &images,
-            reserved_base,
+            reserved,
         );
         self.seal(branch, true)?;
 
@@ -1831,18 +1831,18 @@ impl AgentRuntime {
         snapshot: &WorkspaceSnapshot,
         merge_id: &str,
         images: &PublishedImages,
-        reserved_base: u64,
+        reserved: std::ops::Range<u64>,
     ) {
         let mut state = self.state.lock().unwrap();
         let mut written: Vec<WriteRecord> = Vec::new();
-        let mut reserved = reserved_base;
+        let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
                 // The sequence `merge` reserved before publishing, consumed in the same order it
                 // was counted. `state.apply_seq` is not touched here: it already stands at the end
                 // of this reservation.
-                reserved += 1;
-                let seq = reserved;
+                next_seq += 1;
+                let seq = next_seq;
                 let before = snapshot
                     .ops
                     .iter()
@@ -1905,16 +1905,22 @@ impl AgentRuntime {
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
         // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
         // does not borrow-check.
-        // The reservation `merge` took must be exactly the ops recorded here. It is true by
-        // construction today — both sides count `row_outcomes[..].applied` — and it is asserted
-        // because the two counts live in different functions: a future edit that filters, splits or
-        // reorders one of them would otherwise hand out sequence numbers that overlap the next
-        // merge's, and versions with colliding `begin_ts` silently mis-answer every visibility
-        // comparison downstream.
+        // The range `merge` reserved must be exactly the versions consumed here, and the comparison
+        // has to be against the RESERVATION rather than against a re-count of `rows` — the first
+        // version of this assertion re-derived the expected value from `rows`, the same list the loop
+        // above walks, so it compared the loop to itself and would have passed however few versions
+        // `merge` had actually set aside. A fire-check caught that: shortening the reservation left
+        // the assertion green, and only a behavioural test noticed.
+        //
+        // Consuming past the reservation means this merge is stamping `begin_ts` values the next
+        // merge will hand out again, and two versions sharing a `begin_ts` mis-answer every
+        // visibility comparison downstream — including the one that decides whether a scan depended
+        // on a write.
         debug_assert_eq!(
+            next_seq, reserved.end,
+            "merge reserved versions {:?} but record_applied consumed {} of them",
             reserved,
-            reserved_base + rows.iter().map(|r| r.applied.len() as u64).sum::<u64>(),
-            "merge reserved a different number of versions than record_applied consumed"
+            next_seq - reserved.start
         );
         // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
         // go nowhere leaves cascade unable to see this merge at all, and it would look identical to

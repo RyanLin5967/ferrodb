@@ -270,6 +270,54 @@ fn a_write_outside_the_scanned_range_is_not_a_dependency() {
     assert!(db.has_row(9), "a halted revert changes nothing");
 }
 
+/// **BREAKING SHAPE: one merge that publishes MORE THAN ONE row.** Everything on the write path here
+/// is per-row and per-column — the published pre/post images, the valued write recorded for each
+/// column, and the version sequence `merge` reserves before publishing — and a workload with one row
+/// per commit exercises none of that arithmetic. Two data-loss bugs in this repository survived
+/// precisely that gap, because the generator only ever produced one row per commit. This test also
+/// pins the de-duplication: three published rows inside one merge must name the reading task ONCE,
+/// not three times, and the cascade must undo all three.
+#[test]
+fn a_multi_row_merge_is_named_once_by_the_scan_that_read_it_and_reverts_whole() {
+    let mut db = Db::new();
+    db.seed();
+
+    // One agent task, three published rows: two inserts inside the range the reporter will scan, and
+    // one update well outside it.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'restock-agent' RUN 'r_restock';", &mut a);
+    db.ok("INSERT INTO inventory VALUES (7, 30);", &mut a);
+    db.ok("INSERT INTO inventory VALUES (8, 45);", &mut a);
+    db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut a);
+    let m1 = report(db.ok("MERGE;", &mut a));
+    assert!(m1.applied_to_target, "{}", m1);
+    assert_eq!(m1.rows.len(), 3, "the merge must publish three rows: {}", m1);
+    assert_eq!(db.qty_of(2), 6);
+
+    // The reporter scans the range afterwards and sees rows 1, 7 and 8 — not row 2.
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'reporting-agent' RUN 'r_report';", &mut b);
+    let seen = rows(db.ok("SELECT id, qty FROM inventory WHERE qty >= 20 AND qty < 50;", &mut b));
+    assert_eq!(seen.len(), 3, "expected rows 1, 7 and 8 in [20, 50): {:?}", seen);
+
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1.merge_id), &mut main));
+    assert!(halted.is_blocked());
+    assert_eq!(
+        halted.blocked_by,
+        vec![TxnId(2)],
+        "three published rows, one reader: named once, got {:?}",
+        halted.blocked_by
+    );
+
+    let cascaded = plan(db.ok(&format!("REVERT MERGE {} CASCADE;", m1.merge_id), &mut main));
+    assert_eq!(cascaded.cascade, vec![TxnId(2)]);
+    assert!(!db.has_row(7), "every row the merge published is undone");
+    assert!(!db.has_row(8), "every row the merge published is undone");
+    assert_eq!(db.qty_of(2), 5, "including the one outside the scanned range");
+    assert_eq!(db.qty_of(1), 20, "and nothing else moved");
+}
+
 /// **BREAKING SHAPE: the write moved a value OUT of the scanned range, so its post-image is outside
 /// the region and its pre-image is inside.** The scan that ran afterwards observed an *absence* that
 /// this write caused; reverting the write puts the row back inside its range. A check that only
