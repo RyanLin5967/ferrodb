@@ -64,10 +64,34 @@ var validOps = map[string]bool{
 	// nuisance — a consumer that silently ignored ops it did not recognise would drop schema
 	// changes and never say so.
 	"CREATE_TABLE": true, "DROP_TABLE": true,
+	// B11's column-level three. Same lesson, applied on purpose this time rather than discovered:
+	// the producer and this program were changed together, because a consumer that has not been
+	// taught an op refuses the whole feed and one that silently ignores it drops schema changes.
+	"ADD_COLUMN": true, "RENAME_COLUMN": true, "ALTER_COLUMN_TYPE": true,
 }
 
 // isSchema reports whether an op describes the table's shape rather than a row.
-func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
+func isSchema(op string) bool {
+	switch op {
+	case "CREATE_TABLE", "DROP_TABLE", "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		return true
+	}
+	return false
+}
+
+// isDeclaration reports the schema ops that are **re-emitted** rather than delivered once.
+//
+// This is the distinction that matters to a consumer, and it is NOT the same as isSchema. A
+// CREATE_TABLE is a declaration — "this table has this shape" — re-sent at every checkpoint of the
+// source, because a checkpoint truncates the log and has to re-establish the schema at the new
+// base. A DROP_TABLE likewise leaves the source's retained set. The column-level three are
+// **news**: each is delivered exactly once, at the position the DDL occupied, and a consumer that
+// applies one twice has renamed a column that no longer has the old name.
+//
+// The source draws the same line in the same place (`SchemaChange::is_declaration`), and the
+// mechanism behind it is that an ALTER updates the source's retained CREATE_TABLE declaration
+// rather than being retained itself.
+func isDeclaration(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
 
 // bypassesCursor reports ops whose idempotence CANNOT come from the resume cursor.
 //
@@ -86,7 +110,47 @@ func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE
 // so a replay is a no-op; and a snapshot row arriving AFTER a newer stream event for the same key has a
 // lower commit_lsn and is rejected — which is the cutover's whole hazard, since the snapshot boundary
 // is taken before the scan.
-func bypassesCursor(op string) bool { return isSchema(op) || op == "READ" }
+// B11: `isDeclaration`, not `isSchema`. A column-level change is an ordinary positioned log
+// record delivered once, so the cursor is exactly the right idempotence mechanism for it — and
+// exempting it would be worse than useless: a re-run of the same feed would re-apply the rename.
+func bypassesCursor(op string) bool { return isDeclaration(op) || op == "READ" }
+
+// schemaColumns validates the `after.columns` payload every shape-carrying event has, and returns
+// it as name -> declared type.
+//
+// One function, two callers: `CREATE_TABLE` and B11's column-level three all carry the table's full
+// shape under the same key with the same rules, and validating it twice is two chances to check
+// different things. The map it returns is what lets the column-level cases cross-check the
+// alteration against the shape it claims to have produced.
+func schemaColumns(e *Event, n int) (map[string]string, error) {
+	// Its payload is the table's shape, keyed under `columns` so it can never be mistaken for a row
+	// of data.
+	if e.After == nil {
+		return nil, fmt.Errorf("line %d: %s has no schema payload", n, e.Op)
+	}
+	cols, ok := e.After["columns"]
+	if !ok {
+		return nil, fmt.Errorf("line %d: %s payload has no columns", n, e.Op)
+	}
+	list, ok := cols.([]any)
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("line %d: %s columns is not a non-empty list", n, e.Op)
+	}
+	out := make(map[string]string, len(list))
+	for _, c := range list {
+		m, ok := c.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("line %d: a column is not an object", n)
+		}
+		for _, want := range []string{"name", "type", "nullable"} {
+			if _, ok := m[want]; !ok {
+				return nil, fmt.Errorf("line %d: a column has no %q", n, want)
+			}
+		}
+		out[fmt.Sprint(m["name"])] = fmt.Sprint(m["type"])
+	}
+	return out, nil
+}
 
 // checkEnvelope enforces the invariants the feed documents, independently of the producer.
 func checkEnvelope(e *Event, raw string, n int) error {
@@ -102,33 +166,101 @@ func checkEnvelope(e *Event, raw string, n int) error {
 		if e.Before != nil {
 			return fmt.Errorf("line %d: CREATE_TABLE carries a before image", n)
 		}
-		// Its payload is the table's shape, keyed under `columns` so it can never be mistaken for
-		// a row of data.
-		if e.After == nil {
-			return fmt.Errorf("line %d: CREATE_TABLE has no schema payload", n)
-		}
-		cols, ok := e.After["columns"]
-		if !ok {
-			return fmt.Errorf("line %d: CREATE_TABLE payload has no columns", n)
-		}
-		list, ok := cols.([]any)
-		if !ok || len(list) == 0 {
-			return fmt.Errorf("line %d: CREATE_TABLE columns is not a non-empty list", n)
-		}
-		for _, c := range list {
-			m, ok := c.(map[string]any)
-			if !ok {
-				return fmt.Errorf("line %d: a column is not an object", n)
-			}
-			for _, want := range []string{"name", "type", "nullable"} {
-				if _, ok := m[want]; !ok {
-					return fmt.Errorf("line %d: a column has no %q", n, want)
-				}
-			}
+		if _, err := schemaColumns(e, n); err != nil {
+			return err
 		}
 	case "DROP_TABLE":
 		if e.After != nil {
 			return fmt.Errorf("line %d: DROP_TABLE carries an after image", n)
+		}
+	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		// A column-level change carries BOTH halves and each is checked here, independently of the
+		// producer, because either half alone is unusable:
+		//
+		//   - `columns` is the table's full shape afterwards, which is what the sinks reconcile
+		//     their destination against, positionally, exactly as they do for a CREATE_TABLE;
+		//   - `alter` says which change produced that shape, which the shape cannot say. A rename
+		//     and a drop-plus-add leave identical column lists, and only one of them keeps the
+		//     column's data.
+		//
+		// The cross-checks below are the point of an independent implementation: they verify the
+		// two halves agree with each other, which a producer validated by its own idea of the
+		// format cannot do for itself.
+		if e.Before != nil {
+			return fmt.Errorf("line %d: %s carries a before image", n, e.Op)
+		}
+		cols, err := schemaColumns(e, n)
+		if err != nil {
+			return err
+		}
+		alter, ok := e.After["alter"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("line %d: %s has no alter payload; the new shape alone cannot say "+
+				"which change produced it", n, e.Op)
+		}
+		named := func(k string) (string, error) {
+			v, ok := alter[k].(string)
+			if !ok || v == "" {
+				return "", fmt.Errorf("line %d: %s alter payload has no %q", n, e.Op, k)
+			}
+			return v, nil
+		}
+		switch e.Op {
+		case "ADD_COLUMN":
+			c, err := named("column")
+			if err != nil {
+				return err
+			}
+			if _, ok := cols[c]; !ok {
+				return fmt.Errorf("line %d: ADD_COLUMN adds %q but the new shape does not contain "+
+					"it", n, c)
+			}
+		case "RENAME_COLUMN":
+			from, err := named("from")
+			if err != nil {
+				return err
+			}
+			to, err := named("to")
+			if err != nil {
+				return err
+			}
+			if from == to {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames %q to itself", n, from)
+			}
+			if _, ok := cols[to]; !ok {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames to %q but the new shape does not "+
+					"contain it", n, to)
+			}
+			if _, ok := cols[from]; ok {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames away from %q but the new shape "+
+					"still contains it", n, from)
+			}
+		case "ALTER_COLUMN_TYPE":
+			c, err := named("column")
+			if err != nil {
+				return err
+			}
+			was, err := named("from")
+			if err != nil {
+				return err
+			}
+			now, err := named("to")
+			if err != nil {
+				return err
+			}
+			if was == now {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE changes %q from %s to the same type",
+					n, c, was)
+			}
+			t, ok := cols[c]
+			if !ok {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE retypes %q but the new shape does "+
+					"not contain it", n, c)
+			}
+			if t != now {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE says %q became %s but the new shape "+
+					"declares it %s", n, c, now, t)
+			}
 		}
 	case "READ", "INSERT":
 		if e.Before != nil {
@@ -209,12 +341,56 @@ func (t *Table) apply(e *Event) error {
 		// Schema evolution: adopt the declared shape. A real sink would issue CREATE/ALTER against
 		// its destination here; the point is that it learns the shape IN BAND and in log order,
 		// rather than being told out of band and having to guess which rows it applies to.
-		t.columns = t.columns[:0]
-		if list, ok := e.After["columns"].([]any); ok {
-			for _, c := range list {
-				if m, ok := c.(map[string]any); ok {
-					t.columns = append(t.columns, fmt.Sprint(m["name"]))
-				}
+		t.adoptColumns(e)
+		return nil
+	case "ADD_COLUMN":
+		// The rows already held keep the values they were delivered with; the new column is absent
+		// from them, which is exactly right — it did not exist when they were written, and the
+		// source did not re-image them.
+		t.adoptColumns(e)
+		return nil
+	case "RENAME_COLUMN":
+		// The rows already held are keyed by the OLD name. Renaming the shape and leaving them
+		// alone would make every one of them look like a row missing the new column and carrying a
+		// stray one, and `diff` against the source — which reports the new name — would show every
+		// row as different. This is the case that makes the alteration's `from` load-bearing: the
+		// shape alone cannot say which key to move.
+		from, _ := alterField(e, "from")
+		to, _ := alterField(e, "to")
+		t.adoptColumns(e)
+		if from == "" || to == "" {
+			return nil
+		}
+		if t.key == from {
+			t.key = to
+		}
+		for _, row := range t.rows {
+			if v, ok := row[from]; ok {
+				row[to] = v
+				delete(row, from)
+			}
+		}
+		return nil
+	case "ALTER_COLUMN_TYPE":
+		// The rows already held carry the column in its OLD encoding. The feed encodes BIGINT,
+		// DECIMAL and TIMESTAMP as JSON **strings** and INTEGER as a JSON number (see the producer's
+		// `jsonl` module: a double cannot hold an i64 exactly, so the digits ship as text), and the
+		// source does not re-image existing rows for a retype — the values did not change, only the
+		// column's declared type did.
+		//
+		// So the fold has to re-encode what it is already holding, or a table materialised across a
+		// retype has two encodings for one column and `diff` reports every older row as different.
+		// Every retype the source performs widens toward a string-encoded type, which makes this a
+		// single rule rather than a conversion table.
+		to, _ := alterField(e, "to")
+		col, _ := alterField(e, "column")
+		t.adoptColumns(e)
+		if col == "" || !stringEncoded(to) {
+			return nil
+		}
+		for _, row := range t.rows {
+			if v, ok := row[col]; ok {
+				row[col] = asFeedString(v)
 			}
 		}
 		return nil
@@ -236,6 +412,62 @@ func (t *Table) apply(e *Event) error {
 		delete(t.rows, k)
 	}
 	return nil
+}
+
+// adoptColumns replaces the table's column list with the shape the event declares.
+func (t *Table) adoptColumns(e *Event) {
+	t.columns = t.columns[:0]
+	if list, ok := e.After["columns"].([]any); ok {
+		for _, c := range list {
+			if m, ok := c.(map[string]any); ok {
+				t.columns = append(t.columns, fmt.Sprint(m["name"]))
+			}
+		}
+	}
+}
+
+// alterField reads one string out of a schema event's `alter` payload. `checkEnvelope` has already
+// established that the required fields are present and non-empty for the op, so an empty return
+// here means the caller asked for a field this op does not have.
+func alterField(e *Event, key string) (string, bool) {
+	alter, ok := e.After["alter"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	v, ok := alter[key].(string)
+	return v, ok
+}
+
+// stringEncoded reports the feed types whose values ship as JSON strings rather than numbers.
+//
+// Mirrors the producer's rule in `replication::jsonl`, and the reason is the same: an i64 past 2^53
+// and an unbounded decimal are both corrupted by a default float64 decode, so their digits travel
+// as text. INTEGER is i32 and is deliberately NOT in this set — three orders of magnitude inside
+// what a double holds exactly, and turning it into a string would break every consumer reading that
+// column today.
+func stringEncoded(feedType string) bool {
+	switch feedType {
+	case "BIGINT", "DECIMAL", "TIMESTAMP":
+		return true
+	}
+	return false
+}
+
+// asFeedString renders a decoded JSON value the way the feed would render it as a string.
+//
+// `json.Number` keeps the digits verbatim, which is what makes this exact: the value is re-encoded
+// rather than round-tripped through a float.
+func asFeedString(v any) any {
+	switch n := v.(type) {
+	case nil:
+		return nil
+	case json.Number:
+		return n.String()
+	case string:
+		return n
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // dump prints the table as sorted JSON so a caller can compare it byte for byte.

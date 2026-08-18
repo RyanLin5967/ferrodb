@@ -345,6 +345,126 @@ func (s *DuckSink) ensureDuckFromRow(table string, row map[string]any) error {
 	return s.ensureDuckTable(table, cols)
 }
 
+// applyDuckSchemaChange evolves the destination for a column-level change — B11.
+//
+// **This is where `checkSchemaAgrees` had to be taught rather than worked around.** That check
+// refuses to write through a destination whose columns disagree with the source's declared shape,
+// positionally, by name and by type — which is right, and which means a source table that gained,
+// renamed or retyped a column would abort the entire sink run on the very next re-emitted
+// CREATE_TABLE. Evolving here is what makes the two agree again: the destination is brought to the
+// shape the source now has, so the next declaration matches instead of being refused.
+//
+// Each statement is the narrowest one that reaches the declared shape while keeping every row.
+// Dropping and recreating would produce a correct-looking schema over an empty table, which is
+// self-consistent and wrong — the worst thing a pipeline can be.
+func (s *DuckSink) applyDuckSchemaChange(e *Event) error {
+	list, _ := e.After["columns"].([]any)
+	cols := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		if m, ok := c.(map[string]any); ok {
+			cols = append(cols, map[string]any{
+				"name": fmt.Sprint(m["name"]),
+				"type": duckType(fmt.Sprint(m["type"])),
+			})
+		}
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("%s for %s carries no shape", e.Op, e.Table)
+	}
+	// Never seen this table: the event's shape is the whole truth. This is the resume case, where a
+	// consumer's first event for a table is the ALTER rather than the CREATE.
+	actual, err := s.catalogColumns(e.Table)
+	if err != nil {
+		return err
+	}
+	if len(actual) == 0 {
+		return s.ensureDuckTable(e.Table, cols)
+	}
+
+	typeOf := func(name string) string {
+		for _, c := range cols {
+			if c["name"] == name {
+				return fmt.Sprint(c["type"])
+			}
+		}
+		return ""
+	}
+	has := func(name string) bool {
+		for _, c := range actual {
+			if c == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch e.Op {
+	case "ADD_COLUMN":
+		name, _ := alterField(e, "column")
+		typ := typeOf(name)
+		if name == "" || typ == "" {
+			return fmt.Errorf("ADD_COLUMN for %s names no column present in its shape", e.Table)
+		}
+		// `duckTypes` is the allowlist that keeps a type string out of DDL unless this sink vouches
+		// for it. It applies to a column arriving by ALTER exactly as it does to one arriving by
+		// CREATE — a hostile type is no less hostile for coming second.
+		if !duckTypes[typ] {
+			return fmt.Errorf("column %s.%s: type %q is not one this sink will emit", e.Table, name, typ)
+		}
+		if has(name) {
+			// Re-delivered, or the destination was built from the evolved declaration. Nothing to do.
+			break
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " ADD COLUMN " + quoteIdent(name) + " " + typ
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s.%s: %w", e.Table, name, err)
+		}
+	case "RENAME_COLUMN":
+		from, _ := alterField(e, "from")
+		to, _ := alterField(e, "to")
+		if from == "" || to == "" {
+			return fmt.Errorf("RENAME_COLUMN for %s names no columns", e.Table)
+		}
+		if !has(from) && has(to) {
+			break // already renamed
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " RENAME " + quoteIdent(from) + " TO " +
+			quoteIdent(to)
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("rename %s.%s: %w", e.Table, from, err)
+		}
+	case "ALTER_COLUMN_TYPE":
+		name, _ := alterField(e, "column")
+		typ := typeOf(name)
+		if name == "" || typ == "" {
+			return fmt.Errorf("ALTER_COLUMN_TYPE for %s names no column present in its shape", e.Table)
+		}
+		if !duckTypes[typ] {
+			return fmt.Errorf("column %s.%s: type %q is not one this sink will emit", e.Table, name, typ)
+		}
+		// `duckType` collapses several feed types onto one DuckDB type — INTEGER and BIGINT both
+		// become BIGINT — so a source retype can be a no-op here. Issued anyway rather than
+		// predicted: DuckDB accepts a cast to the type a column already has, and skipping it would
+		// need a comparison against the catalog's spelling of the type, which is a second place for
+		// the mapping to be wrong.
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " ALTER COLUMN " + quoteIdent(name) +
+			" TYPE " + typ
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("retype %s.%s: %w", e.Table, name, err)
+		}
+	}
+
+	// Re-read from the catalog rather than trusting the statement to have produced what was asked
+	// for. `s.columns` drives every subsequent upsert, and one built from the request rather than
+	// from the destination names a column that may not exist.
+	after, err := s.catalogColumns(e.Table)
+	if err != nil {
+		return err
+	}
+	s.columns[e.Table] = after
+	return nil
+}
+
 // apply writes one event, ignoring it if the destination already holds a newer one.
 func (s *DuckSink) apply(e *Event) error {
 	switch e.Op {
@@ -360,6 +480,9 @@ func (s *DuckSink) apply(e *Event) error {
 			}
 		}
 		return s.ensureDuckTable(e.Table, cols)
+
+	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		return s.applyDuckSchemaChange(e)
 
 	case "DROP_TABLE":
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + quoteIdent(e.Table)); err != nil {
