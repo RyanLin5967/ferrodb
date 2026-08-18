@@ -54,28 +54,38 @@ import (
 	"strings"
 )
 
-// engine names a destination's driver and the two dialect facts this file needs.
-type engine struct {
-	driver string
-	// The literal that means "retracted" in this engine. SQLite has no boolean type and stores 1;
-	// DuckDB has a real BOOLEAN and refuses the integer.
-	trueLit string
-}
-
-func engineFor(name string) (engine, error) {
+// driverFor maps an engine name onto its `database/sql` driver, and refuses one it does not know.
+//
+// No fallback to a default: a typo in `-engine` that quietly opened the wrong file is worse than an
+// error, because the destination the operator is watching stays untouched while the one they were not
+// watching changes.
+//
+// **This is the only thing the two engines differ in for this file**, and that is measured rather
+// than assumed. An earlier version also carried a per-engine truth literal, on the stated grounds
+// that "DuckDB has a real BOOLEAN and refuses the integer" — which is false, and a fire-check caught
+// it: replacing DuckDB's `TRUE` with `1` changed no test outcome. Measured directly, all four
+// combinations work — sqlite `SET f = 1` and `SET f = TRUE` both read back as `int64(1)`, duckdb
+// both read back as `bool(true)` — so the split was dead machinery attached to a wrong claim, and
+// `TRUE` is now used for both because it says what it means in either dialect.
+//
+// The engines DO differ in what comes back out; see `truthy`.
+func driverFor(name string) (string, error) {
 	switch name {
-	case "sqlite":
-		return engine{driver: "sqlite", trueLit: "1"}, nil
-	case "duckdb":
-		return engine{driver: "duckdb", trueLit: "TRUE"}, nil
+	case "sqlite", "duckdb":
+		return name, nil
 	default:
-		return engine{}, fmt.Errorf("unknown -engine %q; known engines are sqlite and duckdb", name)
+		return "", fmt.Errorf("unknown -engine %q; known engines are sqlite and duckdb", name)
 	}
 }
 
+// retractedLit is the value `retract` writes into `_retracted`. One literal for both engines; see
+// `driverFor` for the measurement.
+const retractedLit = "TRUE"
+
 // truthy reads a retraction/tombstone flag from either engine.
 //
-// SQLite hands back an int64 and DuckDB a bool for the same logical column, and a `Scan` into either
+// **This engine difference is real, unlike the one `driverFor` used to claim.** Measured: SQLite
+// hands back an `int64` and DuckDB a `bool` for the same logical column, and a `Scan` into either
 // concrete type fails against the other. Scanning into `any` and deciding here is what keeps one
 // query working on both.
 func truthy(v any) bool {
@@ -178,11 +188,11 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode, engineName
 	if mode != quarantine && mode != remove {
 		return fmt.Errorf("unknown -mode %q; known modes are %q and %q", mode, quarantine, remove)
 	}
-	eng, err := engineFor(engineName)
+	driver, err := driverFor(engineName)
 	if err != nil {
 		return err
 	}
-	db, err := sql.Open(eng.driver, dbPath)
+	db, err := sql.Open(driver, dbPath)
 	if err != nil {
 		return err
 	}
@@ -203,9 +213,9 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode, engineName
 		return err
 	}
 
-	set := fmt.Sprintf(`"_retracted" = %s`, eng.trueLit)
+	set := fmt.Sprintf(`"_retracted" = %s`, retractedLit)
 	if mode == remove {
-		set = fmt.Sprintf(`"_retracted" = %s, "_deleted" = %s`, eng.trueLit, eng.trueLit)
+		set = fmt.Sprintf(`"_retracted" = %s, "_deleted" = %s`, retractedLit, retractedLit)
 	}
 	// The predicate is on the column, parameterised. `_model_version` is compared with `=`, which
 	// NULL never satisfies — so unattributed rows are never swept up by a retraction, whatever
@@ -233,11 +243,11 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode, engineName
 // checks a retraction against, produced by a full table scan and not by the code that did the
 // retracting.
 func runScan(dbPath, table, key, engineName string) error {
-	eng, err := engineFor(engineName)
+	driver, err := driverFor(engineName)
 	if err != nil {
 		return err
 	}
-	db, err := sql.Open(eng.driver, dbPath)
+	db, err := sql.Open(driver, dbPath)
 	if err != nil {
 		return err
 	}
