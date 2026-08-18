@@ -153,6 +153,8 @@ struct Workspace {
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
     tables: BTreeMap<u32, String>,
     frame: TxnFrame,
+    /// B11's branch-scoped ALTER staging slot.
+    schema_edits: Vec<(String, String)>,
 }
 
 impl Workspace {
@@ -617,6 +619,7 @@ impl AgentRuntime {
                 base_rows,
                 tables,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
+                schema_edits: Vec::new(),
             },
         );
         state.captures.insert(txn.0, TxnCapture::new(txn, prov, branch));
@@ -1337,6 +1340,33 @@ impl AgentRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Record a branch-scoped `ALTER TABLE`. No envelope read, no charge.
+    pub fn stage_branch_alter(
+        &self,
+        branch: BranchId,
+        table: &str,
+        edit: &str,
+    ) -> Result<(), FerroError> {
+        let mut state = self.state.lock().unwrap();
+        let ws = state
+            .workspaces
+            .get_mut(&branch.id)
+            .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
+        ws.schema_edits.push((table.to_string(), edit.to_string()));
+        Ok(())
+    }
+
+    /// The schema changes a branch is carrying.
+    pub fn pending_branch_alters(&self, branch: BranchId) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .get(&branch.id)
+            .map(|ws| ws.schema_edits.clone())
+            .unwrap_or_default()
     }
 
     // ---- DIFF ------------------------------------------------------------------------------
