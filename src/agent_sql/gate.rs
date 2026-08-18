@@ -214,6 +214,71 @@ impl VerificationGate {
     }
 }
 
+/// **A premise that changed under the branch while it was working.**
+///
+/// The branch retained the exact versions it READ. This compares each of them against the version the
+/// base holds now, at merge admission. If a row the branch reasoned from has been rewritten since the
+/// fork, the conclusion was drawn from state that no longer exists — even though the branch may have
+/// written somewhere else entirely, so nothing the conflict resolver looks at overlaps.
+///
+/// That gap is the reason this check exists. The merge engine validates the cells a branch **wrote**;
+/// the read-set was retained and nothing consulted it, so two agents could each read one row, each act
+/// on it, and both merge clean. Two hospital agents each reading that one on-call physician remains,
+/// each releasing a different one, is the canonical shape.
+///
+/// # Why the status is a property of the READ, not of this check
+///
+/// `Tier::Invariants`, and the status varies per instance, which is what `CheckStatus` is for and what
+/// nothing had used it for. A point or index read retains exact versions, so the comparison is an exact
+/// set intersection: `SoundAndCrisp`, and it may demand a retry. A scan retains a predicate summary with
+/// unbounded bounds — a whole-table over-approximation — so it can only say "something in this table
+/// moved": `Heuristic`, which the gate will only ever let quarantine. Over-approximating staleness
+/// produces false aborts, and a false abort on an agent's finished work is worse than a late one.
+pub struct ReadPremiseCheck {
+    /// `(table, row, version read, version the base holds now)` for every premise that moved.
+    moved: Vec<(TableId, RowId, u64, u64)>,
+    /// True when any part of the branch's read-set was a scan, which makes the answer approximate.
+    approximate: bool,
+}
+
+impl ReadPremiseCheck {
+    pub fn new(moved: Vec<(TableId, RowId, u64, u64)>, approximate: bool) -> Self {
+        ReadPremiseCheck { moved, approximate }
+    }
+}
+
+impl Check for ReadPremiseCheck {
+    fn name(&self) -> String {
+        "read-premise".into()
+    }
+    fn tier(&self) -> Tier {
+        Tier::Invariants
+    }
+    fn status(&self) -> CheckStatus {
+        // Exact when every read named its versions; approximate the moment one of them was a scan.
+        if self.approximate {
+            CheckStatus::Heuristic
+        } else {
+            CheckStatus::SoundAndCrisp
+        }
+    }
+    fn evaluate(&self) -> Option<String> {
+        if self.moved.is_empty() {
+            return None;
+        }
+        let rows: Vec<String> = self
+            .moved
+            .iter()
+            .map(|(t, r, was, now)| format!("t{}:r{} (read version {was}, base now {now})", t.0, r.0))
+            .collect();
+        Some(format!(
+            "{} row(s) this branch read changed in the base before it merged: {}",
+            self.moved.len(),
+            rows.join(", ")
+        ))
+    }
+}
+
 /// The blind-write metric as a gate check: rows the branch changed without ever reading them.
 ///
 /// `BlastRadius` tier, and `Heuristic` status — which is the whole reason the taxonomy exists. A

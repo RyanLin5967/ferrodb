@@ -765,19 +765,23 @@ impl AgentRuntime {
             Some(ws) => ws.txn,
             None => return,
         };
+        // `begin_ts: 0` means "no published version existed when this row was read", and that is a
+        // real observation rather than a null: `state.versions` is written only when a merge
+        // PUBLISHES, so a row nobody has merged yet genuinely has no version to name.
+        //
+        // A baseline sentinel was tried here first and was wrong. Publishing records `begin_ts: seq`
+        // and the first `seq` is 1, so a sentinel of 1 collided with the very first publish and the
+        // premise check silently compared equal. Absence is already the signal; it does not need a
+        // number, and any number picked here is one a real stamp can eventually reach.
         let versions: Vec<VersionRef> = matched
             .iter()
             .map(|(rid, _)| {
-                state
-                    .versions
-                    .get(&(tbl.0, rid.0))
-                    .copied()
-                    .unwrap_or(VersionRef {
-                        tbl,
-                        row: *rid,
-                        rid: RecordId { page_id: 0, slot_num: 0 },
-                        begin_ts: 0,
-                    })
+                state.versions.get(&(tbl.0, rid.0)).copied().unwrap_or(VersionRef {
+                    tbl,
+                    row: *rid,
+                    rid: RecordId { page_id: 0, slot_num: 0 },
+                    begin_ts: 0,
+                })
             })
             .collect();
         let summary = PredicateSummary {
@@ -1557,12 +1561,63 @@ impl AgentRuntime {
             }
         }
 
-        // Gate tier: evaluated for every merge, reported whatever the outcome. It is a
-        // *heuristic* check in DESIGN.md's taxonomy, and the outcome for a heuristic is
-        // quarantine rather than rejection — which does not exist yet — so this tier reports and
-        // does not decide. Deciding on it before quarantine exists would mean either rejecting on
-        // a heuristic or silently ignoring it, and both are worse than saying what was seen.
+        // ---- the verification gate, at the one admission point ---------------------------------
+        //
+        // This used to compute the blind-write metric and stop, with a comment saying the outcome for
+        // a heuristic is quarantine "which does not exist yet". Quarantine has existed end to end
+        // since `integration_quarantine.rs`; the comment outlived it. So the gate now runs here, and
+        // its outcome is honoured.
         let blind = blind_writes_of(&snapshot.rows, &snapshot.reads);
+
+        // The premise check: every version this branch READ, against the version the base holds now.
+        // `state.versions` is the live map the read recorder itself reads from, so this is the same
+        // notion of "current version" on both sides rather than two definitions that can drift.
+        let (moved, approximate) = {
+            let state = self.state.lock().unwrap();
+            let mut moved: Vec<(TableId, RowId, u64, u64)> = Vec::new();
+            let mut approximate = false;
+            for rs in &snapshot.reads {
+                match rs {
+                    crate::provenance::readset::ReadSet::ExactVersions(versions) => {
+                        for v in versions {
+                            // Four cases, and the interesting one is the first. `begin_ts == 0` means
+                            // the branch read a row that no merge had published — so if a version
+                            // exists for it NOW, someone published it in between and the premise moved.
+                            // Treating that zero as "nothing to compare" was the first attempt and it
+                            // silently exempted exactly the rows agents read before anyone had written
+                            // them, which is most of them.
+                            match state.versions.get(&(v.tbl.0, v.row.0)) {
+                                Some(now) if now.begin_ts != v.begin_ts => {
+                                    moved.push((v.tbl, v.row, v.begin_ts, now.begin_ts));
+                                }
+                                // Still unpublished, or the same version: the premise holds.
+                                _ => {}
+                            }
+                        }
+                    }
+                    // A scan retains bounds rather than versions, so the most it can support is "some
+                    // row in this table moved". That is an over-approximation, and it is why the check
+                    // downgrades itself to heuristic rather than pretending to be exact.
+                    crate::provenance::readset::ReadSet::Predicate(_) => approximate = true,
+                }
+            }
+            (moved, approximate)
+        };
+
+        // **Only the premise check gates the merge, and the blind-write metric deliberately does not.**
+        //
+        // `BlindWriteCheck` is `Heuristic`, and its own documentation says why: "a blind write is
+        // genuinely suspicious and genuinely not proof of anything — the agent may have had every right
+        // to set that row without looking." Every INSERT is a blind write by construction. Wiring it in
+        // and honouring the outcome quarantined every ordinary merge in the suite, which is the correct
+        // behaviour for the code and the wrong behaviour for the system: an informational metric that
+        // starts blocking merges has been promoted without anyone deciding to promote it.
+        //
+        // So it stays where it was, reported on `MergeReport::blind_writes`, and the gate carries the
+        // check that is actually decidable.
+        let gate = crate::agent_sql::gate::VerificationGate::new()
+            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)))
+            .run();
 
         let outcome = MergeReport::aggregate(&row_outcomes);
         let merge_id = {
@@ -1570,6 +1625,35 @@ impl AgentRuntime {
             state.next_merge += 1;
             format!("m_{}", state.next_merge)
         };
+
+        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
+        //
+        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
+        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
+        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
+        // retrying blindly would recompute against a base that may move again.
+        //
+        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
+        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
+        // the safe response to not knowing is to hold, not to throw away.
+        if !gate.is_pass() {
+            let detail: Vec<String> = gate
+                .findings()
+                .iter()
+                .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
+                .collect();
+            let reason = format!("{} at merge admission — {}", gate.name(), detail.join("; "));
+            self.quarantine(branch, &reason)?;
+            return Ok(MergeReport {
+                merge_id,
+                from: branch,
+                into: target,
+                outcome,
+                rows: row_outcomes,
+                blind_writes: blind,
+                applied_to_target: false,
+            });
+        }
 
         if outcome.is_conflict() {
             // Nothing is published and the branch stays alive: the agent has the violated
