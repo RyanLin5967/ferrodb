@@ -11,6 +11,37 @@
 //! termination. That is strong evidence and it is not the same claim, so it is written down
 //! rather than rounded up.
 
+//! ## Is this suite load-bearing? — the fire-check record
+//!
+//! Every guard below was checked by removing it and watching these tests fail. Each mutant was
+//! confirmed to **compile** first, because a mutant that does not build prints nothing and looks
+//! exactly like a surviving one. Run 2026-08-18; the mutations are one-line edits, listed here so
+//! the next reader can repeat any of them in a minute rather than trusting this paragraph.
+//!
+//! | # | mutation | what died |
+//! |---|----------|-----------|
+//! | 1 | `types::encode_value` always answers in text | asyncpg + both wire clients: binary column decoded as text |
+//! | 2 | stop appending the `;` the parser requires | all five wire tests: every statement fails `expected ;` |
+//! | 3 | answer `Flush` with `ReadyForQuery` | asyncpg + wire clients hang, then time out |
+//! | 4 | drop the skip-until-`Sync` state | wire client: the `Execute` behind a failed `Bind` runs anyway |
+//! | 5 | re-run a portal on every `Execute` | wire client: a suspended portal restarts and repeats row 1 |
+//! | 6 | splice parameters into SQL text, quoting `'` as `''` | asyncpg: the hostile parameter tokenises |
+//! | 7 | `numeric` drops its display scale | asyncpg: `1.50` comes back as `1.5` |
+//! | 8 | serve connections one at a time again | the concurrency test and asyncpg's pool |
+//! | 9 | describe one column fewer than the row has | every wire test, with the server's own refusal |
+//! | 10 | accept any `client_encoding` | wire client: `LATIN1` accepted |
+//! | 11 | let the txn normaliser rewrite `BEGIN AGENT SESSION` | agent isolation: the branch write lands on main |
+//! | 12 | accept every transaction option | wire client: `SERIALIZABLE` accepted |
+//!
+//! Cases 5 and 11 are the ones worth noticing. Only the *hand-written* client caught 5 — asyncpg's
+//! cursor happens to drain a portal in one `Execute`, so the real driver could not see it — and
+//! only the *agent* test caught 11. Neither would have been found by the other half of the suite,
+//! which is the argument for keeping both.
+//!
+//! The anti-vacuity half: with no mutation applied, all six tests here pass, and so does the rest
+//! of the suite. Several mutations left four of the six passing, which is what makes them evidence
+//! about a specific guard rather than about the harness.
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -246,4 +277,116 @@ fn two_wire_clients_see_branch_isolation_and_share_one_runtime() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     assert!(n >= 5, "only {n} checks ran; the client did almost nothing: {stdout}");
+}
+
+/// Refuse to run when the driver is not installed.
+///
+/// **A test that skips is a test that always passes.** The claim being made here is "a real,
+/// third-party Postgres driver works against this server", and the one thing that must never
+/// establish it is the driver's absence. So this panics with the command that fixes it rather
+/// than returning early.
+fn require_python_module(module: &str) {
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(format!("import {module}"))
+        .output()
+        .expect("python3 is required to run the driver tests");
+    assert!(
+        out.status.success(),
+        "`{module}` is not installed, so this test cannot check that a real driver works against \
+         this server — and a skipped check would report success for the wrong reason. Install it \
+         with:\n\n    python3 -m pip install --user {module}\n\npython3 said: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The number of checks a client reported, from its `OK <n> checks passed` line.
+fn checks_reported(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("OK "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn run_client(script: &str, port: u16) -> (bool, String, String) {
+    let out = Command::new("python3")
+        .arg(script)
+        .arg("127.0.0.1")
+        .arg(port.to_string())
+        .current_dir("tests/pg")
+        .output()
+        .expect("python3 is required to run the wire clients");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// **B12 — a real Postgres driver, running a parameterised query.**
+///
+/// asyncpg speaks the extended query protocol exclusively — `Parse`/`Describe`/`Flush` then
+/// `Bind`/`Execute`/`Sync`, with arguments and results in *binary* format — so before B12 it could
+/// not run one statement against this server: every message tag but `Q` and `X` was answered with
+/// `0A000, not implemented`.
+///
+/// The breaking shape this test would catch: a server that answers binary format requests with
+/// text. Nothing raises — the driver hands the ASCII `"2"` to a four-byte integer decoder and
+/// returns a number nobody wrote. That is why the checks in the script assert values and Python
+/// types rather than the absence of an exception.
+#[test]
+fn a_real_driver_connects_and_runs_a_parameterised_query() {
+    require_python_module("asyncpg");
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg_asyncpg_client.py", server.port);
+    assert!(
+        ok,
+        "asyncpg failed against this server:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 25, "only {n} checks ran; the driver did almost nothing: {stdout}");
+}
+
+/// **B12 — two connections at once, both making progress.**
+///
+/// The claim is interleaved progress, not the absence of an error: a server that serves one
+/// connection to completion before accepting the next produces no error either — the second client
+/// simply hangs in startup, which is what `tests/pg/pg_agent_client.py` documents and works
+/// around. The script alternates writes and reads between two open sockets, then runs four writers
+/// and two agent sessions concurrently, and every step asserts an effect that the *other*
+/// connection can only have produced while still being served.
+#[test]
+fn two_concurrent_connections_both_make_progress() {
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg_concurrent_client.py", server.port);
+    assert!(
+        ok,
+        "concurrent connections failed:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 15, "only {n} checks ran: {stdout}");
+}
+
+/// **B12 — a second real driver, sharing no code with the first.**
+///
+/// asyncpg and pg8000 agree about this server, and they were written by different people from the
+/// same specification: an agreement between them is not a shared misreading. pg8000 also sends two
+/// things asyncpg never does — `begin transaction` before every statement, and parameter types
+/// declared by the client in `Parse` — so it covers branches the asyncpg test cannot reach.
+#[test]
+fn a_second_real_driver_runs_the_same_parameterised_queries() {
+    require_python_module("pg8000");
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg8000_client.py", server.port);
+    assert!(
+        ok,
+        "pg8000 failed against this server:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 15, "only {n} checks ran; the driver did almost nothing: {stdout}");
 }
