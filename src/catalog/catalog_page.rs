@@ -422,56 +422,81 @@ use super::*;
     /// reports a full-text index it does not have.
     #[test]
     fn a_pre_b8_catalog_page_still_parses_with_no_fulltext_indexes() {
+        // **TWO entries, and that is what makes this test able to fail.** With one entry the page is
+        // zero-filled after its last field, so a build that wrongly read a full-text count byte
+        // would read a 0 and produce the same answer — measured: the single-entry version of this
+        // fixture SURVIVED the mutant that deletes the format branch. A second entry puts real bytes
+        // where the spurious count would be read, so the one-byte shift corrupts everything after
+        // it.
         let mut bytes = [0u8; PAGE_SIZE];
         bytes[0] = CATALOG_PAGE_TYPE_V1;
         bytes[1..5].copy_from_slice(&7u32.to_be_bytes()); // page_id
         bytes[5..9].copy_from_slice(&0u32.to_be_bytes()); // next_catalog_page
-        bytes[9..11].copy_from_slice(&1u16.to_be_bytes()); // num_entries
+        bytes[9..11].copy_from_slice(&2u16.to_be_bytes()); // num_entries
         let mut o = HEADER_SIZE;
-        bytes[o] = 1;
-        o += 1;
-        bytes[o..o + 1].copy_from_slice(b"t");
-        o += 1;
-        bytes[o..o + 4].copy_from_slice(&11u32.to_be_bytes()); // first_directory_page_id
-        o += 4;
-        bytes[o..o + 4].copy_from_slice(&12u32.to_be_bytes()); // primary_index_root
-        o += 4;
-        bytes[o..o + 4].copy_from_slice(&13u32.to_be_bytes()); // time_travel_root
-        o += 4;
-        bytes[o..o + 2].copy_from_slice(&1u16.to_be_bytes()); // num_columns
-        o += 2;
-        bytes[o] = 2; // column name length
-        o += 1;
-        bytes[o..o + 2].copy_from_slice(b"id");
-        o += 2;
-        bytes[o] = 0; // DataType::Integer
-        o += 1;
-        bytes[o] = 0; // not nullable
-        o += 1;
-        bytes[o] = 1; // one B-tree index
-        o += 1;
-        bytes[o] = 2; // index column name length
-        o += 1;
-        bytes[o..o + 2].copy_from_slice(b"id");
-        o += 2;
-        bytes[o..o + 4].copy_from_slice(&14u32.to_be_bytes()); // its root
-        // and nothing after it: no full-text count byte at all.
+
+        // one v1 table entry: name, three roots, one INTEGER column, one B-tree index, and NO
+        // full-text count byte at all — that byte is what v2 added.
+        let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+            bytes[*o] = name.len() as u8;
+            *o += 1;
+            bytes[*o..*o + name.len()].copy_from_slice(name);
+            *o += name.len();
+            for r in roots {
+                bytes[*o..*o + 4].copy_from_slice(&r.to_be_bytes());
+                *o += 4;
+            }
+            bytes[*o..*o + 2].copy_from_slice(&1u16.to_be_bytes()); // num_columns
+            *o += 2;
+            bytes[*o] = 2; // column name length
+            *o += 1;
+            bytes[*o..*o + 2].copy_from_slice(b"id");
+            *o += 2;
+            bytes[*o] = 0; // DataType::Integer
+            *o += 1;
+            bytes[*o] = 0; // not nullable
+            *o += 1;
+            bytes[*o] = 1; // one B-tree index
+            *o += 1;
+            bytes[*o] = 2; // index column name length
+            *o += 1;
+            bytes[*o..*o + 2].copy_from_slice(b"id");
+            *o += 2;
+            bytes[*o..*o + 4].copy_from_slice(&index_root.to_be_bytes());
+            *o += 4;
+        };
+        write_entry(&mut bytes, &mut o, b"t", [11, 12, 13], 14);
+        write_entry(&mut bytes, &mut o, b"u", [21, 22, 23], 24);
 
         let page = CatalogPage::deserialize(bytes).expect("a v1 page must still parse");
         assert_eq!(page.page_id, 7);
-        assert_eq!(page.entries.len(), 1);
-        let entry = &page.entries[0];
-        assert_eq!(entry.name, "t");
-        assert_eq!(entry.primary_index_root, 12);
+        assert_eq!(page.entries.len(), 2);
+
+        let first = &page.entries[0];
+        assert_eq!(first.name, "t");
+        assert_eq!(first.primary_index_root, 12);
         assert_eq!(
-            entry.indexes,
+            first.indexes,
             vec![IndexInfo { column_name: "id".to_string(), root_page_id: 14 }]
         );
         assert!(
-            entry.fulltext_indexes.is_empty(),
+            first.fulltext_indexes.is_empty(),
             "a v1 page cannot carry full-text indexes; got {:?}",
-            entry.fulltext_indexes
+            first.fulltext_indexes
         );
+
+        // The second entry is the one that catches an off-by-one in the first entry's tail.
+        let second = &page.entries[1];
+        assert_eq!(second.name, "u", "the entry after a v1 entry must still start where it should");
+        assert_eq!(second.first_directory_page_id, 21);
+        assert_eq!(second.primary_index_root, 22);
+        assert_eq!(second.time_travel_root, 23);
+        assert_eq!(
+            second.indexes,
+            vec![IndexInfo { column_name: "id".to_string(), root_page_id: 24 }]
+        );
+        assert!(second.fulltext_indexes.is_empty());
+
         // Read as the current format, upgraded in memory, so the next persist writes v2.
         assert_eq!(page.page_type, CATALOG_PAGE_TYPE);
     }
