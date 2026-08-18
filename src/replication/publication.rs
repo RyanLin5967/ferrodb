@@ -328,8 +328,12 @@ impl Publication {
             if line.is_empty() {
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("publication ") {
-                let declared = rest.trim();
+            // Matched on the WORD, not on "publication " with its space: a header line whose name
+            // was deleted trims to a bare `publication`, which the prefix form misses entirely and
+            // then reports as "neither a comment nor `table: col, col`" - a message that sends the
+            // reader looking for a missing colon on a line that plainly says publication.
+            if line == "publication" || line.starts_with("publication ") {
+                let declared = line["publication".len()..].trim();
                 if declared.is_empty() {
                     return Err(bad_publication(lineno, "the `publication` header has no name"));
                 }
@@ -609,8 +613,17 @@ mod tests {
     /// feed — a total stall whose cause is invisible at the point it is felt.
     #[test]
     fn a_declaration_with_no_header_is_refused() {
+        // Two guards reach this, and both are exercised: a table line met before any header is
+        // refused where it sits, and a file with no table lines at all falls through to the check at
+        // the end. The first is what a lost header looks like in a real file; the second is what
+        // pointing the flag at the wrong file looks like.
         let err = Publication::parse("customers: id, name\n").expect_err("headerless file accepted");
-        assert!(format!("{err}").contains("publication <name>"), "wrong reason: {err}");
+        assert!(
+            format!("{err}").contains("before any `publication <name>` header"),
+            "wrong reason: {err}"
+        );
+        let err = Publication::parse("# not a publication at all\n").expect_err("accepted");
+        assert!(format!("{err}").contains("no `publication <name>` header"), "wrong reason: {err}");
 
         // Anti-vacuity: the same file with a header parses.
         Publication::parse("publication p\ncustomers: id, name\n").expect("header form refused");
@@ -639,6 +652,16 @@ mod tests {
     fn a_table_declared_twice_is_refused() {
         let err = Publication::parse("publication p\nt: id\nt: id, ssn\n").expect_err("accepted");
         assert!(format!("{err}").contains("declared twice"), "wrong reason: {err}");
+    }
+
+    /// A header whose name was deleted must be reported as a nameless header, not as a line the
+    /// parser cannot read: the message is what an operator uses to find the edit that broke it.
+    #[test]
+    fn a_header_with_no_name_is_refused_as_a_nameless_header() {
+        let err = Publication::parse("publication \nt: id\n").expect_err("accepted");
+        assert!(format!("{err}").contains("header has no name"), "wrong reason: {err}");
+        let err = Publication::parse("publication\nt: id\n").expect_err("accepted");
+        assert!(format!("{err}").contains("header has no name"), "wrong reason: {err}");
     }
 
     #[test]

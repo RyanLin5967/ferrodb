@@ -10,7 +10,9 @@
 //
 // Subcommands:
 //
-//	validate <feed.jsonl>            check a feed file's format, exit non-zero on any violation
+//	validate <feed.jsonl> [-publication f]
+//	                                 check a feed file's format, exit non-zero on any violation; with
+//	                                 -publication, also refuse anything the policy does not publish
 //	precision <feed.jsonl>           report the JSON type of every column, and which numbers a
 //	                                 default float64 decode would silently corrupt
 //	follow <addr> [-key id]          stream a live feed, materialise it, print the resulting table
@@ -176,6 +178,16 @@ func decodeLine(line string, n int) (*Event, error) {
 		return nil, fmt.Errorf("line %d has trailing content after the object", n)
 	}
 	if err := checkEnvelope(&e, line, n); err != nil {
+		return nil, err
+	}
+	// **The publication, re-checked here rather than trusted from the producer.** In decodeLine
+	// because every mode that reads events goes through it, so a subcommand added later cannot be
+	// written without the check. See publication.go for what each direction catches, and for the
+	// blind spot: with no -publication flag, activePublication is nil and nothing is enforced.
+	if err := activePublication.check(&e, n); err != nil {
+		return nil, err
+	}
+	if err := activePublication.checkShape(&e, n); err != nil {
 		return nil, err
 	}
 	return &e, nil
@@ -718,26 +730,48 @@ func diffAgainstSource(feedPath, sourcePath, key string) error {
 	return nil
 }
 
+// publicationFlagHelp is one wording for the flag, so four subcommands cannot describe it four ways.
+const publicationFlagHelp = "publication declaration file; the feed is refused if it carries any " +
+	"column this does not publish, or omits one it does"
+
+// mustUsePublication installs the policy or exits. Not a warning: a run asked to enforce a policy and
+// unable to read it must not land the feed anyway, because the columns it would land are exactly the
+// ones somebody was trying to hold back.
+func mustUsePublication(path string) {
+	if err := usePublication(path); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | "+
+		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> [-publication f] | follow <addr> [flags] | "+
 			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | "+
 			"diff <feed.jsonl> <source.json> [-key col] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "validate":
-		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl>")
+		fs := flag.NewFlagSet("validate", flag.ExitOnError)
+		pub := fs.String("publication", "", publicationFlagHelp)
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> [-publication <file>]")
 			os.Exit(2)
 		}
-		if err := validate(os.Args[2]); err != nil {
+		feed := os.Args[2]
+		if err := fs.Parse(os.Args[3:]); err != nil {
+			os.Exit(2)
+		}
+		mustUsePublication(*pub)
+		if err := validate(feed); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "diff":
 		fs := flag.NewFlagSet("diff", flag.ExitOnError)
 		key := fs.String("key", "id", "primary key column shared by the feed and the source dump")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer diff <feed.jsonl> <source.json> [-key col]")
 			os.Exit(2)
@@ -745,6 +779,7 @@ func main() {
 		if err := fs.Parse(os.Args[4:]); err != nil {
 			os.Exit(2)
 		}
+		mustUsePublication(*pub)
 		if err := diffAgainstSource(os.Args[2], os.Args[3], *key); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -763,12 +798,14 @@ func main() {
 		dbPath := fs.String("db", "cdc.sqlite", "destination database file")
 		key := fs.String("key", "id", "primary key column")
 		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer sink <feed.jsonl> -db <file> [-engine sqlite|duckdb]")
 			os.Exit(2)
 		}
 		feed := os.Args[2]
 		_ = fs.Parse(os.Args[3:])
+		mustUsePublication(*pub)
 		if err := runSink(feed, *dbPath, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -793,12 +830,14 @@ func main() {
 		key := fs.String("key", "id", "column to key the materialised table by")
 		cursor := fs.Uint64("cursor", 0, "resume from this cursor; 0 means the start of the log")
 		limit := fs.Int("limit", 0, "stop after this many events; 0 means until the server closes")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer follow <addr> [flags]")
 			os.Exit(2)
 		}
 		addr := os.Args[2]
 		_ = fs.Parse(os.Args[3:])
+		mustUsePublication(*pub)
 		if err := follow(addr, *key, *cursor, *limit); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
