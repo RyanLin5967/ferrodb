@@ -1570,6 +1570,33 @@ impl AgentRuntime {
             let schema = schemas.get(t).cloned().unwrap_or_else(|| Schema::new(Vec::new()));
             let before = snapshot.base_rows.get(&(*t, *r)).cloned().flatten();
             let now = current.get(&(*t, *r)).cloned();
+
+            // **B11 — read this branch's images in the shape the target has NOW, before anything
+            // compares them.**
+            //
+            // A branch's rows were written against its fork-point shape. If a sibling agent merged
+            // an `ADD COLUMN` or a widening retype since, those images are the wrong width or the
+            // wrong type for the table they are about to be compared against and published into.
+            // Conforming here rather than at publication is deliberate: the cell loop below walks
+            // `0..v.len().min(b.len())`, so two images of different widths would have their extra
+            // columns silently dropped from the merge — no conflict, no report, `Clean`.
+            let (before, after) = match (snapshot.base_shapes.get(&table), schemas.get(t)) {
+                (Some(base_shape), Some(target_shape)) if base_shape != target_shape => {
+                    let b = match &before {
+                        Some(v) => Some(conform_row(v, base_shape, target_shape)?),
+                        None => None,
+                    };
+                    let a = match after {
+                        RowState::Present(v) => {
+                            RowState::Present(conform_row(v, base_shape, target_shape)?)
+                        }
+                        RowState::Deleted => RowState::Deleted,
+                    };
+                    (b, a)
+                }
+                _ => (before, after.clone()),
+            };
+            let after = &after;
             let mut applied_ops: Vec<Op> = Vec::new();
             let mut discarded = Vec::new();
             let mut conflicts: Vec<ConflictReport> = Vec::new();
@@ -1862,30 +1889,15 @@ impl AgentRuntime {
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
         //
-        // Rows go in under the shape the catalog has NOW, and the branch's own schema edits are
+        // Rows go in under the shape the catalog has NOW — every image was conformed to it above,
+        // where the cell merge could still see both shapes — and the branch's own schema edits are
         // executed afterwards. Two reasons, and the order is not interchangeable:
         //
-        // - a branch's rows were written against its fork-point shape, and `ALTER` is refused
-        //   inside a transaction, so the edits cannot run inside the publish transaction anyway;
+        // - `ALTER` is refused inside a transaction, so the edits cannot run inside the publish
+        //   transaction at all;
         // - the alter's own heap rewrite widens every row in the table, which includes the ones
         //   just published — so publishing narrow and altering after is not a compromise, it is
         //   the same single pass over the heap that the alter was always going to make.
-        //
-        // What the rows DO need is conforming to a shape a *sibling* agent may have widened since
-        // this branch forked. Without this the publish fails from inside `Tuple::serialize` with a
-        // message about value counts, for a situation that is neither an error nor this agent's
-        // fault.
-        let mut pending_writes = pending_writes;
-        for w in pending_writes.iter_mut() {
-            let Some(base) = snapshot.base_shapes.get(w.table()) else { continue };
-            let Some(entry) = ctx.catalog.get_table(w.table()) else { continue };
-            if &entry.schema == base {
-                continue;
-            }
-            let target_now = entry.schema.clone();
-            w.conform_from(base, &target_now)?;
-        }
-
         let publish_txn = ctx.txn.begin()?;
         let mut published = 0usize;
         for w in pending_writes {
@@ -1920,7 +1932,11 @@ impl AgentRuntime {
                 let prov = Arc::clone(self.provenance());
                 let shape =
                     ctx.catalog.alter_table(&report.table, &action, &ctx.txn, Some(&prov))?;
-                ctx.txn.checkpoint()?;
+                // Flushed rather than checkpointed, for the reason spelled out in the executor's
+                // `AlterTable` arm: truncating the log here would delete the change history of the
+                // very table this merge just published rows into.
+                ctx.bp.flush_all()?;
+                ctx.bp.disk_manager.sync()?;
                 ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
                     op: crate::wal::log::DdlOp::AlterColumn(alteration),
                     table: report.table.clone(),
@@ -2302,39 +2318,6 @@ enum PendingWrite {
 }
 
 impl PendingWrite {
-    fn table(&self) -> &str {
-        match self {
-            PendingWrite::Insert { table, .. }
-            | PendingWrite::Update { table, .. }
-            | PendingWrite::Delete { table, .. } => table,
-        }
-    }
-
-    /// Re-express the row images this write carries in the shape the target has **now** — B11.
-    ///
-    /// A branch's rows are written against its fork-point shape. If a sibling agent merged an
-    /// `ADD COLUMN` in the meantime, those rows are one value short of the table they are about to
-    /// be published into. `conform_row` is the same widening the heap rewrite uses, so a row
-    /// published through this path and a row rewritten by the `ALTER` itself get identical
-    /// treatment rather than two implementations of "make it fit".
-    ///
-    /// A `Delete` carries only the primary key, whose type cannot change (retyping the primary key
-    /// is refused), so there is nothing in it to conform.
-    fn conform_from(&mut self, base: &Schema, now: &Schema) -> Result<(), FerroError> {
-        match self {
-            PendingWrite::Insert { row, .. } => *row = conform_row(row, base, now)?,
-            PendingWrite::Update { schema, row, before, .. } => {
-                *row = conform_row(row, base, now)?;
-                *before = conform_row(before, base, now)?;
-                // The assignment list `into_stmt` builds is named from this, so it has to be the
-                // shape the statement will actually run against.
-                *schema = now.clone();
-            }
-            PendingWrite::Delete { .. } => {}
-        }
-        Ok(())
-    }
-
     /// Publish inside an already-open transaction.
     fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64, author: Author) -> Result<usize, FerroError> {
         let stmt = self.into_stmt(ctx)?;

@@ -187,7 +187,33 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             };
             let prov = session.runtime.provenance().clone();
             let shape = catalog.alter_table(&table, &action, &txn, Some(&prov))?;
-            txn.checkpoint()?;
+
+            // **Flushed, NOT checkpointed — and this is the one place `ALTER` deliberately differs
+            // from `CREATE TABLE` and `DROP TABLE` above.**
+            //
+            // What those two need from `checkpoint` is durability: the catalog is written outside
+            // the WAL, so its pages have to reach the disk under their own steam. `flush_all` plus
+            // `sync` is that, exactly. What `checkpoint` *also* does is **truncate the log**, and
+            // for a whole-table DDL that costs nothing — a table being created has no history and
+            // one being dropped has no future. For a column-level change it would throw away every
+            // row change the altered table has ever emitted, at the precise moment the feature
+            // exists to keep them coherent: "a column added mid-stream" would mean "a column added,
+            // and every row before it deleted from the feed". A consumer that was behind would
+            // rebuild the table from the alter onwards and never learn what it had missed.
+            //
+            // Nothing is lost by not truncating. The record survives a *later* checkpoint through
+            // `log_ddl`'s retention, which turns it into the table's updated declaration; that is
+            // the same mechanism a `CREATE TABLE` relies on and it does not need the truncation to
+            // work.
+            //
+            // What this does NOT give is crash atomicity, and neither does any other DDL here: the
+            // catalog page and the rewritten heap pages are flushed together but not as one unit,
+            // so a crash midway can leave the two disagreeing. That is a property of the catalog
+            // living outside the WAL — recovery does not replay DDL — and this statement inherits
+            // it rather than introducing it.
+            bp.flush_all()?;
+            bp.disk_manager.sync()?;
+
             txn.log_ddl(DdlRecord {
                 op: DdlOp::AlterColumn(alteration),
                 table: table.clone(),
