@@ -11,7 +11,8 @@ use crate::catalog::catalog::Catalog;
 use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
-use crate::execution::index_handle::IndexHandle;
+use crate::execution::fulltext_search::FullTextSearch;
+use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::execution::session::Session;
 use crate::parser::parser::{Stmt};
 use crate::planner::plan::{Plan, explain, plan};
@@ -99,6 +100,34 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             catalog.create_fulltext_index(&table, &column_name)?;
             txn.checkpoint()?;
             return Ok(Outcome::Ok)
+        }
+        // B8 — ranked retrieval. A read, so it takes the same `ReadView` a SELECT does: inside a
+        // transaction it sees that transaction's snapshot, outside one it sees the latest committed
+        // state. That is what makes a deleted row disappear from a search for a word it contained.
+        Stmt::Search { table, column_name, query, top_k } => {
+            // Refused rather than answered, because the answer would be wrong in a way the caller
+            // could not see. An agent session's writes live on its branch and are invisible to the
+            // shared tables until MERGE, and the full-text index is a shared-table structure — so a
+            // search inside a session would silently ignore everything the session had written.
+            // `run_in_session` above handles Select/Insert/Update/Delete; teaching it retrieval
+            // means changing the branch runtime, which is not this feature's business.
+            if session.agent.is_some() {
+                return Err(FerroError::Bind(
+                    "SEARCH is not available inside an agent session: the full-text index covers the \
+                     shared tables, so it cannot see rows this branch has written and has not merged"
+                        .into(),
+                ));
+            }
+            let view = Arc::new(match session.current {
+                Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id },
+                None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+            });
+            let mut op = FullTextSearch::open(catalog, &table, &column_name, &query, top_k, bp.clone(), view)?;
+            let mut rows = Vec::new();
+            while let Some(row) = op.next() {
+                rows.push(row?.1);
+            }
+            return Ok(Outcome::Rows(rows))
         }
         Stmt::CreateTable { table, columns } => {
             if session.current.is_some() {
@@ -255,6 +284,27 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
         let stored = catalog.get_table(table).and_then(|e| e.indexes.iter().find(|i| i.column_name == col_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
             catalog.update_index_root(table, &col_name, cur)?;
+        }
+    }
+    Ok(())
+}
+
+/// `sync_roots` for the full-text list — B8.
+///
+/// A posting tree splits like any other, and its root moves when it does. The catalog is written
+/// outside the WAL, so a root that is not written back is a tree the next open cannot find: it would
+/// read the pre-split root, which is now an interior node with a *subset* of the postings under it,
+/// and answer a search with a silently short result.
+///
+/// Separate from `sync_roots` because the lists are separate. Matching a full-text column name
+/// inside `TableEntry::indexes` would either miss it or find a same-named B-tree index and record a
+/// token tree's root as that index's.
+pub fn sync_fulltext_roots(table: &str, fulltext: &[FullTextHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
+    for handle in fulltext {
+        let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
+        let stored = catalog.get_table(table).and_then(|e| e.fulltext_indexes.iter().find(|i| i.column_name == handle.column_name).map(|i| i.root_page_id));
+        if stored != Some(cur) {
+            catalog.update_fulltext_root(table, &handle.column_name, cur)?;
         }
     }
     Ok(())

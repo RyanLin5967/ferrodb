@@ -48,14 +48,15 @@
 use crate::binder::binder::BoundExpr;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
-use crate::execution::executor::{Modify, evaluate, sync_roots};
+use crate::execution::executor::{Modify, evaluate, sync_fulltext_roots, sync_roots};
 use crate::storage::tuple::Tuple;
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::catalog::schema::Schema;
 use crate::catalog::column::Value;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
-use crate::execution::index_handle::IndexHandle;
+use crate::execution::index_handle::{FullTextHandle, IndexHandle};
+use crate::storage::index_fulltext::{indexed_text, post_tokens};
 use crate::provenance::{ProvId, ProvenanceStore};
 use std::sync::Arc;
 
@@ -66,6 +67,8 @@ pub struct Insert {
     pub schema: Schema,
     pub primary_index: BPlusTreeManager<Value, RecordId>,
     pub secondary_indexes: Vec<IndexHandle>,
+    /// B8 — full-text indexes on this table, maintained one posting per distinct token.
+    pub fulltext_indexes: Vec<FullTextHandle>,
     /// Who to attribute the inserted version to. `None` means unattributed.
     pub author: Option<(Arc<dyn ProvenanceStore>, ProvId)>,
     /// Needed to answer "is the row this index entry points at still there?".
@@ -152,7 +155,18 @@ impl Modify for Insert {
                 sec_idx.tree.insert(key, ())?;
             }
         }
+        // **B8 — the same rule, one level finer.** A secondary index posts one entry per row; a
+        // full-text index posts one per *distinct token of the value*, so a value that repeats a
+        // word would post that pair twice from a single INSERT, before any DELETE or UPDATE is
+        // involved. `post_tokens` carries both halves of the guard: distinct tokens, and the
+        // search-before-insert probe that the re-used-primary-key case above needs.
+        for ft in &self.fulltext_indexes {
+            if let Some(text) = indexed_text(&vals[ft.col_index])? {
+                post_tokens(&ft.tree, text, &vals[0])?;
+            }
+        }
         sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
+        sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog)?;
         Ok(1)
     }
 }

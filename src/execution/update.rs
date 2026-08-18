@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::binder::binder::BoundExpr;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
-use crate::execution::executor::{Modify, evaluate, sync_roots};
+use crate::execution::executor::{Modify, evaluate, sync_fulltext_roots, sync_roots};
 use crate::storage::tuple::Tuple;
 use crate::wal::txn::ReadView;
 use crate::wal::visibility::check_write_conflict;
@@ -11,7 +11,8 @@ use crate::{catalog::schema::Schema, execution::executor::Executor, storage::hea
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::Value;
-use crate::execution::index_handle::IndexHandle;
+use crate::execution::index_handle::{FullTextHandle, IndexHandle};
+use crate::storage::index_fulltext::{indexed_text, post_tokens};
 use crate::provenance::{ProvId, ProvenanceStore};
 
 pub struct Update {
@@ -22,6 +23,9 @@ pub struct Update {
     pub heap: HeapFileManager,
     pub primary_index: BPlusTreeManager<Value, RecordId>,
     pub secondary_indexes: Vec<IndexHandle>,
+    /// B8 — full-text indexes on this table. Postings for the NEW text are added; postings for the
+    /// old text stay, exactly as the secondary entries do.
+    pub fulltext_indexes: Vec<FullTextHandle>,
     pub view: Arc<ReadView>,
     pub tt_heap: HeapFileManager,
     /// Who to attribute each new version to. `None` means unattributed.
@@ -121,9 +125,36 @@ impl Modify for Update {
                     }
                 }
             }
+            // **B8 — the same shape for postings, and the same reason the old ones stay.**
+            //
+            // A posting is how a reader finds a row by a word in it, and a snapshot older than this
+            // update must still find this row by a word that used to be in it. So the old tokens
+            // are left alone and the new ones are posted, deduped.
+            //
+            // The breaking shape is the one E66 names, and a full-text index reaches it more
+            // easily: `UPDATE body='...' ; UPDATE body='<the original text>' ;` re-posts every
+            // token of the original text over postings that are still there. Without the probe
+            // inside `post_tokens`, `insert_entry` appends and the search returns the row once per
+            // copy. That the value moved away and back is invisible to the index - only the probe
+            // sees it.
+            //
+            // Nothing here removes a posting for a token the new text dropped. `FullTextSearch`
+            // re-tokenizes the version it resolves and drops a candidate whose text no longer holds
+            // any query term, which is what makes a left-behind posting harmless rather than a
+            // wrong answer.
+            for ft in &self.fulltext_indexes {
+                let old_text = indexed_text(&old_values[ft.col_index])?;
+                let new_text = indexed_text(&new_values[ft.col_index])?;
+                if old_text != new_text {
+                    if let Some(text) = new_text {
+                        post_tokens(&ft.tree, text, &pk)?;
+                    }
+                }
+            }
             count += 1;
         }
         sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
+        sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog)?;
         Ok(count)
     }
 }

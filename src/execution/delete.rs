@@ -12,6 +12,21 @@ use crate::storage::heap_file_manager::RecordId;
 use crate::execution::index_handle::IndexHandle;
 use crate::provenance::{ProvId, ProvenanceStore};
 
+/// `DELETE` — and, for B8, the statement that maintains **no** posting on purpose.
+///
+/// There is no `fulltext_indexes` field here, and that is the whole of full-text delete
+/// maintenance. A `DELETE` stamps `end_ts` on the version in place and leaves every index entry
+/// alone, because an entry is how an older snapshot still reaches the row it can still see. Removing
+/// the postings of a deleted row would lose it for those readers, not tidy up after it.
+///
+/// A dead posting is made harmless on the read side instead: `FullTextSearch` resolves each posting
+/// through the primary index, applies `resolve_visibility`, and drops the candidate when no version
+/// is visible — the same three steps `SecondaryIndexScan` takes for the same reason. The cost is the
+/// scan amplification `tests/integration_index_debt.rs` measures at 8x, which is space, not a wrong
+/// answer.
+///
+/// So this statement writes no tree and no full-text root can move, which is why `plan()` drops the
+/// full-text handles when it builds a `Delete`.
 pub struct Delete {
     pub table: String,
     pub child: Box<dyn Executor>,
