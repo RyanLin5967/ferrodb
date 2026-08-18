@@ -628,37 +628,274 @@ fn the_envelope_governs_agent_session_writes_only() {
     );
 }
 
-/// **The most important gap in this feature, asserted so it is visible and so closing it trips a
-/// test.** DDL inside an agent session does not go through `stage_all` at all.
+/// **The most important gap in this feature, asserted so it is visible, so closing it trips a
+/// test, and so nobody reads the envelope as covering more than it does.** Not one verb that
+/// mutates schema is governed by the envelope. This test names each of them and reaches a table
+/// the envelope forbids with every one.
 ///
-/// `src/execution/executor.rs` routes only SELECT / INSERT / UPDATE / DELETE onto the session's
-/// branch; `DROP TABLE`, `CREATE TABLE`, `CREATE INDEX` and `ANALYZE` fall through to the shared
-/// catalog immediately, with no branch and no `MERGE` involved. So a governed agent that may not
-/// *write* `payroll` can still drop it.
+/// # What is governed, and what is not
 ///
-/// Left as a boundary rather than closed here because the fix is in the executor's statement
-/// routing, which this lane does not own, and because "what does DDL on a branch even mean" is a
-/// design question — a branch-scoped `CREATE TABLE` has to decide what a sibling sees and what
-/// `MERGE` does with it. **Anyone reading the envelope as "a session cannot touch what it was not
-/// granted" must read this test first.**
+/// **Governed:** the after-image of every row a `SELECT` / `INSERT` / `UPDATE` / `DELETE` writes on
+/// the session's branch. Those four, and only those four, are routed onto `run_in_session`
+/// (`src/execution/executor.rs:56-60`), and every one of them funnels into
+/// `AgentRuntime::stage_all`, where the envelope is read from the branch's own durable record.
+///
+/// **Not governed:** every other statement. Each falls through that `match` to the **shared
+/// catalog**, with no branch and no `MERGE` — so a governed agent that may not write one row of
+/// `payroll` can still index it, analyse it, and drop it, and every other connection sees the
+/// result immediately.
+///
+/// # This pin used to be a strict subset of the hole it claimed to name
+///
+/// It was `ddl_inside_a_session_bypasses_the_envelope_and_this_is_a_known_gap`, and it named four
+/// verbs in prose while demonstrating exactly one of them. Both halves of that were a problem:
+///
+/// - **Three of the four named verbs were never exercised.** A verb that is only named is a verb
+///   nobody has checked. `ANALYZE`, `CREATE INDEX` and `CREATE TABLE` are each run here against a
+///   table the envelope forbids, and each one's effect is read back out of the catalog rather than
+///   inferred from an `Ok` — a bypass that returns `Ok` and writes nothing is not the same defect
+///   and must not be allowed to stand in for this one.
+/// - **`CREATE FULLTEXT INDEX` (B8) is a fifth verb, added after the pin was written**, on the same
+///   fall-through (`src/execution/executor.rs:96`). It is the worst of the five to leave off a pin:
+///   it opens a B+tree, scans the *entire heap* of the forbidden table and posts every token of the
+///   indexed column into it (`src/catalog/catalog.rs:174-188`). So it does not merely mutate
+///   schema — it makes the contents of a table the branch was never granted retrievable. A pin that
+///   enumerates verbs by name and is not widened when a verb is added decays from a warning into a
+///   false reassurance, silently, while still passing green.
+///
+/// `ALTER TABLE` is a sixth case and a structurally different one — it reaches *branch* state
+/// rather than the shared catalog — so it is pinned separately, by
+/// `the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another`.
+///
+/// # Why this is pinned rather than closed
+///
+/// Because closing it is a design decision that is recorded and owned elsewhere, not an oversight
+/// left lying here: the fix is in the executor's statement routing, and it needs an answer to what
+/// DDL on a branch *means* — a branch-scoped `CREATE TABLE` has to say what a sibling sees and what
+/// `MERGE` does with it. B11 has already built one answer, for `ALTER` alone. **Anyone reading the
+/// envelope as "a session cannot touch what it was not granted" must read this test first.**
 #[test]
-fn ddl_inside_a_session_bypasses_the_envelope_and_this_is_a_known_gap() {
+fn no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap() {
     let mut db = Db::new();
     db.seed();
+
+    // A second forbidden table, carrying a VARCHAR column so the full-text verb has something to
+    // tokenize: `create_fulltext_index` refuses a non-VARCHAR column (`src/catalog/catalog.rs:164`)
+    // and `payroll` is all integers. Built before any envelope exists and outside any session,
+    // which is the ungoverned direct-write path `the_envelope_governs_agent_session_writes_only`
+    // already documents.
+    {
+        let mut s = db.session();
+        db.ok("CREATE TABLE payroll_notes (id INTEGER NOT NULL, note VARCHAR(64));", &mut s);
+        db.ok("INSERT INTO payroll_notes VALUES (1, 'severance clause');", &mut s);
+    }
     db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
 
     let mut a = db.session();
     db.begin("ddl", &mut a);
-    // The envelope refuses every DML against payroll...
-    let err = db.refused("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut a);
-    assert!(err.contains("may not write table `payroll`"), "got {err}");
 
-    // ...and does not see this at all.
+    // Anti-vacuity, and it has to cover BOTH forbidden tables: without this the rest of the test
+    // could be describing a branch that was never governed at all.
+    for sql in [
+        "UPDATE payroll SET salary = 0 WHERE id = 1;",
+        "UPDATE payroll_notes SET note = 'redacted' WHERE id = 1;",
+    ] {
+        let err = db.refused(sql, &mut a);
+        assert!(err.contains("may not write table"), "got {err}");
+    }
+
+    // ---- 1. ANALYZE reads every row of a table the branch may not write ------------------------
+    assert!(
+        !db.catalog.stats.contains_key("payroll"),
+        "`payroll` already carries stats, so the ANALYZE below would prove nothing"
+    );
+    db.ok("ANALYZE payroll;", &mut a);
+    assert_eq!(
+        db.catalog.stats.get("payroll").map(|s| s.row_count),
+        Some(1),
+        "ANALYZE returned Ok without actually scanning the forbidden table, so what this test \
+         measured is not the bypass it claims to measure"
+    );
+
+    // ---- 2. CREATE INDEX allocates a shared structure over a forbidden table ------------------
+    assert!(
+        db.catalog.tables["payroll"].indexes.is_empty(),
+        "`payroll` is already indexed, so the CREATE INDEX below would prove nothing"
+    );
+    db.ok("CREATE INDEX ix_salary ON payroll (salary);", &mut a);
+    assert!(
+        db.catalog.tables["payroll"].indexes.iter().any(|i| i.column_name == "salary"),
+        "CREATE INDEX returned Ok without landing an index on the forbidden table"
+    );
+
+    // ---- 3. CREATE FULLTEXT INDEX (B8) makes a forbidden table's TEXT retrievable -------------
+    //
+    // The verb B3's pin could not have named, because B8 added it afterwards. This is the reason
+    // the pin had to be widened rather than reworded: the hole grew, and the test that was
+    // supposed to be the alarm did not notice.
+    let mut before = db.session();
+    assert!(
+        db.exec("SEARCH payroll_notes (note) FOR 'severance';", &mut before).is_err(),
+        "a full-text index already exists on the forbidden table; the assertion below is then \
+         about a pre-existing index rather than one this session created"
+    );
+    db.ok("CREATE FULLTEXT INDEX ix_note ON payroll_notes (note);", &mut a);
+    assert!(
+        db.catalog.tables["payroll_notes"].fulltext_indexes.iter().any(|i| i.column_name == "note"),
+        "CREATE FULLTEXT INDEX returned Ok without landing an index on the forbidden table"
+    );
+    // And the postings are real, not an empty tree: the whole heap of a table this branch may not
+    // write is now searchable from any connection. Read from a plain session because `SEARCH` is
+    // refused inside an agent session (`src/execution/executor.rs:107-120`).
+    let mut plain = db.session();
+    match db.ok("SEARCH payroll_notes (note) FOR 'severance';", &mut plain) {
+        Outcome::Rows(rows) => assert_eq!(
+            rows.len(),
+            1,
+            "the index the governed session built over a forbidden table returned nothing, so \
+             this measured the schema change and not the content exposure"
+        ),
+        _ => panic!("SEARCH answered with something other than rows"),
+    }
+
+    // ---- 4. CREATE TABLE puts a table nobody granted into the SHARED catalog -------------------
+    //
+    // Not on the branch, and not awaiting `MERGE`: a different connection can read it at once,
+    // and abandoning this agent's branch would not take it away.
+    db.ok("CREATE TABLE contraband (id INTEGER NOT NULL, note VARCHAR(32));", &mut a);
+    let mut reader = db.session();
+    match db.exec("SELECT id FROM contraband;", &mut reader) {
+        Ok(Outcome::Rows(rows)) => assert!(rows.is_empty(), "a fresh table returned rows"),
+        Ok(_) => panic!("SELECT on the new table answered with something other than rows"),
+        Err(e) => panic!(
+            "the table a governed agent created is not readable from a plain session, so it did \
+             not reach the shared catalog and this is a different finding from the one described: \
+             {e}"
+        ),
+    }
+
+    // ---- 5. DROP TABLE destroys a table and its rows ------------------------------------------
+    //
+    // Last, because it takes `payroll` away from the four checks above. This is the verb B3's pin
+    // did demonstrate, and it is still the sharpest statement of the gap: the branch may not write
+    // one row of `payroll`, and it just deleted all of them.
+    assert_eq!(db.salary(1), 1000, "payroll must hold a row for the drop to destroy");
     db.ok("DROP TABLE payroll;", &mut a);
     assert!(
         db.exec("SELECT id FROM payroll;", &mut a).is_err(),
         "if DDL is now governed by the envelope, this gap has been closed and the module docs, \
          the summary and this test must say so"
+    );
+    // Visible outside the session, so it was the shared catalog and not the branch that changed.
+    let mut outside = db.session();
+    assert!(
+        db.exec("SELECT id FROM payroll;", &mut outside).is_err(),
+        "the drop was somehow scoped to the branch, which would mean DDL now has branch semantics \
+         and this whole test needs rewriting"
+    );
+}
+
+/// **The envelope is enforced at exactly one funnel, and B11's branch-scoped `ALTER TABLE` reaches
+/// branch state through a second one — so the envelope structurally cannot see it.** This test
+/// pins that premise, and fails the moment the premise stops holding.
+///
+/// # Why this one is a structural check and not a SQL statement
+///
+/// Every other case in this file drives real SQL. This one cannot: `ALTER TABLE` does not exist in
+/// this tree — there is no `Stmt::Alter`, and the scanner has no `ALTER` keyword. It arrives with
+/// **B11**, unmerged as of this commit, as `src/agent_sql/dispatch.rs::run_agent_alter` calling
+/// `AgentRuntime::stage_schema_edit`, which pushes onto `state.workspaces[branch].schema_edits` and
+/// publishes at `MERGE`. Read on B11's branch rather than taken from its report: that function
+/// performs no envelope read and no charge, so a branch whose envelope allows only `inventory`
+/// would carry an `ALTER TABLE payroll ADD COLUMN ...` all the way to publication.
+///
+/// Writing a test that *executes* that verb would mean merging B11 here, which is a separate,
+/// ordered integration step (`src/agent_sql/runtime.rs` goes B4 → B6 → B11 → B9) and is not this
+/// commit's business. So what is pinned instead is the premise B3's design rests on and B11
+/// falsifies: **`stage_all` is the only way into a branch's write state, which is what makes one
+/// enforcement point sufficient.**
+///
+/// # It is a count, not a list of names
+///
+/// Asserting "`run_agent_alter` is absent" alone would be a denylist, and a denylist only catches
+/// the one bypass somebody already thought of. So the load-bearing assertion is that the funnel is
+/// *singular*: exactly one site reads the envelope, exactly one site charges the budget, exactly
+/// one site mutates a workspace's staged writes, and all three are inside `stage_all`. Any second
+/// funnel — B11's, or one not yet written — trips this regardless of what it is called.
+///
+/// This test fires on the merge that *creates* the hole rather than on the one that fixes it, which
+/// is the only ordering that helps: by the time somebody is looking for why the envelope missed an
+/// `ALTER`, the branch has already published it.
+#[test]
+fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime = std::fs::read_to_string(root.join("src/agent_sql/runtime.rs")).unwrap();
+    let dispatch = std::fs::read_to_string(root.join("src/agent_sql/dispatch.rs")).unwrap();
+
+    // Anti-vacuity for the instrument itself. A moved or renamed file would otherwise make every
+    // assertion below pass against an empty string, and this test would report "one funnel" about
+    // a file it never read — the exact failure mode a zero-result check is supposed to refuse.
+    let funnel_at = runtime.find("fn stage_all(").expect(
+        "`stage_all` is not in src/agent_sql/runtime.rs any more: either the funnel was renamed, \
+         in which case update this test, or this test is reading the wrong file and has been \
+         asserting nothing",
+    );
+    assert!(
+        dispatch.contains("pub fn run_agent_stmt("),
+        "src/agent_sql/dispatch.rs does not contain run_agent_stmt, so this test is not reading \
+         the dispatcher it thinks it is"
+    );
+
+    // The span of `stage_all`, from its signature to the next item at the same indentation.
+    let body = &runtime[funnel_at..];
+    let end = body[1..]
+        .find("\n    fn ")
+        .into_iter()
+        .chain(body[1..].find("\n    pub fn "))
+        .min()
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+    let stage_all = &body[..end];
+
+    // Exactly one of each, and each one inside `stage_all`. Counted over the whole file so a
+    // second call site anywhere trips this, wherever somebody puts it.
+    for (needle, what) in [
+        ("self.branches.envelope_of(", "reads the capability envelope"),
+        ("self.branches.charge_row_writes(", "charges the row-write budget"),
+        ("workspaces.get_mut(", "mutates a branch workspace's staged writes"),
+    ] {
+        assert_eq!(
+            runtime.matches(needle).count(),
+            1,
+            "`{needle}` — the site that {what} — occurs more than once in \
+             src/agent_sql/runtime.rs. The envelope is enforced at ONE funnel, `stage_all`, and \
+             that is only sufficient while nothing else reaches branch write state. If this is \
+             B11's `stage_schema_edit`, the envelope now has a hole it cannot see: widen this \
+             test to drive `ALTER TABLE` against a table the envelope forbids, or govern the new \
+             funnel. Either way this test must stop being a text check."
+        );
+        assert!(
+            stage_all.contains(needle),
+            "`{needle}` has moved out of `stage_all`. Whatever now holds it is a second funnel, \
+             and the envelope only governs the one."
+        );
+    }
+
+    // Belt and braces on top of the count: B11's two symbols by name, so the failure message can
+    // say exactly which merge did it instead of leaving the next reader to work it out.
+    assert!(
+        !dispatch.contains("run_agent_alter"),
+        "B11's branch-scoped ALTER TABLE has landed in src/agent_sql/dispatch.rs. It reaches the \
+         runtime without passing through `stage_all`, so the capability envelope cannot see it: a \
+         branch whose envelope forbids `payroll` can ADD, RENAME or RETYPE a `payroll` column and \
+         publish it at MERGE. Widen \
+         `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap` to demonstrate it with \
+         real SQL, or close the gap — and record which in INTEGRATION.md."
+    );
+    assert!(
+        !runtime.contains("stage_schema_edit"),
+        "`AgentRuntime::stage_schema_edit` (B11) is a second funnel into branch state and performs \
+         no envelope check. See the message above."
     );
 }
 
