@@ -40,7 +40,7 @@ use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
-use crate::branch::BranchCatalog;
+use crate::branch::{BranchCatalog, Reaper};
 
 /// Root page the trunk branch starts at. The CoW store publishes a real root over this on the
 /// first write; until then it is only an identity for the trunk record.
@@ -246,6 +246,9 @@ pub struct AgentRuntime {
     /// Where captured frames go. One frame per agent task, re-appended as the task grows, so a
     /// merge engine on the other side of this trait sees exactly what the SQL layer captured.
     log: Arc<dyn EffectLog>,
+    /// The reaper that reclaims a branch's pages the moment the branch is retired, if one is
+    /// attached. See [`AgentRuntime::with_reaper`].
+    reaper: Option<Arc<dyn Reaper>>,
     state: Mutex<State>,
 }
 
@@ -281,6 +284,7 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: None,
+            reaper: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -337,6 +341,7 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(rows),
+            reaper: None,
             state: Mutex::new(State::default()),
         })
     }
@@ -374,8 +379,27 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(PagedRows::new(store)),
+            reaper: None,
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// Attach the reaper that reclaims a branch's pages when the branch is retired.
+    ///
+    /// **Why a retired branch needs a reaper at all.** `seal` marks a merged or abandoned branch
+    /// reaped in the catalog, which makes its id a hard error and unpins its parent's pages — but
+    /// nothing frees the extents the branch itself allocated. Its shadow pages are garbage the
+    /// instant its work is published (the rows are in the shared tables now) and they stay charged
+    /// to the store until something takes them back. Without a reaper attached that is a lease
+    /// scan away; with one it is immediate, which is what lets a simulation's page count return to
+    /// its baseline rather than to its baseline plus the winners.
+    ///
+    /// **The reaper must be built over the same catalog and page store as this runtime.** A reaper
+    /// over a different catalog would reap a record this runtime never wrote. That is the caller's
+    /// contract because the `Reaper` trait carries no way to check it.
+    pub fn with_reaper(mut self, reaper: Arc<dyn Reaper>) -> Self {
+        self.reaper = Some(reaper);
+        self
     }
 
     /// The provenance store: interned runs, and the author of each version the executor wrote.
@@ -2019,6 +2043,15 @@ impl AgentRuntime {
                 state.names.remove(&ws.name);
             }
         }
+        // With a reaper attached, retiring a branch means reclaiming it: the reaper does
+        // everything below AND frees the extents this branch allocated, which nothing else will.
+        // It is the same call the lease scan makes, so a branch that is merged and a branch that
+        // was walked away from end in exactly the same state.
+        if let Some(reaper) = &self.reaper {
+            reaper.reap(branch)?;
+            return Ok(());
+        }
+
         // Reap through the `BranchCatalog` trait only, so this works against the durable engine
         // as written: mark the record reaped (which bumps the generation, making the old id a
         // hard error) and drop our fork epoch from the parent's live-children array so the
