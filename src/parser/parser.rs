@@ -121,6 +121,25 @@ fn token_sql(t: TokenType) -> &'static str {
     }
 }
 
+/// What one `ALTER TABLE` does to one column.
+///
+/// **Column-level, and end-anchored.** There is no `DROP COLUMN` and no positional `ADD ... AFTER`,
+/// because a column ordinal is the identity of a column everywhere below the parser: tuple bytes
+/// are laid out positionally, `tel::ColId` is documented as "a column, by ordinal within its
+/// table's schema", and every captured `Op`, `Guard` and merge-policy key holds one. Removing a
+/// column, or inserting one anywhere but the end, silently re-points all of them at a different
+/// column — and a merge would still report `Clean`. Appending cannot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    /// `ADD COLUMN c <type> [NULL]`. Appended at the end of the table.
+    AddColumn(Column),
+    /// `RENAME COLUMN a TO b`. Names live only in the catalog, so no row is touched.
+    RenameColumn { from: String, to: String },
+    /// `ALTER COLUMN c TYPE <type>`. Only conversions the catalog can prove total are accepted;
+    /// see `catalog::alter`.
+    RetypeColumn { column: String, to: DataType },
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Select {
@@ -150,6 +169,15 @@ pub enum Stmt {
     /// "`CREATE_TABLE` and `DROP_TABLE` are" carried; half of that was untrue.
     DropTable {
         table: String,
+    },
+    /// `ALTER TABLE t ADD COLUMN c INTEGER;` and friends — B11.
+    ///
+    /// One statement, one column-level action. `SchemaChange` had exactly two variants before
+    /// this, both whole-table, so the most common real-world CDC break — a column added, renamed
+    /// or retyped mid-stream — had no representation anywhere in the system.
+    AlterTable {
+        table: String,
+        action: AlterAction,
     },
     CreateTable {
         table: String,
@@ -334,6 +362,8 @@ impl Parser {
             return Ok(Stmt::DropTable { table })
         } else if self.match_token(&[TokenType::Search]) {
             return self.parse_search()
+        } else if self.match_token(&[TokenType::Alter]) {
+            return self.parse_alter_table()
         } else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
@@ -406,7 +436,6 @@ impl Parser {
             "OFFSET" => "OFFSET",
             "UNION" => "UNION",
             "DISTINCT" => "DISTINCT",
-            "ALTER" => "ALTER",
             "TRUNCATE" => "TRUNCATE",
             _ => return None,
         })
@@ -559,41 +588,8 @@ impl Parser {
         self.consume(TokenType::LeftParen, "expected (")?;
         loop {
             let name = self.consume(TokenType::Identifier, "expected col name")?.lexeme;
-            let data_type = if self.match_token(&[TokenType::TypeInt]) {
-                DataType::Integer
-            } else if self.match_token(&[TokenType::TypeBoolean]) {
-                DataType::Boolean
-            } else if self.match_token(&[TokenType::TypeFloat]) {
-                DataType::Float
-            } else if self.match_token(&[TokenType::TypeBigInt]) {
-                DataType::BigInt
-            } else if self.match_token(&[TokenType::TypeDecimal]) {
-                // No `DECIMAL(p,s)`. This engine stores the digits the writer supplied, so there
-                // is nothing for a declared precision to do except introduce a rounding rule —
-                // which is the loss the type exists to prevent. See `Value::Decimal`.
-                DataType::Decimal
-            } else if self.match_token(&[TokenType::TypeTimestamp]) {
-                DataType::Timestamp
-            } else if self.match_token(&[TokenType::TypeVarchar]) {
-                self.consume(TokenType::LeftParen, "expected ( after VARCHAR")?;
-                let size_token = self.consume(TokenType::Number, "expected size")?;
-                let size: u16 = size_token.lexeme.parse().map_err(|_| Parser::error(size_token.clone(), "invalid size".into()))?;
-                self.consume(TokenType::RightParen, "expected )")?;
-                DataType::Varchar(size)
-            }else {
-                return Err(Parser::error(self.peek(), "expected data type".into()));
-            };
-
-            let mut nullable = true;
-            if self.match_token(&[TokenType::Not]) {
-                if self.match_token(&[TokenType::Null]) {
-                    nullable = false;
-                } else {
-                    return Err(Parser::error(self.peek(), "unexpected NOT".into()));
-                }
-            } else if self.match_token(&[TokenType::Null]) {
-                nullable = true;
-            }
+            let data_type = self.parse_data_type()?;
+            let nullable = self.parse_nullability()?;
             columns.push(Column { name, data_type, nullable });
 
             if !self.match_token(&[TokenType::Comma]) {
@@ -603,6 +599,154 @@ impl Parser {
         self.consume(TokenType::RightParen, "expected )")?;
         self.consume(TokenType::Semicolon, "expected ;")?;
         Ok(Stmt::CreateTable { table, columns })
+    }
+
+    /// One column type, spelled exactly as `CREATE TABLE` spells it.
+    ///
+    /// Lifted out of `parse_create_table` so `ALTER TABLE` cannot drift from it. Two parsers for
+    /// one type vocabulary is how a database ends up accepting `BIGINT` in one statement and not
+    /// the other, and the wire contract in `replication::logical::sql_type_of` assumes there is
+    /// exactly one.
+    pub fn parse_data_type(&mut self) -> Result<DataType, FerroError> {
+        if self.match_token(&[TokenType::TypeInt]) {
+            Ok(DataType::Integer)
+        } else if self.match_token(&[TokenType::TypeBoolean]) {
+            Ok(DataType::Boolean)
+        } else if self.match_token(&[TokenType::TypeFloat]) {
+            Ok(DataType::Float)
+        } else if self.match_token(&[TokenType::TypeBigInt]) {
+            Ok(DataType::BigInt)
+        } else if self.match_token(&[TokenType::TypeDecimal]) {
+            // No `DECIMAL(p,s)`. This engine stores the digits the writer supplied, so there
+            // is nothing for a declared precision to do except introduce a rounding rule —
+            // which is the loss the type exists to prevent. See `Value::Decimal`.
+            Ok(DataType::Decimal)
+        } else if self.match_token(&[TokenType::TypeTimestamp]) {
+            Ok(DataType::Timestamp)
+        } else if self.match_token(&[TokenType::TypeVarchar]) {
+            self.consume(TokenType::LeftParen, "expected ( after VARCHAR")?;
+            let size_token = self.consume(TokenType::Number, "expected size")?;
+            let size: u16 = size_token
+                .lexeme
+                .parse()
+                .map_err(|_| Parser::error(size_token.clone(), "invalid size".into()))?;
+            self.consume(TokenType::RightParen, "expected )")?;
+            Ok(DataType::Varchar(size))
+        } else {
+            Err(Parser::error(self.peek(), "expected data type".into()))
+        }
+    }
+
+    /// The optional `NULL` / `NOT NULL` suffix. Absent means nullable, as `CREATE TABLE` has
+    /// always read it.
+    pub fn parse_nullability(&mut self) -> Result<bool, FerroError> {
+        if self.match_token(&[TokenType::Not]) {
+            if self.match_token(&[TokenType::Null]) {
+                return Ok(false);
+            }
+            return Err(Parser::error(self.peek(), "unexpected NOT".into()));
+        }
+        self.match_token(&[TokenType::Null]);
+        Ok(true)
+    }
+
+    /// A bare word matched by *lexeme*, case-insensitively, without reserving it.
+    ///
+    /// `ADD`, `COLUMN`, `RENAME`, `TO` and `TYPE` go through here rather than becoming token
+    /// types. Reserving them would make `CREATE TABLE t (type INTEGER, ...)` stop parsing, and a
+    /// column called `type` or `to` is an ordinary thing for someone to have. This is the idiom
+    /// `parse_select` already uses for `INNER`/`LEFT`/`RIGHT`/`FULL`.
+    fn match_word(&mut self, word: &str) -> bool {
+        if self.is_at_end() {
+            return false;
+        }
+        if self.peek().lexeme.to_uppercase() == word {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    fn consume_word(&mut self, word: &str, message: &str) -> Result<(), FerroError> {
+        if self.match_word(word) {
+            return Ok(());
+        }
+        Err(Parser::error(self.peek(), message.to_string()))
+    }
+
+    /// `ALTER TABLE t ...` — B11.
+    ///
+    /// ```text
+    /// ALTER TABLE t ADD COLUMN c INTEGER;
+    /// ALTER TABLE t RENAME COLUMN old TO new;
+    /// ALTER TABLE t ALTER COLUMN c TYPE BIGINT;
+    /// ```
+    ///
+    /// `COLUMN` is required in all three rather than optional in some, because one rule produces
+    /// one error message. The two shapes this deliberately refuses — `DROP COLUMN` and any
+    /// positional `ADD ... AFTER`/`FIRST` — are refused *by name*, with the reason, rather than
+    /// falling through to "expected ADD, RENAME or ALTER": a reader who typed valid SQL that this
+    /// database will not do should be told which of those two it is (E67).
+    pub fn parse_alter_table(&mut self) -> Result<Stmt, FerroError> {
+        self.consume(TokenType::Table, "expected TABLE after ALTER")?;
+        let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+
+        // `DROP COLUMN` is real SQL and is refused on a data-model rule, not a syntax one.
+        if self.check(TokenType::Drop) {
+            return Err(FerroError::SqlParseError(format!(
+                "{} at \' {} \': ALTER TABLE DROP COLUMN is not supported by this database. A \
+                 column\'s ordinal is its identity here — tuple bytes are positional and every \
+                 recorded effect, guard and merge policy holds an ordinal — so removing one \
+                 silently re-points all of them at a different column. Columns can be added at the \
+                 end, renamed, and retyped.",
+                self.peek().line,
+                self.peek().lexeme
+            )));
+        }
+
+        if self.match_word("ADD") {
+            self.consume_word("COLUMN", "expected COLUMN after ADD")?;
+            let name = self.consume(TokenType::Identifier, "expected column name")?.lexeme;
+            let data_type = self.parse_data_type()?;
+            let nullable = self.parse_nullability()?;
+            // Positional placement, refused by name for the same reason as DROP COLUMN.
+            if self.match_word("AFTER") || self.match_word("FIRST") || self.match_word("BEFORE") {
+                return Err(FerroError::SqlParseError(format!(
+                    "{}: ALTER TABLE ADD COLUMN places the column at the END of the table and \
+                     takes no position. A column\'s ordinal is its identity here, so inserting one \
+                     mid-table re-points every recorded effect, guard and merge policy after it.",
+                    self.previous().line
+                )));
+            }
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::AlterTable {
+                table,
+                action: AlterAction::AddColumn(Column { name, data_type, nullable }),
+            });
+        }
+
+        if self.match_word("RENAME") {
+            self.consume_word("COLUMN", "expected COLUMN after RENAME")?;
+            let from = self.consume(TokenType::Identifier, "expected column name")?.lexeme;
+            self.consume_word("TO", "expected TO after the column name")?;
+            let to = self.consume(TokenType::Identifier, "expected the new column name")?.lexeme;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::AlterTable { table, action: AlterAction::RenameColumn { from, to } });
+        }
+
+        if self.match_token(&[TokenType::Alter]) {
+            self.consume_word("COLUMN", "expected COLUMN after ALTER")?;
+            let column = self.consume(TokenType::Identifier, "expected column name")?.lexeme;
+            self.consume_word("TYPE", "expected TYPE after the column name")?;
+            let to = self.parse_data_type()?;
+            self.consume(TokenType::Semicolon, "expected ;")?;
+            return Ok(Stmt::AlterTable { table, action: AlterAction::RetypeColumn { column, to } });
+        }
+
+        Err(Parser::error(
+            self.peek(),
+            "expected ADD COLUMN, RENAME COLUMN or ALTER COLUMN after the table name".to_string(),
+        ))
     }
 
     // CREATE INDEX index_name ON table (col)
@@ -1548,5 +1692,116 @@ mod tests {
             }
             _ => panic!("bruh")
         }
+    }
+
+    // ---- B11: column-level DDL ---------------------------------------------------------------
+
+    /// **Breaking shape: `ALTER TABLE ... ADD COLUMN`, which no input could produce before.**
+    ///
+    /// Without the fix `ALTER` is an ordinary identifier that `unsupported_keyword` refuses in
+    /// statement position, so this text produces
+    /// `1 at ' ALTER ': ALTER is not supported by this database` and no `Stmt` at all.
+    #[test]
+    fn alter_table_add_column_parses() {
+        let stmts = parse_sql("ALTER TABLE inventory ADD COLUMN note VARCHAR(20);").unwrap();
+        match &stmts[0] {
+            Stmt::AlterTable { table, action: AlterAction::AddColumn(col) } => {
+                assert_eq!(table, "inventory");
+                assert_eq!(col.name, "note");
+                assert_eq!(col.data_type, DataType::Varchar(20));
+                assert!(col.nullable, "a column added with no NULL/NOT NULL suffix is nullable");
+            }
+            other => panic!("not an ADD COLUMN: {other:?}"),
+        }
+    }
+
+    /// Breaking shape: `NOT NULL` on the added column. The suffix is parsed by the same helper
+    /// `CREATE TABLE` uses, so it must survive the lift-out.
+    #[test]
+    fn alter_table_add_column_carries_not_null() {
+        let stmts = parse_sql("ALTER TABLE t ADD COLUMN c INTEGER NOT NULL;").unwrap();
+        match &stmts[0] {
+            Stmt::AlterTable { action: AlterAction::AddColumn(col), .. } => {
+                assert!(!col.nullable)
+            }
+            other => panic!("not an ADD COLUMN: {other:?}"),
+        }
+    }
+
+    /// Breaking shape: `RENAME COLUMN a TO b`, where `TO` is not a token type.
+    #[test]
+    fn alter_table_rename_column_parses() {
+        let stmts = parse_sql("ALTER TABLE inventory RENAME COLUMN qty TO quantity;").unwrap();
+        match &stmts[0] {
+            Stmt::AlterTable { table, action: AlterAction::RenameColumn { from, to } } => {
+                assert_eq!(table, "inventory");
+                assert_eq!(from, "qty");
+                assert_eq!(to, "quantity");
+            }
+            other => panic!("not a RENAME COLUMN: {other:?}"),
+        }
+    }
+
+    /// Breaking shape: `ALTER COLUMN c TYPE t`, whose second `ALTER` is the same token that
+    /// started the statement.
+    #[test]
+    fn alter_table_retype_column_parses() {
+        let stmts = parse_sql("ALTER TABLE inventory ALTER COLUMN qty TYPE BIGINT;").unwrap();
+        match &stmts[0] {
+            Stmt::AlterTable { table, action: AlterAction::RetypeColumn { column, to } } => {
+                assert_eq!(table, "inventory");
+                assert_eq!(column, "qty");
+                assert_eq!(*to, DataType::BigInt);
+            }
+            other => panic!("not a retype: {other:?}"),
+        }
+    }
+
+    /// **Anti-vacuity for reserving `ALTER`.** The words the grammar needs — `ADD`, `COLUMN`,
+    /// `RENAME`, `TO`, `TYPE` — are matched by lexeme precisely so they stay usable as ordinary
+    /// names. Breaking shape: a table whose columns are called `type`, `to` and `add`. Reserve
+    /// any of them as a token type and this stops parsing.
+    #[test]
+    fn the_alter_grammar_words_are_still_usable_as_column_names() {
+        let stmts =
+            parse_sql("CREATE TABLE t (id INTEGER, type VARCHAR(4), to INTEGER, add INTEGER, column INTEGER, rename INTEGER);")
+                .unwrap();
+        match &stmts[0] {
+            Stmt::CreateTable { columns, .. } => {
+                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(names, vec!["id", "type", "to", "add", "column", "rename"]);
+            }
+            other => panic!("not a CREATE TABLE: {other:?}"),
+        }
+        // And they still read as names on the way back out.
+        parse_sql("SELECT type FROM t WHERE to = 1;").unwrap();
+    }
+
+    /// `DROP COLUMN` is valid SQL this database refuses on a data-model rule. Breaking shape:
+    /// the refusal falling through to a syntax error that names none of the reason (E67's
+    /// complaint about `DROP TABLE` before it was implemented).
+    #[test]
+    fn drop_column_is_refused_by_name_with_the_reason() {
+        let err = parse_sql("ALTER TABLE t DROP COLUMN c;").unwrap_err();
+        assert!(err.contains("DROP COLUMN"), "the refusal does not name the feature: {err}");
+        assert!(err.contains("ordinal"), "the refusal does not give the reason: {err}");
+    }
+
+    /// Same for positional placement: `ADD COLUMN c INTEGER AFTER b` is real SQL elsewhere.
+    #[test]
+    fn positional_add_column_is_refused_by_name() {
+        let err = parse_sql("ALTER TABLE t ADD COLUMN c INTEGER AFTER b;").unwrap_err();
+        assert!(err.contains("END of the table"), "no reason given: {err}");
+    }
+
+    /// Anti-vacuity for the refusals above: the three supported forms are not refused, and a
+    /// genuine typo still reads as a typo rather than as one of the two named refusals.
+    #[test]
+    fn a_mistyped_alter_still_says_what_was_expected() {
+        let err = parse_sql("ALTER TABLE t MODIFY COLUMN c INTEGER;").unwrap_err();
+        assert!(
+            err.contains("expected ADD COLUMN, RENAME COLUMN or ALTER COLUMN"),
+            "unhelpful message: {err}"
+        );
     }
 }

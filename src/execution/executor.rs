@@ -1,10 +1,10 @@
 use crate::catalog::column::DataType;
-use crate::wal::log::DdlOp;
+use crate::wal::log::{ColumnAlteration, DdlOp};
 use crate::wal::txn::DdlRecord;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
+use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_alter, run_agent_stmt, run_in_session, AgentOutput};
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
@@ -14,7 +14,7 @@ use crate::catalog::schema::Schema;
 use crate::execution::fulltext_search::FullTextSearch;
 use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::execution::session::Session;
-use crate::parser::parser::{Stmt};
+use crate::parser::parser::{AlterAction, Stmt};
 use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
 use crate::wal::txn::{ReadView, TxnManager};
@@ -197,6 +197,73 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             })?;
             return Ok(Outcome::Ok)
         }
+        // B11 — the column-level half of DDL. Same shape as `CreateTable` and `DropTable` above,
+        // for the same reasons: refused inside a transaction, the catalog changed first, then a
+        // checkpoint, then the record logged AFTER it through `log_ddl` so the next checkpoint does
+        // not truncate it away.
+        //
+        // The one thing that is *not* the same: the record's `columns` is the shape the alteration
+        // PRODUCED, taken from `alter_table`'s return value rather than re-read from the catalog.
+        // Two reads of a mutable catalog are two chances to log a shape that is not the one that
+        // was applied, and `log_ddl` turns this record into the table's retained declaration — the
+        // thing a consumer is re-told after every truncation. Logging the wrong shape there is a
+        // lie that outlives the statement.
+        Stmt::AlterTable { table, action } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
+            if session.agent.is_some() {
+                return run_agent_alter(table, action, catalog, txn, session);
+            }
+            let (dir_root, tt_root, alteration) = {
+                let entry = catalog.require_table(&table)?;
+                (
+                    entry.first_directory_page_id,
+                    entry.time_travel_root,
+                    // Read BEFORE the change: a rename's old name and a retype's old type are the
+                    // half of the alteration that the resulting shape does not record, and after
+                    // the catalog is updated there is nowhere left to read them from.
+                    alteration_of(&action, &entry.schema)?,
+                )
+            };
+            let prov = session.runtime.provenance().clone();
+            let shape = catalog.alter_table(&table, &action, &txn, Some(&prov))?;
+
+            // **Flushed, NOT checkpointed — and this is the one place `ALTER` deliberately differs
+            // from `CREATE TABLE` and `DROP TABLE` above.**
+            //
+            // What those two need from `checkpoint` is durability: the catalog is written outside
+            // the WAL, so its pages have to reach the disk under their own steam. `flush_all` plus
+            // `sync` is that, exactly. What `checkpoint` *also* does is **truncate the log**, and
+            // for a whole-table DDL that costs nothing — a table being created has no history and
+            // one being dropped has no future. For a column-level change it would throw away every
+            // row change the altered table has ever emitted, at the precise moment the feature
+            // exists to keep them coherent: "a column added mid-stream" would mean "a column added,
+            // and every row before it deleted from the feed". A consumer that was behind would
+            // rebuild the table from the alter onwards and never learn what it had missed.
+            //
+            // Nothing is lost by not truncating. The record survives a *later* checkpoint through
+            // `log_ddl`'s retention, which turns it into the table's updated declaration; that is
+            // the same mechanism a `CREATE TABLE` relies on and it does not need the truncation to
+            // work.
+            //
+            // What this does NOT give is crash atomicity, and neither does any other DDL here: the
+            // catalog page and the rewritten heap pages are flushed together but not as one unit,
+            // so a crash midway can leave the two disagreeing. That is a property of the catalog
+            // living outside the WAL — recovery does not replay DDL — and this statement inherits
+            // it rather than introducing it.
+            bp.flush_all()?;
+            bp.disk_manager.sync()?;
+
+            txn.log_ddl(DdlRecord {
+                op: DdlOp::AlterColumn(alteration),
+                table: table.clone(),
+                dir_root,
+                time_travel_root: tt_root,
+                columns: shape,
+            })?;
+            return Ok(Outcome::Ok)
+        }
         Stmt::Analyze { table } => {
             catalog.analyze(&table)?;
             return Ok(Outcome::Ok)
@@ -270,6 +337,34 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             }
         }
     }
+}
+
+/// The WAL-record half of an [`AlterAction`]: what the resulting shape cannot say.
+///
+/// Called with the schema as it stands **before** the change. A rename's old name and a retype's
+/// old type exist only here; everything else about the alteration is recoverable from the new
+/// shape the record also carries.
+pub fn alteration_of(action: &AlterAction, before: &Schema) -> Result<ColumnAlteration, FerroError> {
+    Ok(match action {
+        AlterAction::AddColumn(col) => ColumnAlteration::Add { column: col.name.clone() },
+        AlterAction::RenameColumn { from, to } => {
+            ColumnAlteration::Rename { from: from.clone(), to: to.clone() }
+        }
+        AlterAction::RetypeColumn { column, .. } => {
+            let from = before
+                .columns
+                .iter()
+                .find(|c| &c.name == column)
+                .map(|c| c.data_type.clone())
+                .ok_or_else(|| {
+                    FerroError::Bind(format!(
+                        "no column '{column}' to retype; the table has: {}",
+                        before.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+            ColumnAlteration::Retype { column: column.clone(), from }
+        }
+    })
 }
 
 pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value, RecordId>, secondaries: &[IndexHandle], catalog: &mut Catalog) -> Result<(), FerroError> {

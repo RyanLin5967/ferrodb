@@ -20,6 +20,7 @@ pub mod ids;
 pub mod log;
 pub mod merge;
 pub mod op;
+pub mod schema_merge;
 
 pub use capture::{capture_assignment, capture_guard, to_guard_expr, ColMap, RowSnapshot};
 pub use engine::{dedup_by_txn, ComposedState, Deduped, Side, ThreeWayMerger};
@@ -32,6 +33,9 @@ pub use merge::{
     MergePolicy, Merger,
 };
 pub use op::{Delta, EscrowClaim, Op, OpKind};
+pub use schema_merge::{
+    merge_schema, ColumnShapeReq, SchemaEdit, SchemaMerge, SchemaMergeOutcome, SchemaPredicate,
+};
 
 use crate::error::FerroError;
 

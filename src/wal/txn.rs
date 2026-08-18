@@ -622,19 +622,63 @@ impl TxnManager {
     /// Retained rather than merely written, because the next checkpoint truncates whatever is
     /// there. A `DropTable` removes the table from the retained set as well as being logged, so a
     /// replay after truncation does not resurrect a table that no longer exists.
+    ///
+    /// # An `AlterColumn` is retained as a re-declaration, not as itself — B11
+    ///
+    /// This is what makes a column-level change survive a restart, and it is the one part of the
+    /// design that is not obvious.
+    ///
+    /// The retained set is replayed at the head of the log after every truncation
+    /// ([`Self::replay_schema`]), so whatever is in it is re-emitted to every consumer, repeatedly,
+    /// forever. `CREATE_TABLE` is safe there because the feed documents it as a **declaration** —
+    /// "this table has this shape" — which a consumer may apply any number of times. An `ALTER` is
+    /// **news**: "this column just changed". Retaining the alter itself would re-deliver that news
+    /// at every checkpoint, and a consumer applying a rename twice renames a column that no longer
+    /// has the old name.
+    ///
+    /// So an alter updates the *declaration*: the retained record for this table becomes a
+    /// `CreateTable` carrying the shape the alter produced. The alter is still appended to the log
+    /// in its own right, in log order, exactly once. After a truncation the log re-declares the
+    /// table with its **new** shape, which is precisely "the schema survives a restart".
+    ///
+    /// The record's `columns` must therefore be the table's FULL shape after the change. It is,
+    /// for every op: `CreateTable` and `AlterColumn` both carry it, and `DropTable` carries none
+    /// because there is no shape left to declare.
     pub fn log_ddl(&self, rec: DdlRecord) -> Result<(), FerroError> {
         {
             let mut log = self.schema_log.lock().unwrap();
-            match rec.op {
+            match &rec.op {
                 DdlOp::CreateTable => {
                     log.retain(|r| r.dir_root != rec.dir_root);
                     log.push(rec.clone());
                 }
                 DdlOp::DropTable => log.retain(|r| r.dir_root != rec.dir_root),
+                DdlOp::AlterColumn(_) => {
+                    log.retain(|r| r.dir_root != rec.dir_root);
+                    log.push(DdlRecord {
+                        op: DdlOp::CreateTable,
+                        table: rec.table.clone(),
+                        dir_root: rec.dir_root,
+                        time_travel_root: rec.time_travel_root,
+                        columns: rec.columns.clone(),
+                    });
+                }
             }
         }
         self.append_ddl(&rec)?;
         self.wal.flush()
+    }
+
+    /// The shape the log would re-declare for `dir_root` after a truncation, if any.
+    ///
+    /// Exposed so a test can ask what survives a restart without having to truncate to find out.
+    pub fn retained_shape(&self, dir_root: u32) -> Option<Vec<(String, DataType, bool)>> {
+        self.schema_log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.dir_root == dir_root)
+            .map(|r| r.columns.clone())
     }
 
     fn append_ddl(&self, r: &DdlRecord) -> Result<(), FerroError> {
@@ -642,7 +686,7 @@ impl TxnManager {
             0,
             0,
             &RecKind::Ddl {
-                op: r.op,
+                op: r.op.clone(),
                 table: r.table.clone(),
                 dir_root: r.dir_root,
                 time_travel_root: r.time_travel_root,

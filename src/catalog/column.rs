@@ -57,6 +57,27 @@ pub enum Value {
 }
 
 
+/// How a type is spelled in SQL, and in the change feed.
+///
+/// **One definition, three readers.** `replication::logical::sql_type_of` is the change feed's
+/// wire contract and delegates here; `tel::schema_merge` renders it into the predicate a schema
+/// conflict hands back to an agent; and a refusal message names it. It lives on the type rather
+/// than in any one of them so that adding a `DataType` variant fails to compile in exactly one
+/// place instead of acquiring three spellings.
+impl std::fmt::Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Integer => f.write_str("INTEGER"),
+            DataType::Float => f.write_str("FLOAT"),
+            DataType::Boolean => f.write_str("BOOLEAN"),
+            DataType::Varchar(n) => write!(f, "VARCHAR({n})"),
+            DataType::BigInt => f.write_str("BIGINT"),
+            DataType::Decimal => f.write_str("DECIMAL"),
+            DataType::Timestamp => f.write_str("TIMESTAMP"),
+        }
+    }
+}
+
 impl Column {
     pub fn new(name: String, data_type: DataType, nullable: bool) -> Self {
         Column {name, data_type, nullable}
