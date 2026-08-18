@@ -1744,12 +1744,31 @@ fn recovery_holds_at_every_fault_point_through_the_catalog() {
                         // this sweep is about: if the surviving file is long enough to hold the
                         // catalog's own page and recovery still refuses, that is a database that
                         // existed and cannot be reopened, not a database that was never created.
-                        let db_bytes = rebooted
-                            .durable_image()
-                            .get(DB)
-                            .map(|v| v.len() as u64)
-                            .unwrap_or(0);
-                        let catalog_page_could_exist = db_bytes >= 2 * PAGE_SIZE as u64;
+                        // **File length does not prove the catalog page was ever written.** This
+                        // used to be `db_bytes >= 2 * PAGE_SIZE`, on the reasoning that a file long
+                        // enough to hold page 1 must hold a catalog. That is false for exactly the
+                        // reason this file documents elsewhere: a write to a later page EXTENDS the
+                        // file past earlier ones, so page 1 can be a zero-filled GAP in an 8192-byte
+                        // file that no catalog write ever reached.
+                        //
+                        // It began failing when B8 landed a format stamp at byte 0 of the catalog
+                        // page (4 = pre-B8, 5 = full-text, anything else refused). Before that, a
+                        // zero page deserialised as a valid EMPTY catalog — which is why B8 added the
+                        // stamp: `Catalog::persist` was deserialising a zero-filled page it had just
+                        // allocated. So the refusal is the improvement, and reading an all-zero page
+                        // as "a database with no tables" was the bug. Loosening B8's allowlist to
+                        // accept zeroes would also accept a corrupt page, which is why that is not
+                        // the fix.
+                        //
+                        // The invariant still bites where it should: a refusal over a catalog page
+                        // that HAS content and cannot be read is still a database that existed and
+                        // cannot be reopened. Only a page that was never written is licensed.
+                        let db_img = rebooted.durable_image().get(DB).cloned().unwrap_or_default();
+                        let db_bytes = db_img.len() as u64;
+                        let cat_lo = PAGE_SIZE as usize;
+                        let cat_hi = 2 * PAGE_SIZE as usize;
+                        let catalog_page_could_exist = db_img.len() >= cat_hi
+                            && db_img[cat_lo..cat_hi].iter().any(|b| *b != 0);
                         assert!(
                             !catalog_page_could_exist,
                             "{what}: the reboot REFUSED while the surviving file is {db_bytes} bytes \
