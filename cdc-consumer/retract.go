@@ -32,6 +32,17 @@ package main
 //     unattributed row in the table. Neither is what anyone asked for.
 //   - A destination with **no `_model_version` column**: landed by a sink that predates attribution.
 //     Retracting nothing from it and printing a zero would read exactly like a clean run.
+//   - An **engine** this program does not know, the same refusal `openDestination` makes: a typo in
+//     `-engine` that quietly opened the wrong file is worse than an error, because the destination
+//     the operator is watching stays untouched.
+//
+// # Both engines, through SQL neither one owns
+//
+// SQLite and DuckDB both land attribution, so both can be retracted from. The queries here are
+// deliberately plain — `SELECT … FROM t LIMIT 0` to ask whether a table or a column exists, rather
+// than SQLite's `PRAGMA table_info` or DuckDB's `duckdb_columns()` — so there is one code path
+// instead of two that can drift. The two places the engines genuinely differ are named explicitly:
+// the driver, and whether `_retracted` is an integer or a real BOOLEAN.
 //   - A model version that matches **no rows**. A retraction that touched nothing has not passed:
 //     the overwhelmingly likely cause is a typo in the version string, and the error names the
 //     versions that are actually present so the next attempt is informed.
@@ -42,6 +53,49 @@ import (
 	"sort"
 	"strings"
 )
+
+// engine names a destination's driver and the two dialect facts this file needs.
+type engine struct {
+	driver string
+	// The literal that means "retracted" in this engine. SQLite has no boolean type and stores 1;
+	// DuckDB has a real BOOLEAN and refuses the integer.
+	trueLit string
+}
+
+func engineFor(name string) (engine, error) {
+	switch name {
+	case "sqlite":
+		return engine{driver: "sqlite", trueLit: "1"}, nil
+	case "duckdb":
+		return engine{driver: "duckdb", trueLit: "TRUE"}, nil
+	default:
+		return engine{}, fmt.Errorf("unknown -engine %q; known engines are sqlite and duckdb", name)
+	}
+}
+
+// truthy reads a retraction/tombstone flag from either engine.
+//
+// SQLite hands back an int64 and DuckDB a bool for the same logical column, and a `Scan` into either
+// concrete type fails against the other. Scanning into `any` and deciding here is what keeps one
+// query working on both.
+func truthy(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case int64:
+		return t != 0
+	case int:
+		return t != 0
+	case []byte:
+		return len(t) > 0 && t[0] != '0'
+	case string:
+		return t != "" && t != "0" && !strings.EqualFold(t, "false")
+	case nil:
+		return false
+	default:
+		return false
+	}
+}
 
 // retractMode decides what a retraction does to the rows it matches.
 type retractMode string
@@ -54,36 +108,39 @@ const (
 	remove retractMode = "delete"
 )
 
-// hasColumn reports whether a table has a column of this name.
+// hasColumn reports whether a table has a column of this name, and errors if the TABLE is missing.
+//
+// Asked with `SELECT … LIMIT 0` rather than with either engine's catalog, so there is one query
+// instead of two. The table is probed separately first, because "no such table" and "no such column"
+// are different facts and a single failing query cannot tell them apart — and the whole point of
+// this file is not misdiagnosing which.
 func hasColumn(db *sql.DB, table, column string) (bool, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", quoteIdent(table)))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	found := false
-	any := false
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notnull int
-		var dflt sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			return false, err
+	// **The column reference is TABLE-QUALIFIED, and that is not style.**
+	//
+	// SQLite's double-quoted-string misfeature makes a bare `"_model_version"` that resolves to no
+	// column fall back to being a string LITERAL — so `SELECT "_model_version" FROM inv` succeeds
+	// against a table without the column, returning the text. Measured: the probe reported the
+	// column present, and the UPDATE then failed with `no such column: _retracted` — the wrong
+	// error, from the wrong place, naming a column nobody had asked about. `inv."_model_version"` is
+	// unambiguously a column reference and cannot be reinterpreted, in either engine.
+	//
+	// `Query`, not `Exec`, for the same reason: `Exec` on a bad SELECT returned nil.
+	probe := func(sel string) error {
+		rows, err := db.Query(fmt.Sprintf("SELECT %s FROM %s LIMIT 0", sel, quoteIdent(table)))
+		if err != nil {
+			return err
 		}
-		any = true
-		if name == column {
-			found = true
-		}
+		err = rows.Err()
+		rows.Close()
+		return err
 	}
-	if err := rows.Err(); err != nil {
-		return false, err
+	if err := probe("1"); err != nil {
+		return false, fmt.Errorf("table %q cannot be read in this destination: %w", table, err)
 	}
-	if !any {
-		return false, fmt.Errorf("table %q does not exist in this destination", table)
+	if probe(quoteIdent(table)+"."+quoteIdent(column)) != nil {
+		return false, nil
 	}
-	return found, nil
+	return true, nil
 }
 
 // presentModelVersions lists the distinct model versions in a table, for an error message that
@@ -112,7 +169,7 @@ func presentModelVersions(db *sql.DB, table string) []string {
 }
 
 // runRetract withdraws every row one model version wrote.
-func runRetract(dbPath, table, modelVersion string, mode retractMode) error {
+func runRetract(dbPath, table, modelVersion string, mode retractMode, engineName string) error {
 	if strings.TrimSpace(modelVersion) == "" {
 		return fmt.Errorf("-model-version is empty. Rows written by no agent run carry a NULL " +
 			"model version, so an empty string names either nothing or every unattributed row " +
@@ -121,7 +178,11 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode) error {
 	if mode != quarantine && mode != remove {
 		return fmt.Errorf("unknown -mode %q; known modes are %q and %q", mode, quarantine, remove)
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	eng, err := engineFor(engineName)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open(eng.driver, dbPath)
 	if err != nil {
 		return err
 	}
@@ -142,9 +203,9 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode) error {
 		return err
 	}
 
-	set := `"_retracted" = 1`
+	set := fmt.Sprintf(`"_retracted" = %s`, eng.trueLit)
 	if mode == remove {
-		set = `"_retracted" = 1, "_deleted" = 1`
+		set = fmt.Sprintf(`"_retracted" = %s, "_deleted" = %s`, eng.trueLit, eng.trueLit)
 	}
 	// The predicate is on the column, parameterised. `_model_version` is compared with `=`, which
 	// NULL never satisfies — so unattributed rows are never swept up by a retraction, whatever
@@ -163,16 +224,20 @@ func runRetract(dbPath, table, modelVersion string, mode retractMode) error {
 			"A retraction that touched nothing has not succeeded — the versions present are %v",
 			table, modelVersion, presentModelVersions(db, table))
 	}
-	fmt.Printf("RETRACTED %d OF %d table=%s model_version=%s mode=%s\n",
-		n, total, table, modelVersion, mode)
+	fmt.Printf("RETRACTED %d OF %d table=%s model_version=%s mode=%s engine=%s\n",
+		n, total, table, modelVersion, mode, engineName)
 	return nil
 }
 
 // runScan prints every row's key, model version and retraction flag: the ground truth a caller
 // checks a retraction against, produced by a full table scan and not by the code that did the
 // retracting.
-func runScan(dbPath, table, key string) error {
-	db, err := sql.Open("sqlite", dbPath)
+func runScan(dbPath, table, key, engineName string) error {
+	eng, err := engineFor(engineName)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open(eng.driver, dbPath)
 	if err != nil {
 		return err
 	}
@@ -200,7 +265,9 @@ func runScan(dbPath, table, key string) error {
 		var k any
 		var provID int64
 		var agent, mv sql.NullString
-		var retracted, deleted int
+		// `any` rather than a concrete type: SQLite returns an integer here and DuckDB a bool, and
+		// scanning into either fails against the other.
+		var retracted, deleted any
 		if err := rows.Scan(&k, &provID, &agent, &mv, &retracted, &deleted); err != nil {
 			return err
 		}
@@ -213,7 +280,7 @@ func runScan(dbPath, table, key string) error {
 			who = agent.String
 		}
 		fmt.Printf("ROW %s=%v prov_id=%d agent=%s model_version=%s retracted=%d deleted=%d\n",
-			key, k, provID, who, version, retracted, deleted)
+			key, k, provID, who, version, b2i(truthy(retracted)), b2i(truthy(deleted)))
 		n++
 	}
 	if err := rows.Err(); err != nil {
@@ -225,6 +292,14 @@ func runScan(dbPath, table, key string) error {
 		return fmt.Errorf("table %q holds no rows; a scan that returned nothing proves nothing "+
 			"about a retraction", table)
 	}
-	fmt.Printf("SCANNED %d table=%s\n", n, table)
+	fmt.Printf("SCANNED %d table=%s engine=%s\n", n, table, engineName)
 	return nil
+}
+
+// b2i renders a flag as 0/1 so the output is one shape whatever the engine stored.
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

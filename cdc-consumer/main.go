@@ -15,8 +15,8 @@
 //	                                 default float64 decode would silently corrupt
 //	follow <addr> [-key id]          stream a live feed, materialise it, print the resulting table
 //	sink <feed.jsonl> -db f [-engine] land the feed with idempotent, order-guarded upserts
-//	retract <db> -table t -model-version v   withdraw everything one model version wrote
-//	scan <db> -table t [-key id]     print every row's writer and retraction flag, for ground truth
+//	retract <db> -table t -model-version v [-engine]  withdraw everything one model version wrote
+//	scan <db> -table t [-key id] [-engine]           print every row's writer and retraction flag
 //	duckdb-sql <file> <sql>          run one statement against a DuckDB destination, separate process
 //
 // `sink` speaks to two destinations, chosen with `-engine`: `sqlite` (the default, and what the
@@ -836,8 +836,8 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | "+
 			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | "+
-			"retract <db> -table <t> -model-version <v> [-mode quarantine|delete] | "+
-			"scan <db> -table <t> [-key col] | "+
+			"retract <db> -table <t> -model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb] | "+
+			"scan <db> -table <t> [-key col] [-engine sqlite|duckdb] | "+
 			"diff <feed.jsonl> <source.json> [-key col] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
@@ -924,9 +924,10 @@ func main() {
 		table := fs.String("table", "", "destination table to retract from")
 		version := fs.String("model-version", "", "the model_version whose rows to withdraw")
 		mode := fs.String("mode", string(quarantine), "quarantine (mark only) or delete (mark and tombstone)")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr,
-				"usage: cdc-consumer retract <db> -table <t> -model-version <v> [-mode quarantine|delete]")
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer retract <db> -table <t> "+
+				"-model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb]")
 			os.Exit(2)
 		}
 		dbPath := os.Args[2]
@@ -935,7 +936,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "retract needs -table")
 			os.Exit(2)
 		}
-		if err := runRetract(dbPath, *table, *version, retractMode(*mode)); err != nil {
+		if err := runRetract(dbPath, *table, *version, retractMode(*mode), *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -943,8 +944,10 @@ func main() {
 		fs := flag.NewFlagSet("scan", flag.ExitOnError)
 		table := fs.String("table", "", "destination table to scan")
 		key := fs.String("key", "id", "primary key column")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: cdc-consumer scan <db> -table <t> [-key id]")
+			fmt.Fprintln(os.Stderr,
+				"usage: cdc-consumer scan <db> -table <t> [-key id] [-engine sqlite|duckdb]")
 			os.Exit(2)
 		}
 		dbPath := os.Args[2]
@@ -953,7 +956,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "scan needs -table")
 			os.Exit(2)
 		}
-		if err := runScan(dbPath, *table, *key); err != nil {
+		if err := runScan(dbPath, *table, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -413,10 +413,11 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   drops on that same scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
-- **Every change carries its writer.** Each event names the agent run behind it — agent, run, model,
-  `model_version` and a SHA-256 of the prompt — or `null` where no agent run produced it, and the
-  commits that ship with no writer are **counted and reported** rather than assumed absent. See
-  *Run identity* below.
+- **Every change can carry its writer.** The event envelope names the agent run behind it — agent,
+  run, model, `model_version` and a SHA-256 of the prompt — or `null` where no agent run produced it,
+  and the commits that ship with no writer are **counted and reported** rather than assumed absent.
+  *Nothing on the SQL path binds a run yet*, so a feed from the shipped binary carries `null` for
+  every event; see *Run identity* below for what is connected and what is not.
 
 Two things the log says that a naive decoder gets wrong, both found by decoding real executor
 output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
@@ -468,6 +469,14 @@ interned run, one small record per stamped version, a torn tail healed and **rep
 swallowed. It wraps the in-memory store rather than reimplementing it, so the same guards and the
 same `footprint_bytes` / `literal_footprint_bytes` density instruments apply unchanged.
 
+> **Not yet wired.** `AgentRuntime`'s three constructors still build a `MemProvenanceStore`, and
+> nothing on the SQL path calls `TxnManager::bind_run`. So on every path a shipped binary takes,
+> restarting still loses attribution and every feed event carries `"writer":null`. What is done is
+> the store, the log record, the wire format and the consumer — each proven by tests — and the
+> remaining hop is one line in each of `runtime.rs:276`, `:332`, `:369` plus a `bind_run` call where
+> a session's transaction is opened. Stated here rather than left for a reader to infer from a
+> feature that appears to be on.
+
 **It stopped at the database boundary.** `ChangeEvent` carried no writer, so a consumer holding a
 million rows from a model since found unsound could not ask which of them came from it. Now every
 event carries one:
@@ -512,11 +521,15 @@ ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted
 …
 ```
 
-`-mode delete` tombstones as well as marks. A retraction naming a version nothing wrote is
-**refused**, not reported as a clean run of zero rows — the likely cause is a typo, and the error
-names the versions that are present. Rows with no writer at all are never swept up, whatever string
-is passed. `tests/integration_cdc_retract_by_model.rs` runs the whole pipeline and checks the
-100%-of-one / 0%-of-any-other property from `scan`, which did not do the retracting.
+`-mode delete` tombstones as well as marks, and `-engine duckdb` targets the analytical destination
+— both sinks land the same attribution columns, pinned by
+`TestBothSinksLandTheSameWriterColumnNames` because `retract` addresses them by name. A retraction
+naming a version nothing wrote is **refused**, not reported as a clean run of zero rows — the likely
+cause is a typo, and the error names the versions that are present. Rows with no writer at all are
+never swept up, whatever string is passed, and a destination landed before attribution existed is
+upgraded in place rather than refused. `tests/integration_cdc_retract_by_model.rs` runs the whole
+pipeline and checks the 100%-of-one / 0%-of-any-other property from `scan`, which did not do the
+retracting.
 
 ### Wide values ship as strings, on purpose
 

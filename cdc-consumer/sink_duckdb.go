@@ -65,7 +65,37 @@ type DuckSink struct {
 // bookkeeping names the columns this sink adds to every destination table. They are prefixed so
 // they cannot collide with a source column unless the source deliberately chose a leading
 // underscore, and they are listed here so the catalog reader can tell them from real ones.
-var bookkeeping = map[string]bool{"_commit_lsn": true, "_lsn": true, "_deleted": true}
+var bookkeeping = map[string]bool{"_commit_lsn": true, "_lsn": true, "_deleted": true,
+	// Attribution. Listed here so `catalogSchema` does not report them as columns of the source
+	// table — a missing entry here surfaces as `checkSchemaAgrees` refusing every CREATE_TABLE
+	// after the first, which reads as a schema conflict rather than as a missing name in a map.
+	"_prov_id": true, "_agent": true, "_run": true, "_model": true, "_model_version": true,
+	"_prompt_sha256": true, "_retracted": true}
+
+// duckWriterColumns mirrors `writerColumns` in sink.go with DuckDB's types.
+//
+// Two lists rather than one because the types genuinely differ — DuckDB has a real BOOLEAN and
+// SQLite does not — and `retract`/`scan` read the columns by name through engine-agnostic SQL, so the
+// names are what has to agree. `TestBothSinksLandTheSameWriterColumnNames` pins that they do; without
+// it, a column added to one sink and not the other shows up as a retraction that silently matches
+// nothing against half the destinations.
+// `decl` is used by CREATE TABLE; `bare` and `fill` by the ALTER path, because **DuckDB refuses
+// `ALTER TABLE … ADD COLUMN` with any constraint** — measured, not assumed: it answers `Parser
+// Error: Adding columns with constraints not yet supported`. So an upgraded table gets the bare type
+// and the existing rows are backfilled to what the DEFAULT would have given them, which makes the
+// DATA equivalent. The constraint itself is not retrofitted, and that difference between a fresh
+// table and an upgraded one is stated here rather than discovered later.
+var duckWriterColumns = []struct{ name, decl, bare, fill string }{
+	{"_prov_id", "BIGINT NOT NULL DEFAULT 0", "BIGINT", "0"},
+	{"_agent", "VARCHAR", "VARCHAR", ""},
+	{"_run", "VARCHAR", "VARCHAR", ""},
+	{"_model", "VARCHAR", "VARCHAR", ""},
+	{"_model_version", "VARCHAR", "VARCHAR", ""},
+	{"_prompt_sha256", "VARCHAR", "VARCHAR", ""},
+	// Set by `retract`, never by the feed. Separate from `_deleted` so an operator can tell a row the
+	// SOURCE deleted from one this consumer withdrew.
+	{"_retracted", "BOOLEAN NOT NULL DEFAULT false", "BOOLEAN", "false"},
+}
 
 func openDuckSink(path, key string) (*DuckSink, error) {
 	if key == "" {
@@ -222,10 +252,16 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 	}
 	defs = append(defs, `"_commit_lsn" BIGINT NOT NULL`, `"_lsn" BIGINT NOT NULL DEFAULT 0`,
 		`"_deleted" BOOLEAN NOT NULL DEFAULT false`)
+	for _, w := range duckWriterColumns {
+		defs = append(defs, quoteIdent(w.name)+" "+w.decl)
+	}
 
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
 	if _, err := s.db.Exec(stmt); err != nil {
 		return fmt.Errorf("create %s: %w", table, err)
+	}
+	if err := s.ensureDuckWriterColumns(table); err != nil {
+		return err
 	}
 	// The table may already have existed with a different shape — an older run's inference, say. Ask
 	// the catalog what is actually there rather than assuming the DDL just issued is what took.
@@ -279,6 +315,55 @@ func (s *DuckSink) checkSchemaAgrees(table string, want, wantTypes, got, gotType
 					"a value written through the wrong type reads back looking fine, so this is refused "+
 					"rather than warned about",
 				table, got[i], gotTypes[i], wantTypes[i])
+		}
+	}
+	return nil
+}
+
+// ensureDuckWriterColumns upgrades a destination written before attribution existed.
+//
+// The decision comes from the CATALOG, not from parsing an error string: `IF NOT EXISTS` on ADD
+// COLUMN is not portable and matching on a driver's duplicate-column wording is exactly the kind of
+// guard that stops working when the driver is upgraded. Refusing to open an older destination is not
+// an option either — that would strand the backups the checkpoint design exists to make resumable.
+func (s *DuckSink) ensureDuckWriterColumns(table string) error {
+	present := map[string]bool{}
+	rows, err := s.db.Query(
+		`SELECT column_name FROM duckdb_columns() WHERE table_name = ? AND schema_name = 'main'`, table)
+	if err != nil {
+		return fmt.Errorf("read catalog for %s: %w", table, err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		present[n] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, w := range duckWriterColumns {
+		if present[w.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s",
+			quoteIdent(table), quoteIdent(w.name), w.bare)
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s to %s: %w", w.name, table, err)
+		}
+		if w.fill == "" {
+			continue
+		}
+		// Backfill what the DEFAULT would have given the rows that were already there. Without it,
+		// `_retracted` is NULL on every pre-existing row — and NULL is neither retracted nor not, so
+		// a reader scanning it into a bool fails and a `WHERE _retracted` silently excludes them.
+		fill := fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IS NULL",
+			quoteIdent(table), quoteIdent(w.name), w.fill, quoteIdent(w.name))
+		if _, err := s.db.Exec(fill); err != nil {
+			return fmt.Errorf("backfill %s in %s: %w", w.name, table, err)
 		}
 	}
 	return nil
@@ -400,6 +485,21 @@ func (s *DuckSink) apply(e *Event) error {
 	placeholders = append(placeholders, "?", "?", "?")
 	values = append(values, int64(e.CommitLSN), int64(e.LSN), deleted)
 
+	// The writer, landed with the row — the same contract sink.go documents. A change no run
+	// produced lands NULLs and prov_id 0, the unattributed slot, which `=` never matches.
+	var provID int64
+	var agent, run, model, modelVersion, promptSHA any
+	if e.Writer != nil {
+		provID = int64(e.Writer.ProvID)
+		agent, run = e.Writer.Agent, e.Writer.Run
+		model, modelVersion = e.Writer.Model, e.Writer.ModelVersion
+		promptSHA = e.Writer.PromptSHA256
+	}
+	names = append(names, `"_prov_id"`, `"_agent"`, `"_run"`, `"_model"`, `"_model_version"`,
+		`"_prompt_sha256"`, `"_retracted"`)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?")
+	values = append(values, provID, agent, run, model, modelVersion, promptSHA, false)
+
 	// The ordering guard lives HERE, in the statement, not in Go control flow above it. Every write
 	// path that goes through this function inherits it, and there is no path that does not.
 	sets := make([]string, 0, len(cols)+2)
@@ -416,6 +516,9 @@ func (s *DuckSink) apply(e *Event) error {
 	}
 	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_lsn"=excluded."_lsn"`,
 		`"_deleted"=excluded."_deleted"`)
+	for _, w := range duckWriterColumns {
+		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(w.name), quoteIdent(w.name)))
+	}
 
 	stmt := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)

@@ -177,7 +177,7 @@ func TestRetractTouchesExactlyOneModelVersionsRows(t *testing.T) {
 		}
 	}
 
-	if err := runRetract(dbPath, "inv", "2026-07", quarantine); err != nil {
+	if err := runRetract(dbPath, "inv", "2026-07", quarantine, "sqlite"); err != nil {
 		t.Fatalf("retract: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestRetractTouchesExactlyOneModelVersionsRows(t *testing.T) {
 // to tell a row the SOURCE deleted from one this consumer withdrew.
 func TestRetractInDeleteModeAlsoTombstones(t *testing.T) {
 	dbPath := landFeed(t, mixedFeed(t))
-	if err := runRetract(dbPath, "inv", "2026-07", remove); err != nil {
+	if err := runRetract(dbPath, "inv", "2026-07", remove, "sqlite"); err != nil {
 		t.Fatalf("retract: %v", err)
 	}
 	for _, r := range fullScan(t, dbPath) {
@@ -244,7 +244,7 @@ func TestRetractInDeleteModeAlsoTombstones(t *testing.T) {
 func TestARetractionThatMatchesNothingIsRefused(t *testing.T) {
 	dbPath := landFeed(t, mixedFeed(t))
 
-	err := runRetract(dbPath, "inv", "2026-99", quarantine)
+	err := runRetract(dbPath, "inv", "2026-99", quarantine, "sqlite")
 	if err == nil {
 		t.Fatal("retracting a model version nothing wrote reported success")
 	}
@@ -265,7 +265,7 @@ func TestARetractionThatMatchesNothingIsRefused(t *testing.T) {
 	}
 
 	// Anti-vacuity: a version that IS present is accepted.
-	if err := runRetract(dbPath, "inv", "2026-05", quarantine); err != nil {
+	if err := runRetract(dbPath, "inv", "2026-05", quarantine, "sqlite"); err != nil {
 		t.Fatalf("a present model version was refused: %v", err)
 	}
 }
@@ -274,7 +274,7 @@ func TestARetractionThatMatchesNothingIsRefused(t *testing.T) {
 func TestAnEmptyModelVersionIsRefused(t *testing.T) {
 	dbPath := landFeed(t, mixedFeed(t))
 	for _, v := range []string{"", "   "} {
-		err := runRetract(dbPath, "inv", v, quarantine)
+		err := runRetract(dbPath, "inv", v, quarantine, "sqlite")
 		if err == nil {
 			t.Fatalf("an empty model version (%q) was accepted", v)
 		}
@@ -307,7 +307,7 @@ func TestADestinationWithNoAttributionIsRefusedRatherThanRetractingNothing(t *te
 	}
 	db.Close()
 
-	err = runRetract(dbPath, "inv", "2026-07", quarantine)
+	err = runRetract(dbPath, "inv", "2026-07", quarantine, "sqlite")
 	if err == nil {
 		t.Fatal("a destination with no attribution accepted a retraction")
 	}
@@ -321,7 +321,7 @@ func TestADestinationWithNoAttributionIsRefusedRatherThanRetractingNothing(t *te
 func TestARetractionSurvivesAReplayButNotAFreshWrite(t *testing.T) {
 	feed := mixedFeed(t)
 	dbPath := landFeed(t, feed)
-	if err := runRetract(dbPath, "inv", "2026-07", quarantine); err != nil {
+	if err := runRetract(dbPath, "inv", "2026-07", quarantine, "sqlite"); err != nil {
 		t.Fatalf("retract: %v", err)
 	}
 
@@ -387,12 +387,12 @@ func TestARetractionSurvivesAReplayButNotAFreshWrite(t *testing.T) {
 // check a retraction without trusting the retraction's own count.
 func TestScanReportsEveryRowsWriterAndMark(t *testing.T) {
 	dbPath := landFeed(t, mixedFeed(t))
-	if err := runRetract(dbPath, "inv", "2026-07", quarantine); err != nil {
+	if err := runRetract(dbPath, "inv", "2026-07", quarantine, "sqlite"); err != nil {
 		t.Fatalf("retract: %v", err)
 	}
 	// runScan writes to stdout; the assertion here is that it agrees with an independent scan about
 	// which rows are marked, which is checked through the same SQL path a caller would use.
-	if err := runScan(dbPath, "inv", "id"); err != nil {
+	if err := runScan(dbPath, "inv", "id", "sqlite"); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 	var marked, clear []int64
@@ -529,7 +529,7 @@ func TestScanRefusesAnEmptyTable(t *testing.T) {
 	}
 	sink.Close()
 
-	err = runScan(dbPath, "inv", "id")
+	err = runScan(dbPath, "inv", "id", "sqlite")
 	if err == nil {
 		t.Fatal("a scan of an empty table reported success")
 	}
@@ -539,7 +539,7 @@ func TestScanRefusesAnEmptyTable(t *testing.T) {
 
 	// Anti-vacuity: a table with rows scans fine.
 	ok := landFeed(t, mixedFeed(t))
-	if err := runScan(ok, "inv", "id"); err != nil {
+	if err := runScan(ok, "inv", "id", "sqlite"); err != nil {
 		t.Fatalf("a populated table was refused: %v", err)
 	}
 }
