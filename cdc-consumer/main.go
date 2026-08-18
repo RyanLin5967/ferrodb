@@ -69,6 +69,25 @@ var validOps = map[string]bool{
 // isSchema reports whether an op describes the table's shape rather than a row.
 func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
 
+// bypassesCursor reports ops whose idempotence CANNOT come from the resume cursor.
+//
+// Schema events are re-emitted at every checkpoint by design, so they were always exempt. READ joins
+// them for a sharper reason: a snapshot is ONE logical batch taken at a single LSN, and
+// `replication::snapshot` gives every row of it the same lsn, commit_lsn AND commit_end_lsn. No
+// positional key can order rows that share every position — so the composite (commit_lsn, lsn) key
+// that fixed multi-row COMMITS cannot fix multi-row SNAPSHOTS, and the first row of a backfill was
+// still advancing the cursor past all its siblings.
+//
+// Measured on the shipped binary before this: a 3-row snapshot landed ONE row, printed
+// `APPLIED 2 SKIPPED 2`, and exited 0 — a full-table backfill of any size landed one row.
+//
+// Their idempotence comes from the upsert instead, which is strictly stronger here: a re-delivered
+// snapshot row compares EQUAL on (commit_lsn, lsn) and the ON CONFLICT guard requires strictly greater,
+// so a replay is a no-op; and a snapshot row arriving AFTER a newer stream event for the same key has a
+// lower commit_lsn and is rejected — which is the cutover's whole hazard, since the snapshot boundary
+// is taken before the scan.
+func bypassesCursor(op string) bool { return isSchema(op) || op == "READ" }
+
 // checkEnvelope enforces the invariants the feed documents, independently of the producer.
 func checkEnvelope(e *Event, raw string, n int) error {
 	if e.Table == "" {
@@ -546,7 +565,7 @@ func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64
 		// Compared LEXICOGRAPHICALLY on (commit_lsn, lsn). commit_lsn alone cannot order two rows of
 		// the same commit, and treating them as equal meant discarding all but the first.
 		cc, cl := sink.cursor(e.Table)
-		if !isSchema(e.Op) && (e.CommitLSN < cc || (e.CommitLSN == cc && e.LSN <= cl)) {
+		if !bypassesCursor(e.Op) && (e.CommitLSN < cc || (e.CommitLSN == cc && e.LSN <= cl)) {
 			skipped++
 			continue
 		}
@@ -558,7 +577,7 @@ func applyFeed(sink changeSink, raw string) (applied, skipped int, cursor uint64
 		if e.CommitEndLSN > cursor {
 			cursor = e.CommitEndLSN
 		}
-		if !isSchema(e.Op) {
+		if !bypassesCursor(e.Op) {
 			if serr := sink.saveCursor(e.Table, e.CommitLSN, e.LSN); serr != nil {
 				return applied, skipped, cursor, lastTable, serr
 			}
