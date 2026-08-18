@@ -36,6 +36,7 @@ use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
+use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
 use crate::branch::BranchCatalog;
@@ -1037,6 +1038,50 @@ impl AgentRuntime {
         self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
     }
 
+    // ---- the capability envelope ------------------------------------------------------------
+
+    /// Narrow what `branch` is permitted to write, durably.
+    ///
+    /// **Narrow, not set.** A branch already carrying an envelope cannot be granted authority it
+    /// did not have — [`BranchRecord::restrict`] refuses any widening — because an envelope a
+    /// governed party can widen is a suggestion. A branch with no envelope is ungoverned, so the
+    /// first call installs freely; every child forked afterwards inherits it.
+    ///
+    /// Installing one on [`BranchId::TRUNK`] is how agent sessions become governed, since
+    /// `BEGIN AGENT SESSION` forks out of trunk by default.
+    ///
+    /// **Sessions already open keep the envelope they forked with.** A capability is what its
+    /// holder was handed at creation; changing it underneath a running holder is *revocation*, and
+    /// revocation is a design decision this does not make — it has to say what happens to a
+    /// statement in flight, and whether a branch may be narrowed below what it has already
+    /// written. The lever that does exist for a live agent is
+    /// [`AgentRuntime::quarantine`]: the branch stays readable and its `MERGE` is refused, so
+    /// nothing it wrote can reach the shared tables.
+    /// `installing_an_envelope_does_not_reach_a_session_that_is_already_open` pins both halves.
+    ///
+    /// **Cost.** Every governed statement that writes a row appends a full `BranchRecord` to the
+    /// catalog log and fsyncs it. On the page-backed path `set_root` already does that once per
+    /// row written, so this adds a fraction; on a map-backed runtime with a durable catalog it is
+    /// the only fsync on the path. Nothing compacts `branches.log`, and `LogBranchCatalog::open`
+    /// replays all of it, so a long-lived governed database pays for this at open time too. The
+    /// alternative — charging in memory and flushing on a bound — trades exactly the property the
+    /// field exists for, so it is a decision to make deliberately rather than a tuning knob.
+    pub fn restrict_branch(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        let mut record = self.branches.get(branch)?;
+        record.restrict(envelope)?;
+        self.branches.put(&record)
+    }
+
+    /// What `branch` is currently permitted to write, read from its durable record. `None` means
+    /// no envelope was ever installed, which is ungoverned.
+    pub fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        Ok(self.branches.get(branch)?.envelope)
+    }
+
     /// Stage every row of ONE statement, or none of them.
     ///
     /// # The defect this shape exists to prevent
@@ -1072,6 +1117,47 @@ impl AgentRuntime {
         // straight past the bound and landed the counter at -100 against a floor of 0. A float decrement
         // slipped through the same gap. Comparing before against after catches every op that lowers the
         // value, including ones not yet invented.
+
+        // The session has to exist before the branch record is consulted, so that writing to a
+        // sealed branch still reports "no agent session" rather than "reaped". Same refusal, same
+        // place in the order, just hoisted ahead of the record read.
+        if !self.state.lock().unwrap().workspaces.contains_key(&branch.id) {
+            return Err(FerroError::Branch(format!("no agent session on branch {}", branch)));
+        }
+
+        // **The capability envelope, read from the branch's own DURABLE record.**
+        //
+        // This is the one policy in this runtime that does not live in `Mutex<State>`. Merge
+        // policy, escrow claims and quarantine reasons all do, which means a restart silently
+        // un-governs every running agent — the envelope is in the record precisely so a reopen
+        // finds it still in force.
+        //
+        // It is evaluated on the same before/after images the escrow check below uses, and for
+        // the same reason, spelled out on `CapabilityEnvelope`: an allowlist keyed on the shape of
+        // the op is walked around by any other shape with the same effect. An INSERT is the live
+        // example — its `Op` carries `col: None`, so a column check reading the ops would see it
+        // write no column while it writes every one of them.
+        let charge = match self.branches.envelope_of(branch)? {
+            None => 0,
+            Some(envelope) => {
+                let images: Vec<RowImage> = items
+                    .iter()
+                    .map(|i| RowImage {
+                        row: i.row.0,
+                        before: i.before.as_deref(),
+                        after: match &i.after {
+                            RowState::Present(v) => Some(v.as_slice()),
+                            RowState::Deleted => None,
+                        },
+                    })
+                    .collect();
+                // The whole statement, before a single row is recorded — the same batch rule the
+                // escrow check follows just below, and for the same reason. Nothing is charged
+                // here: `admit` only answers how much this statement would cost.
+                envelope.admit(tbl.0, table, &images)?
+            }
+        };
+
         let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
         {
             let state = self.state.lock().unwrap();
@@ -1096,6 +1182,24 @@ impl AgentRuntime {
             // The whole statement, before a single unit is charged. This is the line that makes the
             // refusal atomic.
             state.escrow.check_all(branch, &spends)?;
+        }
+
+        // **Every refusal has now been decided, so the budget can be charged.**
+        //
+        // The order is load-bearing and was wrong once: charging before `check_all` meant an
+        // escrow-refused statement permanently spent envelope budget on rows it never wrote, and
+        // since the escrow error tells the client to claim more and retry, an ordinary retry loop
+        // burned the whole envelope budget on statements that wrote nothing.
+        //
+        // `charge_row_writes` is atomic against every other mutation of the record and re-checks
+        // the budget under the catalog's own lock, so it is the charge — not `admit` above — that
+        // decides. The window it leaves is an I/O failure further down (appending the frame,
+        // mirroring to pages) with the budget already spent. That direction is deliberate:
+        // charging afterwards would mean a failed record write leaves a row written and
+        // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
+        // admits one.
+        if charge > 0 {
+            self.branches.charge_row_writes(branch, charge)?;
         }
 
         // ---- apply --------------------------------------------------------------------------
