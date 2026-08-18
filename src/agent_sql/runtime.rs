@@ -177,6 +177,19 @@ struct MergeRecord {
     txns: Vec<TxnId>,
 }
 
+/// One row's worth of a staged change, so a whole statement can be checked before any of it lands.
+///
+/// Exists so `stage_all` can take a statement rather than a row: the refusal has to be decided for every
+/// row before any row is recorded, and that is not expressible while the arguments are loose parameters.
+struct Staged {
+    row: RowId,
+    before: Option<Vec<Value>>,
+    after: RowState,
+    ops: Vec<Op>,
+    guard: Option<Guard>,
+}
+
+
 #[derive(Default)]
 struct State {
     workspaces: BTreeMap<u64, Workspace>,
@@ -870,7 +883,7 @@ impl AgentRuntime {
         };
 
         let rows = self.visible_rows(ctx, Some(branch), table)?;
-        let mut touched = 0usize;
+        let mut staged: Vec<Staged> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
@@ -892,9 +905,18 @@ impl AgentRuntime {
                 Some(w) => Some(guard_from_expr(w, tbl, rid, &schema)?),
                 None => None,
             };
-            self.stage(branch, tbl, table, rid, Some(row), RowState::Present(new_row), ops, guard)?;
-            touched += 1;
+            // Collected, not staged: every row of this statement is decided before any of it is
+            // recorded. Staging inside the loop is what let a refusal on row 2 leave row 1 rewritten.
+            staged.push(Staged {
+                row: rid,
+                before: Some(row),
+                after: RowState::Present(new_row),
+                ops,
+                guard,
+            });
         }
+        let touched = staged.len();
+        self.stage_all(branch, tbl, table, staged)?;
         Ok(touched)
     }
 
@@ -967,7 +989,7 @@ impl AgentRuntime {
             None => None,
         };
         let rows = self.visible_rows(ctx, Some(branch), table)?;
-        let mut n = 0;
+        let mut staged: Vec<Staged> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
@@ -979,13 +1001,24 @@ impl AgentRuntime {
                 None => None,
             };
             let op = Op::new(tbl, rid, None, OpKind::RowDelete);
-            self.stage(branch, tbl, table, rid, Some(row), RowState::Deleted, vec![op], guard)?;
-            n += 1;
+            staged.push(Staged {
+                row: rid,
+                before: Some(row),
+                after: RowState::Deleted,
+                ops: vec![op],
+                guard,
+            });
         }
+        let n = staged.len();
+        self.stage_all(branch, tbl, table, staged)?;
         Ok(n)
     }
 
     /// Put one row change into the branch's buffer and append its ops and guard to the frame.
+    ///
+    /// A thin wrapper over [`AgentRuntime::stage_all`] so that single-row callers and multi-row callers
+    /// go through exactly one refusal path. Two paths is how the multi-row case ended up with weaker
+    /// atomicity than the single-row case for months.
     fn stage(
         &self,
         branch: BranchId,
@@ -997,63 +1030,105 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        // Write-time escrow. This runs BEFORE anything is recorded, so a refused overdraw leaves
-        // no trace in the workspace, the frame or the log — the statement simply fails, which is
-        // the entire point of moving the check off the merge path. A decrement of `n` on a bounded
-        // cell spends `n` of this branch's reservation.
+        self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
+    }
+
+    /// Stage every row of ONE statement, or none of them.
+    ///
+    /// # The defect this shape exists to prevent
+    ///
+    /// `stage` used to charge escrow and record the row in the same pass, and `branch_update` called it
+    /// per row with `?`. So a two-row `UPDATE` refused on its second row returned an error to the client
+    /// with the FIRST row already written into the workspace, the frame and the log — and with the first
+    /// row's escrow units already spent, so the caller's natural retry ("take less") was refused too,
+    /// against a claim drained by a write that never landed. Measured before this change:
+    /// `[(1, 20), (2, 20)]` became `[(1, 8), (2, 20)]` on a statement that returned an error.
+    ///
+    /// The comment that used to sit here said a refused over-draw "leaves no trace in the workspace, the
+    /// frame or the log". That was true of one row and false of one statement, which is the more useful
+    /// granularity: a client sees statements, not rows.
+    ///
+    /// # Decide, then apply
+    ///
+    /// Every spend across every row is computed and checked as a batch first, under one lock, and only
+    /// then is anything charged or recorded. Summing per cell matters: one statement can lower the same
+    /// cell twice, and checking each half against the full remaining balance would admit a batch that
+    /// overdraws in aggregate.
+    fn stage_all(
+        &self,
+        branch: BranchId,
+        tbl: TableId,
+        table: &str,
+        items: Vec<Staged>,
+    ) -> Result<(), FerroError> {
+        // ---- decide -------------------------------------------------------------------------
         //
-        // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying
-        // off `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so
-        // it walked straight past the bound and landed the counter at -100 against a floor of 0.
-        // A float decrement slipped through the same gap. Comparing before against after catches
-        // every op that lowers the value, including ones not yet invented.
-        if let (Some(before_row), RowState::Present(after_row)) = (&before, &after) {
-            let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
-            {
-                let state = self.state.lock().unwrap();
-                for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
-                    let cell = (tbl, row, ColId(idx as u32));
-                    if !state.escrow.is_bounded(&cell) {
-                        continue;
-                    }
-                    if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
-                        // Only a decrease consumes headroom; raising the value gives it back and
-                        // is always safe, so it is not charged.
-                        let drop = b - a;
-                        if drop > 0 {
-                            spends.push((cell, drop));
+        // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying off
+        // `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so it walked
+        // straight past the bound and landed the counter at -100 against a floor of 0. A float decrement
+        // slipped through the same gap. Comparing before against after catches every op that lowers the
+        // value, including ones not yet invented.
+        let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
+        {
+            let state = self.state.lock().unwrap();
+            for item in &items {
+                if let (Some(before_row), RowState::Present(after_row)) = (&item.before, &item.after) {
+                    for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
+                        let cell = (tbl, item.row, ColId(idx as u32));
+                        if !state.escrow.is_bounded(&cell) {
+                            continue;
+                        }
+                        if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
+                            // Only a decrease consumes headroom; raising the value gives it back and
+                            // is always safe, so it is not charged.
+                            let drop = b - a;
+                            if drop > 0 {
+                                spends.push((cell, drop));
+                            }
                         }
                     }
                 }
             }
-            for (cell, amount) in spends {
-                self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
-            }
+            // The whole statement, before a single unit is charged. This is the line that makes the
+            // refusal atomic.
+            state.escrow.check_all(branch, &spends)?;
         }
 
-        let mirrored = after.clone();
+        // ---- apply --------------------------------------------------------------------------
+        //
+        // Past this point nothing may fail on a per-row basis: `check_all` has already established that
+        // every spend fits, so `spend` cannot refuse.
+        for (cell, amount) in spends {
+            self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
+        }
+
+        let mut mirrored: Vec<(RowId, RowState)> = Vec::with_capacity(items.len());
         let frame = {
             let mut state = self.state.lock().unwrap();
             let ws = state.workspaces.get_mut(&branch.id).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {}", branch))
             })?;
-            let key = Workspace::key(tbl, row);
-            ws.base_rows.entry(key).or_insert(before);
             ws.tables.insert(tbl.0, table.to_string());
-            ws.rows.insert(key, after);
-            for op in ops {
-                ws.frame.push_op(op);
-            }
-            if let Some(g) = guard {
-                ws.frame.push_guard(g);
+            for item in items {
+                let key = Workspace::key(tbl, item.row);
+                ws.base_rows.entry(key).or_insert(item.before);
+                ws.rows.insert(key, item.after.clone());
+                for op in item.ops {
+                    ws.frame.push_op(op);
+                }
+                if let Some(g) = item.guard {
+                    ws.frame.push_guard(g);
+                }
+                mirrored.push((item.row, item.after));
             }
             ws.frame.clone()
         };
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
-        // not idempotent and two copies of one frame would double-count.
+        // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
+        // statement, which is also why the frame is cloned after every row is folded in.
         self.log.append(&frame)?;
 
-        // Mirror the staged row onto the branch's OWN copy-on-write tree, when this runtime has a
+        // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
         // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
         // step that makes the branch's state exist as pages, so the isolation between branches is
         // a property of the page graph rather than of a map that happens not to be shared.
@@ -1070,9 +1145,11 @@ impl AgentRuntime {
                 "the caller's TableId disagrees with the table name it passed, so the tree and the \
                  workspace map would key the same row differently"
             );
-            match mirrored {
-                RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
-                RowState::Deleted => self.delete_row(branch, table, row.0)?,
+            for (row, state) in mirrored {
+                match state {
+                    RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
+                    RowState::Deleted => self.delete_row(branch, table, row.0)?,
+                }
             }
         }
         Ok(())
