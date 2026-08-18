@@ -44,7 +44,7 @@ use ferrodb::storage::sim::{
     Durability, FaultKind, FaultPlan, OpKind, SimFabric, TraceOp, WriteShape,
 };
 use ferrodb::storage::tuple::Tuple;
-use ferrodb::wal::log::{RecKind, WalManager};
+use ferrodb::wal::log::{crc32, RecKind, WalManager};
 use ferrodb::wal::recovery::{rebuild_indexes, recover};
 use ferrodb::wal::txn::TxnManager;
 
@@ -1420,4 +1420,80 @@ fn a_garbled_wal_header_takes_the_database_down_with_its_data_intact() {
         fired.kept,
         ROWS + ROWS2
     );
+}
+
+/// **`recover` repairs missing pages in ascending page id, and the trace proves it byte for byte.**
+///
+/// Breaking shape: a crash that leaves several pages named by the log missing from the file. `recover`
+/// walks its `touched` set — a `HashSet` — and writes an empty page for each one it cannot read, so
+/// the repair order used to be a function of a per-process hash seed.
+///
+/// This asserts the order **directly** rather than by comparing runs, and the mechanism is worth
+/// noting: the repair loop writes exactly `Page::empty(page_id).serialize()`, so each repair write can
+/// be picked out of the trace by its content digest and matched to the page it was meant for. No
+/// probability is involved — comparing two runs only catches a hash-order bug when the hash order
+/// happens to differ, and that is how the reverted `losers` sort survived five runs out of five.
+#[test]
+fn recovery_repairs_missing_pages_in_ascending_page_id_order() {
+    // What an empty page for each id looks like on the wire, so a repair write is identifiable.
+    const MAX_PAGE: u32 = 512;
+    let empty_page_crc: BTreeMap<u32, u32> = (0..MAX_PAGE)
+        .map(|pid| {
+            (
+                crc32(&Page::empty(pid).serialize().expect("serialize an empty page")),
+                pid,
+            )
+        })
+        .collect();
+
+    // `SyncOnly` leaves the most for recovery to rebuild: page writes sit in a volatile cache, so a
+    // crash before the checkpoint's fsync means the pages the log describes are simply not there.
+    let census = fabric(None, Durability::SyncOnly);
+    workload(&census).expect("census");
+
+    let mut best: Option<(usize, Vec<u64>)> = None;
+    for &n in census.faultable_ops().iter() {
+        let live = fabric(Some(FaultPlan::at(n, 0x0B10_5EED)), Durability::SyncOnly);
+        let _ = workload(&live);
+        let rebooted = live.restart();
+        let Ok(db) = open(&rebooted) else { continue };
+        let before = rebooted.op_count();
+        if recover(&db.txn).is_err() {
+            continue;
+        }
+        let repairs: Vec<u64> = rebooted
+            .trace()
+            .into_iter()
+            .filter(|t| {
+                t.index >= before
+                    && t.file == DB
+                    && t.kind == OpKind::Pwrite
+                    && empty_page_crc.contains_key(&t.data_crc)
+            })
+            .map(|t| t.offset)
+            .collect();
+        if best.as_ref().is_none_or(|(c, _)| repairs.len() > *c) {
+            best = Some((repairs.len(), repairs));
+        }
+    }
+    let (count, offsets) = best.expect("no crash point produced a recoverable image at all");
+    assert!(
+        count >= 3,
+        "the best crash point left recovery only {count} page(s) to rebuild; with fewer than two \
+         there is no repair order to get wrong and this assertion would be vacuous"
+    );
+    for w in offsets.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "recovery rebuilt the page at offset {} after the one at {}, so the repair order is not \
+             ascending: {offsets:?}",
+            w[1],
+            w[0]
+        );
+    }
+    // Sanity: each repair write really did land at its own page's offset.
+    for o in &offsets {
+        assert_eq!(o % PAGE_SIZE as u64, 0, "a page repair at a non-page offset {o}");
+    }
+    println!("recovery rebuilt {count} pages, in ascending page id: {offsets:?}");
 }
