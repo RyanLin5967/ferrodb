@@ -72,7 +72,7 @@ use crate::catalog::column::{Column, DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
 use crate::storage::tuple::Tuple;
-use crate::wal::log::{DdlOp, RecKind, WalManager};
+use crate::wal::log::{ColumnAlteration, DdlOp, RecKind, WalManager};
 
 /// What happened to one row.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +110,9 @@ impl ChangeOp {
             ChangeOp::Schema { change, .. } => match change {
                 SchemaChange::CreateTable => "CREATE_TABLE",
                 SchemaChange::DropTable => "DROP_TABLE",
+                SchemaChange::AddColumn { .. } => "ADD_COLUMN",
+                SchemaChange::RenameColumn { .. } => "RENAME_COLUMN",
+                SchemaChange::RetypeColumn { .. } => "ALTER_COLUMN_TYPE",
             },
             ChangeOp::Insert { .. } => "INSERT",
             ChangeOp::Update { .. } => "UPDATE",
@@ -119,10 +122,46 @@ impl ChangeOp {
 }
 
 /// Which schema change a `Schema` event describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # Why the three column-level ones are separate ops rather than one `ALTER_TABLE` — B11
+///
+/// Every `Schema` event carries the table's full shape after the change, so a consumer *could*
+/// reconcile positionally from `columns` alone and never look at which change it was. It must not,
+/// and this is the reason the alteration is named rather than left to be inferred: from the shape
+/// alone, `RENAME COLUMN qty TO quantity` is indistinguishable from dropping `qty` and adding
+/// `quantity`. A sink that reconciles by diffing shapes applies the second reading and the
+/// column's data is gone. The change has to say which it was.
+///
+/// Given that it must be named, it is named in `op` rather than buried in the payload, because
+/// `op` is what the format tells a consumer to branch on and what the independent validator keys
+/// its rules off: an `ADD_COLUMN` must name a column that IS in the new shape, a `RENAME_COLUMN`
+/// must name one that is not and one that is, and those are different checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChange {
     CreateTable,
     DropTable,
+    /// A column appended at the end of the table. Its type and nullability are in the event's
+    /// `columns`, which is the full new shape.
+    AddColumn { column: String },
+    /// A column renamed. `to` is in the new shape; `from` is not, which is the whole point.
+    RenameColumn { from: String, to: String },
+    /// A column's type changed. Both spellings are given, in the feed's own type vocabulary
+    /// ([`sql_type_of`]), so a consumer can decide whether its destination needs a conversion
+    /// without having to remember what the column used to be.
+    RetypeColumn { column: String, from: String, to: String },
+}
+
+impl SchemaChange {
+    /// True for the two whole-table changes, false for the column-level ones.
+    ///
+    /// The distinction a consumer needs is not "is this about shape" — all five are — but
+    /// **"is this a declaration or is it news"**. `CREATE_TABLE` is re-emitted at every checkpoint
+    /// and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
+    /// set. The column-level three are delivered exactly once, in log order, at the position the
+    /// DDL occupied, and a consumer that re-applies one has renamed a column twice.
+    pub fn is_declaration(&self) -> bool {
+        matches!(self, SchemaChange::CreateTable | SchemaChange::DropTable)
+    }
 }
 
 /// One column, as the feed describes it to a consumer that must recreate the table.
@@ -165,15 +204,12 @@ pub struct ColumnSpec {
 /// one definition a test can enumerate, and so that adding a `DataType` variant fails to compile
 /// here instead of silently acquiring a spelling somewhere downstream.
 pub fn sql_type_of(ty: &DataType) -> String {
-    match ty {
-        DataType::Integer => "INTEGER".to_string(),
-        DataType::Float => "FLOAT".to_string(),
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Varchar(n) => format!("VARCHAR({n})"),
-        DataType::BigInt => "BIGINT".to_string(),
-        DataType::Decimal => "DECIMAL".to_string(),
-        DataType::Timestamp => "TIMESTAMP".to_string(),
-    }
+    // Delegated to `Display for DataType` rather than matched a second time here. B11 needed the
+    // same spellings in `tel::schema_merge` (a schema conflict hands the agent back a predicate
+    // reading `typeof(inventory.qty) = INTEGER`) and in `catalog::alter`'s refusals, and three
+    // matches over `DataType` is three chances for the feed and the error message to disagree
+    // about what a type is called. `sql_type_contract_is_exhaustive` still pins the mapping.
+    ty.to_string()
 }
 
 /// One row-level change, attributed to the transaction that committed it.
@@ -476,24 +512,31 @@ impl LogicalDecoder {
                         })
                         .collect();
 
+                    // Both `CreateTable` and `AlterColumn` carry the table's FULL shape after the
+                    // change, so both re-establish the decoder's mapping the same way. That is
+                    // what lets records on either side of an ALTER decode against the shape that
+                    // was actually in force where they sit: the tuple bytes below an
+                    // `ADD COLUMN` were written with one fewer column and would not deserialize
+                    // against the new schema at all.
+                    let adopt_shape = |tables: &mut HashMap<u32, (String, Schema, Arc<Vec<String>>)>| {
+                        let schema = Schema::new(
+                            columns
+                                .iter()
+                                .map(|(name, ty, nullable)| Column {
+                                    name: name.clone(),
+                                    data_type: ty.clone(),
+                                    nullable: *nullable,
+                                })
+                                .collect(),
+                        );
+                        let names: Vec<String> =
+                            columns.iter().map(|(n, _, _)| n.clone()).collect();
+                        tables.insert(*dir_root, (table.clone(), schema, Arc::new(names)));
+                    };
+
                     let change = match op {
                         DdlOp::CreateTable => {
-                            let schema = Schema::new(
-                                columns
-                                    .iter()
-                                    .map(|(name, ty, nullable)| Column {
-                                        name: name.clone(),
-                                        data_type: ty.clone(),
-                                        nullable: *nullable,
-                                    })
-                                    .collect(),
-                            );
-                            let names: Vec<String> =
-                                columns.iter().map(|(n, _, _)| n.clone()).collect();
-                            tables.insert(
-                                *dir_root,
-                                (table.clone(), schema, Arc::new(names)),
-                            );
+                            adopt_shape(&mut tables);
                             time_travel.insert(*time_travel_root);
                             SchemaChange::CreateTable
                         }
@@ -501,8 +544,46 @@ impl LogicalDecoder {
                             tables.remove(dir_root);
                             SchemaChange::DropTable
                         }
+                        DdlOp::AlterColumn(alt) => {
+                            // The alteration names a column; the new shape must contain it. A
+                            // record where it does not is malformed, and guessing which column was
+                            // meant would produce a feed that is confidently incorrect — the exact
+                            // failure this module's header is about. Refuse instead.
+                            let subject = alt.column();
+                            let new_type = columns
+                                .iter()
+                                .find(|(n, _, _)| n == subject)
+                                .map(|(_, ty, _)| sql_type_of(ty))
+                                .ok_or_else(|| {
+                                    FerroError::Wal(format!(
+                                        "ddl record alters column '{subject}' of '{table}' but the \
+                                         shape it carries has no such column: {:?}",
+                                        columns.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+                                    ))
+                                })?;
+                            adopt_shape(&mut tables);
+                            time_travel.insert(*time_travel_root);
+                            match alt {
+                                ColumnAlteration::Add { column } => {
+                                    SchemaChange::AddColumn { column: column.clone() }
+                                }
+                                ColumnAlteration::Rename { from, to } => {
+                                    SchemaChange::RenameColumn {
+                                        from: from.clone(),
+                                        to: to.clone(),
+                                    }
+                                }
+                                ColumnAlteration::Retype { column, from } => {
+                                    SchemaChange::RetypeColumn {
+                                        column: column.clone(),
+                                        from: sql_type_of(from),
+                                        to: new_type,
+                                    }
+                                }
+                            }
+                        }
                     };
-                    out.schema_changes.push((lsn, table.clone(), change));
+                    out.schema_changes.push((lsn, table.clone(), change.clone()));
 
                     // Emitted immediately rather than staged: DDL is refused inside a transaction
                     // (`executor.rs`, "DDL not allowed in txn"), so there is no commit to wait for

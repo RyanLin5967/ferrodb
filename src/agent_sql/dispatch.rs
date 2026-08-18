@@ -77,6 +77,33 @@ pub fn is_agent_stmt(stmt: &Stmt) -> bool {
     }
 }
 
+/// `ALTER TABLE` inside an open agent session — B11.
+///
+/// Recorded on the branch as a **pending** schema edit rather than applied to the shared catalog.
+/// Applying it immediately would be the one thing an agent session exists to prevent: a branch's
+/// writes are invisible to main and its siblings until `MERGE`, and a schema is the most visible
+/// write there is — every other connection would see the column appear the moment one agent typed
+/// the statement, and abandoning that agent's branch would not take it away.
+///
+/// The edit is published at `MERGE`, after the schema merge has decided that it composes with
+/// whatever the target's shape has become in the meantime.
+pub fn run_agent_alter(
+    table: String,
+    action: crate::parser::parser::AlterAction,
+    catalog: &mut Catalog,
+    _txn: Arc<TxnManager>,
+    session: &mut Session,
+) -> Result<Outcome, FerroError> {
+    let branch = session
+        .agent
+        .as_ref()
+        .map(|a| a.branch)
+        .ok_or_else(|| FerroError::Txn("no agent session is open".into()))?;
+    let runtime = session.runtime.clone();
+    runtime.stage_schema_edit(catalog, branch, &table, &action)?;
+    Ok(Outcome::Agent(AgentOutput::Affected(0)))
+}
+
 /// Bind and run one agent statement.
 pub fn run_agent_stmt(
     stmt: Stmt,

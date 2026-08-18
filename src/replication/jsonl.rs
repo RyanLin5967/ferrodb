@@ -198,7 +198,13 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
         ChangeOp::Schema { change: SchemaChange::DropTable, .. } => out.push_str("null"),
         // A schema event's payload is the table's shape, not a row. Keyed under `columns` so a
         // consumer never confuses it with data.
-        ChangeOp::Schema { columns, .. } => {
+        //
+        // **B11 — a column-level change adds `alter` alongside `columns`, and never replaces it.**
+        // The full shape stays, because a sink reconciles its destination positionally against it
+        // exactly as it does for a `CREATE_TABLE`; `alter` says which change produced that shape,
+        // because a rename and a drop-plus-add produce the same shape and only one of them keeps
+        // the column's data. Both halves, or a consumer has to guess one of them.
+        ChangeOp::Schema { change, columns } => {
             out.push_str("{\"columns\":[");
             for (i, c) in columns.iter().enumerate() {
                 if i > 0 {
@@ -212,7 +218,34 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
                 out.push_str(if c.nullable { "true" } else { "false" });
                 out.push('}');
             }
-            out.push_str("]}");
+            out.push(']');
+            match change {
+                // A declaration has no alteration to describe: nothing changed one column, the
+                // whole shape is being (re-)stated.
+                SchemaChange::CreateTable | SchemaChange::DropTable => {}
+                SchemaChange::AddColumn { column } => {
+                    out.push_str(",\"alter\":{\"column\":");
+                    escape_json_into(column, &mut out);
+                    out.push('}');
+                }
+                SchemaChange::RenameColumn { from, to } => {
+                    out.push_str(",\"alter\":{\"from\":");
+                    escape_json_into(from, &mut out);
+                    out.push_str(",\"to\":");
+                    escape_json_into(to, &mut out);
+                    out.push('}');
+                }
+                SchemaChange::RetypeColumn { column, from, to } => {
+                    out.push_str(",\"alter\":{\"column\":");
+                    escape_json_into(column, &mut out);
+                    out.push_str(",\"from\":");
+                    escape_json_into(from, &mut out);
+                    out.push_str(",\"to\":");
+                    escape_json_into(to, &mut out);
+                    out.push('}');
+                }
+            }
+            out.push('}');
         }
         ChangeOp::Read { row } => row_into(&e.columns, row, &mut out),
         ChangeOp::Insert { new } | ChangeOp::Update { new, .. } => {
@@ -604,5 +637,89 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "one object per line: {text}");
         assert!(text.ends_with('\n'), "the last line must be terminated too");
         assert!(text.contains("\"qty\":null"), "a NULL did not survive: {text}");
+    }
+
+    // ---- B11: column-level schema events -------------------------------------------------------
+
+    use crate::replication::logical::ColumnSpec;
+
+    fn shape() -> Vec<ColumnSpec> {
+        vec![
+            ColumnSpec { name: "id".into(), sql_type: "INTEGER".into(), nullable: false },
+            ColumnSpec { name: "note".into(), sql_type: "VARCHAR(20)".into(), nullable: true },
+        ]
+    }
+
+    /// **Breaking shape: a column-level event that carries the new shape and nothing else.**
+    ///
+    /// A rename and a drop-plus-add produce the same `columns` list. A consumer reconciling from
+    /// the shape alone applies the second reading and the column's data is gone, so the line has
+    /// to carry `alter` as well — and it has to carry `columns` too, because the sinks reconcile
+    /// their destination positionally against it. Both halves.
+    #[test]
+    fn a_rename_line_carries_the_old_name_the_new_shape_cannot() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::RenameColumn { from: "memo".into(), to: "note".into() },
+            columns: shape(),
+        }));
+        assert!(line.contains(r#""op":"RENAME_COLUMN""#), "{line}");
+        assert!(line.contains(r#""before":null"#), "{line}");
+        assert!(line.contains(r#""alter":{"from":"memo","to":"note"}"#), "{line}");
+        assert!(line.contains(r#""name":"note""#), "the new shape is missing: {line}");
+    }
+
+    #[test]
+    fn an_add_column_line_names_the_added_column_and_the_new_shape() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::AddColumn { column: "note".into() },
+            columns: shape(),
+        }));
+        assert!(line.contains(r#""op":"ADD_COLUMN""#), "{line}");
+        assert!(line.contains(r#""alter":{"column":"note"}"#), "{line}");
+        assert!(line.contains(r#"{"name":"note","type":"VARCHAR(20)","nullable":true}"#), "{line}");
+    }
+
+    /// A retype gives both spellings. A destination that stores INTEGER as one thing and BIGINT as
+    /// another needs to know what it is converting *from*, and the new shape cannot say.
+    #[test]
+    fn a_retype_line_gives_both_type_spellings() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::RetypeColumn {
+                column: "qty".into(),
+                from: "INTEGER".into(),
+                to: "BIGINT".into(),
+            },
+            columns: vec![ColumnSpec {
+                name: "qty".into(),
+                sql_type: "BIGINT".into(),
+                nullable: true,
+            }],
+        }));
+        assert!(line.contains(r#""op":"ALTER_COLUMN_TYPE""#), "{line}");
+        assert!(
+            line.contains(r#""alter":{"column":"qty","from":"INTEGER","to":"BIGINT"}"#),
+            "{line}"
+        );
+    }
+
+    /// **Anti-vacuity for `alter`: the two declarations must NOT grow one.** E69's lesson was that
+    /// a producer and an independent validator disagreeing about one key fails the first real
+    /// event. `CREATE_TABLE` describes no single column, and a consumer told otherwise would look
+    /// for a change that did not happen.
+    #[test]
+    fn a_declaration_carries_no_alteration() {
+        let create = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::CreateTable,
+            columns: shape(),
+        }));
+        assert!(create.contains(r#""op":"CREATE_TABLE""#), "{create}");
+        assert!(!create.contains("alter"), "a CREATE_TABLE grew an alteration: {create}");
+
+        // And a DROP still carries no shape at all — the E69 rule, unchanged by any of this.
+        let drop = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::DropTable,
+            columns: Vec::new(),
+        }));
+        assert!(drop.contains(r#""after":null"#), "a DROP_TABLE grew an after image: {drop}");
     }
 }

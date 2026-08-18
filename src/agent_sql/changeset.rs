@@ -16,6 +16,7 @@ use crate::tel::guard::Guard;
 use crate::tel::ids::{RowId, TableId};
 use crate::tel::merge::{ConflictReport, DiscardedWrite, MergeOutcome};
 use crate::tel::op::Op;
+use crate::tel::schema_merge::{SchemaEdit, SchemaMergeOutcome};
 
 /// What happened to a row on a branch, at row granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +141,22 @@ impl RowMergeOutcome {
     }
 }
 
+/// How one table's **shape** merged — B11.
+///
+/// Separate from `RowMergeOutcome` because a schema change is not about a row, and folding it in
+/// would mean minting a `RowId` for something that has none. The conflicts it produces are the
+/// same `ConflictReport` type, carrying the same violated predicate, and they reach the merge's
+/// top-level outcome through [`MergeReport::aggregate`] like every other conflict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaMergeReport {
+    pub table: String,
+    pub outcome: SchemaMergeOutcome,
+    /// The edits still to execute against the target. Excludes any it already satisfied.
+    pub to_apply: Vec<SchemaEdit>,
+    /// Column names after the merge, so a caller can see the shape without re-reading the catalog.
+    pub shape: Vec<String>,
+}
+
 /// The answer to `MERGE`. Exit criterion 5.
 ///
 /// `outcome` is the aggregate over `rows`, and it is deliberately pessimistic in one direction:
@@ -158,6 +175,8 @@ pub struct MergeReport {
     /// exist yet, so this tier reports and does not decide. A non-empty list is a signal for a
     /// human or a later tier, never on its own a reason the merge did not apply.
     pub blind_writes: Vec<(TableId, RowId)>,
+    /// How each touched table's shape merged — B11. Empty on a merge where no shape moved.
+    pub schema: Vec<SchemaMergeReport>,
     /// True when the merge was published to the target. False means the merge was rejected and
     /// the target was left **untouched** — which is the only honest report for a conflict, since
     /// a half-applied merge is exactly what a merge exists to prevent.
@@ -165,13 +184,23 @@ pub struct MergeReport {
 }
 
 impl MergeReport {
-    /// Aggregate the per-row outcomes. Order matters: a conflict beats a loss beats a
-    /// composition beats clean.
-    pub fn aggregate(rows: &[RowMergeOutcome]) -> MergeOutcome {
+    /// Aggregate the per-row and per-table outcomes. Order matters: a conflict beats a loss beats
+    /// a composition beats clean.
+    ///
+    /// **The schema half, and why `Commuting` can carry an empty op list.** A shape that composed
+    /// is a composition, and reporting it as `Clean` would tell an agent that main was untouched
+    /// when a column was added to it. But `MergeOutcome::Commuting` carries `Vec<Op>`, and a
+    /// schema edit is deliberately not an `Op` — `Op` is keyed by `ColId`, a schema *ordinal*,
+    /// which is the very thing an alteration moves. So a merge whose only composition was a shape
+    /// reports `Commuting` with no ops, and the composition itself is in
+    /// [`MergeReport::schema`]. `MergeOutcome::name()` — which is what every caller renders — says
+    /// "Commuting" either way.
+    pub fn aggregate(rows: &[RowMergeOutcome], schema: &[SchemaMergeReport]) -> MergeOutcome {
         let mut conflicts: Vec<ConflictReport> = Vec::new();
         let mut discarded: Vec<DiscardedWrite> = Vec::new();
         let mut applied: Vec<Op> = Vec::new();
         let mut composed: Vec<Op> = Vec::new();
+        let mut schema_composed = false;
         for r in rows {
             conflicts.extend(r.conflicts.iter().cloned());
             discarded.extend(r.discarded.iter().cloned());
@@ -180,13 +209,19 @@ impl MergeReport {
                 composed.extend(c.iter().cloned());
             }
         }
+        for s in schema {
+            conflicts.extend(s.outcome.conflicts().iter().cloned());
+            if matches!(s.outcome, SchemaMergeOutcome::Commuting { .. }) {
+                schema_composed = true;
+            }
+        }
         if !conflicts.is_empty() {
             return MergeOutcome::Conflict(conflicts);
         }
         if !discarded.is_empty() {
             return MergeOutcome::ResolvedWithLoss { applied, discarded };
         }
-        if !composed.is_empty() {
+        if !composed.is_empty() || schema_composed {
             return MergeOutcome::Commuting { composed };
         }
         MergeOutcome::Clean
@@ -209,6 +244,12 @@ impl Display for MergeReport {
             self.outcome.name(),
             if self.applied_to_target { "" } else { " (target unchanged)" }
         )?;
+        for s in &self.schema {
+            write!(f, "\n  schema {}: {} [{}]", s.table, s.outcome.name(), s.shape.join(", "))?;
+            for c in s.outcome.conflicts() {
+                write!(f, "\n    conflict {:?}: {}", c.kind, c.feedback())?;
+            }
+        }
         for r in &self.rows {
             write!(f, "\n  {}.{}: {}", r.table, r.row, r.outcome.name())?;
             for c in &r.conflicts {
@@ -258,7 +299,7 @@ mod tests {
                 policy: MergePolicy::Lww,
                 reason: "older writer".into(),
             }], vec![]),
-        ]);
+        ], &[]);
         assert!(agg.lost_a_write());
         assert_ne!(agg.name(), "Clean");
     }
@@ -291,13 +332,13 @@ mod tests {
                 RowId(1),
                 Some(ColId(2)),
             )]),
-        ]);
+        ], &[]);
         assert!(agg.is_conflict());
         assert!(agg.conflicts()[0].feedback().contains("qty >= 0"));
     }
 
     #[test]
     fn an_empty_merge_is_clean() {
-        assert_eq!(MergeReport::aggregate(&[]), MergeOutcome::Clean);
+        assert_eq!(MergeReport::aggregate(&[], &[]), MergeOutcome::Clean);
     }
 }
