@@ -725,14 +725,33 @@ impl AgentRuntime {
     /// contain. `Catalog::drop_table` already purges `stats` for the same reason (E69 fixed exactly
     /// that omission); this is the same omission one layer over.
     ///
-    /// Purging `versions` too is not incidental: it is what the read-premise check compares against
-    /// (`merge`), so a stale version stamp under a recycled name would report a moved premise for a
-    /// row the branch never read in the table that now holds that name.
+    /// # `versions` is deliberately NOT purged, and the first version of this function purged it
     ///
-    /// **What this deliberately does NOT purge**, stated rather than left to be discovered: the
-    /// escrow ledger, the dependency graph and the applied-op log. None is exposed by the
-    /// observability views, and each is keyed by something other than the table alone — undoing them
-    /// on a drop is a separate decision about `REVERT`'s reach, not a presentation fix.
+    /// It looked symmetrical: `versions` is keyed the same way, so a stale stamp under a recycled name
+    /// could report a moved premise for a row the branch never read. Purging it **disarmed B1's
+    /// read-premise gate**, and the test
+    /// `integration_system_views::dropping_a_table_does_not_silence_the_read_premise_gate` exists
+    /// because of it.
+    ///
+    /// `versions` is what the gate compares against at merge admission, and the comparison reads an
+    /// **absent** entry as "the premise holds" (`merge`, the `_ => {}` arm). Erasing the entries
+    /// therefore erases the evidence: a branch whose premise had already been replaced merged `Clean`
+    /// instead of being held. Measured, with a control proving the gate fires in the same fixture
+    /// without the drop. It is the same absence-reads-as-unchanged confusion the comment beside that
+    /// arm records having already been fixed once, arriving from the opposite direction.
+    ///
+    /// The two directions are not symmetrical in cost, which is what decides this. A stale stamp
+    /// over-approximates staleness and routes to **quarantine** — a hold that stays queryable and can
+    /// be released. A missing stamp under-approximates it and **publishes** a merge computed from
+    /// state that no longer exists. One is recoverable and the other is not, so absence is the error
+    /// worth avoiding. And nothing in this module needed `versions` purged in the first place: no
+    /// view exposes it, so purging it bought nothing and cost a safety check.
+    ///
+    /// **What this deliberately does NOT purge**, stated rather than left to be discovered:
+    /// `versions` as above, plus the escrow ledger, the dependency graph and the applied-op log. None
+    /// of the latter three is exposed by the observability views, and each is keyed by something other
+    /// than the table alone — undoing them on a drop is a separate decision about `REVERT`'s reach,
+    /// not a presentation fix.
     ///
     /// Note that authorship deliberately survives an ordinary `DELETE` of the row. That is an audit
     /// record answering "which agent wrote this", which is criterion 9, and it outliving the row is
@@ -742,7 +761,6 @@ impl AgentRuntime {
         let tbl = table_id(table).0;
         let mut state = self.state.lock().unwrap();
         state.row_author.retain(|(t, _), _| *t != tbl);
-        state.versions.retain(|(t, _), _| *t != tbl);
     }
 
     // ---- reads -----------------------------------------------------------------------------

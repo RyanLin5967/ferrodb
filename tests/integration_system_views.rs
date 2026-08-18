@@ -1014,3 +1014,97 @@ fn a_reaped_branch_reports_the_slots_current_generation() {
         .expect_err("the minted handle must be refused after a reap");
     assert!(err.to_string().contains("generation 1"), "{err}");
 }
+
+
+/// **`DROP TABLE` must not disarm the read-premise gate.**
+///
+/// This is a regression test for a defect B9 itself introduced. `forget_table` was added so
+/// `ferro_row_authors` would stop attributing a recreated table's rows to an agent that never touched
+/// it, and it purged two maps: `row_author`, which is what the view reads, and `versions`, which is
+/// what B1's read-premise check compares against at merge admission.
+///
+/// The premise loop reads `state.versions.get(...)` and treats an **absent** entry as "the premise
+/// holds". Purging `versions` therefore erases exactly the evidence the gate needs: a branch whose
+/// premise had already moved merges `Clean` instead of being held. A presentation fix silently
+/// disabled a safety check — and it is the same absence-reads-as-unchanged confusion the comment
+/// beside that loop records having already been fixed once.
+///
+/// The breaking shape is a `DROP TABLE` *between* the merge that moves the premise and the merge that
+/// should be held. No test touched a table's lifecycle inside an agent scenario, so nothing caught it.
+/// The control below — the identical scenario without the drop — is what makes this a measurement:
+/// it proves the gate fires in this fixture, so the drop is the only thing that can silence it.
+#[test]
+fn dropping_a_table_does_not_silence_the_read_premise_gate() {
+    // --- control: the gate fires in this fixture -------------------------------------------------
+    {
+        let mut db = Db::new();
+        db.seed();
+        let mut a = db.session();
+        db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+        db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+        let mut b = db.session();
+        db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+        db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut b);
+        let held = b.agent.as_ref().unwrap().branch;
+        db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+        db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut b);
+        db.ok("MERGE;", &mut a);
+        db.ok("MERGE;", &mut b);
+        assert_eq!(
+            db.runtime.branches().get(held).expect("record").state,
+            BranchState::Quarantined,
+            "the control does not hold B, so this fixture cannot detect the gate being silenced"
+        );
+        assert_eq!(db.view("SELECT * FROM ferro_quarantine;").len(), 1);
+    }
+
+    // --- the same scenario, with a DROP + recreate before B merges -------------------------------
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut b);
+    let held = b.agent.as_ref().unwrap().branch;
+    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut b);
+    db.ok("MERGE;", &mut a);
+
+    // A third connection drops and recreates the table B reasoned from.
+    let mut d = db.session();
+    db.ok("DROP TABLE oncall;", &mut d);
+    db.ok("CREATE TABLE oncall (id INTEGER NOT NULL, qty INTEGER);", &mut d);
+    db.ok("INSERT INTO oncall VALUES (1, 50);", &mut d);
+
+    db.ok("MERGE;", &mut b);
+
+    // Asserted through the reason map rather than through `branches().get`, because a branch that
+    // merged is SEALED and reaped — `get` then returns "has been reaped" and panics the test with a
+    // message about generations instead of about the gate. The absence of a reason is the signal.
+    let reason = db.runtime.quarantine_reason(held);
+    assert!(
+        reason.is_some(),
+        "B merged even though the row it reasoned from had already been replaced — a DROP TABLE \
+         erased the version evidence the read-premise gate compares against. Branch record now: {:?}",
+        db.runtime.branches().get(held).map(|r| r.state).map_err(|e| e.to_string())
+    );
+    let q = db.view("SELECT branch_id, reason FROM ferro_quarantine;");
+    assert_eq!(q.len(), 1, "the held branch is not in the view: {:?}", q.rows);
+    assert!(
+        column(&q, "reason")[0].contains("read-premise"),
+        "held for something other than the moved premise: {:?}",
+        q.rows
+    );
+
+    // And the thing `forget_table` exists for still holds: the recreated table inherits no
+    // authorship. Both halves in one test, so a fix that trades one for the other cannot pass.
+    assert!(
+        db.view("SELECT * FROM ferro_row_authors;")
+            .rows
+            .iter()
+            .all(|r| text_of(&r[0]) != "oncall"),
+        "the recreated table inherited the dropped table's authorship"
+    );
+}
