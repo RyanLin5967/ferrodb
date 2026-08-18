@@ -575,3 +575,35 @@ fn a_branch_cannot_widen_its_own_envelope() {
     assert!(err.contains("may not DELETE"), "the narrowing did not take effect: {err}");
 }
 
+
+// ---- stated boundaries -----------------------------------------------------------------------
+
+/// **Scope boundary, asserted rather than implied.** The envelope governs AGENT-SESSION writes,
+/// because `stage_all` is the funnel those pass through and nothing else does. A plain `UPDATE`
+/// outside any session goes straight through the executor and is not governed.
+///
+/// This is the same boundary escrow states for itself in
+/// `escrow_governs_agent_writes_only_and_a_direct_write_is_not_charged`, and it is left as a
+/// boundary for the same reason: the envelope is branch-scoped and a direct write has no branch,
+/// so closing it needs someone to say whether the operator gets an implicit unlimited envelope,
+/// trunk's, or a refusal. Inventing one of those quietly would be worse than saying it is open.
+/// What is NOT acceptable is the claim "a session cannot write outside its envelope" without this
+/// qualifier.
+#[test]
+fn the_envelope_governs_agent_session_writes_only() {
+    let mut db = Db::new();
+    db.seed();
+    db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+
+    let mut s = db.session(); // no BEGIN AGENT SESSION
+    db.ok("UPDATE payroll SET salary = -1 WHERE id = 1;", &mut s);
+
+    let mut a = db.session();
+    db.begin("scoped", &mut a);
+    let err = db.refused("UPDATE payroll SET salary = -2 WHERE id = 1;", &mut a);
+    assert!(
+        err.contains("may not write table `payroll`"),
+        "if a direct write is now governed too, this boundary has moved and the module docs must \
+         move with it: {err}"
+    );
+}

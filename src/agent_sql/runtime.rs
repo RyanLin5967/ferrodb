@@ -1151,6 +1151,12 @@ impl AgentRuntime {
             // memory is a budget a restart hands back, which is the whole defect this field
             // exists to close. Nothing below this line can fail on a per-row basis, so the charge
             // cannot outlive a statement that was then refused.
+            //
+            // It CAN outlive one that failed on I/O — appending the frame or mirroring to pages
+            // can still return an error after this point, and the budget stays spent. That is the
+            // deliberate direction: charging afterwards would mean a failed record write leaves a
+            // row written and unbudgeted, which is fail-open. Over-charging refuses a later write;
+            // under-charging admits one.
             let envelope = record.envelope.as_mut().expect("a charge implies an envelope");
             envelope.row_writes += charge;
             self.branches.put(&record)?;

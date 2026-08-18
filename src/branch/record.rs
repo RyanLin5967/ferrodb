@@ -445,11 +445,33 @@ pub fn changed_columns(before: Option<&[Value]>, after: Option<&[Value]>) -> Vec
     for i in 0..n {
         let lhs = b.get(i).unwrap_or(&Value::Null);
         let rhs = a.get(i).unwrap_or(&Value::Null);
-        if lhs != rhs {
+        if !same_stored_value(lhs, rhs) {
             out.push(i as u32);
         }
     }
     out
+}
+
+/// Do these two cells hold the same **stored** value?
+///
+/// Deliberately stricter than `Value`'s own `PartialEq`, which compares numerically across the
+/// whole numeric band: it reports `Integer(5) == Float(5.0)` and, because trailing zeros do not
+/// change a number, `Decimal("1.50") == Decimal("1.5")`. Those are the right answers in a `WHERE`
+/// clause and the wrong ones here. A statement that swaps a cell's stored representation HAS
+/// written that cell, and calling it unchanged would leave a column allowlist with a walk-around:
+/// rewrite the cell as an equal value of another type and no column is reported as touched.
+///
+/// It matters in this engine specifically because `Delta::apply` promotes an `Integer` cell to
+/// `Float` on a float delta, so a representation change is something an ordinary write produces,
+/// not a contrived one.
+fn same_stored_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        // The digit text, not the number: `1.50` and `1.5` are the same value and different bytes,
+        // and `Value::Decimal`'s own documentation says the trailing zero is significant to a
+        // consumer reading a price.
+        (Value::Decimal(x), Value::Decimal(y)) => x == y,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b) && a == b,
+    }
 }
 
 /// A column this branch may write, and the floor its value may not be driven below.
@@ -1070,6 +1092,26 @@ mod tests {
         let before = row(&[Value::Integer(1), Value::Integer(9), Value::Null]);
         assert_eq!(changed_columns(Some(&before), Some(&after)), vec![1]);
         assert!(changed_columns(Some(&before), Some(&before)).is_empty());
+    }
+
+    /// A cell rewritten as a numerically equal value of another type HAS been written. `Value`'s
+    /// own equality says otherwise, which would let a column allowlist be walked around by
+    /// changing the representation instead of the number.
+    #[test]
+    fn a_representation_change_counts_as_writing_the_cell() {
+        let int = row(&[Value::Integer(5)]);
+        let float = row(&[Value::Float(5.0)]);
+        assert_eq!(int[0], float[0], "the premise: Value's own equality calls these equal");
+        assert_eq!(changed_columns(Some(&int), Some(&float)), vec![0]);
+
+        let a = row(&[Value::Decimal("1.50".into())]);
+        let b = row(&[Value::Decimal("1.5".into())]);
+        assert_eq!(a[0], b[0], "the premise, again");
+        assert_eq!(changed_columns(Some(&a), Some(&b)), vec![0]);
+
+        // Anti-vacuity: an identical cell is still unchanged, so this is not "everything changed".
+        assert!(changed_columns(Some(&int), Some(&int)).is_empty());
+        assert!(changed_columns(Some(&a), Some(&a)).is_empty());
     }
 
     #[test]
