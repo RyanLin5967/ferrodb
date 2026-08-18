@@ -1422,28 +1422,36 @@ fn a_garbled_wal_header_takes_the_database_down_with_its_data_intact() {
     );
 }
 
-/// **`recover` repairs missing pages in ascending page id, and the trace proves it byte for byte.**
+/// **Every page the log names and the file does not hold gets its own empty page, in ascending order.**
 ///
-/// Breaking shape: a crash that leaves several pages named by the log missing from the file. `recover`
-/// walks its `touched` set — a `HashSet` — and writes an empty page for each one it cannot read, so
-/// the repair order used to be a function of a per-process hash seed.
+/// Breaking shape: a crash that leaves several pages named by the log missing from the file, at
+/// *scattered* page ids. `recover` walks its `touched` set — a `HashSet` — and writes an empty page for
+/// each id it cannot read:
 ///
-/// This asserts the order **directly** rather than by comparing runs, and the mechanism is worth
-/// noting: the repair loop writes exactly `Page::empty(page_id).serialize()`, so each repair write can
-/// be picked out of the trace by its content digest and matched to the page it was meant for. No
-/// probability is involved — comparing two runs only catches a hash-order bug when the hash order
-/// happens to differ, and that is how the reverted `losers` sort survived five runs out of five.
+/// ```text
+/// for (_, page_id) in &touched {
+///     if bp.disk_manager.read(*page_id).is_err() { write Page::empty(*page_id) }
+/// }
+/// ```
+///
+/// and writing page 10 **extends the file past pages 3 and 7**, so a later `read(3)` succeeds on a
+/// zero-filled gap and page 3 never gets its own empty page. A zero-filled gap deserialises as a page
+/// whose recorded id is 0 and whose free space is 0, so the directory entry rebuilt from it claims the
+/// page is full. Visiting the ids in ascending order is what stops a high page from hiding the low
+/// ones — the sort is not only about reproducibility here, it changes what the database ends up
+/// holding.
+///
+/// So this asserts the exact set: the empty pages recovery wrote must be precisely the missing ids, in
+/// ascending order. The missing set is computed **independently**, by walking the surviving log for the
+/// pages it names and comparing against the surviving file's length — not by asking `recover` what it
+/// thought. Each repair write is identified in the trace by its content digest, because it is exactly
+/// `Page::empty(page_id).serialize()`.
 #[test]
-fn recovery_repairs_missing_pages_in_ascending_page_id_order() {
+fn recovery_gives_every_missing_page_its_own_empty_page_in_ascending_order() {
     // What an empty page for each id looks like on the wire, so a repair write is identifiable.
     const MAX_PAGE: u32 = 512;
-    let empty_page_crc: BTreeMap<u32, u32> = (0..MAX_PAGE)
-        .map(|pid| {
-            (
-                crc32(&Page::empty(pid).serialize().expect("serialize an empty page")),
-                pid,
-            )
-        })
+    let page_of_crc: BTreeMap<u32, u32> = (0..MAX_PAGE)
+        .map(|pid| (crc32(&Page::empty(pid).serialize().expect("serialize an empty page")), pid))
         .collect();
 
     // `SyncOnly` leaves the most for recovery to rebuild: page writes sit in a volatile cache, so a
@@ -1451,49 +1459,81 @@ fn recovery_repairs_missing_pages_in_ascending_page_id_order() {
     let census = fabric(None, Durability::SyncOnly);
     workload(&census).expect("census");
 
-    let mut best: Option<(usize, Vec<u64>)> = None;
+    // Take the crash point whose surviving image is missing the most pages the log names.
+    let mut best: Option<(usize, BTreeMap<String, Vec<u8>>)> = None;
     for &n in census.faultable_ops().iter() {
         let live = fabric(Some(FaultPlan::at(n, 0x0B10_5EED)), Durability::SyncOnly);
         let _ = workload(&live);
-        let rebooted = live.restart();
-        let Ok(db) = open(&rebooted) else { continue };
-        let before = rebooted.op_count();
-        if recover(&db.txn).is_err() {
-            continue;
-        }
-        let repairs: Vec<u64> = rebooted
-            .trace()
-            .into_iter()
-            .filter(|t| {
-                t.index >= before
-                    && t.file == DB
-                    && t.kind == OpKind::Pwrite
-                    && empty_page_crc.contains_key(&t.data_crc)
-            })
-            .map(|t| t.offset)
-            .collect();
-        if best.as_ref().is_none_or(|(c, _)| repairs.len() > *c) {
-            best = Some((repairs.len(), repairs));
+        let image = live.durable_image();
+        let probe = SimFabric::from_images(image.clone(), None, Durability::SyncOnly);
+        probe.set_write_atomicity(DB, PAGE_SIZE as u64);
+        probe.set_verified_from(WAL, wal_header_len());
+        let Ok(db) = open(&probe) else { continue };
+        let missing = missing_pages(&db.wal, image.get(DB).map(|v| v.len() as u64).unwrap_or(0));
+        if best.as_ref().is_none_or(|(m, _)| missing.len() > *m) {
+            best = Some((missing.len(), image));
         }
     }
-    let (count, offsets) = best.expect("no crash point produced a recoverable image at all");
+    let (_, image) = best.expect("no crash point produced an openable image at all");
+
+    let rebooted = SimFabric::from_images(image.clone(), None, Durability::SyncOnly);
+    rebooted.set_write_atomicity(DB, PAGE_SIZE as u64);
+    rebooted.set_verified_from(WAL, wal_header_len());
+    let db = open(&rebooted).expect("reopen");
+    let db_len = image.get(DB).map(|v| v.len() as u64).unwrap_or(0);
+    let missing = missing_pages(&db.wal, db_len);
     assert!(
-        count >= 3,
-        "the best crash point left recovery only {count} page(s) to rebuild; with fewer than two \
-         there is no repair order to get wrong and this assertion would be vacuous"
+        missing.len() >= 3,
+        "the best crash point is missing only {} of the pages its log names; with fewer than three, \
+         scattered ids cannot show a high page hiding a low one and this test would be vacuous",
+        missing.len()
     );
-    for w in offsets.windows(2) {
-        assert!(
-            w[0] < w[1],
-            "recovery rebuilt the page at offset {} after the one at {}, so the repair order is not \
-             ascending: {offsets:?}",
-            w[1],
-            w[0]
-        );
+
+    let before = rebooted.op_count();
+    recover(&db.txn).expect("recover");
+    let repaired: Vec<u32> = rebooted
+        .trace()
+        .into_iter()
+        .filter(|t| t.index >= before && t.file == DB && t.kind == OpKind::Pwrite)
+        .filter_map(|t| page_of_crc.get(&t.data_crc).copied().filter(|p| *p as u64 * PAGE_SIZE as u64 == t.offset))
+        .collect();
+
+    assert_eq!(
+        repaired, missing,
+        "recovery rebuilt pages {repaired:?}; the log names {missing:?} as missing from a {db_len}-byte \
+         file. A high page repaired first extends the file past the lower ones, so they read back as a \
+         zero-filled gap and never get an empty page of their own."
+    );
+    println!("recovery rebuilt {} missing pages, in ascending order: {repaired:?}", repaired.len());
+}
+
+/// Pages the surviving log names that a `db_len`-byte file cannot hold. Computed from the log and the
+/// file length alone, so it is an independent answer rather than `recover`'s own.
+fn missing_pages(wal: &WalManager, db_len: u64) -> Vec<u32> {
+    let mut named: BTreeSet<u32> = BTreeSet::new();
+    let end = wal.next_lsn.load(Ordering::SeqCst);
+    let mut lsn = wal.base_lsn.load(Ordering::SeqCst);
+    while lsn < end {
+        let Ok((rec, next)) = wal.read_record(lsn) else { break };
+        let mut note = |k: &RecKind| match k {
+            RecKind::HeapInsert { page_id, .. }
+            | RecKind::HeapDelete { page_id, .. }
+            | RecKind::HeapUpdate { page_id, .. } => {
+                named.insert(*page_id);
+            }
+            _ => {}
+        };
+        match &rec.kind {
+            RecKind::Clr { redo, .. } => note(redo),
+            other => note(other),
+        }
+        if next <= lsn {
+            break;
+        }
+        lsn = next;
     }
-    // Sanity: each repair write really did land at its own page's offset.
-    for o in &offsets {
-        assert_eq!(o % PAGE_SIZE as u64, 0, "a page repair at a non-page offset {o}");
-    }
-    println!("recovery rebuilt {count} pages, in ascending page id: {offsets:?}");
+    named
+        .into_iter()
+        .filter(|p| (*p as u64 + 1) * PAGE_SIZE as u64 > db_len)
+        .collect()
 }
