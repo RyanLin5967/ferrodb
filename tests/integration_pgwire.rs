@@ -247,3 +247,95 @@ fn two_wire_clients_see_branch_isolation_and_share_one_runtime() {
         .unwrap_or(0);
     assert!(n >= 5, "only {n} checks ran; the client did almost nothing: {stdout}");
 }
+
+/// Refuse to run when the driver is not installed.
+///
+/// **A test that skips is a test that always passes.** The claim being made here is "a real,
+/// third-party Postgres driver works against this server", and the one thing that must never
+/// establish it is the driver's absence. So this panics with the command that fixes it rather
+/// than returning early.
+fn require_python_module(module: &str) {
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(format!("import {module}"))
+        .output()
+        .expect("python3 is required to run the driver tests");
+    assert!(
+        out.status.success(),
+        "`{module}` is not installed, so this test cannot check that a real driver works against \
+         this server — and a skipped check would report success for the wrong reason. Install it \
+         with:\n\n    python3 -m pip install --user {module}\n\npython3 said: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The number of checks a client reported, from its `OK <n> checks passed` line.
+fn checks_reported(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("OK "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn run_client(script: &str, port: u16) -> (bool, String, String) {
+    let out = Command::new("python3")
+        .arg(script)
+        .arg("127.0.0.1")
+        .arg(port.to_string())
+        .current_dir("tests/pg")
+        .output()
+        .expect("python3 is required to run the wire clients");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// **B12 — a real Postgres driver, running a parameterised query.**
+///
+/// asyncpg speaks the extended query protocol exclusively — `Parse`/`Describe`/`Flush` then
+/// `Bind`/`Execute`/`Sync`, with arguments and results in *binary* format — so before B12 it could
+/// not run one statement against this server: every message tag but `Q` and `X` was answered with
+/// `0A000, not implemented`.
+///
+/// The breaking shape this test would catch: a server that answers binary format requests with
+/// text. Nothing raises — the driver hands the ASCII `"2"` to a four-byte integer decoder and
+/// returns a number nobody wrote. That is why the checks in the script assert values and Python
+/// types rather than the absence of an exception.
+#[test]
+fn a_real_driver_connects_and_runs_a_parameterised_query() {
+    require_python_module("asyncpg");
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg_asyncpg_client.py", server.port);
+    assert!(
+        ok,
+        "asyncpg failed against this server:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 25, "only {n} checks ran; the driver did almost nothing: {stdout}");
+}
+
+/// **B12 — two connections at once, both making progress.**
+///
+/// The claim is interleaved progress, not the absence of an error: a server that serves one
+/// connection to completion before accepting the next produces no error either — the second client
+/// simply hangs in startup, which is what `tests/pg/pg_agent_client.py` documents and works
+/// around. The script alternates writes and reads between two open sockets, then runs four writers
+/// and two agent sessions concurrently, and every step asserts an effect that the *other*
+/// connection can only have produced while still being served.
+#[test]
+fn two_concurrent_connections_both_make_progress() {
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg_concurrent_client.py", server.port);
+    assert!(
+        ok,
+        "concurrent connections failed:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 15, "only {n} checks ran: {stdout}");
+}
