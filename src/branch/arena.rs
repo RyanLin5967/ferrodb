@@ -333,10 +333,20 @@ impl ArenaPageStore {
         recycled >= ext.next_free
     }
 
-    /// Every live arena and its owner. Used by the reaper to find extents whose owning branch is
-    /// gone.
+    /// Every live arena and its owner, **in arena-id order**. Used by the reaper to find extents
+    /// whose owning branch is gone.
+    ///
+    /// Sorted because this order reaches durable state rather than a diagnostic:
+    /// `reaper::sweep_empty_extents` frees empty extents in exactly this sequence, each
+    /// `free_arena` pushes the freed extent's start page onto `free_extent_starts`, and
+    /// `ArenaSpaceManager::reserve` **pops** that stack. So the `extents` map's hash order decided
+    /// which page range the next arena was handed, and two runs of one workload laid their extents
+    /// out differently.
     pub fn live_arenas(&self) -> Vec<(ArenaId, BranchId)> {
-        self.state.lock().unwrap().extents.iter().map(|(a, e)| (*a, e.owner)).collect()
+        let mut live: Vec<(ArenaId, BranchId)> =
+            self.state.lock().unwrap().extents.iter().map(|(a, e)| (*a, e.owner)).collect();
+        live.sort_unstable();
+        live
     }
 
     /// Slow path: hand every page still allocated in `rec`'s arenas to the interval rule at
@@ -415,8 +425,16 @@ impl ArenaPageStore {
         }
         drop(free);
 
-        b.extend_from_slice(&(st.extents.len() as u32).to_be_bytes());
-        for (arena, ext) in st.extents.iter() {
+        // The two maps below are walked in **key order**, not hash order, because this function
+        // decides the bytes of a durable file and the CRC32 over them. Iterated as `HashMap`s, one
+        // arena state serialised by two processes produced two different images with two different
+        // checksums: no test can pin such an image, and a crash sweep over `<db>.arena` — the
+        // obvious next use of `storage::sim` — would be as unreplayable as `flush_all` was.
+        let mut extents: Vec<_> = st.extents.iter().collect();
+        extents.sort_unstable_by_key(|(arena, _)| **arena);
+
+        b.extend_from_slice(&(extents.len() as u32).to_be_bytes());
+        for (arena, ext) in extents {
             b.extend_from_slice(&arena.0.to_be_bytes());
             b.extend_from_slice(&ext.owner.id.to_be_bytes());
             b.extend_from_slice(&ext.owner.generation.to_be_bytes());
@@ -431,8 +449,11 @@ impl ArenaPageStore {
             }
         }
 
-        b.extend_from_slice(&(st.current.len() as u32).to_be_bytes());
-        for (branch, arena) in st.current.iter() {
+        let mut current: Vec<_> = st.current.iter().collect();
+        current.sort_unstable_by_key(|(branch, _)| **branch);
+
+        b.extend_from_slice(&(current.len() as u32).to_be_bytes());
+        for (branch, arena) in current {
             b.extend_from_slice(&branch.id.to_be_bytes());
             b.extend_from_slice(&branch.generation.to_be_bytes());
             b.extend_from_slice(&arena.0.to_be_bytes());
@@ -1502,6 +1523,112 @@ mod tests {
             }
             other => panic!("the third operation was {other:?}"),
         }
+    }
+
+    /// A store holding `n` branches, each with its own arena and one page in it.
+    ///
+    /// Every `Harness` builds fresh `HashMap`s, and `RandomState` gives each instance different
+    /// hash keys — so two stores built by this function hold the same logical map in two different
+    /// iteration orders, which is exactly the difference a durable image must not show.
+    fn store_with_n_arenas(n: u64) -> (Harness, Vec<ArenaId>) {
+        let h = Harness::new();
+        let mut arenas = Vec::new();
+        for _ in 0..n {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let a = h.store.arena_for(b.branch_id).unwrap();
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+            arenas.push(a);
+        }
+        (h, arenas)
+    }
+
+    /// Read the two key sequences straight out of a checkpoint image, using the format documented
+    /// above `state_bytes`.
+    ///
+    /// An independent reader on purpose: `load_state` puts every entry back into a `HashMap`, so it
+    /// cannot see the order they arrived in — which is the whole property under test.
+    fn key_order_in_image(b: &[u8]) -> (Vec<u32>, Vec<(u64, u32)>) {
+        let u32_at = |at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+        // version u8, then base_page, next_extent_start, next_arena_id, live, reserved.
+        let mut at = 1 + 4 * 5;
+        at += 4 + 4 * u32_at(at) as usize; // free_starts
+
+        let n_extents = u32_at(at) as usize;
+        at += 4;
+        let mut arenas = Vec::new();
+        for _ in 0..n_extents {
+            arenas.push(u32_at(at));
+            // arena, owner.id, owner.generation, start_page, page_count, next_free
+            at += 4 + 8 + 4 + 4 + 4 + 4;
+            at += 4 + 4 * u32_at(at) as usize; // recycled
+        }
+
+        let n_current = u32_at(at) as usize;
+        at += 4;
+        let mut current = Vec::new();
+        for _ in 0..n_current {
+            current.push((u64_at(at), u32_at(at + 8)));
+            at += 8 + 4 + 4;
+        }
+        (arenas, current)
+    }
+
+    /// **A durable image whose byte order comes from a `HashMap` cannot be replayed.**
+    ///
+    /// B10's finding 4. Nothing here is a correctness bug on its own — `load_state` is
+    /// count-prefixed, so any order reloads the same logical map — but the same arena state
+    /// checkpointed twice produced two different files with two different CRC32s. That makes the
+    /// image impossible to pin in a test and a crash sweep over `<db>.arena` impossible to replay,
+    /// which is the premise of aiming a crash at all.
+    #[test]
+    fn two_stores_in_the_same_state_checkpoint_byte_identical_images() {
+        let (a, _) = store_with_n_arenas(16);
+        let (b, _) = store_with_n_arenas(16);
+        assert_eq!(
+            a.store.base_page(),
+            b.store.base_page(),
+            "fixture: the two stores describe different regions, so this proves nothing"
+        );
+        let left = a.store.state_bytes();
+        let right = b.store.state_bytes();
+        assert_eq!(
+            &left[left.len() - 4..],
+            &right[right.len() - 4..],
+            "the same free-space map produced two different checksums"
+        );
+        assert_eq!(left, right, "the same free-space map produced two different durable images");
+    }
+
+    #[test]
+    fn the_checkpoint_image_lists_extents_and_current_arenas_in_key_order() {
+        let (h, arenas) = store_with_n_arenas(16);
+        let (in_image, current) = key_order_in_image(&h.store.state_bytes());
+
+        assert_eq!(in_image.len(), arenas.len(), "fixture: the image lost extents");
+        let mut sorted = in_image.clone();
+        sorted.sort_unstable();
+        assert_eq!(in_image, sorted, "the extents section is in hash order, not arena-id order");
+
+        assert_eq!(current.len(), arenas.len(), "fixture: the image lost current arenas");
+        let mut sorted_current = current.clone();
+        sorted_current.sort_unstable();
+        assert_eq!(
+            current, sorted_current,
+            "the current-arena section is in hash order, not branch-id order"
+        );
+    }
+
+    /// The reaper frees empty extents in this order and `reserve` pops the stack those frees build,
+    /// so a `HashMap`'s order here decided which page range the next arena got.
+    #[test]
+    fn live_arenas_comes_back_in_arena_id_order() {
+        let (h, arenas) = store_with_n_arenas(16);
+        let live: Vec<ArenaId> = h.store.live_arenas().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(live.len(), arenas.len(), "fixture: an arena went missing");
+        let mut sorted = live.clone();
+        sorted.sort_unstable();
+        assert_eq!(live, sorted, "live_arenas is in hash order");
     }
 
     /// Guards the **production** entry point, which the recorder cannot reach: `checkpoint` itself
