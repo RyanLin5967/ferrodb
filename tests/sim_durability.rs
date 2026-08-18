@@ -350,8 +350,8 @@ fn check_invariants(after: &AfterRecovery, what: &str) -> &'static str {
         );
     }
 
-    // 2. Every surviving row is one of the five, whole. A torn write that spliced half of one row
-    //    onto half of another lands here, because the payloads differ in both length and content.
+    // 2. Every surviving row is one that was actually written, whole. A torn write that spliced half
+    //    of one row onto half of another lands here, because the payloads differ in length AND content.
     for r in rows {
         assert!(
             expected.contains(r),
@@ -371,9 +371,11 @@ fn check_invariants(after: &AfterRecovery, what: &str) -> &'static str {
         unique.len()
     );
 
-    // 4. **All or nothing, per transaction.** This is the breaking shape: 1..=39 rows out of the
-    //    first transaction's 40 is the failure two silent data-loss bugs in this repository would
-    //    have produced, and it could not be seen while every generator committed a single row.
+    // 4. **All or nothing, per transaction.** This is the breaking shape: anything from 1 to
+    //    ROWS - 1 rows of the first transaction's ROWS is the failure two silent data-loss bugs in
+    //    this repository would have produced, and it could not be seen while every generator
+    //    committed a single row. Written against the constants rather than spelled out, because the
+    //    two numbers that were spelled out here both went stale as the workload grew.
     let from_first = rows.iter().filter(|r| first_txn.contains(*r)).count();
     assert!(
         from_first == 0 || from_first == ROWS,
@@ -685,6 +687,13 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
     // reported success. `Corrupt` is the third because a tear and a drop both leave a *short* record,
     // which a bounds check catches on its own: with only those two, removing every CRC check from the
     // WAL read path left this sweep green.
+    //
+    // **The run count is not the coverage number.** A `Tear` or a `Corrupt` aimed at the database
+    // file degrades to a `Drop`, because that file is page-atomic in this model — so three runs at
+    // one database write stage one fault, not three. Measured: 68 faultable operations x 3 shapes =
+    // 204 runs per durability model, staging **86 distinct faults**. The duplicate runs are kept
+    // because they cost microseconds and keep the loop uniform, but a claim about what this sweep
+    // covers is a claim about the 86.
     for &n in &points {
         for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
             let plan = FaultPlan::at_shaped(n, seed, shape);
