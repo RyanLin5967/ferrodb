@@ -11,6 +11,11 @@ pub enum TokenType {
     And, Not, False, Null, Or, True, 
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain, Drop,
     Begin, Commit, Rollback,
+    // B11: the only new *reserved* word column-level DDL needs. `ADD`, `COLUMN`, `RENAME`, `TO`
+    // and `TYPE` are matched by lexeme in the parser instead — the same idiom `parse_select`
+    // already uses for `INNER`/`LEFT`/`RIGHT`/`FULL` — so none of them stops being a usable
+    // column name. `ALTER` has to be a token because it is what selects the statement.
+    Alter,
 
     // agent-isolation surface (DESIGN.md section 5)
     Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
@@ -186,6 +191,9 @@ impl Scanner {
             // E69: `DROP` is a real keyword now. It was an ordinary identifier, which is why
             // `DROP TABLE t` reported "expected a statement" - the parser never saw a DROP at all.
             "DROP" => TokenType::Drop,
+            // B11: was an ordinary identifier, and `unsupported_keyword` refused it in statement
+            // position. It is a real keyword now that `ALTER TABLE` is implemented.
+            "ALTER" => TokenType::Alter,
             "TABLE" => TokenType::Table,
             "AND" => TokenType::And,
             "OR" => TokenType::Or,
