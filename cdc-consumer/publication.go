@@ -396,6 +396,16 @@ var envelopeKeys = map[string]bool{
 	// and `model_version` is what B5's retract keys on. Admitting the key does not settle that; it
 	// stops the feed being wholly broken while the question is open.
 	"writer": true,
+	// `alter` (B11): which column-level change produced the shape in `columns`. Same reasoning as
+	// `writer` - a known, closed shape this consumer validates rather than an unknown field it would
+	// have to ignore. B7 flagged B5 as the lane that would need an entry here; B11 is the second one
+	// and nobody flagged it, so without this every ADD_COLUMN / RENAME_COLUMN / ALTER_COLUMN event
+	// fails the whole line under any publication.
+	//
+	// The producer masks the object itself: `jsonl.rs` omits `alter` when the column it names is not
+	// published, because the alteration NAMES a column and would otherwise leak the one thing the
+	// shape above withheld.
+	"alter": true,
 }
 
 // policeRawLine enforces the structural rules a policy-checked line must satisfy, reading the raw

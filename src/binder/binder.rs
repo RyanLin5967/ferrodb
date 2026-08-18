@@ -198,6 +198,7 @@ impl<'a> Binder<'a> {
             // nothing for the optimizer to choose between.
             | Stmt::Search { .. }
             | Stmt::DropTable { .. }
+            | Stmt::AlterTable { .. }
             | Stmt::CreateTable { .. } => Err(FerroError::Bind(
                 "DML and DDL are applied directly by the executor and have no logical plan; \
                  Binder::bind takes SELECT".into(),

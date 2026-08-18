@@ -140,8 +140,63 @@ func quoteIdent(s string) string {
 // schema at the new base. A sink that treated each one as "a new table appeared" would fail on the
 // second checkpoint of every table's life.
 func (s *Sink) ensureTable(table string, cols []map[string]any) error {
-	names := make([]string, 0, len(cols))
-	defs := make([]string, 0, len(cols)+2)
+	names, ddl := s.tableDDL(table, cols)
+	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), ddl)
+	if _, err := s.db.Exec(stmt); err != nil {
+		return fmt.Errorf("create %s: %w", table, err)
+	}
+	// **A destination BEHIND the declared shape is caught up — B11.** See the DuckDB sink's
+	// `catchUpToDeclaredShape` for why this case exists and why only a strict prefix qualifies: a
+	// consumer that missed the `ADD_COLUMN` window and resumed after the source truncated its log
+	// gets the evolved declaration and nothing else, and `CREATE TABLE IF NOT EXISTS` is a no-op on
+	// the table it already has.
+	//
+	// SQLite has no equivalent of `checkSchemaAgrees`, so a mismatch here has always surfaced later
+	// as "no such column" at INSERT time. That is unchanged for every case except this one.
+	got, err := s.tableColumns(table)
+	if err != nil {
+		return err
+	}
+	if len(got) < len(names) {
+		prefix := true
+		for i := range got {
+			if got[i] != names[i] {
+				prefix = false
+				break
+			}
+		}
+		if prefix {
+			for i := len(got); i < len(names); i++ {
+				def := quoteIdent(names[i]) + " " + sqlType(fmt.Sprint(cols[i]["type"]))
+				add := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " + def
+				if _, err := s.db.Exec(add); err != nil {
+					if !strings.Contains(err.Error(), "duplicate column name") {
+						return fmt.Errorf("catch %s up to the declared shape (%s): %w",
+							table, names[i], err)
+					}
+				}
+			}
+		}
+	}
+	// B5's attribution columns, on the path an OLDER destination takes. The merge dropped this call
+	// once: `ensureWriterColumns` was defined and never invoked, which compiles, passes every test
+	// that does not read an attribution column, and silently ships a destination with no writer
+	// columns at all.
+	if err := s.ensureWriterColumns(table); err != nil {
+		return err
+	}
+	s.columns[table] = names
+	return nil
+}
+
+// tableDDL renders a destination table's column definitions, and the data column names alongside.
+//
+// One renderer, two callers: `ensureTable` and the retype rebuild in `apply`. SQLite cannot change
+// a column's declared type in place, so a retype has to build the table again — and building it
+// from a second copy of these definitions is how the rebuilt table quietly loses the PRIMARY KEY or
+// a bookkeeping column.
+func (s *Sink) tableDDL(table string, cols []map[string]any) (names []string, defs string) {
+	out := make([]string, 0, len(cols)+3)
 	for _, c := range cols {
 		name := fmt.Sprint(c["name"])
 		names = append(names, name)
@@ -149,25 +204,28 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 		if name == s.key {
 			def += " PRIMARY KEY"
 		}
-		defs = append(defs, def)
+		out = append(out, def)
 	}
 	// Bookkeeping columns, prefixed so they cannot collide with a source column of the same name
 	// without the source having chosen a leading underscore deliberately.
-	defs = append(defs, `"_commit_lsn" INTEGER NOT NULL`, `"_lsn" INTEGER NOT NULL DEFAULT 0`,
+	out = append(out, `"_commit_lsn" INTEGER NOT NULL`, `"_lsn" INTEGER NOT NULL DEFAULT 0`,
 		`"_deleted" INTEGER NOT NULL DEFAULT 0`)
 	for _, w := range writerColumns {
-		defs = append(defs, quoteIdent(w.name)+" "+w.decl)
+		out = append(out, quoteIdent(w.name)+" "+w.decl)
 	}
+	return names, strings.Join(out, ", ")
+}
 
-	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
-	if _, err := s.db.Exec(stmt); err != nil {
-		return fmt.Errorf("create %s: %w", table, err)
+// eventColumns pulls the full post-change shape out of a schema event.
+func eventColumns(e *Event) []map[string]any {
+	list, _ := e.After["columns"].([]any)
+	cols := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		if m, ok := c.(map[string]any); ok {
+			cols = append(cols, m)
+		}
 	}
-	if err := s.ensureWriterColumns(table); err != nil {
-		return err
-	}
-	s.columns[table] = names
-	return nil
+	return cols
 }
 
 // writerColumns are the attribution columns every destination table carries.
@@ -204,6 +262,175 @@ func (s *Sink) ensureWriterColumns(table string) error {
 	return nil
 }
 
+// applySchemaChange evolves the destination for a column-level change — B11.
+//
+// **The destination is altered rather than re-declared.** A sink that reacted to a shape change by
+// dropping and recreating the table would land a correct-looking schema and an empty table, which
+// is the worst outcome available: self-consistent and wrong, with nothing downstream able to tell.
+// So each case issues the narrowest statement that produces the declared shape while keeping every
+// row.
+func (s *Sink) applySchemaChange(e *Event) error {
+	cols := eventColumns(e)
+	if len(cols) == 0 {
+		return fmt.Errorf("%s for %s carries no shape", e.Op, e.Table)
+	}
+	// A destination that has never seen this table has nothing to alter; the event's shape is the
+	// whole truth, so create it. This is the resume case: a consumer starting mid-feed after the
+	// source truncated its log gets the CREATE_TABLE re-declaration with the evolved shape, but a
+	// consumer whose first event is the ALTER itself must not fail.
+	if _, err := s.db.Exec("SELECT 1 FROM " + quoteIdent(e.Table) + " LIMIT 0"); err != nil {
+		return s.ensureTable(e.Table, cols)
+	}
+
+	switch e.Op {
+	case "ADD_COLUMN":
+		name, _ := alterField(e, "column")
+		var typ string
+		for _, c := range cols {
+			if fmt.Sprint(c["name"]) == name {
+				typ = sqlType(fmt.Sprint(c["type"]))
+			}
+		}
+		if name == "" || typ == "" {
+			return fmt.Errorf("ADD_COLUMN for %s names no column present in its shape", e.Table)
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " ADD COLUMN " + quoteIdent(name) + " " + typ
+		if _, err := s.db.Exec(stmt); err != nil {
+			// Already there: the same event re-delivered, or a destination created from the
+			// evolved declaration. Not an error — but only this one, so a genuine DDL failure is
+			// still a failure.
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return fmt.Errorf("add %s.%s: %w", e.Table, name, err)
+			}
+		}
+	case "RENAME_COLUMN":
+		from, _ := alterField(e, "from")
+		to, _ := alterField(e, "to")
+		if from == "" || to == "" {
+			return fmt.Errorf("RENAME_COLUMN for %s names no columns", e.Table)
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " RENAME COLUMN " + quoteIdent(from) +
+			" TO " + quoteIdent(to)
+		if _, err := s.db.Exec(stmt); err != nil {
+			if !strings.Contains(err.Error(), "no such column") {
+				return fmt.Errorf("rename %s.%s: %w", e.Table, from, err)
+			}
+		}
+	case "ALTER_COLUMN_TYPE":
+		// SQLite has no `ALTER COLUMN ... TYPE`, and this is not a case where "it is dynamically
+		// typed so it does not matter" holds: the declared type sets the column's **affinity**, and
+		// `sqlType` maps DECIMAL to TEXT while INTEGER and BIGINT both map to INTEGER. A column that
+		// should have become TEXT but kept INTEGER affinity coerces its digit strings back to
+		// integers on the way in, silently losing every digit past an i64 — the exact loss the
+		// source ships decimals as text to prevent.
+		//
+		// The rebuild is SQLite's own documented recipe, and it is unconditional rather than
+		// conditional on the affinity actually moving: a conditional would need a second copy of
+		// the type mapping to decide, and two copies of a mapping is how they diverge.
+		if err := s.rebuildTable(e.Table, cols); err != nil {
+			return err
+		}
+	}
+	// Re-read the shape from the destination rather than trusting the statement above to have
+	// produced it: the column list drives every subsequent INSERT, and one built from what was
+	// asked for rather than from what is there names a column that may not exist.
+	actual, err := s.tableColumns(e.Table)
+	if err != nil {
+		return err
+	}
+	s.columns[e.Table] = actual
+	return nil
+}
+
+// rebuildTable recreates a table with new column definitions, carrying every row across.
+//
+// SQLite's documented procedure for a change `ALTER TABLE` cannot express. Columns are copied BY
+// NAME, so a rebuild for a retype moves the data and a column absent from the new shape would be
+// dropped rather than mis-assigned — but this source has no DROP COLUMN, so the name sets are equal
+// in practice and a difference would be a bug worth failing on rather than absorbing.
+func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
+	existing, err := s.tableColumns(table)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for _, c := range existing {
+		have[c] = true
+	}
+	names, defs := s.tableDDL(table, cols)
+	carried := make([]string, 0, len(names)+3)
+	for _, n := range names {
+		if !have[n] {
+			return fmt.Errorf("rebuild %s: the new shape names column %q, which the destination "+
+				"does not have; a retype must not invent a column", table, n)
+		}
+		carried = append(carried, quoteIdent(n))
+	}
+	carried = append(carried, `"_commit_lsn"`, `"_lsn"`, `"_deleted"`)
+	tmp := table + "_cdc_rebuild"
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	steps := []string{
+		fmt.Sprintf("DROP TABLE IF EXISTS %s", quoteIdent(tmp)),
+		fmt.Sprintf("CREATE TABLE %s (%s)", quoteIdent(tmp), defs),
+		fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s", quoteIdent(tmp),
+			strings.Join(carried, ", "), strings.Join(carried, ", "), quoteIdent(table)),
+		fmt.Sprintf("DROP TABLE %s", quoteIdent(table)),
+		fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteIdent(tmp), quoteIdent(table)),
+	}
+	for _, stmt := range steps {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild %s: %w", table, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// tableColumns asks the destination what a table's data columns actually are, in order.
+func (s *Sink) tableColumns(table string) ([]string, error) {
+	rows, err := s.db.Query("SELECT name FROM pragma_table_info(?) ORDER BY cid", table)
+	if err != nil {
+		return nil, fmt.Errorf("read %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		// **Bookkeeping columns are not data columns**, and the list has to include B5's
+		// attribution columns as well as the three original ones. This filter was written when
+		// `_commit_lsn`, `_lsn` and `_deleted` were the only ones there; B5 then added seven
+		// attribution columns to every destination, and B11's catch-up path re-reads the shape
+		// FROM the destination - so those seven came back as data columns and the upsert named each
+		// of them twice, once with a NULL. Measured: `NOT NULL constraint failed: inv._prov_id`,
+		// from a statement listing `"_prov_id"` in both halves.
+		//
+		// Driven off `writerColumns` rather than a second hand-written list, which is the same
+		// reason that declaration exists: two copies are one place to drift, and the drift shows up
+		// as a retraction that silently matches nothing.
+		if n == "_commit_lsn" || n == "_lsn" || n == "_deleted" {
+			continue
+		}
+		bookkeeping := false
+		for _, w := range writerColumns {
+			if n == w.name {
+				bookkeeping = true
+				break
+			}
+		}
+		if !bookkeeping {
+			out = append(out, n)
+		}
+	}
+	return out, rows.Err()
+}
+
 // ensureFromRow creates a table from a data row, for a feed whose CREATE_TABLE has been truncated
 // away. Types are inferred, which is worse than being told — recorded here so the difference is
 // visible rather than silently equivalent.
@@ -227,14 +454,10 @@ func (s *Sink) ensureFromRow(table string, row map[string]any) error {
 func (s *Sink) apply(e *Event) error {
 	switch e.Op {
 	case "CREATE_TABLE":
-		list, _ := e.After["columns"].([]any)
-		cols := make([]map[string]any, 0, len(list))
-		for _, c := range list {
-			if m, ok := c.(map[string]any); ok {
-				cols = append(cols, m)
-			}
-		}
-		return s.ensureTable(e.Table, cols)
+		return s.ensureTable(e.Table, eventColumns(e))
+
+	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		return s.applySchemaChange(e)
 
 	case "DROP_TABLE":
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + quoteIdent(e.Table)); err != nil {
