@@ -35,7 +35,7 @@ use crate::agent_sql::merge_engine::{
 use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
-use crate::binder::binder::{Binder, Scope};
+use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
@@ -53,8 +53,9 @@ use crate::execution::executor::evaluate;
 use crate::parser::parser::{Expr, Stmt, TableRef};
 use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, Plan};
-use crate::provenance::readset::{AccessShape, PredicateSummary, VersionRef};
-use crate::provenance::revert::{DependencyGraphBuilder, RevertMode, RevertPlan};
+use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
+use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
+use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
@@ -146,7 +147,6 @@ struct Workspace {
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
     tables: BTreeMap<u32, String>,
     frame: TxnFrame,
-    reads: Vec<crate::provenance::readset::ReadSet>,
 }
 
 impl Workspace {
@@ -214,7 +214,22 @@ struct State {
     /// is the question being asked.
     row_author: BTreeMap<(u32, u64), ProvId>,
     versions: BTreeMap<(u32, u64), VersionRef>,
-    dep: DependencyGraphBuilder,
+    /// What each agent task retained: the reads its access shapes demanded — every scan carrying
+    /// the snapshot it read at — and every version it published, with the values it published.
+    ///
+    /// **The runtime's only retention point, and that is the fix.** This used to be a bare
+    /// `DependencyGraphBuilder` here plus a second copy of the read-sets on each `Workspace`, fed
+    /// with exact versions only. `record_predicate_read` and `record_write_value` — the two calls
+    /// that turn a SCAN into a causal edge — were reachable from `provenance::capture` and from
+    /// nowhere else, and the runtime never referenced that module. So `REVERT ... CASCADE`
+    /// under-reported precisely where agents read: the query surface has no `LIMIT` and no
+    /// `ORDER BY`, which makes an agent's natural read a full scan, and a full scan retained a
+    /// region that nothing downstream ever looked at.
+    ///
+    /// Keyed by txn, and never dropped by `seal`: the dependency graph has to outlive the workspace
+    /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
+    /// become visible to everyone else, which is the moment they can start being read.
+    captures: BTreeMap<u64, TxnCapture>,
     policy: PolicyTable,
 }
 
@@ -560,9 +575,9 @@ impl AgentRuntime {
                 base_rows,
                 tables,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
-                reads: Vec::new(),
             },
         );
+        state.captures.insert(txn.0, TxnCapture::new(txn, prov, branch));
         Ok(AgentSession {
             branch,
             branch_name: name,
@@ -614,7 +629,8 @@ impl AgentRuntime {
         let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
             FerroError::Branch(format!("no agent session on branch {branch}"))
         })?;
-        Ok(blind_writes_of(&ws.rows, &ws.reads))
+        let reads = state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default();
+        Ok(blind_writes_of(&ws.rows, &reads))
     }
 
     /// The branch's changeset, derived from the PAGES rather than from the workspace map.
@@ -739,7 +755,14 @@ impl AgentRuntime {
         // Record the read-set against the *reading* session, if there is one.
         if let Some(reader_branch) = reader {
             let shape = access_shape(where_clause.as_ref(), &schema);
-            self.record_read(reader_branch, table_id(&from.name), shape, &matched, where_clause.as_ref());
+            self.record_read(
+                reader_branch,
+                table_id(&from.name),
+                shape,
+                &matched,
+                where_clause.as_ref(),
+                bound_where.as_ref(),
+            );
         }
 
         let mut out = Vec::with_capacity(matched.len());
@@ -753,6 +776,12 @@ impl AgentRuntime {
         Ok(out)
     }
 
+    /// Retain one access against the reading task's capture.
+    ///
+    /// `shape` alone decides the form (exact versions for a point or index lookup, a predicate for a
+    /// range or scan); `TxnCapture::on_read` performs that routing, so there is no second copy of it
+    /// here. What this function owns is the two things only the runtime knows: which versions the
+    /// rows it returned are at, and **what snapshot the read saw**.
     fn record_read(
         &self,
         reader: BranchId,
@@ -760,10 +789,11 @@ impl AgentRuntime {
         shape: AccessShape,
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
+        bound_where: Option<&BoundExpr>,
     ) {
         let mut state = self.state.lock().unwrap();
-        let txn = match state.workspaces.get(&reader.id) {
-            Some(ws) => ws.txn,
+        let (txn, prov) = match state.workspaces.get(&reader.id) {
+            Some(ws) => (ws.txn, ws.prov),
             None => return,
         };
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
@@ -785,25 +815,29 @@ impl AgentRuntime {
                 })
             })
             .collect();
-        let summary = PredicateSummary {
-            tbl,
-            col: None,
-            lo: crate::provenance::readset::Bound::Unbounded,
-            hi: crate::provenance::readset::Bound::Unbounded,
-            residual: where_clause.map(|w| w.to_sql()),
-            rows_observed: matched.len() as u64,
-        };
-        let mut builder = crate::provenance::readset::ReadSetBuilder::new();
-        builder.observe(shape, versions.clone(), Some(summary));
-        let sets = builder.finish();
-        for v in &versions {
-            if shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions {
-                state.dep.record_read(txn, *v);
-            }
-        }
-        if let Some(ws) = state.workspaces.get_mut(&reader.id) {
-            ws.reads.extend(sets);
-        }
+        // **The snapshot this read saw, on the runtime's own version clock.** `record_applied`
+        // stamps every published version with `apply_seq`, so everything published so far is
+        // `<= apply_seq` and the next version that can exist is `apply_seq + 1`. That is a HIGH
+        // WATER MARK, and `DependencyGraphBuilder::build` compares strictly against it
+        // (`begin_ts < observed_at`), the same rule `ReadView::is_commited_for_me` applies.
+        //
+        // The `+ 1` is load-bearing and is the anti-vacuity half of criterion 10. With `apply_seq`
+        // itself, a scan would come out depending on the write that landed AT that seq — a write it
+        // could not have seen — and every scan would then be a dependent of the merge immediately
+        // preceding it, which is the same under-reporting failure with the sign flipped.
+        let observed_at = state.apply_seq + 1;
+        let summary = predicate_summary(tbl, where_clause, bound_where, matched.len() as u64);
+        // `or_insert_with`, never `if let Some`. A read that finds no capture and retains nothing
+        // silently is indistinguishable from a read that had nothing to retain, and that is the
+        // precise failure this lane exists to remove — the previous shape lost a scan's region with
+        // no error anywhere. There is one workspace-creation site and it opens a capture, so this
+        // arm should be unreachable; it is written this way so that a second site cannot make
+        // retention optional by forgetting.
+        state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, prov, reader))
+            .on_read(shape, versions, Some(summary), observed_at);
     }
 
     // ---- writes on a branch ----------------------------------------------------------------
@@ -1462,7 +1496,7 @@ impl AgentRuntime {
                 tables: ws.tables.clone(),
                 ops: ws.frame.ops.clone(),
                 guards: ws.frame.guards.clone(),
-                reads: ws.reads.clone(),
+                reads: state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default(),
             }
         };
 
@@ -1804,6 +1838,55 @@ impl AgentRuntime {
             });
         }
 
+        // **The images each row moves BETWEEN, which is what a retained predicate is tested
+        // against.** A scan kept a region, not versions, so the only way to ask "did what this merge
+        // published fall inside the region you scanned" is against values — and both ends are
+        // needed, not just the new one:
+        //
+        // - `post` is what a scan running after this merge SAW. A write into the scanned range is
+        //   the phantom case.
+        // - `pre` is what such a scan no longer saw. A write that moved a value OUT of the range, or
+        //   deleted the row entirely, is a dependency too: the scan observed an ABSENCE that this
+        //   merge caused, and reverting the merge puts the row back inside the range. Phantom
+        //   coverage is exactly about the rows that were not there, so leaving `pre` out would drop
+        //   half of it.
+        //
+        // `pre` comes from `current`, the target's image at merge time, rather than from the
+        // branch's fork-point `base_rows`: what matters is what the row held immediately before this
+        // merge published, which is not the same thing once a concurrent branch has merged.
+        let images = PublishedImages {
+            pre: pending_writes
+                .iter()
+                .filter_map(|w| w.row_key())
+                .filter_map(|k| current.get(&k).map(|row| (k, row.clone())))
+                .collect(),
+            post: pending_writes.iter().filter_map(|w| w.published_image()).collect(),
+        };
+
+        // **Reserve the version sequence BEFORE the rows become visible.**
+        //
+        // `record_applied` runs after `commit`, and it used to be where `apply_seq` advanced. That
+        // left a window in which the published rows were readable while the clock still said they
+        // did not exist: a scan landing there would take `observed_at = apply_seq + 1`, land at or
+        // below the versions it had just read, and the temporal rule in
+        // `DependencyGraphBuilder::build` would drop a real edge — a silently missing dependent,
+        // which is the failure mode this whole lane is about.
+        //
+        // Reserving first inverts the error: in that window the clock is ahead of visibility, so a
+        // scan that could NOT see the rows may still be named a dependent. Over-reporting is
+        // recoverable — the operator sees a name in the halt tree and dismisses it — and
+        // under-reporting cascades a revert through work that depended on the write.
+        //
+        // Not reachable through today's server, which serves one connection at a time
+        // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
+        // numbering is unchanged: the same ops, in the same order, get the same sequence values.
+        let reserved: std::ops::Range<u64> = {
+            let mut state = self.state.lock().unwrap();
+            let base = state.apply_seq;
+            state.apply_seq += row_outcomes.iter().map(|r| r.applied.len() as u64).sum::<u64>();
+            base..state.apply_seq
+        };
+
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
@@ -1820,7 +1903,15 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
-        self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
+        self.record_applied(
+            branch,
+            snapshot.txn,
+            &row_outcomes,
+            &snapshot,
+            &merge_id,
+            &images,
+            reserved,
+        );
         self.seal(branch, true)?;
 
         Ok(MergeReport {
@@ -1874,12 +1965,19 @@ impl AgentRuntime {
         rows: &[RowMergeOutcome],
         snapshot: &WorkspaceSnapshot,
         merge_id: &str,
+        images: &PublishedImages,
+        reserved: std::ops::Range<u64>,
     ) {
         let mut state = self.state.lock().unwrap();
+        let mut written: Vec<WriteRecord> = Vec::new();
+        let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
-                state.apply_seq += 1;
-                let seq = state.apply_seq;
+                // The sequence `merge` reserved before publishing, consumed in the same order it
+                // was counted. `state.apply_seq` is not touched here: it already stands at the end
+                // of this reservation.
+                next_seq += 1;
+                let seq = next_seq;
                 let before = snapshot
                     .ops
                     .iter()
@@ -1909,10 +2007,65 @@ impl AgentRuntime {
                     begin_ts: seq,
                 };
                 state.versions.insert((op.tbl.0, op.row.0), v);
-                state.dep.record_write(txn, v);
+                // **The valued writes a scan's retained region is checked against.** One per COLUMN
+                // of each image, because `PredicateSummary::covers` matches a write only against the
+                // column its predicate names: a summary over `qty` cannot see a write recorded
+                // against `id`, so recording only the op's own cell would leave every scan over
+                // every other column blind. A write with no image left to name (a delete of a row
+                // whose before-image we never held) still records the version itself, so the exact
+                // read-after-write edge survives; it simply cannot answer a region query.
+                let key = (op.tbl.0, op.row.0);
+                let mut seen: Vec<(u32, Value)> = Vec::new();
+                for img in [images.post.get(&key), images.pre.get(&key)].into_iter().flatten() {
+                    for (idx, val) in img.iter().enumerate() {
+                        let cell = (idx as u32, val.clone());
+                        if seen.contains(&cell) {
+                            continue;
+                        }
+                        seen.push(cell);
+                        written.push(WriteRecord::new(
+                            v,
+                            Some(ColId(idx as u32)),
+                            Some(val.clone()),
+                        ));
+                    }
+                }
+                if seen.is_empty() {
+                    written.push(WriteRecord::new(v, op.col, None));
+                }
                 // Authorship of the published row, kept past `seal` (exit criterion 9).
                 state.row_author.insert((op.tbl.0, op.row.0), snapshot.prov);
             }
+        }
+        // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
+        // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
+        // does not borrow-check.
+        // The range `merge` reserved must be exactly the versions consumed here, and the comparison
+        // has to be against the RESERVATION rather than against a re-count of `rows` — the first
+        // version of this assertion re-derived the expected value from `rows`, the same list the loop
+        // above walks, so it compared the loop to itself and would have passed however few versions
+        // `merge` had actually set aside. A fire-check caught that: shortening the reservation left
+        // the assertion green, and only a behavioural test noticed.
+        //
+        // Consuming past the reservation means this merge is stamping `begin_ts` values the next
+        // merge will hand out again, and two versions sharing a `begin_ts` mis-answer every
+        // visibility comparison downstream — including the one that decides whether a scan depended
+        // on a write.
+        debug_assert_eq!(
+            next_seq, reserved.end,
+            "merge reserved versions {:?} but record_applied consumed {} of them",
+            reserved,
+            next_seq - reserved.start
+        );
+        // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
+        // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
+        // a merge that published nothing.
+        let capture = state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        for w in written {
+            capture.on_write(w);
         }
         state.merges.insert(
             merge_id.to_string(),
@@ -1991,7 +2144,7 @@ impl AgentRuntime {
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, state.dep.build())
+            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
         };
         let target = *targets
             .first()
@@ -2176,6 +2329,120 @@ fn blind_writes_of(
         .collect()
 }
 
+/// The images a merge moved its published rows between. See where it is built in `merge`.
+#[derive(Debug, Default)]
+struct PublishedImages {
+    /// What the target held immediately before this merge published.
+    pre: BTreeMap<(u32, u64), Vec<Value>>,
+    /// What it holds after. Absent for a delete.
+    post: BTreeMap<(u32, u64), Vec<Value>>,
+}
+
+/// The dependency graph over everything every task retained — exact and predicate-derived alike.
+///
+/// **One derivation, and it lives in `ProvenanceLog::dependency_graph`.** That function is the only
+/// code in the tree that composes read-after-write edges over exact versions with the edges derived
+/// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
+/// does not keep a second copy of it, which is the reconciliation this lane exists to make.
+fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
+    let mut log = ProvenanceLog::new();
+    for c in captures.values() {
+        log.record(c.clone().finish());
+    }
+    log.dependency_graph()
+}
+
+/// The region a range or full scan looked at, retained so that a write landing inside it later is a
+/// phantom the read depended on.
+///
+/// **The bounds are narrowed only when the clause proves a narrowing**, and that asymmetry is the
+/// whole safety argument. A conjunction of literal comparisons over one column gives a real
+/// interval; anything else — an `OR`, a `!=`, a column compared to a column, no `WHERE` at all —
+/// keeps the region unbounded over the table. A region WIDER than the truth names a dependent that
+/// may not be one, which an operator sees in the halt tree and can dismiss; a region NARROWER than
+/// the truth silently cascades a revert through work that did depend on it. Only one of those two
+/// errors is recoverable, so only one of them is allowed.
+///
+/// The `residual` keeps the clause verbatim either way, so a re-check is always possible.
+fn predicate_summary(
+    tbl: TableId,
+    where_clause: Option<&Expr>,
+    bound: Option<&BoundExpr>,
+    rows_observed: u64,
+) -> PredicateSummary {
+    let (col, lo, hi) = match bound.and_then(column_range) {
+        Some((c, lo, hi)) => (Some(ColId(c as u32)), lo, hi),
+        None => (None, Bound::Unbounded, Bound::Unbounded),
+    };
+    PredicateSummary { tbl, col, lo, hi, residual: where_clause.map(|w| w.to_sql()), rows_observed }
+}
+
+/// `(column, lo, hi)` for a clause that bounds ONE column with literals; `None` otherwise.
+///
+/// Derived from the BOUND expression rather than the parsed one: the binder has already resolved the
+/// column to its index, coerced the literal to the column's type and refused a cross-category
+/// comparison, so the values compared here are the values the executor compared. Re-deriving that
+/// from `Expr` would be a second, weaker copy of the binder's type rules.
+fn column_range(e: &BoundExpr) -> Option<(usize, Bound, Bound)> {
+    match e {
+        BoundExpr::BinaryOp { left, operator: TokenType::And, right } => {
+            match (column_range(left), column_range(right)) {
+                // Both conjuncts bound the same column: the region is their intersection.
+                (Some((lc, llo, lhi)), Some((rc, rlo, rhi))) if lc == rc => {
+                    Some((lc, llo.tighter_lo(rlo), lhi.tighter_hi(rhi)))
+                }
+                // Two different columns, or one side unusable: keep one side and DROP the other
+                // conjunct. Dropping a conjunct widens the region, which is the safe direction; a
+                // summary has one column and cannot express both.
+                (Some(l), _) => Some(l),
+                (None, r) => r,
+            }
+        }
+        // An `OR` is a union, and a union of two intervals is not an interval. Reporting either arm
+        // would understate the region, so the whole clause falls back to unbounded.
+        BoundExpr::BinaryOp { left, operator, right } => comparison_range(left, *operator, right),
+        _ => None,
+    }
+}
+
+fn comparison_range(
+    left: &BoundExpr,
+    operator: TokenType,
+    right: &BoundExpr,
+) -> Option<(usize, Bound, Bound)> {
+    let (col, v, op) = match (left, right) {
+        (BoundExpr::Column(c), BoundExpr::Literal(v)) => (*c, v.clone(), operator),
+        // `20 <= qty` is `qty >= 20`. Mirroring rather than refusing matters because refusing here
+        // is not neutral: it widens the region to the whole table for a clause that was perfectly
+        // precise, just written the other way round.
+        (BoundExpr::Literal(v), BoundExpr::Column(c)) => (*c, v.clone(), mirror(operator)?),
+        _ => return None,
+    };
+    let (lo, hi) = match op {
+        TokenType::Equal => (Bound::Included(v.clone()), Bound::Included(v)),
+        TokenType::Less => (Bound::Unbounded, Bound::Excluded(v)),
+        TokenType::LessEqual => (Bound::Unbounded, Bound::Included(v)),
+        TokenType::Greater => (Bound::Excluded(v), Bound::Unbounded),
+        TokenType::GreaterEqual => (Bound::Included(v), Bound::Unbounded),
+        // `!=` is the complement of a point: two intervals, and a single one could only over- or
+        // under-state it. Under-stating is not allowed, so it stays unbounded.
+        _ => return None,
+    };
+    Some((col, lo, hi))
+}
+
+/// The same comparison with its operands swapped.
+fn mirror(operator: TokenType) -> Option<TokenType> {
+    Some(match operator {
+        TokenType::Equal => TokenType::Equal,
+        TokenType::Less => TokenType::Greater,
+        TokenType::LessEqual => TokenType::GreaterEqual,
+        TokenType::Greater => TokenType::Less,
+        TokenType::GreaterEqual => TokenType::LessEqual,
+        _ => return None,
+    })
+}
+
 /// Who to attribute the versions a write produces to. `None` leaves them `ProvId::NONE`.
 type Author = Option<(Arc<dyn ProvenanceStore>, ProvId)>;
 
@@ -2188,6 +2455,31 @@ enum PendingWrite {
 }
 
 impl PendingWrite {
+    /// `(table, row)` this write lands on, or `None` for a write with no row image to key by.
+    fn row_key(&self) -> Option<(u32, u64)> {
+        match self {
+            PendingWrite::Insert { table, row } | PendingWrite::Update { table, row, .. } => {
+                Some((table_id(table).0, row_id_of(row).0))
+            }
+            // A delete names the key rather than the row, and `row_id_of` takes the primary key as
+            // the first column of a row — which is exactly what `key` is.
+            PendingWrite::Delete { table, key } => {
+                Some((table_id(table).0, row_id_of(std::slice::from_ref(key)).0))
+            }
+        }
+    }
+
+    /// The image this write leaves behind, for the rows that still have one. `None` for a delete:
+    /// what a scan can depend on there is the row's absence, which is answered from the `pre` image.
+    fn published_image(&self) -> Option<((u32, u64), Vec<Value>)> {
+        match self {
+            PendingWrite::Insert { row, .. } | PendingWrite::Update { row, .. } => {
+                self.row_key().map(|k| (k, row.clone()))
+            }
+            PendingWrite::Delete { .. } => None,
+        }
+    }
+
     /// Publish inside an already-open transaction.
     fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64, author: Author) -> Result<usize, FerroError> {
         let stmt = self.into_stmt(ctx)?;

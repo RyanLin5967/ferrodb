@@ -11,6 +11,25 @@
 //! method here that turns exact versions into an interval, whatever the count, because for `k`
 //! scattered reads over `N` rows the enclosing interval covers `N(k-1)/(k+1)` rows — at `k = 3`
 //! that is already half the table.
+//!
+//! **This module is the single retention layer, and the agent runtime is one of its two sources.**
+//! It used to be the only path that could produce a causal edge out of a SCAN — `record_write_value`
+//! and `record_predicate_read` were reachable from here and from nowhere else, while
+//! `agent_sql::runtime` kept a second, narrower path of its own that retained exact versions only.
+//! Two implementations, and the one the runtime used was the one that could not answer
+//! `REVERT ... CASCADE` for a scan. The runtime now feeds a [`TxnCapture`] per agent task, so there
+//! is one retention type, one place edges are derived ([`ProvenanceLog::dependency_graph`]), and two
+//! *sources* that fill a capture:
+//!
+//! - [`CapturingScan`], which wraps a Volcano operator and reads `begin_ts` out of the real 24-byte
+//!   version header (`tests/provenance_e2e.rs`);
+//! - `agent_sql::runtime`, whose branch rows live in a per-task buffer with no version header, and
+//!   which stamps versions from its own apply sequence at merge time.
+//!
+//! **A single [`ProvenanceLog`] must be fed from ONE version clock.** `observed_at` and `begin_ts`
+//! are compared to each other and to nothing else, so mixing heap `begin_ts` values with the
+//! runtime's apply sequence in one log would compare two unrelated counters and decide visibility
+//! from the collision. Nothing does that today: each source owns its own log.
 
 use std::sync::{Arc, Mutex};
 
@@ -131,6 +150,16 @@ impl TxnCapture {
 
     pub fn writes(&self) -> &[WriteRecord] {
         &self.writes
+    }
+
+    /// What this transaction has read so far, in the form each access shape demanded, **without
+    /// consuming the capture**.
+    ///
+    /// The merge gate and the blind-write metric need the read-sets while the task is still open
+    /// and still reading; `finish` is for the end of the task. Retaining a second copy on the side
+    /// for the open case is what produced two divergent read-set stores in the first place.
+    pub fn read_sets(&self) -> Vec<ReadSet> {
+        self.reads.clone().finish()
     }
 
     pub fn finish(self) -> TxnProvenance {
