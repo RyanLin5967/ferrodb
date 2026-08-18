@@ -795,7 +795,7 @@ mod tests {
     /// all, and its siblings must still ship, which is what makes the test about the allowlist rather
     /// than about emitting nothing.
     #[test]
-    fn a_denied_column_is_absent_from_the_bytes_and_declared_in_withheld() {
+    fn a_denied_column_is_named_nowhere_in_the_line() {
         let line =
             to_json_line(&customer(ChangeOp::Insert { new: row3() }), &analytics()).expect("refused");
         assert!(!line.contains("000-11-2222"), "the denied value left the database: {line}");

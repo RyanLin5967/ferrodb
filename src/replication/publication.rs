@@ -10,8 +10,12 @@
 //!
 //! # Where it is enforced
 //!
-//! At [`super::jsonl::to_json_line`], through the mask it hands to `row_into` — the one function
-//! that turns a row into bytes. Not at the SQL layer, not in the decoder, and not in the sinks:
+//! In [`super::jsonl`], through the mask handed to `row_into` — the one function that turns a **row**
+//! into bytes — and to the `CREATE_TABLE` shape loop beside it, which renders column *names* rather
+//! than values and so needs the same rule over a different payload. Production reaches those through
+//! [`super::jsonl::write_feed`] and [`super::jsonl::write_table_json`];
+//! [`super::jsonl::to_json_line`] is the single-event form the tests use. Not at the SQL layer, not in
+//! the decoder, and not in the sinks:
 //! those are three places that would each need their own copy of the rule, and a fourth write path
 //! added later would arrive with none of it. Three write paths already exist and none of them is
 //! the "main" one:
@@ -119,7 +123,15 @@ pub enum Publication {
     /// design note somewhere.** It exists because the renderers require a `&Publication` and the
     /// call sites that predate this module have no policy to give them. Making it the only way to
     /// spell "no policy" means every such site names it in its own source, so
-    /// `grep -rn 'unrestricted'` enumerates exactly the paths this guard does not cover.
+    /// `grep -rn 'unrestricted'` enumerates every **feed** path that can run unguarded.
+    ///
+    /// It does not enumerate everything that can carry the same column off the machine, and an
+    /// auditor took the sentence literally before this paragraph existed: physical replication ships
+    /// raw WAL records (`super::ReplicationSource`), a base backup ships data pages
+    /// (`super::backup::take`), and `pgwire` and the CLI render the same values to a client. None of
+    /// them knows what a publication is. A publication guards the **change feed and the table dump**;
+    /// it does not make a column unreadable, and two of those paths ship bytes this module never
+    /// sees.
     ///
     /// What it must never become is a **default**. Nothing in this module hands it to a caller who
     /// forgot to choose, because a guard that defaults to open is a guard that is on in the tests

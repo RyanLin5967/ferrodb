@@ -332,6 +332,12 @@ impl SnapshotBoundaryBuilder {
     ///
     /// The recording is not separable from the writing, which is the entire point: the boundary's
     /// table set is then a description of what this builder did rather than a claim about it.
+    ///
+    /// **Atomicity is per call, so check the publication covers every table before the first one.**
+    /// `write_feed` writes nothing when it refuses, but two calls are two batches: deliver `orders`
+    /// successfully, refuse on `shipments`, and the consumer holds a snapshot that looks whole. An
+    /// adversarial review named this shape. `publication.columns_of(t).is_some()` answers it for each
+    /// table up front, before anything is written.
     pub fn deliver<W: Write>(
         &mut self,
         table: &str,
