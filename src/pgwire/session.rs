@@ -11,8 +11,15 @@
 //!
 //! ## The allowlist, and what is deliberately absent
 //!
-//! A real driver runs a small, fixed set of statements of its own: asyncpg's connection pool
-//! releases a connection by sending `SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *;
+//! **What a driver probes on connect was measured, not assumed.** `tests/pg/pg_probe_spy.py` logs
+//! every frontend message a driver sends against a socket that answers only the handshake; on
+//! 2026-08-18 both asyncpg 0.31.0 and pg8000 sent the SSL request, the startup packet, and then
+//! *nothing*. Neither issues a statement at connect time: the session parameters they act on come
+//! from the `ParameterStatus` messages, which is why [`SessionParams::startup_status`] reporting a
+//! complete and parseable set is the load-bearing part, and `server_version` most of all.
+//!
+//! Later, and only on its own initiative, a driver does run a small fixed set: asyncpg's connection
+//! pool releases a connection by sending `SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *;
 //! RESET ALL;` as one simple query, and clients probe `version()` and `current_setting()`. Those
 //! are answered here, by name.
 //!
