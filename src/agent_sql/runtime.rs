@@ -36,7 +36,7 @@ use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, Scope};
-use crate::branch::record::{CapabilityEnvelope, ColumnCapability, RowImage, TableCapability};
+use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
 use crate::branch::BranchCatalog;
@@ -88,12 +88,6 @@ pub fn table_id(name: &str) -> TableId {
         h = h.wrapping_mul(0x0100_0193);
     }
     TableId(h)
-}
-
-/// A [`TableCapability`] for a table named in SQL, so a caller building an envelope does not have
-/// to hash the name itself and get a different answer than the write funnel does.
-pub fn table_capability(name: &str, columns: Vec<ColumnCapability>) -> TableCapability {
-    TableCapability::new(table_id(name).0, columns)
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {

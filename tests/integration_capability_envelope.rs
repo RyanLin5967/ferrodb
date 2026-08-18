@@ -26,7 +26,7 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ferrodb::agent_sql::runtime::{table_capability, AgentRuntime};
+use ferrodb::agent_sql::runtime::{table_id, AgentRuntime};
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::types::BranchId;
 use ferrodb::branch::{BranchCatalog, CapabilityEnvelope, ColumnCapability, Verb};
@@ -188,7 +188,7 @@ impl Db {
 /// Everything on `inventory`, nothing anywhere else, no floor, ample budget.
 fn inventory_only() -> CapabilityEnvelope {
     CapabilityEnvelope::new(Verb::ALL, 1_000).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
     )
 }
@@ -272,7 +272,7 @@ fn budget_already_spent_is_not_handed_back_by_a_restart() {
     let mut db = Db::new();
     db.seed();
     let envelope = CapabilityEnvelope::new(Verb::ALL, 2).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, envelope).unwrap();
@@ -369,7 +369,7 @@ fn an_assignment_that_lowers_a_bounded_value_is_refused_not_just_a_decrement() {
     let mut db = Db::new();
     db.seed();
     let floored = CapabilityEnvelope::new(Verb::ALL, 1_000).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::floored(QTY, 0)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, floored).unwrap();
@@ -405,7 +405,7 @@ fn an_insert_cannot_write_a_column_the_branch_was_never_granted() {
     db.seed();
     // `qty` only. `id` is deliberately NOT granted.
     let qty_only = CapabilityEnvelope::new(Verb::ALL, 1_000).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(QTY)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, qty_only).unwrap();
@@ -431,7 +431,7 @@ fn a_verb_off_the_allowlist_is_refused_and_one_on_it_still_writes() {
     let mut db = Db::new();
     db.seed();
     let no_delete = CapabilityEnvelope::new(Verb::INSERT | Verb::UPDATE, 1_000).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, no_delete).unwrap();
@@ -463,7 +463,7 @@ fn a_statement_that_overruns_the_row_budget_is_refused_whole() {
     let mut db = Db::new();
     db.seed();
     let two = CapabilityEnvelope::new(Verb::ALL, 2).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, two).unwrap();
@@ -503,7 +503,7 @@ fn a_write_that_changes_nothing_costs_no_budget() {
     let mut db = Db::new();
     db.seed();
     let one = CapabilityEnvelope::new(Verb::ALL, 1).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
     );
     db.runtime.restrict_branch(BranchId::TRUNK, one).unwrap();
@@ -551,11 +551,11 @@ fn a_branch_cannot_widen_its_own_envelope() {
 
     let wider = CapabilityEnvelope::new(Verb::ALL, 1_000)
         .allow(
-            table_capability("inventory", vec![]).table,
+            table_id("inventory").0,
             vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
         )
         .allow(
-            table_capability("payroll", vec![]).table,
+            table_id("payroll").0,
             vec![ColumnCapability::open(ID), ColumnCapability::open(QTY)],
         );
     let err = db.runtime.restrict_branch(branch, wider).unwrap_err().to_string();
@@ -567,7 +567,7 @@ fn a_branch_cannot_widen_its_own_envelope() {
 
     // Anti-vacuity: narrowing IS accepted, so `restrict_branch` is not simply refusing everything.
     let narrower = CapabilityEnvelope::new(Verb::UPDATE, 5).allow(
-        table_capability("inventory", vec![]).table,
+        table_id("inventory").0,
         vec![ColumnCapability::floored(QTY, 0)],
     );
     db.runtime.restrict_branch(branch, narrower).expect("a narrowing must be accepted");
