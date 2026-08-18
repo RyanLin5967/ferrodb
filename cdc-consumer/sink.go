@@ -41,6 +41,18 @@ package main
 // and with it the only evidence that would let the sink reject a stale re-insert arriving
 // afterwards. The row is gone from the caller's point of view either way; keeping the tombstone is
 // what makes "gone" stick.
+//
+// # Why the writer is landed with the row
+//
+// Every destination row also carries the run that wrote it: `_prov_id`, `_agent`, `_run`,
+// `_model`, `_model_version`. That is what makes `retract` possible at all — "withdraw everything
+// model_version 2026-07 wrote" is answerable by a scan of the destination, with no access to the
+// source database, no replay of the feed, and no join against a log a checkpoint may have truncated
+// away. A pipeline that has to go back to the producer to answer it cannot answer it after the
+// producer is gone, which is exactly when the question gets asked.
+//
+// The prompt is landed as a digest (`_prompt_sha256`) and never as text; see `writerKeys` in
+// main.go for the allowlist that enforces that upstream of here.
 
 import (
 	"database/sql"
@@ -143,12 +155,52 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 	// without the source having chosen a leading underscore deliberately.
 	defs = append(defs, `"_commit_lsn" INTEGER NOT NULL`, `"_lsn" INTEGER NOT NULL DEFAULT 0`,
 		`"_deleted" INTEGER NOT NULL DEFAULT 0`)
+	for _, w := range writerColumns {
+		defs = append(defs, quoteIdent(w.name)+" "+w.decl)
+	}
 
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
 	if _, err := s.db.Exec(stmt); err != nil {
 		return fmt.Errorf("create %s: %w", table, err)
 	}
+	if err := s.ensureWriterColumns(table); err != nil {
+		return err
+	}
 	s.columns[table] = names
+	return nil
+}
+
+// writerColumns are the attribution columns every destination table carries.
+//
+// Declared in one place because they are added by two paths — CREATE TABLE for a new destination,
+// ALTER TABLE for one an older sink already made — and two hand-written lists is one place for them
+// to drift apart, which would show up as a retraction that silently matches nothing.
+var writerColumns = []struct{ name, decl string }{
+	{"_prov_id", "INTEGER NOT NULL DEFAULT 0"},
+	{"_agent", "TEXT"},
+	{"_run", "TEXT"},
+	{"_model", "TEXT"},
+	{"_model_version", "TEXT"},
+	{"_prompt_sha256", "TEXT"},
+	// Set by `retract`, never by the feed. Kept separate from `_deleted` so an operator can tell a
+	// row the SOURCE deleted from one this consumer withdrew.
+	{"_retracted", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// ensureWriterColumns upgrades a destination written before attribution existed.
+//
+// Refusing to open an older destination would strand exactly the backups the checkpoint design
+// exists to make resumable, so the columns are added in place. SQLite has no `ADD COLUMN IF NOT
+// EXISTS`, so a duplicate is the expected outcome on every run after the first and is the only
+// error swallowed here.
+func (s *Sink) ensureWriterColumns(table string) error {
+	for _, w := range writerColumns {
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s",
+			quoteIdent(table), quoteIdent(w.name), w.decl)
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add %s to %s: %w", w.name, table, err)
+		}
+	}
 	return nil
 }
 
@@ -218,13 +270,36 @@ func (s *Sink) apply(e *Event) error {
 	placeholders = append(placeholders, "?", "?", "?")
 	values = append(values, int64(e.CommitLSN), int64(e.LSN), deleted)
 
+	// The writer, landed with the row. A change no run produced lands NULLs and prov_id 0, which is
+	// the unattributed slot — distinct from a run whose model_version is the empty string, and
+	// `retract` refuses an empty model version precisely so the two cannot be conflated.
+	var provID int64
+	var agent, run, model, modelVersion, promptSHA any
+	if e.Writer != nil {
+		provID = int64(e.Writer.ProvID)
+		agent, run = e.Writer.Agent, e.Writer.Run
+		model, modelVersion = e.Writer.Model, e.Writer.ModelVersion
+		promptSHA = e.Writer.PromptSHA256
+	}
+	// A newly applied event replaces the row AND its attribution, so `_retracted` returns to 0: the
+	// mark described the row as it stood, and this is a different row now. A re-delivery of an
+	// already-retracted event does not reach here — the ordering guard below rejects it — so a
+	// retraction is not undone by a replay.
+	names = append(names, `"_prov_id"`, `"_agent"`, `"_run"`, `"_model"`, `"_model_version"`,
+		`"_prompt_sha256"`, `"_retracted"`)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?")
+	values = append(values, provID, agent, run, model, modelVersion, promptSHA, 0)
+
 	// The ordering guard lives HERE, in the statement, not in Go control flow above it.
-	sets := make([]string, 0, len(cols)+2)
+	sets := make([]string, 0, len(cols)+3+len(writerColumns))
 	for _, c := range cols {
 		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(c), quoteIdent(c)))
 	}
 	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_lsn"=excluded."_lsn"`,
 		`"_deleted"=excluded."_deleted"`)
+	for _, w := range writerColumns {
+		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(w.name), quoteIdent(w.name)))
+	}
 
 	stmt := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
