@@ -363,6 +363,33 @@ def main():
     fields, rows, _, errs = c.query("SHOW application_name;")
     check(rows == [[""]], f"RESET ALL did not put application_name back: {rows}")
 
+    # A pg_catalog query must be refused *with the reason*. There is no pg_type here and there is
+    # not going to be one; answering an introspection query with invented rows would have the
+    # client build a type cache out of them and misdecode every value afterwards, with nothing to
+    # trace it back to. The refusal is the feature.
+    _, _, _, errs = c.query("SELECT typname FROM pg_catalog.pg_type;")
+    check(bool(errs), "a pg_catalog query was not refused")
+    check(
+        "pg_catalog" in errs[0].get("M", ""),
+        f"the refusal did not explain that this server has no pg_catalog: {errs}",
+    )
+    # ...and the allowed half of that pair: the catalog-ish statements it does answer.
+    for probe, expected in [
+        ("SELECT current_database();", "ferro"),
+        ("SELECT current_schema();", "public"),
+        ("SELECT current_setting('server_encoding');", "UTF8"),
+    ]:
+        _f, rows, _t, errs = c.query(probe)
+        check(not errs and rows == [[expected]], f"{probe} answered {rows} {errs}")
+
+    # The transaction-control spellings a driver uses, and the two that would be a false promise.
+    for sql in ["BEGIN TRANSACTION;", "COMMIT;", "START TRANSACTION;", "ROLLBACK;", "BEGIN;", "END;"]:
+        _f, _r, _t, errs = c.query(sql)
+        check(not errs, f"{sql} was refused: {errs}")
+    for sql in ["BEGIN ISOLATION LEVEL SERIALIZABLE;", "BEGIN READ ONLY;", "SAVEPOINT a;"]:
+        _f, _r, _t, errs = c.query(sql)
+        check(bool(errs), f"{sql} was accepted, which promises something this engine has not")
+
     c.terminate()
     print(f"OK {checks} checks passed")
 

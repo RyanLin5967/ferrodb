@@ -339,3 +339,23 @@ fn two_concurrent_connections_both_make_progress() {
     let n = checks_reported(&stdout);
     assert!(n >= 15, "only {n} checks ran: {stdout}");
 }
+
+/// **B12 — a second real driver, sharing no code with the first.**
+///
+/// asyncpg and pg8000 agree about this server, and they were written by different people from the
+/// same specification: an agreement between them is not a shared misreading. pg8000 also sends two
+/// things asyncpg never does — `begin transaction` before every statement, and parameter types
+/// declared by the client in `Parse` — so it covers branches the asyncpg test cannot reach.
+#[test]
+fn a_second_real_driver_runs_the_same_parameterised_queries() {
+    require_python_module("pg8000");
+    let server = start();
+    let (ok, stdout, stderr) = run_client("pg8000_client.py", server.port);
+    assert!(
+        ok,
+        "pg8000 failed against this server:\nstdout: {stdout}\nstderr: {stderr}\nserver stderr: {}",
+        server.stderr()
+    );
+    let n = checks_reported(&stdout);
+    assert!(n >= 15, "only {n} checks ran; the driver did almost nothing: {stdout}");
+}

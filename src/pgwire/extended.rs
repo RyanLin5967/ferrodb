@@ -185,6 +185,15 @@ impl Statement {
         declared: &[i32],
         ctx: &ServerContext,
     ) -> Result<Statement, (&'static str, String)> {
+        // `begin transaction` / `start transaction` / `end` / `abort` are the same three statements
+        // this engine's parser knows as `BEGIN` / `COMMIT` / `ROLLBACK`, under the names drivers
+        // actually use. Normalised here rather than in the parser, because which spellings a *wire
+        // client* sends is a property of the protocol surface and not of the SQL dialect.
+        let sql = match crate::pgwire::session::normalise_txn_control(sql) {
+            Some(Ok(canonical)) => canonical,
+            Some(Err(e)) => return Err(e),
+            None => sql,
+        };
         if let Some(cmd) = crate::pgwire::session::parse(sql) {
             let cmd = cmd?;
             if sql.contains('$') {
@@ -203,24 +212,35 @@ impl Statement {
         }
 
         let (rewritten, nparams) = params::rewrite(sql).map_err(|e| ("42P02", e))?;
-        // The ferrodb parser requires a terminating semicolon and a driver never sends one, so it
-        // is supplied here. This is the single most load-bearing line for "a real driver works at
-        // all": without it every asyncpg query fails with `expected ;`.
+        // The ferrodb parser requires a terminating semicolon, and it is missing twice over: a
+        // driver never sends one, and `split_statements` above consumes the one a hand-written
+        // client did send. So it is supplied here, for every statement rather than only for the
+        // driver's. Removing this line fails **every** statement on the server with `expected ;`,
+        // which is what a fire-check of it showed: all five wire tests died, including the ones
+        // whose SQL ends in a semicolon.
         let with_semi = if rewritten.trim_end().ends_with(';') {
             rewritten
         } else {
             format!("{};", rewritten.trim_end())
         };
+        // A `pg_catalog` query fails in the *scanner*, on the dot in `pg_catalog.pg_type`, so the
+        // explanation has to be attached here as well as at the binder below. Without it a driver
+        // author reads "expected ;" and goes looking for a syntax error in a query that is
+        // perfectly good SQL and simply has nowhere to run.
+        let hint = crate::pgwire::session::pg_catalog_hint(sql).unwrap_or("");
         let tokens = Scanner::new(with_semi.chars().collect(), Vec::new())
             .scan_tokens()
-            .map_err(|e| ("42601", strip_sentinels(&e.to_string())))?;
+            .map_err(|e| ("42601", format!("{}{hint}", strip_sentinels(&e.to_string()))))?;
         let mut parser = Parser::new(tokens);
         let mut stmts = parser.parse();
         if !parser.errors.is_empty() {
             return Err((
                 "42601",
-                strip_sentinels(
-                    &parser.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+                format!(
+                    "{}{hint}",
+                    strip_sentinels(
+                        &parser.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+                    )
                 ),
             ));
         }
@@ -244,10 +264,8 @@ impl Statement {
         // the columns are — and both are read under one acquisition.
         let catalog = ctx.catalog();
         let param_oids = params::infer_types(&stmt, nparams, declared, &catalog);
-        let fields = describe_stmt(&stmt, &catalog).map_err(|e| {
-            let hint = crate::pgwire::session::pg_catalog_hint(sql).unwrap_or("");
-            (sqlstate_of(&e), format!("{e}{hint}"))
-        })?;
+        let fields =
+            describe_stmt(&stmt, &catalog).map_err(|e| (sqlstate_of(&e), format!("{e}{hint}")))?;
         Ok(Statement { sql: sql.to_string(), kind: Kind::Sql { stmt, verb }, param_oids, fields })
     }
 
@@ -370,7 +388,9 @@ fn run_session(cmd: &SessionCommand, conn: &mut Connection) -> Result<RunResult,
             conn.statements.clear();
             conn.session_params.reset_all();
         }
-        SessionCommand::Unlisten => {}
+        // Validated at parse time and then nothing to do: `check_txn_modifiers` only accepts
+        // options this engine already satisfies.
+        SessionCommand::Unlisten | SessionCommand::SetTransaction => {}
         SessionCommand::Probe { value, .. } => {
             let text = match value {
                 ProbeValue::Literal(s) => s.clone(),

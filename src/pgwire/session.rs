@@ -43,6 +43,9 @@ pub enum SessionCommand {
     /// `UNLISTEN *`. There is no LISTEN in this server, so having no listeners to remove is not a
     /// pretence: the post-condition the client wants already holds.
     Unlisten,
+    /// `SET TRANSACTION ...` — validated (see [`check_txn_modifiers`]) and then a no-op, because
+    /// every level it accepts is one this engine already provides.
+    SetTransaction,
     /// A one-column, one-row answer this server knows by name.
     Probe { column: &'static str, value: ProbeValue },
 }
@@ -67,7 +70,13 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("application_name", ""),
     ("client_encoding", "UTF8"),
     ("DateStyle", "ISO, MDY"),
-    ("default_transaction_isolation", "read committed"),
+    // **Repeatable read, and measured rather than assumed.** A transaction's snapshot is taken at
+    // `BEGIN` and does not move: `executor.rs`'s `test_snapshot_pins_at_begin` commits a row from
+    // another session mid-transaction and proves the open transaction still cannot see it. That is
+    // snapshot isolation, which is the level Postgres calls `repeatable read`. This said `read
+    // committed` until the claim was checked, which would have told a client its statements each
+    // see a fresh snapshot when they do not.
+    ("default_transaction_isolation", "repeatable read"),
     ("default_transaction_read_only", "off"),
     ("extra_float_digits", "1"),
     ("integer_datetimes", "on"),
@@ -80,7 +89,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     // so a backslash in one is a backslash. Reporting `off` would tell a client to double them.
     ("standard_conforming_strings", "on"),
     ("TimeZone", "UTC"),
-    ("transaction_isolation", "read committed"),
+    ("transaction_isolation", "repeatable read"),
     ("transaction_read_only", "off"),
     ("bytea_output", "hex"),
     ("statement_timeout", "0"),
@@ -298,6 +307,7 @@ pub fn describe(cmd: &SessionCommand) -> (Option<Vec<Field>>, String) {
         SessionCommand::Deallocate { .. } => (None, "DEALLOCATE".into()),
         SessionCommand::DiscardAll => (None, "DISCARD ALL".into()),
         SessionCommand::Unlisten => (None, "UNLISTEN".into()),
+        SessionCommand::SetTransaction => (None, "SET".into()),
         SessionCommand::Probe { column, .. } => {
             (Some(vec![Field::text(*column, oid::TEXT)]), "SELECT 1".into())
         }
@@ -371,6 +381,10 @@ fn parse_set(w: &[&str]) -> Result<SessionCommand, (&'static str, String)> {
     if w[0].eq_ignore_ascii_case("names") {
         let value = w.get(1).copied().unwrap_or("UTF8").to_string();
         return Ok(SessionCommand::Set { name: "client_encoding".into(), value });
+    }
+    if w[0].eq_ignore_ascii_case("transaction") {
+        check_txn_modifiers(&w[1..])?;
+        return Ok(SessionCommand::SetTransaction);
     }
     let name = w[0].to_string();
     let rest = &w[1..];
@@ -465,6 +479,161 @@ fn parse_probe(w: &[&str]) -> Option<SessionCommand> {
         }
     }
     None
+}
+
+/// Canonicalise the transaction-control spellings a driver uses into the three this engine's parser
+/// accepts: `BEGIN`, `COMMIT`, `ROLLBACK`.
+///
+/// `BEGIN` is one word in ferrodb's grammar, and `begin transaction` — which is what pg8000 sends
+/// before every statement — is a syntax error against it. These are not new features: they are the
+/// same three statements under the names the SQL standard and every driver use for them.
+///
+/// `None` means this is not transaction control. `Some(Err(..))` means it is, and this server will
+/// not pretend to honour it — a savepoint, a read-only transaction or `SERIALIZABLE` accepted
+/// silently is a guarantee the engine does not implement.
+pub fn normalise_txn_control(
+    sql: &str,
+) -> Option<Result<&'static str, (&'static str, String)>> {
+    let words = tokenise(sql);
+    let w: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    if w.is_empty() {
+        return None;
+    }
+    let head = w[0].to_ascii_uppercase();
+    let noise = |rest: &[&str]| -> usize {
+        match rest.first() {
+            Some(x) if x.eq_ignore_ascii_case("work") || x.eq_ignore_ascii_case("transaction") => 1,
+            _ => 0,
+        }
+    };
+    match head.as_str() {
+        // `BEGIN AGENT SESSION` is this database's own statement and must reach its own parser.
+        "BEGIN" if w.get(1).is_some_and(|s| s.eq_ignore_ascii_case("agent")) => None,
+        "BEGIN" => {
+            let rest = &w[1 + noise(&w[1..])..];
+            Some(check_txn_modifiers(rest).map(|_| "BEGIN;"))
+        }
+        "START" if w.get(1).is_some_and(|s| s.eq_ignore_ascii_case("transaction")) => {
+            Some(check_txn_modifiers(&w[2..]).map(|_| "BEGIN;"))
+        }
+        "COMMIT" | "END" => {
+            let rest = &w[1 + noise(&w[1..])..];
+            if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("and")) {
+                return Some(Err((
+                    "0A000",
+                    "`AND CHAIN` is not implemented; COMMIT then BEGIN again".into(),
+                )));
+            }
+            Some(Ok("COMMIT;"))
+        }
+        "ROLLBACK" | "ABORT" => {
+            if w.get(1).is_some_and(|s| s.eq_ignore_ascii_case("to")) {
+                return Some(Err(("0A000", savepoint_refusal())));
+            }
+            let rest = &w[1 + noise(&w[1..])..];
+            if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("and")) {
+                return Some(Err((
+                    "0A000",
+                    "`AND CHAIN` is not implemented; ROLLBACK then BEGIN again".into(),
+                )));
+            }
+            Some(Ok("ROLLBACK;"))
+        }
+        "SAVEPOINT" | "RELEASE" => Some(Err(("0A000", savepoint_refusal()))),
+        _ => None,
+    }
+}
+
+fn savepoint_refusal() -> String {
+    "savepoints are not implemented by this engine; a transaction here is all-or-nothing, and \
+     accepting a SAVEPOINT would promise a partial rollback that cannot happen"
+        .into()
+}
+
+/// Validate the modifiers on `BEGIN` / `START TRANSACTION` / `SET TRANSACTION`.
+///
+/// **Every level accepted here is one the engine already provides.** A transaction's snapshot is
+/// pinned at `BEGIN` (`executor.rs`, `test_snapshot_pins_at_begin`), which is snapshot isolation —
+/// `repeatable read` in Postgres's naming. A client asking for `READ UNCOMMITTED` or `READ
+/// COMMITTED` gets something stronger than it asked for, which is allowed and is what Postgres
+/// does with `READ UNCOMMITTED` too. `SERIALIZABLE` is refused, because nothing here detects the
+/// write skew that separates it from snapshot isolation.
+fn check_txn_modifiers(w: &[&str]) -> Result<(), (&'static str, String)> {
+    let mut i = 0;
+    while i < w.len() {
+        let word = w[i].to_ascii_uppercase();
+        match word.as_str() {
+            "," => i += 1,
+            "ISOLATION" => {
+                // ISOLATION LEVEL <level>, where the level is one or two words.
+                let mut level = String::new();
+                let mut j = i + 1;
+                if w.get(j).is_some_and(|s| s.eq_ignore_ascii_case("level")) {
+                    j += 1;
+                }
+                while j < w.len() && w[j] != "," {
+                    if !level.is_empty() {
+                        level.push(' ');
+                    }
+                    level.push_str(&w[j].to_ascii_uppercase());
+                    j += 1;
+                    if level == "READ UNCOMMITTED"
+                        || level == "READ COMMITTED"
+                        || level == "REPEATABLE READ"
+                        || level == "SERIALIZABLE"
+                    {
+                        break;
+                    }
+                }
+                match level.as_str() {
+                    "READ UNCOMMITTED" | "READ COMMITTED" | "REPEATABLE READ" => {}
+                    "SERIALIZABLE" => {
+                        return Err((
+                            "0A000",
+                            "this engine gives snapshot isolation (repeatable read) and does not \
+                             detect the write skew that SERIALIZABLE forbids, so it will not claim \
+                             that level"
+                                .into(),
+                        ))
+                    }
+                    other => {
+                        return Err(("42601", format!("unknown isolation level `{other}`")))
+                    }
+                }
+                i = j;
+            }
+            "READ" => {
+                match w.get(i + 1).map(|s| s.to_ascii_uppercase()).as_deref() {
+                    Some("WRITE") => i += 2,
+                    Some("ONLY") => {
+                        return Err((
+                            "0A000",
+                            "this engine has no read-only transaction mode, so `READ ONLY` would \
+                             not be enforced"
+                                .into(),
+                        ))
+                    }
+                    other => {
+                        return Err((
+                            "42601",
+                            format!("expected READ WRITE or READ ONLY, got `{}`", other.unwrap_or("end of statement")),
+                        ))
+                    }
+                }
+            }
+            "NOT" if w.get(i + 1).is_some_and(|s| s.eq_ignore_ascii_case("deferrable")) => i += 2,
+            "DEFERRABLE" => {
+                return Err((
+                    "0A000",
+                    "`DEFERRABLE` only means anything for a SERIALIZABLE READ ONLY transaction, \
+                     neither of which this engine has"
+                        .into(),
+                ))
+            }
+            other => return Err(("42601", format!("unexpected `{other}` in transaction options"))),
+        }
+    }
+    Ok(())
 }
 
 /// A hint for a statement that failed and mentions something only `pg_catalog` would have.
@@ -717,6 +886,87 @@ mod tests {
     fn a_select_against_a_real_table_is_not_a_probe() {
         assert!(parse("SELECT version FROM releases").is_none());
         assert!(parse("SELECT 1 FROM t").is_none());
+    }
+
+    /// pg8000's DBAPI opens a transaction before every statement, spelled `begin transaction`.
+    /// This engine's parser knows `BEGIN` only, so without the normalisation the driver cannot run
+    /// one statement — which is exactly what it did, before this existed.
+    #[test]
+    fn the_transaction_spellings_drivers_send_map_onto_the_three_this_engine_has() {
+        let cases = [
+            ("begin transaction", "BEGIN;"),
+            ("BEGIN", "BEGIN;"),
+            ("BEGIN WORK", "BEGIN;"),
+            ("START TRANSACTION", "BEGIN;"),
+            ("START TRANSACTION ISOLATION LEVEL REPEATABLE READ", "BEGIN;"),
+            ("BEGIN ISOLATION LEVEL READ COMMITTED, READ WRITE", "BEGIN;"),
+            ("BEGIN TRANSACTION NOT DEFERRABLE", "BEGIN;"),
+            ("commit", "COMMIT;"),
+            ("COMMIT TRANSACTION", "COMMIT;"),
+            ("END", "COMMIT;"),
+            ("END WORK", "COMMIT;"),
+            ("rollback", "ROLLBACK;"),
+            ("ROLLBACK TRANSACTION", "ROLLBACK;"),
+            ("ABORT", "ROLLBACK;"),
+        ];
+        for (sql, want) in cases {
+            match normalise_txn_control(sql) {
+                Some(Ok(got)) => assert_eq!(got, want, "{sql}"),
+                other => panic!("{sql} normalised to {other:?}"),
+            }
+        }
+    }
+
+    /// The anti-vacuity half: the statements that must NOT be rewritten. `BEGIN AGENT SESSION` is
+    /// this database's own statement, and turning it into a plain `BEGIN` would open a transaction
+    /// where an agent branch was asked for — the write would land on main.
+    #[test]
+    fn the_normaliser_leaves_alone_what_is_not_transaction_control() {
+        assert!(
+            normalise_txn_control("BEGIN AGENT SESSION AS 'pricing' RUN 'r_1';").is_none(),
+            "BEGIN AGENT SESSION must reach the ferrodb parser untouched"
+        );
+        for sql in ["SELECT * FROM t", "INSERT INTO t VALUES (1)", "SET x = 1", "SHOW all"] {
+            assert!(normalise_txn_control(sql).is_none(), "{sql}");
+        }
+    }
+
+    /// Refused rather than accepted-and-ignored: each of these asks for a guarantee the engine
+    /// does not implement, and a client that is told "yes" has no way to find out otherwise.
+    #[test]
+    fn a_transaction_option_this_engine_cannot_honour_is_refused() {
+        for sql in [
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "START TRANSACTION READ ONLY",
+            "BEGIN TRANSACTION DEFERRABLE",
+            "SAVEPOINT a",
+            "RELEASE SAVEPOINT a",
+            "ROLLBACK TO SAVEPOINT a",
+            "COMMIT AND CHAIN",
+        ] {
+            assert!(
+                matches!(normalise_txn_control(sql), Some(Err(_))),
+                "{sql} was not refused"
+            );
+        }
+        // ...and the allowed counterpart, so the refusal is not simply "everything with options".
+        assert!(matches!(
+            normalise_txn_control("BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE"),
+            Some(Ok("BEGIN;"))
+        ));
+        assert!(matches!(parse("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+                         Some(Ok(SessionCommand::SetTransaction))));
+        assert!(matches!(parse("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), Some(Err(_))));
+    }
+
+    /// The isolation level this server reports is a claim about the engine, and it was wrong until
+    /// it was checked: `executor.rs`'s `test_snapshot_pins_at_begin` proves a transaction's
+    /// snapshot does not move, which is `repeatable read` and not `read committed`.
+    #[test]
+    fn the_reported_isolation_level_is_the_one_the_engine_actually_gives() {
+        let p = SessionParams::new();
+        assert_eq!(p.get("transaction_isolation"), Some("repeatable read"));
+        assert_eq!(p.get("default_transaction_isolation"), Some("repeatable read"));
     }
 
     #[test]
