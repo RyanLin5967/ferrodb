@@ -17,6 +17,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::{Decoded, LogicalDecoder, SchemaChange};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -86,7 +87,7 @@ fn create_table_reaches_the_feed_as_a_schema_event() {
     assert_eq!(*change, SchemaChange::CreateTable);
 
     let mut buf = Vec::new();
-    write_feed(&out.events, &mut buf).unwrap();
+    write_feed(&out.events, &Publication::unrestricted(), &mut buf).unwrap();
     let feed = String::from_utf8(buf).unwrap();
 
     assert!(feed.contains("\"op\":\"CREATE_TABLE\""), "no schema event in the feed:\n{feed}");
@@ -136,7 +137,7 @@ fn a_decoder_with_no_catalog_learns_the_table_from_the_log() {
     // And the values are right, not merely present — a decoder that learned the wrong schema would
     // still produce events, just nonsense ones.
     let mut buf = Vec::new();
-    write_feed(&out.events, &mut buf).unwrap();
+    write_feed(&out.events, &Publication::unrestricted(), &mut buf).unwrap();
     let feed = String::from_utf8(buf).unwrap();
     assert!(feed.contains("\"after\":{\"id\":3,\"qty\":30}"), "wrong values decoded:\n{feed}");
     assert!(feed.contains("\"after\":{\"id\":1,\"qty\":999}"), "the update decoded wrong:\n{feed}");
@@ -156,7 +157,7 @@ fn a_blank_decoder_keeps_two_tables_apart() {
     assert_eq!(out.schema_changes.len(), 2, "{:?}", out.schema_changes);
 
     let mut buf = Vec::new();
-    write_feed(&out.events, &mut buf).unwrap();
+    write_feed(&out.events, &Publication::unrestricted(), &mut buf).unwrap();
     let feed = String::from_utf8(buf).unwrap();
 
     let a_line = feed

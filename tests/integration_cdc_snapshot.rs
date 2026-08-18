@@ -19,6 +19,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::snapshot::snapshot_table;
 use ferrodb::replication::stream::FeedStreamer;
 use ferrodb::storage::disk_manager::DiskManager;
@@ -98,7 +99,7 @@ fn a_consumer_that_snapshots_then_streams_sees_every_row_that_ever_existed() {
     let catalog = &mut d.catalog;
     let session = &mut d.session;
 
-    let snap = snapshot_table("inventory", &d.wal, &mut snap_out, || {
+    let snap = snapshot_table("inventory", &d.wal, &Publication::unrestricted(), &mut snap_out, || {
         // The consistent read, through the engine's own MVCC visibility.
         let rows = match exec("SELECT * FROM inventory;", catalog, &bp, &txn, session) {
             Outcome::Rows(r) => r,
@@ -126,7 +127,7 @@ fn a_consumer_that_snapshots_then_streams_sees_every_row_that_ever_existed() {
     d.wal.flush().unwrap();
 
     // Stream from the handoff.
-    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog));
+    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog), Publication::unrestricted());
     let mut stream_out: Vec<u8> = Vec::new();
     let mut cursor = snap.lsn;
     let mut emitted_through = 0u64;
@@ -176,7 +177,7 @@ fn snapshot_rows_carry_their_actual_values() {
     let (bp, txn) = (d.bp.clone(), d.txn.clone());
     let catalog = &mut d.catalog;
     let session = &mut d.session;
-    let snap = snapshot_table("t", &d.wal, &mut out, || {
+    let snap = snapshot_table("t", &d.wal, &Publication::unrestricted(), &mut out, || {
         let rows = match exec("SELECT * FROM t;", catalog, &bp, &txn, session) {
             Outcome::Rows(r) => r,
             _ => panic!("SELECT did not return rows"),
@@ -206,7 +207,7 @@ fn snapshot_values_are_escaped() {
     let (bp, txn) = (d.bp.clone(), d.txn.clone());
     let catalog = &mut d.catalog;
     let session = &mut d.session;
-    snapshot_table("t", &d.wal, &mut out, || {
+    snapshot_table("t", &d.wal, &Publication::unrestricted(), &mut out, || {
         let rows = match exec("SELECT * FROM t;", catalog, &bp, &txn, session) {
             Outcome::Rows(r) => r,
             _ => panic!("SELECT did not return rows"),

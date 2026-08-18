@@ -147,6 +147,20 @@ impl<'a> Mask<'a> {
         &self.withheld
     }
 
+    /// Refuse an image whose every column was withheld.
+    ///
+    /// Minted from the mask rather than recomputed, so the refusal names the same withheld set the
+    /// renderer was working from. The byte renderer needs this for a `CREATE_TABLE` whose declared
+    /// shape projects to nothing: an empty column list is not "no columns withheld", it is a claim
+    /// that the table HAS no columns, and the Go consumer refuses that outright.
+    pub fn refuse_nothing_publishable(&self) -> Refusal {
+        Refusal {
+            publication: self.publication.to_string(),
+            table: self.table.to_string(),
+            reason: RefusalReason::NothingPublishable { withheld: self.withheld.clone() },
+        }
+    }
+
     /// Refuse a value position that has no column name.
     pub fn refuse_unnamed(&self, index: usize) -> Refusal {
         Refusal {

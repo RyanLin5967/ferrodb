@@ -38,6 +38,31 @@
 //! is the usual CDC contract and it is why events carry `commit_lsn`: it is a natural idempotence
 //! key.
 //!
+//! # A refusal is a third thing, and it is where this bug class lives — B7
+//!
+//! A [`Publication`] can refuse an event outright: an undecided table must not leave the database,
+//! whichever write path produced it. That makes a refusal the first case in this module where an
+//! event is decoded, not emitted, and **must be emitted later**, which is exactly the shape the
+//! cursor gets wrong.
+//!
+//! The naive form advances the cursor over the refused event, because the cursor is computed from
+//! every decoded event before any filter runs — deliberately, so that a fully snapshot-suppressed
+//! batch still makes progress. Applied to a refusal that reasoning inverts: a suppressed event has
+//! been decided about and will never be wanted again, while a refused event is precisely the one
+//! that must come back. So the batch is **truncated before the cursor is computed**, and the
+//! refused event is replayed on the next pump.
+//!
+//! Truncating at the offending event is not enough, and this is the third time one bug class has
+//! shipped in this pipeline. The sink lost rows twice — E74 and E75 — because its idempotence key
+//! could not distinguish siblings within one commit, and both times the mistake lived in the
+//! cursor: a commit_lsn identifies a transaction, not a row, so the first row of a commit advanced
+//! a position that then discarded its siblings. The same granularity mismatch is here. A refusal is
+//! per **event**; the cursor is per **commit**. Truncate at the event and the publishable siblings
+//! ahead of it in the same commit are written, the cursor lands on that commit's `commit_end_lsn`,
+//! and the refused row is stepped over for good — the identical loss, arrived at from the opposite
+//! direction. So the truncation is to the **start of the commit** that holds the refused event, and
+//! nothing of that commit is emitted until all of it may be.
+//!
 //! # Joining an initial snapshot
 //!
 //! One duplication is *not* left to the consumer: the overlap at a snapshot-to-stream cutover.
@@ -55,6 +80,7 @@ use super::snapshot::SnapshotBoundary;
 
 use super::jsonl::write_feed;
 use super::logical::{Decoded, LogicalDecoder};
+use super::publication::{Publication, Refusal};
 
 /// What one pump did.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,12 +117,31 @@ pub struct Pumped {
     /// emitting nothing should be able to tell "the snapshot already had all of it" from "the feed
     /// is dropping records", and those look identical from the emitted count alone.
     pub suppressed: usize,
+    /// Events this pump decoded and **refused** to write, because the publication does not allow
+    /// them out of the database.
+    ///
+    /// Counts the offending event, every sibling of it in the same commit, and everything the batch
+    /// held after it. All of them are replayed by the next pump — the cursor is deliberately left
+    /// behind the refused commit — so this is a *stall*, not a loss, and the two must not be
+    /// confused: a stalled feed is fixed by amending the publication, a lost row is not fixed by
+    /// anything.
+    pub refused: usize,
+    /// What was refused and why, for the **first** refusal in the batch.
+    ///
+    /// Present exactly when `refused > 0`. Carried in the report rather than logged and dropped,
+    /// because "emitted 0" is what a caught-up consumer looks like too, and an operator cannot tell
+    /// a stalled feed from a quiet one without being told which it is.
+    pub refusal: Option<Refusal>,
 }
 
 impl Pumped {
     /// Whether everything readable became an event or was legitimately withheld.
+    ///
+    /// A refusal makes this false. The feed is not corrupt and nothing is lost, but it has stopped
+    /// making progress and will not resume on its own, and a caller that reported that as a clean
+    /// run would be reporting a stalled pipeline as a healthy one.
     pub fn is_clean(&self) -> bool {
-        self.unresolved == 0
+        self.unresolved == 0 && self.refused == 0
     }
 
     /// How far behind the log this consumer is, in bytes.
@@ -126,11 +171,26 @@ pub struct FeedStreamer {
     /// The snapshot an initial read already delivered, when this streamer is following one.
     /// See [`FeedStreamer::resuming_after_snapshot`].
     already_snapshotted: Option<SnapshotBoundary>,
+    /// What this stream is allowed to emit. Required rather than optional: a streamer built without
+    /// naming a policy would be a feed whose egress rules depend on whether its caller remembered,
+    /// and the failure of forgetting is unrecoverable. `Publication::unrestricted()` is how a caller
+    /// says "no policy" out loud.
+    publication: Publication,
 }
 
 impl FeedStreamer {
-    pub fn new(decoder: LogicalDecoder) -> Self {
-        FeedStreamer { decoder, max_bytes: 1 << 20, already_snapshotted: None }
+    pub fn new(decoder: LogicalDecoder, publication: Publication) -> Self {
+        FeedStreamer {
+            decoder,
+            max_bytes: 1 << 20,
+            already_snapshotted: None,
+            publication,
+        }
+    }
+
+    /// The policy this streamer enforces.
+    pub fn publication(&self) -> &Publication {
+        &self.publication
     }
 
     /// Bound how much log one pump will decode. A consumer that has been away for a long time
@@ -207,6 +267,8 @@ impl FeedStreamer {
                 withheld: 0,
                 unresolved: 0,
                 suppressed: 0,
+                refused: 0,
+                refusal: None,
             });
         }
 
@@ -218,10 +280,12 @@ impl FeedStreamer {
         //
         // First: only past a commit that was actually decoded. An empty pump does not move.
         //
-        // Second: computed over every decoded event, *before* either filter below runs. A commit
-        // whose events were suppressed has still been seen and decided about, so the cursor must
-        // move past it; leaving it behind would make a fully-suppressed batch return the same
-        // cursor for ever and hang the loop.
+        // Second: computed over every event that is still a candidate, *before* either filter below
+        // runs. A commit whose events were suppressed has still been seen and decided about, so the
+        // cursor must move past it; leaving it behind would make a fully-suppressed batch return the
+        // same cursor for ever and hang the loop. "Still a candidate" is the correction B7 made to
+        // this clause, which used to say "every decoded event": a refused event has NOT been decided
+        // about and is removed above, which is the whole of the fourth part.
         //
         // Third: NEVER past the earliest record of a transaction still open. Without this, a
         // transaction that is in flight while a LATER-started one commits in the same batch gets
@@ -235,8 +299,34 @@ impl FeedStreamer {
         //
         // Clamping rewinds over T3's already-emitted events, so the `emitted_through` filter below
         // is what stops them being delivered twice.
-        let emitted_max = decoded
-            .events
+        //
+        // Fourth, and it is the one that made this comment grow a section in the module docs: a
+        // refused event is truncated away BEFORE any of the above, at the boundary of the COMMIT
+        // that holds it. See the "third instance" section up there for why the commit rather than
+        // the event, and why suppression and refusal must move the cursor differently despite
+        // looking the same from the emitted count.
+        let mut events = decoded.events;
+        let mut refused = 0usize;
+        let mut refusal: Option<Refusal> = None;
+        if let Some(at) = events.iter().position(|e| self.publication.check(e).is_err()) {
+            let r = self
+                .publication
+                .check(&events[at])
+                .expect_err("the event that just refused now passes; the publication is not pure");
+            // Back up to the FIRST event of that commit. Truncating at `at` would write the
+            // publishable siblings ahead of it and then compute the cursor over them - landing on
+            // this commit's own `commit_end_lsn` and stepping over the refused row for good.
+            let commit = events[at].commit_lsn;
+            let boundary = events
+                .iter()
+                .position(|e| e.commit_lsn == commit)
+                .expect("the refused event's own commit is in the batch");
+            refused = events.len() - boundary;
+            refusal = Some(r);
+            events.truncate(boundary);
+        }
+
+        let emitted_max = events
             .iter()
             .map(|e| e.commit_end_lsn)
             .max()
@@ -253,7 +343,6 @@ impl FeedStreamer {
         // The snapshot filter first: these events were delivered by the *initial snapshot*, not by
         // this stream, so they are not "already emitted" in the `emitted_through` sense and must
         // never move that position.
-        let mut events = decoded.events;
         let suppressed = match &self.already_snapshotted {
             None => 0,
             Some(already) => {
@@ -272,7 +361,9 @@ impl FeedStreamer {
         // transaction after that one again, on every pump, forever.
         events.retain(|e| e.commit_lsn > emitted_through);
 
-        let emitted = write_feed(&events, w)?;
+        // Refused events are already gone from `events`, so this cannot refuse - and if it ever
+        // does, it errors rather than writing a denied column, which is the right way round.
+        let emitted = write_feed(&events, &self.publication, w)?;
         let delivered_through = events
             .iter()
             .map(|e| e.commit_lsn)
@@ -289,6 +380,8 @@ impl FeedStreamer {
             unresolved: decoded.unresolved.values().sum::<usize>()
                 + decoded.undecodable.values().sum::<usize>(),
             suppressed,
+            refused,
+            refusal,
         })
     }
 }
@@ -451,9 +544,21 @@ mod tests {
             .data
     }
 
-    /// A streamer over one table at `dir_root` 7.
+    /// A streamer over one table at `dir_root` 7, with no publication policy — the shape every test
+    /// here had before B7, so what they assert is still the cursor rule and nothing else.
     fn streamer() -> FeedStreamer {
-        FeedStreamer::new(LogicalDecoder::for_table(7, "inventory", schema(), 8))
+        FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::unrestricted(),
+        )
+    }
+
+    /// A streamer that publishes only `columns` of `inventory`, for the refusal tests.
+    fn streamer_publishing(columns: &[&str]) -> FeedStreamer {
+        FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics").publishing("inventory", columns.to_vec()),
+        )
     }
 
     fn wal(tag: &str) -> (tempfile::TempDir, WalManager) {

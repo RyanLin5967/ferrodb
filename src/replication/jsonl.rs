@@ -74,12 +74,33 @@
 //! `FLOAT` is not included either — it *is* a double, so a double round-trips it exactly, and the
 //! shortest-round-trip printing below is what makes that true.
 
+//! # What may leave at all — B7
+//!
+//! Every rule above is about representing a value faithfully. A [`Publication`] is about whether the
+//! value may be represented here in the first place, and it is enforced in this module because this
+//! is where a row becomes bytes: [`row_into`] holds the allowlist, so the WAL stream, the initial
+//! snapshot and the table dump are all covered by one decision rather than by three copies of it.
+//!
+//! Two shapes on the wire follow from it:
+//!
+//! * A withheld column's key is **absent** from `before`/`after`, and the event grows
+//!   `"withheld":["ssn"]` naming what was left out. Absent-and-declared, not absent: this module's
+//!   whole position is that a consumer which cannot tell "null" from "not sent" cannot apply an
+//!   update, and silently dropping a column would be exactly that failure dressed as a feature.
+//! * The key appears **only** when something was withheld, so a feed with no publication — or one
+//!   whose every column is published — is byte-for-byte what it was before publications existed.
+//!
+//! A refusal (an undecided table, a row with nothing publishable in it) is not a line at all. It
+//! comes back as a [`Refusal`], and what the streaming caller must then do with its cursor is the
+//! hard part — see [`super::stream::FeedStreamer::pump`].
+
 use std::io::Write;
 
 use crate::catalog::column::Value;
 use crate::error::FerroError;
 
 use super::logical::{ChangeEvent, ChangeOp, SchemaChange};
+use super::publication::{Mask, Publication, Refusal};
 
 /// Append `s` to `out` as a quoted, escaped JSON string.
 ///
@@ -137,27 +158,71 @@ pub fn value_into(v: &Value, out: &mut String) {
     }
 }
 
-fn row_into(columns: &[String], values: &[Value], out: &mut String) {
-    // A row whose value count disagrees with its column count cannot be keyed honestly. Rather than
-    // emit a half-labelled object, the extra or missing positions are made visible: surplus values
-    // get explicit synthetic keys, so nothing is dropped without a reader noticing.
+/// Render one row as a JSON object, **through the publication's mask**.
+///
+/// This is the single function in the codebase that turns a row into bytes, which is why the
+/// allowlist is enforced here rather than at any of the three callers. A column the mask does not
+/// publish is not written: not nulled, not renamed, not emptied — the key is absent, and
+/// [`to_json_line`] declares its name in the event's `withheld` list instead.
+///
+/// A row whose value count disagrees with its column count cannot be keyed honestly. Rather than
+/// emit a half-labelled object, the extra or missing positions are made visible: with no policy in
+/// force, surplus values get explicit synthetic keys, so nothing is dropped without a reader
+/// noticing. Under an allowlist a nameless value is instead **refused** — a policy cannot decide
+/// about a column it cannot name, and a guard that falls through to allow when it cannot read its
+/// own input is not a guard.
+fn row_into(
+    mask: &Mask<'_>,
+    columns: &[String],
+    values: &[Value],
+    out: &mut String,
+) -> Result<(), Refusal> {
     out.push('{');
+    // Counted rather than using the loop index: a withheld FIRST column with `if i > 0` would leave
+    // a leading comma and emit `{,"qty":10}`, which is not JSON at all. The separator has to follow
+    // what was written, not what was considered.
+    let mut written = 0usize;
     for (i, v) in values.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
         match columns.get(i) {
-            Some(name) => escape_json_into(name, out),
-            None => escape_json_into(&format!("__unnamed_column_{i}"), out),
+            Some(name) => {
+                if !mask.publishes(name) {
+                    continue;
+                }
+                if written > 0 {
+                    out.push(',');
+                }
+                escape_json_into(name, out);
+            }
+            None if mask.may_name_a_surplus_value() => {
+                if written > 0 {
+                    out.push(',');
+                }
+                escape_json_into(&format!("__unnamed_column_{i}"), out);
+            }
+            None => return Err(mask.refuse_unnamed(i)),
         }
         out.push(':');
         value_into(v, out);
+        written += 1;
     }
     out.push('}');
+    Ok(())
 }
 
 /// One change event as a single line of JSON, **without** the trailing newline.
-pub fn to_json_line(e: &ChangeEvent) -> String {
+///
+/// Refuses rather than returns bytes when the publication has not decided about the event's table,
+/// or when nothing in the row is publishable. A caller advancing a cursor must read
+/// [`super::stream::FeedStreamer::pump`] before deciding what to do with the refusal: the event is
+/// not lost, but only if the cursor stays behind the commit that produced it.
+pub fn to_json_line(e: &ChangeEvent, publication: &Publication) -> Result<String, Refusal> {
+    let mask = publication.check(e)?;
+    line_with_mask(e, &mask)
+}
+
+/// The renderer both entry points share, so [`to_json_line`] and [`write_feed`] cannot disagree
+/// about what a masked event looks like on the wire.
+fn line_with_mask(e: &ChangeEvent, mask: &Mask<'_>) -> Result<String, Refusal> {
     let mut out = String::with_capacity(128);
     out.push_str("{\"table\":");
     escape_json_into(&e.table, &mut out);
@@ -180,7 +245,7 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
             out.push_str("null")
         }
         ChangeOp::Update { old, .. } | ChangeOp::Delete { old } => {
-            row_into(&e.columns, old, &mut out)
+            row_into(mask, &e.columns, old, &mut out)?
         }
     }
 
@@ -199,9 +264,17 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
         // A schema event's payload is the table's shape, not a row. Keyed under `columns` so a
         // consumer never confuses it with data.
         ChangeOp::Schema { columns, .. } => {
+            // **The declared shape goes through the same mask as a row.** A withheld column's name
+            // and type are themselves information that must not leave — and worse, a consumer told
+            // about a column it will never receive a value for creates it and then reports the
+            // column as permanently null, which reads as data loss rather than as policy.
             out.push_str("{\"columns\":[");
-            for (i, c) in columns.iter().enumerate() {
-                if i > 0 {
+            let mut written = 0usize;
+            for c in columns.iter() {
+                if !mask.publishes(&c.name) {
+                    continue;
+                }
+                if written > 0 {
                     out.push(',');
                 }
                 out.push_str("{\"name\":");
@@ -211,24 +284,45 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
                 out.push_str(",\"nullable\":");
                 out.push_str(if c.nullable { "true" } else { "false" });
                 out.push('}');
+                written += 1;
             }
             out.push_str("]}");
+            // Unreachable while a `CREATE_TABLE`'s spec list and the event's column list come from
+            // the same DDL record, because the publication refuses an event whose every column is
+            // withheld before this runs. Kept because the byte it would otherwise emit is
+            // `{"columns":[]}`, which claims the table has no columns at all — a different and
+            // false statement, and one the Go consumer refuses by name.
+            if written == 0 && !columns.is_empty() {
+                return Err(mask.refuse_nothing_publishable());
+            }
         }
-        ChangeOp::Read { row } => row_into(&e.columns, row, &mut out),
+        ChangeOp::Read { row } => row_into(mask, &e.columns, row, &mut out)?,
         ChangeOp::Insert { new } | ChangeOp::Update { new, .. } => {
-            row_into(&e.columns, new, &mut out)
+            row_into(mask, &e.columns, new, &mut out)?
         }
         ChangeOp::Delete { .. } => out.push_str("null"),
     }
 
+    // Declared only when something was actually withheld, so a feed with no policy — or one whose
+    // every column is published — is byte-for-byte what it was before publications existed. A
+    // consumer seeing this key has been told a column exists that it is not being sent, which is a
+    // true statement it can act on; a consumer seeing the key absent has been told nothing was held
+    // back, which is also true.
+    if !mask.withheld().is_empty() {
+        out.push_str(",\"withheld\":[");
+        for (i, c) in mask.withheld().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            escape_json_into(c, &mut out);
+        }
+        out.push(']');
+    }
+
     out.push('}');
-    out
+    Ok(out)
 }
 
-/// Write a feed of events as JSON Lines.
-///
-/// Returns how many lines were written, so a caller can tell "wrote nothing" from "wrote
-/// something" without re-reading its own output.
 /// Render a table's live rows as one JSON array of objects — the **source** side of a diff.
 ///
 /// # Why this lives here and not in the example that calls it
@@ -247,27 +341,58 @@ pub fn to_json_line(e: &ChangeEvent) -> String {
 ///
 /// Row order is by the rows as given and is **not** part of the contract: the consumer indexes both
 /// sides by primary key before comparing, so ordering cannot produce a false difference.
+///
+/// The publication applies here too, and for a reason worth stating: a dump is egress. The rows go
+/// to a file that a consumer reads, so a column withheld from the feed and printed by the dump has
+/// left the database just as thoroughly — and the diff would then compare a projected feed against
+/// an unprojected source and report the withheld column as a data mismatch, which is the wrong
+/// answer to the wrong question.
 pub fn write_table_json<W: Write>(
+    table: &str,
     columns: &[String],
     rows: &[Vec<Value>],
+    publication: &Publication,
     w: &mut W,
 ) -> Result<usize, FerroError> {
+    let mask = publication.mask_for(table, columns)?;
     let mut out = String::from("[");
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        row_into(columns, row, &mut out);
+        row_into(&mask, columns, row, &mut out)?;
     }
     out.push(']');
     writeln!(w, "{out}").map_err(|e| FerroError::Io(format!("write table json: {e}")))?;
     Ok(rows.len())
 }
 
-pub fn write_feed<W: Write>(events: &[ChangeEvent], w: &mut W) -> Result<usize, FerroError> {
+/// Write a feed of events as JSON Lines, **or write none of them**.
+///
+/// Returns how many lines were written, so a caller can tell "wrote nothing" from "wrote something"
+/// without re-reading its own output.
+///
+/// # Every event is decided before any byte is written
+///
+/// The publication is asked about the whole batch first, and a single refusal means nothing is
+/// written at all. A half-written batch is the worst of both outcomes: the caller gets an error, so
+/// it must assume the write failed, while the consumer already holds the prefix — and for the
+/// snapshot path, that prefix is a partial table that looks like a complete one.
+///
+/// This is a check-then-act shape, which in this codebase usually means a defect, so: it is sound
+/// here because nothing between the two passes can change the answer. `events` is a shared borrow,
+/// the publication is immutable, and `check` is a pure function of the two. There is no window to
+/// race, unlike the WAL frontier or the log base, which move under a reader by design.
+pub fn write_feed<W: Write>(
+    events: &[ChangeEvent],
+    publication: &Publication,
+    w: &mut W,
+) -> Result<usize, FerroError> {
+    let masks: Vec<Mask<'_>> =
+        events.iter().map(|e| publication.check(e)).collect::<Result<_, Refusal>>()?;
     let mut n = 0;
-    for e in events {
-        let line = to_json_line(e);
+    for (e, mask) in events.iter().zip(&masks) {
+        let line = line_with_mask(e, mask)?;
         writeln!(w, "{line}").map_err(|err| FerroError::Io(format!("write feed: {err}")))?;
         n += 1;
     }
@@ -279,6 +404,13 @@ pub fn write_feed<W: Write>(events: &[ChangeEvent], w: &mut W) -> Result<usize, 
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Render with no policy in force. Every test below that is not about publications uses this, so
+    /// that what it asserts is the encoding rather than the encoding-plus-a-policy — and so that the
+    /// bytes it pins are the ones a feed with no publication still emits today.
+    fn line(e: &ChangeEvent) -> String {
+        to_json_line(e, &Publication::unrestricted()).expect("an unrestricted feed refused an event")
+    }
 
     fn event(op: ChangeOp) -> ChangeEvent {
         ChangeEvent {
@@ -294,7 +426,7 @@ mod tests {
 
     #[test]
     fn an_insert_line_carries_after_and_a_null_before() {
-        let line = to_json_line(&event(ChangeOp::Insert {
+        let line = line(&event(ChangeOp::Insert {
             new: vec![Value::Integer(1), Value::Integer(10)],
         }));
         assert!(line.contains("\"op\":\"INSERT\""), "{line}");
@@ -305,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_delete_line_carries_before_and_a_null_after() {
-        let line = to_json_line(&event(ChangeOp::Delete {
+        let line = line(&event(ChangeOp::Delete {
             old: vec![Value::Integer(2), Value::Integer(20)],
         }));
         assert!(line.contains("\"op\":\"DELETE\""), "{line}");
@@ -315,7 +447,7 @@ mod tests {
 
     #[test]
     fn an_update_line_carries_both_images() {
-        let line = to_json_line(&event(ChangeOp::Update {
+        let line = line(&event(ChangeOp::Update {
             old: vec![Value::Integer(1), Value::Integer(10)],
             new: vec![Value::Integer(1), Value::Integer(999)],
         }));
@@ -378,7 +510,7 @@ mod tests {
             columns: Arc::new(vec!["we\"ird".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
         };
-        let line = to_json_line(&e);
+        let line = line(&e);
         assert!(line.contains("\"we\\\"ird\":1"), "column name was not escaped: {line}");
         assert!(line.contains("\"odd\\\"table\""), "table name was not escaped: {line}");
     }
@@ -395,7 +527,7 @@ mod tests {
             columns: Arc::new(vec!["a".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1), Value::Integer(2)] },
         };
-        let line = to_json_line(&e);
+        let line = line(&e);
         assert!(line.contains("\"a\":1"), "{line}");
         assert!(
             line.contains("__unnamed_column_1\":2"),
@@ -538,7 +670,7 @@ mod tests {
                 ],
             },
         };
-        let line = to_json_line(&e);
+        let line = line(&e);
         assert!(line.contains("\"i\":42"), "INTEGER must stay a bare number: {line}");
         assert!(line.contains("\"f\":1.5"), "FLOAT must stay a bare number: {line}");
         assert!(line.contains("\"b\":true"), "{line}");
@@ -587,7 +719,7 @@ mod tests {
             columns: Arc::new(vec!["a".into(), "b".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1), Value::Null] },
         };
-        let line = to_json_line(&e);
+        let line = line(&e);
         assert!(line.contains("\"b\":null"), "the null column was omitted entirely: {line}");
     }
 
@@ -598,7 +730,7 @@ mod tests {
             event(ChangeOp::Delete { old: vec![Value::Integer(1), Value::Null] }),
         ];
         let mut buf: Vec<u8> = Vec::new();
-        let n = write_feed(&events, &mut buf).unwrap();
+        let n = write_feed(&events, &Publication::unrestricted(), &mut buf).unwrap();
         assert_eq!(n, 2);
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text.lines().count(), 2, "one object per line: {text}");

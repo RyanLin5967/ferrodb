@@ -19,6 +19,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -73,7 +74,7 @@ fn main() {
         .expect("decode");
 
     let mut stdout = std::io::stdout().lock();
-    let n = write_feed(&out.events, &mut stdout).expect("write feed");
+    let n = write_feed(&out.events, &Publication::unrestricted(), &mut stdout).expect("write feed");
 
     // Everything that did NOT become an event, on stderr. A consumer that only reads stdout gets a
     // clean feed; an operator watching the terminal still learns what was skipped and why.

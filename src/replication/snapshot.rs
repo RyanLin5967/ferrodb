@@ -112,6 +112,7 @@ use crate::wal::txn::{Snapshot as TxnSnapshot, TxnManager};
 
 use super::jsonl::write_feed;
 use super::logical::{ChangeEvent, ChangeOp};
+use super::publication::Publication;
 
 /// What a snapshot captured, and where the stream must resume.
 #[derive(Debug)]
@@ -156,6 +157,7 @@ impl Snapshot {
 pub fn snapshot_table<W, F>(
     table: &str,
     wal: &Arc<WalManager>,
+    publication: &Publication,
     w: &mut W,
     read_rows: F,
 ) -> Result<Snapshot, FerroError>
@@ -199,7 +201,12 @@ where
         })
         .collect();
 
-    let n = write_feed(&events, w)?;
+    // The publication applies to a backfill exactly as it does to the stream, and it has to be the
+    // same check: a column withheld from every streamed change and shipped by the initial snapshot
+    // has left the database once, which is all it takes. E75 is the reason this is stated rather than
+    // assumed — the fix for a multi-row loss landed in the stream path and missed the backfill, and
+    // the two paths had to be repaired separately.
+    let n = write_feed(&events, publication, w)?;
 
     Ok(Snapshot {
         table: table.to_string(),
@@ -287,8 +294,8 @@ impl SnapshotBoundary {
 ///
 /// ```text
 /// let mut b = SnapshotBoundaryBuilder::new(txn.begin_snapshot_read()?);
-/// b.deliver("orders", cols_a, rows_a, &mut out)?;      // read under b.reader()
-/// b.deliver("shipments", cols_b, rows_b, &mut out)?;
+/// b.deliver("orders", cols_a, rows_a, &pubn, &mut out)?;    // read under b.reader()
+/// b.deliver("shipments", cols_b, rows_b, &pubn, &mut out)?;
 /// txn.end_read_only(b.reader())?;
 /// let (boundary, pin) = b.finish();
 /// ```
@@ -330,10 +337,11 @@ impl SnapshotBoundaryBuilder {
         table: &str,
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+        publication: &Publication,
         w: &mut W,
     ) -> Result<usize, FerroError> {
         let events = read_events(table, &self.handoff, columns, rows);
-        let n = write_feed(&events, w)?;
+        let n = write_feed(&events, publication, w)?;
         self.tables.insert(table.to_string());
         Ok(n)
     }
@@ -447,6 +455,7 @@ impl std::fmt::Debug for ExactSnapshot {
 pub fn snapshot_table_exact<W, F>(
     table: &str,
     txn: &TxnManager,
+    publication: &Publication,
     w: &mut W,
     read_rows: F,
 ) -> Result<ExactSnapshot, FerroError>
@@ -490,7 +499,7 @@ where
     // it: the table set is whatever `deliver` recorded, and `deliver` records only what it wrote.
     let reader_txn_id = handoff.txn_id;
     let mut builder = SnapshotBoundaryBuilder::new(handoff);
-    let n = builder.deliver(table, columns, rows, w)?;
+    let n = builder.deliver(table, columns, rows, publication, w)?;
     let (boundary, pin) = builder.finish();
 
     Ok(ExactSnapshot { table: table.to_string(), rows: n, boundary, pin, reader_txn_id })
@@ -520,7 +529,7 @@ mod tests {
     fn a_snapshot_writes_read_events_and_reports_its_handoff() {
         let (_d, w) = wal("basic");
         let mut buf = Vec::new();
-        let snap = snapshot_table("inventory", &w, &mut buf, || Ok(rows())).unwrap();
+        let snap = snapshot_table("inventory", &w, &Publication::unrestricted(), &mut buf, || Ok(rows())).unwrap();
 
         assert_eq!(snap.rows, 2);
         assert_eq!(snap.table, "inventory");
@@ -540,7 +549,7 @@ mod tests {
         let mut buf = Vec::new();
 
         // A write lands *during* the scan, exactly as it would on a live database.
-        let snap = snapshot_table("t", &w, &mut buf, || {
+        let snap = snapshot_table("t", &w, &Publication::unrestricted(), &mut buf, || {
             w.append(1, 0, &RecKind::Begin).unwrap();
             w.append(1, 0, &RecKind::Commit).unwrap();
             w.flush().unwrap();
@@ -571,7 +580,7 @@ mod tests {
     fn a_quiet_database_hands_off_exactly() {
         let (_d, w) = wal("quiet");
         let mut buf = Vec::new();
-        let snap = snapshot_table("t", &w, &mut buf, || Ok(rows())).unwrap();
+        let snap = snapshot_table("t", &w, &Publication::unrestricted(), &mut buf, || Ok(rows())).unwrap();
 
         assert!(!snap.concurrent_writes, "nothing wrote, yet concurrent writes were reported");
         assert_eq!(snap.lsn, snap.lsn_after);
@@ -585,7 +594,7 @@ mod tests {
         let (_d, w) = wal("empty");
         let mut buf = Vec::new();
         let snap =
-            snapshot_table("t", &w, &mut buf, || Ok((vec!["id".into()], Vec::new()))).unwrap();
+            snapshot_table("t", &w, &Publication::unrestricted(), &mut buf, || Ok((vec!["id".into()], Vec::new()))).unwrap();
 
         assert_eq!(snap.rows, 0);
         assert!(buf.is_empty(), "an empty table wrote lines: {:?}", String::from_utf8_lossy(&buf));
@@ -617,7 +626,7 @@ mod tests {
         let (_d, txn) = engine("exact_basic");
         let mut buf = Vec::new();
         let snap =
-            snapshot_table_exact("inventory", &txn, &mut buf, |_reader| Ok(rows())).unwrap();
+            snapshot_table_exact("inventory", &txn, &Publication::unrestricted(), &mut buf, |_reader| Ok(rows())).unwrap();
 
         assert_eq!(snap.rows, 2);
         let text = String::from_utf8(buf).unwrap();
@@ -643,7 +652,7 @@ mod tests {
     fn a_failed_exact_scan_closes_its_reader_and_yields_no_handoff() {
         let (_d, txn) = engine("exact_fail");
         let mut buf = Vec::new();
-        let r = snapshot_table_exact("t", &txn, &mut buf, |_reader| {
+        let r = snapshot_table_exact("t", &txn, &Publication::unrestricted(), &mut buf, |_reader| {
             Err(FerroError::Io("table vanished".into()))
         });
         assert!(r.is_err(), "a failed scan produced a snapshot");
@@ -670,7 +679,7 @@ mod tests {
         let bp = txn.bp.clone();
         let mut buf = Vec::new();
 
-        let r = snapshot_table_exact("t", &txn, &mut buf, |reader| {
+        let r = snapshot_table_exact("t", &txn, &Publication::unrestricted(), &mut buf, |reader| {
             // Writing through the reader is what makes the close refuse.
             let mut heap = HeapFileManager::new(bp.clone()).unwrap();
             heap.set_transaction(txn.clone(), reader);
@@ -712,7 +721,7 @@ mod tests {
         let mut b = SnapshotBoundaryBuilder::new(txn.begin_snapshot_read().unwrap());
         let reader = b.reader();
         let (cols, rows) = rows();
-        b.deliver("orders", cols, rows, &mut buf).unwrap();
+        b.deliver("orders", cols, rows, &Publication::unrestricted(), &mut buf).unwrap();
         txn.end_read_only(reader).unwrap();
         let (boundary, _pin) = b.finish();
 
@@ -760,7 +769,7 @@ mod tests {
         txn.wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
 
         let mut buf = Vec::new();
-        let err = snapshot_table_exact("t", &txn, &mut buf, |_reader| Ok(rows()))
+        let err = snapshot_table_exact("t", &txn, &Publication::unrestricted(), &mut buf, |_reader| Ok(rows()))
             .expect_err("a snapshot was handed back over a resume point the log no longer holds");
         assert!(format!("{err}").contains("truncated"), "wrong reason: {err}");
         assert!(buf.is_empty(), "a snapshot that never read anything wrote rows");
@@ -781,7 +790,7 @@ mod tests {
     fn a_failed_scan_yields_no_handoff() {
         let (_d, w) = wal("fail");
         let mut buf = Vec::new();
-        let r = snapshot_table("t", &w, &mut buf, || {
+        let r = snapshot_table("t", &w, &Publication::unrestricted(), &mut buf, || {
             Err(FerroError::Io("table vanished".into()))
         });
         assert!(r.is_err(), "a failed scan produced a snapshot");

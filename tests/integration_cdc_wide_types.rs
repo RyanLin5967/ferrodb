@@ -27,6 +27,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -131,7 +132,7 @@ impl Db {
         assert!(!out.events.is_empty(), "nothing to serialise; the test would be vacuous");
         let path = self.dir.path().join("feed.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        let n = write_feed(&out.events, &mut f).expect("write feed");
+        let n = write_feed(&out.events, &Publication::unrestricted(), &mut f).expect("write feed");
         assert_eq!(n, out.events.len(), "write_feed miscounted its own output");
         path
     }

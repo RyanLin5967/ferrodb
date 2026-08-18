@@ -1,4 +1,4 @@
-//! E11 — a streaming CDC source over TCP. `cdc_server <db> <addr> <rows>`
+//! E11 — a streaming CDC source over TCP. `cdc_server <db> <addr> <rows> [publication-file]`
 //!
 //! Writes a workload on one thread while serving the change feed on another, so a consumer sees
 //! events arrive as transactions commit rather than as one batch at the end.
@@ -8,6 +8,14 @@
 //! server then writes JSON Lines until the workload is finished and the consumer is caught up, at
 //! which point it closes. Resuming is the same connection made again with the last
 //! `commit_end_lsn` the consumer processed.
+//!
+//! # A publication stops the serve rather than skipping an event — B7
+//!
+//! With a publication file, the feed carries only the columns it names. If it refuses an event, this
+//! server prints the refusal and closes the connection instead of continuing to poll: a refusal does
+//! not advance the cursor, so the same batch would be re-decoded and re-refused for as long as the
+//! process ran — a busy loop that emits nothing while reporting no error. Closing hands the operator
+//! the reason, and the consumer's cursor is still exactly where the refused commit begins.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -21,6 +29,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::stream::FeedStreamer;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -31,6 +40,14 @@ fn main() {
     let db = args.get(1).cloned().unwrap_or_else(|| "cdc.db".into());
     let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:0".into());
     let rows: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+    // No publication argument means no policy, said out loud. A file that will not parse is a hard
+    // exit: serving everything because the policy could not be read is the one outcome an operator
+    // who passed a policy file cannot recover from.
+    let publication = match args.get(4) {
+        None => Publication::unrestricted(),
+        Some(path) => Publication::load(std::path::Path::new(path))
+            .unwrap_or_else(|e| { eprintln!("cdc_server: {e}"); std::process::exit(1); }),
+    };
 
     // Single-writer lock, taken before the file is opened. Two processes on one database both build
     // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
@@ -63,7 +80,7 @@ fn main() {
 
     // The decoder is built AFTER the table exists, so its dir_root mapping includes it. Built
     // before, it would resolve nothing and every change would be reported unresolved.
-    let streamer = Arc::new(FeedStreamer::new(LogicalDecoder::new(&catalog)));
+    let streamer = Arc::new(FeedStreamer::new(LogicalDecoder::new(&catalog), publication));
     let listener = TcpListener::bind(&addr).expect("bind");
     // **Writes that tolerate a closed pipe.** `println!` PANICS on EPIPE — proven, not assumed:
     // closing this process's stdout before its first write kills it with
@@ -142,6 +159,16 @@ fn main() {
             };
             cursor = pumped.cursor;
             emitted_through = pumped.emitted_through;
+            // Before the caught-up test, because a refusal also emits nothing and would otherwise be
+            // read as "caught up" or spun on for ever.
+            if let Some(refusal) = &pumped.refusal {
+                eprintln!(
+                    "cdc_server: the feed cannot advance past cursor {cursor}: {refusal}\n\
+                     cdc_server: {} event(s) were held back, none lost; closing the connection",
+                    pumped.refused
+                );
+                break;
+            }
             if pumped.emitted == 0 {
                 // Caught up. Finish only when the workload is finished too, so a consumer is not
                 // disconnected merely for being faster than the writer.
