@@ -1852,6 +1852,17 @@ impl AgentRuntime {
     /// The refusal is the point. `SIMULATE` never trips it, because it re-evaluates each candidate
     /// against the base as it stands at that candidate's turn; a caller that holds an evaluation
     /// across another merge gets an error instead of a silently wrong publication.
+    ///
+    /// **Two costs this imposes on every ordinary `MERGE`, stated rather than discovered:**
+    ///
+    /// * The touched tables are scanned twice — once to evaluate, once to fingerprint here. On a
+    ///   large table that doubles the merge's scan. The alternative is publishing against a base
+    ///   that may have moved, and there is no cheaper sufficient signal: a row count cannot see an
+    ///   update, and the version map only moves when a merge publishes.
+    /// * `MERGE` can now return an `Err` where it previously always returned a `MergeReport`. It
+    ///   happens only when another connection changed the base between this merge's own evaluate
+    ///   and publish, and the answer is to run `MERGE` again. The pre-split code had the same race
+    ///   and resolved it by publishing the stale merge, which is the failure this replaces.
     fn publish_evaluation_as(
         &self,
         ctx: &mut ExecCtx,
@@ -2500,6 +2511,13 @@ fn cells_text(guard: &Guard, schema: &Schema, row: &[Value]) -> String {
 }
 
 /// One cell as text. Deliberately not a float rendering of a decimal: the digits are the value.
+///
+/// **This is the fourth copy of this match in the tree** — `cli::display_value`,
+/// `optimizer::format_value` and `tel::guard::write_value` are the others, each private to its
+/// module, and the Decimal comment has already been copy-pasted between them. The right fix is one
+/// `impl Display for Value` in `catalog::column` and four deletions; it is not done here because
+/// three of those four files belong to other work in flight, and a fifth copy is cheaper to delete
+/// later than a merge conflict is to resolve now.
 fn cell_text(v: &Value) -> String {
     match v {
         Value::Boolean(b) => b.to_string(),
@@ -2535,6 +2553,13 @@ fn premise_rows_of(reads: &[crate::provenance::readset::ReadSet]) -> Vec<(TableI
 /// of movement a stale evaluation must not be published against. The bytes come from `encode_row`,
 /// which is the same encoding the branch trees store, so two values that differ only in variant
 /// (`Integer(5)` against `Float(5.0)`) do not collide.
+///
+/// **Its precision floor is `row_id_of`'s, and that is inherited rather than chosen.** The map
+/// handed in is keyed by row identity derived from the first column, so two rows whose first
+/// column collides — two `NULL`s, both `RowId(0)` — collapse into one entry, and a change to the
+/// shadowed row moves nothing here. The merge itself is keyed the same way and has the same blind
+/// spot; `row_id_of` is documented as the stand-in for a surrogate minted at insert, and the day
+/// it becomes one this becomes exact with no change here.
 fn fingerprint_rows(rows: &BTreeMap<(u32, u64), Vec<Value>>) -> Result<u64, FerroError> {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for ((t, r), row) in rows {

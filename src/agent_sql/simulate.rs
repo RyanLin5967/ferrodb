@@ -45,6 +45,18 @@
 //! twelve candidates does not need a client to tidy up after it, and why it costs nothing
 //! permanently.
 //!
+//! # What does NOT compose with this, stated so it is not discovered
+//!
+//! **Escrow.** `claim_escrow` reserves headroom on a bounded cell *for a branch*, and a candidate's
+//! branch does not exist until `simulate` forks it — so nothing can claim for a candidate, and a
+//! candidate that writes an escrow-bounded cell is refused at write time with "claim more before
+//! writing". That is escrow working exactly as designed; the simulation reports the candidate as
+//! errored rather than admitting it. The two features are not merely unwired: escrow models
+//! *concurrent consumers* of one pool, and candidates are *alternatives* of which at most a few
+//! are ever admitted, so giving every candidate a claim would reserve slack for work that will
+//! never happen. Pinned by
+//! `a_candidate_writing_an_escrow_bounded_cell_errors_visibly_rather_than_overdrawing`.
+//!
 //! A loser is deliberately **not quarantined**, even though a production `MERGE` quarantines a
 //! branch the gate declines. Quarantine is a *hold for inspection*: it takes the branch out of
 //! `live_branches`, which is exactly the set the lease scan walks, so quarantining every losing
