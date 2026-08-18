@@ -521,6 +521,52 @@ fn who_wrote_row_answers_after_the_database_is_reopened() {
     assert_eq!(fresh.describe_row(one), "unattributed");
 }
 
+/// **The handoff to the runtime lane, compiled rather than described.**
+///
+/// `AgentRuntime` holds its provenance store as `Arc<dyn ProvenanceStore>` and all three of its
+/// constructors build a `MemProvenanceStore`. Wiring the durable one is a one-line change in each,
+/// in a file this lane does not own — so this test does the part that can be checked from here:
+/// that `DurableProvenanceStore` really is usable through that exact type, with every trait method
+/// exercised behind the object rather than on the concrete struct.
+///
+/// Without this, "it is a drop-in replacement" would be a claim in a summary. A missing `Send`, a
+/// method taking `&mut self`, or a signature that did not match would only be discovered by the
+/// lane that has to do the wiring.
+#[test]
+fn the_durable_store_is_usable_as_the_trait_object_agent_runtime_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("provenance.log");
+    let entity = a_run(0, "restock-agent", "run-42", "2026-05", "top up everything below reorder");
+    let rid = RecordId { page_id: 4, slot_num: 2 };
+
+    let id = {
+        let store: Arc<dyn ProvenanceStore> =
+            Arc::new(DurableProvenanceStore::open(&path).unwrap());
+        let id = store.intern(&entity).unwrap();
+        store.stamp(rid, id).unwrap();
+        assert_eq!(store.attribute(rid).unwrap(), id);
+        assert_eq!(store.lookup(id).unwrap().agent_id, "restock-agent");
+
+        // Shared across threads, which is what `AgentRuntime` does with it: two sessions for one
+        // run must reach the same slot.
+        let other = Arc::clone(&store);
+        let mine = entity.clone();
+        let same = std::thread::spawn(move || other.intern(&mine).unwrap()).join().unwrap();
+        assert_eq!(same, id, "two sessions for one run got two slots");
+        id
+    };
+
+    // And the durability is intact through the trait object, which is the whole point of swapping
+    // the implementation there.
+    let store: Arc<dyn ProvenanceStore> = Arc::new(DurableProvenanceStore::open(&path).unwrap());
+    assert_eq!(store.attribute(rid).unwrap(), id);
+    assert_eq!(store.lookup(id).unwrap().run_id, "run-42");
+
+    // Anti-vacuity: the store the runtime builds today answers nothing about the same row.
+    let today: Arc<dyn ProvenanceStore> = Arc::new(MemProvenanceStore::new());
+    assert_eq!(today.attribute(rid).unwrap(), ProvId::NONE);
+}
+
 /// A run bound to a transaction that then aborts leaves nothing in the log to retract.
 ///
 /// **Breaking shape:** a rolled-back agent transaction. If the identity record were written when
