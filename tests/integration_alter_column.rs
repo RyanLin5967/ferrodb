@@ -34,6 +34,7 @@ use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
 use ferrodb::replication::logical::{ChangeOp, LogicalDecoder, SchemaChange};
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::tel::merge::{ConflictKind, MergeOutcome};
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
@@ -196,49 +197,166 @@ fn rows_written_before_the_column_are_still_readable_after_it() {
     );
 }
 
-/// The rewrite must not disturb the primary index, which maps a key to a physical slot the rewrite
-/// can move. Breaking shape: a lookup by key, which takes the index path rather than a scan.
+/// The rewrite must not disturb the primary index, which maps a key to a **physical slot** the
+/// rewrite can move.
+///
+/// Breaking shape, and every clause of it is load-bearing — a fire-check caught the first version
+/// of this test proving nothing:
+///
+/// - **rows big enough to fill pages.** Growing a tuple that no longer fits its page makes
+///   `HeapFileManager::update` delete the slot and re-insert elsewhere, which changes its
+///   `RecordId`. `Page::update` also does not reclaim the bytes it grew out of, so a full page
+///   spills after the first row on it grows, not after the last.
+/// - **a query that actually uses the index.** With no statistics the cost model picks a
+///   sequential scan, which finds the row whatever the index says — so the first version of this
+///   test passed with the repointing deleted. `ANALYZE` before the alter and an `EXPLAIN`
+///   assertion after it are what make the index the thing being measured.
 #[test]
 fn a_lookup_by_key_still_finds_a_row_the_rewrite_moved() {
     let mut d = db();
-    mid_stream_workload(&mut d);
-    // Enough rows that at least some of them have to be relocated when every tuple grows.
-    for i in 4..60 {
-        d.sql(&format!("INSERT INTO inv VALUES ({i}, {}, 'x');", i * 10));
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, pad VARCHAR(200));");
+    let pad = "x".repeat(180);
+    for i in 1..=200 {
+        d.sql(&format!("INSERT INTO inv VALUES ({i}, '{pad}');"));
     }
-    d.sql("ALTER TABLE inv ADD COLUMN sku VARCHAR(40);");
+    d.sql("ANALYZE inv;");
+    d.sql("ALTER TABLE inv ADD COLUMN note VARCHAR(20);");
 
-    for i in [1, 2, 3, 40, 59] {
-        let rows = d.rows(&format!("SELECT id, qty FROM inv WHERE id = {i};"));
+    let plan = explain(&mut d, "EXPLAIN SELECT id FROM inv WHERE id = 137;");
+    assert!(
+        plan.contains("Index scan"),
+        "this test only measures the primary index if the plan uses it, and it does not:\n{plan}"
+    );
+
+    for i in [1, 17, 137, 200] {
+        let rows = d.rows(&format!("SELECT id FROM inv WHERE id = {i};"));
         assert_eq!(rows.len(), 1, "row {i} is unreachable by key after the rewrite: {rows:?}");
         assert_eq!(rows[0][0], Value::Integer(i));
     }
     let all = d.rows("SELECT id FROM inv;");
-    assert_eq!(all.len(), 59, "the rewrite lost rows: {}", all.len());
+    assert_eq!(all.len(), 200, "the rewrite lost rows: {}", all.len());
 }
 
-/// A secondary index over a **retyped** column has to be rebuilt: `Value` orders by type rank
-/// before value, so old-typed keys sort into a different region of the tree from every key written
-/// afterwards and a lookup for the new type walks straight past them.
+/// `EXPLAIN` text, so a test can prove which plan it is actually measuring.
+fn explain(d: &mut Db, sql: &str) -> String {
+    match d.sql(sql) {
+        Outcome::Explain(t) => t,
+        other => panic!("`{sql}` did not explain: {}", outcome_name(&other)),
+    }
+}
+
+/// **A secondary index over a retyped column keeps answering, and this test pins the reason.**
 ///
-/// Breaking shape: an indexed column, retyped, then queried through the index.
+/// The reason is not that anything rebuilds the index — nothing does, deliberately. It is that
+/// `Value::cmp` compares the whole numeric band by VALUE rather than by type rank, so the
+/// `Integer` key an entry was written with is *equal* to the `BigInt` the column became, and the
+/// tree stays ordered across the change. Every conversion in the widening allowlist stays inside
+/// that band or leaves the type alone.
+///
+/// This is worth a test of its own precisely because it is load-bearing and invisible: an earlier
+/// version of `alter_table` rebuilt the index on the opposite belief, doing unnecessary work and
+/// silently discarding the historical `(old value, key)` entries E66 keeps on purpose. If
+/// `Value::cmp` ever stopped comparing across the numeric band, nothing else in the suite would
+/// notice that every pre-retype index entry had become unreachable.
+///
+/// Breaking shape: entries written BEFORE the retype, looked up by the NEW type. Measured against
+/// the index structure rather than through a query, because this cost model does not choose a
+/// secondary index for a table this size — measured, before and after the alter — so a
+/// query-level assertion would fall back to a sequential scan and prove only that the rows exist.
 #[test]
 fn a_secondary_index_over_a_retyped_column_still_answers() {
     let mut d = db();
-    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
-    d.sql("INSERT INTO inv VALUES (1, 10);");
-    d.sql("INSERT INTO inv VALUES (2, 20);");
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER, pad VARCHAR(200));");
+    let pad = "x".repeat(180);
+    for i in 1..=200 {
+        d.sql(&format!("INSERT INTO inv VALUES ({i}, {}, '{pad}');", i * 10));
+    }
     d.sql("CREATE INDEX ix ON inv (qty);");
+    d.sql("ANALYZE inv;");
     d.sql("ALTER TABLE inv ALTER COLUMN qty TYPE BIGINT;");
 
-    let rows = d.rows("SELECT id, qty FROM inv WHERE qty = 20;");
-    assert_eq!(rows.len(), 1, "the index lost the row after the retype: {rows:?}");
-    assert_eq!(rows[0], vec![Value::Integer(2), Value::BigInt(20)]);
+    let root = d.catalog.get_table("inv").unwrap().indexes[0].root_page_id;
+    let ix = BPlusTreeManager::<(Value, Value), ()>::open(root, d.bp.clone());
+    assert!(
+        ix.search(&(Value::BigInt(1370), Value::Integer(137))).unwrap().is_some(),
+        "an entry written before the retype is unreachable by the column's new type"
+    );
+
+    // A row inserted AFTER the retype writes a BIGINT key into the same tree, and both are
+    // findable — which is the whole claim: one tree, two spellings of the same values, correctly
+    // ordered.
+    d.sql(&format!("INSERT INTO inv VALUES (201, 7, '{pad}');"));
+    let root = d.catalog.get_table("inv").unwrap().indexes[0].root_page_id;
+    let ix = BPlusTreeManager::<(Value, Value), ()>::open(root, d.bp.clone());
+    assert!(
+        ix.search(&(Value::BigInt(7), Value::Integer(201))).unwrap().is_some(),
+        "an entry written after the retype is unreachable"
+    );
+    assert!(
+        ix.search(&(Value::BigInt(1370), Value::Integer(137))).unwrap().is_some(),
+        "writing a new-typed key made the old-typed entries unreachable"
+    );
+
+    // The rows themselves are intact and hold the new type.
+    let rows = d.rows("SELECT id, qty FROM inv WHERE qty = 1370;");
+    assert_eq!(rows.len(), 1, "the retype lost the row: {rows:?}");
+    assert_eq!(rows[0], vec![Value::Integer(137), Value::BigInt(1370)]);
 
     // And the widening is real: a value no INTEGER could hold now stores and reads back.
-    d.sql("INSERT INTO inv VALUES (3, 9223372036854775807);");
-    let wide = d.rows("SELECT qty FROM inv WHERE id = 3;");
+    d.sql(&format!("INSERT INTO inv VALUES (202, 9223372036854775807, '{pad}');"));
+    let wide = d.rows("SELECT qty FROM inv WHERE id = 202;");
     assert_eq!(wide[0][0], Value::BigInt(i64::MAX));
+}
+
+/// A table's statistics must survive an alteration, or every `ALTER` silently de-optimises every
+/// query against the table until somebody runs `ANALYZE`.
+///
+/// Breaking shape: a plan that used an index before the alter and stops using it after. That is
+/// exactly how two of the tests above first passed with their guards deleted.
+#[test]
+fn statistics_survive_an_alteration_exactly() {
+    let mut d = db();
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER, pad VARCHAR(200));");
+    let pad = "x".repeat(180);
+    for i in 1..=200 {
+        d.sql(&format!("INSERT INTO inv VALUES ({i}, {}, '{pad}');", i * 10));
+    }
+    d.sql("ANALYZE inv;");
+    let before = explain(&mut d, "EXPLAIN SELECT id FROM inv WHERE id = 137;");
+    assert!(before.contains("Index scan"), "the fixture does not use an index to begin with:\n{before}");
+
+    d.sql("ALTER TABLE inv ADD COLUMN note VARCHAR(20);");
+    let after = explain(&mut d, "EXPLAIN SELECT id FROM inv WHERE id = 137;");
+    assert!(after.contains("Index scan"), "the ALTER de-optimised the plan:\n{after}");
+
+    // The added column's statistics are the exact ones ANALYZE would compute for an all-null
+    // column, not a guess and not an absence.
+    let stats = d.catalog.stats.get("inv").expect("the ALTER dropped the statistics");
+    assert_eq!(stats.row_count, 200);
+    assert_eq!(stats.columns.len(), 4, "the statistics are not one per column");
+    assert_eq!(stats.columns[3].nulls, 200, "the added column is NULL in every existing row");
+    assert_eq!(stats.columns[3].distinct, 0);
+    assert!(stats.columns[3].min.is_none() && stats.columns[3].max.is_none());
+
+    // A retype carries min/max through the same widening the rows went through.
+    d.sql("ALTER TABLE inv ALTER COLUMN qty TYPE BIGINT;");
+
+    // **"Carried" has to mean "equal to what ANALYZE would compute", and it is compared by Debug
+    // rendering rather than by `==`.**
+    //
+    // `Value`'s equality is `cmp`, which compares the whole numeric band by VALUE — so
+    // `Integer(10)` and `BigInt(10)` are equal, and an assertion written with `assert_eq!` cannot
+    // tell a statistic that was converted from one that was left in the old type. A fire-check
+    // caught precisely that: deleting the min/max conversion left this test green.
+    let carried = format!("{:?}", d.catalog.stats.get("inv").expect("the retype dropped the stats"));
+    d.sql("ANALYZE inv;");
+    let recomputed = format!("{:?}", d.catalog.stats.get("inv").unwrap());
+    assert_eq!(
+        carried, recomputed,
+        "the statistics carried across the ALTER are not the ones ANALYZE computes for the \
+         altered table"
+    );
+    assert!(carried.contains("BigInt(2000)"), "the retyped column's bounds kept the old type: {carried}");
 }
 
 /// A rename must move the name everywhere it is recorded, and an index records it BY NAME
@@ -258,6 +376,16 @@ fn renaming_an_indexed_column_leaves_the_table_queryable() {
     let rows = d.rows("SELECT id, quantity FROM inv WHERE quantity = 10;");
     assert_eq!(rows.len(), 1, "the renamed column is unreachable: {rows:?}");
     assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(10)]);
+
+    // **A WRITE is what proves the index metadata followed the rename**, and a read is not.
+    // `open_table` resolves `IndexInfo.column_name` to an ordinal with `position()` on every
+    // write and turns a miss into `KeyNotFound`; the read path merely declines to use an index it
+    // cannot resolve and falls back to a scan, which succeeds either way. A fire-check caught this
+    // test passing with the rename of `IndexInfo.column_name` deleted.
+    d.sql("UPDATE inv SET quantity = 11 WHERE id = 1;");
+    assert_eq!(d.rows("SELECT quantity FROM inv WHERE id = 1;")[0][0], Value::Integer(11));
+    d.sql("INSERT INTO inv VALUES (2, 20);");
+    d.sql("DELETE FROM inv WHERE id = 2;");
     assert_eq!(
         d.shape("inv"),
         vec![("id".into(), DataType::Integer), ("quantity".into(), DataType::Integer)]
@@ -267,6 +395,35 @@ fn renaming_an_indexed_column_leaves_the_table_queryable() {
 // ---------------------------------------------------------------------------------------------
 // Recovery
 // ---------------------------------------------------------------------------------------------
+
+/// **A deleted row must stay deleted across the rewrite.**
+///
+/// A tombstone is a version with a non-zero `end_ts` sitting in the main heap — `DELETE` stamps the
+/// live version rather than removing it — and the rewrite scans every slot, tombstones included.
+/// `Tuple::serialize` writes a fresh version header, so the rewrite has to carry `begin_ts` **and**
+/// `end_ts` across from the old bytes. Carry only `begin_ts` and every row the table has ever
+/// deleted comes back to life at the next `ALTER`.
+///
+/// Breaking shape: a row deleted BEFORE the alter. A table whose rows are all live proves nothing.
+#[test]
+fn deleted_rows_stay_deleted_across_a_rewrite() {
+    let mut d = db();
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    d.sql("INSERT INTO inv VALUES (1, 10);");
+    d.sql("INSERT INTO inv VALUES (2, 20);");
+    d.sql("INSERT INTO inv VALUES (3, 30);");
+    d.sql("DELETE FROM inv WHERE id = 2;");
+    assert_eq!(d.rows("SELECT id FROM inv;").len(), 2, "the fixture did not delete anything");
+
+    d.sql("ALTER TABLE inv ADD COLUMN note VARCHAR(20);");
+
+    let ids: Vec<Value> = d.rows("SELECT id FROM inv;").into_iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        ids,
+        vec![Value::Integer(1), Value::Integer(3)],
+        "the rewrite resurrected a deleted row"
+    );
+}
 
 /// **Exit criterion: the schema survives a restart.**
 ///
@@ -732,16 +889,28 @@ fn a_row_written_before_a_sibling_widened_the_table_still_publishes() {
     let mut b = Session::with_runtime(d.runtime.clone());
     exec(&mut d, "BEGIN AGENT SESSION AS 'agent-a';", &mut a);
     exec(&mut d, "BEGIN AGENT SESSION AS 'agent-b';", &mut b);
+    // An INSERT, not an UPDATE, and that is the whole breaking shape. An updated row already
+    // exists on the target, so the merge starts from the target's image and is the right width by
+    // accident; a NEW row exists only on the branch, in the branch's fork-point shape, and is the
+    // image that has to be conformed on the way out. A fire-check caught the first version of this
+    // test — written with an UPDATE — passing with the conforming deleted.
+    exec(&mut d, "INSERT INTO inv VALUES (2, 22);", &mut b);
     exec(&mut d, "UPDATE inv SET qty = 99 WHERE id = 1;", &mut b);
     exec(&mut d, "ALTER TABLE inv ADD COLUMN note VARCHAR(20);", &mut a);
 
     assert!(merge_report(exec(&mut d, "MERGE;", &mut a)).applied_to_target);
     let rb = merge_report(exec(&mut d, "MERGE;", &mut b));
     assert!(rb.applied_to_target, "the row branch could not publish into the widened table: {rb}");
+    let rows = d.rows("SELECT * FROM inv;");
     assert_eq!(
-        d.rows("SELECT * FROM inv;")[0],
+        rows[0],
         vec![Value::Integer(1), Value::Integer(99), Value::Null],
-        "the row did not land in the widened shape"
+        "the updated row did not land in the widened shape"
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::Integer(2), Value::Integer(22), Value::Null],
+        "the inserted row did not land in the widened shape"
     );
 }
 

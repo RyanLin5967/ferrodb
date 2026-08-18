@@ -1002,4 +1002,77 @@ mod tests {
         assert!(out.events.is_empty());
         assert_eq!(out.unresolved.get(&7), Some(&1), "the record vanished without being counted");
     }
+
+    /// **A DDL record whose alteration names a column its own shape does not contain is refused.**
+    ///
+    /// The record's two halves are the full shape and the change that produced it, and they must
+    /// agree. A decoder that guessed which column was meant — or shrugged and emitted the change
+    /// with an empty type — would put a confidently incorrect event into the feed, which is the
+    /// failure this module's header is entirely about. The independent Go validator refuses the
+    /// same disagreement from the other side; this is the producer refusing to emit it at all.
+    ///
+    /// Breaking shape: a record written by a build whose alteration and shape were computed from
+    /// different snapshots of the catalog.
+    #[test]
+    fn a_ddl_record_whose_alteration_is_not_in_its_shape_is_refused() {
+        use crate::wal::log::{ColumnAlteration, DdlOp, RecKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalManager::new(dir.path().join("t.wal")).unwrap();
+        let shape = vec![
+            ("id".to_string(), DataType::Integer, false),
+            ("qty".to_string(), DataType::Integer, true),
+        ];
+        wal.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                // The alteration says `note` was added; the shape it carries has no `note`.
+                op: DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+                table: "inv".into(),
+                dir_root: 7,
+                time_travel_root: 8,
+                columns: shape.clone(),
+            },
+        )
+        .unwrap();
+        wal.flush().unwrap();
+
+        let base = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let next = wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let err = LogicalDecoder::blank()
+            .decode(&wal, base, next)
+            .expect_err("a record whose halves disagree was decoded into an event");
+        let text = format!("{err}");
+        assert!(text.contains("note"), "the refusal does not name the column: {text}");
+        assert!(text.contains("no such column"), "refused, but not by this guard: {text}");
+
+        // **Anti-vacuity**: the same record with a shape that DOES contain the column decodes, so
+        // the refusal above is about the disagreement and not about alterations in general.
+        let wal2 = WalManager::new(dir.path().join("ok.wal")).unwrap();
+        let mut wider = shape;
+        wider.push(("note".to_string(), DataType::Varchar(20), true));
+        wal2.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+                table: "inv".into(),
+                dir_root: 7,
+                time_travel_root: 8,
+                columns: wider,
+            },
+        )
+        .unwrap();
+        wal2.flush().unwrap();
+        let out = LogicalDecoder::blank()
+            .decode(
+                &wal2,
+                wal2.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
+                wal2.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("a well-formed alteration record was refused");
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].op.name(), "ADD_COLUMN");
+    }
 }

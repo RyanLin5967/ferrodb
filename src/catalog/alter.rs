@@ -55,10 +55,10 @@
 //!
 //! - **`ADD COLUMN ... NOT NULL`.** There is no `DEFAULT` in this SQL surface, so every existing
 //!   row would have to violate the constraint the statement just declared.
-//! - **Retyping the primary key.** `Update::execute` already refuses to update the primary key for
-//!   the same reason — moving a key means moving every index entry that points at the row — and a
-//!   retype moves every key at once. `Value`'s ordering is by type rank first, so a half-converted
-//!   primary index is not merely stale, it is unsearchable.
+//! - **Retyping the primary key.** The rewrite repoints only the rows it moves, so the primary
+//!   index would be left holding keys of two types at once. `Update::execute` already refuses to
+//!   update the primary key for the neighbouring reason. (An earlier draft justified this by
+//!   claiming cross-type values do not compare; they do — see the note at the refusal.)
 //! - **Any conversion not in [`Widening`].** An allowlist. A denylist would only catch the
 //!   conversions someone already thought of, and the cost of admitting a wrong one is a column of
 //!   values that are silently different from what was stored.
@@ -68,9 +68,9 @@ use std::sync::atomic::Ordering;
 
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
-use crate::catalog::catalog_page::IndexInfo;
 use crate::catalog::column::{DataType, Value};
 use crate::catalog::schema::Schema;
+use crate::catalog::stats::ColumnStats;
 use crate::error::FerroError;
 use crate::parser::parser::AlterAction;
 use crate::provenance::ProvenanceStore;
@@ -230,12 +230,25 @@ pub fn resulting_schema(
                 .position(|c| &c.name == column)
                 .ok_or_else(|| no_such_column(table, column, schema))?;
             if idx == 0 {
+                // **Refused conservatively, and the reason stated here is the true one.**
+                //
+                // An earlier version of this message claimed that values of different types do not
+                // compare and that a half-converted primary index would be unsearchable. That is
+                // wrong: `Value::cmp` compares the numeric band by value, so an `Integer` key and
+                // the `BigInt` it becomes are equal. The real reason is narrower and is about what
+                // has been established rather than about what is impossible — the rewrite repoints
+                // only the rows it MOVES, so a retyped primary key leaves the index holding keys of
+                // two types at once, and every path that reads it (recovery's `rebuild_indexes`,
+                // the range scan, a branch's own row store) would be resting on that cross-type
+                // comparison holding everywhere. The cost of being wrong is a table in which no row
+                // can be found by key. `UPDATE` refuses to move a primary key for the neighbouring
+                // reason, and this follows it until someone measures the alternative.
                 return Err(FerroError::Constraint(format!(
                     "column '{column}' of '{table}' is the primary key and its type cannot be \
-                     changed: every entry in the primary index is keyed by the value itself, and \
-                     values of different types do not compare — a half-converted index is not \
-                     stale, it is unsearchable. This is the same restriction UPDATE places on the \
-                     primary key."
+                     changed: the rewrite repoints only the rows it moves, so the primary index \
+                     would be left holding keys of two types at once. DELETE and re-INSERT under \
+                     the new type, or rebuild the table. This is the same restriction UPDATE \
+                     places on the primary key."
                 )));
             }
             let from = schema.columns[idx].data_type.clone();
@@ -432,48 +445,92 @@ impl Catalog {
                     },
                 )?;
 
-                // A secondary index on the retyped column holds keys of the OLD type. `Value`
-                // orders by type rank before value, so those keys do not merely look wrong — they
-                // sort into a different region of the tree from every key written after this, and
-                // a lookup for the new type walks past them. Rebuilt from the rewritten heap.
-                // Indexes on other columns hold keys this change did not touch and are left alone.
-                let stale: Vec<IndexInfo> =
-                    indexes.iter().filter(|i| &i.column_name == column).cloned().collect();
-                for info in &stale {
-                    let new_root = rebuild_secondary(
-                        &self.buffer_pool,
-                        dir_root,
-                        &new_schema,
-                        idx,
-                        info.root_page_id,
-                    )?;
-                    let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
-                    if let Some(i) =
-                        entry.indexes.iter_mut().find(|i| i.column_name == info.column_name)
-                    {
-                        i.root_page_id = new_root;
-                    }
-                }
+                // **A secondary index over the retyped column is deliberately NOT rebuilt, and
+                // this reverses what an earlier version of this code did.**
+                //
+                // It rebuilt, on the stated grounds that `Value` orders by type rank so an
+                // `Integer` key and a `BigInt` key sort into different regions of the tree and a
+                // lookup for the new type walks past the old entries. That is **false**, and a
+                // fire-check is what exposed it: `Value::cmp` compares the whole numeric band —
+                // `Integer`, `BigInt`, `Float`, `Decimal` — against each other by VALUE, and falls
+                // through to `type_rank` only for pairs outside it (`catalog::column`, and the
+                // tests there pin exactly this). Every conversion in [`Widening`] stays inside that
+                // band or does not change the type at all, so an entry written before the retype
+                // compares equal to the same value written after it and the tree stays ordered.
+                //
+                // The rebuild was therefore unnecessary work — and worse than unnecessary. It
+                // discarded every historical `(value, primary key)` entry the index holds, which
+                // E66 keeps ON PURPOSE: a secondary entry is how a reader finds a row by a value it
+                // *used* to have, and `Update` leaves the old entry in place for exactly that
+                // reason. Rebuilding from the live heap silently threw that away.
+                let _ = (idx, &indexes);
                 self.finish(table, new_schema)
             }
         }
     }
 
-    /// Install the new schema, drop stale statistics, persist, and hand back the shape.
+    /// Install the new schema, carry the statistics across it, persist, and hand back the shape.
     ///
-    /// `analyze` stores one `ColumnStats` per column *positionally*, so a table that gained a
-    /// column has statistics one entry short and the cost model would index past them. They are
-    /// dropped rather than extended with a guess: an absent statistic makes the optimizer fall
-    /// back to its defaults, and a fabricated one makes it plan against data that does not exist.
+    /// # The statistics are carried, not dropped, and the difference is not cosmetic
+    ///
+    /// `analyze` stores one `ColumnStats` **positionally**, so a table that gained a column has
+    /// statistics one entry short of its columns. Dropping them is the safe-looking answer and it
+    /// is quietly expensive: with no statistics the cost model falls back to its defaults, and the
+    /// first thing that changes is that it stops choosing index scans. An `ALTER` would therefore
+    /// silently de-optimise every query against the table until somebody thought to run `ANALYZE` —
+    /// a performance cliff triggered by a schema change, with nothing to attribute it to. It is
+    /// also how a fire-check on this module first came back green for the wrong reason: two tests
+    /// meant to prove the indexes survived an alter were quietly running sequential scans.
+    ///
+    /// Carrying them is *exact* here, not a guess, which is the only reason it is allowed:
+    ///
+    /// - an added column is `NULL` in every existing row, so its statistics are exactly
+    ///   `distinct: 0, nulls: row_count, min/max: None` — what `analyze` would compute;
+    /// - a renamed column keeps its position, and statistics are positional;
+    /// - a retyped column's `min`/`max` go through the very [`Widening`] the rows went through, so
+    ///   they are the same values in the new type rather than an estimate of them.
+    ///
+    /// A table with no statistics to begin with still has none afterwards.
     fn finish(
         &mut self,
         table: &str,
         new_schema: Schema,
     ) -> Result<Vec<ColumnShape>, FerroError> {
+        let old_len = self.tables.get(table).map(|e| e.schema.columns.len()).unwrap_or(0);
+        let widened: Vec<Option<Widening>> = {
+            let old = self.tables.get(table).map(|e| e.schema.clone());
+            (0..old_len)
+                .map(|i| {
+                    let o = old.as_ref()?.columns.get(i)?.data_type.clone();
+                    let n = new_schema.columns.get(i)?.data_type.clone();
+                    if o == n { None } else { Widening::of(&o, &n) }
+                })
+                .collect()
+        };
+        if let Some(stats) = self.stats.get_mut(table) {
+            for (i, w) in widened.iter().enumerate() {
+                let Some(w) = w else { continue };
+                if let Some(c) = stats.columns.get_mut(i) {
+                    c.min = match &c.min {
+                        Some(v) => Some(w.apply(v)?),
+                        None => None,
+                    };
+                    c.max = match &c.max {
+                        Some(v) => Some(w.apply(v)?),
+                        None => None,
+                    };
+                }
+            }
+            // An appended column is NULL in every row that already exists.
+            let rows = stats.row_count;
+            while stats.columns.len() < new_schema.columns.len() {
+                stats.columns.push(ColumnStats { distinct: 0, nulls: rows, min: None, max: None });
+            }
+            stats.columns.truncate(new_schema.columns.len());
+        }
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.schema = new_schema;
         let shape = shape_of(&entry.schema);
-        self.stats.remove(table);
         self.persist()?;
         Ok(shape)
     }
@@ -570,24 +627,3 @@ fn rewrite_heap(
     Ok(rewritten)
 }
 
-/// Rebuild one secondary index from the (already rewritten) heap, returning its new root page.
-///
-/// The same shape as `Catalog::create_index`'s build loop, against the new schema. The old tree's
-/// pages are freed rather than orphaned.
-fn rebuild_secondary(
-    bp: &Arc<BufferPoolManager>,
-    dir_root: u32,
-    schema: &Schema,
-    col_index: usize,
-    old_root: u32,
-) -> Result<u32, FerroError> {
-    let tree = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
-    let heap = HeapFileManager::open(dir_root, bp.clone());
-    for item in heap.scan() {
-        let (_, tuple) = item?;
-        let values = tuple.deserialize(schema)?;
-        tree.insert((values[col_index].clone(), values[0].clone()), ())?;
-    }
-    BPlusTreeManager::<(Value, Value), ()>::open(old_root, bp.clone()).free_all()?;
-    Ok(tree.root_page_id.load(Ordering::Relaxed))
-}
