@@ -25,7 +25,10 @@ pub mod types;
 pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub use reaper::{PageLinks, TwoTierReaper};
-pub use record::{reclaimable, ArenaExtent, BranchRecord, PendingFree};
+pub use record::{
+    changed_columns, reclaimable, ArenaExtent, BranchRecord, CapabilityEnvelope,
+    CapabilityRefusal, ColumnCapability, PendingFree, RowEffect, RowImage, TableCapability, Verb,
+};
 pub use types::{
     ArenaId, BranchError, BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId,
     ARENA_EXTENT_PAGES, MAX_BRANCH_DEPTH,
