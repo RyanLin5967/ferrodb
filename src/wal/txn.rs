@@ -403,6 +403,15 @@ impl TxnManager {
     /// which is below the identity record — and the next batch reads both together.
     /// `tests/integration_run_identity_feed.rs` runs exactly that workload against both placements.
     ///
+    /// **The precise claim is "in this transaction, after every row it staged, before its
+    /// `Commit`" — not physical adjacency in the log.** The two appends are separate calls and
+    /// nothing holds a lock across them, so another transaction's record, or a `Ddl` record (which
+    /// bypasses the active-transaction table entirely), can land between them. That is harmless: the
+    /// decoder keys both the staging and the binding by `txn_id`, and the cursor argument above needs
+    /// only that the identity record sit *above* this transaction's earliest staged record and
+    /// *below* its commit. An earlier version of this doc asserted adjacency, which would have made
+    /// any test of it flaky under a concurrent workload.
+    ///
     /// # Guards
     ///
     /// Refuses an unknown transaction (a binding nothing would ever write), `ProvId::NONE` (a
@@ -418,6 +427,35 @@ impl TxnManager {
                 run.agent_id, run.run_id
             )));
         }
+        // **Every named field must be named.**
+        //
+        // Refused here rather than counted downstream, because the consumer's contract is stricter
+        // than this type: `cdc-consumer`'s `checkWriter` REFUSES a writer object with an empty
+        // agent, run, model or model_version, and it refuses the whole LINE — so one such run would
+        // make `validate`, `sink`, `diff` and `follow` all abort at the first row it wrote and land
+        // nothing at all. `model_version` is also the field `retract` keys on, and an empty one is
+        // indistinguishable from the NULL a row with no writer carries.
+        //
+        // A producer that can emit what its consumer must reject is a contract whose halves
+        // disagree, and the half to fix is the one that can still refuse cheaply.
+        for (field, value) in [
+            ("agent_id", &run.agent_id),
+            ("run_id", &run.run_id),
+            ("model", &run.model),
+            ("model_version", &run.model_version),
+        ] {
+            if value.trim().is_empty() {
+                return Err(FerroError::Provenance(format!(
+                    "refusing to bind run {} to txn {txn_id}: its {field} is empty. Every field of \
+                     an identity record is part of the answer to 'who wrote this row', and the \
+                     change-feed consumer refuses a writer object carrying an empty one - so this \
+                     run would make the whole feed unreadable rather than merely vague. Use an \
+                     explicit placeholder such as \"unspecified\" if there is genuinely nothing to \
+                     name.",
+                    run.describe()
+                )));
+            }
+        }
         if !self.att.lock().unwrap().contains_key(&txn_id) {
             return Err(FerroError::Txn(format!(
                 "cannot bind a run to txn {txn_id}: it is not active, so no identity record would \
@@ -425,9 +463,14 @@ impl TxnManager {
             )));
         }
         {
-            let mut bindings = self.run_bindings.lock().unwrap();
+            let bindings = self.run_bindings.lock().unwrap();
             match bindings.get(&txn_id) {
-                Some(existing) if existing != &run => {
+                // Compared with `same_actor`, NOT `==`: `started_at` is when a particular session
+                // began and is deliberately not part of who the actor is, so two sessions of one run
+                // legitimately differ in it. `MemProvenanceStore::intern` hands them the same
+                // `ProvId` for exactly that reason, and a full-equality test here would refuse a
+                // second session of the same run because the clock had moved.
+                Some(existing) if !existing.same_actor(&run) => {
                     return Err(FerroError::Provenance(format!(
                         "txn {txn_id} is already bound to {}; refusing to rebind it to {}. One \
                          transaction has one writer.",
@@ -438,9 +481,17 @@ impl TxnManager {
                 Some(_) => return Ok(()),
                 None => {}
             }
-            bindings.insert(txn_id, run.clone());
         }
-        self.declare_run(run)
+        // **Declared BEFORE the binding is installed, and that order is the fix for a real defect.**
+        //
+        // It used to insert first. When `declare_run` then refused a slot collision, `bind_run`
+        // returned `Err` and the binding STOOD — so the next `commit` appended an identity record
+        // for that slot anyway, putting two different actors under one `prov_id` in the log. That is
+        // precisely the state `LogicalDecoder` refuses outright, which would make the whole log
+        // range undecodable: the guard's own failure path produced the disaster the guard names.
+        self.declare_run(run.clone())?;
+        self.run_bindings.lock().unwrap().insert(txn_id, run);
+        Ok(())
     }
 
     /// Remember a run so a checkpoint can re-declare it, without binding it to a transaction.
@@ -450,7 +501,12 @@ impl TxnManager {
     pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
         let mut log = self.run_log.lock().unwrap();
         if let Some(existing) = log.iter().find(|r| r.prov_id == run.prov_id) {
-            if existing != &run {
+            // `same_actor`, not `==`. Full equality compares `started_at`, which is when a session
+            // began rather than part of who the actor is — so a second session of the same run
+            // carries a different one and was being refused for having a later clock reading. The
+            // in-memory store already draws the line here and hands both sessions one `ProvId`; two
+            // definitions of "the same actor" in one system is how that becomes a bug.
+            if !existing.same_actor(&run) {
                 return Err(FerroError::Provenance(format!(
                     "provenance slot {} is already declared as {}; refusing to redeclare it as {}",
                     run.prov_id,
@@ -730,13 +786,19 @@ use super::*;
         )
     }
 
-    /// **The identity record is the append immediately before `Commit`, with nothing between.**
+    /// **The identity record is this transaction's last record before its `Commit`.**
     ///
     /// Its position is a correctness property of the change feed rather than a matter of taste —
     /// see [`TxnManager::bind_run`] — so it is asserted on the log's own record order and not only
     /// through the decoder that reads it.
+    ///
+    /// Filtered to **this transaction's** records on purpose. Nothing holds a lock across the two
+    /// appends, so a concurrent transaction's record, or a `Ddl` (which bypasses the active-txn
+    /// table), can land between them in the byte stream. Asserting raw adjacency would be asserting
+    /// single-threadedness; what the feed needs is that this record follow every row this transaction
+    /// staged and precede its commit.
     #[test]
-    fn the_run_identity_record_sits_immediately_before_the_commit() {
+    fn the_run_identity_record_is_the_last_record_before_its_own_commit() {
         let (bp, wal, txn, _dir) = setup();
         let t1 = txn.begin().unwrap();
         txn.bind_run(t1, a_run(1, "restock-agent")).unwrap();
@@ -745,23 +807,31 @@ use super::*;
         heap.insert(Tuple::new(vec![1, 2, 3, 4])).unwrap();
         txn.commit(t1).unwrap();
 
-        let recs = walk_log(&wal);
-        let commit_at = recs
+        let all = walk_log(&wal);
+        let mine: Vec<&LogRecord> = all.iter().filter(|r| r.txn_id == t1).collect();
+        let commit_at = mine
             .iter()
             .position(|r| matches!(r.kind, RecKind::Commit))
-            .expect("no commit record");
-        assert!(commit_at > 0, "the commit is the first record; nothing could precede it");
-        match &recs[commit_at - 1].kind {
-            RecKind::RunIdentity { run } => {
-                assert_eq!(run.agent_id, "restock-agent");
-                assert_eq!(recs[commit_at - 1].txn_id, t1, "the record must name the committing txn");
-            }
+            .expect("no commit record for this transaction");
+        assert!(commit_at > 0, "the commit is this transaction's first record");
+        match &mine[commit_at - 1].kind {
+            RecKind::RunIdentity { run } => assert_eq!(run.agent_id, "restock-agent"),
             other => panic!(
-                "the record before the commit is {other:?}, not the run identity. Anything between \
-                 them can be separated from the commit by a batch boundary, and the feed then ships \
-                 the rows attributed to nobody."
+                "this transaction's record before its commit is {other:?}, not the run identity. \
+                 Anything of this transaction's between them can be separated from the commit by a \
+                 batch boundary, and the feed then ships the rows attributed to nobody."
             ),
         }
+        // And it is AFTER every row this transaction staged, which is the other half of the cursor
+        // argument: below the earliest staged record it would be stepped over.
+        let last_row = mine
+            .iter()
+            .rposition(|r| matches!(r.kind, RecKind::HeapInsert { .. }))
+            .expect("no row record");
+        assert!(
+            last_row < commit_at - 1,
+            "the identity record sits at or below a row this transaction staged"
+        );
 
         // Anti-vacuity: an unbound transaction writes no identity record at all, so the assertion
         // above is about the binding and not about some record that is always there.
@@ -774,6 +844,140 @@ use super::*;
             .filter(|r| matches!(r.kind, RecKind::RunIdentity { .. }))
             .count();
         assert_eq!(identities, 1, "an unbound transaction wrote an identity record");
+    }
+
+    /// **A second session of the same run is not a different actor, and the clock must not decide.**
+    ///
+    /// `started_at` is when a particular session began. `MemProvenanceStore::intern` deliberately
+    /// excludes it from `same_actor` — its doc records that including it was a real bug CI caught,
+    /// where the same input was refused or accepted depending on whether the system clock had ticked
+    /// — and hands two sessions of one run the SAME `ProvId`.
+    ///
+    /// `declare_run` and `bind_run` reintroduced that bug by comparing with derived `==`, which does
+    /// compare `started_at`. Two definitions of "the same actor" in one system is how this becomes a
+    /// defect, and it is worse here than in the store: a refused declaration meant a legitimate
+    /// second session could not commit at all.
+    ///
+    /// **Breaking shape:** the same run bound twice with a later `started_at` — that is, any agent
+    /// that opens a second session, which is the ordinary case. A workload where each run commits
+    /// exactly once never produces it.
+    #[test]
+    fn a_second_session_of_one_run_is_the_same_actor_however_the_clock_moved() {
+        let (bp, _wal, txn, _dir) = setup();
+        let first = a_run(1, "restock-agent");
+        let mut later = a_run(1, "restock-agent");
+        later.started_at = first.started_at + 5_000;
+        assert_ne!(first, later, "the two entities must differ, or this test proves nothing");
+        assert!(first.same_actor(&later), "same_actor changed meaning; this test is measuring it");
+
+        txn.declare_run(first.clone()).unwrap();
+        txn.declare_run(later.clone())
+            .expect("a second session of the same run was refused for having a later clock reading");
+        assert_eq!(txn.retained_runs(), 1, "the second session became a second declaration");
+
+        // And it can actually commit, which is what the refusal was blocking.
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        let t1 = txn.begin().unwrap();
+        txn.bind_run(t1, later.clone()).expect("bind_run refused a second session");
+        heap.set_transaction(txn.clone(), t1);
+        heap.insert(Tuple::new(vec![1, 2, 3, 4])).unwrap();
+        txn.commit(t1).unwrap();
+
+        // Anti-vacuity: a genuinely different actor under the same slot is still refused.
+        let err = txn
+            .declare_run(a_run(1, "auditor-agent"))
+            .expect_err("a different agent under one slot was accepted");
+        assert!(format!("{err}").contains("already declared"), "{err}");
+    }
+
+    /// **A refused `bind_run` must leave NO binding, or the refusal causes the thing it prevents.**
+    ///
+    /// The insert used to happen before `declare_run` could refuse. On a slot collision `bind_run`
+    /// returned `Err` and the binding stood, so the next `commit` appended an identity record for
+    /// that slot anyway — putting two different actors under one `prov_id` in the log, which is
+    /// exactly what `LogicalDecoder` refuses outright. The guard's failure path produced the disaster
+    /// the guard is named after.
+    ///
+    /// **Breaking shape:** a caller that ignores `bind_run`'s error and commits anyway — which is
+    /// what any `?`-less call site does, and what a caller that logs and continues does deliberately.
+    #[test]
+    fn a_refused_binding_leaves_nothing_behind_for_the_commit_to_write() {
+        let (bp, wal, txn, _dir) = setup();
+        // Slot 1 already means `restock-agent`.
+        txn.declare_run(a_run(1, "restock-agent")).unwrap();
+
+        let t1 = txn.begin().unwrap();
+        let err = txn
+            .bind_run(t1, a_run(1, "auditor-agent"))
+            .expect_err("a colliding slot was bound");
+        assert!(format!("{err}").contains("already declared"), "{err}");
+
+        // Commit anyway, as a caller that ignored the error would. No identity record may appear.
+        let mut heap = HeapFileManager::new(bp.clone()).unwrap();
+        heap.set_transaction(txn.clone(), t1);
+        heap.insert(Tuple::new(vec![9, 9])).unwrap();
+        txn.commit(t1).unwrap();
+
+        let records = walk_log(&wal);
+        let identities: Vec<&RecKind> = records
+            .iter()
+            .map(|r| &r.kind)
+            .filter(|k| matches!(k, RecKind::RunIdentity { .. }))
+            .collect();
+        assert!(
+            identities.is_empty(),
+            "a refused binding still put an identity record in the log: {identities:?}"
+        );
+
+        // Anti-vacuity: an accepted binding does write one.
+        let t2 = txn.begin().unwrap();
+        txn.bind_run(t2, a_run(1, "restock-agent")).unwrap();
+        heap.set_transaction(txn.clone(), t2);
+        heap.insert(Tuple::new(vec![8, 8])).unwrap();
+        txn.commit(t2).unwrap();
+        let n = walk_log(&wal)
+            .iter()
+            .filter(|r| matches!(r.kind, RecKind::RunIdentity { .. }))
+            .count();
+        assert_eq!(n, 1, "an accepted binding wrote no identity record either");
+    }
+
+    /// **An identity record with an empty field is refused at the producer.**
+    ///
+    /// The consumer's contract is stricter than `RunEntity`: `cdc-consumer`'s `checkWriter` refuses a
+    /// writer object with an empty agent, run, model or model_version, and it refuses the whole LINE
+    /// — so one such run makes `validate`, `sink`, `diff` and `follow` abort at the first row it
+    /// wrote and land nothing. `model_version` is also the field `retract` keys on, where an empty
+    /// string is indistinguishable from the NULL a row with no writer carries.
+    ///
+    /// **Breaking shape:** any caller that defaults a field to `""` rather than to an explicit
+    /// placeholder. `begin_session_with_model` already defaults to the literal `unspecified`, which is
+    /// why this was reachable but not yet reached.
+    #[test]
+    fn binding_a_run_with_an_empty_named_field_is_refused() {
+        let (_bp, _wal, txn, _dir) = setup();
+        let t1 = txn.begin().unwrap();
+        let mutations: [(&str, fn(&mut RunEntity)); 4] = [
+            ("agent_id", |r| r.agent_id = String::new()),
+            ("run_id", |r| r.run_id = String::new()),
+            ("model", |r| r.model = String::new()),
+            // Whitespace only, because "   " is not a name and `trim` is what decides that.
+            ("model_version", |r| r.model_version = "   ".into()),
+        ];
+        for (field, mutate) in mutations {
+            let mut run = a_run(1, "restock-agent");
+            mutate(&mut run);
+            let err = txn
+                .bind_run(t1, run)
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains(&format!("its {field} is empty")),
+                "an empty {field} was not refused by this guard: {err}"
+            );
+            assert_eq!(txn.retained_runs(), 0, "a refused binding declared the run anyway");
+        }
+        // Anti-vacuity: a fully named run binds.
+        txn.bind_run(t1, a_run(1, "restock-agent")).expect("a fully named run was refused");
     }
 
     /// One provenance slot cannot mean two actors. The slot is the reference every stamped version

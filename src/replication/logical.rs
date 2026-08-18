@@ -542,7 +542,16 @@ impl LogicalDecoder {
                     // long gone.
                     let key = run.prov_id.0;
                     match runs.get(&key) {
-                        Some(known) if known.as_ref() != run => {
+                        // `same_actor`, NOT `==`. Derived equality compares `started_at`, which is
+                        // when a session began and deliberately not part of who the actor is —
+                        // `MemProvenanceStore::intern` hands two sessions of one run the same
+                        // `ProvId` for exactly that reason, so their identity records differ in that
+                        // one field and in no other. A full-equality test refused them as "two
+                        // different actors" and, because this arm returns `Err`, made the entire log
+                        // range permanently undecodable: `FeedStreamer::pump` propagates it and the
+                        // consumer can never get past those bytes. `RunEntity::same_actor`'s own doc
+                        // records this same mistake being made once before.
+                        Some(known) if !known.same_actor(run) => {
                             // The same slot naming two different actors means the log disagrees
                             // with itself. Picking one would attribute rows to an actor the
                             // database never recorded, which is worse than refusing.
@@ -559,7 +568,9 @@ impl LogicalDecoder {
                         .entry(key)
                         .or_insert_with(|| Arc::new(run.clone()))
                         .clone();
-                    out.runs.insert(key, run.clone());
+                    // First wins, matching `MemProvenanceStore`: a re-declaration of the same
+                    // actor with a later `started_at` must not rewrite what the slot means.
+                    out.runs.entry(key).or_insert_with(|| run.clone());
                     // Transaction 0 never commits: a record carrying it is a DECLARATION replayed
                     // after a checkpoint, not a binding. Binding it would attach a run to a
                     // transaction id that every DDL record also uses.
@@ -817,6 +828,48 @@ mod tests {
             format!("{err}").contains("different"),
             "it failed, but not by this guard: {err}"
         );
+    }
+
+    /// **Two sessions of one run differ in `started_at` and are the same actor.**
+    ///
+    /// `MemProvenanceStore::intern` hands both sessions the same `ProvId` because `same_actor`
+    /// deliberately excludes `started_at` — its doc records that including it made the same input
+    /// refused or accepted depending on whether the clock had ticked. So a log legitimately holds two
+    /// identity records for one slot differing in exactly that field.
+    ///
+    /// The conflict check compared with derived `==`, which does compare `started_at`, and this arm
+    /// returns `Err` — so a perfectly ordinary second session made `decode` fail, `pump` propagate,
+    /// and the whole log range permanently undecodable. A feed that cannot get past a byte offset is
+    /// worse than one that loses a row.
+    ///
+    /// **Breaking shape:** any agent that opens a second session, with the clock advancing between
+    /// them. A workload where each run commits exactly once never produces it, and neither does one
+    /// fast enough to land both sessions inside a single clock tick — which is how the same mistake
+    /// passed on macOS and failed on an Ubuntu runner the first time it was made.
+    #[test]
+    fn a_second_session_of_one_run_is_not_a_conflicting_actor() {
+        let (_d, w) = wal("second-session");
+        let first = a_run(1, "restock-agent");
+        let mut later = a_run(1, "restock-agent");
+        later.started_at = first.started_at + 5_000;
+        assert_ne!(first, later, "the two entities must differ, or this test proves nothing");
+
+        w.append(0, 0, &RecKind::RunIdentity { run: first.clone() }).unwrap();
+        w.append(7, 0, &RecKind::Begin).unwrap();
+        insert(&w, 7, 7, 70);
+        w.append(7, 0, &RecKind::RunIdentity { run: later }).unwrap();
+        w.append(7, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "one run became two: {:?}", out.runs);
+        assert_eq!(
+            out.runs[&1].started_at, first.started_at,
+            "the later session rewrote what the slot means; the first declaration must win"
+        );
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
     }
 
     /// A declaration (transaction 0) names a run without binding one, and a binding attributes the

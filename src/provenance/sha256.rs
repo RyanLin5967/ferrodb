@@ -52,9 +52,18 @@ pub struct Sha256 {
     /// Partial block. Never reaches 64 bytes: it is compressed the moment it fills.
     block: [u8; 64],
     used: usize,
-    /// Total message length in BYTES. The padding encodes it in bits, and the multiplication is
-    /// done in `u128` — a message of 2^61 bytes overflows a `u64` of bits, and a silently wrapped
-    /// length produces a digest that is wrong rather than an error.
+    /// Total message length in BYTES.
+    ///
+    /// `u128` so that the bytes-to-bits multiplication in `finish` cannot overflow before it is
+    /// encoded — in a `u64` it would wrap at 2^61 bytes, which in a debug build panics and in a
+    /// release build silently produces the wrong digest.
+    ///
+    /// **The encoded field is still 64 bits, and that is the algorithm's own limit rather than a
+    /// shortcut here:** FIPS 180-4 defines SHA-256 for messages shorter than 2^64 bits, and its
+    /// length block is exactly 64 bits wide. A longer message has no defined digest at all, so
+    /// there is nothing this implementation could encode instead. It does not detect that case, and
+    /// this comment says so rather than implying a guard that is not there — 2^61 bytes is 2 EiB,
+    /// which no caller of `prompt_digest` can construct.
     len: u128,
 }
 

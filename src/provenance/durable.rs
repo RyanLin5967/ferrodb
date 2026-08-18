@@ -1,6 +1,6 @@
 //! A [`ProvenanceStore`] that survives the process.
 //!
-//! # The gap this closes
+//! # The gap this closes, and the half of it that is NOT closed yet
 //!
 //! [`MemProvenanceStore`] was the only implementation, and all three `AgentRuntime` constructors
 //! built one — including `reopen_with_storage`, whose entire job is to attach to a tree another
@@ -8,6 +8,15 @@
 //! answering *nothing* about any of them: exit criterion 9 held for as long as one process stayed
 //! alive and not one moment longer. Attribution that evaporates on restart is not attribution; it
 //! is a cache of it.
+//!
+//! **This type is the replacement, and nothing constructs it yet.** `src/agent_sql/runtime.rs` is
+//! owned by another lane and was deliberately not touched, so all three of its constructors still
+//! build `Arc::new(MemProvenanceStore::new())` and `prov_store` has no setter. Read the paragraph
+//! above in the present tense for every path that goes through `AgentRuntime`: on those, restarting
+//! still loses attribution. What is done here is the store itself, proven durable and proven to be
+//! usable as the exact `Arc<dyn ProvenanceStore>` that field holds
+//! (`tests/integration_run_identity_feed.rs::the_durable_store_is_usable_as_the_trait_object_agent_runtime_holds`).
+//! Wiring it is one line in each of `runtime.rs:276`, `:332` and `:369`.
 //!
 //! # Shape: an append-only log, replayed on open
 //!
@@ -254,12 +263,34 @@ impl DurableProvenanceStore {
         // and only file order says which that is.
         let stamp_count = stamps.len();
         for (at, rid, id) in stamps {
-            mem.stamp(rid, id).map_err(|e| {
-                FerroError::Provenance(format!(
-                    "{}: the stamp at offset {at} names {id}, which this file never declared: {e}",
-                    path.display()
-                ))
-            })?;
+            if let Err(e) = mem.stamp(rid, id) {
+                // **Two different failures, told apart rather than both blamed on the file.**
+                //
+                // `stamp` refuses an id that was never interned AND a page whose dictionary has hit
+                // its 255-entry cap. The first means the file disagrees with itself; the second says
+                // nothing about the file at all, and reporting it as "this file never declared that
+                // run" would send the reader looking for corruption that is not there.
+                //
+                // The second branch is **defensive rather than reachable through this store's own
+                // API**: the cap is enforced at write time, so a file this build wrote cannot carry
+                // a 256th run for one page. It exists for a file written by a build with a different
+                // cap, or one edited by hand — and it is here rather than absent because a wrong
+                // diagnosis costs more than an unused branch. That reachability is stated rather
+                // than tested, because there is no honest way to test it from here.
+                let known = mem.lookup(id).is_ok();
+                return Err(FerroError::Provenance(if known {
+                    format!(
+                        "{}: the stamp at offset {at} names {id}, which this file DID declare, so \
+                         the file is intact — the store refused the stamp for another reason: {e}",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "{}: the stamp at offset {at} names {id}, which this file never declared: {e}",
+                        path.display()
+                    )
+                }));
+            }
         }
 
         Ok(RecoveryReport {
@@ -416,12 +447,19 @@ enum Frame {
 
 impl ProvenanceStore for DurableProvenanceStore {
     fn intern(&self, run: &RunEntity) -> Result<ProvId, FerroError> {
-        self.refuse_if_poisoned()?;
         // The file lock is taken FIRST and held across BOTH the in-memory intern and the append,
         // so two threads cannot both observe "this run is new" and both write it, and no stamp can
         // slip between a run being interned and its record reaching the file. Lock order is
         // file -> mem, everywhere.
         let file = self.file.lock().unwrap();
+        // Checked UNDER the lock, and that is the fix for a race rather than tidiness. Checked
+        // before taking it, a writer that had already passed the check could be sitting on
+        // `file.lock()` while another thread's append failed and poisoned the store; it would then
+        // acquire the lock and append anyway, producing exactly the file the poison flag exists to
+        // prevent — a `Stamp` naming a run whose `Run` record never landed, which the next `open`
+        // must refuse whole. Check-then-act on shared state, which is the shape that has produced
+        // six separate defects in this codebase.
+        self.refuse_if_poisoned()?;
         let before = self.mem.run_count();
         let id = self.mem.intern(run)?;
         if self.mem.run_count() == before {
@@ -456,8 +494,9 @@ impl ProvenanceStore for DurableProvenanceStore {
     }
 
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError> {
-        self.refuse_if_poisoned()?;
         let file = self.file.lock().unwrap();
+        // Under the lock; see `intern` for the race that checking it first opened.
+        self.refuse_if_poisoned()?;
         // In memory first: it holds the guards (an uninterned id, `ProvId::NONE`, a page dictionary
         // at its cap), and a refused stamp must not reach the file.
         self.mem.stamp(rid, id)?;
