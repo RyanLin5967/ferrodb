@@ -35,5 +35,5 @@ pub use gate::{BlindWriteCheck, Check, CheckStatus, Finding, GateOutcome, ReadPr
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use paged_rows::PagedRows;
-pub use runtime::{AgentRuntime, BranchResolver, ExecCtx};
+pub use runtime::{AgentRuntime, BranchResolver, ExecCtx, RunActivity};
 pub use session::AgentSession;

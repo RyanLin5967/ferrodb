@@ -3,3 +3,4 @@ pub mod column;
 pub mod catalog_page;
 pub mod catalog;
 pub mod stats;
+pub mod system_views;

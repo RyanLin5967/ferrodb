@@ -185,6 +185,17 @@ fn print_outcome(out: &Outcome) {
         }
         Outcome::Affected(n) => println!("({} row{} affected)", n, if *n == 1 {""} else {"s"}),
         Outcome::Explain(s) => println!("{}", s.trim_end()),
+        // Column names, then rows, then the count. A system view read at the CLI with no rows still
+        // prints its header, so "nothing is quarantined" and "this view is broken" do not look the
+        // same here either.
+        Outcome::Table(t) => {
+            println!("{}", t.header().join(" | "));
+            for row in &t.rows {
+                let cells: Vec<String> = row.iter().map(display_value).collect();
+                println!("{}", cells.join(" | "));
+            }
+            println!("({} row{})", t.rows.len(), if t.rows.len() == 1 { "" } else { "s" });
+        }
         Outcome::Agent(a) => println!("{}", a),
         Outcome::Ok => println!("ok"),
     }

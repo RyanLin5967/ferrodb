@@ -217,6 +217,31 @@ struct State {
     policy: PolicyTable,
 }
 
+/// What one live agent task has written and read, as counts. See [`AgentRuntime::run_activity`]
+/// for what each field does and does not include.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunActivity {
+    pub branch: BranchId,
+    /// The name this branch answers to in SQL (`b_3`).
+    pub branch_name: String,
+    /// `None` only if the interned run went missing, which would be a bug rather than a state.
+    pub run: Option<RunEntity>,
+    /// Typed ops in this task's own frame. Not inherited at fork.
+    pub ops_captured: u64,
+    /// Guards in this task's own frame. Not inherited at fork.
+    pub guards_captured: u64,
+    /// Rows in the workspace map. **Inherited at fork** from an open parent session.
+    pub staged_rows: u64,
+    /// Distinct `(table, row)` pairs read as exact versions.
+    pub rows_read_exact: u64,
+    /// Range / full-scan reads, which retain a predicate summary rather than versions.
+    pub scan_reads: u64,
+    /// Rows those scans reported observing. Diagnostic; never feeds a decision.
+    pub scan_rows_observed: u64,
+    /// Rows staged without ever being read — DESIGN.md section 4's cheap metric.
+    pub blind_writes: u64,
+}
+
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {
     fn resolve_branch(&self, name: &str) -> Result<BranchId, FerroError>;
@@ -603,6 +628,82 @@ impl AgentRuntime {
             .filter(|((t, _), _)| *t == tbl)
             .filter_map(|((_, r), p)| state.runs.get(&p.0).map(|e| (RowId(*r), e.clone())))
             .collect()
+    }
+
+    /// Per-run counters for the observability views, one row per **live** agent task.
+    ///
+    /// **Counts only; this adds no bookkeeping.** Every number here is the length of something the
+    /// workspace already holds — the captured frame, the staged row map, the retained read-set — so
+    /// this is a read-only projection of state the runtime maintains for merge, not a new ledger
+    /// kept for reporting. Nothing here is durable: a workspace exists only between
+    /// `BEGIN AGENT SESSION` and `MERGE` / `ABANDON` (`seal` drops it), so this answers about work
+    /// in flight and says nothing about work already published. `authors_of` is the question to ask
+    /// about published rows.
+    ///
+    /// The counters are deliberately separate rather than summed into one "writes" and one "reads",
+    /// because they are not interchangeable and adding them would invent a number:
+    ///
+    /// * `ops_captured` / `guards_captured` come from this task's own `TxnFrame`, which is **not**
+    ///   copied at fork, so they count only what this run did.
+    /// * `staged_rows` is the workspace's row map, which **is** copied at fork from an open parent
+    ///   session (`begin_session_with_model`). For a branch forked from another live agent task it
+    ///   therefore includes rows inherited at fork time, not only rows this run wrote. Named
+    ///   `staged_rows` and not `rows_written` for exactly that reason.
+    /// * `rows_read_exact` counts DISTINCT `(table, row)` pairs across the exact-version read-sets;
+    ///   a point read repeated is one premise, not two.
+    /// * `scan_reads` / `scan_rows_observed` are the range and full-scan reads, kept apart from the
+    ///   exact ones because a scan retains a predicate summary rather than versions — DESIGN.md
+    ///   section 2's "chosen by ACCESS SHAPE, never by size". `rows_observed` is that summary's own
+    ///   diagnostic count.
+    pub fn run_activity(&self) -> Vec<RunActivity> {
+        use crate::provenance::readset::ReadSet;
+        let state = self.state.lock().unwrap();
+        let mut out = Vec::with_capacity(state.workspaces.len());
+        for (id, ws) in state.workspaces.iter() {
+            // The generation lives in `names`, not in the workspace: `workspaces` is keyed by the id
+            // SLOT alone. Falling back to generation 0 would name a *different* branch after an id
+            // slot is recycled, so the name map is the authority and its absence is reported as
+            // generation 0 only when there is no name at all — which `seal` makes impossible while a
+            // workspace is present.
+            let branch = state
+                .names
+                .get(&ws.name)
+                .copied()
+                .unwrap_or_else(|| BranchId::new(*id, 0));
+            let mut exact: Vec<(u32, u64)> = Vec::new();
+            let mut scan_reads = 0u64;
+            let mut scan_rows_observed = 0u64;
+            for rs in &ws.reads {
+                match rs {
+                    ReadSet::ExactVersions(versions) => {
+                        for v in versions {
+                            let key = (v.tbl.0, v.row.0);
+                            if let Err(at) = exact.binary_search(&key) {
+                                exact.insert(at, key);
+                            }
+                        }
+                    }
+                    ReadSet::Predicate(p) => {
+                        scan_reads += 1;
+                        scan_rows_observed += p.rows_observed;
+                    }
+                }
+            }
+            out.push(RunActivity {
+                branch,
+                branch_name: ws.name.clone(),
+                run: state.runs.get(&ws.prov.0).cloned(),
+                ops_captured: ws.frame.ops.len() as u64,
+                guards_captured: ws.frame.guards.len() as u64,
+                staged_rows: ws.rows.len() as u64,
+                rows_read_exact: exact.len() as u64,
+                scan_reads,
+                scan_rows_observed,
+                blind_writes: blind_writes_of(&ws.rows, &ws.reads).len() as u64,
+            });
+        }
+        out.sort_by_key(|a| (a.branch.id, a.branch.generation));
+        out
     }
 
     // ---- reads -----------------------------------------------------------------------------

@@ -8,6 +8,7 @@ use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, 
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::catalog::system_views::{self, NamedRows, SystemView};
 use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
@@ -43,10 +44,32 @@ pub enum Outcome {
     Explain(String),
     /// The structured result of an agent-session statement.
     Agent(AgentOutput),
+    /// Rows that carry their own column names and declared types.
+    ///
+    /// A separate variant from `Rows` rather than a widening of it, deliberately. `Rows` is what
+    /// every heap-backed `SELECT` returns and it has thirty-odd consumers across the suite; giving
+    /// it a schema would rewrite all of them for no gain, because a heap-backed row's names are
+    /// already recoverable from the catalog. What could not be recovered from anywhere was the
+    /// schema of a result with **no table behind it** — a system view — and that is what this
+    /// carries (B9).
+    Table(NamedRows),
     Ok,
 }
 
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    // B9 — read-only system views over the agent layer, checked BEFORE every other route.
+    //
+    // The order is not a preference. A view name is not in `Catalog::tables`, so every other route
+    // rejects it as an unknown table: the binder at `bind_scan`, the planner at `require_table`, and
+    // `runtime.select` inside an agent session. Checking here also means a view is readable from
+    // inside an agent session, which matters — an agent asking what the branch engine thinks of its
+    // own branch is the main reason these exist.
+    if let Stmt::Select { from, .. } = &stmt {
+        if let Some(view) = SystemView::by_name(&from.name) {
+            let rows = system_views::run_select(view, &stmt, catalog, session.runtime.as_ref())?;
+            return Ok(Outcome::Table(rows));
+        }
+    }
     // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
     if is_agent_stmt(&stmt) {
         return run_agent_stmt(stmt, catalog, bp, txn, session);

@@ -25,7 +25,10 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::error::FerroError;
+use crate::catalog::system_views::NamedRows;
+use crate::catalog::column::DataType;
 use crate::execution::executor::{run, Outcome};
+use crate::planner::logical_plan::is_computed_column;
 use crate::execution::session::Session;
 use crate::parser::parser::Parser;
 use crate::parser::scanner::Scanner;
@@ -171,6 +174,61 @@ fn oid_of(v: &Value) -> i32 {
         Value::Timestamp(_) => oid::INT8,
         Value::Varchar(_) | Value::Null => oid::TEXT,
     }
+}
+
+/// The OID for a column's **declared** type, as opposed to [`oid_of`]'s answer for one observed
+/// value.
+///
+/// The two exist together rather than one calling the other because they answer different questions.
+/// `oid_of` looks at a value and can only be asked about a column that has one; this looks at a
+/// schema and answers for an empty result too, which is the entire reason an empty system view is
+/// distinguishable from a broken one — the field list is still fully typed with no rows to infer
+/// from.
+///
+/// `Timestamp` maps to `int8` here for the same reason it does in `oid_of`, and the mapping is
+/// duplicated rather than shared: they are two tables over two different domains that happen to
+/// agree, and collapsing them would make the next divergence silent.
+fn oid_of_type(t: &DataType) -> i32 {
+    match t {
+        DataType::Integer => oid::INT4,
+        DataType::Float => oid::FLOAT8,
+        DataType::Boolean => oid::BOOL,
+        DataType::BigInt => oid::INT8,
+        DataType::Decimal => oid::NUMERIC,
+        // Epoch milliseconds with no calendar formatter, so `int8` is the true answer. See `oid_of`.
+        DataType::Timestamp => oid::INT8,
+        DataType::Varchar(_) => oid::TEXT,
+    }
+}
+
+/// The `RowDescription` fields for a result that knows its own schema.
+///
+/// A declared type is used as declared, with one exception that is a correctness fix rather than a
+/// nicety: `LogicalPlan`'s output schema carries a **placeholder** type for a projected expression
+/// that is not a bare column reference (`SELECT qty * 2` — see `logical_plan::is_computed_column`),
+/// and that placeholder is a hardcoded `Integer`. Announcing `int4` and then sending `3.5` is a parse
+/// error at every conforming driver, so for those columns the OID comes from the value the query
+/// actually produced, and falls back to `text` when there are no rows to look at. `text` is the one
+/// type every client will accept the bytes of.
+fn fields_of(rows: &NamedRows) -> Vec<(String, i32)> {
+    rows.columns
+        .iter()
+        .enumerate()
+        .map(|(at, col)| {
+            let oid = if is_computed_column(col) {
+                rows.rows
+                    .iter()
+                    .find_map(|r| match r.get(at) {
+                        Some(Value::Null) | None => None,
+                        Some(v) => Some(oid_of(v)),
+                    })
+                    .unwrap_or(oid::TEXT)
+            } else {
+                oid_of_type(&col.data_type)
+            };
+            (col.name.clone(), oid)
+        })
+        .collect()
 }
 
 /// Text-format rendering. `None` is SQL NULL, which the protocol encodes as length -1 rather than
@@ -390,10 +448,32 @@ fn execute(
                 }
                 out.push(Message::CommandComplete(format!("SELECT {}", text.lines().count())));
             }
+            // A system view, or anything else that carries its own schema: real column names, and
+            // an OID per column even when there are no rows.
+            Outcome::Table(t) => {
+                out.push(Message::RowDescription(fields_of(&t)));
+                let count = t.rows.len();
+                for r in &t.rows {
+                    out.push(Message::DataRow(r.iter().map(render).collect()));
+                }
+                out.push(Message::CommandComplete(format!("SELECT {count}")));
+            }
+            // **This used to be one `text` column holding `format!("{a:?}")`.**
+            //
+            // A client could read it and could do nothing with it: the `Debug` rendering of a
+            // `MergeReport` is a Rust literal, so a driver got one opaque string where the design
+            // promises structured data an agent can act on (DESIGN.md exit criteria 4 and 5 —
+            // "structured throughout ... never rendered text"). `AgentOutput::to_rows` is the typed
+            // form beside `Display`; `Display` stays because the CLI wants a sentence and a wire
+            // client wants columns.
             Outcome::Agent(a) => {
-                out.push(Message::RowDescription(vec![("agent".into(), oid::TEXT)]));
-                out.push(Message::DataRow(vec![Some(format!("{a:?}"))]));
-                out.push(Message::CommandComplete("SELECT 1".into()));
+                let t = a.to_rows();
+                out.push(Message::RowDescription(fields_of(&t)));
+                let count = t.rows.len();
+                for r in &t.rows {
+                    out.push(Message::DataRow(r.iter().map(render).collect()));
+                }
+                out.push(Message::CommandComplete(format!("SELECT {count}")));
             }
             Outcome::Ok => out.push(Message::CommandComplete(verb.to_string())),
         }
