@@ -43,6 +43,7 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::cow::page_header::{flags, stamp_checksum, verify_checksum, PageHeader, PageType};
 use crate::cow::{CowPage, PageHandle, PageStore, PAGE_HEADER_SIZE};
 use crate::error::FerroError;
+use crate::storage::atomic_file::{replace_atomically, FileOps, OsFileOps};
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::wal::log::crc32;
 
@@ -579,12 +580,31 @@ impl ArenaPageStore {
         }
     }
 
-    /// Write the free-space map to `path`, via a temporary file and a rename, so a crash leaves
-    /// either the previous checkpoint or the new one and never a half-written map.
+    /// Write the free-space map to `path` durably, so a crash leaves either the previous checkpoint
+    /// or the new one and never a half-written map.
+    ///
+    /// That sentence was already here while the body was `std::fs::write` plus `std::fs::rename` —
+    /// two of the four steps the idiom needs. Neither call makes anything durable, so a power cut
+    /// could leave the *rename* on the device while the bytes it named were still in the page cache:
+    /// exactly the half-written map the promise excludes. `<db>.arena` is the only thing on disk
+    /// that says where the branch arena starts, and [`ArenaPageStore::load_state`] verifies a CRC32
+    /// over it, so the observable outcome was a database that will not open at all.
+    ///
+    /// The four steps live in [`crate::storage::atomic_file`], which is also where they can be
+    /// *asserted*: an fsync is invisible to any test that merely reads the file back.
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), FerroError> {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.state_bytes()).map_err(|e| FerroError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| FerroError::Io(e.to_string()))
+        self.checkpoint_with(&OsFileOps, path)
+    }
+
+    /// [`ArenaPageStore::checkpoint`] against an injected [`FileOps`], so a test can see the order
+    /// of the four operations rather than only their result.
+    pub(crate) fn checkpoint_with(
+        &self,
+        ops: &dyn FileOps,
+        path: &std::path::Path,
+    ) -> Result<(), FerroError> {
+        replace_atomically(ops, path, &self.state_bytes())
+            .map_err(|e| FerroError::Io(e.to_string()))
     }
 
     /// Restore from a checkpoint written by [`ArenaPageStore::checkpoint`]. A missing file is not
@@ -1430,6 +1450,95 @@ mod tests {
         // and the good image still loads
         target.load_state(&good).unwrap();
         assert_eq!(target.arena_owner(a), Some(b.branch_id));
+    }
+
+    /// **The checkpoint's "atomic rename" is only atomic if both fsyncs happen.**
+    ///
+    /// `<db>.arena` is the only thing on disk that says where the branch arena starts, and it was
+    /// written with `std::fs::write` + `std::fs::rename`, neither of which makes anything durable.
+    /// A power cut could therefore leave the directory entry pointing at bytes that never reached
+    /// the device — and `load_state`'s CRC32 then refuses the image, so the database does not open.
+    ///
+    /// Asserted as an operation *order*, because that is the only way to see it: every test that
+    /// reads the file back is answered by the page cache whether the fsyncs happened or not.
+    #[test]
+    fn the_checkpoint_syncs_the_image_before_the_rename_and_the_directory_after_it() {
+        use crate::storage::atomic_file::{Op, RecordingOps};
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+
+        // A path that does not exist: nothing here may touch a real filesystem, which is the point
+        // of recording the operations instead of their aftermath.
+        let path = std::path::Path::new("/ferro-no-such-dir/db.arena");
+        let ops = RecordingOps::new();
+        h.store.checkpoint_with(&ops, path).unwrap();
+
+        let tmp = std::path::PathBuf::from("/ferro-no-such-dir/db.arena.tmp");
+        assert_eq!(
+            ops.shape(),
+            vec![
+                ("write", tmp.clone()),
+                ("sync_file", tmp.clone()),
+                ("rename", tmp.clone()),
+                ("sync_dir", std::path::PathBuf::from("/ferro-no-such-dir")),
+            ],
+            "the free-space map must be on the device before the rename names it, and the rename \
+             must be on the device after it"
+        );
+        match &ops.ops()[0] {
+            Op::Write(_, bytes) => assert_eq!(
+                bytes,
+                &h.store.state_bytes(),
+                "the temporary must receive this store's free-space map"
+            ),
+            other => panic!("the first operation was {other:?}"),
+        }
+        match &ops.ops()[2] {
+            Op::Rename(from, to) => {
+                assert_eq!(from, &tmp);
+                assert_eq!(to, path, "the temporary must land on the checkpoint path itself");
+            }
+            other => panic!("the third operation was {other:?}"),
+        }
+    }
+
+    /// Guards the **production** entry point, which the recorder cannot reach: `checkpoint` itself
+    /// has to go through [`crate::storage::atomic_file`] rather than growing its own copy of the
+    /// idiom again.
+    ///
+    /// The observable is the temporary's *name*, which is chosen in exactly one place. Blocking
+    /// `<target>.tmp` with a directory makes the real call fail; the version this replaced staged
+    /// through `path.with_extension("tmp")` — `db.tmp`, a different file — and would sail past.
+    #[test]
+    fn the_public_checkpoint_stages_through_the_durable_helper() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("ferro-arena-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("db.arena");
+        h.store.checkpoint(&target).unwrap();
+        let good = std::fs::read(&target).unwrap();
+
+        // Occupy the one path a durable replace must stage through.
+        std::fs::create_dir(dir.join("db.arena.tmp")).unwrap();
+        let err = h.store.checkpoint(&target);
+        assert!(
+            err.is_err(),
+            "checkpoint did not stage through db.arena.tmp, so it is not using the durable replace"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            good,
+            "a failed checkpoint must leave the previous map exactly as it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
