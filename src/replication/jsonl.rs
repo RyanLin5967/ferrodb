@@ -81,14 +81,21 @@
 //! is where a row becomes bytes: [`row_into`] holds the allowlist, so the WAL stream, the initial
 //! snapshot and the table dump are all covered by one decision rather than by three copies of it.
 //!
-//! Two shapes on the wire follow from it:
+//! What that looks like on the wire:
 //!
-//! * A withheld column's key is **absent** from `before`/`after`, and the event grows
-//!   `"withheld":["ssn"]` naming what was left out. Absent-and-declared, not absent: this module's
-//!   whole position is that a consumer which cannot tell "null" from "not sent" cannot apply an
-//!   update, and silently dropping a column would be exactly that failure dressed as a feature.
-//! * The key appears **only** when something was withheld, so a feed with no publication — or one
-//!   whose every column is published — is byte-for-byte what it was before publications existed.
+//! * A withheld column's key is **absent** from `before`/`after`, and nothing anywhere names it.
+//!   Not a redaction marker, not a `withheld` list: a guard whose job is that a column cannot leave
+//!   must not ship the name of the column it is protecting, and `salary_band` is information even
+//!   with the number removed.
+//! * The **declared shape is projected by the same mask**, which is what makes the absence honest
+//!   rather than silent. This module's standing rule is that a consumer unable to tell "null" from
+//!   "not sent" cannot apply an update — that rule assumes the consumer knows the column exists, and
+//!   under a publication it does not. The `CREATE_TABLE` it is given and the rows it receives agree
+//!   exactly, so there is no absence for it to misread. Skip the projection of the shape and the rule
+//!   bites immediately: the consumer creates a column, never receives a value for it, and reports it
+//!   as permanently null.
+//! * A feed with no publication — or one whose every column is published — is byte-for-byte what it
+//!   was before publications existed.
 //!
 //! A refusal (an undecided table, a row with nothing publishable in it) is not a line at all. It
 //! comes back as a [`Refusal`], and what the streaming caller must then do with its cursor is the
@@ -303,22 +310,18 @@ fn line_with_mask(e: &ChangeEvent, mask: &Mask<'_>) -> Result<String, Refusal> {
         ChangeOp::Delete { .. } => out.push_str("null"),
     }
 
-    // Declared only when something was actually withheld, so a feed with no policy — or one whose
-    // every column is published — is byte-for-byte what it was before publications existed. A
-    // consumer seeing this key has been told a column exists that it is not being sent, which is a
-    // true statement it can act on; a consumer seeing the key absent has been told nothing was held
-    // back, which is also true.
-    if !mask.withheld().is_empty() {
-        out.push_str(",\"withheld\":[");
-        for (i, c) in mask.withheld().iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            escape_json_into(c, &mut out);
-        }
-        out.push(']');
-    }
-
+    // **Nothing names the withheld columns on the wire, and that is a decision rather than an
+    // omission.** An earlier version of this emitted `"withheld":["ssn"]`, on the reasoning that a
+    // consumer which cannot tell "null" from "not sent" cannot apply an update — the rule the rest of
+    // this module is built on. It is the wrong rule here, because it assumes the consumer knows the
+    // column exists. Under a publication it does not: the `CREATE_TABLE` shape is projected by the
+    // same mask, so the shape the consumer is told about and the rows it receives agree exactly, and
+    // there is no absence for it to misread.
+    //
+    // What the list did cost was real: a column NAME is itself information — `hiv_status`,
+    // `salary_band` — and a guard whose job is that a column cannot leave the database must not ship
+    // the name of the column it is protecting. So a denied column appears in the feed neither as a
+    // key, nor as a value, nor as a name in a metadata field.
     out.push('}');
     Ok(out)
 }
@@ -721,6 +724,220 @@ mod tests {
         };
         let line = line(&e);
         assert!(line.contains("\"b\":null"), "the null column was omitted entirely: {line}");
+    }
+
+    // ---- B7: the publication, at the boundary where a row becomes bytes ------------------------
+
+    /// A three-column table whose third column must never leave.
+    fn customer(op: ChangeOp) -> ChangeEvent {
+        ChangeEvent {
+            txn_id: 2,
+            lsn: 216,
+            commit_lsn: 422,
+            commit_end_lsn: 455,
+            table: "customers".into(),
+            columns: Arc::new(vec!["id".into(), "name".into(), "ssn".into()]),
+            op,
+        }
+    }
+
+    fn analytics() -> Publication {
+        Publication::parse("publication analytics\ncustomers: id, name\n").unwrap()
+    }
+
+    fn row3() -> Vec<Value> {
+        vec![Value::Integer(1), Value::Varchar("ada".into()), Value::Varchar("000-11-2222".into())]
+    }
+
+    /// **The property this whole lane exists for, at the byte level.**
+    ///
+    /// Breaking shape: any row of a table with a denied column — here `customers(id, name, ssn)`
+    /// under a publication naming `id, name`. The digits of the ssn must not appear in the bytes at
+    /// all, and its siblings must still ship, which is what makes the test about the allowlist rather
+    /// than about emitting nothing.
+    #[test]
+    fn a_denied_column_is_absent_from_the_bytes_and_declared_in_withheld() {
+        let line =
+            to_json_line(&customer(ChangeOp::Insert { new: row3() }), &analytics()).expect("refused");
+        assert!(!line.contains("000-11-2222"), "the denied value left the database: {line}");
+        // The NAME, anywhere in the line, not just as a key. A redaction marker or a `withheld`
+        // list would satisfy "no key" and still ship the name of the column being protected.
+        assert!(!line.contains("ssn"), "the denied column is named in the line: {line}");
+        assert!(line.contains("\"after\":{\"id\":1,\"name\":\"ada\"}"), "{line}");
+    }
+
+    /// **A withheld FIRST column must not leave a leading comma**, which would make the line
+    /// unparseable — and it would break at the consumer's parser rather than here.
+    ///
+    /// Breaking shape: the separator written from the loop index rather than from what has actually
+    /// been written. `{,"name":"ada"}` is not JSON, and the first version of this loop did exactly
+    /// that.
+    #[test]
+    fn a_withheld_first_column_leaves_valid_json() {
+        let p = Publication::parse("publication p\ncustomers: name, ssn\n").unwrap();
+        let line = to_json_line(&customer(ChangeOp::Insert { new: row3() }), &p).expect("refused");
+        assert!(!line.contains("{,"), "a leading comma made the row unparseable: {line}");
+        assert!(line.contains("\"after\":{\"name\":\"ada\",\"ssn\":\"000-11-2222\"}"), "{line}");
+        assert!(!line.contains("\"id\""), "the withheld column is named in the line: {line}");
+    }
+
+    /// **Both images of an UPDATE go through the mask.**
+    ///
+    /// Breaking shape: an update that changes the ssn. A projection applied only to `after` — the
+    /// obvious half, and the one a reader of `to_json_line` sees first — ships the OLD ssn in
+    /// `before` and passes any test that only looks at `after`.
+    #[test]
+    fn both_images_of_an_update_are_projected() {
+        let e = customer(ChangeOp::Update {
+            old: vec![
+                Value::Integer(1),
+                Value::Varchar("ada".into()),
+                Value::Varchar("000-11-2222".into()),
+            ],
+            new: vec![
+                Value::Integer(1),
+                Value::Varchar("ada".into()),
+                Value::Varchar("999-88-7777".into()),
+            ],
+        });
+        let line = to_json_line(&e, &analytics()).expect("refused");
+        assert!(!line.contains("000-11-2222"), "the OLD denied value left in `before`: {line}");
+        assert!(!line.contains("999-88-7777"), "the new denied value left in `after`: {line}");
+        assert!(line.contains("\"before\":{\"id\":1,\"name\":\"ada\"}"), "{line}");
+        assert!(line.contains("\"after\":{\"id\":1,\"name\":\"ada\"}"), "{line}");
+    }
+
+    /// A DELETE carries **only** a before image, so a fix applied to the after path alone misses it
+    /// entirely — and a delete's before image is a whole row of denied values.
+    #[test]
+    fn a_delete_projects_its_only_image() {
+        let line = to_json_line(&customer(ChangeOp::Delete { old: row3() }), &analytics())
+            .expect("refused");
+        assert!(!line.contains("000-11-2222"), "a DELETE shipped the denied column: {line}");
+        assert!(line.contains("\"before\":{\"id\":1,\"name\":\"ada\"}"), "{line}");
+        assert!(line.contains("\"after\":null"), "{line}");
+    }
+
+    /// A snapshot `READ` is the third image-carrying op and the one E75 proves is a separate path.
+    #[test]
+    fn a_snapshot_read_projects_its_row() {
+        let line =
+            to_json_line(&customer(ChangeOp::Read { row: row3() }), &analytics()).expect("refused");
+        assert!(!line.contains("000-11-2222"), "a snapshot row shipped the denied column: {line}");
+        assert!(line.contains("\"op\":\"READ\""), "{line}");
+        assert!(line.contains("\"after\":{\"id\":1,\"name\":\"ada\"}"), "{line}");
+    }
+
+    /// **The declared shape is projected too.** A consumer told about a column it will never receive
+    /// creates it and then reports it as permanently null, which reads as data loss; and the name and
+    /// type of a denied column are themselves information that must not leave.
+    #[test]
+    fn a_create_table_shape_omits_the_denied_column() {
+        use crate::replication::logical::ColumnSpec;
+        let e = customer(ChangeOp::Schema {
+            change: SchemaChange::CreateTable,
+            columns: vec![
+                ColumnSpec { name: "id".into(), sql_type: "INTEGER".into(), nullable: false },
+                ColumnSpec { name: "name".into(), sql_type: "VARCHAR(32)".into(), nullable: true },
+                ColumnSpec { name: "ssn".into(), sql_type: "VARCHAR(16)".into(), nullable: true },
+            ],
+        });
+        let line = to_json_line(&e, &analytics()).expect("refused");
+        assert!(!line.contains("ssn"), "the denied column was declared to the consumer: {line}");
+        assert!(line.contains("\"name\":\"id\""), "{line}");
+        assert!(line.contains("\"name\":\"name\""), "{line}");
+    }
+
+    /// A table the publication has never heard of is refused rather than emptied, and the anti-vacuity
+    /// half shows the same renderer emitting the table it does name.
+    #[test]
+    fn an_undecided_table_is_refused_by_the_renderer() {
+        let e = ChangeEvent {
+            txn_id: 1,
+            lsn: 1,
+            commit_lsn: 2,
+            commit_end_lsn: 3,
+            table: "audit_log".into(),
+            columns: Arc::new(vec!["id".into()]),
+            op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
+        };
+        let r = to_json_line(&e, &analytics()).expect_err("an undecided table was rendered");
+        assert_eq!(r.table, "audit_log");
+        to_json_line(&customer(ChangeOp::Insert { new: row3() }), &analytics())
+            .expect("the published table was refused too, so the refusal proves nothing");
+    }
+
+    /// **A refused event must not leave a prefix on the wire.**
+    ///
+    /// Breaking shape: a batch whose *second* event is refused. Written line by line, the consumer
+    /// holds event one while the caller sees an error and must assume the write failed — and for the
+    /// snapshot path that prefix is a partial table that looks exactly like a complete one.
+    #[test]
+    fn write_feed_writes_nothing_at_all_when_any_event_is_refused() {
+        let good = customer(ChangeOp::Insert { new: row3() });
+        let bad = ChangeEvent {
+            table: "audit_log".into(),
+            columns: Arc::new(vec!["id".into()]),
+            op: ChangeOp::Insert { new: vec![Value::Integer(7)] },
+            ..customer(ChangeOp::Insert { new: row3() })
+        };
+        let events = vec![good.clone(), bad, good.clone()];
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_feed(&events, &analytics(), &mut buf)
+            .expect_err("a batch containing a refused event was written");
+        assert!(format!("{err}").contains("audit_log"), "{err}");
+        assert!(
+            buf.is_empty(),
+            "the events before the refusal were already on the wire: {}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        // Anti-vacuity: the same batch without the refused event writes every line.
+        let mut buf2: Vec<u8> = Vec::new();
+        assert_eq!(write_feed(&[good.clone(), good], &analytics(), &mut buf2).unwrap(), 2);
+        assert_eq!(String::from_utf8(buf2).unwrap().lines().count(), 2);
+    }
+
+    /// **A feed with nothing withheld is byte-for-byte what it was before publications existed.**
+    ///
+    /// Two ways to be in that state and both are asserted: no policy at all, and a policy that
+    /// publishes every column the event carries. Neither may grow a `withheld` key, or every existing
+    /// consumer sees a field it was not built for.
+    #[test]
+    fn a_feed_with_nothing_withheld_is_unchanged() {
+        let e = customer(ChangeOp::Insert { new: row3() });
+        let none = to_json_line(&e, &Publication::unrestricted()).unwrap();
+        let all = to_json_line(
+            &e,
+            &Publication::parse("publication p\ncustomers: id, name, ssn\n").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(none, all, "a fully published table is not rendered like an unpublished feed");
+        assert!(none.contains("000-11-2222"), "the unrestricted feed dropped a column: {none}");
+        // No marker of any kind is added to a line that withheld nothing, so every consumer built
+        // against the pre-B7 envelope keeps working unchanged.
+        assert!(!none.contains("withheld"), "an unwithheld line grew a policy field: {none}");
+    }
+
+    /// The table dump goes through the same mask, because a dump is egress too — and because a
+    /// projected feed diffed against an unprojected dump reports the withheld column as a data
+    /// mismatch, which is a true statement about the wrong thing.
+    #[test]
+    fn a_table_dump_is_projected_and_refused_by_the_same_policy() {
+        let columns = vec!["id".to_string(), "name".to_string(), "ssn".to_string()];
+        let rows = vec![row3()];
+        let mut buf: Vec<u8> = Vec::new();
+        let n = write_table_json("customers", &columns, &rows, &analytics(), &mut buf).unwrap();
+        assert_eq!(n, 1);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("000-11-2222"), "the dump shipped the denied column: {text}");
+        assert!(text.contains("\"name\":\"ada\""), "the dump withheld a published column: {text}");
+
+        // And a table the publication does not name cannot be dumped at all.
+        let mut buf2: Vec<u8> = Vec::new();
+        write_table_json("audit_log", &columns, &rows, &analytics(), &mut buf2)
+            .expect_err("an undecided table was dumped");
+        assert!(buf2.is_empty(), "bytes were written before the refusal: {buf2:?}");
     }
 
     #[test]

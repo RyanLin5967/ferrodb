@@ -26,11 +26,11 @@
 //!
 //! # Two outcomes, and they are deliberately not the same outcome
 //!
-//! * A **column** the publication does not name is **withheld**. Its key is left out of the emitted
-//!   row and the event carries `"withheld":["ssn"]`, so the consumer is *told* that a column exists
-//!   which it is not being sent. Dropping it in silence would break the rule this feed's format is
-//!   built on — that a consumer which cannot tell "this column is null" from "this column was not
-//!   sent" cannot apply an update correctly (see [`super::jsonl`]).
+//! * A **column** the publication does not name is **withheld**: its key is left out of every
+//!   emitted image, and nothing on the wire names it — see [`super::jsonl`] for why no `withheld`
+//!   list is emitted, and why projecting the `CREATE_TABLE` shape through the same mask is what makes
+//!   the absence honest rather than silent. A guard whose purpose is that a column cannot leave must
+//!   not ship the name of the column it is protecting.
 //! * A **table** the publication does not name is **refused**. No event for it is emitted at all,
 //!   and the feed stops there rather than stepping over it. An absent table is a question the
 //!   policy has not answered, and the only safe answer to an unanswered question about egress is
@@ -112,8 +112,8 @@ pub enum Publication {
 /// The decision for one event or one table dump: which columns may become bytes.
 ///
 /// Carries the publication and table names so the byte renderer can mint a refusal without being
-/// handed the policy a second time, and the `withheld` list so the emitted event can declare what it
-/// is not carrying.
+/// handed the policy a second time, and the `withheld` list so a refusal and an operator's report can
+/// name what was held back. The list is never written to the feed — see [`Mask::withheld`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mask<'a> {
     publication: &'a str,
@@ -143,6 +143,11 @@ impl<'a> Mask<'a> {
     }
 
     /// Columns of this table that exist and are **not** being sent, in the table's column order.
+    ///
+    /// For refusal messages and for an operator-facing report — `table_dump` prints it to stderr, to
+    /// the terminal of the person who passed the policy file. **Never written to the feed.** The
+    /// names would be egress in their own right, and a consumer has no use for them: the shape it is
+    /// given is projected too, so it never learns that the column exists.
     pub fn withheld(&self) -> &[String] {
         &self.withheld
     }
