@@ -986,3 +986,258 @@ fn a_merge_report_names_the_shape_it_produced() {
     assert!(text.contains("note"), "the report does not name the new column: {text}");
     assert!(matches!(r.outcome, MergeOutcome::Clean), "a one-sided change is Clean: {r}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Shapes the design notes name as dangerous, measured rather than reasoned about
+// ---------------------------------------------------------------------------------------------
+
+/// **The null-bitmap boundary: adding a ninth column to an eight-column table.**
+///
+/// This is the exact case that rules out the cheap alternative to a rewrite. A tuple's null bitmap
+/// is `(ncols + 7) / 8` bytes, so it is one byte for one to eight columns and two for nine — and
+/// every column offset after it moves. A "tolerant" reader that treated a short tuple as
+/// "the missing columns are NULL" works perfectly up to eight columns and then silently reads
+/// garbage, which is a correctness cliff at a column count rather than a visible failure.
+///
+/// The rewrite does not care, but it has to be *shown* not to care, on both sides of the boundary.
+#[test]
+fn crossing_the_null_bitmap_boundary_keeps_every_value() {
+    let mut d = db();
+    d.sql(
+        "CREATE TABLE wide (id INTEGER NOT NULL, c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER, \
+         c5 INTEGER, c6 INTEGER, c7 INTEGER);",
+    );
+    // Eight columns, with NULLs scattered so the bitmap actually carries information: a row of
+    // all-non-null values would read the same whatever the bitmap said.
+    d.sql("INSERT INTO wide VALUES (1, 10, NULL, 30, NULL, 50, 60, NULL);");
+    d.sql("INSERT INTO wide VALUES (2, NULL, 20, NULL, 40, NULL, 60, 70);");
+
+    // Eight -> nine. The bitmap grows from one byte to two and every column shifts.
+    d.sql("ALTER TABLE wide ADD COLUMN c8 VARCHAR(8);");
+    let rows = d.rows("SELECT * FROM wide;");
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Null,
+            Value::Integer(30),
+            Value::Null,
+            Value::Integer(50),
+            Value::Integer(60),
+            Value::Null,
+            Value::Null,
+        ],
+        "a row lost or moved a value crossing the null-bitmap boundary"
+    );
+    assert_eq!(
+        rows[1],
+        vec![
+            Value::Integer(2),
+            Value::Null,
+            Value::Integer(20),
+            Value::Null,
+            Value::Integer(40),
+            Value::Null,
+            Value::Integer(60),
+            Value::Integer(70),
+            Value::Null,
+        ]
+    );
+
+    // And the wider shape is writable and readable afterwards.
+    d.sql("INSERT INTO wide VALUES (3, 1, 2, 3, 4, 5, 6, 7, 'nine');");
+    let back = d.rows("SELECT c8 FROM wide WHERE id = 3;");
+    assert_eq!(back[0][0], Value::Varchar("nine".into()));
+
+    // Nine -> ten, still inside the second bitmap byte, as the other side of the boundary.
+    // Columns are id, c1..c7, c8, c9 — so c8 is index 8 and c9 is index 9.
+    d.sql("ALTER TABLE wide ADD COLUMN c9 INTEGER;");
+    let rows = d.rows("SELECT * FROM wide;");
+    assert_eq!(rows[0].len(), 10, "the second add did not widen every row");
+    assert_eq!(rows[0][8], Value::Null, "row 1 never had a c8");
+    assert_eq!(rows[0][9], Value::Null);
+    assert_eq!(rows[2][8], Value::Varchar("nine".into()), "the c8 written before c9 existed moved");
+    assert_eq!(rows[2][9], Value::Null);
+    // The NULLs scattered through the first eight columns are still exactly where they were, which
+    // is the bitmap claim: a second bitmap byte must not shift the bits in the first.
+    assert_eq!(rows[0][2], Value::Null);
+    assert_eq!(rows[0][4], Value::Null);
+    assert_eq!(rows[0][7], Value::Null);
+    assert_eq!(rows[1][1], Value::Null);
+    assert_eq!(rows[1][3], Value::Null);
+    assert_eq!(rows[1][5], Value::Null);
+}
+
+/// A retype that changes a column's **width** shifts every column after it, which is the other
+/// half of the layout problem. Breaking shape: a retype of a column in the MIDDLE of a row, with
+/// values on both sides of it, and a NULL among them so the bitmap is load-bearing.
+#[test]
+fn retyping_a_middle_column_does_not_disturb_its_neighbours() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, before_it INTEGER, subject INTEGER, after_it VARCHAR(8));");
+    d.sql("INSERT INTO t VALUES (1, 11, 22, 'tail');");
+    d.sql("INSERT INTO t VALUES (2, NULL, 222, NULL);");
+
+    // INTEGER is four bytes and BIGINT is eight, so `after_it` moves.
+    d.sql("ALTER TABLE t ALTER COLUMN subject TYPE BIGINT;");
+    let rows = d.rows("SELECT * FROM t;");
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(11),
+            Value::BigInt(22),
+            Value::Varchar("tail".into())
+        ],
+        "a retype in the middle disturbed its neighbours"
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::Integer(2), Value::Null, Value::BigInt(222), Value::Null]
+    );
+}
+
+/// **Three branches, not two.** Two branches is the smallest case that composes at all; a third
+/// one forked between the other two merges is where a merge that compared against the wrong
+/// snapshot would show it.
+///
+/// Breaking shape: C forks AFTER A has merged but BEFORE B has, so C's fork point is a shape
+/// neither of the others ever saw.
+#[test]
+fn three_branches_forked_at_three_different_shapes_all_compose() {
+    let mut d = db();
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    d.sql("INSERT INTO inv VALUES (1, 10);");
+
+    let mut a = Session::with_runtime(d.runtime.clone());
+    let mut b = Session::with_runtime(d.runtime.clone());
+    exec(&mut d, "BEGIN AGENT SESSION AS 'agent-a';", &mut a);
+    exec(&mut d, "BEGIN AGENT SESSION AS 'agent-b';", &mut b);
+    exec(&mut d, "ALTER TABLE inv ADD COLUMN note VARCHAR(20);", &mut a);
+    exec(&mut d, "ALTER TABLE inv ADD COLUMN sku VARCHAR(8);", &mut b);
+
+    assert!(merge_report(exec(&mut d, "MERGE;", &mut a)).applied_to_target);
+
+    // C forks HERE — after `note` exists and before `sku` does.
+    let mut c = Session::with_runtime(d.runtime.clone());
+    exec(&mut d, "BEGIN AGENT SESSION AS 'agent-c';", &mut c);
+    exec(&mut d, "ALTER TABLE inv ADD COLUMN price DECIMAL;", &mut c);
+
+    let rb = merge_report(exec(&mut d, "MERGE;", &mut b));
+    assert!(rb.applied_to_target, "the second branch did not land: {rb}");
+    let rc = merge_report(exec(&mut d, "MERGE;", &mut c));
+    assert!(rc.applied_to_target, "the third branch did not land: {rc}");
+
+    assert_eq!(
+        d.shape("inv").iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["id", "qty", "note", "sku", "price"],
+        "three concurrent adds did not all compose"
+    );
+    assert_eq!(
+        d.rows("SELECT * FROM inv;")[0],
+        vec![Value::Integer(1), Value::Integer(10), Value::Null, Value::Null, Value::Null]
+    );
+}
+
+/// A branch that ALTERs a table it has never read or written must still record that table's
+/// fork-point shape, or the merge has nothing to compare against and would treat the target's
+/// current shape as the base — silently letting through an edit written against something else.
+///
+/// Breaking shape: an agent whose *only* statement is an `ALTER`.
+#[test]
+fn a_branch_whose_only_statement_is_an_alter_still_merges_against_its_fork_point() {
+    let mut d = db();
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+
+    let mut a = Session::with_runtime(d.runtime.clone());
+    let mut b = Session::with_runtime(d.runtime.clone());
+    exec(&mut d, "BEGIN AGENT SESSION AS 'agent-a';", &mut a);
+    exec(&mut d, "BEGIN AGENT SESSION AS 'agent-b';", &mut b);
+    // Neither touches a row. Both retype the same column, to different types.
+    exec(&mut d, "ALTER TABLE inv ALTER COLUMN qty TYPE BIGINT;", &mut a);
+    exec(&mut d, "ALTER TABLE inv ALTER COLUMN qty TYPE DECIMAL;", &mut b);
+
+    assert!(merge_report(exec(&mut d, "MERGE;", &mut a)).applied_to_target);
+    let rb = merge_report(exec(&mut d, "MERGE;", &mut b));
+    assert!(!rb.applied_to_target, "a contradictory retype was published: {rb}");
+    assert_eq!(
+        rb.outcome.conflicts()[0].violated_guard.as_ref().unwrap().violated_predicate(),
+        "typeof(inv.qty) = INTEGER",
+        "the branch merged against the wrong base shape"
+    );
+}
+
+/// A column name that needs escaping has to survive the producer's JSON, the independent
+/// validator, and both sinks' identifier quoting. Breaking shape: a name carrying a double quote
+/// and a backslash — the two characters JSON must escape and the two SQL identifier quoting must.
+#[test]
+fn a_column_name_needing_escaping_survives_the_whole_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut d = db();
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    d.sql("INSERT INTO inv VALUES (1, 10);");
+    // The scanner accepts identifiers of letters, digits and underscore, so the hostile name is
+    // introduced where a real one could also arrive: through the catalog, which is what the DDL
+    // record and the feed read from.
+    d.catalog
+        .alter_table(
+            "inv",
+            &ferrodb::parser::parser::AlterAction::AddColumn(ferrodb::catalog::column::Column {
+                name: "we\"ird\\name".into(),
+                data_type: DataType::Varchar(8),
+                nullable: true,
+            }),
+            &d.txn,
+            None,
+        )
+        .expect("alter with an escaped name");
+    d.bp.flush_all().unwrap();
+    let entry = d.catalog.get_table("inv").unwrap();
+    let (dir_root, tt) = (entry.first_directory_page_id, entry.time_travel_root);
+    let shape: Vec<(String, DataType, bool)> = entry
+        .schema
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+        .collect();
+    d.txn
+        .log_ddl(ferrodb::wal::txn::DdlRecord {
+            op: ferrodb::wal::log::DdlOp::AlterColumn(
+                ferrodb::wal::log::ColumnAlteration::Add { column: "we\"ird\\name".into() },
+            ),
+            table: "inv".into(),
+            dir_root,
+            time_travel_root: tt,
+            columns: shape,
+        })
+        .unwrap();
+
+    let feed = feed_file(dir.path(), &d);
+    let raw = std::fs::read_to_string(&feed).unwrap();
+    assert!(
+        raw.contains(r#"we\"ird\\name"#),
+        "the name was not escaped on the wire: {raw}"
+    );
+
+    let v = go(&["validate"], &feed, &[]);
+    assert!(
+        v.status.success(),
+        "the independent validator refused an escaped column name:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+
+    let dest = dir.path().join("out.sqlite");
+    let s = go(&["sink"], &feed, &["-db", dest.to_str().unwrap(), "-key", "id"]);
+    assert!(
+        s.status.success(),
+        "the sink failed on an escaped column name:\n{}\n{}",
+        String::from_utf8_lossy(&s.stderr),
+        String::from_utf8_lossy(&s.stdout)
+    );
+    let cols = query(&dest, "SELECT name FROM pragma_table_info('inv') ORDER BY cid;");
+    assert!(
+        cols.split('\n').any(|c| c == "we\"ird\\name"),
+        "the destination did not round-trip the name: {cols}"
+    );
+}
