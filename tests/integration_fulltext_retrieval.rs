@@ -842,6 +842,64 @@ fn two_fulltext_indexes_on_one_table_stay_separate() {
     assert_eq!(d.postings_for("t", "body", "alpha"), vec![2]);
 }
 
+/// **The README's documented search output is executed, not trusted** — E50's rule, applied to the
+/// one transcript this feature added.
+///
+/// Breaking shape: any change to the scorer, the tie-break, the bound, or the position of the score
+/// column. Each of those silently falsifies a block a reader will paste verbatim, and the numbers in
+/// it are exactly the kind of thing that gets quoted. This runs the documented statements and
+/// asserts the rendered rows are the lines the README shows, using the same rendering
+/// `cli::print_outcome` uses.
+#[test]
+fn the_readme_s_documented_search_transcript_is_what_the_engine_prints() {
+    let readme = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+    )
+    .expect("read README.md");
+    for claimed in [
+        "CREATE FULLTEXT INDEX name ON table(col);",
+        "SEARCH table (col) FOR 'search text' [TOP k];",
+    ] {
+        assert!(
+            readme.contains(claimed),
+            "README no longer documents {claimed:?}; if the syntax changed, change both"
+        );
+    }
+
+    let mut d = db();
+    d.sql("CREATE TABLE posts (id INTEGER NOT NULL, user_id INTEGER, title VARCHAR(32));");
+    d.sql("INSERT INTO posts VALUES (1, 1, 'hello');");
+    d.sql("INSERT INTO posts VALUES (2, 1, 'world');");
+    d.sql("CREATE FULLTEXT INDEX ptitle ON posts (title);");
+    d.sql("INSERT INTO posts VALUES (3, 1, 'hello world again');");
+
+    let rows = d.rows("SEARCH posts (title) FOR 'hello world';");
+    assert_eq!(rows.len(), 3);
+    // The same cell rendering as `cli::print_outcome`.
+    let rendered: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| match v {
+                    Value::Integer(i) => i.to_string(),
+                    Value::Varchar(t) => t.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    other => panic!("unexpected cell {other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect();
+    for line in &rendered {
+        assert!(
+            readme.contains(line),
+            "the README documents this search's output and the engine printed a different line:\n  \
+             {line}\nall printed lines: {rendered:?}"
+        );
+    }
+    assert!(readme.contains("(3 rows)"));
+}
+
 /// `DROP TABLE` takes the posting tree with it, and the table can be recreated and re-indexed.
 #[test]
 fn dropping_a_table_takes_its_posting_tree() {
