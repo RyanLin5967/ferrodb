@@ -640,6 +640,26 @@ impl From<CapabilityRefusal> for FerroError {
 /// allow, including a value the floor check cannot compare — a bound it cannot evaluate is a bound
 /// that refuses, not one that waves the write past.
 ///
+/// # What it does not govern, and this is the load-bearing sentence
+///
+/// "Cannot be written" is a claim about ONE funnel — `AgentRuntime::stage_all` — and it is exactly
+/// as wide as that funnel and no wider. A statement that does not reach `stage_all` is not governed
+/// at all, and in this tree that is every verb that changes schema: `ANALYZE`, `CREATE INDEX`,
+/// `CREATE FULLTEXT INDEX`, `CREATE TABLE` and `DROP TABLE` all fall through
+/// `src/execution/executor.rs::run` to the **shared catalog**, with no branch and no `MERGE`. So a
+/// branch that may not write one row of a table can still index it, read every row of it into a
+/// full-text index, and drop it. Demonstrated verb by verb, against a forbidden table, by
+/// `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap`.
+///
+/// That single funnel is also a premise rather than a guarantee, and B11's branch-scoped
+/// `ALTER TABLE` breaks it: it reaches a branch's own staged state through `stage_schema_edit`, not
+/// through `stage_all`, so no envelope check runs. `ALTER` is not in this tree yet;
+/// `the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another`
+/// fails on the merge that brings it.
+///
+/// Both are recorded gaps rather than oversights — but read them before reading the paragraph above
+/// as "a session cannot touch what it was not granted", because that is not what it says.
+///
 /// A branch with **no** envelope (`BranchRecord::envelope == None`) is ungoverned. That is stated
 /// rather than implied, and `an_ungoverned_branch_writes_exactly_as_before` asserts it. It is the
 /// compatibility default for two reasons: a record written before this field existed has to load
