@@ -114,7 +114,7 @@ pub struct ArenaPageStore {
     /// Extent pages currently reserved by some branch. Returns to baseline only if freed extents
     /// are genuinely recycled, which is the stronger claim exit criterion 8 actually wants.
     reserved_pages: AtomicU32,
-    /// Where to persist the free-space map when a new extent is claimed, if anywhere.
+    /// Where to persist the free-space map when an extent is claimed or freed, if anywhere.
     ///
     /// Without this the map reaches disk only when the owner remembers to call `checkpoint`, which
     /// for the CLI is at clean exit — so a `kill -9` leaves a durable map older than the durable
@@ -922,6 +922,22 @@ impl PageStore for ArenaPageStore {
             self.space.give_back(start);
             self.reserved_pages.fetch_sub(self.space.extent_pages, Ordering::SeqCst);
             self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
+            // Persist the shrunk map, for the same reason `alloc_arena` persists the grown one.
+            // Without this only *claims* were durable and frees never were, so a crash after a reap
+            // left an image still charging the extent to a branch that no longer exists — and the
+            // next open could not collect it either: `reaper::sweep_empty_extents` asks
+            // `extent_is_empty`, and the durable extent's `next_free` sits above its recycled count
+            // because the fast path frees the extent whole and never releases its pages one by one.
+            // The extent leaked until the file was rebuilt, and it is the reserved-page count that
+            // exit criterion 8 is stated in.
+            //
+            // Ordered after the in-memory free so a crash in between leaves the extent recorded as
+            // still-live: a leak, which is the safe direction. The other order publishes a page
+            // range as reusable while a durable record may still point into it.
+            //
+            // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
+            // as the claim this mirrors, and not per page.
+            self.persist_if_configured()?;
         }
         Ok(allocated)
     }
@@ -1666,6 +1682,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A freed extent that never reaches the durable map is space no restart gets back.**
+    ///
+    /// Recorded by B10 as an aside and confirmed here: `alloc_arena` checkpointed, `free_arena` did
+    /// not, so only claims were durable. The image a crash left still charged the extent to a
+    /// branch that no longer exists, and the sweep that would otherwise collect it refuses —
+    /// `extent_is_empty` compares recycled pages against `next_free`, and the fast path frees an
+    /// extent whole without ever releasing its pages one at a time. Measured before the fix, the
+    /// restored store below reported `owner=Some(BranchId { id: 1, generation: 0 })`, 256 pages
+    /// still reserved and its page still live — for an arena that had been freed.
+    #[test]
+    fn freeing_an_extent_checkpoints_the_map_so_a_restart_gets_the_space_back() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-free-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap(); // claims the extent, and checkpoints it
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+        // Checkpoint the *allocated* state explicitly, so the durable image the assertions below
+        // read is one where every counter is non-zero. Without this the last image predates the
+        // page and `live_page_count` reads 0 whether the free was persisted or not.
+        h.store.checkpoint(&path).unwrap();
+        assert_eq!(
+            h.store.reserved_page_count(),
+            ARENA_EXTENT_PAGES,
+            "fixture: no extent was reserved, so freeing one proves nothing"
+        );
+
+        h.store.free_arena(a).unwrap();
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            target.arena_owner(a),
+            None,
+            "the durable map still charges the freed extent to its dead owner"
+        );
+        assert_eq!(
+            target.reserved_page_count(),
+            0,
+            "reserved pages never come back after a restart, which is exit criterion 8"
+        );
+        assert_eq!(
+            target.live_page_count().unwrap(),
+            0,
+            "the page inside the freed extent is still counted as live"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

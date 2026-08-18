@@ -518,6 +518,37 @@ mod tests {
         assert_eq!(h.store.pending_len(), 0);
     }
 
+    /// The same fast path as above, but asked what a **restart** sees. `free_arena` reaches the
+    /// durable free-space map only if it checkpoints, and until it did, a reap that a crash
+    /// followed left the extent charged to a branch that no longer exists.
+    #[test]
+    fn a_fast_path_reap_reaches_the_durable_map_not_just_memory() {
+        let (h, reaper) = setup();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-reap-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        write_pages(&h, b.branch_id, 11);
+        assert_eq!(reaper.reap(b.branch_id).unwrap(), 11);
+
+        let restarted = h.fresh_store();
+        assert!(restarted.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            restarted.arena_owner(arena),
+            None,
+            "after a restart the reaped branch's extent is still charged to it"
+        );
+        assert_eq!(
+            restarted.reserved_page_count(),
+            0,
+            "the space the reap reclaimed was lost again by the restart"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn slow_path_pins_pages_a_live_child_can_still_see_then_releases_them() {
         let (h, reaper) = setup();
