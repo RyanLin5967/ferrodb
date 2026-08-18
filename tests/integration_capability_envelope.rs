@@ -857,29 +857,47 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
         .unwrap_or(body.len());
     let stage_all = &body[..end];
 
-    // Exactly one of each, and each one inside `stage_all`. Counted over the whole file so a
-    // second call site anywhere trips this, wherever somebody puts it.
+    // All three still live inside `stage_all`. If the envelope read, the charge or the staging
+    // leaves the funnel, whatever now holds it IS the funnel and this pin is stale.
     for (needle, what) in [
         ("self.branches.envelope_of(", "reads the capability envelope"),
         ("self.branches.charge_row_writes(", "charges the row-write budget"),
         ("workspaces.get_mut(", "mutates a branch workspace's staged writes"),
     ] {
-        assert_eq!(
-            runtime.matches(needle).count(),
-            1,
-            "`{needle}` — the site that {what} — occurs more than once in \
-             src/agent_sql/runtime.rs. The envelope is enforced at ONE funnel, `stage_all`, and \
-             that is only sufficient while nothing else reaches branch write state. If this is \
-             B11's `stage_schema_edit`, the envelope now has a hole it cannot see: widen this \
-             test to drive `ALTER TABLE` against a table the envelope forbids, or govern the new \
-             funnel. Either way this test must stop being a text check."
-        );
         assert!(
             stage_all.contains(needle),
-            "`{needle}` has moved out of `stage_all`. Whatever now holds it is a second funnel, \
-             and the envelope only governs the one."
+            "`{needle}` — the site that {what} — has moved out of `stage_all`. Whatever now holds \
+             it is a second funnel, and the envelope only governs the one."
         );
     }
+
+    // Only ONE of those three is a hazard detector when COUNTED, and it is the staging site.
+    //
+    // Counting the other two had its polarity backwards. An ungoverned funnel — the thing this
+    // test exists to catch — by construction calls neither `envelope_of` nor `charge_row_writes`,
+    // so neither count can ever rise because of one. They rise only when somebody adds MORE
+    // envelope-awareness — a governed second funnel, or even a read-only "would this be admitted"
+    // query that reaches no branch write state at all — and the failure then read "the envelope
+    // now has a hole it cannot see" about a change that opened none, while prescribing "govern the
+    // new funnel" to somebody who just had. Both cases were run before this was changed.
+    //
+    // `workspaces.get_mut(` is the needle whose count does track the hazard: it is how anything
+    // reaches a branch's staged writes, so a second occurrence is a second way in. A text check
+    // still cannot tell whether that second way in is governed, so it refuses either way rather
+    // than guessing — but it must not claim to know which one it found.
+    assert_eq!(
+        runtime.matches("workspaces.get_mut(").count(),
+        1,
+        "a second site in src/agent_sql/runtime.rs reaches a branch workspace's staged writes. \
+         The envelope is enforced at ONE funnel, `stage_all`, and that is only sufficient while \
+         nothing else reaches branch write state. This check reads text, so it cannot tell \
+         whether the new site consults the envelope. If it does NOT — B11's `stage_schema_edit` \
+         does not — the envelope has a hole it cannot see, and a branch whose envelope forbids \
+         `payroll` can ADD, RENAME or RETYPE a `payroll` column and publish it at MERGE. If it \
+         DOES, the single-funnel premise this test pins is simply gone. Either way this test must \
+         stop being a text check: replace it with one that drives the new verb against a table \
+         the envelope forbids, and record which case it was in INTEGRATION.md."
+    );
 
     // Belt and braces on top of the count: B11's two symbols by name, so the failure message can
     // say exactly which merge did it instead of leaving the next reader to work it out.
