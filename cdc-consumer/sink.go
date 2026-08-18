@@ -133,6 +133,39 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 	if _, err := s.db.Exec(stmt); err != nil {
 		return fmt.Errorf("create %s: %w", table, err)
 	}
+	// **A destination BEHIND the declared shape is caught up — B11.** See the DuckDB sink's
+	// `catchUpToDeclaredShape` for why this case exists and why only a strict prefix qualifies: a
+	// consumer that missed the `ADD_COLUMN` window and resumed after the source truncated its log
+	// gets the evolved declaration and nothing else, and `CREATE TABLE IF NOT EXISTS` is a no-op on
+	// the table it already has.
+	//
+	// SQLite has no equivalent of `checkSchemaAgrees`, so a mismatch here has always surfaced later
+	// as "no such column" at INSERT time. That is unchanged for every case except this one.
+	got, err := s.tableColumns(table)
+	if err != nil {
+		return err
+	}
+	if len(got) < len(names) {
+		prefix := true
+		for i := range got {
+			if got[i] != names[i] {
+				prefix = false
+				break
+			}
+		}
+		if prefix {
+			for i := len(got); i < len(names); i++ {
+				def := quoteIdent(names[i]) + " " + sqlType(fmt.Sprint(cols[i]["type"]))
+				add := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " + def
+				if _, err := s.db.Exec(add); err != nil {
+					if !strings.Contains(err.Error(), "duplicate column name") {
+						return fmt.Errorf("catch %s up to the declared shape (%s): %w",
+							table, names[i], err)
+					}
+				}
+			}
+		}
+	}
 	s.columns[table] = names
 	return nil
 }

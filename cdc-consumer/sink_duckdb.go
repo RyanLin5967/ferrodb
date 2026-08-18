@@ -246,11 +246,64 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		s.columns[table] = names
 		return nil
 	}
+	// **A destination that is BEHIND the declared shape is caught up, not refused — B11.**
+	//
+	// This case did not exist before column-level DDL, because a table's shape never changed once
+	// created. It does now, and it is reachable without anybody doing anything wrong: a consumer
+	// that applied `CREATE_TABLE(id, qty)`, died before the `ADD_COLUMN`, and resumed after the
+	// source truncated its log is handed the re-emitted declaration `CREATE_TABLE(id, qty, note)`.
+	// `CREATE TABLE IF NOT EXISTS` is a no-op on the table that is already there, and without this
+	// the count check below refuses — permanently, because the ALTER that would have fixed it was
+	// truncated away. A stuck consumer with no way forward is a worse answer than a wrong one.
+	//
+	// **Only a strict PREFIX is caught up**, and that restriction is the whole safety argument: the
+	// destination's columns must be the declared ones, same names and same types, in order, with
+	// the declaration merely longer. Nothing is renamed, nothing is retyped, and the columns added
+	// are ones the destination has never had. A rename still surfaces as a name mismatch at an
+	// ordinal and a retype as a type mismatch, and both are still refused — a shape diff cannot
+	// tell a rename from a drop-plus-add, and guessing there loses the column's data.
+	if grown, err := s.catchUpToDeclaredShape(table, names, types, actualCols, actualTypes); err != nil {
+		return err
+	} else if grown {
+		actualCols, actualTypes, err = s.catalogSchema(table)
+		if err != nil {
+			return err
+		}
+	}
 	if err := s.checkSchemaAgrees(table, names, types, actualCols, actualTypes); err != nil {
 		return err
 	}
 	s.columns[table] = actualCols
 	return nil
+}
+
+// catchUpToDeclaredShape adds columns a declaration has and the destination does not, and reports
+// whether it added any.
+//
+// Refuses to do anything unless the destination is a strict PREFIX of the declaration — every
+// column it already has must be the declared one at that ordinal, by name and by type. Anything
+// else is left for `checkSchemaAgrees` to refuse. See the caller for why this case exists at all.
+func (s *DuckSink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTypes []string) (bool, error) {
+	if len(got) >= len(want) {
+		return false, nil
+	}
+	for i := range got {
+		if got[i] != want[i] || !strings.EqualFold(gotTypes[i], wantTypes[i]) {
+			return false, nil
+		}
+	}
+	for i := len(got); i < len(want); i++ {
+		if !duckTypes[wantTypes[i]] {
+			return false, fmt.Errorf("column %s.%s: type %q is not one this sink will emit",
+				table, want[i], wantTypes[i])
+		}
+		stmt := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " + quoteIdent(want[i]) + " " +
+			wantTypes[i]
+		if _, err := s.db.Exec(stmt); err != nil {
+			return false, fmt.Errorf("catch %s up to the declared shape (%s): %w", table, want[i], err)
+		}
+	}
+	return true, nil
 }
 
 // checkSchemaAgrees refuses when the destination table is not the table the event describes.

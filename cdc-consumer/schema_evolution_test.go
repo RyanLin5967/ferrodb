@@ -449,3 +449,138 @@ func TestASinkThatNeverSawTheCreateStillGetsTheShape(t *testing.T) {
 		t.Errorf("the row did not land under the shape the ALTER declared: %v", rows)
 	}
 }
+
+// **A consumer that missed the ALTER window must be able to catch up, not be stuck forever.**
+//
+// This state did not exist before column-level DDL and is reachable without anybody doing anything
+// wrong: a consumer applies `CREATE_TABLE(id, qty)`, dies before the `ADD_COLUMN`, and by the time
+// it resumes the source has checkpointed — which truncates the log and re-declares the table at its
+// **evolved** shape. The alter record it needed is gone. `CREATE TABLE IF NOT EXISTS` is a no-op on
+// the table it already has, so without a catch-up the destination stays two columns wide and every
+// later row either fails to insert (SQLite) or is refused by the schema check (DuckDB), permanently.
+//
+// Breaking shape: a destination built from the OLD declaration, then handed only the NEW one.
+func TestASinkThatMissedTheAlterCatchesUpFromTheReDeclaration(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "out.sqlite")
+
+	// Pass one: the pre-alter world. The consumer dies here.
+	first := filepath.Join(dir, "first.jsonl")
+	writeLines(t, first, []string{createInv, insertLine(1, 10, 10, "")})
+	if err := runSink(first, db, "id", "sqlite"); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// Pass two: the source truncated its log, so all the consumer is handed is the re-emitted
+	// declaration at the evolved shape — no ADD_COLUMN anywhere in it — and then rows using it.
+	wider := `{"table":"inv","op":"CREATE_TABLE","txn":0,"lsn":40,"commit_lsn":40,"commit_end_lsn":41,` +
+		`"before":null,"after":` + widerShape + `}}`
+	second := filepath.Join(dir, "second.jsonl")
+	writeLines(t, second, []string{wider, insertLine(2, 20, 50, `,"note":"later"`)})
+	if err := runSink(second, db, "id", "sqlite"); err != nil {
+		t.Fatalf("a consumer resuming after the alter window was refused: %v", err)
+	}
+
+	rows := sqliteRows(t, db, `SELECT id, qty, COALESCE(note,'<null>') FROM inv ORDER BY id`)
+	if len(rows) != 2 {
+		t.Fatalf("expected both rows, got %v", rows)
+	}
+	if fmt.Sprint(rows[0][2]) != "<null>" {
+		t.Errorf("the row from before the column got a value for it: %v", rows[0])
+	}
+	if fmt.Sprint(rows[1][2]) != "later" {
+		t.Errorf("the row that needed the new column did not land it: %v", rows[1])
+	}
+}
+
+// **Anti-vacuity for the catch-up: only a strict PREFIX is caught up.** A declaration that renames
+// or retypes a column the destination already has must still be refused, because a shape diff
+// cannot tell a rename from a drop-plus-add and guessing there loses the column's data.
+//
+// Measured on the DuckDB sink, which is the one with a schema check to subvert.
+func TestTheCatchUpRefusesAnythingThatIsNotAPrefix(t *testing.T) {
+	s := &DuckSink{key: "id"}
+	// Destination has [id INTEGER, qty BIGINT]; the declaration renames the second column.
+	grown, err := s.catchUpToDeclaredShape("inv",
+		[]string{"id", "quantity", "note"}, []string{"BIGINT", "BIGINT", "VARCHAR"},
+		[]string{"id", "qty"}, []string{"BIGINT", "BIGINT"})
+	if err != nil || grown {
+		t.Errorf("a rename was treated as a catch-up (grown=%v, err=%v)", grown, err)
+	}
+	// ...and one that retypes it.
+	grown, err = s.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty", "note"}, []string{"BIGINT", "VARCHAR", "VARCHAR"},
+		[]string{"id", "qty"}, []string{"BIGINT", "BIGINT"})
+	if err != nil || grown {
+		t.Errorf("a retype was treated as a catch-up (grown=%v, err=%v)", grown, err)
+	}
+	// ...and a destination that is not behind at all is left alone.
+	grown, err = s.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty"}, []string{"BIGINT", "BIGINT"},
+		[]string{"id", "qty"}, []string{"BIGINT", "BIGINT"})
+	if err != nil || grown {
+		t.Errorf("an up-to-date destination was altered (grown=%v, err=%v)", grown, err)
+	}
+	// A type the sink will not emit is refused rather than concatenated into DDL, even here.
+	if _, err := s.catchUpToDeclaredShape("inv",
+		[]string{"id", "evil"}, []string{"BIGINT", "VARCHAR; DROP TABLE inv"},
+		[]string{"id"}, []string{"BIGINT"}); err == nil {
+		t.Error("a type outside the allowlist reached the catch-up's DDL")
+	}
+}
+
+// The DuckDB half of the catch-up, against a real DuckDB file.
+//
+// DuckDB is the engine with a schema check to satisfy: `checkSchemaAgrees` compares the destination
+// against the declared shape positionally and refuses any disagreement, which is right and which is
+// exactly what would strand a consumer that missed the ALTER window. Breaking shape: a destination
+// created from the OLD declaration, then handed only the NEW one and a row that needs it.
+func TestTheFeedLandsInDuckdbAcrossAMissedAlter(t *testing.T) {
+	s := newSink(t)
+	old := &Event{Table: "inv", Op: "CREATE_TABLE", CommitLSN: 1, CommitEndLSN: 2, After: map[string]any{
+		"columns": []any{
+			map[string]any{"name": "id", "type": "INTEGER", "nullable": false},
+			map[string]any{"name": "qty", "type": "INTEGER", "nullable": true},
+		},
+	}}
+	if err := s.apply(old); err != nil {
+		t.Fatalf("the pre-alter declaration was refused: %v", err)
+	}
+	if err := s.apply(&Event{Table: "inv", Op: "INSERT", CommitLSN: 3, CommitEndLSN: 4, LSN: 3,
+		After: map[string]any{"id": 1, "qty": 10}}); err != nil {
+		t.Fatalf("pre-alter row: %v", err)
+	}
+
+	// The consumer never sees the ADD_COLUMN — only the evolved re-declaration.
+	evolved := &Event{Table: "inv", Op: "CREATE_TABLE", CommitLSN: 5, CommitEndLSN: 6, After: map[string]any{
+		"columns": []any{
+			map[string]any{"name": "id", "type": "INTEGER", "nullable": false},
+			map[string]any{"name": "qty", "type": "INTEGER", "nullable": true},
+			map[string]any{"name": "note", "type": "VARCHAR(20)", "nullable": true},
+		},
+	}}
+	if err := s.apply(evolved); err != nil {
+		t.Fatalf("a consumer resuming after the alter window was refused: %v", err)
+	}
+	if err := s.apply(&Event{Table: "inv", Op: "INSERT", CommitLSN: 7, CommitEndLSN: 8, LSN: 7,
+		After: map[string]any{"id": 2, "qty": 20, "note": "later"}}); err != nil {
+		t.Fatalf("the row that needed the new column: %v", err)
+	}
+
+	var note string
+	if err := s.db.QueryRow(`SELECT note FROM inv WHERE id = 2`).Scan(&note); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if note != "later" {
+		t.Errorf("the caught-up column did not take the value: %q", note)
+	}
+	// The row from before the catch-up survived it — a sink that "fixed" the shape by recreating
+	// the table would have a correct schema over an empty table.
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM inv`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("the catch-up lost rows: %d", n)
+	}
+}
