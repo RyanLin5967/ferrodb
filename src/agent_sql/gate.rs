@@ -380,6 +380,14 @@ impl AssertionResult {
     }
 }
 
+/// Every assertion in `results` that did not hold, by the predicate as it was written.
+///
+/// One function rather than one per caller: `MergeEvaluation` and `Verdict` both answer this
+/// question about the same slice, and two copies of a filter drift the moment `holds` changes.
+pub fn failed_assertions(results: &[AssertionResult]) -> Vec<String> {
+    results.iter().filter(|a| !a.holds()).map(|a| a.source.clone()).collect()
+}
+
 /// One [`AssertionResult`] presented to the gate as a check.
 ///
 /// One check per assertion rather than one check for all of them, because the gate runs every

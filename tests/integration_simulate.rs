@@ -31,7 +31,6 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::{Expr, Parser, Stmt};
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
-use ferrodb::tel::ids::RowId;
 use ferrodb::tel::MemEffectLog;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
@@ -826,7 +825,6 @@ fn an_admitted_candidates_rows_are_attributed_to_that_candidate() {
         who.run_id, "r_9/gentle",
         "the row is attributed to the simulation rather than to the candidate that wrote it"
     );
-    assert_eq!(RowId(row_id_of(&[Value::Integer(1)]).0), row_id_of(&[Value::Integer(1)]));
 }
 
 // -------------------------------------------------------------------------------------------
@@ -918,4 +916,267 @@ fn a_candidate_whose_body_errors_is_reported_and_never_admitted() {
     assert!(!broken.admitted);
     assert!(report.get("fine").unwrap().admitted, "one broken candidate blocked the others");
     assert_eq!(db.qty(1), 19);
+}
+
+// -------------------------------------------------------------------------------------------
+// Findings from the adversarial review of this diff, each pinned by the test that would have
+// caught it.
+// -------------------------------------------------------------------------------------------
+
+/// **Breaking shape:** `BEGIN; SIMULATE …; ROLLBACK;`. Agent statements are dispatched before the
+/// executor reaches its transaction arms, and admitting a candidate publishes it in its own
+/// transaction — so the admissions commit and the ROLLBACK cannot undo them. The client sees a
+/// block it rolled back that permanently changed the database.
+#[test]
+fn simulate_is_refused_inside_a_transaction_block_because_it_would_escape_the_rollback() {
+    let mut db = Db::new();
+    db.seed();
+    let mut s = db.session();
+    db.ok("BEGIN;", &mut s);
+
+    let err = expect_err(db.exec(
+        "SIMULATE AS 'a' CANDIDATE 'c' ( UPDATE inventory SET qty = qty - 8 WHERE id = 1; ) \
+         ASSERT ON inventory (qty >= 0) ADMIT ALL;",
+        &mut s,
+    ));
+    assert!(
+        err.to_string().contains("cannot SIMULATE inside a transaction block"),
+        "got {err}"
+    );
+    db.ok("ROLLBACK;", &mut s);
+    assert_eq!(db.qty(1), 20, "the simulation published past the transaction block");
+
+    // ANTI-VACUITY: outside a block the same statement runs and publishes.
+    let mut s2 = db.session();
+    db.ok(
+        "SIMULATE AS 'a' CANDIDATE 'c' ( UPDATE inventory SET qty = qty - 8 WHERE id = 1; ) \
+         ASSERT ON inventory (qty >= 0) ADMIT ALL;",
+        &mut s2,
+    );
+    assert_eq!(db.qty(1), 12);
+}
+
+/// **Breaking shape:** a branch that READS one table and WRITES another, whose premise moves
+/// between evaluation and publication. The fingerprint covered only the tables the branch wrote
+/// (a read does not put its table into the workspace's table map), so the read-premise check's
+/// `Pass` went stale while the fingerprint still matched — and that is the exact case the check
+/// exists for: two agents each read that one physician remains on call, each releases a different
+/// one, and neither write overlaps.
+#[test]
+fn an_evaluation_whose_read_premise_moved_is_refused_even_though_it_wrote_a_different_table() {
+    let mut db = Db::new();
+    db.seed();
+    {
+        let mut s = db.session();
+        db.ok("CREATE TABLE roster (id INTEGER NOT NULL, staff INTEGER);", &mut s);
+        db.ok("INSERT INTO roster VALUES (1, 3);", &mut s);
+    }
+
+    // The reader: reads `inventory` row 1 by exact version, writes `roster`.
+    let reader = db.runtime.begin_session("ward-a", Some("r_a"), BranchId::TRUNK).unwrap();
+    // The mover: writes `inventory` row 1 and publishes it.
+    let mover = db.runtime.begin_session("ward-b", Some("r_b"), BranchId::TRUNK).unwrap();
+
+    let rt = db.runtime.clone();
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+
+    let select = stmts("SELECT qty FROM inventory WHERE id = 1;").remove(0);
+    rt.select(&mut ctx, reader.branch, &select, Some(reader.branch)).unwrap();
+    rt.write(&mut ctx, reader.branch, stmts("UPDATE roster SET staff = 2 WHERE id = 1;").remove(0))
+        .unwrap();
+    rt.write(
+        &mut ctx,
+        mover.branch,
+        stmts("UPDATE inventory SET qty = qty - 1 WHERE id = 1;").remove(0),
+    )
+    .unwrap();
+
+    // Scored while the premise still holds: the gate passes.
+    let stale = rt.evaluate_merge(&mut ctx, reader.branch, &[]).unwrap();
+    assert!(stale.gate.is_pass(), "the premise had not moved yet: {:?}", stale.gate);
+    assert!(stale.is_admissible());
+
+    // The premise moves: `inventory` row 1 gets a published version.
+    let moved = rt.evaluate_merge(&mut ctx, mover.branch, &[]).unwrap();
+    rt.publish_evaluation(&mut ctx, moved).expect("the mover publishes");
+
+    let err = rt.publish_evaluation(&mut ctx, stale).unwrap_err();
+    assert!(
+        err.to_string().contains("moved"),
+        "an evaluation whose read premise moved was published: {err}"
+    );
+    drop(ctx);
+
+    // ANTI-VACUITY: re-evaluated now, the branch is REFUSED BY THE GATE rather than by the
+    // fingerprint — which is what the fingerprint was protecting.
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let fresh = rt.evaluate_merge(&mut ctx, reader.branch, &[]).unwrap();
+    assert!(!fresh.gate.is_pass(), "the read-premise check did not fire on re-evaluation");
+    assert_eq!(fresh.gate.findings()[0].check, "read-premise");
+}
+
+/// `rows_written` must mean rows written. Folding a `SELECT`'s row count into it made every
+/// reading candidate report rows it never wrote, and `rows_written == 0` unusable as "this
+/// candidate changed nothing".
+#[test]
+fn a_read_only_candidate_reports_no_rows_written() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut plan = SimulationPlan::new("pricing-agent").run("r_9");
+    plan = plan.candidate("look", stmts("SELECT qty FROM inventory WHERE id = 1;"));
+    plan = plan.candidate(
+        "act",
+        stmts("SELECT qty FROM inventory WHERE id = 1; UPDATE inventory SET qty = qty - 1 WHERE id = 1;"),
+    );
+    let plan = plan.assert_on("inventory", predicate("qty >= 0")).admit(AdmitPolicy::AtMost(0));
+
+    let report = db.simulate(&plan).expect("simulation");
+    let look = report.get("look").unwrap();
+    assert_eq!(look.rows_written, 0, "a candidate that only reads reported writes");
+    assert_eq!(look.rows_read, 1, "the read was not counted at all");
+    let act = report.get("act").unwrap();
+    assert_eq!(act.rows_written, 1);
+    assert_eq!(act.rows_read, 1);
+}
+
+/// The builder must default to the value that publishes nothing. A caller who forgets `.admit()`
+/// gets a scored report, not every admissible candidate merged into the shared tables.
+#[test]
+fn a_plan_that_never_says_admit_publishes_nothing() {
+    let mut db = Db::new();
+    db.seed();
+
+    let plan = SimulationPlan::new("pricing-agent")
+        .candidate("take-1", stmts("UPDATE inventory SET qty = qty - 1 WHERE id = 1;"))
+        .assert_on("inventory", predicate("qty >= 0"));
+
+    let report = db.simulate(&plan).expect("simulation");
+    assert!(report.get("take-1").unwrap().scored.is_some(), "it must still be scored");
+    assert!(report.admitted().is_empty(), "the default admitted a candidate");
+    assert_eq!(db.qty(1), 20);
+}
+
+/// The lease reaper reclaims a loser's pages without telling the runtime, so its workspace, its
+/// `b_N` name and any escrow it held would stay in memory for the life of the process. A server
+/// running simulations all day is the workload where that matters, and it is the workload this
+/// feature is for.
+#[test]
+fn state_for_branches_the_reaper_took_is_dropped_rather_than_retained_forever() {
+    let mut db = Db::new();
+    db.seed();
+
+    let plan = plan_taking(&[8, 8, 8], "qty >= 0").admit(AdmitPolicy::AtMost(0)).lease_millis(1_000);
+    let first = db.simulate(&plan).expect("simulation");
+    assert_eq!(first.candidates.len(), 3);
+    // Every branch is still live, so nothing may be forgotten yet.
+    assert_eq!(
+        db.runtime.forget_reaped_branches(),
+        0,
+        "a live branch's state was dropped; a loser stays queryable while its lease runs"
+    );
+    for c in &first.candidates {
+        assert!(db.runtime.run_of(c.branch).is_some(), "{} lost its workspace early", c.name);
+    }
+
+    // No cooperation: the leases expire and the reaper takes them.
+    let reaped = db.reaper.reap_expired(LeaseDeadline::now_millis() + 60_000).unwrap();
+    assert_eq!(reaped.len(), 3);
+
+    assert_eq!(
+        db.runtime.forget_reaped_branches(),
+        3,
+        "the runtime kept the workspaces of branches the reaper had already reclaimed"
+    );
+    for c in &first.candidates {
+        assert!(db.runtime.run_of(c.branch).is_none(), "{}'s workspace survived", c.name);
+    }
+    // Idempotent, and the second call finds nothing left to do.
+    assert_eq!(db.runtime.forget_reaped_branches(), 0);
+}
+
+/// **A stated limit, pinned so it cannot become a silent one.** Escrow and SIMULATE do not
+/// compose: `claim_escrow` is per branch, a candidate's branch is created inside `simulate`, and
+/// nothing can claim for it. A candidate that writes an escrow-bounded cell therefore fails at
+/// WRITE time — which is escrow working exactly as designed — and the simulation reports the
+/// candidate as errored rather than admitting it or silently overdrawing.
+#[test]
+fn a_candidate_writing_an_escrow_bounded_cell_errors_visibly_rather_than_overdrawing() {
+    let mut db = Db::new();
+    db.seed();
+    db.runtime
+        .open_escrow("inventory", row_id_of(&[Value::Integer(1)]), ferrodb::tel::ids::ColId(1), 20)
+        .unwrap();
+
+    let report = db.simulate(&plan_taking(&[8, 8], "qty >= 0")).expect("simulation");
+    for c in &report.candidates {
+        let err = c.error.as_ref().unwrap_or_else(|| {
+            panic!("{} wrote a bounded cell with no escrow claim and was not refused", c.name)
+        });
+        assert!(err.contains("escrow"), "refused for the wrong reason: {err}");
+        assert!(!c.admitted);
+    }
+    assert_eq!(db.qty(1), 20, "an unclaimed overdraw reached the shared tables");
+}
+
+/// `with_reaper` takes a `Reaper` it cannot check: the trait exposes no catalog to compare against
+/// the runtime's own. What it CAN do is check the result — after a successful reap, this runtime's
+/// catalog must no longer hold the branch as live.
+///
+/// **Breaking shape:** two runtimes over two catalogs, each of which mints branch id 2. A reaper
+/// built over the wrong one reaps a record that is not ours, reports success, and our branch is
+/// retired in name only with its pages still charged to it. Silent, and permanent.
+#[test]
+fn a_reaper_wired_to_a_different_catalog_is_caught_at_the_first_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join(name))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let branches = Arc::new(LogBranchCatalog::in_memory(1));
+        let store =
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+        (bp, branches, store)
+    };
+    let (bp_a, cat_a, store_a) = mk("a.db");
+    let (_bp_b, cat_b, store_b) = mk("b.db");
+
+    // The reaper belongs to catalog B; the runtime to catalog A.
+    let wrong = Arc::new(TwoTierReaper::new(Arc::clone(&cat_b), Arc::clone(&store_b)));
+    let rt = AgentRuntime::with_storage(
+        Arc::clone(&cat_a) as Arc<dyn BranchCatalog>,
+        Arc::new(MemEffectLog::new()),
+        Arc::clone(&store_a) as Arc<dyn PageStore>,
+    )
+    .unwrap()
+    .with_reaper(Arc::clone(&wrong) as Arc<dyn Reaper>);
+
+    // Both catalogs mint the same id for their first fork, which is what makes the mis-wiring
+    // reap something rather than simply error.
+    let mine = rt.begin_session("a", Some("r"), BranchId::TRUNK).unwrap();
+    let theirs = cat_b
+        .fork(BranchId::TRUNK, ferrodb::branch::types::LeaseDeadline::from_now(60_000))
+        .unwrap();
+    assert_eq!(mine.branch.id, theirs.branch_id.id, "the two catalogs did not agree on the id");
+
+    let err = rt.abandon(mine.branch).unwrap_err();
+    assert!(
+        err.to_string().contains("different branch catalog"),
+        "a reaper over the wrong catalog was not caught: {err}"
+    );
+    // And the branch is still live here, which is the state the message describes.
+    assert_eq!(
+        cat_a.get(mine.branch).unwrap().state,
+        ferrodb::branch::types::BranchState::Live
+    );
+    let _ = bp_a;
 }

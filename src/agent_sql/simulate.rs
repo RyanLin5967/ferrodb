@@ -140,7 +140,11 @@ impl SimulationPlan {
             model: None,
             candidates: Vec::new(),
             assertions: Vec::new(),
-            admit: AdmitPolicy::All,
+            // The DRY RUN, not `All`. The SQL grammar has no default at all — how much of a
+            // simulation's output to publish is the caller's decision — and a builder that has to
+            // pick one must pick the value that publishes nothing. A caller who forgets `.admit()`
+            // gets a scored report, not twelve merges nobody asked for.
+            admit: AdmitPolicy::AtMost(0),
             lease_millis: DEFAULT_LEASE_MILLIS,
         }
     }
@@ -203,7 +207,7 @@ impl Verdict {
 
     /// Every declared assertion that did not hold, by the predicate as written.
     pub fn failed_assertions(&self) -> Vec<String> {
-        self.assertions.iter().filter(|a| !a.holds()).map(|a| a.source.clone()).collect()
+        crate::agent_sql::gate::failed_assertions(&self.assertions)
     }
 }
 
@@ -214,8 +218,13 @@ pub struct CandidateScore {
     pub branch: BranchId,
     pub branch_name: String,
     pub run_id: String,
-    /// Rows the candidate's body wrote on its own branch.
+    /// Rows the candidate's body WROTE on its own branch. Rows a `SELECT` returned are counted
+    /// separately: `rows_written == 0` has to mean the candidate changed nothing, or nothing can
+    /// be read off it.
     pub rows_written: usize,
+    /// Rows the candidate's body READ. Not a cost measure — it is what the read-premise check at
+    /// admission is about.
+    pub rows_read: usize,
     /// Set when the candidate's body failed to run at all. Such a candidate is never scored and
     /// never admitted; it is reported and left for the reaper.
     pub error: Option<String>,
@@ -381,14 +390,27 @@ impl AgentRuntime {
             }
         }
 
+        // Losing candidates are left alive for the lease reaper, and the reaper reclaims their
+        // PAGES without telling this runtime — so their workspaces would accumulate here for the
+        // life of the process. Sweeping at the start of a simulation rather than at the end keeps
+        // a loser queryable for as long as its branch is alive, which is the point of leaving it
+        // alive, while bounding what a server that runs simulations all day retains.
+        self.forget_reaped_branches();
+
         // ---- 1. fork K, and prove the fork copied nothing ---------------------------------
         let pages_before_fork = self.live_page_count()?;
         let mut forked: Vec<(usize, crate::agent_sql::session::AgentSession)> =
             Vec::with_capacity(plan.candidates.len());
         for (i, c) in plan.candidates.iter().enumerate() {
+            // `<unnamed>` is what `begin_session` already records for a task whose caller
+            // declared no run, and it means exactly that here too. Note what it does NOT mean:
+            // two simulations that both omit RUN and share a candidate name intern to the SAME
+            // run, so `who_wrote_row` cannot tell them apart. That is the honest reading of "no
+            // run was declared" rather than a unique id invented on the caller's behalf — declare
+            // RUN if the provenance has to distinguish one simulation from another.
             let run = match &plan.run_id {
                 Some(r) => format!("{r}/{}", c.name),
-                None => c.name.clone(),
+                None => format!("<unnamed>/{}", c.name),
             };
             let model = plan.model.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
             let session =
@@ -403,6 +425,14 @@ impl AgentRuntime {
                 // Not a warning. K candidates are affordable *because* a fork copies nothing; if
                 // that stops being true the cost model this feature rests on is gone, and the
                 // honest response is to refuse rather than to run K database copies.
+                //
+                // **Stated blind spot:** `live_page_count` is a store-wide counter, so a page
+                // another connection allocated between the two readings is attributed to the
+                // forks and refuses this simulation. That direction is the safe one — a refusal
+                // before any candidate has run costs a retry, while a silent K-copy fork costs
+                // the cost model — but it is a false positive, and the same scope means
+                // `pages_after_bodies` is a measurement of every writer in the process rather
+                // than of these candidates alone.
                 return Err(FerroError::Branch(format!(
                     "forking {} candidate branches changed the live page count from {before} to \
                      {after}; a fork must copy zero pages, so the cost model SIMULATE depends on \
@@ -417,18 +447,25 @@ impl AgentRuntime {
         for (i, session) in &forked {
             let c = &plan.candidates[*i];
             let mut rows_written = 0usize;
+            let mut rows_read = 0usize;
             let mut error = None;
             for stmt in &c.body {
+                // Reads and writes are counted apart. Folding a SELECT's row count into
+                // `rows_written` made every reading candidate report rows it never wrote.
                 let outcome = match stmt {
                     Stmt::Select { .. } => {
                         // Reads are executed and their read-set retained, because the read-set is
                         // what the read-premise check at admission is about.
-                        self.select(ctx, session.branch, stmt, Some(session.branch)).map(|r| r.len())
+                        self.select(ctx, session.branch, stmt, Some(session.branch))
+                            .map(|r| (0, r.len()))
                     }
-                    other => self.write(ctx, session.branch, other.clone()),
+                    other => self.write(ctx, session.branch, other.clone()).map(|n| (n, 0)),
                 };
                 match outcome {
-                    Ok(n) => rows_written += n,
+                    Ok((w, r)) => {
+                        rows_written += w;
+                        rows_read += r;
+                    }
                     Err(e) => {
                         error = Some(e.to_string());
                         break;
@@ -441,6 +478,7 @@ impl AgentRuntime {
                 branch_name: session.branch_name.clone(),
                 run_id: session.run_id.clone(),
                 rows_written,
+                rows_read,
                 error,
                 scored: None,
                 rechecked: None,
@@ -466,6 +504,14 @@ impl AgentRuntime {
         // Ranked: admissible first, then by score, then by declaration order. A candidate the
         // scoring pass refused is still re-evaluated when its turn comes — the base may have moved
         // in the direction that makes it legal — it simply queues behind the ones that passed.
+        //
+        // **Among admissible candidates this IS declaration order, and that is not an accident to
+        // be fixed by sorting harder.** A candidate is admissible only if every assertion held, so
+        // every admissible candidate scores exactly 1.00 and the score cannot separate them.
+        // SIMULATE has no objective function: it can say which candidates are legal, never which
+        // legal candidate is best. So `ADMIT 1` over ten admissible candidates publishes the one
+        // declared first — including an empty "change nothing" control, if that is what you put
+        // first. Declare them in preference order, or admit them all.
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|a, b| {
             let (x, y) = (&scores[*a], &scores[*b]);

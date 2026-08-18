@@ -1065,15 +1065,27 @@ mod tests {
         assert!(err.contains("at least one ASSERT"), "got {err}");
     }
 
-    /// An unterminated body must not swallow the rest of the script. Without the `is_at_end` guard
-    /// the loop runs off the end of the token stream.
+    /// A body that runs off the end of the token stream is reported against the CANDIDATE.
+    ///
+    /// Two failures, deliberately kept apart, because the first version of this test conflated
+    /// them and could not fail. Asserting only `err.contains("expected")` was worthless: delete
+    /// the `is_at_end` guard and `parse_statement` reports "expected a statement" at EOF, which
+    /// contains "expected", so the test stayed green with the guard it names in its own
+    /// doc-comment gone. Each case now asserts the message only its own path produces.
     #[test]
-    fn an_unterminated_candidate_body_is_an_error_not_a_hang() {
+    fn an_unterminated_candidate_body_names_the_candidate_it_belongs_to() {
+        // Runs to EOF inside the body: only the `is_at_end` guard can produce this message.
+        let err = parse_sql("SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1;")
+            .unwrap_err();
+        assert!(err.contains("unterminated body for candidate 'c'"), "got {err}");
+
+        // A body containing something that is not a statement stops at that token instead, and
+        // says so — the `)` was never reached but the stream did not end either.
         let err = parse_sql(
             "SIMULATE AS 'a' CANDIDATE 'c' ( DELETE FROM t WHERE id = 1; ASSERT ON t (qty >= 0) ADMIT ALL;",
         )
         .unwrap_err();
-        assert!(err.contains("candidate") || err.contains("expected"), "got {err}");
+        assert!(err.contains("expected a statement"), "got {err}");
     }
 
     #[test]

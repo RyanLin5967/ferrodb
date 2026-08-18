@@ -1515,8 +1515,21 @@ impl AgentRuntime {
             }
         }
 
+        // Every row this branch READ by exact version. The gate's read-premise verdict is computed
+        // from `state.versions` for exactly these rows, and `tables_read` cannot cover them: a read
+        // does not put its table into the workspace's table map (only `stage_all` does), and a
+        // `TableId` is a one-way hash of the name, so there is no table to re-scan. They are
+        // fingerprinted directly instead.
+        //
+        // Without this, an evaluation of a branch that READ `oncall` and WROTE `roster` carried a
+        // `Pass` from the read-premise check and a fingerprint over `roster` alone — so a
+        // concurrent publication to `oncall` left the fingerprint matching and the stale verdict
+        // publishable. That is the hospital case the check exists for, arriving through the door
+        // the split opened.
+        let premise_rows = premise_rows_of(&snapshot.reads);
         // The base this evaluation is about, as one number. See `publish_evaluation`.
-        let base_fingerprint = fingerprint_rows(&current)?;
+        let base_fingerprint =
+            fnv64_update(fingerprint_rows(&current)?, &self.fingerprint_premises(&premise_rows).to_be_bytes());
 
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
@@ -1808,6 +1821,7 @@ impl AgentRuntime {
             produced,
             base_fingerprint,
             tables_read: table_names,
+            premise_rows,
             snapshot,
             pending: pending_writes,
         })
@@ -1860,7 +1874,10 @@ impl AgentRuntime {
             )));
         }
 
-        let now = self.fingerprint_tables(ctx, &eval.tables_read)?;
+        let now = fnv64_update(
+            self.fingerprint_tables(ctx, &eval.tables_read)?,
+            &self.fingerprint_premises(&eval.premise_rows).to_be_bytes(),
+        );
         if now != eval.base_fingerprint {
             return Err(FerroError::Merge(format!(
                 "refusing to publish {} against a base that moved after it was scored: this \
@@ -1920,6 +1937,23 @@ impl AgentRuntime {
             }
         }
         fingerprint_rows(&current)
+    }
+
+    /// Fingerprint of the published version of every row an evaluation READ.
+    ///
+    /// `state.versions` is the map the read-premise check compares against, so folding it in is
+    /// what makes that check's verdict part of what the staleness guard protects. It also catches
+    /// a republication of byte-identical rows, which moves a version without moving any row image.
+    fn fingerprint_premises(&self, rows: &[(TableId, RowId)]) -> u64 {
+        let state = self.state.lock().unwrap();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (t, r) in rows {
+            h = fnv64_update(h, &t.0.to_be_bytes());
+            h = fnv64_update(h, &r.0.to_be_bytes());
+            let v = state.versions.get(&(t.0, r.0)).map(|v| v.begin_ts).unwrap_or(0);
+            h = fnv64_update(h, &v.to_be_bytes());
+        }
+        h
     }
 
     /// The composed effect the target absorbed on this cell since we forked, if any.
@@ -2010,6 +2044,52 @@ impl AgentRuntime {
 
     // ---- ABANDON ---------------------------------------------------------------------------
 
+    /// Forget the in-memory state of every branch this runtime holds that the catalog no longer
+    /// does, returning how many were dropped.
+    ///
+    /// **The gap this closes.** `seal` is what removes a workspace, its `b_N` name and its escrow
+    /// claim, and `seal` is reached only from a merge or an `ABANDON`. A branch reclaimed by the
+    /// lease reaper is reclaimed *without client cooperation* — that is the whole point of the
+    /// lease — so nothing here is told, and its workspace stays in the map for the life of the
+    /// process. Its pages are gone; its bookkeeping is not. A server running simulations, where
+    /// most branches end this way by design, would grow without bound.
+    ///
+    /// Escrow is released rather than settled: a branch the reaper took never published anything,
+    /// so its claim goes back to the pool exactly as an abandoned branch's does.
+    ///
+    /// Safe to call at any time. A branch that is still live is left completely alone.
+    pub fn forget_reaped_branches(&self) -> usize {
+        // Two phases on purpose: the catalog is asked about each branch with the state lock NOT
+        // held, because the catalog takes its own lock and the two are taken in the other order
+        // elsewhere.
+        let candidates: Vec<(u64, String, BranchId)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .workspaces
+                .keys()
+                .filter_map(|id| {
+                    let name = format!("b_{id}");
+                    let bid = *state.names.get(&name)?;
+                    // The name now points at a different slot: this workspace's own branch is
+                    // unreachable through it, so leave it rather than guess.
+                    (bid.id == *id).then_some((*id, name, bid))
+                })
+                .collect()
+        };
+        let gone: Vec<(u64, String, BranchId)> = candidates
+            .into_iter()
+            .filter(|(_, _, bid)| self.branches.get(*bid).is_err())
+            .collect();
+        let mut state = self.state.lock().unwrap();
+        for (id, name, bid) in &gone {
+            state.workspaces.remove(id);
+            state.names.remove(name);
+            state.escrow.release(*bid);
+            state.quarantine_reasons.remove(id);
+        }
+        gone.len()
+    }
+
     /// Drop a branch and everything buffered on it.
     ///
     /// The buffered writes were never in the shared tables, so an abandoned agent task costs
@@ -2049,6 +2129,22 @@ impl AgentRuntime {
         // was walked away from end in exactly the same state.
         if let Some(reaper) = &self.reaper {
             reaper.reap(branch)?;
+            // `with_reaper` cannot check that the reaper was built over this runtime's catalog —
+            // the `Reaper` trait exposes no catalog to compare. What it CAN do is check the
+            // result: after a successful reap, this runtime's own catalog must no longer hold the
+            // branch as live. If it does, the reaper reaped a record nobody here wrote, and the
+            // branch is now retired in name only with its pages still charged. Loud beats silent.
+            if let Ok(rec) = self.branches.get(branch) {
+                if rec.state != BranchState::Reaped {
+                    return Err(FerroError::Branch(format!(
+                        "the attached reaper reported success for {branch}, but this runtime's \
+                         catalog still holds it as {:?}. The reaper is built over a different \
+                         branch catalog than this runtime, so nothing it reaps belongs to these \
+                         branches and their pages are still charged.",
+                        rec.state
+                    )));
+                }
+            }
             return Ok(());
         }
 
@@ -2218,6 +2314,9 @@ pub struct MergeEvaluation {
     base_fingerprint: u64,
     /// The tables that fingerprint covers.
     tables_read: BTreeMap<u32, String>,
+    /// The rows this branch read by exact version, whose published versions the fingerprint also
+    /// covers. A read-set is not a table the fingerprint can re-scan, so it is folded in directly.
+    premise_rows: Vec<(TableId, RowId)>,
     snapshot: WorkspaceSnapshot,
     pending: Vec<PendingWrite>,
 }
@@ -2243,7 +2342,7 @@ impl MergeEvaluation {
 
     /// Every declared assertion that did not hold, by the predicate as it was written.
     pub fn failed_assertions(&self) -> Vec<String> {
-        self.assertions.iter().filter(|a| !a.holds()).map(|a| a.source.clone()).collect()
+        crate::agent_sql::gate::failed_assertions(&self.assertions)
     }
 
     /// The gate's verdict as the sentence a quarantine reason is written from.
@@ -2287,6 +2386,10 @@ impl MergeEvaluation {
     }
 }
 
+/// The row a compiled assertion predicate refers to. Every row's cells are presented under this
+/// id in turn; the real row id is carried alongside, by the loop that does the presenting.
+const ASSERTION_PROBE_ROW: RowId = RowId(0);
+
 /// Score declared assertions against the state a merge would leave behind.
 ///
 /// The row set is the asserted table **as the merge would leave it**: the shared table now,
@@ -2294,9 +2397,14 @@ impl MergeEvaluation {
 /// the rows the candidate touched was the first shape and it is weaker in a way that matters — a
 /// candidate that changes nothing would then satisfy every assertion by touching nothing.
 ///
-/// Each row is checked through [`check_guards`], which is the same evaluator the production merge
-/// re-checks its guards with, so an assertion and a guard cannot disagree about what a predicate
-/// means.
+/// Each row is checked through [`Guard::check`], which is what `check_guards` calls for the
+/// production merge's own guards, so an assertion and a guard cannot disagree about what a
+/// predicate means.
+///
+/// The predicate is compiled **once**, against a fixed probe row, and each row's cells are then
+/// presented under that same probe id — a `GuardExpr` bakes the row it refers to, and compiling one
+/// per row cost a full parse-and-bind for every row of the table on every candidate, twice per
+/// simulation. The row a violation names comes from the loop, not from the guard.
 fn evaluate_assertions(
     assertions: &[Assertion],
     schemas: &BTreeMap<u32, Schema>,
@@ -2322,18 +2430,12 @@ fn evaluate_assertions(
             out.push(result);
             continue;
         };
-        // Compiled once against the schema rather than per row: a predicate naming a column that
-        // does not exist fails for every row for the same reason, and reporting it once says so.
-        if let Err(e) = guard_from_expr(&a.predicate, tbl, RowId(0), schema) {
-            result.unevaluable.push((RowId(0), e.to_string()));
-            out.push(result);
-            continue;
-        }
 
-        let mut rows: BTreeMap<u64, Vec<Value>> = current
+        // Borrowed, not cloned: the row images live in `current` and `produced` for the whole call.
+        let mut rows: BTreeMap<u64, &Vec<Value>> = current
             .iter()
             .filter(|((t, _), _)| *t == tbl.0)
-            .map(|((_, r), row)| (*r, row.clone()))
+            .map(|((_, r), row)| (*r, row))
             .collect();
         for ((t, r), image) in produced {
             if *t != tbl.0 {
@@ -2341,7 +2443,7 @@ fn evaluate_assertions(
             }
             match image {
                 Some(row) => {
-                    rows.insert(*r, row.clone());
+                    rows.insert(*r, row);
                 }
                 None => {
                     rows.remove(r);
@@ -2349,27 +2451,28 @@ fn evaluate_assertions(
             }
         }
 
+        let guard = match guard_from_expr(&a.predicate, tbl, ASSERTION_PROBE_ROW, schema) {
+            Ok(g) => g,
+            Err(e) => {
+                result.unevaluable.push((RowId(0), e.to_string()));
+                out.push(result);
+                continue;
+            }
+        };
         result.rows_checked = rows.len();
         for (rid, row) in rows {
             let row_id = RowId(rid);
-            let guard = match guard_from_expr(&a.predicate, tbl, row_id, schema) {
-                Ok(g) => g,
-                Err(e) => {
-                    result.unevaluable.push((row_id, e.to_string()));
-                    continue;
-                }
-            };
             let mut state = CellState::new();
             for (idx, v) in row.iter().enumerate() {
-                state.set(tbl, row_id, ColId(idx as u32), v.clone());
+                state.set(tbl, ASSERTION_PROBE_ROW, ColId(idx as u32), v.clone());
             }
-            for c in check_guards(&[guard.clone()], &state) {
-                match c.kind {
-                    ConflictKind::GuardUnevaluable => {
-                        result.unevaluable.push((row_id, c.detail.clone()))
-                    }
-                    _ => result.violations.push((row_id, cells_text(&guard, schema, &row))),
-                }
+            match guard.check(&state) {
+                Ok(true) => {}
+                Ok(false) => result.violations.push((row_id, cells_text(&guard, schema, row))),
+                // An error is NOT a violation: the predicate could not be decided on this row, and
+                // the gate hard-rejects that rather than treating it as a failure the caller can
+                // retry against.
+                Err(e) => result.unevaluable.push((row_id, e.to_string())),
             }
         }
         out.push(result);
@@ -2408,6 +2511,22 @@ fn cell_text(v: &Value) -> String {
         Value::Timestamp(ms) => ms.to_string(),
         Value::Null => "NULL".to_string(),
     }
+}
+
+/// Every row an evaluation read by exact version, sorted and de-duplicated so the fingerprint over
+/// them is stable. A scan-shaped read retains a predicate summary rather than versions, and the
+/// read-premise check already downgrades itself to a heuristic for those; there is nothing here to
+/// name.
+fn premise_rows_of(reads: &[crate::provenance::readset::ReadSet]) -> Vec<(TableId, RowId)> {
+    let mut out: Vec<(TableId, RowId)> = Vec::new();
+    for rs in reads {
+        if let crate::provenance::readset::ReadSet::ExactVersions(versions) = rs {
+            out.extend(versions.iter().map(|v| (v.tbl, v.row)));
+        }
+    }
+    out.sort_by_key(|(t, r)| (t.0, r.0));
+    out.dedup();
+    out
 }
 
 /// A fingerprint over every row handed in, for detecting that a base moved under an evaluation.

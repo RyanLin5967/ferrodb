@@ -143,6 +143,19 @@ pub fn run_agent_stmt(
             Ok(Outcome::Agent(AgentOutput::Revert(plan)))
         }
         BoundAgentStmt::Simulate { base, plan } => {
+            // **The same refusal `BEGIN AGENT SESSION` makes, for a sharper reason: SIMULATE
+            // PUBLISHES.** `executor::run` dispatches agent statements before it reaches the
+            // transaction arms, and admitting a candidate publishes it in `publish_evaluation`'s
+            // OWN transaction. So inside `BEGIN ... ROLLBACK` the admissions would commit and the
+            // ROLLBACK could not undo them: the client would see a rolled-back block that
+            // permanently changed the database. A statement that quietly escapes the enclosing
+            // transaction is worse than one that refuses to run inside it.
+            if session.current.is_some() {
+                return Err(FerroError::Txn(
+                    "cannot SIMULATE inside a transaction block: admitting a candidate publishes                      it in its own transaction, so a ROLLBACK here would not undo it. COMMIT or                      ROLLBACK first."
+                        .into(),
+                ));
+            }
             let report = runtime.simulate(&mut ctx, base, &plan)?;
             Ok(Outcome::Agent(AgentOutput::Simulation(Box::new(report))))
         }
