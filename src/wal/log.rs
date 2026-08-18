@@ -1,6 +1,6 @@
-use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::OpenOptions, mem::take, path::PathBuf, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::{catalog::column::DataType, error::FerroError, storage::disk_manager::{pread, pwrite}};
+use crate::{catalog::column::DataType, error::FerroError, storage::storage::Storage};
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
@@ -10,7 +10,12 @@ const MIN_FRAME: usize = 33;
 
 // need next_txn_id for mvcc, and then multi txn statements before mvcc
 pub struct WalManager {
-    pub file: Mutex<File>,
+    /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
+    /// this log — a torn frame, a lost frame, a flush that reports success it did not achieve. Those
+    /// are the faults `scan_valid_end` and the CRC exist to survive, and until this seam existed the
+    /// only way to stage one was to edit the file after closing it. `impl Storage for File` keeps the
+    /// production path on the same syscalls.
+    pub file: Mutex<Arc<dyn Storage>>,
     pub buffer: Mutex<WalBuffer>,
     pub next_lsn: AtomicU64,
     pub flushed_lsn: AtomicU64,
@@ -298,9 +303,16 @@ impl RecKind {
 }
 
 impl WalManager {
+    /// Open the log on a real file. The production entry point.
     pub fn new(path: PathBuf) -> Result<Self, FerroError> {
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| FerroError::Wal(e.to_string()))?;
-        let len = file.metadata().map_err(|e| FerroError::Wal(e.to_string()))?.len();
+        Self::with_storage(Arc::new(file), path)
+    }
+
+    /// Open the log on any [`Storage`]. `path` is still carried because callers report it and
+    /// `WalManager::path` is public; nothing here opens it.
+    pub fn with_storage(file: Arc<dyn Storage>, path: PathBuf) -> Result<Self, FerroError> {
+        let len = file.len().map_err(|e| FerroError::Wal(e.to_string()))?;
 
         let (base_lsn, header_txn_id) = if len == 0 {
             let mut header = [0u8; HEADER_SIZE];
@@ -308,12 +320,12 @@ impl WalManager {
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
             header[8..16].copy_from_slice(&INITIAL_LSN.to_be_bytes());
             header[16..24].copy_from_slice(&1u64.to_be_bytes());
-            pwrite_all(&file, &header, 0)?;
+            pwrite_all(&*file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
             (INITIAL_LSN, 1u64)
         } else {
             let mut header = [0u8; HEADER_SIZE];
-            pread_all(&file, &mut header, 0)?;
+            pread_all(&*file, &mut header, 0)?;
             if u32::from_be_bytes(header[0..4].try_into().unwrap()) != MAGIC {
                 return Err(FerroError::Wal("incorrect magic".into()));
             }
@@ -324,7 +336,7 @@ impl WalManager {
             let txn_hwn = u64::from_be_bytes(header[16..24].try_into().unwrap());
             (base, txn_hwn)
         };
-        let valid_end = scan_valid_end(&file, base_lsn, len)?;
+        let valid_end = scan_valid_end(&*file, base_lsn, len)?;
         let file_end = HEADER_SIZE as u64 + (valid_end - base_lsn);
         if file_end < len {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
@@ -416,13 +428,13 @@ impl WalManager {
             })?;
             let offset = HEADER_SIZE as u64 + rel;
             let mut len_buf = [0u8; 4];
-            pread_all(&file, &mut len_buf, offset)?;
+            pread_all(&**file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
             if total < MIN_FRAME {
                 return Err(FerroError::Wal("incorrect record length".into()));
             }
             let mut buf = vec![0u8; total];
-            pread_all(&file, &mut buf, offset)?;
+            pread_all(&**file, &mut buf, offset)?;
             buf
         };
         let total = frame.len();
@@ -496,7 +508,7 @@ impl WalManager {
             FerroError::Wal(format!("lsn {lsn} is below the log's base; it was truncated away"))
         })?;
         let mut buf = vec![0u8; len];
-        pread_all(&file, &mut buf, HEADER_SIZE as u64 + rel)?;
+        pread_all(&**file, &mut buf, HEADER_SIZE as u64 + rel)?;
         Ok(buf)
     }
 
@@ -533,7 +545,7 @@ impl WalManager {
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
         header[8..16].copy_from_slice(&next.to_be_bytes());
         header[16..24].copy_from_slice(&next_txn_id.to_be_bytes());
-        pwrite_all(&file, &mut header, 0)?;
+        pwrite_all(&**file, &mut header, 0)?;
         file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
         file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
         file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
@@ -575,7 +587,7 @@ impl WalManager {
         let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn.load(Ordering::SeqCst));
         let wrote = {
             let file = self.file.lock().unwrap();
-            pwrite_all(&file, &bytes, offset)
+            pwrite_all(&**file, &bytes, offset)
                 .and_then(|()| file.sync_data().map_err(|e| FerroError::Wal(e.to_string())))
         };
         if let Err(e) = wrote {
@@ -600,7 +612,7 @@ impl WalManager {
     }
 }
 
-pub fn scan_valid_end(file: &File, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{
+pub fn scan_valid_end(file: &dyn Storage, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{
     let mut offset = HEADER_SIZE as u64;
     loop {
         if offset + 4 > file_len {
@@ -664,9 +676,9 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-pub fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> Result<(), FerroError> {
+pub fn pwrite_all(file: &dyn Storage, mut buf: &[u8], mut offset: u64) -> Result<(), FerroError> {
     while !buf.is_empty() {
-        match pwrite(file, buf, offset) {
+        match file.pwrite(buf, offset) {
             Ok(0) => return Err(FerroError::Wal("wrote 0 bytes".into())),
             Ok(n) => {
                 buf = &buf[n..];
@@ -678,10 +690,10 @@ pub fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> Result<(), Fe
     Ok(())
 }
 
-pub fn pread_all(file: &File, buf: &mut [u8], mut offset: u64) -> Result<(), FerroError>{
+pub fn pread_all(file: &dyn Storage, buf: &mut [u8], mut offset: u64) -> Result<(), FerroError>{
     let mut total_read = 0;
     while total_read < buf.len() {
-        match pread(file, &mut buf[total_read..], offset) {
+        match file.pread(&mut buf[total_read..], offset) {
             Ok(0) => return Err(FerroError::Wal("eof before finished record".into())),
             Ok(n) => {
                 total_read += n;

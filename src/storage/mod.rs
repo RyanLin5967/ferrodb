@@ -8,3 +8,5 @@ pub mod index;
 pub mod index_page;
 pub mod heap_scanner;
 pub mod range_scan;
+pub mod storage;
+pub mod sim;

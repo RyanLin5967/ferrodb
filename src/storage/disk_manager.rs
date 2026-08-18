@@ -1,13 +1,21 @@
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use crate::error::FerroError;
+use crate::storage::storage::Storage;
 
 pub const PAGE_SIZE: usize = 4096;
 const BITS_PER_BITMAP: u32 = (PAGE_SIZE as u32 - 4) *8;
 pub struct DiskManager {
     pub next_page_id: AtomicU32,
-    pub file: File,
+    /// Where the pages actually go.
+    ///
+    /// This was a concrete `File`, and that was the reason no crash could be *aimed* at this
+    /// database: there was no seam at which a write could be made to tear, vanish, or fail to flush,
+    /// so the recovery path — the entire justification for a write-ahead log — was reachable only by
+    /// hand-editing a file after the fact. `impl Storage for File` means the production path performs
+    /// the same syscalls in the same order as before; see [`DiskManager::new`].
+    pub storage: Arc<dyn Storage>,
     bitmap_lock: Mutex<()>,
     /// First page of a region this allocator must never touch, or `u32::MAX` when there is none.
     ///
@@ -24,19 +32,28 @@ pub struct DiskManager {
 
 impl DiskManager{
 
+    /// Open a database on a real file. The production entry point, and behaviourally identical to
+    /// what it replaced: `File` implements [`Storage`] by forwarding to the same free `pwrite`/`pread`
+    /// helpers this function used to call directly.
     // writes page 0 if it isn't already written with data. bytes 0-3 are header(pointer to next bitmap page), 4 is 1, rest is 0
     pub fn new(file: File) -> Result<Self, FerroError>{
-        let metadata = match file.metadata().map_err(|e| FerroError::Io(e.to_string())){
-            Ok(me) => me,
+        Self::with_storage(Arc::new(file))
+    }
+
+    /// Open a database on any [`Storage`]. This is the injection point: hand it a
+    /// [`crate::storage::sim::SimStorage`] and a write can be made to tear at a chosen byte.
+    pub fn with_storage(storage: Arc<dyn Storage>) -> Result<Self, FerroError>{
+        let file_len = match storage.len().map_err(|e| FerroError::Io(e.to_string())){
+            Ok(l) => l,
             Err(e) => return Err(FerroError::Io(e.to_string()))
         };
         let next_page_id: u32;
-        if metadata.len() == 0{
+        if file_len == 0{
             let mut first_page_bitmap = [0u8; PAGE_SIZE];
             first_page_bitmap[4] = 1;
             let mut total_written = 0;
             while total_written < PAGE_SIZE{
-                let written = match pwrite(&file, &first_page_bitmap[total_written..], total_written as u64) {
+                let written = match storage.pwrite(&first_page_bitmap[total_written..], total_written as u64) {
                     Ok(w) => w,
                     Err(e) => return Err(FerroError::Io(e.to_string()))
                 };
@@ -47,11 +64,11 @@ impl DiskManager{
             }
             next_page_id = 1;
         }else {
-            next_page_id = (metadata.len()/PAGE_SIZE as u64) as u32;
+            next_page_id = (file_len/PAGE_SIZE as u64) as u32;
         }
         Ok(DiskManager {
             next_page_id: AtomicU32::new(next_page_id),
-            file,
+            storage,
             bitmap_lock: Mutex::new(()),
             arena_floor: AtomicU32::new(u32::MAX),
         })
@@ -64,7 +81,7 @@ impl DiskManager{
         let offset:u64 = page_id as u64* PAGE_SIZE as u64;
         let mut total_wrote = 0;
         while total_wrote < PAGE_SIZE {
-            let written = match pwrite(&self.file, &data[total_wrote..] , offset + total_wrote as u64){
+            let written = match self.storage.pwrite(&data[total_wrote..], offset + total_wrote as u64){
                 Ok(w) => w,
                 Err(e) => return Err(FerroError::Io(e.to_string()))
             };
@@ -82,7 +99,7 @@ impl DiskManager{
         let offset = page_id as u64 * PAGE_SIZE as u64;
         let mut total_read = 0;
         while total_read < PAGE_SIZE {
-            let size = match pread(&self.file, &mut buffer[total_read..], offset + total_read as u64) {
+            let size = match self.storage.pread(&mut buffer[total_read..], offset + total_read as u64) {
                 Ok(s) => s,
                 Err(e) => return Err(FerroError::Io(e.to_string()))
             };
@@ -338,7 +355,7 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
     }
 
     pub fn sync(&self) -> Result<(), FerroError>{
-        self.file.sync_all().map_err(|e| FerroError::Io(e.to_string()))
+        self.storage.sync_all().map_err(|e| FerroError::Io(e.to_string()))
     }
 }
 
