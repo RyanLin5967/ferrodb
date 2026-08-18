@@ -98,8 +98,19 @@ impl Message {
                     b.extend_from_slice(&0i32.to_be_bytes()); // table oid: unknown
                     b.extend_from_slice(&0i16.to_be_bytes()); // column attr: unknown
                     b.extend_from_slice(&type_oid.to_be_bytes());
-                    b.extend_from_slice(&(-1i16).to_be_bytes()); // type size: variable
-                    b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier: none
+                    // The type's on-disk width, which is a property of the OID and not of this
+                    // result. `-1` means variable-width and was correct for every column this server
+                    // used to send, because before B9 they all went out as `text`. Now that `int4`,
+                    // `int8` and `bool` are announced, `-1` is a claim real Postgres contradicts
+                    // (4, 8, 1), and a client that trusts typlen over the DataRow length prefix would
+                    // be reading a lie. No value is corrupted either way — text format means the
+                    // per-value length governs — so this is a mislabel rather than a wrong number,
+                    // and it is the same class of mislabel `oid_of` refuses for `timestamp`.
+                    b.extend_from_slice(&typlen_of(*type_oid).to_be_bytes());
+                    // Type modifier: genuinely none. The declared `VARCHAR(n)` widths in the system
+                    // views are not enforced on the wire and are not announced here, so a value wider
+                    // than its declared width is sent whole rather than truncated.
+                    b.extend_from_slice(&(-1i32).to_be_bytes());
                     b.extend_from_slice(&0i16.to_be_bytes()); // format: text
                 }
             }
@@ -173,6 +184,20 @@ fn oid_of(v: &Value) -> i32 {
         // `timestamp` and sending an integer is a parse error at every real driver.
         Value::Timestamp(_) => oid::INT8,
         Value::Varchar(_) | Value::Null => oid::TEXT,
+    }
+}
+
+/// The width Postgres reports for a type, in bytes; `-1` for a variable-width one.
+///
+/// Read off `pg_type.typlen` for the six OIDs this server can send. Only the fixed-width ones matter:
+/// they became reachable with B9, because every column this server sent before that was `text`.
+fn typlen_of(type_oid: i32) -> i16 {
+    match type_oid {
+        oid::BOOL => 1,
+        oid::INT4 => 4,
+        oid::INT8 | oid::FLOAT8 => 8,
+        // `text` and `numeric` are both variable-width, which is what -1 means.
+        _ => -1,
     }
 }
 
@@ -629,6 +654,53 @@ mod tests {
         typed_result(&empty, &mut out).expect("an empty result is not an error");
         assert!(matches!(out[0], Message::RowDescription(ref f) if f.len() == 1));
         assert!(matches!(out[1], Message::CommandComplete(ref t) if t == "SELECT 0"));
+    }
+
+    /// **`RowDescription` announces the width Postgres reports for each type.**
+    ///
+    /// The breaking shape is any non-`text` column, which only became reachable with B9: before it,
+    /// every column this server sent was `text`, where the hardcoded `-1` (variable width) was right.
+    /// Announcing `-1` for `int4` is a claim real Postgres contradicts, and a client that trusts
+    /// typlen over the per-value length prefix reads a lie. No value is corrupted — text format means
+    /// the DataRow prefix governs — so nothing else in the suite can see this.
+    #[test]
+    fn row_description_announces_the_real_width_of_each_type() {
+        // typlen sits 4 (oid) + 2 (fmt) back from the end of each 18-byte field trailer; decode it
+        // rather than trusting an offset by eye.
+        let fields = vec![
+            ("i".to_string(), oid::INT4),
+            ("b".to_string(), oid::INT8),
+            ("f".to_string(), oid::FLOAT8),
+            ("t".to_string(), oid::BOOL),
+            ("s".to_string(), oid::TEXT),
+            ("n".to_string(), oid::NUMERIC),
+        ];
+        let bytes = Message::RowDescription(fields.clone()).encode();
+        let mut at = 1 + 4 + 2; // tag, length, field count
+        let mut seen = Vec::new();
+        for (name, _) in &fields {
+            at += name.len() + 1; // the cstr
+            at += 4 + 2; // table oid, column attr
+            let type_oid = i32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+            at += 4;
+            let typlen = i16::from_be_bytes(bytes[at..at + 2].try_into().unwrap());
+            at += 2;
+            at += 4 + 2; // type modifier, format
+            seen.push((type_oid, typlen));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (oid::INT4, 4),
+                (oid::INT8, 8),
+                (oid::FLOAT8, 8),
+                (oid::BOOL, 1),
+                // Both genuinely variable-width, which is what -1 means.
+                (oid::TEXT, -1),
+                (oid::NUMERIC, -1),
+            ],
+            "a type's announced width does not match what Postgres reports for it"
+        );
     }
 
     #[test]

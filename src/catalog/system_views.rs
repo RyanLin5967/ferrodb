@@ -14,6 +14,21 @@
 //! kept its own bookkeeping would be a second source of truth about what the agent layer did, and
 //! the first thing to go wrong with a second source of truth is that it disagrees with the first.
 //!
+//! # A view is a snapshot per source, not one snapshot across sources
+//!
+//! Stated because the alternative is for a reader to assume otherwise. Four of the five views read
+//! more than one source through separate lock acquisitions — `ferro_runs` takes an `all_branches`
+//! snapshot and then asks `run_of` per branch, `ferro_row_authors` asks `authors_of` per table,
+//! `ferro_quarantine` takes the held set and then a reason per branch — so a `MERGE` landing mid-scan
+//! can leave a row out that was live when the scan began, or show one table's newly published rows
+//! while another table's from the same merge are missing. `ferro_run_activity` is the one view built
+//! from a single acquisition.
+//!
+//! Holding one lock across all of it is not the fix: the runtime's `Mutex` and the branch catalog's
+//! `RwLock` are currently only ever nested in one order, and widening a view's critical section is how
+//! that stops being true. The honest answer is that these are diagnostics, not a serialisable read,
+//! and this paragraph is where that is written down.
+//!
 //! The corollary is that a view is exactly as durable as the thing behind it, which is not the same
 //! for all five and is stated per view below rather than left to be discovered. `ferro_branches`
 //! and `ferro_quarantine`'s membership come off the durable branch record log; a quarantine
@@ -178,7 +193,14 @@ impl SystemView {
     /// # Two width decisions that are not stylistic
     ///
     /// `lease_deadline` and `row_id` are `DECIMAL`, not `BIGINT`, because both are `u64` values that
-    /// genuinely exceed `i64::MAX` in this codebase and `BIGINT` is `i64`. The trunk's lease is
+    /// genuinely exceed `i64::MAX` in this codebase and `BIGINT` is `i64`.
+    ///
+    /// The one other narrowing cast here is `prov_id`, a `u32` announced as `int4`. Listed rather than
+    /// left out: it is allocated as `runs.len() + 1`, so it takes 2^31 interned runs in one process to
+    /// go negative, and unlike the two above there is no sentinel that reaches the boundary
+    /// deliberately. `branch_id.id`, `fork_epoch`, `started_at` and `txn_id` are monotonic counters
+    /// with no `u64::MAX` sentinel anywhere, and `root_page_id` is a `u32` under `BIGINT`, which is
+    /// lossless. The trunk's lease is
     /// `LeaseDeadline(u64::MAX)` (`branch::catalog::TRUNK_LEASE`), which as an `i64` is `-1`; a
     /// `RowId` for a non-integer primary key is `fnv64` of the key bytes, which is uniformly
     /// distributed over the whole `u64` range, so half of them are negative as `i64`. `Value::Decimal`
@@ -384,7 +406,12 @@ fn runs_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
             Value::Varchar(run.model_version.clone()),
             Value::Varchar(hex32(&run.prompt_hash)),
             Value::BigInt(run.started_at as i64),
-            Value::Varchar(run.parent_branch.to_string()),
+            // `b_{id}`, not `BranchId`'s `Display` (`b0@g0`). This view already carries `branch_name`
+            // in the pasteable spelling and justifies it as "a name a reader can paste into a
+            // statement"; putting the other rendering in the next column over made the view argue
+            // with itself, and `AS OF BRANCH b0@g0` does not resolve — `state.names` is keyed by this
+            // spelling.
+            Value::Varchar(format!("b_{}", run.parent_branch.id)),
         ]);
     }
     Ok(out)
@@ -644,7 +671,8 @@ pub fn intercept(
     let read_only = |view: SystemView, verb: &str| {
         Some(Err(FerroError::Constraint(format!(
             "{} is a read-only system view, so it cannot be the target of {verb}; it is materialised \
-             from the agent layer on every read and has no rows of its own to change",
+             from the agent layer on every read, so there is nothing behind it to write to, index or \
+             analyse",
             view.name()
         ))))
     };

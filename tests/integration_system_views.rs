@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::branch::types::BranchState;
+use ferrodb::branch::types::{BranchState, LeaseDeadline};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
@@ -218,7 +218,18 @@ fn every_view_is_populated_once_an_agent_has_run() {
     assert_eq!(column(&runs, "run_id"), vec!["r_7"]);
     assert_eq!(column(&runs, "model_name"), vec!["claude-opus-5"]);
     assert_eq!(column(&runs, "model_version"), vec!["2026-05"]);
-    assert_eq!(column(&runs, "prompt_hash")[0].len(), 64, "a sha-width hex string");
+    // **Asserted as the all-zero hash, not merely as 64 characters wide.** A width assertion is what a
+    // constant passes, and this IS a constant: every `RunEntity` the SQL surface builds passes
+    // `[0u8; 32]`, because `BEGIN AGENT SESSION` has no syntax for a prompt. `RunEntity`'s own field
+    // doc calls it "hash of the prompt that produced the run", so the column is a documented gap
+    // rather than a value, and pinning the gap is what makes it visible: the day a prompt is captured,
+    // this fails and points at the column to re-check.
+    assert_eq!(
+        column(&runs, "prompt_hash"),
+        vec!["0".repeat(64)],
+        "prompt_hash is no longer the unset all-zero hash — a prompt is now being captured somewhere, \
+         so this assertion and the column's doc both need revisiting"
+    );
     assert_eq!(column(&runs, "branch_name"), vec![format!("b_{}", branch.id)]);
 
     // ferro_run_activity: the per-run write and read counts, while the work is in flight.
@@ -750,13 +761,46 @@ fn the_readmes_system_view_examples_run_as_written() {
         statements.len()
     );
 
-    // A database with something in every view, so a statement cannot pass by returning nothing.
+    // A database with something in EVERY view, so no documented statement can pass by returning
+    // nothing. The first version of this said that and did not do it: nothing was ever quarantined, so
+    // the documented `SELECT ... FROM ferro_quarantine` returned zero rows and the loop below — which
+    // only checks that columns arrive — would have passed against a broken quarantine view. Getting a
+    // branch held takes the read-premise shape, so that is what this builds.
     let mut db = Db::new();
     db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'readme_a' RUN 'r_a';", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+    let mut held = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'readme_held' RUN 'r_h';", &mut held);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut held);
+    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut held);
+    db.ok("MERGE;", &mut a);
+    db.ok("MERGE;", &mut held);
+    assert_eq!(
+        db.view("SELECT * FROM ferro_quarantine;").len(),
+        1,
+        "the fixture holds nothing, so a documented quarantine query cannot be checked against rows"
+    );
+    assert_eq!(
+        db.view("SELECT * FROM ferro_row_authors;").len(),
+        1,
+        "the fixture published nothing, so a documented authorship query has no rows to check"
+    );
+
+    // A live session too, so ferro_runs and ferro_run_activity are populated as well.
     let mut a = db.session();
     db.ok("BEGIN AGENT SESSION AS 'readme' RUN 'r_doc';", &mut a);
-    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
-    db.ok("UPDATE oncall SET qty = 9 WHERE id = 1;", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 3;", &mut a);
+    db.ok("UPDATE oncall SET qty = 9 WHERE id = 3;", &mut a);
+    for v in ["ferro_branches", "ferro_runs", "ferro_row_authors", "ferro_quarantine", "ferro_run_activity"] {
+        assert!(
+            !db.view(&format!("SELECT * FROM {v};")).is_empty(),
+            "{v} is empty, so a documented statement over it cannot pass for the right reason"
+        );
+    }
 
     for sql in statements {
         let out = db.view(sql);
@@ -766,6 +810,12 @@ fn the_readmes_system_view_examples_run_as_written() {
         assert!(
             out.columns.iter().all(|c| !c.name.is_empty()),
             "the README's `{sql}` returned an unnamed column"
+        );
+        // And it must return rows. Without this the loop passes on a view that answers nothing, which
+        // is exactly what it did before the fixture above was made to populate all five.
+        assert!(
+            !out.is_empty(),
+            "the README's `{sql}` returned no rows against a fixture built to populate every view"
         );
     }
 
@@ -1107,4 +1157,82 @@ fn dropping_a_table_does_not_silence_the_read_premise_gate() {
             .all(|r| text_of(&r[0]) != "oncall"),
         "the recreated table inherited the dropped table's authorship"
     );
+}
+
+
+/// **Two sessions of the SAME run do not restamp the run's start time.**
+///
+/// The breaking shape is a second `BEGIN AGENT SESSION` with the same agent and run id — an agent
+/// resuming, or a second connection for one task. `MemProvenanceStore::intern` returns the *existing*
+/// `ProvId` in that case, because attribution is run-level and `same_actor` deliberately excludes
+/// `started_at` ("when a particular session began, not part of who the actor is"). The runtime's
+/// mirror of that entity used `insert`, so the second session overwrote the first's `started_at` and
+/// `ferro_runs` then reported both branches as having started at T2 — the earlier branch claiming a
+/// start time after it already existed. A single-session workload cannot reach it.
+#[test]
+fn a_second_session_of_one_run_does_not_restamp_when_the_run_started() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut first = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'resumer' RUN 'r_same' MODEL 'm/1';", &mut first);
+    let b1 = first.agent.as_ref().unwrap().branch;
+    let t1 = column(&db.view("SELECT started_at FROM ferro_runs;"), "started_at")[0].clone();
+
+    // **Wait for the millisecond counter to advance before opening the second session.**
+    //
+    // Without this the test passes for the wrong reason and detects nothing: `started_at` is
+    // `LeaseDeadline::now_millis()`, both sessions land inside one millisecond, and an overwrite
+    // therefore writes the SAME value. Fire-checking caught that — the mutant that restores `insert`
+    // survived — which is the identical clock-granularity trap `RunEntity::same_actor`'s own doc
+    // records: "a second session for one run was REFUSED when the clock moved and silently ACCEPTED
+    // when it did not. Same input, two behaviours, decided by clock granularity."
+    //
+    // So the advance is waited for rather than hoped for, and asserted below: a run of this test in
+    // which the clock did not move cannot detect the defect and must say so instead of passing.
+    let spin_start = std::time::Instant::now();
+    while LeaseDeadline::now_millis().to_string() == t1 {
+        std::thread::yield_now();
+        assert!(
+            spin_start.elapsed() < std::time::Duration::from_secs(5),
+            "the millisecond clock did not advance in 5s, so this test cannot observe the defect"
+        );
+    }
+
+    // A second session for the SAME (agent, run, model): one run, so one interned entity.
+    let mut second = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'resumer' RUN 'r_same' MODEL 'm/1';", &mut second);
+    let b2 = second.agent.as_ref().unwrap().branch;
+    assert_ne!(b1.id, b2.id, "the two sessions share a branch, so this cannot test the mirror");
+    assert_eq!(
+        first.agent.as_ref().unwrap().prov,
+        second.agent.as_ref().unwrap().prov,
+        "the two sessions did not share a ProvId, so nothing would have been overwritten"
+    );
+
+    let runs = db.view("SELECT branch_id, started_at, prov_id FROM ferro_runs;");
+    assert_eq!(runs.len(), 2, "{:?}", runs.rows);
+    let stamps = column(&runs, "started_at");
+    // The precondition, asserted rather than assumed: the clock HAS moved past t1, so an overwrite
+    // would be visible. Without this the assertion below is satisfiable by a stopped clock.
+    assert_ne!(
+        LeaseDeadline::now_millis().to_string(),
+        t1,
+        "the clock never left the first session's millisecond, so nothing here is being tested"
+    );
+    assert!(
+        stamps.iter().all(|t| *t == t1),
+        "the second session rewrote the run's start time, so a branch reports a run that began after \
+         it did: first saw {t1}, view now reports {stamps:?}"
+    );
+
+    // Anti-vacuity: a DIFFERENT run is a different entity with its own start time, so this is not
+    // simply freezing every stamp to the first one ever recorded.
+    let mut other = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'resumer' RUN 'r_other' MODEL 'm/1';", &mut other);
+    let all = db.view("SELECT run_id, prov_id FROM ferro_runs;");
+    let mut provs: Vec<String> = column(&all, "prov_id");
+    provs.sort();
+    provs.dedup();
+    assert_eq!(provs.len(), 2, "a different run did not get its own entity: {:?}", all.rows);
 }

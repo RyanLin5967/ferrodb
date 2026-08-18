@@ -558,7 +558,13 @@ impl AgentRuntime {
             started,
             parent,
         );
-        state.runs.insert(prov.0, entity);
+        // `or_insert`, not `insert`. Attribution is run-level: `MemProvenanceStore::intern` returns
+        // the EXISTING `ProvId` when `same_actor` holds, and `same_actor` deliberately excludes
+        // `started_at` because that is when a particular session began, not part of who the actor is.
+        // Overwriting therefore stamped every branch of one run with the LAST session's start time, so
+        // `ferro_runs` reported a run starting after a branch it had already forked. First start wins,
+        // which is the only one that is a fact about the run.
+        state.runs.entry(prov.0).or_insert(entity);
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
@@ -673,17 +679,19 @@ impl AgentRuntime {
                 .get(&ws.name)
                 .copied()
                 .unwrap_or_else(|| BranchId::new(*id, 0));
-            let mut exact: Vec<(u32, u64)> = Vec::new();
+            // A `BTreeSet`, not a sorted `Vec`. `Vec::insert` memmoves the tail, so building the
+            // distinct set was O(n^2) in the size of a branch's read-set — and it ran while holding
+            // the one Mutex every write path also takes, so reading `ferro_run_activity` against a
+            // branch with a large read-set stalled every other connection. This is documented as
+            // "counts only"; it should not be able to block a writer.
+            let mut exact: BTreeSet<(u32, u64)> = BTreeSet::new();
             let mut scan_reads = 0u64;
             let mut scan_rows_observed = 0u64;
             for rs in &ws.reads {
                 match rs {
                     ReadSet::ExactVersions(versions) => {
                         for v in versions {
-                            let key = (v.tbl.0, v.row.0);
-                            if let Err(at) = exact.binary_search(&key) {
-                                exact.insert(at, key);
-                            }
+                            exact.insert((v.tbl.0, v.row.0));
                         }
                     }
                     ReadSet::Predicate(p) => {
@@ -1452,13 +1460,26 @@ impl AgentRuntime {
         if rec.state == BranchState::Quarantined {
             return Ok(());
         }
-        rec.state = BranchState::Quarantined;
-        self.branches.put(&rec)?;
+        // **The reason is recorded BEFORE the state is published, and the order is the whole point.**
+        //
+        // These are two stores with two locks: the reason lives in this runtime's in-memory state, the
+        // state flag in the durable branch record. `put` makes `Quarantined` visible to every reader
+        // on every connection — the runtime is shared by all of them (`pgwire::ServerContext`) — so
+        // publishing first left a window in which `ferro_quarantine` showed a held branch with a NULL
+        // reason. `system_views` tells the reader that a NULL there means the reason did not survive a
+        // restart, which would have been a false statement about a live process.
+        //
+        // Reversed, the only window left is a branch whose reason is recorded and whose state is still
+        // `Live` — invisible to the view, because it selects on state, so a reader sees either nothing
+        // or a hold with its reason. `release_from_quarantine` already has the safe order for the same
+        // reason: it clears the state first and the reason after.
         self.state
             .lock()
             .unwrap()
             .quarantine_reasons
             .insert(branch.id, reason.to_string());
+        rec.state = BranchState::Quarantined;
+        self.branches.put(&rec)?;
         Ok(())
     }
 
