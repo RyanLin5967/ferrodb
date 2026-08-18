@@ -224,7 +224,7 @@ func TestParsePublicationRefusesEveryMalformedShape(t *testing.T) {
 		// an allowlist that publishes nothing and stalls the feed with no clue why.
 		{"table before header", "customers: id\n", "before any `publication <name>` header"},
 		{"nothing but comments", "# not a publication\n", "no `publication <name>` header"},
-		{"no tables", "publication p\n# nothing\n", "names no table"},
+		{"no tables", "publication p\n# nothing\n", "publishes no table"},
 		{"empty column list", "publication p\ncustomers:\n", "lists no columns"},
 		{"table twice", "publication p\nt: id\nt: id, ssn\n", "declared twice"},
 		{"column twice", "publication p\nt: id, id\n", "twice"},
@@ -232,6 +232,13 @@ func TestParsePublicationRefusesEveryMalformedShape(t *testing.T) {
 		{"empty between commas", "publication p\nt: id,,qty\n", "empty column between commas"},
 		{"header with no name", "publication \nt: id\n", "header has no name"},
 		{"bare header word", "publication\nt: id\n", "header has no name"},
+		// **The widening both parsers had.** `customers: id, ssn#hash` truncated to `customers: id,
+		// ssn` and published `ssn`. Refused now, by name, in the consumer as well as the producer -
+		// and the point of it being refused HERE too is that a producer running an older parser
+		// cannot hand this consumer a feed built from the widened set.
+		{"name containing the comment character", "publication p\ncustomers: id, ssn#hash\n", "not an identifier"},
+		{"non-identifier column", "publication p\nt: id, qty-2\n", "not an identifier"},
+		{"non-identifier table", "publication p\nt able: id\n", "not an identifier"},
 		{"two headers", "publication a\npublication b\nt: id\n", "second `publication` header"},
 	} {
 		_, err := parsePublication(c.decl)
@@ -244,7 +251,7 @@ func TestParsePublicationRefusesEveryMalformedShape(t *testing.T) {
 	}
 
 	// Anti-vacuity: the well-formed declaration parses, and to exactly what it names.
-	p, err := parsePublication("publication analytics\n# c\ncustomers: id, name # only these\n\norders: id\n")
+	p, err := parsePublication("publication analytics\n# c\ncustomers: id, name\n\norders: id\n")
 	if err != nil {
 		t.Fatalf("a well-formed declaration was refused: %v", err)
 	}
@@ -273,5 +280,210 @@ func TestTheSinkRefusesADeniedColumnBeforeLandingIt(t *testing.T) {
 	db2 := filepath.Join(t.TempDir(), "ok.sqlite")
 	if err := runSink(writeFeed(t, rowLine(`{"id":1,"name":"ada"}`)), db2, "id", "sqlite"); err != nil {
 		t.Fatalf("a compliant feed was refused by the sink: %v", err)
+	}
+}
+
+// **The mode that prints column names and values, which does not go through decodeLine.**
+//
+// Breaking shape: `precision leaky.jsonl -publication p.txt`. `precision` decodes each line itself —
+// twice, once loosely and once exactly — and prints `FIELD <line> <col> <type> <value>` for every
+// column it finds. With the guard wired only into decodeLine it printed `FIELD 3 ssn string
+// 000-11-2222` and exited 0: the denied column's name and value, on stdout, from the mode whose whole
+// job is to describe columns. Found by an adversarial review of the wiring, not by writing it.
+func TestPrecisionRefusesADeniedColumnRatherThanPrintingIt(t *testing.T) {
+	withPolicy(t, policy)
+	err := precision(writeFeed(t, rowLine(`{"id":1,"name":"ada","ssn":"000-11-2222"}`)))
+	if err == nil {
+		t.Fatal("precision reported on a column the policy denies; its name and value went to stdout")
+	}
+	if !strings.Contains(err.Error(), "ssn") || !strings.Contains(err.Error(), "type report") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+
+	// Anti-vacuity: the compliant feed still gets a report. Without this the test would pass against a
+	// precision that refused everything, which would make the detector useless rather than safe.
+	if err := precision(writeFeed(t, rowLine(`{"id":1,"name":"ada"}`))); err != nil {
+		t.Fatalf("precision refused a compliant feed: %v", err)
+	}
+
+	// And with no policy it reports everything, as it did before B7.
+	activePublication = nil
+	if err := precision(writeFeed(t, rowLine(`{"id":1,"name":"ada","ssn":"000-11-2222"}`))); err != nil {
+		t.Fatalf("with no publication, precision must behave as it did before B7: %v", err)
+	}
+}
+
+// An undecided table refuses in the type report too, for the same reason it refuses in every other
+// mode: the policy has not been told about it.
+func TestPrecisionRefusesAnUndecidedTable(t *testing.T) {
+	withPolicy(t, policy)
+	line := `{"table":"audit_log","op":"INSERT","txn":1,"lsn":10,"commit_lsn":20,` +
+		`"commit_end_lsn":21,"before":null,"after":{"id":1}}` + "\n"
+	err := precision(writeFeed(t, line))
+	if err == nil {
+		t.Fatal("precision reported on a table outside the publication")
+	}
+	if !strings.Contains(err.Error(), "audit_log") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+}
+
+// **A DROP_TABLE's before image was exempt from the whole rule.**
+//
+// Breaking shape: `{"op":"DROP_TABLE",...,"before":{"id":1,"ssn":"111-22-3333"},"after":null}`. The
+// check skipped the row loop for any schema op and looked only inside `after["columns"]`, which a drop
+// does not have — so a whole row of denied columns validated with OK 1 and exit 0. A producer never
+// writes a before image on a drop, which is exactly why this is the shape worth policing: this check
+// exists for feeds the producer should not have written. Found by an adversarial review.
+func TestConsumerChecksADropsBeforeImage(t *testing.T) {
+	withPolicy(t, policy)
+	leak := `{"table":"customers","op":"DROP_TABLE","txn":1,"lsn":10,"commit_lsn":10,` +
+		`"commit_end_lsn":11,"before":{"id":1,"ssn":"111-22-3333"},"after":null}` + "\n"
+	err := validate(writeFeed(t, leak))
+	if err == nil {
+		t.Fatal("a DROP carrying a row of denied columns validated")
+	}
+	if !strings.Contains(err.Error(), "ssn") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+
+	// Anti-vacuity: an ordinary DROP still passes. Refusing every drop would stop a consumer ever
+	// learning that a table is gone.
+	ok := `{"table":"customers","op":"DROP_TABLE","txn":1,"lsn":10,"commit_lsn":10,` +
+		`"commit_end_lsn":11,"before":null,"after":null}` + "\n"
+	if err := validate(writeFeed(t, ok)); err != nil {
+		t.Fatalf("an ordinary DROP was refused: %v", err)
+	}
+}
+
+// **Duplicate keys: the leak that survives the JSON parser.**
+//
+// Breaking shape: `{"id":1,"name":"ada","name":"000-11-2222"}` from a table declared
+// `CREATE TABLE t (id, name, name)`, which this database accepts. `encoding/json` keeps the LAST
+// duplicate, so the denied position's value is the one that reaches the destination while the published
+// one is destroyed — an adversarial review followed it into a SQLite row. Only a token walk over the
+// raw bytes can see two keys where the struct has one.
+func TestConsumerRefusesDuplicateKeysInOneObject(t *testing.T) {
+	withPolicy(t, policy)
+	dup := rowLine(`{"id":1,"name":"ada","name":"000-11-2222"}`)
+	err := validate(writeFeed(t, dup))
+	if err == nil {
+		t.Fatal("a line with two keys of one name validated; the surviving value may be the denied one")
+	}
+	if !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+
+	// Anti-vacuity: the same key in DIFFERENT objects is not a duplicate.
+	fine := `{"table":"customers","op":"UPDATE","txn":1,"lsn":10,"commit_lsn":20,` +
+		`"commit_end_lsn":21,"before":{"id":1,"name":"ada"},"after":{"id":1,"name":"grace"}}` + "\n"
+	if err := validate(writeFeed(t, fine)); err != nil {
+		t.Fatalf("an UPDATE with the same column in both images was refused: %v", err)
+	}
+}
+
+// A key beside the envelope's own, at the top level or beside a schema payload, is where a denied
+// column travels when the checks only walk `before` and `after`.
+func TestConsumerRefusesKeysOutsideTheEnvelope(t *testing.T) {
+	withPolicy(t, policy)
+	for _, c := range []struct{ name, line string }{
+		{"top-level", `{"table":"customers","op":"INSERT","txn":1,"lsn":10,"commit_lsn":20,` +
+			`"commit_end_lsn":21,"before":null,"after":{"id":1},"ssn":"111-22-3333"}` + "\n"},
+		{"beside the schema payload", `{"table":"customers","op":"CREATE_TABLE","txn":0,"lsn":10,` +
+			`"commit_lsn":10,"commit_end_lsn":11,"before":null,"after":{"columns":[` +
+			`{"name":"id","type":"INTEGER","nullable":false}],"ssn":"111-22-3333"}}` + "\n"},
+	} {
+		err := validate(writeFeed(t, c.line))
+		if err == nil {
+			t.Fatalf("%s: a key outside the envelope validated", c.name)
+		}
+		if !strings.Contains(err.Error(), "ssn") {
+			t.Fatalf("%s: refused, but not by this guard: %v", c.name, err)
+		}
+	}
+
+	// Anti-vacuity: the envelope's own keys, and a real schema payload, still pass.
+	shape := `{"table":"customers","op":"CREATE_TABLE","txn":0,"lsn":10,"commit_lsn":10,` +
+		`"commit_end_lsn":11,"before":null,"after":{"columns":[` +
+		`{"name":"id","type":"INTEGER","nullable":false},` +
+		`{"name":"name","type":"VARCHAR(32)","nullable":true}]}}` + "\n"
+	if err := validate(writeFeed(t, shape)); err != nil {
+		t.Fatalf("a well-formed schema event was refused: %v", err)
+	}
+}
+
+// A row value that is an object or an array is a place to hide a denied column under a published key.
+// Every value a row of this database can carry is a scalar.
+func TestConsumerRefusesANonScalarRowValue(t *testing.T) {
+	withPolicy(t, policy)
+	for _, body := range []string{
+		`{"id":1,"name":{"name":"ada","ssn":"111-22-3333"}}`,
+		`{"id":1,"name":["ada","111-22-3333"]}`,
+	} {
+		err := validate(writeFeed(t, rowLine(body)))
+		if err == nil {
+			t.Fatalf("%s: a nested container under a published key validated", body)
+		}
+		if !strings.Contains(err.Error(), "scalar") {
+			t.Fatalf("%s: refused, but not by this guard: %v", body, err)
+		}
+	}
+
+	// Anti-vacuity: scalars of every JSON type a feed uses still pass.
+	if err := validate(writeFeed(t, rowLine(`{"id":1,"name":null}`))); err != nil {
+		t.Fatalf("a null column was refused: %v", err)
+	}
+	if err := validate(writeFeed(t, rowLine(`{"id":1,"name":"ada"}`))); err != nil {
+		t.Fatalf("a string column was refused: %v", err)
+	}
+}
+
+// `exclude` on the consumer: the producer drops these events, so one arriving here means the two ends
+// are running different policies — which is a refusal, not a silent drop.
+func TestConsumerRefusesAnEventForAnExcludedTable(t *testing.T) {
+	withPolicy(t, "publication analytics\ncustomers: id, name\nexclude audit_log\n")
+	line := `{"table":"audit_log","op":"INSERT","txn":1,"lsn":10,"commit_lsn":20,` +
+		`"commit_end_lsn":21,"before":null,"after":{"id":1}}` + "\n"
+	err := validate(writeFeed(t, line))
+	if err == nil {
+		t.Fatal("an event for an excluded table validated")
+	}
+	if !strings.Contains(err.Error(), "EXCLUDES") || !strings.Contains(err.Error(), "audit_log") {
+		t.Fatalf("refused, but not by this guard: %v", err)
+	}
+	// And the message must distinguish it from a table nobody decided about, because the two send an
+	// operator to different lines of the file.
+	if strings.Contains(err.Error(), "undecided") {
+		t.Fatalf("an excluded table was reported as undecided: %v", err)
+	}
+
+	// Anti-vacuity: the published table still passes under the same policy.
+	if err := validate(writeFeed(t, rowLine(`{"id":1,"name":"ada"}`))); err != nil {
+		t.Fatalf("a published table was refused: %v", err)
+	}
+}
+
+// The parser's own handling of the new form.
+func TestParsePublicationHandlesExclusions(t *testing.T) {
+	p, err := parsePublication("publication analytics\ncustomers: id\nexclude audit_log\n")
+	if err != nil {
+		t.Fatalf("a declaration with an exclusion was refused: %v", err)
+	}
+	if !p.Excluded["audit_log"] || p.Excluded["customers"] {
+		t.Fatalf("the exclusion was recorded wrongly: %+v", p)
+	}
+	for _, c := range []struct{ name, decl, want string }{
+		{"both ways round", "publication p\nt: id\nexclude t\n", "both published and excluded"},
+		{"reverse order", "publication p\nexclude t\nt: id\n", "both excluded and published"},
+		{"twice", "publication p\nt: id\nexclude u\nexclude u\n", "excluded twice"},
+		{"no name", "publication p\nt: id\nexclude\n", "no table name"},
+		{"exclusions only", "publication p\nexclude t\n", "publishes no table"},
+		{"before the header", "exclude t\npublication p\nt: id\n", "before any"},
+	} {
+		if _, err := parsePublication(c.decl); err == nil {
+			t.Fatalf("%s: accepted", c.name)
+		} else if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: refused, but not by the expected guard: %v", c.name, err)
+		}
 	}
 }
