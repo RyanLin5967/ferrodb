@@ -367,3 +367,158 @@ pub fn run_in_session(
         s => Ok(Outcome::Affected(runtime.write(&mut ctx, branch, s)?)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_sql::changeset::{ChangeOutcome, RowChange, RowChangeKind, RowMergeOutcome};
+    use crate::branch::types::BranchId;
+    use crate::provenance::ProvId;
+    use crate::tel::ids::{RowId, TableId, TxnId};
+    use crate::tel::merge::MergeOutcome;
+
+    fn session() -> AgentSession {
+        AgentSession {
+            branch: BranchId::new(3, 0),
+            branch_name: "b_3".into(),
+            agent_id: "a".into(),
+            run_id: "r".into(),
+            prov: ProvId(1),
+            txn: TxnId(7),
+        }
+    }
+
+    fn row_change() -> RowChange {
+        RowChange {
+            table: "t".into(),
+            tbl: TableId(1),
+            row: RowId(u64::MAX),
+            kind: RowChangeKind::Update,
+            ops: Vec::new(),
+            before: None,
+            after: None,
+            guards: Vec::new(),
+            outcome: ChangeOutcome::Pending,
+        }
+    }
+
+    fn merge_report(rows: Vec<RowMergeOutcome>) -> MergeReport {
+        MergeReport {
+            merge_id: "m_1".into(),
+            from: BranchId::new(3, 0),
+            into: BranchId::TRUNK,
+            outcome: MergeOutcome::Clean,
+            rows,
+            blind_writes: Vec::new(),
+            applied_to_target: false,
+        }
+    }
+
+    /// One row per variant, so nothing is covered by inspection alone.
+    fn every_variant() -> Vec<(&'static str, AgentOutput)> {
+        vec![
+            ("SessionStarted", AgentOutput::SessionStarted(session())),
+            ("Diff (empty)", AgentOutput::Diff(ChangeSet {
+                from: BranchId::new(3, 0), to: BranchId::TRUNK, rows: Vec::new(),
+            })),
+            ("Diff (one row)", AgentOutput::Diff(ChangeSet {
+                from: BranchId::new(3, 0), to: BranchId::TRUNK, rows: vec![row_change()],
+            })),
+            ("Merge (no rows)", AgentOutput::Merge(merge_report(Vec::new()))),
+            ("Merge (one row)", AgentOutput::Merge(merge_report(vec![RowMergeOutcome {
+                table: "t".into(),
+                tbl: TableId(1),
+                row: RowId(u64::MAX),
+                outcome: MergeOutcome::Clean,
+                applied: Vec::new(),
+                discarded: Vec::new(),
+                conflicts: Vec::new(),
+            }]))),
+            ("Abandoned", AgentOutput::Abandoned { branch: "b_3".into() }),
+            ("Revert (halted)", AgentOutput::Revert(RevertPlan {
+                target: TxnId(4), mode: RevertMode::Halt,
+                blocked_by: vec![TxnId(5)], cascade: Vec::new(),
+            })),
+            ("Revert (cascaded)", AgentOutput::Revert(RevertPlan {
+                target: TxnId(4), mode: RevertMode::Cascade,
+                blocked_by: Vec::new(), cascade: vec![TxnId(5), TxnId(6)],
+            })),
+            ("Affected", AgentOutput::Affected(3)),
+        ]
+    }
+
+    /// **Every row is exactly as wide as the declared column list.**
+    ///
+    /// The breaking shape is a variant whose rows and columns are built in two separate places — which
+    /// is every variant here. A row one value short shifts every value after it under the wrong column
+    /// NAME for the rest of the result, and the wire cannot detect that: `DataRow` carries a count, so
+    /// a short row is a well-formed message a client reads as valid data. The integration test covers
+    /// three variants because those are the three a SQL session produces; this covers all of them,
+    /// including the two `Revert` shapes and the empty/populated `Diff` and `Merge` pairs.
+    #[test]
+    fn every_agent_output_row_matches_its_declared_column_count() {
+        for (what, out) in every_variant() {
+            let t = out.to_rows();
+            assert!(!t.columns.is_empty(), "{what} declared no columns");
+            for (i, r) in t.rows.iter().enumerate() {
+                assert_eq!(
+                    r.len(),
+                    t.columns.len(),
+                    "{what} row {i} has {} values against {} columns",
+                    r.len(),
+                    t.columns.len()
+                );
+            }
+            let mut names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+            names.sort_unstable();
+            let before = names.len();
+            names.dedup();
+            assert_eq!(before, names.len(), "{what} declares a duplicate column name");
+        }
+    }
+
+    /// **A verdict is never dropped for want of a row to hang it on.**
+    ///
+    /// `MERGE` with no per-row outcomes still has to report `applied_to_target`, and a merge the gate
+    /// held is exactly that shape — nothing published, target untouched. A per-row-only rendering
+    /// returns zero rows there and the single most important thing the statement can say is gone.
+    /// `DIFF` is the deliberate exception: no changes means no rows, and the column list is what tells
+    /// a client that apart from a failure.
+    #[test]
+    fn only_an_empty_diff_returns_no_rows() {
+        for (what, out) in every_variant() {
+            let t = out.to_rows();
+            if what == "Diff (empty)" {
+                assert!(t.is_empty(), "an untouched branch reported a change");
+                assert!(t.column_index("change").is_some(), "{:?}", t.header());
+            } else {
+                assert!(!t.is_empty(), "{what} returned no rows, so its result is unreadable");
+            }
+        }
+        // The held-merge shape specifically: one row, the verdict present, the row columns NULL.
+        let t = AgentOutput::Merge(merge_report(Vec::new())).to_rows();
+        assert_eq!(t.rows.len(), 1);
+        let at = t.column_index("applied_to_target").expect("declared");
+        assert!(matches!(t.rows[0][at], Value::Boolean(false)), "{:?}", t.rows[0][at]);
+        let at = t.column_index("table_name").expect("declared");
+        assert!(matches!(t.rows[0][at], Value::Null), "{:?}", t.rows[0][at]);
+    }
+
+    /// A `RowId` above `i64::MAX` — what `fnv64` of a varchar key produces about half the time — must
+    /// reach a client as its digits, not as a negative number.
+    #[test]
+    fn a_row_id_past_i64_max_is_not_reported_as_negative() {
+        assert!((u64::MAX as i64) < 0, "the cast this avoids");
+        let t = AgentOutput::Diff(ChangeSet {
+            from: BranchId::new(3, 0),
+            to: BranchId::TRUNK,
+            rows: vec![row_change()],
+        })
+        .to_rows();
+        let at = t.column_index("row_id").expect("declared");
+        match &t.rows[0][at] {
+            Value::Decimal(d) => assert_eq!(d, "18446744073709551615"),
+            other => panic!("a row id past i64::MAX rendered as {other:?}"),
+        }
+    }
+}
