@@ -273,3 +273,92 @@ fn every_user_path_binary_refuses_a_database_that_is_already_open() {
         );
     }
 }
+
+/// **E46 — no test harness picks a port for a server it has not started yet (I16).**
+///
+/// `integration_cdc_go_consumer::the_server_survives_a_consumer_that_stops_reading_its_stdout`
+/// opened its own listener on `127.0.0.1:0`, read the port off it, dropped it, and handed the bare
+/// number to a server it spawned afterwards. Across that gap the port belongs to nobody — and the
+/// gap is a process spawn plus the whole of that server's startup, not microseconds — so anything
+/// else on the machine may take it. Six independent lanes hit `the server never accepted a
+/// connection` on that one test while the fleet was running ten worktrees at once.
+///
+/// What rules out the alternative explanation: bind time was measured at 30ms median and 838ms max
+/// over 50 spawns at load 91, **with zero failures to bind**. The server was not starved; the port
+/// was taken. And a retry around the connect does not fix it — it relabels a stolen port as a slow
+/// start, which is the same flake with its evidence deleted.
+///
+/// The fix everywhere in this repo is the same: the server binds `:0` itself and reports the
+/// address it got — on stdout for the harnesses that read it, and to `FERRODB_LISTEN_FILE` for the
+/// one that closes stdout on purpose. This pins it, because the idiom is two lines to retype and
+/// its failure is rare, remote, and blamed on machine load every single time.
+///
+/// # Why a whole-name ban rather than a pattern match
+///
+/// Matching the exact shape that failed would be a denylist: spread over three statements, or with
+/// the listener dropped by hand, the same mistake walks straight past. So this bans the type from
+/// test sources outright and carries an allowlist of files that are permitted to name it, which is
+/// empty. A test that genuinely needs its own socket — proving an "address already in use" path,
+/// say — adds itself here with a reason, and that edit is the review.
+///
+/// Its remaining blind spot, stated rather than discovered later: a harness that reaches a raw
+/// socket through some other type, or shells out to something that does, is invisible to this.
+#[test]
+fn no_test_picks_a_port_for_a_server_it_has_not_started_yet() {
+    // Assembled from pieces so this file does not match itself, and never spelled whole anywhere
+    // above either — the doc comment says "listener", not the type name.
+    let needle = concat!("Tcp", "Listener");
+
+    // Files permitted to bind a socket of their own, each with the reason. Empty: after I16 no test
+    // in this repo needs one, because every example server reports the address it bound.
+    const ALLOWED: &[(&str, &str)] = &[];
+
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir("tests").expect("read tests/").flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        scanned += 1;
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if ALLOWED.iter().any(|(f, _)| *f == name) {
+            continue;
+        }
+        // Whole-line comments are dropped first, so a test may still EXPLAIN the defect it used
+        // to have — the one that had it carries a long comment naming the type. A line whose first
+        // non-space characters are `//` is unambiguously a comment, which is why the rule is that
+        // and not "strip from `//` to end of line": the latter also eats the middle of a string
+        // literal. Not handled, and stated rather than left to be found: a trailing comment after
+        // code on the same line (over-strict, it fires and the fix is to move the comment), a
+        // block comment, and a raw string containing a line that begins with `//`.
+        let src = std::fs::read_to_string(&path).expect("read a test source");
+        let code = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if code.contains(needle) {
+            offenders.push(name);
+        }
+    }
+
+    // A scan that read nothing is not a pass. This directory holds dozens of test binaries; if it
+    // comes back empty the working directory is not the package root, and a clean verdict from
+    // there is a fact about the scan rather than about the repo.
+    assert!(
+        scanned >= 10,
+        "only {scanned} test sources were scanned, so this guard was pointed at the wrong directory \
+         rather than finding the repo clean"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these test sources bind a listener of their own: {}.\nThat is the discover-then-drop port \
+         race of I16 — the port is unowned between the harness dropping it and the server's own \
+         bind, and on a loaded machine something takes it. Let the server bind `:0` and report the \
+         address it got: the `LISTENING` line on stdout, or `FERRODB_LISTEN_FILE` when the harness \
+         closes stdout on purpose. If a test really does need its own socket, add it to ALLOWED \
+         above with the reason.",
+        offenders.join(", ")
+    );
+}
