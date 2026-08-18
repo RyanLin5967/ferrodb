@@ -87,7 +87,7 @@ pub enum Durability {
 
 /// What kind of break to stage. Chosen from the operation's type, not guessed, so a plan always
 /// fires: a write gets torn or dropped, a flush gets failed, a truncate gets skipped.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum FaultKind {
     /// The first `kept` bytes of the write land, the rest never do.
     TearWrite,
@@ -128,12 +128,23 @@ impl FaultPlan {
     }
 
     /// A plan at a caller-chosen operation index; the seed still chooses the shape of the break.
-    /// This is what the sweep uses, one point at a time.
+    ///
+    /// `at_op` is mixed into the stream, not just carried alongside it. Without that the shape is a
+    /// function of the seed alone, so a sweep over a hundred operations with one seed tears none of
+    /// them or all of them — measured: a 60-point sweep produced 50 dropped writes and **zero** torn
+    /// ones, which quietly removed a whole fault kind from the range being swept.
     pub fn at(at_op: u64, seed: u64) -> FaultPlan {
-        let mut rng = Rng::new(seed ^ 0x5DEE_CE66_D0D1_6E01);
+        let mut rng = Rng::new(seed ^ at_op.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5DEE_CE66_D0D1_6E01);
         let tear = rng.next_u64() % 2 == 0;
         let tear_pick = rng.next_u64();
         FaultPlan { seed, at_op, tear, tear_pick }
+    }
+
+    /// A plan at a chosen operation with a chosen shape, so a sweep can put **both** shapes at every
+    /// point instead of taking whichever one the seed happened to pick. The seed still chooses where
+    /// inside the buffer a tear lands.
+    pub fn at_shaped(at_op: u64, seed: u64, tear: bool) -> FaultPlan {
+        FaultPlan { tear, ..Self::at(at_op, seed) }
     }
 }
 
@@ -225,6 +236,10 @@ impl FileImage {
 struct FabricState {
     next_op: u64,
     files: BTreeMap<String, FileImage>,
+    /// Per file, the unit a torn write can tear at: 1 byte by default, or a whole page for a file
+    /// whose writer is entitled to assume page-atomic writes. See
+    /// [`SimFabric::set_write_atomicity`].
+    atomic_unit: BTreeMap<String, u64>,
     trace: Vec<TraceOp>,
     trace_digest_bytes: Vec<u8>,
     fired: Option<FiredFault>,
@@ -250,6 +265,18 @@ fn fault_err(kind: FaultKind, index: u64) -> io::Error {
 }
 
 impl SimFabric {
+    /// Lock the state, **tolerating poison**.
+    ///
+    /// A fault-injection harness exists to make code die in the middle of things, and the tests
+    /// around it deliberately catch panics. A poisoned mutex here would turn "the workload panicked
+    /// at operation 41" into "the harness panicked while asking which operation it was", which
+    /// destroys the only evidence. The state is a byte image and a counter, not an invariant that a
+    /// half-finished operation can break: every mutation in `execute` happens after every fallible
+    /// step, so recovering the inner value is safe.
+    fn lock(&self) -> std::sync::MutexGuard<'_, FabricState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A fabric with no fault: the census run. Records the trace and the operation count a sweep
     /// needs.
     pub fn clean(durability: Durability) -> Arc<Self> {
@@ -267,6 +294,7 @@ impl SimFabric {
             state: Mutex::new(FabricState {
                 next_op: 0,
                 files: BTreeMap::new(),
+                atomic_unit: BTreeMap::new(),
                 trace: Vec::new(),
                 trace_digest_bytes: Vec::new(),
                 fired: None,
@@ -284,7 +312,7 @@ impl SimFabric {
     ) -> Arc<Self> {
         let f = Self::with_plan(plan, durability);
         {
-            let mut st = f.state.lock().unwrap();
+            let mut st = f.lock();
             for (name, bytes) in images {
                 st.files.insert(name, FileImage::new(bytes));
             }
@@ -292,21 +320,48 @@ impl SimFabric {
         f
     }
 
+    /// Declare that writes to `name` tear only at multiples of `unit` bytes, absolutely (a tear ends
+    /// at a `unit` boundary in the file, the way a device tears at a sector boundary).
+    ///
+    /// **This is a statement about the fault model, and it is the most consequential knob here.** With
+    /// `unit == 1` — the default — a 4 KiB page write can land 3924 bytes and leave the last 172 stale.
+    /// Whether that is a fault a given file's *writer* is allowed to be broken by depends entirely on
+    /// whether that writer has a way to detect it:
+    ///
+    /// * The WAL is built for it. Every frame carries a CRC32 and `scan_valid_end` walks the chain and
+    ///   stops at the first frame that fails, so a torn tail is expected and survivable. Byte
+    ///   granularity is the right model there and finds real bugs.
+    /// * Ordinary table pages are **not**. `heap_page::Page` has a `checksum` field that is written
+    ///   verbatim and read back verbatim and never computed by anything (contrast
+    ///   `cow::page_header::stamp_checksum`, which the branch arena really does verify). So a torn
+    ///   table page is undetectable by design, and the engine's durability rests on a page write being
+    ///   all-or-nothing.
+    ///
+    /// Setting `PAGE_SIZE` for the database file therefore does not paper over a bug; it states the
+    /// assumption the engine already makes, so that a sweep over it tests recovery rather than
+    /// re-deriving a known gap at forty different offsets. The gap itself is pinned by
+    /// `a_torn_table_page_is_served_as_a_row_that_was_never_written` in `tests/sim_durability.rs`,
+    /// which sets the unit back to 1 on purpose.
+    pub fn set_write_atomicity(&self, name: &str, unit: u64) {
+        let unit = unit.max(1);
+        self.lock().atomic_unit.insert(name.to_string(), unit);
+    }
+
     /// A handle on one file. Creating it is not an operation — a real `open` is not part of the
     /// durable-IO surface this models — so it does not move the counter.
     pub fn open(self: &Arc<Self>, name: &str) -> Arc<SimStorage> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         st.files.entry(name.to_string()).or_insert_with(|| FileImage::new(Vec::new()));
         drop(st);
         Arc::new(SimStorage { fabric: Arc::clone(self), name: name.to_string() })
     }
 
     pub fn op_count(&self) -> u64 {
-        self.state.lock().unwrap().next_op
+        self.lock().next_op
     }
 
     pub fn trace(&self) -> Vec<TraceOp> {
-        self.state.lock().unwrap().trace.clone()
+        self.lock().trace.clone()
     }
 
     /// Indices of every operation a fault could break, in order. The sweep walks exactly this list,
@@ -325,14 +380,14 @@ impl SimFabric {
     /// A single number over the whole operation sequence: kind, file, offset, length and, for writes,
     /// the bytes. Two runs agreeing on this agree on *what was written, where, and in what order*.
     pub fn trace_digest(&self) -> u32 {
-        crc32(&self.state.lock().unwrap().trace_digest_bytes)
+        crc32(&self.lock().trace_digest_bytes)
     }
 
     /// A digest of the surviving bytes of every file. Answers a different question from
     /// [`SimFabric::trace_digest`]: not "were the same writes issued" but "did the same image end up
     /// on disk".
     pub fn image_digest(&self) -> u32 {
-        let st = self.state.lock().unwrap();
+        let st = self.lock();
         let mut buf = Vec::new();
         for (name, img) in st.files.iter() {
             buf.extend_from_slice(name.as_bytes());
@@ -343,11 +398,11 @@ impl SimFabric {
     }
 
     pub fn fired(&self) -> Option<FiredFault> {
-        self.state.lock().unwrap().fired.clone()
+        self.lock().fired.clone()
     }
 
     pub fn crashed(&self) -> bool {
-        self.state.lock().unwrap().crashed
+        self.lock().crashed
     }
 
     /// The bytes that survived the crash, per file.
@@ -361,9 +416,13 @@ impl SimFabric {
             .collect()
     }
 
-    /// The machine after the reboot: a fresh, fault-free fabric holding only what survived.
+    /// The machine after the reboot: a fresh, fault-free fabric holding only what survived, with the
+    /// same write-atomicity model — rebooting does not change the hardware.
     pub fn restart(&self) -> Arc<SimFabric> {
-        SimFabric::from_images(self.durable_image(), None, self.durability)
+        let fresh = SimFabric::from_images(self.durable_image(), None, self.durability);
+        let units = self.lock().atomic_unit.clone();
+        fresh.lock().atomic_unit = units;
+        fresh
     }
 
     /// Perform one operation: claim the next index, decide whether this is the one to break, record
@@ -376,7 +435,7 @@ impl SimFabric {
     fn execute(&self, name: &str, offset: u64, req: Req<'_>) -> io::Result<u64> {
         let kind = req.kind();
         let len = req.len();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         let index = st.next_op;
         st.next_op += 1;
 
@@ -394,10 +453,21 @@ impl SimFabric {
                     // A tear needs at least one byte on each side of the boundary. A one-byte write
                     // cannot be torn, so it is dropped instead — and `kept` records which happened,
                     // so a test compares the fault that fired, not the one that was planned.
-                    let kept = if plan.tear && len >= 2 {
+                    let raw = if plan.tear && len >= 2 {
                         1 + (plan.tear_pick % (len as u64 - 1)) as usize
                     } else {
                         0
+                    };
+                    // Round the boundary down to this file's atomic unit, measured in absolute file
+                    // offsets: a device tears at a sector boundary, not at a boundary relative to
+                    // whatever the caller happened to pass. With the default unit of 1 this is a no-op.
+                    let unit = *st.atomic_unit.get(name).unwrap_or(&1);
+                    let kept = if unit <= 1 {
+                        raw
+                    } else {
+                        let abs_end = offset + raw as u64;
+                        let aligned = abs_end - (abs_end % unit);
+                        aligned.saturating_sub(offset) as usize
                     };
                     let fk = if kept > 0 { FaultKind::TearWrite } else { FaultKind::DropWrite };
                     FiredFault { op_index: index, file: name.to_string(), kind: fk, offset, len, kept }
