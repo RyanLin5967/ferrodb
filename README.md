@@ -146,6 +146,48 @@ FROM table [AS] [alias]
 - **Operators:** = != <= > >= + - * / AND OR NOT
 - **Columns:** *, qualified references, table aliases, qualified star
 
+### System views over the agent layer
+
+Five read-only views, selectable like any table, with `WHERE` and projection:
+
+| View | One row per | Lifetime |
+|---|---|---|
+| `ferro_branches` | every branch the catalog holds, live or reaped | durable |
+| `ferro_runs` | live agent branch, with its agent / run / model | in memory, gone at `MERGE` |
+| `ferro_row_authors` | published row, with the run that wrote it | in memory, survives the merge |
+| `ferro_quarantine` | branch the verification gate is holding, **with the reason** | membership durable, reason in memory |
+| `ferro_run_activity` | live agent branch, with what it has written and read | in memory, gone at `MERGE` |
+
+```sql
+SELECT branch_id, state, depth FROM ferro_branches WHERE depth > 0;
+SELECT agent_id, run_id, staged_rows, rows_read_exact, blind_writes FROM ferro_run_activity;
+SELECT branch_name, reason FROM ferro_quarantine;
+```
+
+They are **presentation, not bookkeeping**: every row is materialised on each read from an API the
+agent layer already exposed, so there is no second record of what an agent did that could disagree
+with the first. That also means they are outside MVCC — a view read inside `BEGIN` sees the runtime
+as it is now, not as the transaction's snapshot saw it.
+
+Three consequences worth knowing before you rely on them:
+
+- A view's **lifetime is its source's**. `ferro_runs` answers from the branch's workspace, which
+  `MERGE` and `ABANDON` drop, so a merged run leaves it. `ferro_row_authors` is the question that
+  keeps answering afterwards. A `NULL` reason in `ferro_quarantine` means the branch is still held
+  and the reason did not survive a restart — not that it was held for nothing.
+- They are **read-only, and refuse by name**. `INSERT INTO ferro_runs` says so; it does not answer
+  `unknown table`.
+- `CREATE TABLE ferro_runs` is **refused**, because such a table's rows would be unreachable behind
+  the view. A table that already carries one of these names — from a database written before the
+  views existed — keeps its rows: the table wins, and the view yields.
+
+Two names are `branch_name` and `model_name` rather than `branch` and `model` because both of the
+shorter ones are reserved words here (`AS OF BRANCH`, `MODEL '...'`), and a column named after a
+keyword can only be reached through `SELECT *`.
+
+`u64` values that do not fit `i64` (a branch lease of `u64::MAX`, a `row_id` hashed from a
+non-integer key) are `DECIMAL`, so they arrive as exact digits rather than as a negative `BIGINT`.
+
 ### Try it yourself
 Start the REPL (either `cargo run`/`cargo run -- mydb.db` or by unziping then executing the binary).
 Statements end with a `;` and may span multiple lines. Everything is saved to the .db file, so data persists
@@ -662,6 +704,9 @@ Three further limits, each found by a test rather than reasoned about:
 - [x] Quarantine: a declined branch stays unmerged but still queryable
 - [x] Escrow at fork, so a bounded-counter overdraw fails at write time
 - [x] Depth guard + `COLLAPSE` at ancestry depth 8
+- [x] System views over the agent layer (`ferro_branches`, `ferro_runs`, `ferro_row_authors`,
+      `ferro_quarantine`, `ferro_run_activity`), and structured agent results as typed columns on
+      the wire rather than one `Debug` string
 - [ ] SQL statements writing directly to CoW pages (the largest remaining gap, above)
 
 ## Why I built it

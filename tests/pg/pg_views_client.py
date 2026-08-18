@@ -52,7 +52,7 @@ EXPECTED_FIELDS = {
     "ferro_branches": [
         ("branch_id", INT8),
         ("generation", INT4),
-        ("branch", TEXT),
+        ("branch_name", TEXT),
         ("parent_id", INT8),
         ("fork_epoch", INT8),
         ("root_page_id", INT8),
@@ -69,7 +69,7 @@ EXPECTED_FIELDS = {
         ("prov_id", INT4),
         ("agent_id", TEXT),
         ("run_id", TEXT),
-        ("model", TEXT),
+        ("model_name", TEXT),
         ("model_version", TEXT),
         ("prompt_hash", TEXT),
         ("started_at", INT8),
@@ -81,13 +81,13 @@ EXPECTED_FIELDS = {
         ("prov_id", INT4),
         ("agent_id", TEXT),
         ("run_id", TEXT),
-        ("model", TEXT),
+        ("model_name", TEXT),
         ("model_version", TEXT),
     ],
     "ferro_quarantine": [
         ("branch_id", INT8),
         ("generation", INT4),
-        ("branch", TEXT),
+        ("branch_name", TEXT),
         ("reason", TEXT),
     ],
     "ferro_run_activity": [
@@ -170,6 +170,7 @@ def main():
     # The trunk row, and the value that a BIGINT column would have reported as -1.
     fields, rows, _, _ = q(a, "SELECT * FROM ferro_branches;")
     check(col(fields, rows, "branch_id") == ["0"], f"the trunk is not branch 0: {rows}")
+    check(col(fields, rows, "branch_name") == ["b_0"], f"{rows}")
     check(
         col(fields, rows, "parent_id") == [None],
         f"the trunk's parent must arrive as SQL NULL (length -1), not a string: {rows}",
@@ -192,7 +193,7 @@ def main():
     check(len(rows) == 1, f"ferro_runs did not see the open session: {rows}")
     check(col(fields, rows, "agent_id") == ["held"], f"{rows}")
     check(col(fields, rows, "run_id") == ["r_held"], f"{rows}")
-    check(col(fields, rows, "model") == ["claude-opus-5"], f"{rows}")
+    check(col(fields, rows, "model_name") == ["claude-opus-5"], f"{rows}")
     check(col(fields, rows, "model_version") == ["2026-05"], f"{rows}")
     check(len(col(fields, rows, "prompt_hash")[0]) == 64, f"{rows}")
 

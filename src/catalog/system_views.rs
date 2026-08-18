@@ -164,6 +164,23 @@ impl SystemView {
 
     /// This view's declared columns.
     ///
+    /// # Column names must be selectable, which rules two obvious names out
+    ///
+    /// `branch` and `model` are **reserved words** in this SQL surface (`scanner.rs` maps them to
+    /// `TokenType::Branch` and `TokenType::Model` for `AS OF BRANCH` and `MODEL '...'`), so a column
+    /// called either one can only ever be reached through `SELECT *` — `SELECT branch FROM
+    /// ferro_quarantine` fails to scan. Both were originally named that way and it was not caught by
+    /// any assertion that read columns out of a `SELECT *`, which is every obvious one. They are
+    /// `branch_name` and `model_name`, and
+    /// `integration_system_views::every_declared_column_is_selectable_by_name` is the guard that
+    /// catches the next collision instead of a reader finding it.
+    ///
+    /// `branch_name` is the spelling `AS OF BRANCH` and `MERGE BRANCH` accept — `b_{id}` — rather
+    /// than `BranchId`'s `Display` (`b1@g0`), because a name a reader can paste into a statement is
+    /// worth more than a second rendering of the identity that `branch_id` and `generation` already
+    /// carry. It resolves only while the branch has a live session: the trunk has none, so `b_0` is
+    /// a spelling and not a resolvable name.
+    ///
     /// # Two width decisions that are not stylistic
     ///
     /// `lease_deadline` and `row_id` are `DECIMAL`, not `BIGINT`, because both are `u64` values that
@@ -186,7 +203,7 @@ impl SystemView {
             SystemView::Branches => vec![
                 big("branch_id"),
                 int("generation"),
-                text("branch", 32),
+                text("branch_name", 32),
                 // NULL only for the trunk, which has no parent. A sentinel here would be
                 // indistinguishable from branch 0, which is the trunk itself.
                 big_null("parent_id"),
@@ -205,7 +222,7 @@ impl SystemView {
                 int("prov_id"),
                 text("agent_id", 64),
                 text("run_id", 64),
-                text("model", 64),
+                text("model_name", 64),
                 text("model_version", 32),
                 text("prompt_hash", 64),
                 big("started_at"),
@@ -217,13 +234,13 @@ impl SystemView {
                 int("prov_id"),
                 text("agent_id", 64),
                 text("run_id", 64),
-                text("model", 64),
+                text("model_name", 64),
                 text("model_version", 32),
             ],
             SystemView::Quarantine => vec![
                 big("branch_id"),
                 int("generation"),
-                text("branch", 32),
+                text("branch_name", 32),
                 // NULL is a real answer, not a missing one: branch state is durable and the reason
                 // is not, so a branch held before a restart is still held and its reason is gone.
                 // Reporting that as an empty string would claim it was quarantined for no reason.
@@ -320,7 +337,7 @@ fn branches_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> 
             vec![
                 Value::BigInt(r.branch_id.id as i64),
                 Value::Integer(r.branch_id.generation as i32),
-                Value::Varchar(r.branch_id.to_string()),
+                Value::Varchar(format!("b_{}", r.branch_id.id)),
                 match r.parent_id {
                     Some(p) => Value::BigInt(p.id as i64),
                     None => Value::Null,
@@ -398,7 +415,7 @@ fn quarantine_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError
             vec![
                 Value::BigInt(b.id as i64),
                 Value::Integer(b.generation as i32),
-                Value::Varchar(b.to_string()),
+                Value::Varchar(format!("b_{}", b.id)),
                 // `None` reaches the client as SQL NULL rather than as the string "None" or as an
                 // empty reason. The gate always records one, so a NULL here means the reason did
                 // not survive a restart — which a reader has to be able to tell apart from a

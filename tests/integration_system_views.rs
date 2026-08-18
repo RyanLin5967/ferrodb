@@ -17,6 +17,7 @@
 //! is `tests/pg/pg_views_client.py`, driven by `integration_system_views_wire.rs`.
 
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
@@ -172,6 +173,7 @@ fn an_empty_view_still_announces_every_declared_column() {
     assert_eq!(column(&branches, "branch_id"), vec!["0"]);
     assert_eq!(column(&branches, "state"), vec!["Live"]);
     assert_eq!(column(&branches, "parent_id"), vec!["NULL"], "the trunk has no parent");
+    assert_eq!(column(&branches, "branch_name"), vec!["b_0"]);
 
     for name in ["ferro_runs", "ferro_row_authors", "ferro_quarantine", "ferro_run_activity"] {
         assert!(
@@ -214,7 +216,7 @@ fn every_view_is_populated_once_an_agent_has_run() {
     assert_eq!(runs.len(), 1, "{:?}", runs.rows);
     assert_eq!(column(&runs, "agent_id"), vec!["restock"]);
     assert_eq!(column(&runs, "run_id"), vec!["r_7"]);
-    assert_eq!(column(&runs, "model"), vec!["claude-opus-5"]);
+    assert_eq!(column(&runs, "model_name"), vec!["claude-opus-5"]);
     assert_eq!(column(&runs, "model_version"), vec!["2026-05"]);
     assert_eq!(column(&runs, "prompt_hash")[0].len(), 64, "a sha-width hex string");
     assert_eq!(column(&runs, "branch_name"), vec![format!("b_{}", branch.id)]);
@@ -311,7 +313,7 @@ fn a_quarantined_branch_shows_up_with_the_reason_it_is_held() {
     assert_eq!(q.len(), 1, "the held branch is not in the view: {:?}", q.rows);
     assert_eq!(column(&q, "branch_id"), vec![held.id.to_string()]);
     assert_eq!(column(&q, "generation"), vec![held.generation.to_string()]);
-    assert_eq!(column(&q, "branch"), vec![held.to_string()]);
+    assert_eq!(column(&q, "branch_name"), vec![format!("b_{}", held.id)]);
 
     let reason = &column(&q, "reason")[0];
     assert!(
@@ -659,7 +661,7 @@ fn a_table_that_predates_the_views_still_answers_for_its_own_name() {
     // Anti-vacuity: a view whose name NOTHING has claimed still answers as a view in the same
     // database. Without this half, a `view_for` that always returned `None` would pass above.
     let q = db.view("SELECT * FROM ferro_quarantine;");
-    assert_eq!(q.header(), vec!["branch_id", "generation", "branch", "reason"]);
+    assert_eq!(q.header(), vec!["branch_id", "generation", "branch_name", "reason"]);
 }
 
 /// **Read-only is a refusal that names the view, not `unknown table`.**
@@ -709,4 +711,112 @@ fn every_write_shape_against_a_view_refuses_by_name() {
     }
     db.ok("DELETE FROM oncall;", &mut s);
     db.ok("DROP TABLE oncall;", &mut s);
+}
+
+
+/// **The README's view examples are executed, not trusted.**
+///
+/// The repo already learned this three times over (`tests/integration_readme_commands.rs`): a
+/// documented command that was true when written, falsified by a later change, and never re-run. The
+/// same risk applies to a documented column name — rename `staged_rows` and the README becomes a
+/// list of statements that error, with nothing failing to say so.
+///
+/// The README is the fixture rather than a copy of it. The SQL is read out of the file, so editing
+/// the block changes what this runs; deleting the block fails the test rather than quietly covering
+/// nothing.
+#[test]
+fn the_readmes_system_view_examples_run_as_written() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+    let marker = "### System views over the agent layer";
+    let at = readme.find(marker).unwrap_or_else(|| {
+        panic!(
+            "README no longer contains {marker:?}. If that section was renamed, update this test; \
+             if it was deleted, say so here rather than letting this test quietly cover nothing."
+        )
+    });
+    let rest = &readme[at..];
+    let open = rest.find("```sql").expect("no ```sql block after the marker");
+    let body_start = rest[open..].find('\n').expect("unterminated fence") + open + 1;
+    let close = rest[body_start..].find("```").expect("unterminated fenced block") + body_start;
+    let statements: Vec<&str> = rest[body_start..close]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("--"))
+        .collect();
+    assert!(
+        statements.len() >= 3,
+        "the documented block has {} statements; it is not covering the views",
+        statements.len()
+    );
+
+    // A database with something in every view, so a statement cannot pass by returning nothing.
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'readme' RUN 'r_doc';", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+    db.ok("UPDATE oncall SET qty = 9 WHERE id = 1;", &mut a);
+
+    for sql in statements {
+        let out = db.view(sql);
+        // Every documented column name must resolve — that is the drift this catches — and the
+        // statement must actually be answered by a view rather than by something else.
+        assert!(!out.columns.is_empty(), "the README's `{sql}` returned no columns");
+        assert!(
+            out.columns.iter().all(|c| !c.name.is_empty()),
+            "the README's `{sql}` returned an unnamed column"
+        );
+    }
+
+    // Anti-vacuity: a documented column that does NOT exist must fail here, so the loop above is
+    // checking names rather than merely checking that SELECT runs.
+    let mut s = db.session();
+    let err = refusal(
+        db.exec("SELECT no_such_documented_column FROM ferro_run_activity;", &mut s),
+        "a column the README does not document",
+    );
+    assert!(err.to_string().contains("no_such_documented_column"), "{err}");
+}
+
+
+/// **Every declared column of every view can be SELECTed by name.**
+///
+/// The breaking shape is a column whose name is a reserved word. `branch` and `model` both are
+/// (`scanner.rs` maps them to `TokenType::Branch` and `TokenType::Model`, for `AS OF BRANCH` and
+/// `MODEL '...'`), and both were the original names of columns here. Nothing caught it, because every
+/// assertion in this file read its values out of `SELECT *` — the one form that never names a column.
+/// `SELECT branch FROM ferro_quarantine` did not even scan.
+///
+/// So this asks for each column by name, one statement per column. It is the guard that catches the
+/// next collision when someone adds a column, rather than a reader finding it.
+#[test]
+fn every_declared_column_is_selectable_by_name() {
+    let mut db = Db::new();
+    db.seed();
+    // A populated database, so a broken column cannot pass by returning nothing.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'named' RUN 'r_n' MODEL 'm/1';", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+    db.ok("UPDATE oncall SET qty = 5 WHERE id = 1;", &mut a);
+
+    let mut checked = 0;
+    for view in VIEW_NAMES {
+        for col in SystemView::by_name(view).expect("resolves").columns() {
+            let sql = format!("SELECT {} FROM {};", col.name, view);
+            let mut s = db.session();
+            let out = match db.exec(&sql, &mut s) {
+                Ok(Outcome::Table(t)) => t,
+                Ok(other) => panic!("`{sql}` returned {}", outcome_kind(&other)),
+                Err(e) => panic!(
+                    "`{sql}` failed: {e}\n  a declared column that cannot be named is reachable only \
+                     through SELECT *; if this is a reserved word, rename the column",
+                ),
+            };
+            assert_eq!(out.header(), vec![col.name.clone()], "`{sql}` named the wrong column");
+            checked += 1;
+        }
+    }
+    // A run that collected nothing has not passed.
+    assert!(checked >= 40, "only {checked} columns were checked; the loop covered almost nothing");
 }
