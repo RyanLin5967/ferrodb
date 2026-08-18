@@ -8,6 +8,9 @@
 //! SELECT * FROM inventory AS OF BRANCH b_1;              -- another branch's uncommitted state
 //! DIFF;                                                  -- structured changeset, not a blob
 //! MERGE;                                                 -- Clean/Commuting/Conflict/WithLoss
+//! SIMULATE AS 'pricing-agent'                            -- K candidates off one base, scored,
+//!   CANDIDATE 'cut-5' ( UPDATE inventory SET qty = qty - 5 WHERE id = 1; )
+//!   ASSERT ON inventory (qty >= 0) ADMIT ALL;            --   the winners admitted
 //! ABANDON;                                               -- drop the branch and everything on it
 //! REVERT MERGE m_1 CASCADE;                              -- causal rollback via read-sets
 //! ```
