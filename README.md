@@ -574,11 +574,48 @@ scalars agree by accident and prove nothing.
 `-engine duckdb` needs **cgo** (`github.com/marcboeker/go-duckdb` links DuckDB statically), so
 `CGO_ENABLED=0` will not build the consumer at all — the cost is module-wide, not per-engine.
 
+### Column-level schema evolution
+
+The feed carries five schema ops, not two: `CREATE_TABLE`, `DROP_TABLE`, and — through
+`ALTER TABLE ... ADD COLUMN` / `RENAME COLUMN` / `ALTER COLUMN ... TYPE` — `ADD_COLUMN`,
+`RENAME_COLUMN` and `ALTER_COLUMN_TYPE`. Each arrives **in band and in log order**, at the position
+the DDL actually occupied, so the events before it describe the old shape and the ones after it
+describe the new one.
+
+Every column-level event carries **both halves**: `after.columns` is the table's full shape
+afterwards, which the sinks reconcile their destination against positionally; `after.alter` says
+which change produced that shape. Both are needed, because a rename and a drop-plus-add leave
+identical column lists and only one of them keeps the column's data.
+
+Three things are worth knowing about the shape of the feature rather than the wire format:
+
+- **The two whole-table ops are declarations; the three column-level ones are news.** A
+  `CREATE_TABLE` is re-emitted at every checkpoint and a consumer may apply it any number of times.
+  An `ALTER` is delivered exactly once, and a consumer that applied one twice would rename a column
+  that no longer has the old name. An alter updates the source's *retained declaration* instead of
+  being retained itself, which is also how the new shape survives a log truncation and a restart.
+- **A column is added at the end, and there is no `DROP COLUMN`.** A column's ordinal is its
+  identity below the parser — tuple bytes are positional, and every recorded effect, guard and
+  merge policy holds an ordinal — so removing one, or inserting one mid-table, would silently
+  re-point all of them at a different column.
+- **Retypes are an allowlist of conversions that are total for every stored value**: `INTEGER` to
+  `BIGINT` or `DECIMAL`, `BIGINT` to `DECIMAL`, and `VARCHAR(n)` to `VARCHAR(m)` where `m >= n`.
+  Anything else would have to decide what to do with a value that does not fit, and every answer to
+  that is data loss. Retyping the primary key is refused.
+
+Two agents can evolve one schema concurrently. A branch's `ALTER` is **pending** — invisible to
+main and to siblings until `MERGE`, and gone if the branch is abandoned — and at merge it is
+three-way merged against the shape the target has *then*. Two branches adding different columns
+compose (`Commuting`); two retyping one column to different types `Conflict`, and the agent is
+handed back the violated predicate itself, e.g. `typeof(inventory.qty) = INTEGER`. An edit the
+target already satisfies identically is absorbed rather than refused.
+
 **Limits:** there is no wire framing beyond newline delimiting, and the feed is JSON rather than a
-compact binary format. `ALTER TABLE` is not carried — `CREATE_TABLE` and `DROP_TABLE` are, so a
-consumer learns a table's shape and its disappearance but not a column added later. The sinks
-replace whole rows rather than merging, which is correct only because this feed always emits full
-before/after images.
+compact binary format. The sinks replace whole rows rather than merging, which is correct only
+because this feed always emits full before/after images. An `ALTER` rewrites the table in place and
+is refused while any transaction is open; like every other DDL here it is not crash-atomic, because
+the catalog is written outside the WAL and recovery does not replay it. An alter also truncates the
+table's MVCC version chains, which is unobservable only because it requires that quiesce.
 
 ## Replication — what it gives you, and what it cannot
 

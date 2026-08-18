@@ -6,7 +6,9 @@
 //! deserialises, drives the retained-record logic in `wal::txn`, and `replication::logical` turns it
 //! into a `DROP_TABLE` event. The Go consumer validates it, the SQLite sink runs
 //! `DROP TABLE IF EXISTS`, the DuckDB sink has its own branch, and the README states that
-//! "`CREATE_TABLE` and `DROP_TABLE` are" carried while `ALTER TABLE` is not.
+//! "`CREATE_TABLE` and `DROP_TABLE` are" carried while `ALTER TABLE` is not. (B11 has since made
+//! `ALTER TABLE` carried too, in three column-level ops; the sentence quoted here is the one that
+//! was false at the time, and it is left as quoted because it is what this file is about.)
 //!
 //! **Nothing could ever write one.** `DdlOp::CreateTable` was the only op any code path logged, because
 //! `DROP TABLE` was not in the SQL surface at all — E67 measured it as
