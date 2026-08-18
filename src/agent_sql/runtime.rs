@@ -1047,8 +1047,25 @@ impl AgentRuntime {
     /// governed party can widen is a suggestion. A branch with no envelope is ungoverned, so the
     /// first call installs freely; every child forked afterwards inherits it.
     ///
-    /// Installing one on [`BranchId::TRUNK`] is how every future agent session becomes governed,
-    /// since `BEGIN AGENT SESSION` forks out of trunk by default.
+    /// Installing one on [`BranchId::TRUNK`] is how agent sessions become governed, since
+    /// `BEGIN AGENT SESSION` forks out of trunk by default.
+    ///
+    /// **Sessions already open keep the envelope they forked with.** A capability is what its
+    /// holder was handed at creation; changing it underneath a running holder is *revocation*, and
+    /// revocation is a design decision this does not make — it has to say what happens to a
+    /// statement in flight, and whether a branch may be narrowed below what it has already
+    /// written. The lever that does exist for a live agent is
+    /// [`AgentRuntime::quarantine`]: the branch stays readable and its `MERGE` is refused, so
+    /// nothing it wrote can reach the shared tables.
+    /// `installing_an_envelope_does_not_reach_a_session_that_is_already_open` pins both halves.
+    ///
+    /// **Cost.** Every governed statement that writes a row appends a full `BranchRecord` to the
+    /// catalog log and fsyncs it. On the page-backed path `set_root` already does that once per
+    /// row written, so this adds a fraction; on a map-backed runtime with a durable catalog it is
+    /// the only fsync on the path. Nothing compacts `branches.log`, and `LogBranchCatalog::open`
+    /// replays all of it, so a long-lived governed database pays for this at open time too. The
+    /// alternative — charging in memory and flushing on a bound — trades exactly the property the
+    /// field exists for, so it is a decision to make deliberately rather than a tuning knob.
     pub fn restrict_branch(
         &self,
         branch: BranchId,
@@ -1120,8 +1137,7 @@ impl AgentRuntime {
         // the op is walked around by any other shape with the same effect. An INSERT is the live
         // example — its `Op` carries `col: None`, so a column check reading the ops would see it
         // write no column while it writes every one of them.
-        let mut record = self.branches.get(branch)?;
-        let charge = match &record.envelope {
+        let charge = match self.branches.envelope_of(branch)? {
             None => 0,
             Some(envelope) => {
                 let images: Vec<RowImage> = items
@@ -1136,25 +1152,11 @@ impl AgentRuntime {
                     })
                     .collect();
                 // The whole statement, before a single row is recorded — the same batch rule the
-                // escrow check follows two blocks down, and for the same reason.
+                // escrow check follows just below, and for the same reason. Nothing is charged
+                // here: `admit` only answers how much this statement would cost.
                 envelope.admit(tbl.0, table, &images)?
             }
         };
-        if charge > 0 {
-            // Charged durably, and charged BEFORE anything is applied. A budget spent only in
-            // memory is a budget a restart hands back, which is the whole defect this field
-            // exists to close. Nothing below this line can fail on a per-row basis, so the charge
-            // cannot outlive a statement that was then refused.
-            //
-            // It CAN outlive one that failed on I/O — appending the frame or mirroring to pages
-            // can still return an error after this point, and the budget stays spent. That is the
-            // deliberate direction: charging afterwards would mean a failed record write leaves a
-            // row written and unbudgeted, which is fail-open. Over-charging refuses a later write;
-            // under-charging admits one.
-            let envelope = record.envelope.as_mut().expect("a charge implies an envelope");
-            envelope.row_writes += charge;
-            self.branches.put(&record)?;
-        }
 
         let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
         {
@@ -1180,6 +1182,24 @@ impl AgentRuntime {
             // The whole statement, before a single unit is charged. This is the line that makes the
             // refusal atomic.
             state.escrow.check_all(branch, &spends)?;
+        }
+
+        // **Every refusal has now been decided, so the budget can be charged.**
+        //
+        // The order is load-bearing and was wrong once: charging before `check_all` meant an
+        // escrow-refused statement permanently spent envelope budget on rows it never wrote, and
+        // since the escrow error tells the client to claim more and retry, an ordinary retry loop
+        // burned the whole envelope budget on statements that wrote nothing.
+        //
+        // `charge_row_writes` is atomic against every other mutation of the record and re-checks
+        // the budget under the catalog's own lock, so it is the charge — not `admit` above — that
+        // decides. The window it leaves is an I/O failure further down (appending the frame,
+        // mirroring to pages) with the budget already spent. That direction is deliberate:
+        // charging afterwards would mean a failed record write leaves a row written and
+        // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
+        // admits one.
+        if charge > 0 {
+            self.branches.charge_row_writes(branch, charge)?;
         }
 
         // ---- apply --------------------------------------------------------------------------

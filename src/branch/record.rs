@@ -296,31 +296,69 @@ impl BranchRecord {
         // reading them as an envelope tag would turn every old record into a corrupt one.
         let envelope = if c.at >= body_len {
             None
-        } else if c.u8()? == 0 {
-            None
         } else {
-            let verbs = c.u8()?;
-            let max_row_writes = c.u64()?;
-            let row_writes = c.u64()?;
-            let table_len = c.u32()? as usize;
-            let mut tables = Vec::with_capacity(table_len);
-            for _ in 0..table_len {
-                let table = c.u32()?;
-                let col_len = c.u32()? as usize;
-                let mut columns = Vec::with_capacity(col_len);
-                for _ in 0..col_len {
-                    let col = c.u32()?;
-                    let has_floor = c.u8()?;
-                    let floor = c.i64()?;
-                    columns.push(ColumnCapability {
-                        col,
-                        floor: if has_floor == 1 { Some(floor) } else { None },
-                    });
+            match c.u8()? {
+                0 => None,
+                1 => {
+                    let verbs = c.u8()?;
+                    let max_row_writes = c.u64()?;
+                    let row_writes = c.u64()?;
+                    let table_len = c.u32()? as usize;
+                    let mut tables = Vec::new();
+                    for _ in 0..table_len {
+                        let table = c.u32()?;
+                        let col_len = c.u32()? as usize;
+                        let mut columns = Vec::new();
+                        for _ in 0..col_len {
+                            let col = c.u32()?;
+                            // Anything but 0 or 1 is refused, not read as "no floor". A tag this
+                            // read does not understand turning a floored column into an unbounded
+                            // one is the one direction this type forbids: a bound it cannot
+                            // evaluate refuses, it does not wave the write past.
+                            let floor = match c.u8()? {
+                                0 => {
+                                    c.i64()?;
+                                    None
+                                }
+                                1 => Some(c.i64()?),
+                                other => {
+                                    return Err(BranchError::Corrupt(format!(
+                                        "unknown capability floor tag {other} on table {table} \
+                                         column {col}"
+                                    )))
+                                }
+                            };
+                            columns.push(ColumnCapability { col, floor });
+                        }
+                        tables.push((table, columns));
+                    }
+                    // Built through `allow`, which sorts and deduplicates, so an envelope read off
+                    // disk carries the same invariant as one built in process. Reconstructing the
+                    // struct raw here is what let a non-canonical record mis-resolve a table it
+                    // had actually been granted.
+                    let mut e = CapabilityEnvelope::new(verbs, max_row_writes);
+                    for (table, columns) in tables {
+                        e = e.allow(table, columns);
+                    }
+                    e.row_writes = row_writes;
+                    Some(e)
                 }
-                tables.push(TableCapability { table, columns });
+                other => {
+                    return Err(BranchError::Corrupt(format!(
+                        "unknown capability envelope tag {other}"
+                    )))
+                }
             }
-            Some(CapabilityEnvelope { verbs, tables, max_row_writes, row_writes })
         };
+        if c.at != body_len {
+            // Trailing bytes inside a body that checksums mean this record was written by
+            // something whose format this build does not know. Refuse rather than act on the part
+            // of it that happened to parse.
+            return Err(BranchError::Corrupt(format!(
+                "branch record has {} byte(s) after the last field this build understands",
+                body_len - c.at
+            )));
+        }
 
         Ok(BranchRecord {
             branch_id: BranchId::new(id, gen_at_birth),
@@ -412,15 +450,17 @@ pub struct RowImage<'a> {
 }
 
 impl<'a> RowImage<'a> {
-    /// The verb this row transition amounts to.
-    pub fn effect(&self) -> RowEffect {
+    /// The verb this row transition amounts to, given the columns it authored.
+    ///
+    /// Takes the change set rather than recomputing it: `admit` needs both for every row, and
+    /// computing it twice was two scans and two allocations per row on the write funnel.
+    pub fn effect_given(&self, changed: &[u32]) -> RowEffect {
         match (self.before, self.after) {
             (None, Some(_)) => RowEffect::Wrote(Verb::Insert),
-            (Some(_), None) => RowEffect::Wrote(Verb::Delete),
             // A row that vanishes from nowhere is still a removal as far as authority goes.
-            (None, None) => RowEffect::Wrote(Verb::Delete),
-            (Some(b), Some(a)) => {
-                if changed_columns(Some(b), Some(a)).is_empty() {
+            (Some(_), None) | (None, None) => RowEffect::Wrote(Verb::Delete),
+            (Some(_), Some(_)) => {
+                if changed.is_empty() {
                     RowEffect::Unchanged
                 } else {
                     RowEffect::Wrote(Verb::Update)
@@ -428,28 +468,55 @@ impl<'a> RowImage<'a> {
             }
         }
     }
+
+    /// The verb this row transition amounts to. Convenience for callers that do not already hold
+    /// the change set; `admit` uses [`RowImage::effect_given`] instead.
+    pub fn effect(&self) -> RowEffect {
+        self.effect_given(&changed_columns(self.before, self.after))
+    }
 }
 
-/// Column indices whose value differs between the two images.
+/// Column indices this statement authored, read off the two images.
 ///
-/// A side that does not exist reads as all-`Null`, and the shorter image is padded with `Null`, so
-/// an INSERT reports every column it gave a value to and a DELETE reports every column it took one
-/// away from. **That is why an INSERT cannot slip past a column allowlist**: its `Op` carries
-/// `col: None`, so a check keyed on the op's column would see an INSERT touch no column at all and
-/// wave through a row that wrote every one of them.
+/// **A row that appears or disappears authors every one of its cells.** An INSERT creates the
+/// whole row and a DELETE destroys the whole row, so both report every column, and the value in
+/// the cell is irrelevant to that. Only an in-place UPDATE reports a subset — the cells that
+/// actually differ.
+///
+/// **That is why an INSERT cannot slip past a column allowlist**: its `Op` carries `col: None`, so
+/// a check keyed on the op's column would see an INSERT touch no column at all and wave through a
+/// row that wrote every one of them.
+///
+/// This used to compare the absent side against a pad of `Null`, which was subtly wrong in one
+/// direction and the reason it no longer does: a cell written as SQL `NULL` matched the pad and
+/// reported as *unchanged*, so `INSERT INTO t VALUES (9, NULL)` wrote a column that was never
+/// granted and planted a `NULL` in a floored cell — while `UPDATE t SET qty = NULL`, which reaches
+/// the identical end state, was refused. A guard that disagrees with itself about the same end
+/// state depending on which statement produced it is not a guard.
+///
+/// The consequence is deliberate and worth stating: **DELETE needs authority over every column of
+/// the row**, because a row removal destroys every cell in it. Granting `Verb::DELETE` with a
+/// narrow column list therefore refuses every delete. Grant the columns, or do not grant the verb.
+/// `a_delete_needs_authority_over_every_column_it_destroys` pins both halves.
 pub fn changed_columns(before: Option<&[Value]>, after: Option<&[Value]>) -> Vec<u32> {
-    let b = before.unwrap_or(&[]);
-    let a = after.unwrap_or(&[]);
-    let n = b.len().max(a.len());
-    let mut out = Vec::new();
-    for i in 0..n {
-        let lhs = b.get(i).unwrap_or(&Value::Null);
-        let rhs = a.get(i).unwrap_or(&Value::Null);
-        if !same_stored_value(lhs, rhs) {
-            out.push(i as u32);
+    match (before, after) {
+        // The row survives: only the cells that actually differ were authored.
+        (Some(b), Some(a)) => {
+            let n = b.len().max(a.len());
+            let mut out = Vec::new();
+            for i in 0..n {
+                let lhs = b.get(i).unwrap_or(&Value::Null);
+                let rhs = a.get(i).unwrap_or(&Value::Null);
+                if !same_stored_value(lhs, rhs) {
+                    out.push(i as u32);
+                }
+            }
+            out
         }
+        // The row appeared or vanished: every cell of the side that exists was authored.
+        (None, Some(r)) | (Some(r), None) => (0..r.len() as u32).collect(),
+        (None, None) => Vec::new(),
     }
-    out
 }
 
 /// Do these two cells hold the same **stored** value?
@@ -508,11 +575,23 @@ impl ColumnCapability {
 }
 
 /// One table a branch may write, and which of its columns.
+///
+/// **`table` is a 32-bit FNV-1a of the table name** (`agent_sql::runtime::table_id`), and no name
+/// is stored. That is the identity the rest of this system already keys on — workspaces, escrow
+/// cells, every `Op` — so using anything else here would make the envelope disagree with the
+/// funnel it guards. Stated because the consequence is different for a capability than for a
+/// lookup key: two table names that collide share one allowlist entry, and the refusal path cannot
+/// tell them apart, because the name in the message text comes from the caller and not from the
+/// record. At the birthday bound that is around 77k tables in one database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableCapability {
     pub table: u32,
     /// Sorted by column index. A column that is absent may not be written: default-deny.
-    pub columns: Vec<ColumnCapability>,
+    ///
+    /// Private because [`TableCapability::column`] binary-searches it: an unsorted list makes a
+    /// granted column resolve to "not on the allowlist". [`TableCapability::new`] is the only way
+    /// to build one, and it sorts.
+    columns: Vec<ColumnCapability>,
 }
 
 impl TableCapability {
@@ -522,6 +601,10 @@ impl TableCapability {
         columns.sort_by_key(|c| (c.col, std::cmp::Reverse(c.floor)));
         columns.dedup_by_key(|c| c.col);
         TableCapability { table, columns }
+    }
+
+    pub fn columns(&self) -> &[ColumnCapability] {
+        &self.columns
     }
 
     fn column(&self, col: u32) -> Option<&ColumnCapability> {
@@ -573,19 +656,28 @@ impl From<CapabilityRefusal> for FerroError {
 /// reads an `OpKind`, a `Stmt`, or the SQL text. That is deliberate, and it is the rule the write
 /// funnel already learned the hard way — see the comment on `AgentRuntime::stage_all`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// # Why the fields are private
+///
+/// `table()` and `column()` binary-search their arrays, so an envelope whose arrays are not sorted
+/// resolves a granted table to "not on the allowlist" and a granted column to the same. That
+/// invariant used to be maintained only by `new`/`allow` while every field was `pub` and
+/// `deserialize` rebuilt the structs raw — so a struct literal, or any record read off disk, could
+/// carry an envelope that silently mis-resolved. Making the state unrepresentable is cheaper than
+/// documenting it: the constructors are the only way in, and they sort.
 pub struct CapabilityEnvelope {
     /// Bitmask of [`Verb`] bits.
-    pub verbs: u8,
+    verbs: u8,
     /// Sorted by table id. A table that is absent may not be written: default-deny.
-    pub tables: Vec<TableCapability>,
+    tables: Vec<TableCapability>,
     /// How many row-writes this branch may perform over its whole life.
     ///
     /// A "row-write" is one row whose image a statement changed. Re-writing the same row in a
     /// later statement costs another one — this is a budget on writes, not a count of distinct
     /// rows, and it is named that way so nobody reads it as the latter.
-    pub max_row_writes: u64,
+    max_row_writes: u64,
     /// How many it has already spent. **Durable**, so a restart does not hand the budget back.
-    pub row_writes: u64,
+    row_writes: u64,
 }
 
 impl CapabilityEnvelope {
@@ -607,6 +699,40 @@ impl CapabilityEnvelope {
 
     pub fn table(&self, table: u32) -> Option<&TableCapability> {
         self.tables.binary_search_by_key(&table, |t| t.table).ok().map(|i| &self.tables[i])
+    }
+
+    pub fn verbs(&self) -> u8 {
+        self.verbs
+    }
+
+    pub fn tables(&self) -> &[TableCapability] {
+        &self.tables
+    }
+
+    pub fn max_row_writes(&self) -> u64 {
+        self.max_row_writes
+    }
+
+    /// Row-writes already spent.
+    pub fn row_writes(&self) -> u64 {
+        self.row_writes
+    }
+
+    /// Spend `n` row-writes, refusing if they do not fit.
+    ///
+    /// Re-checks rather than trusting [`CapabilityEnvelope::admit`]'s answer, because the two are
+    /// not one atomic step: `admit` decides against the envelope a statement read, and something
+    /// else may have charged against the same branch in between. The check that must hold is the
+    /// one at the moment of the charge.
+    pub fn charge(&mut self, n: u64) -> Result<(), CapabilityRefusal> {
+        if n > self.remaining() {
+            return Err(CapabilityRefusal(format!(
+                "charging {n} row-write(s) would exceed the branch's remaining budget of {}",
+                self.remaining()
+            )));
+        }
+        self.row_writes += n;
+        Ok(())
     }
 
     /// Row-writes still available.
@@ -717,7 +843,8 @@ impl CapabilityEnvelope {
 
         let mut charged = 0u64;
         for image in rows {
-            let RowEffect::Wrote(verb) = image.effect() else {
+            let changed = changed_columns(image.before, image.after);
+            let RowEffect::Wrote(verb) = image.effect_given(&changed) else {
                 // The images are identical, so this statement wrote nothing here. Governing a
                 // non-write would charge budget for a no-op and refuse a statement that changed
                 // nothing.
@@ -731,7 +858,7 @@ impl CapabilityEnvelope {
                     image.row
                 )));
             }
-            for col in changed_columns(image.before, image.after) {
+            for col in changed {
                 let Some(column) = cap.column(col) else {
                     return Err(CapabilityRefusal(format!(
                         "branch may not write `{table_name}` column {col} (row {}): the column is \
@@ -1045,7 +1172,7 @@ mod tests {
         r.live_children = vec![Epoch(1)];
         r.arenas = vec![ArenaId(2), ArenaId(4)];
         let mut e = full_envelope().allow(9, vec![ColumnCapability::floored(3, -42)]);
-        e.row_writes = 17;
+        e.charge(17).unwrap();
         r.envelope = Some(e);
         let bytes = r.serialize();
         assert_eq!(BranchRecord::deserialize(&bytes).unwrap(), r);
@@ -1081,17 +1208,144 @@ mod tests {
     }
 
     /// **Breaking shape: an INSERT.** Its `Op` carries `col: None`, so a column check keyed on the
-    /// op would see it touch no column and wave through a row that wrote every one of them.
-    /// Reading the images instead reports every column the insert gave a value to.
+    /// op would see it touch no column and wave through a row that wrote every one of them. A row
+    /// that appears or disappears authors every one of its cells, whatever those cells hold.
+    ///
+    /// **Breaking shape, second: a cell written as SQL `NULL`.** This used to compare the absent
+    /// side against a pad of `Null`, so `INSERT INTO t VALUES (9, NULL)` reported column 1 as
+    /// unchanged and slipped it past both the allowlist and the floor — while
+    /// `UPDATE t SET qty = NULL`, which reaches the identical end state, was refused. The third
+    /// assertion below is that case.
     #[test]
     fn changed_columns_reads_images_so_an_insert_reports_every_column_it_wrote() {
         let after = row(&[Value::Integer(1), Value::Integer(2), Value::Null]);
-        assert_eq!(changed_columns(None, Some(&after)), vec![0, 1]);
-        assert_eq!(changed_columns(Some(&after), None), vec![0, 1], "a delete takes them away");
+        assert_eq!(changed_columns(None, Some(&after)), vec![0, 1, 2]);
+        assert_eq!(changed_columns(Some(&after), None), vec![0, 1, 2], "a delete takes them away");
 
-        let before = row(&[Value::Integer(1), Value::Integer(9), Value::Null]);
-        assert_eq!(changed_columns(Some(&before), Some(&after)), vec![1]);
-        assert!(changed_columns(Some(&before), Some(&before)).is_empty());
+        // A NULL an INSERT wrote is a cell it authored, exactly as the same NULL written by an
+        // UPDATE would be.
+        let nulled = row(&[Value::Integer(1), Value::Null]);
+        assert_eq!(changed_columns(None, Some(&nulled)), vec![0, 1]);
+        let before = row(&[Value::Integer(1), Value::Integer(9)]);
+        assert_eq!(
+            changed_columns(Some(&before), Some(&nulled)),
+            vec![1],
+            "the UPDATE that reaches the same end state must report the same column"
+        );
+
+        // An in-place update still reports only what differs, or nothing at all.
+        let b3 = row(&[Value::Integer(1), Value::Integer(9), Value::Null]);
+        assert_eq!(changed_columns(Some(&b3), Some(&after)), vec![1]);
+        assert!(changed_columns(Some(&b3), Some(&b3)).is_empty());
+    }
+
+    /// The consequence of "a row removal destroys every cell": DELETE needs authority over every
+    /// column of the row. Stated as a deliberate rule with both halves, so it reads as a decision
+    /// rather than as something nobody noticed.
+    #[test]
+    fn a_delete_needs_authority_over_every_column_it_destroys() {
+        let before = row(&[Value::Integer(1), Value::Integer(20)]);
+        let del = [RowImage { row: 1, before: Some(&before), after: None }];
+
+        let narrow = CapabilityEnvelope::new(Verb::ALL, 10).allow(T, vec![ColumnCapability::open(1)]);
+        let err = narrow.admit(T, "t", &del).expect_err("a delete destroyed an ungranted column");
+        assert!(format!("{err}").contains("column 0"), "got {err}");
+
+        // Anti-vacuity: grant every column and the same delete goes through.
+        let wide = CapabilityEnvelope::new(Verb::ALL, 10)
+            .allow(T, vec![ColumnCapability::open(0), ColumnCapability::open(1)]);
+        assert_eq!(wide.admit(T, "t", &del).unwrap(), 1);
+    }
+
+    /// An INSERT whose value is NULL is still a write of that column, and a NULL is still below
+    /// every floor. Both halves of the hole the `Null` pad opened.
+    #[test]
+    fn an_insert_cannot_launder_a_column_or_a_floor_through_a_null() {
+        let e = CapabilityEnvelope::new(Verb::ALL, 10)
+            .allow(T, vec![ColumnCapability::open(0), ColumnCapability::floored(1, 0)]);
+
+        let nulled = row(&[Value::Integer(9), Value::Null]);
+        let err = e
+            .admit(T, "t", &[RowImage { row: 9, before: None, after: Some(&nulled) }])
+            .expect_err("an INSERT planted a NULL in a floored cell");
+        assert!(format!("{err}").contains("the floor is 0"), "got {err}");
+
+        // And through the column allowlist: column 0 is not granted here.
+        let narrow = CapabilityEnvelope::new(Verb::ALL, 10)
+            .allow(T, vec![ColumnCapability::open(1)]);
+        let err = narrow
+            .admit(T, "t", &[RowImage { row: 9, before: None, after: Some(&nulled) }])
+            .expect_err("an INSERT wrote an ungranted column by leaving it NULL");
+        assert!(format!("{err}").contains("column 0"), "got {err}");
+
+        // Anti-vacuity: a value at the floor inserts fine.
+        let ok = row(&[Value::Integer(9), Value::Integer(0)]);
+        assert_eq!(e.admit(T, "t", &[RowImage { row: 9, before: None, after: Some(&ok) }]).unwrap(), 1);
+    }
+
+    /// An envelope whose arrays arrived unsorted must not resolve a granted table to "not on the
+    /// allowlist". The fields are private so a struct literal cannot build one; this checks the
+    /// two doors that remain — `allow` in any order, and a record read back off disk.
+    #[test]
+    fn a_granted_table_resolves_however_the_envelope_was_assembled() {
+        let e = CapabilityEnvelope::new(Verb::ALL, 10)
+            .allow(90, vec![ColumnCapability::open(1), ColumnCapability::open(0)])
+            .allow(7, vec![ColumnCapability::open(0)])
+            .allow(40, vec![ColumnCapability::open(0)]);
+        for t in [7u32, 40, 90] {
+            assert!(e.table(t).is_some(), "table {t} was granted and did not resolve");
+        }
+        assert!(e.table(8).is_none(), "and an ungranted table still does not");
+
+        let mut r = BranchRecord::trunk(1, LeaseDeadline(0));
+        r.envelope = Some(e.clone());
+        let back = BranchRecord::deserialize(&r.serialize()).unwrap();
+        assert_eq!(back.envelope.as_ref().unwrap(), &e);
+        for t in [7u32, 40, 90] {
+            assert!(back.envelope.as_ref().unwrap().table(t).is_some(), "table {t} lost on reload");
+        }
+    }
+
+    /// A floor tag this build does not understand must refuse the record, not read as "no floor".
+    /// Dropping a floor is the one direction the envelope forbids.
+    #[test]
+    fn an_unknown_floor_tag_is_refused_rather_than_read_as_unbounded() {
+        let mut r = BranchRecord::trunk(1, LeaseDeadline(0));
+        r.envelope =
+            Some(CapabilityEnvelope::new(Verb::ALL, 10).allow(T, vec![ColumnCapability::floored(1, 5)]));
+        let bytes = r.serialize();
+
+        // The floor tag is the 9th byte from the end of the body: |col u32|tag u8|floor i64|crc u32|
+        let tag_at = bytes.len() - 4 - 8 - 1;
+        assert_eq!(bytes[tag_at], 1, "the byte being corrupted is not the floor tag");
+        let mut broken = bytes.clone();
+        broken[tag_at] = 2;
+        // Re-checksum, so this tests the TAG check and not the crc.
+        let body = broken.len() - 4;
+        let crc = crc32(&broken[..body]);
+        broken[body..].copy_from_slice(&crc.to_be_bytes());
+
+        let err = BranchRecord::deserialize(&broken).expect_err("an unknown floor tag was accepted");
+        assert!(format!("{err}").contains("floor tag"), "got {err}");
+        // Anti-vacuity: the untouched record still loads, floor intact.
+        assert_eq!(BranchRecord::deserialize(&bytes).unwrap(), r);
+    }
+
+    /// Bytes after the last field this build understands mean the record came from something else.
+    /// Refuse rather than act on the part that happened to parse.
+    #[test]
+    fn trailing_bytes_inside_a_valid_checksum_are_refused() {
+        let mut r = BranchRecord::trunk(1, LeaseDeadline(0));
+        r.envelope = Some(full_envelope());
+        let bytes = r.serialize();
+        let mut longer = bytes[..bytes.len() - 4].to_vec();
+        longer.extend_from_slice(&[0xAB, 0xCD]);
+        let crc = crc32(&longer);
+        longer.extend_from_slice(&crc.to_be_bytes());
+
+        let err = BranchRecord::deserialize(&longer).expect_err("trailing bytes were ignored");
+        assert!(format!("{err}").contains("after the last field"), "got {err}");
+        assert!(BranchRecord::deserialize(&bytes).is_ok(), "anti-vacuity: the real record loads");
     }
 
     /// A cell rewritten as a numerically equal value of another type HAS been written. `Value`'s
@@ -1262,11 +1516,11 @@ mod tests {
 
         let err = e.admit(T, "t", &images).expect_err("4 rows fit in a budget of 3");
         assert!(format!("{err}").contains("row-write budget"), "got {err}");
-        assert_eq!(e.row_writes, 0, "a refused statement charged the budget anyway");
+        assert_eq!(e.row_writes(), 0, "a refused statement charged the budget anyway");
 
         // Anti-vacuity: three of them fit exactly, and a fourth then does not.
         assert_eq!(e.admit(T, "t", &images[..3]).unwrap(), 3);
-        e.row_writes = 3;
+        e.charge(3).unwrap();
         assert!(e.admit(T, "t", &images[..1]).is_err(), "the spent budget was handed back");
     }
 
@@ -1314,16 +1568,16 @@ mod tests {
     fn forking_does_not_mint_budget_the_parent_had_already_spent() {
         let mut parent = BranchRecord::trunk(1, LeaseDeadline(0));
         let mut e = full_envelope();
-        e.row_writes = 60;
+        e.charge(60).unwrap();
         parent.envelope = Some(e);
 
         let child =
             BranchRecord::fork_child(&parent, BranchId::new(1, 0), Epoch(1), LeaseDeadline(0)).unwrap();
         let inherited = child.envelope.as_ref().expect("a child of a governed branch is governed");
-        assert_eq!(inherited.max_row_writes, 40, "the child got the parent's SPENT budget back");
-        assert_eq!(inherited.row_writes, 0);
-        assert_eq!(inherited.tables, parent.envelope.as_ref().unwrap().tables);
-        assert_eq!(inherited.verbs, parent.envelope.as_ref().unwrap().verbs);
+        assert_eq!(inherited.max_row_writes(), 40, "the child got the parent's SPENT budget back");
+        assert_eq!(inherited.row_writes(), 0);
+        assert_eq!(inherited.tables(), parent.envelope.as_ref().unwrap().tables());
+        assert_eq!(inherited.verbs(), parent.envelope.as_ref().unwrap().verbs());
 
         // Anti-vacuity: an ungoverned parent still forks an ungoverned child.
         let plain = BranchRecord::trunk(1, LeaseDeadline(0));
@@ -1337,6 +1591,6 @@ mod tests {
             T,
             vec![ColumnCapability::floored(1, 0), ColumnCapability::open(1), ColumnCapability::floored(1, 5)],
         );
-        assert_eq!(cap.columns, vec![ColumnCapability::floored(1, 5)]);
+        assert_eq!(cap.columns(), &[ColumnCapability::floored(1, 5)]);
     }
 }

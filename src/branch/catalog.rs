@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use crate::branch::record::BranchRecord;
+use crate::branch::record::{BranchRecord, CapabilityEnvelope};
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
@@ -269,6 +269,43 @@ impl BranchCatalog for LogBranchCatalog {
         let mut rec = self.get(branch)?;
         rec.lease_deadline = lease;
         self.put(&rec)
+    }
+
+    fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        let st = self.state.read().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        // Same readability rule as `get`: a branch mid-reap or at a stale generation does not get
+        // to answer questions about its authority either.
+        rec.check_readable(branch)?;
+        Ok(rec.envelope.clone())
+    }
+
+    /// Read, charge and durably record **under the write lock**, so nothing can interleave.
+    ///
+    /// The read-modify-write that this replaces held no lock across its two halves, so it wrote
+    /// back a record snapshot that could be several mutations stale — losing a published root or a
+    /// child's fork epoch, not just a row-write. Holding the write lock across the whole thing is
+    /// the same discipline `fork` uses for the same reason.
+    ///
+    /// `append` under the write lock matches `fork`, which already takes the state lock and then
+    /// the sink lock; the ordering is established, so this adds no new deadlock edge. It cannot
+    /// call `self.put` — that takes the same lock, and it is not reentrant.
+    fn charge_row_writes(&self, branch: BranchId, n: u64) -> Result<(), FerroError> {
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        let mut rec = rec.clone();
+        match rec.envelope.as_mut() {
+            Some(e) => e.charge(n)?,
+            None => {
+                return Err(FerroError::Constraint(format!(
+                    "cannot charge {n} row-write(s) to {branch}: it has no capability envelope"
+                )))
+            }
+        }
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec);
+        Ok(())
     }
 }
 

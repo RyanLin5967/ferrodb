@@ -170,6 +170,17 @@ impl Db {
         }
     }
 
+    fn salary(&mut self, id: i32) -> i32 {
+        let mut s = self.session();
+        match self.ok(&format!("SELECT salary FROM payroll WHERE id = {id};"), &mut s) {
+            Outcome::Rows(rows) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Integer(i)) => *i,
+                other => panic!("unexpected salary: {other:?}"),
+            },
+            _ => panic!("expected rows"),
+        }
+    }
+
     fn count(&mut self, table: &str) -> usize {
         let mut s = self.session();
         match self.ok(&format!("SELECT id FROM {table};"), &mut s) {
@@ -231,10 +242,10 @@ fn an_envelope_survives_closing_and_reopening_the_database() {
     // budget, and lands in main. Without all three the envelope could have come back as "refuse
     // everything" and this test would still have been green.
     db.ok("UPDATE inventory SET qty = 7 WHERE id = 1;", &mut a);
-    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes, 1);
+    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 1);
     db.ok("MERGE;", &mut a);
     assert_eq!(db.qty(1), 7);
-    assert_eq!(db.count("payroll"), 1, "a refused write reached the shared table");
+    assert_eq!(db.salary(1), 1000, "a refused write reached the shared table");
 }
 
 /// The same claim with the write carried all the way through `MERGE` into the shared table.
@@ -262,7 +273,8 @@ fn an_envelope_survives_a_restart_of_the_branch_metadata_layer() {
     db.ok("UPDATE inventory SET qty = 7 WHERE id = 1;", &mut a);
     db.ok("MERGE;", &mut a);
     assert_eq!(db.qty(1), 7);
-    assert_eq!(db.count("payroll"), 1, "a refused write reached the shared table");
+    // The refused statement here was an INSERT, so the row count is what sees it.
+    assert_eq!(db.count("payroll"), 1, "the refused INSERT reached the shared table");
 }
 
 /// The budget's SPENT half has to survive too, or a restart hands a governed agent its quota back
@@ -281,13 +293,13 @@ fn budget_already_spent_is_not_handed_back_by_a_restart() {
         let mut a = db.session();
         let branch = db.begin("spender", &mut a);
         db.ok("UPDATE inventory SET qty = 19 WHERE id = 1;", &mut a);
-        assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes, 1);
+        assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 1);
         branch
     };
 
     let db = db.reopen();
     let after = db.runtime.envelope_of(branch).unwrap().expect("envelope lost");
-    assert_eq!(after.row_writes, 1, "a restart handed the spent budget back");
+    assert_eq!(after.row_writes(), 1, "a restart handed the spent budget back");
     assert_eq!(after.remaining(), 1);
 }
 
@@ -320,7 +332,10 @@ fn a_table_off_the_allowlist_is_refused_and_one_on_it_still_writes() {
     db.ok("MERGE;", &mut a);
     assert_eq!(db.qty(1), 11);
     assert_eq!(db.count("inventory"), 3, "one added, one deleted, three seeded");
-    assert_eq!(db.count("payroll"), 1, "a refused write reached the shared table");
+    // The refused statements were an UPDATE, an INSERT and a DELETE; a row count alone cannot see
+    // the UPDATE, so the salary is checked too.
+    assert_eq!(db.count("payroll"), 1, "the refused INSERT or DELETE reached the shared table");
+    assert_eq!(db.salary(1), 1000, "the refused UPDATE reached the shared table");
 }
 
 /// An UPDATE that matches no row is still an attempt to write a table. Authority is not a function
@@ -475,7 +490,7 @@ fn a_statement_that_overruns_the_row_budget_is_refused_whole() {
     let err = db.refused("UPDATE inventory SET qty = 1;", &mut a);
     assert!(err.contains("row-write budget"), "got {err}");
     assert_eq!(
-        db.runtime.envelope_of(branch).unwrap().unwrap().row_writes,
+        db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
         0,
         "a refused statement charged the budget anyway"
     );
@@ -511,10 +526,10 @@ fn a_write_that_changes_nothing_costs_no_budget() {
     let mut a = db.session();
     let branch = db.begin("noop", &mut a);
     db.ok("UPDATE inventory SET qty = 20 WHERE id = 1;", &mut a); // already 20
-    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes, 0);
+    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 0);
     // Anti-vacuity: a real change does cost one.
     db.ok("UPDATE inventory SET qty = 21 WHERE id = 1;", &mut a);
-    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes, 1);
+    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 1);
 }
 
 // ---- inheritance and attenuation -------------------------------------------------------------
@@ -597,6 +612,11 @@ fn the_envelope_governs_agent_session_writes_only() {
 
     let mut s = db.session(); // no BEGIN AGENT SESSION
     db.ok("UPDATE payroll SET salary = -1 WHERE id = 1;", &mut s);
+    assert_eq!(
+        db.salary(1),
+        -1,
+        "the ungoverned direct write must actually have landed, or this test says nothing"
+    );
 
     let mut a = db.session();
     db.begin("scoped", &mut a);
@@ -606,4 +626,138 @@ fn the_envelope_governs_agent_session_writes_only() {
         "if a direct write is now governed too, this boundary has moved and the module docs must \
          move with it: {err}"
     );
+}
+
+/// **The most important gap in this feature, asserted so it is visible and so closing it trips a
+/// test.** DDL inside an agent session does not go through `stage_all` at all.
+///
+/// `src/execution/executor.rs` routes only SELECT / INSERT / UPDATE / DELETE onto the session's
+/// branch; `DROP TABLE`, `CREATE TABLE`, `CREATE INDEX` and `ANALYZE` fall through to the shared
+/// catalog immediately, with no branch and no `MERGE` involved. So a governed agent that may not
+/// *write* `payroll` can still drop it.
+///
+/// Left as a boundary rather than closed here because the fix is in the executor's statement
+/// routing, which this lane does not own, and because "what does DDL on a branch even mean" is a
+/// design question — a branch-scoped `CREATE TABLE` has to decide what a sibling sees and what
+/// `MERGE` does with it. **Anyone reading the envelope as "a session cannot touch what it was not
+/// granted" must read this test first.**
+#[test]
+fn ddl_inside_a_session_bypasses_the_envelope_and_this_is_a_known_gap() {
+    let mut db = Db::new();
+    db.seed();
+    db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+
+    let mut a = db.session();
+    db.begin("ddl", &mut a);
+    // The envelope refuses every DML against payroll...
+    let err = db.refused("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut a);
+    assert!(err.contains("may not write table `payroll`"), "got {err}");
+
+    // ...and does not see this at all.
+    db.ok("DROP TABLE payroll;", &mut a);
+    assert!(
+        db.exec("SELECT id FROM payroll;", &mut a).is_err(),
+        "if DDL is now governed by the envelope, this gap has been closed and the module docs, \
+         the summary and this test must say so"
+    );
+}
+
+/// **The envelope is granted at fork, so installing one does not reach sessions already open.**
+///
+/// A capability is what you were handed when you were created; changing it under a running holder
+/// is *revocation*, which is a separate design decision — it has to say what happens to a
+/// statement already in flight and whether a branch can be narrowed below what it has already
+/// written. The existing answer for a misbehaving live agent is `quarantine`, which leaves the
+/// branch readable and blocks its `MERGE`, and that is asserted here rather than assumed.
+#[test]
+fn installing_an_envelope_does_not_reach_a_session_that_is_already_open() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    let branch = db.begin("already_running", &mut a); // forked while trunk is ungoverned
+    db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+
+    assert_eq!(
+        db.runtime.envelope_of(branch).unwrap(),
+        None,
+        "if a live session now inherits an envelope installed after its fork, revocation has been \
+         built and this test should describe it"
+    );
+    db.ok("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut a);
+
+    // The operator's actual lever over a running agent: hold it, so nothing it wrote can publish.
+    db.runtime.quarantine(branch, "writing outside its remit").unwrap();
+    let err = db.refused("MERGE;", &mut a);
+    assert!(err.contains("quarantined"), "got {err}");
+    assert_eq!(db.salary(1), 1000, "a quarantined branch published anyway");
+
+    // Anti-vacuity: a session forked AFTER the install is governed.
+    let mut b = db.session();
+    db.begin("forked_after", &mut b);
+    let err = db.refused("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut b);
+    assert!(err.contains("may not write table `payroll`"), "got {err}");
+}
+
+/// Reading the branch record to find its envelope also applies that record's readability rule, so
+/// a branch mid-reap can no longer write even though its workspace is still around. That is a
+/// strengthening rather than an accident, so it gets a test.
+#[test]
+fn a_branch_being_reaped_cannot_write_even_with_its_workspace_intact() {
+    use ferrodb::branch::types::BranchState;
+
+    let mut db = Db::new();
+    db.seed();
+    let mut a = db.session();
+    let branch = db.begin("doomed", &mut a);
+
+    // Anti-vacuity first: while it is Live the write is admitted.
+    db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut a);
+
+    let mut rec = db.runtime.branches().get(branch).unwrap();
+    rec.state = BranchState::Reaping;
+    db.runtime.branches().put(&rec).unwrap();
+
+    let err = db.refused("UPDATE inventory SET qty = 6 WHERE id = 1;", &mut a);
+    assert!(err.contains("being reaped"), "got {err}");
+}
+
+/// **A statement the escrow ledger refuses must not spend envelope budget.**
+///
+/// The breaking shape is the ORDER of two whole-statement checks at one funnel. The envelope
+/// charge used to be written — and fsynced — before `EscrowLedger::check_all` ran, so a statement
+/// escrow then refused permanently consumed row-writes it never used. That is worse than it
+/// sounds: the escrow refusal's own text tells the client to claim more and retry, so an ordinary
+/// claim-and-retry loop burned the entire envelope budget on statements that wrote zero rows.
+///
+/// Both checks now decide before anything is charged, which is the same rule each of them already
+/// applies within itself.
+#[test]
+fn a_statement_refused_by_escrow_spends_no_envelope_budget() {
+    use ferrodb::tel::ids::{ColId, RowId};
+
+    let mut db = Db::new();
+    db.seed();
+    db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+    db.runtime.open_escrow("inventory", RowId(1), ColId(1), 20).unwrap();
+
+    let mut a = db.session();
+    let branch = db.begin("retrier", &mut a);
+    db.runtime.claim_escrow(branch, "inventory", RowId(1), ColId(1), 1).unwrap();
+
+    // Ten retries of a statement escrow refuses. The envelope's budget is 1000, so if each one
+    // charged, this would still not exhaust it — the assertion is that NONE of them charged.
+    for _ in 0..10 {
+        let err = db.refused("UPDATE inventory SET qty = qty - 5 WHERE id = 1;", &mut a);
+        assert!(err.contains("remaining escrow"), "refused for the wrong reason: {err}");
+    }
+    assert_eq!(
+        db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
+        0,
+        "escrow-refused statements spent envelope budget on rows they never wrote"
+    );
+
+    // Anti-vacuity: a write escrow DOES admit charges exactly one.
+    db.ok("UPDATE inventory SET qty = qty - 1 WHERE id = 1;", &mut a);
+    assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 1);
 }

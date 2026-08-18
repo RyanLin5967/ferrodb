@@ -111,6 +111,23 @@ impl BranchCatalog for MemBranchCatalog {
         Self::lookup(&records, branch)
     }
 
+    /// Charged under the one lock this catalog has, so it is atomic against every other mutation
+    /// here — the same reason `fork` updates the parent and inserts the child under it.
+    fn charge_row_writes(&self, branch: BranchId, n: u64) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let mut rec = Self::lookup(&records, branch)?;
+        match rec.envelope.as_mut() {
+            Some(e) => e.charge(n)?,
+            None => {
+                return Err(FerroError::Constraint(format!(
+                    "cannot charge {n} row-write(s) to {branch}: it has no capability envelope"
+                )))
+            }
+        }
+        records.insert(branch.id, rec);
+        Ok(())
+    }
+
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         self.records
             .lock()
