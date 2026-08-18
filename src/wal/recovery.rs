@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -172,6 +172,32 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
             for (_, vals) in &rows {
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
+            }
+            info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+        }
+
+        // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
+        // old tree, create a fresh one, refill it, record the new root. This is all a full-text
+        // index needs to survive a crash, and it is why no WAL record was added for one: index
+        // structure is not logged at all, the heap is authoritative after redo/undo, and every tree
+        // in the database is reconstructed here.
+        //
+        // `post_tokens` rather than a bare `insert`, and the difference is load-bearing twice over.
+        // A value that repeats a word would post that pair once per occurrence, and — the case that
+        // is invisible until it happens — a `DELETE` followed by re-`INSERT` of the same primary key
+        // leaves TWO slots with that key in this heap, so `rows` holds both and every token they
+        // share is posted twice. `insert_entry` appends rather than overwrites, so the search would
+        // then return that row once per copy: a crash would turn a correct index into a
+        // double-counting one, which is worse than losing it.
+        for info in entry.fulltext_indexes.iter_mut() {
+            let col = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
+            let old = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
+            old.free_tree()?;
+            let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
+            for (_, vals) in &rows {
+                if let Some(text) = indexed_text(&vals[col])? {
+                    post_tokens(&fresh, text, &vals[0])?;
+                }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
         }
