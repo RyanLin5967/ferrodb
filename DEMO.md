@@ -205,9 +205,16 @@ Listed because each one bounds a verdict above.
 
 ### The layers are not wired together
 
-1. **SQL *statements* do not write CoW pages.** `stage()` still writes a per-branch `BTreeMap`, so
-   Act II's isolation is in-memory rather than shadow paging. This remains the largest gap in the
-   system. A page-backed row path exists alongside it (`AgentRuntime::with_storage` + `put_row`),
+1. **Branch state exists as pages; the workspace map is still what merge reads.** This entry used to
+   say statements do not write CoW pages and called it "the largest gap in the system". That is no
+   longer true and contradicted this document's own opening section: `stage()` mirrors every staged row
+   onto the branch's copy-on-write tree whenever the runtime has a page store, and the CLI and this
+   demo both build one (`src/agent_sql/runtime.rs:1056-1078`). What remains is narrower and is an open
+   architectural decision rather than an omission: `DIFF` and `MERGE` still read the per-branch
+   `BTreeMap`, so the map is authoritative for merge even though the pages exist. Deleting it needs
+   tables themselves to live in the tree — migrating `CREATE TABLE`/`INSERT`/`SELECT` off the heap onto
+   the CoW substrate — and every partial version leaves two stores that can silently diverge. A
+   page-backed row path exists alongside it (`AgentRuntime::with_storage` + `put_row`),
    and criteria 1 and 8 are measured on it; what is missing is routing statements through it.
 2. **`BEGIN AGENT SESSION` allocates no pages.** This used to hold only because the SQL layer had
    no pages to allocate, which made the zero uninteresting. That is no longer so: with
@@ -322,7 +329,7 @@ exited non-zero — so "all self-checks passed" is a result, not a default.
 ## Where the criteria are also covered by tests
 
 The demo is not the only evidence; it is the readable evidence. The suite behind it is
-**699 passing, 0 failing** (`cargo test`), of which 5 were added here for criterion 9.
+**867 passing, 0 failing** (`cargo test`, measured at `1598cad`), of which 5 were added here for criterion 9. The number is dated on purpose: it read `699` for long enough to be wrong by 168, and an undated count in a shipping document goes stale invisibly.
 
 Those 5 were mutation-checked: deleting the one line that records authorship
 (`state.row_author.insert(...)`) makes 4 of them fail. A test that cannot fail proves nothing, so
