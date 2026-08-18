@@ -61,6 +61,13 @@ use crate::storage::heap_file_manager::RecordId;
 /// The shape a result needs to reach a client as typed rows: names and declared types in emission
 /// order, alongside the values. `Vec<Vec<Value>>` on its own cannot answer "what is column 3
 /// called", which is why pgwire had to invent `column3` for every result until this existed.
+///
+/// **The columns are held independently of the rows, and that is load-bearing rather than
+/// incidental.** A result with columns and no rows is not the same thing as a broken one: an empty
+/// `ferro_quarantine` still announces `branch_id, generation, branch, reason` with `SELECT 0`, so a
+/// client can tell "nothing is held" from "this view does not work". A shape that derived its field
+/// list from the first row — which is what the pre-existing `Outcome::Rows` path in pgwire does —
+/// sends zero fields and zero rows for both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamedRows {
     pub columns: Vec<BoundColumn>,
@@ -70,14 +77,6 @@ pub struct NamedRows {
 impl NamedRows {
     pub fn new(columns: Vec<BoundColumn>, rows: Vec<Vec<Value>>) -> Self {
         NamedRows { columns, rows }
-    }
-
-    /// A result with columns and no rows. **Not the same as a broken view**, which is the whole
-    /// reason the columns are carried separately from the rows: an empty `ferro_quarantine` still
-    /// announces `branch_id, generation, branch, reason`, so a client can tell "nothing is held"
-    /// from "this view does not work".
-    pub fn empty(columns: Vec<BoundColumn>) -> Self {
-        NamedRows { columns, rows: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -563,6 +562,74 @@ pub fn run_select(
     Ok(NamedRows::new(schema, rows))
 }
 
+/// The view this name refers to, unless a real table has already claimed it.
+///
+/// **An existing table wins, and that is a correctness rule rather than a courtesy.** A database
+/// created before B9 can hold a table called `ferro_runs`: `Catalog::load` rebuilds `tables` straight
+/// from the catalog pages and never passes through `create_table`, so
+/// [`reject_view_name_collision`] never sees it. If the view answered for that name, every row of a
+/// real table would be permanently unreachable — writes accepted, reads answering something else,
+/// no error anywhere. Yielding to the table cannot lose anything, because a view's rows are derived
+/// and can be asked for under any other spelling, while the table's rows exist nowhere else.
+///
+/// Going forward the ambiguity cannot be created at all, because `create_table` refuses it. This
+/// handles only the databases that already exist.
+pub fn view_for(catalog: &Catalog, name: &str) -> Option<SystemView> {
+    if catalog.get_table(name).is_some() {
+        return None;
+    }
+    SystemView::by_name(name)
+}
+
+/// The answer for a statement that names a system view, or `None` when none is involved.
+///
+/// One interception point, so the executor does not have to know which statement shapes name a
+/// relation. Every non-`SELECT` shape is a refusal that says what a view is — the alternative is what
+/// these statements did before, which was to fall through to `require_table` and answer `unknown
+/// table 'ferro_runs'` about a name the very next `SELECT` resolves. A wrong reason for a right
+/// refusal sends the reader looking for a typo.
+pub fn intercept(
+    stmt: &Stmt,
+    catalog: &Catalog,
+    runtime: &AgentRuntime,
+) -> Option<Result<NamedRows, FerroError>> {
+    let read_only = |view: SystemView, verb: &str| {
+        Some(Err(FerroError::Constraint(format!(
+            "{} is a read-only system view, so it cannot be the target of {verb}; it is materialised \
+             from the agent layer on every read and has no rows of its own to change",
+            view.name()
+        ))))
+    };
+    match stmt {
+        Stmt::Select { from, .. } => {
+            let view = view_for(catalog, &from.name)?;
+            Some(run_select(view, stmt, catalog, runtime))
+        }
+        Stmt::Insert { table, .. } => read_only(view_for(catalog, table)?, "INSERT"),
+        Stmt::Update { table, .. } => read_only(view_for(catalog, table)?, "UPDATE"),
+        Stmt::Delete { table, .. } => read_only(view_for(catalog, table)?, "DELETE"),
+        Stmt::DropTable { table } => read_only(view_for(catalog, table)?, "DROP TABLE"),
+        Stmt::CreateIndex { table, .. } => read_only(view_for(catalog, table)?, "CREATE INDEX"),
+        Stmt::Analyze { table } => read_only(view_for(catalog, table)?, "ANALYZE"),
+        // `EXPLAIN` of a view would have to describe a physical plan, and there is none: the rows are
+        // materialised rather than scanned. Refused by name rather than left to answer `unknown
+        // table`, which is what `planner::explain` says for a name it cannot find in the catalog.
+        Stmt::Explain(inner) => match &**inner {
+            Stmt::Select { from, .. } => {
+                let view = view_for(catalog, &from.name)?;
+                Some(Err(FerroError::Bind(format!(
+                    "EXPLAIN cannot describe {}: a system view is materialised from the agent \
+                     layer's APIs rather than scanned, so it has no physical plan. Its columns are \
+                     fixed and listed in catalog::system_views",
+                    view.name()
+                ))))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Refuse a `CREATE TABLE` that would shadow a system view.
 ///
 /// **A guard over the resulting state, not over the statement text.** A table named
@@ -573,6 +640,12 @@ pub fn run_select(
 ///
 /// Checked here in `catalog` rather than in the parser so it holds for every path that creates a
 /// table, not only for the one that spells it in SQL.
+///
+/// **Stated blind spot:** this cannot see a table that already exists. `Catalog::load` rebuilds
+/// `tables` from the catalog pages directly and does not come through here, so a database written
+/// before these views existed can hold a colliding name. That case is handled at the other end
+/// instead — [`view_for`] yields to a real table — because refusing to open such a database would
+/// take away the data rather than protect it.
 pub fn reject_view_name_collision(name: &str) -> Result<(), FerroError> {
     if SystemView::by_name(name).is_some() {
         return Err(FerroError::Constraint(format!(

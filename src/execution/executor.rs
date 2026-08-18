@@ -8,7 +8,7 @@ use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, 
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
-use crate::catalog::system_views::{self, NamedRows, SystemView};
+use crate::catalog::system_views::{self, NamedRows};
 use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
@@ -64,11 +64,8 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
     // `runtime.select` inside an agent session. Checking here also means a view is readable from
     // inside an agent session, which matters — an agent asking what the branch engine thinks of its
     // own branch is the main reason these exist.
-    if let Stmt::Select { from, .. } = &stmt {
-        if let Some(view) = SystemView::by_name(&from.name) {
-            let rows = system_views::run_select(view, &stmt, catalog, session.runtime.as_ref())?;
-            return Ok(Outcome::Table(rows));
-        }
+    if let Some(answer) = system_views::intercept(&stmt, catalog, session.runtime.as_ref()) {
+        return answer.map(Outcome::Table);
     }
     // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
     if is_agent_stmt(&stmt) {

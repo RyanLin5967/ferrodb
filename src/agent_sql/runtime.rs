@@ -648,7 +648,10 @@ impl AgentRuntime {
     /// * `staged_rows` is the workspace's row map, which **is** copied at fork from an open parent
     ///   session (`begin_session_with_model`). For a branch forked from another live agent task it
     ///   therefore includes rows inherited at fork time, not only rows this run wrote. Named
-    ///   `staged_rows` and not `rows_written` for exactly that reason.
+    ///   `staged_rows` and not `rows_written` for exactly that reason. **`blind_writes` is derived
+    ///   from the same map and inherits the same caveat**: for a branch forked from an open session
+    ///   it counts inherited rows the child never read, which is true of the map and is not a
+    ///   statement about what the child did.
     /// * `rows_read_exact` counts DISTINCT `(table, row)` pairs across the exact-version read-sets;
     ///   a point read repeated is one premise, not two.
     /// * `scan_reads` / `scan_rows_observed` are the range and full-scan reads, kept apart from the

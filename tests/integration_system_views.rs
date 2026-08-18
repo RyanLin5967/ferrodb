@@ -611,3 +611,102 @@ fn an_empty_agent_result_is_distinguishable_from_a_broken_one() {
     assert_eq!(column(&merge, "applied_to_target"), vec!["true"]);
     assert_eq!(column(&merge, "table_name"), vec!["NULL"], "no row, so the row columns are NULL");
 }
+
+
+/// **A table that already carries a view's name keeps its rows.**
+///
+/// The breaking shape is a database written BEFORE these views existed. `Catalog::load` rebuilds
+/// `tables` straight from the catalog pages and never passes through `create_table`, so the
+/// collision guard cannot see such a table — and with the view answering first, every row in it would
+/// be unreachable: writes accepted, reads answering the view, no error anywhere. That is precisely
+/// the state the guard exists to prevent, arriving through the one door the guard does not watch.
+///
+/// The state is reproduced the way `load` produces it: the entry is put into `Catalog::tables` under
+/// the colliding key directly, bypassing `create_table`. Nothing else in this file reaches it,
+/// because every other test creates its tables through SQL.
+#[test]
+fn a_table_that_predates_the_views_still_answers_for_its_own_name() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE legacy (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+    db.ok("INSERT INTO legacy VALUES (7, 70);", &mut s);
+
+    // Exactly what `Catalog::load` would hand back for an old database that has a table called
+    // `ferro_runs`: a real entry, real pages, under a name `create_table` would now refuse.
+    let mut entry = db.catalog.tables.remove("legacy").expect("the table exists");
+    entry.name = "ferro_runs".to_string();
+    db.catalog.tables.insert("ferro_runs".to_string(), entry);
+
+    match db.ok("SELECT id, qty FROM ferro_runs;", &mut s) {
+        Outcome::Rows(r) => {
+            assert_eq!(r.len(), 1, "the table's row is unreachable: {r:?}");
+            assert_eq!(text_of(&r[0][0]), "7");
+            assert_eq!(text_of(&r[0][1]), "70");
+        }
+        Outcome::Table(t) => panic!(
+            "the view answered for a name a real table holds, so the table's rows are unreachable: {:?}",
+            t.header()
+        ),
+        other => panic!("{}", outcome_kind(&other)),
+    }
+    // Writes reach the table too, not a refusal about a view.
+    db.ok("INSERT INTO ferro_runs VALUES (8, 80);", &mut s);
+    match db.ok("SELECT id FROM ferro_runs;", &mut s) {
+        Outcome::Rows(r) => assert_eq!(r.len(), 2, "the INSERT did not land in the table: {r:?}"),
+        other => panic!("{}", outcome_kind(&other)),
+    }
+
+    // Anti-vacuity: a view whose name NOTHING has claimed still answers as a view in the same
+    // database. Without this half, a `view_for` that always returned `None` would pass above.
+    let q = db.view("SELECT * FROM ferro_quarantine;");
+    assert_eq!(q.header(), vec!["branch_id", "generation", "branch", "reason"]);
+}
+
+/// **Read-only is a refusal that names the view, not `unknown table`.**
+///
+/// Before this, every write shape fell through to `require_table` and answered `unknown table
+/// 'ferro_runs'` — about a name the very next `SELECT` resolves. A right refusal with a wrong reason
+/// sends the reader hunting for a typo that is not there.
+#[test]
+fn every_write_shape_against_a_view_refuses_by_name() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE oncall (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+
+    let statements = [
+        "INSERT INTO ferro_runs VALUES (1, 2);",
+        "UPDATE ferro_runs SET run_id = 'x';",
+        "DELETE FROM ferro_runs;",
+        "DROP TABLE ferro_runs;",
+        "CREATE INDEX ix ON ferro_runs (run_id);",
+        "ANALYZE ferro_runs;",
+    ];
+    for sql in statements {
+        let err = refusal(db.exec(sql, &mut s), sql);
+        let msg = err.to_string();
+        assert!(msg.contains("ferro_runs"), "{sql}: {msg}");
+        assert!(msg.contains("read-only system view"), "{sql}: {msg}");
+        assert!(
+            !msg.contains("unknown table"),
+            "{sql} still answers as if the name did not exist: {msg}"
+        );
+    }
+
+    // EXPLAIN has no plan to describe, and says so rather than answering `unknown table`.
+    let err = refusal(db.exec("EXPLAIN SELECT * FROM ferro_quarantine;", &mut s), "EXPLAIN of a view");
+    assert!(err.to_string().contains("ferro_quarantine"), "{err}");
+    assert!(err.to_string().contains("no physical plan"), "{err}");
+    assert!(!err.to_string().contains("unknown table"), "{err}");
+
+    // Anti-vacuity, twice over: the same shapes against a real table still work, and EXPLAIN of a
+    // real table still explains. A blanket refusal keyed on the statement kind would pass above.
+    db.ok("INSERT INTO oncall VALUES (1, 10);", &mut s);
+    db.ok("UPDATE oncall SET qty = 11 WHERE id = 1;", &mut s);
+    db.ok("ANALYZE oncall;", &mut s);
+    match db.ok("EXPLAIN SELECT * FROM oncall;", &mut s) {
+        Outcome::Explain(text) => assert!(!text.trim().is_empty(), "EXPLAIN produced nothing"),
+        other => panic!("{}", outcome_kind(&other)),
+    }
+    db.ok("DELETE FROM oncall;", &mut s);
+    db.ok("DROP TABLE oncall;", &mut s);
+}
