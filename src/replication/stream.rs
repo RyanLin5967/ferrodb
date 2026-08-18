@@ -91,10 +91,24 @@ pub struct Pumped {
     /// emitting nothing should be able to tell "the snapshot already had all of it" from "the feed
     /// is dropping records", and those look identical from the emitted count alone.
     pub suppressed: usize,
+    /// Row changes written this pump that named **no writer**.
+    ///
+    /// Reported for the same reason `unresolved` is: a feed shipping rows attributed to nobody
+    /// looks identical, event by event, to one where nobody happened to be an agent — every line
+    /// simply carries `\"writer\":null`. Snapshot `READ` rows and schema declarations are excluded,
+    /// because neither is a run's write and counting them would drown the number that matters.
+    ///
+    /// Counted over what was actually WRITTEN, not over what was decoded: events suppressed by the
+    /// snapshot boundary or already delivered were not shipped by this pump and are not this
+    /// pump's problem.
+    pub unattributed: usize,
 }
 
 impl Pumped {
     /// Whether everything readable became an event or was legitimately withheld.
+    ///
+    /// Says nothing about attribution on purpose: a database nobody runs agents against ships rows
+    /// with no writer and is not thereby unclean. [`Pumped::unattributed`] is the separate question.
     pub fn is_clean(&self) -> bool {
         self.unresolved == 0
     }
@@ -207,6 +221,7 @@ impl FeedStreamer {
                 withheld: 0,
                 unresolved: 0,
                 suppressed: 0,
+                unattributed: 0,
             });
         }
 
@@ -272,6 +287,12 @@ impl FeedStreamer {
         // transaction after that one again, on every pump, forever.
         events.retain(|e| e.commit_lsn > emitted_through);
 
+        // Counted before the write, over exactly the events this pump is about to ship.
+        let unattributed = events
+            .iter()
+            .filter(|e| e.op.is_write() && e.writer.is_none())
+            .count();
+
         let emitted = write_feed(&events, w)?;
         let delivered_through = events
             .iter()
@@ -289,6 +310,7 @@ impl FeedStreamer {
             unresolved: decoded.unresolved.values().sum::<usize>()
                 + decoded.undecodable.values().sum::<usize>(),
             suppressed,
+            unattributed,
         })
     }
 }

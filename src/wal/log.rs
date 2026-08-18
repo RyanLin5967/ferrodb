@@ -1,6 +1,12 @@
 use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::{catalog::column::DataType, error::FerroError, storage::disk_manager::{pread, pwrite}};
+use crate::{
+    branch::types::BranchId,
+    catalog::column::DataType,
+    error::FerroError,
+    provenance::{ProvId, RunEntity},
+    storage::disk_manager::{pread, pwrite},
+};
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
@@ -101,6 +107,32 @@ pub enum RecKind {
         /// `(name, type, nullable)` per column. Empty for a drop.
         columns: Vec<(String, DataType, bool)>,
     },
+    /// **Who wrote this transaction**: one interned [`RunEntity`], bound to the record's `txn_id`.
+    ///
+    /// Tag 10. Tags 0..9 were taken when this arrived, and it takes the next free number rather
+    /// than reusing one, so a WAL written before this variant existed still replays — the same
+    /// additive discipline the wide column types followed at `DataType::BigInt`.
+    ///
+    /// # It carries the whole entity, and that is not redundancy
+    ///
+    /// A bare `prov_id` would be a reference into a table the log does not contain. Provenance is
+    /// interned *in memory*, so a reader of an archived log — or of a log whose database is gone —
+    /// would hold a number naming nothing. Carrying the tuple makes the log self-describing about
+    /// its writers for exactly the reason [`RecKind::Ddl`] carries the columns rather than a table
+    /// id: a decoder must be able to answer from the log alone.
+    ///
+    /// The density argument in `provenance` is untouched by this. Interning is about the cost per
+    /// *row version*, and this is one record per **transaction**, not per row.
+    ///
+    /// # Two jobs, one variant, told apart by `txn_id`
+    ///
+    /// * `txn_id != 0` — a **binding**: this transaction's changes were written by this run. It is
+    ///   appended immediately before the `Commit`, and [`crate::replication::logical`] documents
+    ///   at length why anywhere else loses it.
+    /// * `txn_id == 0` — a **declaration**: this run exists. Written by `TxnManager` after every
+    ///   checkpoint, because a checkpoint discards the log whole, exactly as `replay_schema` does
+    ///   for DDL. Transaction 0 never commits, so a declaration binds nothing.
+    RunIdentity { run: RunEntity },
 }
 
 pub struct LogRecord {
@@ -111,7 +143,12 @@ pub struct LogRecord {
 }
 
 /// Length-prefixed string, so a name containing anything at all cannot desync the reader.
-fn write_str(buffer: &mut Vec<u8>, s: &str) {
+///
+/// `pub(crate)` rather than private because the durable provenance store writes the same
+/// length-prefixed strings into its own file. One encoder means the two formats cannot disagree
+/// about what a string is, and a second hand-written one is a second place for the same
+/// off-by-two to live.
+pub(crate) fn write_str(buffer: &mut Vec<u8>, s: &str) {
     buffer.extend_from_slice(&(s.len() as u16).to_be_bytes());
     buffer.extend_from_slice(s.as_bytes());
 }
@@ -119,36 +156,54 @@ fn write_str(buffer: &mut Vec<u8>, s: &str) {
 // Bounds-checked readers. These bytes arrive from a disk or a socket, so every read has to be able
 // to refuse: indexing past the end of a truncated record panics the whole process, which is a
 // denial of service triggered by a corrupt log rather than a parse error.
-fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
+pub(crate) fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
     let v = *bytes.get(*at).ok_or_else(|| short(*at, 1, bytes.len()))?;
     *at += 1;
     Ok(v)
 }
 
-fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
+pub(crate) fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
     let end = *at + 2;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 2, bytes.len()))?;
     *at = end;
     Ok(u16::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
+pub(crate) fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
     let end = *at + 4;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 4, bytes.len()))?;
     *at = end;
     Ok(u32::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
+pub(crate) fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64, FerroError> {
+    let end = *at + 8;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 8, bytes.len()))?;
+    *at = end;
+    Ok(u64::from_be_bytes(slice.try_into().unwrap()))
+}
+
+/// Exactly `N` bytes, refusing a record too short to hold them.
+pub(crate) fn take_array<const N: usize>(
+    bytes: &[u8],
+    at: &mut usize,
+) -> Result<[u8; N], FerroError> {
+    let end = *at + N;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, N, bytes.len()))?;
+    *at = end;
+    Ok(slice.try_into().unwrap())
+}
+
+pub(crate) fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
     let len = take_u16(bytes, at)? as usize;
     let end = *at + len;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, len, bytes.len()))?;
     *at = end;
     String::from_utf8(slice.to_vec())
-        .map_err(|e| FerroError::Wal(format!("ddl record holds a non-utf8 name: {e}")))
+        .map_err(|e| FerroError::Wal(format!("log record holds a non-utf8 string: {e}")))
 }
 
-fn short(at: usize, want: usize, have: usize) -> FerroError {
+pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
     FerroError::Wal(format!(
         "log record is truncated: wanted {want} byte(s) at offset {at} but the record is {have} bytes"
     ))
@@ -215,6 +270,18 @@ impl RecKind {
                     }
                     buffer.push(if *nullable { 1 } else { 0 });
                 }
+            }
+            RecKind::RunIdentity { run } => {
+                buffer.push(10);
+                buffer.extend_from_slice(&run.prov_id.0.to_be_bytes());
+                write_str(buffer, &run.agent_id);
+                write_str(buffer, &run.run_id);
+                write_str(buffer, &run.model);
+                write_str(buffer, &run.model_version);
+                buffer.extend_from_slice(&run.prompt_hash);
+                buffer.extend_from_slice(&run.started_at.to_be_bytes());
+                buffer.extend_from_slice(&run.parent_branch.id.to_be_bytes());
+                buffer.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
             }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
@@ -285,6 +352,39 @@ impl RecKind {
                     columns.push((name, ty, nullable));
                 }
                 Ok(RecKind::Ddl { op, table, dir_root, time_travel_root, columns })
+            }
+            10 => {
+                // Bounds-checked throughout, for the same reason the DDL arm is: these bytes came
+                // off a disk, and a truncated record must be refused rather than indexed past.
+                let mut at = 1usize;
+                let prov_id = ProvId(take_u32(bytes, &mut at)?);
+                if prov_id.is_none() {
+                    return Err(FerroError::Wal(
+                        "run identity record names ProvId::NONE, which is the value meaning \
+                         'unattributed'; a record claiming a writer must name one"
+                            .into(),
+                    ));
+                }
+                let agent_id = take_str(bytes, &mut at)?;
+                let run_id = take_str(bytes, &mut at)?;
+                let model = take_str(bytes, &mut at)?;
+                let model_version = take_str(bytes, &mut at)?;
+                let prompt_hash = take_array::<32>(bytes, &mut at)?;
+                let started_at = take_u64(bytes, &mut at)?;
+                let branch_id = take_u64(bytes, &mut at)?;
+                let generation = take_u32(bytes, &mut at)?;
+                Ok(RecKind::RunIdentity {
+                    run: RunEntity::new(
+                        prov_id,
+                        agent_id,
+                        run_id,
+                        model,
+                        model_version,
+                        prompt_hash,
+                        started_at,
+                        BranchId::new(branch_id, generation),
+                    ),
+                })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());

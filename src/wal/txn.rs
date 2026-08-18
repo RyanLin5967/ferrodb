@@ -1,6 +1,7 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 use crate::catalog::column::DataType;
+use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
 
 /// Commits between automatic checkpoints.
@@ -43,6 +44,24 @@ pub struct TxnManager {
     /// from its own base, which is the same reason an ARIES checkpoint re-records the dirty page
     /// table rather than assuming a reader saw the original entries.
     schema_log: Mutex<Vec<DdlRecord>>,
+    /// Every agent run this database has been told about, retained for exactly the reason
+    /// `schema_log` is: [`WalManager::truncate`] discards the log **whole** rather than by prefix,
+    /// so a checkpoint erases every identity record in it. Replayed as declarations at the head of
+    /// the new log by [`TxnManager::replay_runs`], so a reader starting at the new base can still
+    /// name the database's writers.
+    ///
+    /// **Stated cost:** this grows with the number of distinct runs and is never pruned, and every
+    /// checkpoint rewrites all of it — the same unbounded shape `schema_log` has for tables, where
+    /// the bound is the schema and here it is the agent history. A database with a very large
+    /// number of runs pays for that at each checkpoint. [`TxnManager::retained_runs`] is how a
+    /// caller sees the size; nothing here caps it, because dropping declarations would silently
+    /// make some writers unnameable and that is the failure this record exists to prevent.
+    run_log: Mutex<Vec<RunEntity>>,
+    /// Open transaction -> the run that will be named immediately before its `Commit`.
+    ///
+    /// Held here rather than written when it is bound, and that is the whole correctness property.
+    /// See [`TxnManager::bind_run`].
+    run_bindings: Mutex<HashMap<u64, RunEntity>>,
 }
 
 /// A retained DDL record, replayed into the log after every checkpoint.
@@ -157,7 +176,7 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()) }
+        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
@@ -363,11 +382,122 @@ impl TxnManager {
         Ok(lsn)
     }
 
+    /// Name the run that wrote this transaction, so its `Commit` is attributable.
+    ///
+    /// # The record is written at COMMIT, and nowhere else
+    ///
+    /// This method records the binding and writes nothing. The identity record goes into the log in
+    /// [`TxnManager::commit`], in the append immediately before the `Commit` record, and that
+    /// position is a correctness property rather than a tidy choice.
+    ///
+    /// A change feed's cursor may not advance past the earliest **staged** record of any still-open
+    /// transaction — `Decoded::open_from` — or that transaction's rows are stepped over and lost
+    /// when it finally commits. An identity record written when the session begins sits *below*
+    /// that point: it stages nothing, so it does not hold the cursor back, and the next pump starts
+    /// above it. The record is then never read again, and every row of that transaction ships
+    /// attributed to nobody while the feed reports a clean run.
+    ///
+    /// Written immediately before the `Commit` instead, the record cannot be separated from the
+    /// commit it describes. If a batch boundary falls between the two, the transaction is still
+    /// open at the end of that batch, so the cursor is clamped back below its first staged row —
+    /// which is below the identity record — and the next batch reads both together.
+    /// `tests/integration_run_identity_feed.rs` runs exactly that workload against both placements.
+    ///
+    /// # Guards
+    ///
+    /// Refuses an unknown transaction (a binding nothing would ever write), `ProvId::NONE` (a
+    /// record claiming a writer must name one), and a second, *different* run for one transaction —
+    /// one transaction has one writer, and quietly keeping either of two would attribute rows to an
+    /// actor that did not write them. Re-binding the identical run is a no-op.
+    pub fn bind_run(&self, txn_id: u64, run: RunEntity) -> Result<(), FerroError> {
+        if run.prov_id.is_none() {
+            return Err(FerroError::Provenance(format!(
+                "refusing to bind run {}/{} to txn {txn_id} with ProvId::NONE: that is the value \
+                 meaning 'unattributed', so the identity record would claim a writer and name none. \
+                 Intern the run first and bind the id the store assigned.",
+                run.agent_id, run.run_id
+            )));
+        }
+        if !self.att.lock().unwrap().contains_key(&txn_id) {
+            return Err(FerroError::Txn(format!(
+                "cannot bind a run to txn {txn_id}: it is not active, so no identity record would \
+                 ever be written for it"
+            )));
+        }
+        {
+            let mut bindings = self.run_bindings.lock().unwrap();
+            match bindings.get(&txn_id) {
+                Some(existing) if existing != &run => {
+                    return Err(FerroError::Provenance(format!(
+                        "txn {txn_id} is already bound to {}; refusing to rebind it to {}. One \
+                         transaction has one writer.",
+                        existing.describe(),
+                        run.describe()
+                    )));
+                }
+                Some(_) => return Ok(()),
+                None => {}
+            }
+            bindings.insert(txn_id, run.clone());
+        }
+        self.declare_run(run)
+    }
+
+    /// Remember a run so a checkpoint can re-declare it, without binding it to a transaction.
+    ///
+    /// Refuses to hold two different actors under one `prov_id`: the slot is the reference every
+    /// stamped version carries, so two meanings for it would make every attribution ambiguous.
+    pub fn declare_run(&self, run: RunEntity) -> Result<(), FerroError> {
+        let mut log = self.run_log.lock().unwrap();
+        if let Some(existing) = log.iter().find(|r| r.prov_id == run.prov_id) {
+            if existing != &run {
+                return Err(FerroError::Provenance(format!(
+                    "provenance slot {} is already declared as {}; refusing to redeclare it as {}",
+                    run.prov_id,
+                    existing.describe(),
+                    run.describe()
+                )));
+            }
+            return Ok(());
+        }
+        log.push(run);
+        Ok(())
+    }
+
+    /// How many run declarations a checkpoint would replay. See [`TxnManager::run_log`].
+    pub fn retained_runs(&self) -> usize {
+        self.run_log.lock().unwrap().len()
+    }
+
+    /// Re-declare every known run at the head of the log, after a truncation discarded them.
+    ///
+    /// Transaction id 0, matching [`TxnManager::append_ddl`]: a declaration says "this run exists",
+    /// and transaction 0 never commits, so it binds nothing. `LogicalDecoder` relies on exactly
+    /// that to tell a declaration from a binding.
+    fn replay_runs(&self) -> Result<(), FerroError> {
+        let runs = self.run_log.lock().unwrap().clone();
+        if runs.is_empty() {
+            return Ok(());
+        }
+        for run in runs {
+            self.wal.append(0, 0, &RecKind::RunIdentity { run })?;
+        }
+        self.wal.flush()
+    }
+
     pub fn commit(&self, txn_id: u64) -> Result<(), FerroError> {
+        // **Immediately before the `Commit`, with no append between them.** See `bind_run` for what
+        // any other position costs. Read rather than removed, so a failed append leaves the binding
+        // intact for the abort that follows.
+        let bound = self.run_bindings.lock().unwrap().get(&txn_id).cloned();
+        if let Some(run) = bound {
+            self.append_chained(txn_id, &RecKind::RunIdentity { run })?;
+        }
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
+        self.run_bindings.lock().unwrap().remove(&txn_id);
         if self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1 >= checkpoint_interval() && self.att.lock().unwrap().is_empty() {
             self.checkpoint()?;
         }
@@ -424,6 +554,10 @@ impl TxnManager {
         }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
         self.att.lock().unwrap().remove(&txn_id);
+        // The run bound to this transaction described work that has been rolled back. No identity
+        // record was written — they are only written at commit — so there is nothing in the log to
+        // retract, only a binding that must not outlive its transaction id.
+        self.run_bindings.lock().unwrap().remove(&txn_id);
         Ok(())
     }
 
@@ -489,6 +623,9 @@ impl TxnManager {
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.
         self.replay_schema()?;
+        // And every run declaration, for the same reason: a reader starting at the new base would
+        // otherwise have no way to name the database's writers.
+        self.replay_runs()?;
         Ok(())
     }
 
