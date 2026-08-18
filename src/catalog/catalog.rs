@@ -262,7 +262,15 @@ impl Catalog {
 
     pub fn persist(&self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
-        let mut iter = self.tables.values().peekable();
+        // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
+        // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
+        // same two tables produced a different on-disk layout on every run. Nothing can rely on the
+        // old order because the old order was random, so sorting is safe; what it buys is a catalog
+        // whose image is a function of its contents, which is what makes a crash during `persist`
+        // reproducible at all.
+        let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
+        sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let mut iter = sorted.into_iter().peekable();
 
         loop {
             let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;

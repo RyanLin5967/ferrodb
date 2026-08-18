@@ -80,8 +80,8 @@ fn flushed_lsn_never_over_reports_while_flushes_are_in_flight() {
                     let base = wal.base_lsn.load(Ordering::SeqCst);
                     let valid_end = {
                         let file = wal.file.lock().unwrap();
-                        let len = file.metadata().expect("metadata").len();
-                        scan_valid_end(&file, base, len).expect("scan")
+                        let len = file.len().expect("length");
+                        scan_valid_end(&**file, base, len).expect("scan")
                     };
                     samples.fetch_add(1, Ordering::Relaxed);
                     if claimed > valid_end {
@@ -170,8 +170,8 @@ fn the_log_remains_a_walkable_chain_after_concurrent_use() {
 
     let base = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
     let file = wal.file.lock().unwrap();
-    let len = file.metadata().expect("metadata").len();
-    let valid_end = scan_valid_end(&file, base, len).expect("scan");
+    let len = file.len().expect("length");
+    let valid_end = scan_valid_end(&**file, base, len).expect("scan");
 
     // Every byte written should be part of a valid record; a shortfall means the chain broke.
     let header = 64u64; // scan starts after the header

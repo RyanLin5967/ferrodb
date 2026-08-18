@@ -50,6 +50,18 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     }
     txn.next_txn_id.fetch_max(max_txn + 1, Ordering::SeqCst);
 
+    // **Every loop below walks `touched` in this fixed order, not the `HashSet`'s.**
+    //
+    // `touched` is a `HashSet`, seeded per instance, so recovery used to repair pages — and *write*
+    // them — in a different order on every run. That makes a crash during recovery irreproducible:
+    // recovery is itself a sequence of durable writes, and it is the sequence most likely to be
+    // interrupted, because it only runs after something has already gone wrong. A crash-in-recovery
+    // that cannot be replayed cannot be debugged, and "the same seed reproduces the same byte
+    // sequence" is unmeetable while the sequence depends on a hash seed. Sorted by (dir_root,
+    // page_id): a total order, and ascending page id is the same order `flush_all` now uses.
+    let mut touched: Vec<(u32, u32)> = touched.into_iter().collect();
+    touched.sort_unstable();
+
     // restore pages with broken file extensions
     let bp = &txn.bp;
     for (_, page_id) in &touched {
@@ -70,7 +82,14 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     }
 
     // undo
-    let losers: Vec<u64> = last_lsn.keys().copied().filter(|id| !ended.contains(id)).collect();
+    //
+    // Sorted for the same reason as `touched`: `last_lsn` is a `HashMap`, so the set of losers came
+    // back in a per-process order, and undo *writes* — a CLR record per undone action, plus the page
+    // it repairs. Two losers therefore produced two different byte sequences from the same crash.
+    // Ascending transaction id is also the order the transactions started in, which is the order a
+    // reader of the log would expect their compensation records to appear.
+    let mut losers: Vec<u64> = last_lsn.keys().copied().filter(|id| !ended.contains(id)).collect();
+    losers.sort_unstable();
     for id in losers {
         txn.att.lock().unwrap().insert(id, TxnEntry {
             status: TxnStatus::Aborting,
@@ -149,7 +168,15 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
 }
 
 pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Result<(), FerroError> {
-    for entry in catalog.tables.values_mut() {
+    // **By table name, not by `HashMap` order.** This loop frees every index tree and builds a fresh
+    // one, so the order decides which page ids the new trees get and therefore every byte written
+    // from here on. Iterating `values_mut()` made that a function of a per-process hash seed: the
+    // same crash, recovered twice, produced two different databases. Both were correct; neither could
+    // be compared with the other, which is what a crash sweep has to do.
+    let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
+    names.sort_unstable();
+    for name in names {
+        let entry = catalog.tables.get_mut(&name).expect("name came from this map");
         let hfm = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
         let mut rows = Vec::new();
         for r in hfm.scan() {

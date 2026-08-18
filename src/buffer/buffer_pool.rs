@@ -257,7 +257,29 @@ impl BufferPoolManager {
     pub fn flush_all(&self) -> Result<(), FerroError>{
         let pt = self.page_table.read().unwrap();
 
-        for (&page_id, &frame_i) in pt.iter() {
+        // **Ascending page id, not HashMap order, and the sort is load-bearing.**
+        //
+        // `page_table` is a `HashMap`, whose iteration order is seeded per instance, so this loop
+        // used to write the same set of dirty pages in a *different order on every run of the same
+        // program*. Nothing about a single run is wrong when it does that — the same bytes reach the
+        // same offsets — but three things become impossible:
+        //
+        //   1. A crash cannot be reproduced. "The database broke when the 7th page write was torn"
+        //      names a different page each run, so a failing crash point cannot be replayed, let
+        //      alone bisected. That is the whole reason `storage::sim` exists, and it is dead weight
+        //      without this line: the fault is aimed at an operation *index*.
+        //   2. Two runs cannot be compared. The exit criterion "the same seed produces the same byte
+        //      sequence" is unmeetable while the sequence is a function of a per-process hash seed.
+        //   3. Any future ordering rule here has nothing to stand on. Write order is what decides
+        //      which prefix of a flush survives a crash; a rule about it needs an order to exist.
+        //
+        // Ascending page id is the cheapest total order available, and it is also the friendliest to
+        // a spinning disk. `wal_gate` may flush the WAL from inside this loop, so the order also
+        // fixes when that happens.
+        let mut pages: Vec<(u32, usize)> = pt.iter().map(|(&p, &f)| (p, f)).collect();
+        pages.sort_unstable_by_key(|&(page_id, _)| page_id);
+
+        for (page_id, frame_i) in pages {
             let frame = self.frames[frame_i].read().unwrap();
             if frame.dirty_flag.load(Ordering::Relaxed) {
                 self.wal_gate(&frame.data)?;
