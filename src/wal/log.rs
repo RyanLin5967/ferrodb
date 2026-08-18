@@ -897,7 +897,17 @@ mod tests {
             RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 3, tuple: vec![4, 5, 6] },
             RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 4, old: vec![7, 8, 9] },
             RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![1], new: vec![4,5] },
-            RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) }
+            RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) },
+            RecKind::RunIdentity { run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(7),
+                "restock-agent",
+                "run-42",
+                "claude-opus",
+                "2026-05",
+                [0xab; 32],
+                1_700_000_000_000,
+                crate::branch::types::BranchId::new(4, 3),
+            ) },
         ];
 
         for case in cases {
@@ -991,5 +1001,109 @@ mod tests {
     fn deserialize_rejects_empty_and_unknown_tag() {
         assert!(RecKind::deserialize(&[]).is_err());
         assert!(RecKind::deserialize(&[99]).is_err());
+    }
+
+    /// **The additive-tag discipline, for tag 10.**
+    ///
+    /// Tags 0..9 were taken when `RunIdentity` arrived, so it took the next free number. A log
+    /// written before it existed contains none of them, and every record in it must still decode —
+    /// which is the property that lets this variant be added to a running database at all. Checked
+    /// by decoding one of every older tag after the new one was introduced.
+    ///
+    /// Breaking shape: reusing an existing tag, or renumbering. Either produces a build in which
+    /// yesterday's log decodes into today's record type with the wrong fields, which is far worse
+    /// than a decode error because it succeeds.
+    #[test]
+    fn an_older_logs_records_still_decode_after_the_new_tag_was_added() {
+        for (tag, kind) in [
+            (0u8, RecKind::Begin),
+            (1, RecKind::Commit),
+            (2, RecKind::Abort),
+            (3, RecKind::TxnEnd),
+            (4, RecKind::Checkpoint),
+        ] {
+            let mut buf = Vec::new();
+            kind.serialize(&mut buf);
+            assert_eq!(buf[0], tag, "the tag of {kind:?} moved; an existing log now misdecodes");
+            assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        }
+        let mut buf = Vec::new();
+        RecKind::Ddl {
+            op: DdlOp::CreateTable,
+            table: "t".into(),
+            dir_root: 1,
+            time_travel_root: 2,
+            columns: vec![("c".into(), DataType::Integer, true)],
+        }
+        .serialize(&mut buf);
+        assert_eq!(buf[0], 9, "the DDL tag moved");
+
+        let mut buf = Vec::new();
+        RecKind::RunIdentity {
+            run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(1),
+                "a",
+                "r",
+                "m",
+                "v",
+                [0u8; 32],
+                0,
+                crate::branch::types::BranchId::TRUNK,
+            ),
+        }
+        .serialize(&mut buf);
+        assert_eq!(buf[0], 10, "run identity must be tag 10; 0..9 are taken by existing logs");
+    }
+
+    /// A run identity record must name a run. `ProvId::NONE` is the value meaning *unattributed*,
+    /// so a record carrying it would claim a writer and name none — and every row of that commit
+    /// would then be attributed to a slot that resolves to nothing.
+    #[test]
+    fn a_run_identity_record_that_names_no_run_is_refused() {
+        let run = crate::provenance::RunEntity::new(
+            crate::provenance::ProvId(3),
+            "restock-agent",
+            "run-42",
+            "claude-opus",
+            "2026-05",
+            [1u8; 32],
+            5,
+            crate::branch::types::BranchId::new(2, 0),
+        );
+        let mut buf = Vec::new();
+        RecKind::RunIdentity { run }.serialize(&mut buf);
+        // Anti-vacuity: it decodes as written, so the refusal below is about the id and not about
+        // the record being unreadable.
+        RecKind::deserialize(&buf).expect("a well-formed run identity record was refused");
+
+        // prov_id occupies bytes 1..5.
+        buf[1..5].copy_from_slice(&0u32.to_be_bytes());
+        let err = RecKind::deserialize(&buf).expect_err("a record naming ProvId::NONE was accepted");
+        assert!(format!("{err}").contains("ProvId::NONE"), "{err}");
+    }
+
+    /// A truncated run identity record is refused rather than indexed past. These bytes arrive from
+    /// a disk; reading off the end of one panics the whole process.
+    #[test]
+    fn a_truncated_run_identity_record_is_refused_rather_than_panicking() {
+        let mut buf = Vec::new();
+        RecKind::RunIdentity {
+            run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(1),
+                "restock-agent",
+                "run-42",
+                "claude-opus",
+                "2026-05",
+                [9u8; 32],
+                77,
+                crate::branch::types::BranchId::new(1, 0),
+            ),
+        }
+        .serialize(&mut buf);
+        assert!(RecKind::deserialize(&buf).is_ok(), "the intact record was refused");
+        for cut in 1..buf.len() {
+            let err = RecKind::deserialize(&buf[..cut]);
+            assert!(err.is_err(), "a record truncated to {cut} bytes decoded as if it were whole");
+        }
     }
 }
