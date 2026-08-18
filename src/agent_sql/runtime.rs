@@ -791,8 +791,8 @@ impl AgentRuntime {
         bound_where: Option<&BoundExpr>,
     ) {
         let mut state = self.state.lock().unwrap();
-        let txn = match state.workspaces.get(&reader.id) {
-            Some(ws) => ws.txn,
+        let (txn, prov) = match state.workspaces.get(&reader.id) {
+            Some(ws) => (ws.txn, ws.prov),
             None => return,
         };
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
@@ -826,9 +826,17 @@ impl AgentRuntime {
         // preceding it, which is the same under-reporting failure with the sign flipped.
         let observed_at = state.apply_seq + 1;
         let summary = predicate_summary(tbl, where_clause, bound_where, matched.len() as u64);
-        if let Some(capture) = state.captures.get_mut(&txn.0) {
-            capture.on_read(shape, versions, Some(summary), observed_at);
-        }
+        // `or_insert_with`, never `if let Some`. A read that finds no capture and retains nothing
+        // silently is indistinguishable from a read that had nothing to retain, and that is the
+        // precise failure this lane exists to remove — the previous shape lost a scan's region with
+        // no error anywhere. There is one workspace-creation site and it opens a capture, so this
+        // arm should be unreachable; it is written this way so that a second site cannot make
+        // retention optional by forgetting.
+        state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, prov, reader))
+            .on_read(shape, versions, Some(summary), observed_at);
     }
 
     // ---- writes on a branch ----------------------------------------------------------------
@@ -1720,6 +1728,30 @@ impl AgentRuntime {
             post: pending_writes.iter().filter_map(|w| w.published_image()).collect(),
         };
 
+        // **Reserve the version sequence BEFORE the rows become visible.**
+        //
+        // `record_applied` runs after `commit`, and it used to be where `apply_seq` advanced. That
+        // left a window in which the published rows were readable while the clock still said they
+        // did not exist: a scan landing there would take `observed_at = apply_seq + 1`, land at or
+        // below the versions it had just read, and the temporal rule in
+        // `DependencyGraphBuilder::build` would drop a real edge — a silently missing dependent,
+        // which is the failure mode this whole lane is about.
+        //
+        // Reserving first inverts the error: in that window the clock is ahead of visibility, so a
+        // scan that could NOT see the rows may still be named a dependent. Over-reporting is
+        // recoverable — the operator sees a name in the halt tree and dismisses it — and
+        // under-reporting cascades a revert through work that depended on the write.
+        //
+        // Not reachable through today's server, which serves one connection at a time
+        // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
+        // numbering is unchanged: the same ops, in the same order, get the same sequence values.
+        let reserved_base = {
+            let mut state = self.state.lock().unwrap();
+            let base = state.apply_seq;
+            state.apply_seq += row_outcomes.iter().map(|r| r.applied.len() as u64).sum::<u64>();
+            base
+        };
+
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
@@ -1736,7 +1768,15 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
-        self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id, &images);
+        self.record_applied(
+            branch,
+            snapshot.txn,
+            &row_outcomes,
+            &snapshot,
+            &merge_id,
+            &images,
+            reserved_base,
+        );
         self.seal(branch, true)?;
 
         Ok(MergeReport {
@@ -1791,13 +1831,18 @@ impl AgentRuntime {
         snapshot: &WorkspaceSnapshot,
         merge_id: &str,
         images: &PublishedImages,
+        reserved_base: u64,
     ) {
         let mut state = self.state.lock().unwrap();
         let mut written: Vec<WriteRecord> = Vec::new();
+        let mut reserved = reserved_base;
         for r in rows {
             for op in &r.applied {
-                state.apply_seq += 1;
-                let seq = state.apply_seq;
+                // The sequence `merge` reserved before publishing, consumed in the same order it
+                // was counted. `state.apply_seq` is not touched here: it already stands at the end
+                // of this reservation.
+                reserved += 1;
+                let seq = reserved;
                 let before = snapshot
                     .ops
                     .iter()
@@ -1860,10 +1905,26 @@ impl AgentRuntime {
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
         // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
         // does not borrow-check.
-        if let Some(capture) = state.captures.get_mut(&txn.0) {
-            for w in written {
-                capture.on_write(w);
-            }
+        // The reservation `merge` took must be exactly the ops recorded here. It is true by
+        // construction today — both sides count `row_outcomes[..].applied` — and it is asserted
+        // because the two counts live in different functions: a future edit that filters, splits or
+        // reorders one of them would otherwise hand out sequence numbers that overlap the next
+        // merge's, and versions with colliding `begin_ts` silently mis-answer every visibility
+        // comparison downstream.
+        debug_assert_eq!(
+            reserved,
+            reserved_base + rows.iter().map(|r| r.applied.len() as u64).sum::<u64>(),
+            "merge reserved a different number of versions than record_applied consumed"
+        );
+        // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
+        // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
+        // a merge that published nothing.
+        let capture = state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        for w in written {
+            capture.on_write(w);
         }
         state.merges.insert(
             merge_id.to_string(),
