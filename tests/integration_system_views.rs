@@ -820,3 +820,197 @@ fn every_declared_column_is_selectable_by_name() {
     // A run that collected nothing has not passed.
     assert!(checked >= 40, "only {checked} columns were checked; the loop covered almost nothing");
 }
+
+
+/// **A table dropped and recreated under the same name does not inherit the old one's authorship.**
+///
+/// The breaking shape is DROP followed by CREATE with the SAME name. `row_author` is keyed by
+/// `table_id(name)` — an FNV hash of the *name*, because the catalog mints no table ids — so to that
+/// map the new table IS the old one. Without a purge, `ferro_row_authors` reports the previous
+/// table's rows: row ids the new table does not contain, attributed to an agent that never touched
+/// it. A workload that only ever creates tables cannot reach it, which is why it survived.
+///
+/// This is the same omission `Catalog::drop_table` already fixed one layer down for `stats` (E69),
+/// and B9 is what made it observable — `authors_of` had no SQL surface before.
+#[test]
+fn a_recreated_table_does_not_inherit_the_previous_tables_authorship() {
+    let mut db = Db::new();
+    db.seed();
+
+    // A SECOND table, authored BEFORE the drop. This is the half that detects over-purging, and the
+    // first version of this test did not have it: it created its anti-vacuity authorship *after* the
+    // drop, so a `forget_table` that cleared every table's records passed. Fire-checking found that —
+    // the mutant survived — which is the whole reason the second table is here and is authored first.
+    let mut s = db.session();
+    db.ok("CREATE TABLE keepme (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+    db.ok("INSERT INTO keepme VALUES (5, 50);", &mut s);
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'author' RUN 'r_1';", &mut a);
+    db.ok("UPDATE oncall SET qty = 42 WHERE id = 1;", &mut a);
+    db.ok("UPDATE keepme SET qty = 51 WHERE id = 5;", &mut a);
+    db.ok("MERGE;", &mut a);
+
+    let before = db.view("SELECT table_name, row_id, agent_id FROM ferro_row_authors;");
+    assert_eq!(before.len(), 2, "the merge attributed nothing: {:?}", before.rows);
+    assert_eq!(column(&before, "agent_id"), vec!["author"; 2]);
+
+    let mut s = db.session();
+    db.ok("DROP TABLE oncall;", &mut s);
+    let kept = db.view("SELECT table_name, row_id FROM ferro_row_authors;");
+    assert_eq!(
+        column(&kept, "table_name"),
+        vec!["keepme"],
+        "dropping one table purged another table's authorship, or failed to purge its own: {:?}",
+        kept.rows
+    );
+    assert_eq!(column(&kept, "row_id"), vec!["5"], "{:?}", kept.rows);
+
+    // The same name comes back, with different data. Row 1 does not exist in it at all.
+    db.ok("CREATE TABLE oncall (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+    db.ok("INSERT INTO oncall VALUES (9, 900);", &mut s);
+    let after = db.view("SELECT table_name, row_id FROM ferro_row_authors;");
+    assert_eq!(
+        column(&after, "table_name"),
+        vec!["keepme"],
+        "the recreated table inherited the previous table's authorship: {:?}",
+        after.rows
+    );
+
+    // And attribution still works on the recreated table, so the purge did not leave the name
+    // permanently unattributable.
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'second' RUN 'r_2';", &mut b);
+    db.ok("UPDATE oncall SET qty = 901 WHERE id = 9;", &mut b);
+    db.ok("MERGE;", &mut b);
+    let fresh = db.view("SELECT table_name, row_id, agent_id FROM ferro_row_authors;");
+    let mut pairs: Vec<(String, String)> = fresh
+        .rows
+        .iter()
+        .map(|r| (text_of(&r[0]), text_of(&r[1])))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![("keepme".to_string(), "5".to_string()), ("oncall".to_string(), "9".to_string())],
+        "{:?}",
+        fresh.rows
+    );
+}
+
+/// **A table that already holds a view's name gets the "already exists" refusal, not the view one.**
+///
+/// The breaking shape is again the legacy database. The view-collision message says every `SELECT`
+/// would answer from the view and the table's rows would be unreachable — and for a database that
+/// already has that table, both halves are false, because `view_for` yields to it. Ordering the
+/// collision guard after the already-exists check is what makes the refusal true.
+#[test]
+fn creating_over_a_legacy_table_named_like_a_view_says_the_table_exists() {
+    let mut db = Db::new();
+    let mut s = db.session();
+    db.ok("CREATE TABLE legacy (id INTEGER NOT NULL);", &mut s);
+    let mut entry = db.catalog.tables.remove("legacy").expect("exists");
+    entry.name = "ferro_runs".to_string();
+    db.catalog.tables.insert("ferro_runs".to_string(), entry);
+
+    let err = refusal(
+        db.exec("CREATE TABLE ferro_runs (id INTEGER NOT NULL);", &mut s),
+        "CREATE TABLE over a legacy table holding a view name",
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("already exists"), "the refusal is not about the table that exists: {msg}");
+    assert!(
+        !msg.contains("system view"),
+        "the refusal claims the rows are unreachable behind a view, which is false here: {msg}"
+    );
+
+    // Anti-vacuity: with no such table, the SAME statement gets the view-collision refusal.
+    let mut db2 = Db::new();
+    let mut s2 = db2.session();
+    let err = refusal(
+        db2.exec("CREATE TABLE ferro_runs (id INTEGER NOT NULL);", &mut s2),
+        "CREATE TABLE over a view name on a fresh database",
+    );
+    assert!(err.to_string().contains("system view"), "{err}");
+}
+
+/// **A view named on the RIGHT of a join is refused by name, not as an unknown table.**
+///
+/// The breaking shape is the join whose view is not the FROM relation. `intercept` looked at
+/// `from.name` only, so this one fell through to `bind_scan` and answered `unknown table
+/// 'ferro_runs'` — about a name the next `SELECT` resolves. The existing join test only covered a
+/// view on the left, which is how half the shapes stayed uncovered while `run_select`'s doc claimed
+/// all of them were handled.
+#[test]
+fn a_view_on_either_side_of_a_join_is_refused_by_name() {
+    let mut db = Db::new();
+    db.seed();
+    let mut s = db.session();
+
+    for sql in [
+        "SELECT * FROM ferro_runs JOIN oncall ON ferro_runs.branch_id = oncall.id;",
+        "SELECT * FROM oncall JOIN ferro_runs ON oncall.id = ferro_runs.branch_id;",
+    ] {
+        let err = refusal(db.exec(sql, &mut s), sql);
+        let msg = err.to_string();
+        assert!(msg.contains("ferro_runs"), "{sql}: {msg}");
+        assert!(msg.contains("joining"), "{sql}: does not say what was refused: {msg}");
+        assert!(
+            !msg.contains("unknown table"),
+            "{sql}: still answers as if the name did not exist: {msg}"
+        );
+    }
+
+    // Anti-vacuity: a join between two real tables still works, so the refusal is keyed on the view
+    // and not on the presence of a JOIN.
+    db.ok("CREATE TABLE other (id INTEGER NOT NULL, note VARCHAR(8));", &mut s);
+    db.ok("INSERT INTO other VALUES (1, 'x');", &mut s);
+    match db.ok("SELECT oncall.id, other.note FROM oncall JOIN other ON oncall.id = other.id;", &mut s) {
+        Outcome::Rows(r) => assert_eq!(r.len(), 1, "a real join broke: {r:?}"),
+        other => panic!("{}", outcome_kind(&other)),
+    }
+}
+
+/// **`ferro_branches.generation` is the id slot's CURRENT generation, not the one it was minted with.**
+///
+/// The breaking shape is a branch that has been reaped, which an ordinary `MERGE` produces: `seal`
+/// calls `mark_reaped`, which bumps `BranchRecord::generation` and leaves `branch_id.generation`
+/// alone. Reporting the minted value showed a reaped slot sitting at generation 0 — the very value
+/// `check_readable` rejects — presented as the slot's identity. Every branch in a test that never
+/// merges is at generation 0 either way, which is why this needs a merge to be visible at all.
+#[test]
+fn a_reaped_branch_reports_the_slots_current_generation() {
+    let mut db = Db::new();
+    db.seed();
+
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'sealed' RUN 'r_s';", &mut a);
+    db.ok("UPDATE oncall SET qty = 1 WHERE id = 1;", &mut a);
+    let branch = a.agent.as_ref().unwrap().branch;
+    assert_eq!(branch.generation, 0, "minted at generation 0");
+
+    // While live, the two generations agree, so this half cannot detect the defect on its own.
+    let live = db.view(&format!("SELECT generation, state FROM ferro_branches WHERE branch_id = {};", branch.id));
+    assert_eq!(column(&live, "generation"), vec!["0"], "{:?}", live.rows);
+    assert_eq!(column(&live, "state"), vec!["Live"]);
+
+    db.ok("MERGE;", &mut a);
+
+    let reaped = db.view(&format!("SELECT generation, state FROM ferro_branches WHERE branch_id = {};", branch.id));
+    assert_eq!(column(&reaped, "state"), vec!["Reaped"], "the merge did not seal the branch");
+    assert_eq!(
+        column(&reaped, "generation"),
+        vec!["1"],
+        "the view reported the generation the branch was MINTED with, so the pair it hands out is \
+         not the slot's identity: {:?}",
+        reaped.rows
+    );
+    // And the minted pair is exactly what the branch engine now rejects, which is what makes
+    // reporting it wrong rather than merely stale.
+    let err = db
+        .runtime
+        .branches()
+        .get(branch)
+        .expect_err("the minted handle must be refused after a reap");
+    assert!(err.to_string().contains("generation 1"), "{err}");
+}

@@ -37,15 +37,6 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
-        // B9: a table may not take a system view's name. Checked here, before the collision check
-        // below, because `Catalog::tables` is where every path that creates a table converges — the
-        // parser is not, and a guard in the parser would be walked around by any caller that builds
-        // a `CreateTable` without going through SQL text.
-        //
-        // The state being made unrepresentable: `executor::run` recognises a view name BEFORE any
-        // other route, so a table called `ferro_quarantine` would accept writes and answer every
-        // read from the view. Rows in, nothing out, no error anywhere.
-        crate::catalog::system_views::reject_view_name_collision(&name)?;
         // E67: this was `FerroError::KeyNotFound`, so creating a table that already exists answered
         // `error: key wasn't found` - a storage-layer message, for a name collision, telling the
         // reader that something is missing when the problem is that something is present.
@@ -54,6 +45,23 @@ impl Catalog {
                 "table '{name}' already exists; DROP TABLE {name} first, or choose another name"
             )));
         }
+        // B9: a table may not take a system view's name. Checked here — in `catalog`, because
+        // `Catalog::tables` is where every path that creates a table converges, and the parser is
+        // not; a guard in the parser is walked around by any caller that builds a `CreateTable`
+        // without going through SQL text.
+        //
+        // The state being made unrepresentable: `executor::run` recognises a view name before any
+        // other route, so a table called `ferro_quarantine` would accept writes and answer every
+        // read from the view. Rows in, nothing out, no error anywhere.
+        //
+        // **Ordered AFTER the already-exists check, and that order is a correctness fix.** On a
+        // database written before these views existed, a table CAN already hold one of these names
+        // (`Catalog::load` rebuilds `tables` from the catalog pages and never comes through here).
+        // Refusing such a `CREATE TABLE` with the view message told the reader that every SELECT
+        // would answer from the view and the table's rows were unreachable — and for that database
+        // both halves are false, because `system_views::view_for` yields to the real table. The
+        // honest answer there is the one above: the table already exists.
+        crate::catalog::system_views::reject_view_name_collision(&name)?;
         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
         let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
         let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;

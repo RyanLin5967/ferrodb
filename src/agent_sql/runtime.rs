@@ -709,6 +709,42 @@ impl AgentRuntime {
         out
     }
 
+    /// Forget every per-row record this runtime holds for `table`. Called when a table is dropped.
+    ///
+    /// # Why a drop has to reach in here at all
+    ///
+    /// `row_author` and `versions` are keyed by `table_id(name)` — an FNV hash of the table's
+    /// **name**, chosen because the catalog mints no table ids and a name hash is stable across
+    /// processes where an assignment counter would not be. The cost of that choice is that a table
+    /// dropped and recreated under the same name is, to these maps, the same table: the new one
+    /// inherits the old one's authorship and version stamps.
+    ///
+    /// Before B9 that was invisible, because `authors_of` and `who_wrote_row` had no SQL surface.
+    /// `ferro_row_authors` gives them one, and it then reported rows of the *previous* table —
+    /// attributed to an agent that never touched the new one, for row ids the new table does not
+    /// contain. `Catalog::drop_table` already purges `stats` for the same reason (E69 fixed exactly
+    /// that omission); this is the same omission one layer over.
+    ///
+    /// Purging `versions` too is not incidental: it is what the read-premise check compares against
+    /// (`merge`), so a stale version stamp under a recycled name would report a moved premise for a
+    /// row the branch never read in the table that now holds that name.
+    ///
+    /// **What this deliberately does NOT purge**, stated rather than left to be discovered: the
+    /// escrow ledger, the dependency graph and the applied-op log. None is exposed by the
+    /// observability views, and each is keyed by something other than the table alone — undoing them
+    /// on a drop is a separate decision about `REVERT`'s reach, not a presentation fix.
+    ///
+    /// Note that authorship deliberately survives an ordinary `DELETE` of the row. That is an audit
+    /// record answering "which agent wrote this", which is criterion 9, and it outliving the row is
+    /// the point; a dropped *table* is different, because the name can come back attached to
+    /// different data.
+    pub fn forget_table(&self, table: &str) {
+        let tbl = table_id(table).0;
+        let mut state = self.state.lock().unwrap();
+        state.row_author.retain(|(t, _), _| *t != tbl);
+        state.versions.retain(|(t, _), _| *t != tbl);
+    }
+
     // ---- reads -----------------------------------------------------------------------------
 
     /// Rows this branch wrote without ever reading. See [`blind_writes_of`].

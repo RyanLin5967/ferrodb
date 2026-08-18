@@ -77,9 +77,13 @@ def main():
     # second connection returns A's uncommitted 15, while `b1` and `b_99` both answer "unknown
     # branch".
     #
-    # Reaping an abandoned branch is the LEASE's job (exit criterion 8) and happens on expiry with no
-    # client cooperation, not on socket close. Cooperation is exactly the contract the design says is
-    # not viable.
+    # **What actually happens to that branch in THIS server: nothing.** Saying so rather than pointing
+    # at the lease, because this comment replaced one unverified claim and must not install another.
+    # `TwoTierReaper` is constructed in `examples/agent_isolation_demo.rs` and two integration tests
+    # and NOWHERE else — not in `examples/pgserver.rs`, not in the CLI (grepped 2026-08-18). So a
+    # client that disconnects without merging leaks its branch for the life of the process. The lease
+    # reaper is the design's answer to exactly that (exit criterion 8, non-cooperative expiry) and it
+    # exists and is tested; it is simply not wired into the server under test here.
     _f, rows, _t, errors = b.query("SELECT qty FROM inv AS OF BRANCH b_1;")
     check(
         rows == [["15"]] and not errors,

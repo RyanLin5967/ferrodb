@@ -92,12 +92,6 @@ impl NamedRows {
         self.columns.iter().position(|c| c.name == name)
     }
 
-    /// Every row's value in column `name`, in row order.
-    pub fn column(&self, name: &str) -> Option<Vec<&Value>> {
-        let at = self.column_index(name)?;
-        Some(self.rows.iter().filter_map(|r| r.get(at)).collect())
-    }
-
     /// Assert-friendly rendering used by tests and by the CLI: the declared column names, then one
     /// line per row.
     pub fn header(&self) -> Vec<String> {
@@ -202,6 +196,15 @@ impl SystemView {
         match self {
             SystemView::Branches => vec![
                 big("branch_id"),
+                // **The id slot's CURRENT generation, which is not always the one the branch was
+                // minted with.** `BranchRecord` carries both: `branch_id.generation` is as minted
+                // and never changes, while `generation` is bumped by `mark_reaped` so a stale
+                // handle fails loudly. For a live branch they are equal; for a reaped one they are
+                // not, and reporting the minted value showed a reaped slot sitting at generation 0
+                // — the very number `check_readable` rejects, presented as the slot's identity. The
+                // reaper's own convention for naming a slot is
+                // `BranchId::new(r.branch_id.id, r.generation)` (`branch/reaper.rs`), and this
+                // matches it.
                 int("generation"),
                 text("branch_name", 32),
                 // NULL only for the trunk, which has no parent. A sentinel here would be
@@ -239,6 +242,10 @@ impl SystemView {
             ],
             SystemView::Quarantine => vec![
                 big("branch_id"),
+                // From `quarantined_branches`, which yields `branch_id`, so this is the generation
+                // as minted. Equal to the slot's current generation here and not by luck: only
+                // `mark_reaped` bumps it, and a record in state `Quarantined` has not been reaped.
+                // `ferro_branches` is where the two can differ, and its column doc says so.
                 int("generation"),
                 text("branch_name", 32),
                 // NULL is a real answer, not a missing one: branch state is durable and the reason
@@ -336,7 +343,9 @@ fn branches_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> 
         .map(|r| {
             vec![
                 Value::BigInt(r.branch_id.id as i64),
-                Value::Integer(r.branch_id.generation as i32),
+                // `r.generation`, NOT `r.branch_id.generation`. See the column's doc: the record
+                // carries both, and only this one is the id slot's current generation.
+                Value::Integer(r.generation as i32),
                 Value::Varchar(format!("b_{}", r.branch_id.id)),
                 match r.parent_id {
                     Some(p) => Value::BigInt(p.id as i64),
@@ -497,6 +506,17 @@ impl Executor for MaterialisedRows {
     }
 }
 
+/// The one refusal for joining a system view, so the two places that can detect it — a view on the
+/// left, reached through `run_select`, and a view on the right, reached through `intercept` — cannot
+/// drift into two different messages for one condition.
+fn join_refusal(view: SystemView) -> FerroError {
+    FerroError::Bind(format!(
+        "joining {} is not supported: a system view has no catalog table entry for the optimizer to \
+         lower a scan of",
+        view.name()
+    ))
+}
+
 /// Run one `SELECT` against a system view.
 ///
 /// Binds the query's projection and `WHERE` against the view's declared schema, builds the logical
@@ -535,11 +555,7 @@ pub fn run_select(
         )));
     }
     if !joins.is_empty() {
-        return Err(FerroError::Bind(format!(
-            "joining {} is not supported: a system view has no catalog table entry for the \
-             optimizer to lower a scan of",
-            view.name()
-        )));
+        return Err(join_refusal(view));
     }
 
     let qualifier = from.alias.clone().unwrap_or_else(|| view.name().to_string());
@@ -633,9 +649,20 @@ pub fn intercept(
         ))))
     };
     match stmt {
-        Stmt::Select { from, .. } => {
-            let view = view_for(catalog, &from.name)?;
-            Some(run_select(view, stmt, catalog, runtime))
+        Stmt::Select { from, joins, .. } => {
+            if let Some(view) = view_for(catalog, &from.name) {
+                return Some(run_select(view, stmt, catalog, runtime));
+            }
+            // **A view named on the RIGHT of a join, which `from.name` alone does not see.**
+            // Without this the statement falls through to `bind_scan` and answers
+            // `unknown table 'ferro_runs'` — about a name the very next `SELECT` resolves, and the
+            // exact "right refusal, wrong reason" this module exists to remove. `run_select`'s own
+            // doc already claims a join is refused by name, so leaving this arm out made that doc
+            // false for half the join shapes.
+            joins
+                .iter()
+                .find_map(|j| view_for(catalog, &j.table.name))
+                .map(|view| Err(join_refusal(view)))
         }
         Stmt::Insert { table, .. } => read_only(view_for(catalog, table)?, "INSERT"),
         Stmt::Update { table, .. } => read_only(view_for(catalog, table)?, "UPDATE"),

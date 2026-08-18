@@ -231,6 +231,40 @@ fn fields_of(rows: &NamedRows) -> Vec<(String, i32)> {
         .collect()
 }
 
+/// Emit a schema-carrying result: `RowDescription`, one `DataRow` per row, then `CommandComplete`.
+///
+/// **Refuses a row whose width disagrees with the announced field list.** `system_views::run_select`
+/// already refuses that on its own path; `AgentOutput::to_rows` had no equivalent, and this is the
+/// one place both converge, so the guard belongs here rather than duplicated in each producer.
+///
+/// The reason it is a refusal and not a debug assertion: `DataRow` carries its own field count, so a
+/// row narrower than the `RowDescription` is a **well-formed protocol message**. A client reads it
+/// as valid data with every value after the missing one under the wrong column name, and nothing —
+/// not the client, not the wire, not a test that only looks at values — can tell. An error the caller
+/// sees beats data the caller trusts.
+fn typed_result(t: &NamedRows, out: &mut Vec<Message>) -> Result<(), FerroError> {
+    let fields = fields_of(t);
+    for (i, r) in t.rows.iter().enumerate() {
+        if r.len() != fields.len() {
+            return Err(FerroError::Internal(format!(
+                "row {i} has {} values against {} announced columns ({}); sending it would put every \
+                 value after the {}th under the wrong column name",
+                r.len(),
+                fields.len(),
+                fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+                r.len()
+            )));
+        }
+    }
+    out.push(Message::RowDescription(fields));
+    let count = t.rows.len();
+    for r in &t.rows {
+        out.push(Message::DataRow(r.iter().map(render).collect()));
+    }
+    out.push(Message::CommandComplete(format!("SELECT {count}")));
+    Ok(())
+}
+
 /// Text-format rendering. `None` is SQL NULL, which the protocol encodes as length -1 rather than
 /// as the string "NULL" — a client cannot tell those apart otherwise.
 fn render(v: &Value) -> Option<String> {
@@ -450,14 +484,7 @@ fn execute(
             }
             // A system view, or anything else that carries its own schema: real column names, and
             // an OID per column even when there are no rows.
-            Outcome::Table(t) => {
-                out.push(Message::RowDescription(fields_of(&t)));
-                let count = t.rows.len();
-                for r in &t.rows {
-                    out.push(Message::DataRow(r.iter().map(render).collect()));
-                }
-                out.push(Message::CommandComplete(format!("SELECT {count}")));
-            }
+            Outcome::Table(t) => typed_result(&t, &mut out)?,
             // **This used to be one `text` column holding `format!("{a:?}")`.**
             //
             // A client could read it and could do nothing with it: the `Debug` rendering of a
@@ -466,15 +493,7 @@ fn execute(
             // "structured throughout ... never rendered text"). `AgentOutput::to_rows` is the typed
             // form beside `Display`; `Display` stays because the CLI wants a sentence and a wire
             // client wants columns.
-            Outcome::Agent(a) => {
-                let t = a.to_rows();
-                out.push(Message::RowDescription(fields_of(&t)));
-                let count = t.rows.len();
-                for r in &t.rows {
-                    out.push(Message::DataRow(r.iter().map(render).collect()));
-                }
-                out.push(Message::CommandComplete(format!("SELECT {count}")));
-            }
+            Outcome::Agent(a) => typed_result(&a.to_rows(), &mut out)?,
             Outcome::Ok => out.push(Message::CommandComplete(verb.to_string())),
         }
         let _ = (i, n);
@@ -549,6 +568,67 @@ mod tests {
         .encode();
         let n = i16::from_be_bytes([bytes[5], bytes[6]]);
         assert_eq!(n, 2);
+    }
+
+    fn cols(names: &[(&str, DataType)]) -> Vec<crate::binder::binder::BoundColumn> {
+        names
+            .iter()
+            .map(|(n, t)| crate::binder::binder::BoundColumn {
+                qualifier: "v".into(),
+                name: (*n).into(),
+                data_type: t.clone(),
+                nullable: false,
+            })
+            .collect()
+    }
+
+    /// **A row narrower than the announced field list is refused, not sent.**
+    ///
+    /// The breaking shape is a producer whose column list and rows are built in two places and drift —
+    /// which is every `AgentOutput::to_rows` arm and every system view. This cannot be caught
+    /// downstream: `DataRow` carries its own field count, so a short row is a **well-formed protocol
+    /// message**. A client reads it as valid data with every value after the gap sitting under the
+    /// wrong column name, and neither the wire, nor the client, nor a test that only compares values
+    /// can tell. So the refusal has to happen here, at the one point both producers converge.
+    #[test]
+    fn a_row_narrower_than_its_row_description_is_refused_rather_than_sent() {
+        let columns = cols(&[("a", DataType::Integer), ("b", DataType::Varchar(8))]);
+
+        // Anti-vacuity first: the well-formed case must go out, and go out complete.
+        let good = NamedRows::new(
+            columns.clone(),
+            vec![vec![Value::Integer(1), Value::Varchar("x".into())]],
+        );
+        let mut out = Vec::new();
+        typed_result(&good, &mut out).expect("a well-formed result must be sent");
+        assert!(matches!(out[0], Message::RowDescription(ref f) if f.len() == 2), "{:?}", out.len());
+        assert!(matches!(out[1], Message::DataRow(ref r) if r.len() == 2));
+        assert!(matches!(out[2], Message::CommandComplete(ref t) if t == "SELECT 1"));
+
+        // One value short: refused, and nothing is emitted for it.
+        let ragged = NamedRows::new(columns.clone(), vec![vec![Value::Integer(1)]]);
+        let mut out = Vec::new();
+        let err = typed_result(&ragged, &mut out).expect_err("a ragged row must be refused");
+        assert!(out.is_empty(), "a refused result still emitted {} messages", out.len());
+        let msg = err.to_string();
+        assert!(msg.contains("1 values against 2"), "the refusal does not say what mismatched: {msg}");
+        assert!(msg.contains("wrong column name"), "the refusal does not say why it matters: {msg}");
+
+        // Wider than the schema is equally wrong, and in the other direction: the extra value would
+        // be dropped by a client that trusts the field count.
+        let wide = NamedRows::new(
+            columns,
+            vec![vec![Value::Integer(1), Value::Varchar("x".into()), Value::Integer(9)]],
+        );
+        let mut out = Vec::new();
+        assert!(typed_result(&wide, &mut out).is_err(), "an over-wide row was sent");
+
+        // And a result with columns but no rows is fine — that is an empty view, not a broken one.
+        let empty = NamedRows::new(cols(&[("only", DataType::BigInt)]), Vec::new());
+        let mut out = Vec::new();
+        typed_result(&empty, &mut out).expect("an empty result is not an error");
+        assert!(matches!(out[0], Message::RowDescription(ref f) if f.len() == 1));
+        assert!(matches!(out[1], Message::CommandComplete(ref t) if t == "SELECT 0"));
     }
 
     #[test]

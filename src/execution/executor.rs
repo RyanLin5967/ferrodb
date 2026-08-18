@@ -166,6 +166,11 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 (entry.first_directory_page_id, entry.time_travel_root)
             };
             catalog.drop_table(&table)?;
+            // B9: the agent layer keys row authorship and version stamps by a hash of the table
+            // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
+            // would attribute the new table's rows to an agent that never touched it. See
+            // `AgentRuntime::forget_table`.
+            session.runtime.forget_table(&table);
             txn.checkpoint()?;
             txn.log_ddl(DdlRecord {
                 op: DdlOp::DropTable,
