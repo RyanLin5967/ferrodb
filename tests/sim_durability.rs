@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::catalog::catalog::Catalog;
+use ferrodb::catalog::column::{Column, DataType};
+use ferrodb::catalog::schema::Schema;
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use ferrodb::storage::heap_file_manager::HeapFileManager;
@@ -39,7 +42,7 @@ use ferrodb::storage::heap_page::Page;
 use ferrodb::storage::sim::{Durability, FaultKind, FaultPlan, OpKind, SimFabric, TraceOp};
 use ferrodb::storage::tuple::Tuple;
 use ferrodb::wal::log::{RecKind, WalManager};
-use ferrodb::wal::recovery::recover;
+use ferrodb::wal::recovery::{rebuild_indexes, recover};
 use ferrodb::wal::txn::TxnManager;
 
 const DB: &str = "sim.db";
@@ -51,7 +54,12 @@ const WAL: &str = "sim.wal";
 const ROWS: usize = 150;
 /// Rows in the second committed transaction, the one followed by a checkpoint.
 const ROWS2: usize = 60;
-/// Rows in the transaction that never commits.
+/// Rows in each of the **two** transactions that never commit.
+///
+/// Two, not one, and that is the point: `recover`'s undo loop took its losers straight from
+/// `last_lsn.keys()`, a `HashMap`, and undo writes — a compensation record per action and the page it
+/// repairs. With a single loser there is no order to get wrong and the sort that fixes it cannot be
+/// fire-checked. With two, reverting the sort changes the byte sequence.
 const LOSER_ROWS: usize = 3;
 
 /// Distinct length *and* distinct content per row, so a row that survives can be identified and a
@@ -72,9 +80,15 @@ fn committed2_payload(i: usize) -> Vec<u8> {
     v
 }
 
-/// Recognisably from the transaction that never committed.
+/// Recognisably from the first transaction that never committed.
 fn loser_payload(i: usize) -> Vec<u8> {
     vec![0x5A; 80 + i * 5]
+}
+
+/// From the second uncommitted transaction. Distinct bytes and distinct lengths from the first, so a
+/// row that survives can be attributed to the right loser.
+fn loser2_payload(i: usize) -> Vec<u8> {
+    vec![0x6B; 110 + i * 7]
 }
 
 /// Every fabric in this file is built here, so the fault model is stated once.
@@ -171,11 +185,18 @@ fn workload_inner(fabric: &Arc<SimFabric>, do_checkpoint: bool) -> Result<Writte
         db.txn.checkpoint()?;
     }
 
-    // A loser. Undo has to run at recovery and remove these rows.
+    // Two losers, interleaved in the same pages. Undo has to run for both at recovery and remove
+    // every one of these rows, and the ORDER it runs them in is what the sort in `recover` fixes.
     let t3 = db.txn.begin()?;
     heap.set_transaction(db.txn.clone(), t3);
     for i in 0..LOSER_ROWS {
         heap.insert(Tuple::new(loser_payload(i)))?;
+    }
+    db.wal.flush()?;
+    let t4 = db.txn.begin()?;
+    heap.set_transaction(db.txn.clone(), t4);
+    for i in 0..LOSER_ROWS {
+        heap.insert(Tuple::new(loser2_payload(i)))?;
     }
     db.wal.flush()?;
 
@@ -294,14 +315,17 @@ fn check_invariants(after: &AfterRecovery, what: &str) -> &'static str {
     };
 
     let expected: BTreeSet<Vec<u8>> = all_committed_rows().into_iter().collect();
-    let losers: BTreeSet<Vec<u8>> = (0..LOSER_ROWS).map(loser_payload).collect();
+    let losers: BTreeSet<Vec<u8>> = (0..LOSER_ROWS)
+        .map(loser_payload)
+        .chain((0..LOSER_ROWS).map(loser2_payload))
+        .collect();
     let first_txn: BTreeSet<Vec<u8>> = (0..ROWS).map(committed_payload).collect();
 
-    // 1. No row from the transaction that never committed. Undo must have run.
+    // 1. No row from either transaction that never committed. Undo must have run, for both.
     for r in rows {
         assert!(
             !losers.contains(r),
-            "{what}: a row from the uncommitted transaction survived recovery: {r:?}"
+            "{what}: a row from one of the uncommitted transactions survived recovery: {r:?}"
         );
     }
 
@@ -405,6 +429,19 @@ fn the_same_seed_reproduces_the_same_byte_sequence_and_the_same_fault_point() {
     assert_eq!(a.trace(), b.trace(), "same seed, different operation trace");
     assert_eq!(a.image_digest(), b.image_digest(), "same seed, different surviving image");
 
+    // Anti-vacuity for the digest itself: it distinguishes runs that really differ. A digest that
+    // returned a constant would satisfy every equality above.
+    assert_ne!(
+        a.trace_digest(),
+        census.trace_digest(),
+        "a crashed run and a clean run share a trace digest, so the digest distinguishes nothing"
+    );
+    assert_ne!(
+        a.image_digest(),
+        census.image_digest(),
+        "a crashed run and a clean run share an image digest"
+    );
+
     // And the clean run is reproducible too, which is the part the sorts in `flush_all` and
     // `recover` are responsible for.
     let census2 = fabric(None, Durability::WriteThrough);
@@ -468,13 +505,18 @@ fn recovery_itself_writes_the_same_sequence_three_times() {
         let after = reboot_and_recover(&rebooted, base.dir_root);
         assert!(after.outcome.is_ok(), "recovery of a fixed image failed: {:?}", after.outcome);
         check_invariants(&after, "fixed image");
-        let seq: Vec<(u64, u32)> = rebooted
+        // Every operation, both files. Filtering to the database file alone would miss the undo
+        // ordering entirely: two losers produce their compensation records in the WAL, and it is the
+        // WAL bytes that differ when the loser order does.
+        let seq: Vec<(String, OpKind, u64, usize, u32)> = rebooted
             .trace()
             .into_iter()
-            .filter(|t| t.index >= before && t.kind == OpKind::Pwrite && t.file == DB)
-            .map(|t| (t.offset, t.data_crc))
+            .filter(|t| t.index >= before)
+            .map(|t| (t.file, t.kind, t.offset, t.len, t.data_crc))
             .collect();
-        assert_eq!(seq.len(), writes, "the same image produced a different number of writes");
+        let db_writes =
+            seq.iter().filter(|(f, k, ..)| f == DB && *k == OpKind::Pwrite).count();
+        assert_eq!(db_writes, writes, "the same image produced a different number of page writes");
         sequences.push(seq);
     }
     assert_eq!(sequences[0], sequences[1], "recovery wrote a different sequence on run 2");
@@ -485,8 +527,11 @@ fn recovery_itself_writes_the_same_sequence_three_times() {
 // Exit criterion 2: two different seeds produce different fault points.
 // ---------------------------------------------------------------------------------------------
 
-/// **Proves the seed is read.** Without this a `SimStorage` that ignored its seed entirely would
-/// still pass every determinism assertion above — identical runs are trivially identical.
+/// **Proves the seed is read.**
+///
+/// Breaking shape: a `SimStorage` that ignores its seed. Every determinism assertion above would
+/// still pass — identical runs are trivially identical — so "reproducible" would mean nothing more
+/// than "always crashes in the same one place", and a sweep over one point is not a sweep.
 #[test]
 fn two_different_seeds_crash_in_different_places() {
     let census = fabric(None, Durability::WriteThrough);
@@ -580,75 +625,81 @@ fn sweep(durability: Durability, seed: u64) -> Tally {
     // reported success.
     for &n in &points {
         for tear in [false, true] {
-        let plan = FaultPlan::at_shaped(n, seed, tear);
-        let live = fabric(Some(plan), durability);
-        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| workload(&live)));
-        assert!(
-            ran.is_ok(),
-            "the workload PANICKED with a fault at operation {n} ({:?}). A durable-IO error must \
-             come back as an error, not as a process that stops existing.",
-            live.fired()
-        );
-        let fired = live
-            .fired()
-            .unwrap_or_else(|| panic!("operation {n} was listed as faultable but nothing fired"));
-        match fired.kind {
-            FaultKind::TearWrite => {
-                tally.torn += 1;
-                assert!(
-                    fired.kept > 0 && fired.kept < fired.len,
-                    "a tear at operation {n} kept {} of {} bytes, which is not a tear",
-                    fired.kept,
-                    fired.len
+            let plan = FaultPlan::at_shaped(n, seed, tear);
+            let live = fabric(Some(plan), durability);
+            let ran = std::panic::catch_unwind(AssertUnwindSafe(|| workload(&live)));
+            assert!(
+                ran.is_ok(),
+                "the workload PANICKED with a fault at operation {n} ({:?}). A durable-IO error \
+                 must come back as an error, not as a process that stops existing.",
+                live.fired()
+            );
+            let fired = live.fired().unwrap_or_else(|| {
+                panic!("operation {n} was listed as faultable but nothing fired")
+            });
+            // A durable-IO fault must reach the caller. Every operation in the workload is behind a
+            // `?`, so a run that reports success while the fabric refused an operation means someone
+            // dropped an error on the floor — which is how an acknowledged commit loses data.
+            if let Ok(Ok(_)) = &ran {
+                panic!(
+                    "the workload reported SUCCESS with a fault at operation {n} ({fired:?}); a \
+                     durable-IO error was swallowed"
                 );
             }
-            FaultKind::DropWrite => tally.dropped += 1,
-            FaultKind::FailSync => tally.failed_sync += 1,
-            FaultKind::DropSetLen => tally.dropped_set_len += 1,
-        }
+            match fired.kind {
+                FaultKind::TearWrite => {
+                    tally.torn += 1;
+                    assert!(
+                        fired.kept > 0 && fired.kept < fired.len,
+                        "a tear at operation {n} kept {} of {} bytes, which is not a tear",
+                        fired.kept,
+                        fired.len
+                    );
+                }
+                FaultKind::DropWrite => tally.dropped += 1,
+                FaultKind::FailSync => tally.failed_sync += 1,
+                FaultKind::DropSetLen => tally.dropped_set_len += 1,
+            }
 
-        // The machine reboots with only what survived, and nothing faults from here on.
-        let rebooted = live.restart();
-        let what = format!("fault at op {n}: {fired:?}");
-        let after = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            reboot_and_recover(&rebooted, base.dir_root)
-        }));
-        let after = match after {
-            Ok(a) => a,
-            Err(_) => panic!("recovery PANICKED after {what}"),
-        };
-        if after.commit_durable {
-            tally.commit_durable += 1;
-        }
-        match check_invariants(&after, &what) {
-            "all rows" => tally.all_rows += 1,
-            "first only" => tally.first_only += 1,
-            "empty" => tally.empty += 1,
-            _ => {
-                tally.refused += 1;
-                if let Err(e) = &after.outcome {
-                    tally.refusals.push((n, fired.kind, e.clone()));
+            // The machine reboots with only what survived, and nothing faults from here on.
+            let rebooted = live.restart();
+            let what = format!("fault at op {n} ({}): {fired:?}", if tear { "tearing" } else { "dropping" });
+            let after = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                reboot_and_recover(&rebooted, base.dir_root)
+            })) {
+                Ok(a) => a,
+                Err(_) => panic!("recovery PANICKED after {what}"),
+            };
+            if after.commit_durable {
+                tally.commit_durable += 1;
+            }
+            match check_invariants(&after, &what) {
+                "all rows" => tally.all_rows += 1,
+                "first only" => tally.first_only += 1,
+                "empty" => tally.empty += 1,
+                _ => {
+                    tally.refused += 1;
+                    if let Err(e) = &after.outcome {
+                        tally.refusals.push((n, fired.kind, e.clone()));
+                    }
                 }
             }
-        }
 
-        // Recovery must be idempotent: a crash during recovery means it runs again next boot.
-        if after.outcome.is_ok() {
-            let twice = reboot_and_recover(&rebooted, base.dir_root);
-            assert_eq!(
-                after.outcome.as_ref().ok().map(|r| r.len()),
-                twice.outcome.as_ref().ok().map(|r| r.len()),
-                "recovery run twice gave two different databases after {what}: {:?} then {:?}",
-                after.outcome,
-                twice.outcome
-            );
-        }
+            // **Recovery must be idempotent**, because a crash during recovery means it runs again
+            // at the next boot. Compared row by row, not by count: two databases with the same
+            // number of different rows is the failure a length check cannot see.
+            if after.outcome.is_ok() {
+                let twice = reboot_and_recover(&rebooted, base.dir_root);
+                check_invariants(&twice, &format!("{what}, recovered twice"));
+                assert_eq!(
+                    after.outcome.as_ref().ok(),
+                    twice.outcome.as_ref().ok(),
+                    "recovery run twice gave two different databases after {what}"
+                );
+            }
         }
     }
 
-    // Anti-vacuity, and the reason a green run here means something. Every fault kind fired at least
-    // once, and the sweep saw a database that kept its rows AND one that had nothing to keep — so
-    // the invariants were evaluated on both branches rather than skipped.
     let mut by_reason: BTreeMap<(FaultKind, String), Vec<u64>> = BTreeMap::new();
     for (n, kind, why) in &tally.refusals {
         by_reason.entry((*kind, why.clone())).or_default().push(*n);
@@ -698,6 +749,11 @@ fn recovery_holds_at_every_fault_point_write_through() {
 
 /// The same sweep against the harsher model: writes sit in a volatile cache and a crash loses
 /// everything not flushed. Strictly more is lost at every point than under `WriteThrough`.
+///
+/// Breaking shape: a crash between a commit and the next checkpoint's fsync. The rows are in the log
+/// and nowhere else, so recovery has to rebuild every page of them from the log — including pages the
+/// file never grew far enough to contain. Under `WriteThrough` that path is barely taken, because the
+/// page writes are already durable.
 ///
 /// This one is not redundant. It is the model in which `checkpoint`'s ordering — flush the log, write
 /// the pages, **fsync the pages**, only then discard the log — is the difference between a recoverable
@@ -775,8 +831,12 @@ fn flush_all_writes_pages_in_ascending_page_id_order() {
 // The fabric's own guards. A harness nobody has checked is not evidence.
 // ---------------------------------------------------------------------------------------------
 
-/// A torn write must land a *prefix* and nothing more, and the run must be over. If the fabric let
-/// the workload keep writing after a tear it would be simulating a bad disk, not a crash.
+/// A torn write must land a *prefix* and nothing more, and the run must be over.
+///
+/// Breaking shape: a fabric that keeps serving operations after the fault. It would be simulating a
+/// disk that dropped one write and carried on — a bad disk, not a dead process — and every later
+/// write in the workload would reach the image, so the surviving bytes would be a state no crash can
+/// produce. Every "recovery held" result would then be about a database that never existed.
 #[test]
 fn a_torn_write_lands_a_prefix_and_ends_the_run() {
     let census = fabric(None, Durability::WriteThrough);
@@ -816,8 +876,11 @@ fn a_torn_write_lands_a_prefix_and_ends_the_run() {
 }
 
 /// Anti-vacuity for the whole file: with **no** fault the workload completes, recovery finds every
-/// row, and nothing was refused. If this failed, every "recovery held" above would be the harness
-/// refusing to do anything.
+/// row, and nothing was refused.
+///
+/// Breaking shape: a workload or a fabric that fails for a reason unrelated to any injected fault. If
+/// this failed, every "recovery held" above would be the harness declining to do anything and calling
+/// the refusal an acceptable outcome.
 #[test]
 fn with_no_fault_the_workload_completes_and_every_row_comes_back() {
     let f = fabric(None, Durability::WriteThrough);
@@ -851,6 +914,9 @@ fn with_no_fault_the_workload_completes_and_every_row_comes_back() {
 
 /// `SyncOnly` must be the harsher model, not a differently-worded `WriteThrough`. Forced on purpose:
 /// write without syncing, and the bytes must not be in the surviving image.
+///
+/// Breaking shape: a `Durability` enum that both arms treat the same. The `SyncOnly` sweep would then
+/// be a second copy of the `WriteThrough` one, reported as twice the coverage.
 #[test]
 fn under_sync_only_an_unflushed_write_does_not_survive() {
     let f = fabric(None, Durability::SyncOnly);
@@ -1010,4 +1076,79 @@ fn a_torn_table_page_is_served_as_a_row_that_was_never_written() {
         "known gap: a table page torn at operation {op} put {bogus} row(s) that were never written \
          into a successful scan"
     );
+}
+
+fn three_column_schema() -> Schema {
+    Schema::new(vec![
+        Column { name: "id".to_string(), data_type: DataType::Integer, nullable: false },
+        Column { name: "age".to_string(), data_type: DataType::Integer, nullable: false },
+    ])
+}
+
+/// **Breaking shape: more than one table.**
+///
+/// `Catalog::persist` iterated `tables.values()` and `rebuild_indexes` iterated `tables.values_mut()`,
+/// both `HashMap`s. With one table there is nothing to reorder. With three there is, and the second
+/// case is the worse one: `rebuild_indexes` frees every index tree and builds a fresh one, so the
+/// iteration order decides **which page id each table's index gets**, and therefore every byte written
+/// from that point on. Recovery ran it, so two recoveries of one crash produced two different
+/// databases — both correct, neither comparable with the other, which is what a crash sweep has to do.
+///
+/// Three separate runs here means three separately-seeded `HashMap`s in three separate processes'
+/// worth of state, which is what makes the comparison capable of failing.
+#[test]
+fn the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run() {
+    let mut traces = Vec::new();
+    let mut digests = Vec::new();
+    for run in 0..3 {
+        let f = fabric(None, Durability::WriteThrough);
+        let first_catalog_page = {
+            let db = open(&f).expect("open");
+            let mut catalog = Catalog::create(db.bp.clone()).expect("catalog");
+            // Deliberately not in name order, so a sort has something to do.
+            for name in ["zulu", "alpha", "mike"] {
+                catalog
+                    .create_table(name.to_string(), three_column_schema())
+                    .expect("create table");
+            }
+            catalog.create_index("alpha", "age").expect("index on alpha");
+            catalog.create_index("mike", "age").expect("index on mike");
+            catalog.persist().expect("persist");
+            db.bp.flush_all().expect("flush");
+            db.bp.disk_manager.sync().expect("sync");
+            catalog.first_catalog_page_id
+        };
+
+        // Reboot and rebuild, which is what recovery does.
+        let rebooted = f.restart();
+        let db = open(&rebooted).expect("reopen");
+        let before = rebooted.op_count();
+        let mut catalog = Catalog::open(db.bp.clone(), first_catalog_page).expect("reopen catalog");
+        assert_eq!(catalog.tables.len(), 3, "the catalog did not come back with its three tables");
+        rebuild_indexes(&mut catalog, &db.bp).expect("rebuild_indexes");
+        db.bp.flush_all().expect("flush");
+        db.bp.disk_manager.sync().expect("sync");
+
+        let seq: Vec<(String, u64, usize, u32)> = rebooted
+            .trace()
+            .into_iter()
+            .filter(|t| t.index >= before && t.kind == OpKind::Pwrite)
+            .map(|t| (t.file, t.offset, t.len, t.data_crc))
+            .collect();
+        assert!(
+            seq.len() >= 6,
+            "run {run}: rebuilding three tables' indexes wrote only {} pages, so an ordering bug \
+             could not show and this assertion would be vacuous",
+            seq.len()
+        );
+        traces.push(seq);
+        digests.push(rebooted.image_digest());
+    }
+    assert_eq!(
+        traces[0], traces[1],
+        "run 1 wrote the rebuilt catalog and indexes in a different order from run 0"
+    );
+    assert_eq!(traces[1], traces[2], "run 2 differed from run 1");
+    assert_eq!(digests[0], digests[1], "run 1 produced a different database image from run 0");
+    assert_eq!(digests[1], digests[2], "run 2 produced a different image from run 1");
 }

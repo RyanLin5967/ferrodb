@@ -367,9 +367,7 @@ impl SimFabric {
     /// Indices of every operation a fault could break, in order. The sweep walks exactly this list,
     /// so no faultable point is skipped and no point is wasted on a read.
     pub fn faultable_ops(&self) -> Vec<u64> {
-        self.state
-            .lock()
-            .unwrap()
+        self.lock()
             .trace
             .iter()
             .filter(|o| o.kind.faultable())
@@ -407,9 +405,7 @@ impl SimFabric {
 
     /// The bytes that survived the crash, per file.
     pub fn durable_image(&self) -> BTreeMap<String, Vec<u8>> {
-        self.state
-            .lock()
-            .unwrap()
+        self.lock()
             .files
             .iter()
             .map(|(n, f)| (n.clone(), f.durable.clone()))
