@@ -836,6 +836,9 @@ mod tests {
             table: "customers".into(),
             columns: Arc::new(vec!["id".into(), "name".into(), "ssn".into()]),
             op,
+            // B5 added attribution to the event; this fixture predates it and is about
+            // egress policy, not who wrote the row.
+            writer: None,
         }
     }
 
@@ -958,6 +961,9 @@ mod tests {
             table: "audit_log".into(),
             columns: Arc::new(vec!["id".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
+            // B5 added attribution to the event; this fixture predates it and is about
+            // egress policy, not who wrote the row.
+            writer: None,
         };
         let r = to_json_line(&e, &analytics()).expect_err("an undecided table was rendered");
         assert_eq!(r.table, "audit_log");
@@ -1050,6 +1056,9 @@ mod tests {
             table: "customers".into(),
             columns: Arc::new(vec!["id".into()]),
             op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
+            // B5 added attribution to the event; this fixture predates it and is about
+            // egress policy, not who wrote the row.
+            writer: None,
         };
         // Column list published; declared shape entirely denied.
         let mismatched = ChangeEvent {

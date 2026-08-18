@@ -253,7 +253,13 @@ fn stream_two_pumps(early_identity: bool) -> (usize, usize, Vec<Option<String>>)
     d.sql("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER NOT NULL);");
     let writer = a_run(1, "restock-agent", "run-42", "2026-05", "top up everything below reorder");
 
-    let streamer = FeedStreamer::new(LogicalDecoder::new(&d.catalog));
+    // B7 gave every render path a publication. This feed is about attribution, not egress
+    // policy, so it publishes everything - `unrestricted()` is the identity policy, not a
+    // weakening of one.
+    let streamer = FeedStreamer::new(
+        LogicalDecoder::new(&d.catalog),
+        ferrodb::replication::publication::Publication::unrestricted(),
+    );
     let mut cursor = FeedStreamer::start_cursor(&d.wal);
     let mut delivered_through = 0u64;
 

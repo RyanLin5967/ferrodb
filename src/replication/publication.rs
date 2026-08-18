@@ -797,6 +797,9 @@ mod tests {
             table: table.into(),
             columns: Arc::new(columns.iter().map(|c| c.to_string()).collect()),
             op,
+            // B5 added attribution to the event; this fixture predates it and is about
+            // egress policy, not who wrote the row.
+            writer: None,
         }
     }
 

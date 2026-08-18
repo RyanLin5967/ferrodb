@@ -146,7 +146,14 @@ impl Db {
         assert!(!decoded.events.is_empty(), "nothing to serialise; the test would be vacuous");
         let path = self.dir.path().join("feed.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        write_feed(&decoded.events, &mut f).expect("write feed");
+        // B7 gave the render path a publication. This test is about attribution and retraction,
+        // not egress policy, so it publishes everything.
+        write_feed(
+            &decoded.events,
+            &ferrodb::replication::publication::Publication::unrestricted(),
+            &mut f,
+        )
+        .expect("write feed");
         path
     }
 }
