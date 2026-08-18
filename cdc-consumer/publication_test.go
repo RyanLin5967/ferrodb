@@ -9,6 +9,7 @@ package main
 // the same shape passing when the policy allows it.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -485,5 +486,41 @@ func TestParsePublicationHandlesExclusions(t *testing.T) {
 		} else if !strings.Contains(err.Error(), c.want) {
 			t.Fatalf("%s: refused, but not by the expected guard: %v", c.name, err)
 		}
+	}
+}
+
+// **I11 — a writer-bearing event must survive a publication, and it did not.**
+//
+// Breaking shape: B5 added a top-level `writer` object to the feed. B7 added `envelopeKeys`, an
+// allowlist of the feed's top-level keys, and `policeRawLine` refuses an unknown one by name. The two
+// lanes were built in parallel against the same base, so neither suite ever saw the other's change:
+// once both are merged, EVERY attributed event fails the whole line under ANY publication, and
+// `validate`, `sink`, `diff` and `follow` all land nothing.
+//
+// The lanes did not catch this because B5's tests pass no publication (so `activePublication` is nil
+// and nothing is enforced) and B7's tests emit no writer.
+func TestAnAttributedEventSurvivesAPublication(t *testing.T) {
+	withPolicy(t, policy)
+	w, err := json.Marshal(writerJSON(3, "restock-agent", "run-123", "claude-opus", "2026-09"))
+	if err != nil {
+		t.Fatalf("the test's own writer does not marshal: %v", err)
+	}
+	line := `{"table":"customers","op":"INSERT","txn":1,"lsn":10,"commit_lsn":20,` +
+		`"commit_end_lsn":21,"writer":` + string(w) + `,"before":null,"after":{"id":1,"name":"ada"}}`
+	if _, err := decodeLine(line, 1); err != nil {
+		t.Fatalf("an attributed event was refused under a publication that publishes every column "+
+			"it carries: %v", err)
+	}
+}
+
+// Anti-vacuity: admitting `writer` must not have opened the envelope to anything else. If this stops
+// failing, the allowlist has become a denylist and the guard is gone.
+func TestAnUnknownTopLevelKeyIsStillRefused(t *testing.T) {
+	withPolicy(t, policy)
+	line := `{"table":"customers","op":"INSERT","txn":1,"lsn":10,"commit_lsn":20,` +
+		`"commit_end_lsn":21,"smuggled":{"ssn":"111-22-3333"},"before":null,` +
+		`"after":{"id":1,"name":"ada"}}`
+	if _, err := decodeLine(line, 1); err == nil {
+		t.Fatal("an unknown top-level key was accepted; a denied column can travel in it")
 	}
 }

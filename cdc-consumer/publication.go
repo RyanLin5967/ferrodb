@@ -381,6 +381,21 @@ func (p *Publication) checkShape(e *Event, n int) error {
 var envelopeKeys = map[string]bool{
 	"table": true, "op": true, "txn": true, "lsn": true,
 	"commit_lsn": true, "commit_end_lsn": true, "before": true, "after": true,
+	// `writer` (B5): run identity for the transaction that produced the event. Admitted here because
+	// the allowlist is by design a list of keys this consumer can REASON about, and it can: the
+	// writer object is a closed set validated by `checkWriter`, which refuses an unknown key inside
+	// it and carries the prompt-leak guard (`prompt_sha256`, never the prompt). Nesting under
+	// `writer` is therefore checked, not merely tolerated.
+	//
+	// Left out, this refuses every attributed event under every publication and lands nothing -
+	// `validate`, `sink`, `diff` and `follow` alike. Neither lane's suite could see it: B5's tests
+	// pass no publication, and B7's emit no writer.
+	//
+	// STILL UNDECIDED, deliberately: whether writer identity is itself subject to the publication.
+	// B7's own principle - unnamed means withheld - argues that agent/run/model should be maskable,
+	// and `model_version` is what B5's retract keys on. Admitting the key does not settle that; it
+	// stops the feed being wholly broken while the question is open.
+	"writer": true,
 }
 
 // policeRawLine enforces the structural rules a policy-checked line must satisfy, reading the raw

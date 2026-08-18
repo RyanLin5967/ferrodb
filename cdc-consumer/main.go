@@ -276,6 +276,7 @@ func decodeLine(line string, n int) (*Event, error) {
 	}
 	if err := activePublication.checkShape(&e, n); err != nil {
 		return nil, err
+	}
 	if e.Writer != nil {
 		// Re-read the writer as raw keys. The struct above cannot answer "what else was in there",
 		// and that is exactly the question the prompt-leak guard has to ask.
