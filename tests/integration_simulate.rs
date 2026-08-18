@@ -233,6 +233,12 @@ fn forking_k_candidates_copies_zero_pages_and_the_trunk_really_had_pages_to_copy
         report.pages_after_fork.unwrap_or(0) as i64 - trunk_pages as i64
     );
 
+    println!(
+        "MEASURED (this machine, this run): live pages {} before 5 forks, {} after",
+        report.pages_before_fork.unwrap(),
+        report.pages_after_fork.unwrap()
+    );
+
     // Zero-copy is only correct if the children can still READ the base. A fork that copies
     // nothing and sees nothing would satisfy the count while failing the point.
     for c in &report.candidates {
@@ -269,6 +275,15 @@ fn k_candidates_cost_k_path_copies_not_k_database_copies() {
         written > 0,
         "5 candidates each wrote a row and allocated no pages; nothing was mirrored onto their \
          trees and this test would prove nothing"
+    );
+    // Printed, not only asserted: the number is the claim, and a claim nobody can read is one
+    // nobody can check. `cargo test --test integration_simulate -- --nocapture` shows it.
+    println!(
+        "MEASURED (this machine, this run): trunk = {trunk_pages} pages; 5 candidates each \
+         writing 1 row cost {written} pages in total, {:.1} per candidate; one full copy of the \
+         trunk would be {trunk_pages} and five would be {}",
+        written as f64 / 5.0,
+        trunk_pages * 5
     );
     assert!(
         written < trunk_pages,
@@ -685,19 +700,36 @@ fn the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_re
     let baseline = db.pages();
     assert!(baseline > 1, "the baseline is {baseline} page(s); the measurement would be vacuous");
 
-    // Six candidates, one admitted. Nobody ever calls ABANDON on the other five.
-    let plan = plan_taking(&[1, 1, 1, 1, 1, 1], "qty >= 0")
-        .admit(AdmitPolicy::AtMost(1))
+    // Six candidates each taking 8 from 20 under `qty >= 0`, admitting as many as compose. Two
+    // fit; the other four are re-evaluated, REFUSED, and left exactly where they are. Nobody ever
+    // calls ABANDON on any of them.
+    //
+    // The shape matters. An earlier version of this test used `ADMIT 1`, which meant the five
+    // losers were never re-evaluated at all — so a mutant that routed a refused candidate to
+    // quarantine (taking it out of `live_branches`, and therefore out of the lease scan, forever)
+    // left this test green. Every loser here is one the admission pass actually refused.
+    let plan = plan_taking(&[8, 8, 8, 8, 8, 8], "qty >= 0")
+        .admit(AdmitPolicy::All)
         .lease_millis(1_000);
     let report = db.simulate(&plan).expect("simulation");
-    assert_eq!(report.admitted().len(), 1);
-    assert_eq!(report.losers().len(), 5);
+    assert_eq!(report.admitted().len(), 2, "{report}");
+    assert_eq!(report.losers().len(), 4);
+    assert!(
+        report.losers().iter().all(|l| l.refused_after_recheck()),
+        "a loser here must have been refused BY the re-check, or the reclamation claim below is \
+         only about candidates nothing ever looked at"
+    );
 
     let during = db.pages();
     assert!(
         during > baseline,
         "the candidates wrote rows and allocated no pages ({baseline} -> {during}); there would \
          be nothing for the reaper to reclaim and this test would prove nothing"
+    );
+
+    println!(
+        "MEASURED (this machine, this run): baseline {baseline} pages (including a healthy \
+         long-lease branch), {during} with 6 candidate branches live"
     );
 
     // The negative control FIRST: an unexpired lease is left alone.
@@ -731,7 +763,7 @@ fn the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_re
     );
     // And the trunk is intact.
     assert_eq!(db.runtime.scan_rows(BranchId::TRUNK, "ballast").unwrap().len(), 400);
-    assert_eq!(db.qty(1), 19, "the one admitted candidate did not land");
+    assert_eq!(db.qty(1), 4, "the two admitted candidates did not compose (20 - 8 - 8)");
 }
 
 /// A losing candidate must NOT be quarantined, even though a production `MERGE` quarantines a
