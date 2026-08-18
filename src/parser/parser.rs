@@ -160,6 +160,34 @@ pub enum Stmt {
         table: String,
         column_name: String
     },
+    /// `CREATE FULLTEXT INDEX ix ON docs (body);` — B8.
+    ///
+    /// Same shape as `CreateIndex`, including that `index_name` is parsed and then dropped: the
+    /// catalog's identity for an index is `(table, column)`, and inventing a second identity for
+    /// full-text indexes alone would be a surface this engine cannot honour anywhere else.
+    CreateFullTextIndex {
+        index_name: String,
+        table: String,
+        column_name: String
+    },
+    /// `SEARCH docs (body) FOR 'wireless charger' TOP 5;` — B8, ranked retrieval.
+    ///
+    /// **Why this is a statement and not a `WHERE` predicate.** Retrieval is not a filter: it
+    /// returns the *best* rows, so it needs a ranking and a bound, and this SQL surface has neither
+    /// `ORDER BY` nor `LIMIT` to supply them. Expressing it as a predicate would also mean either a
+    /// new field on `Stmt::Select` or a new `BoundExpr` variant, and both are destructured
+    /// field-by-field inside `src/agent_sql/` and `src/tel/` — a retrieval feature is not a reason
+    /// to reach into the merge engine.
+    ///
+    /// `TOP` is optional; when it is absent the operator uses its own default bound
+    /// (`execution::fulltext_search::DEFAULT_TOP_K`), which is the honest reading of "there is no
+    /// LIMIT here": a bound still exists, so it is named rather than implied.
+    Search {
+        table: String,
+        column_name: String,
+        query: String,
+        top_k: Option<usize>,
+    },
     Join {
         table: String,
         on: Expr,
@@ -268,13 +296,18 @@ impl Parser {
             let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
             self.consume(TokenType::Semicolon, "expected ;")?;
             return Ok(Stmt::DropTable { table })
+        } else if self.match_token(&[TokenType::Search]) {
+            return self.parse_search()
         } else if self.match_token(&[TokenType::Create]){
             if self.match_token(&[TokenType::Index]) {
                 return self.parse_create_index()
+            } else if self.match_token(&[TokenType::Fulltext]) {
+                self.consume(TokenType::Index, "expected INDEX after FULLTEXT")?;
+                return self.parse_create_fulltext_index()
             } else if self.match_token(&[TokenType::Table]) {
                 return self.parse_create_table()
             } else {
-                return Err(Parser::error(self.peek(), "expected TABLE or INDEX after CREATE".into()));
+                return Err(Parser::error(self.peek(), "expected TABLE, INDEX or FULLTEXT INDEX after CREATE".into()));
             }
         } else {
             if let Some(e) = self.unsupported_here() {
@@ -552,6 +585,57 @@ impl Parser {
         self.consume(TokenType::RightParen, "expected )")?;
         self.consume(TokenType::Semicolon, "expected ;")?;
         Ok(Stmt::CreateIndex { index_name, table, column_name })
+    }
+
+    // CREATE FULLTEXT INDEX index_name ON table (col)   — B8. `CREATE` and `FULLTEXT INDEX` are
+    // already consumed. Deliberately the same token-for-token shape as `parse_create_index` above,
+    // so the only thing a reader has to learn is the one extra word.
+    pub fn parse_create_fulltext_index(&mut self) -> Result<Stmt, FerroError> {
+        let index_name = self.consume(TokenType::Identifier, "expected index name")?.lexeme;
+        if !self.match_token(&[TokenType::On]) {
+            return Err(Parser::error(self.peek(), "expected ON".into()));
+        }
+
+        let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+        self.consume(TokenType::LeftParen, "expected (")?;
+        let column_name = self.consume(TokenType::Identifier, "expected column name")?.lexeme;
+        if self.check(TokenType::Comma) {
+            return Err(Parser::error(self.peek(), "a full-text index covers one column; multi-column full-text indexes are not supported".into()));
+        }
+        self.consume(TokenType::RightParen, "expected )")?;
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::CreateFullTextIndex { index_name, table, column_name })
+    }
+
+    // SEARCH table (col) FOR 'query text' [TOP k]   — B8. `SEARCH` is already consumed.
+    pub fn parse_search(&mut self) -> Result<Stmt, FerroError> {
+        let table = self.consume(TokenType::Identifier, "expected table name")?.lexeme;
+        self.consume(TokenType::LeftParen, "expected ( and the name of a full-text indexed column")?;
+        let column_name = self.consume(TokenType::Identifier, "expected column name")?.lexeme;
+        if self.check(TokenType::Comma) {
+            return Err(Parser::error(self.peek(), "SEARCH reads one full-text indexed column".into()));
+        }
+        self.consume(TokenType::RightParen, "expected )")?;
+        if !self.match_token(&[TokenType::For]) {
+            return Err(Parser::error(self.peek(), "expected FOR followed by the quoted search text".into()));
+        }
+        let query = self.consume(TokenType::String, "expected the search text in single quotes")?.lexeme;
+
+        let mut top_k = None;
+        if self.match_token(&[TokenType::Top]) {
+            let k_token = self.consume(TokenType::Number, "expected a row count after TOP")?;
+            let k: usize = k_token.lexeme.parse().map_err(|_| {
+                Parser::error(k_token.clone(), format!("TOP takes a whole number of rows, not '{}'", k_token.lexeme))
+            })?;
+            // Refused here rather than returning nothing: `TOP 0` reads like a query and answers
+            // like an empty table, which is the one answer a caller cannot tell from "no matches".
+            if k == 0 {
+                return Err(Parser::error(k_token, "TOP must be at least 1; a bound of 0 rows would return nothing whatever the data says".into()));
+            }
+            top_k = Some(k);
+        }
+        self.consume(TokenType::Semicolon, "expected ;")?;
+        Ok(Stmt::Search { table, column_name, query, top_k })
     }
 
     pub fn parse_analyze(&mut self) -> Result<Stmt, FerroError> {

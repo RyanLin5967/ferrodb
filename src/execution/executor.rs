@@ -88,6 +88,18 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             txn.checkpoint()?;
             return Ok(Outcome::Ok)
         }
+        // B8. Same three steps as CREATE INDEX above, for the same reasons: DDL inside a
+        // transaction is refused, and the checkpoint is what makes the new index durable — the
+        // catalog is written outside the WAL, so without it the tree exists and the record of
+        // where it is does not.
+        Stmt::CreateFullTextIndex { table, column_name, .. } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
+            catalog.create_fulltext_index(&table, &column_name)?;
+            txn.checkpoint()?;
+            return Ok(Outcome::Ok)
+        }
         Stmt::CreateTable { table, columns } => {
             if session.current.is_some() {
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
