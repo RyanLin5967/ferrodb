@@ -11,6 +11,37 @@
 //! termination. That is strong evidence and it is not the same claim, so it is written down
 //! rather than rounded up.
 
+//! ## Is this suite load-bearing? — the fire-check record
+//!
+//! Every guard below was checked by removing it and watching these tests fail. Each mutant was
+//! confirmed to **compile** first, because a mutant that does not build prints nothing and looks
+//! exactly like a surviving one. Run 2026-08-18; the mutations are one-line edits, listed here so
+//! the next reader can repeat any of them in a minute rather than trusting this paragraph.
+//!
+//! | # | mutation | what died |
+//! |---|----------|-----------|
+//! | 1 | `types::encode_value` always answers in text | asyncpg + both wire clients: binary column decoded as text |
+//! | 2 | stop appending the `;` the parser requires | all five wire tests: every statement fails `expected ;` |
+//! | 3 | answer `Flush` with `ReadyForQuery` | asyncpg + wire clients hang, then time out |
+//! | 4 | drop the skip-until-`Sync` state | wire client: the `Execute` behind a failed `Bind` runs anyway |
+//! | 5 | re-run a portal on every `Execute` | wire client: a suspended portal restarts and repeats row 1 |
+//! | 6 | splice parameters into SQL text, quoting `'` as `''` | asyncpg: the hostile parameter tokenises |
+//! | 7 | `numeric` drops its display scale | asyncpg: `1.50` comes back as `1.5` |
+//! | 8 | serve connections one at a time again | the concurrency test and asyncpg's pool |
+//! | 9 | describe one column fewer than the row has | every wire test, with the server's own refusal |
+//! | 10 | accept any `client_encoding` | wire client: `LATIN1` accepted |
+//! | 11 | let the txn normaliser rewrite `BEGIN AGENT SESSION` | agent isolation: the branch write lands on main |
+//! | 12 | accept every transaction option | wire client: `SERIALIZABLE` accepted |
+//!
+//! Cases 5 and 11 are the ones worth noticing. Only the *hand-written* client caught 5 — asyncpg's
+//! cursor happens to drain a portal in one `Execute`, so the real driver could not see it — and
+//! only the *agent* test caught 11. Neither would have been found by the other half of the suite,
+//! which is the argument for keeping both.
+//!
+//! The anti-vacuity half: with no mutation applied, all six tests here pass, and so does the rest
+//! of the suite. Several mutations left four of the six passing, which is what makes them evidence
+//! about a specific guard rather than about the harness.
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
