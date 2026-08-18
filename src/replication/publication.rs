@@ -40,6 +40,17 @@
 //! The asymmetry is the point. Withholding a column still delivers a row a consumer can apply.
 //! There is no such thing as delivering a row of a table nobody has decided about.
 //!
+//! # `exclude`, and why a refusal needed an alternative
+//!
+//! A third form, `exclude <table>`, drops that table's changes and lets the feed carry on. It is not
+//! a hole in the allowlist — it is the operator making the decision that a refusal says has not been
+//! made — and without it the guard is barely deployable. An adversarial review of this lane found why:
+//! a refusal stops the cursor, a stopped cursor is a [`super::stream::Subscription`] whose pin sits on
+//! that commit, and `WalManager::truncate` reclaims nothing at or above the oldest pin. So an
+//! undecided table is not a quiet feed, it is a **log that grows without bound** until someone edits
+//! the policy — and the only edit the language offered was to publish the table that was being kept
+//! in. `exclude` is the other edit, and the refusal message now names both.
+//!
 //! # A refusal is not free, and it must not be silent
 //!
 //! Refusing an event stalls the feed at that event, on purpose. [`super::stream::FeedStreamer::pump`]
@@ -59,22 +70,36 @@
 //!
 //! ```text
 //! publication analytics
-//! # everything from a # to end of line is a comment
+//! # a line whose first non-blank character is # is a comment
 //! inventory: id, qty
 //! orders: id, total
 //! ```
 //!
-//! **The parser can only ever produce a smaller allowlist than its author intended, never a larger
-//! one**, and that property is what makes a line-oriented format safe for a security guard.
-//! Splitting on `,` cannot invent a name that contains a comma, so a column whose name holds a
-//! comma or a colon — this database permits one, and [`super::jsonl`] has a test with a quote in a
-//! column name — simply fails to match anything in the set and is withheld. Every way of
-//! mis-parsing this file lands on "does not ship", which is the direction that cannot hurt anyone.
+//! **Every name it accepts is exactly the name in the file**, and that property is what makes a
+//! line-oriented format usable as a security guard. It rests on two things rather than on hope:
 //!
-//! Refused at parse time, rather than at the first event: a file with no `publication` header, a
-//! file that names no table, a table named twice, a table with an empty column list, a duplicated
-//! column, or a line that is neither a comment nor `table: cols`. A publication that is wrong is a
-//! configuration error, and the moment to say so is when it is loaded.
+//! * every table and column name this database can create is an identifier — the scanner accepts
+//!   `[A-Za-z0-9_]` and there are no quoted identifiers (`src/parser/scanner.rs`, `identifier`) — and
+//!   this parser accepts exactly that set and **refuses** anything else, by name, at load time. So no
+//!   accepted name can contain a separator, and a name that contains one cannot be silently split
+//!   into something shorter that happens to match a real column.
+//! * `#` starts a comment only at the beginning of a line. This is the correction that matters, and
+//!   it was found by an adversarial review of this file rather than by writing it: with `#` honoured
+//!   mid-line, `customers: id, ssn#hash` truncated to `customers: id, ssn` and **published `ssn`** —
+//!   a widening, in the exact column the docs here use as the thing that must never leave, and one
+//!   both this parser and the Go one made identically, so reading the file twice could not see it.
+//!
+//! An earlier version of this doc claimed instead that mis-parsing "can only ever narrow" because
+//! splitting on `,` cannot invent a comma. That was false in one direction and unfounded in the
+//! other: the `#` case widens, and the justification rested on this database permitting a comma in a
+//! column name, which it does not — SQL cannot express such a name at all. The claim is recorded here
+//! as corrected rather than quietly replaced, because it was the stated reason for choosing the
+//! format.
+//!
+//! Refused at parse time, rather than at the first event: a file with no `publication` header, a file
+//! that names no table, a table named twice, a table with an empty column list, a duplicated column,
+//! a name that is not an identifier, or a line that is neither a comment nor `table: cols`. A
+//! publication that is wrong is a configuration error, and the moment to say so is when it is loaded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -100,12 +125,19 @@ pub enum Publication {
     /// forgot to choose, because a guard that defaults to open is a guard that is on in the tests
     /// and off in production.
     Unrestricted,
-    /// An allowlist. A table that is not a key of `tables` is refused, never published; a column
-    /// that is not in its table's set is withheld.
+    /// An allowlist. A table that is in neither `tables` nor `excluded` is refused, never published;
+    /// a column that is not in its table's set is withheld.
     Allowlist {
         /// For the refusal messages, so an operator learns *which* publication refused.
         name: String,
         tables: BTreeMap<String, BTreeSet<String>>,
+        /// Tables the operator has decided **not** to publish, which is a different thing from a
+        /// table the policy has never heard of — see [`Publication::excludes`]. This exists because a
+        /// refusal is not free: it stops the feed, and a stopped feed's subscription pins the WAL, so
+        /// an undecided table is a growing log and not merely a quiet one. Without a way to say "do
+        /// not publish this and keep going", the only escape from that stall would be to publish the
+        /// very table someone was trying to keep in.
+        excluded: BTreeSet<String>,
     },
 }
 
@@ -189,6 +221,13 @@ pub enum RefusalReason {
     /// The publication says nothing about this table. Not "publish none of it" — *nothing*, which is
     /// a different claim and the reason this is a refusal rather than an empty row.
     TableNotPublished,
+    /// The publication names this table under `exclude`, and something asked to render it anyway.
+    ///
+    /// A refusal rather than a silent drop, because the paths that reach it name one table explicitly
+    /// — a snapshot of it, a dump of it — so the caller has asked for something the policy forbids and
+    /// wants to hear so. The **stream** does not reach it: [`super::stream::FeedStreamer::pump`] drops
+    /// an excluded table's events and keeps moving, which is the whole point of the form.
+    TableExcluded,
     /// The table is published but not one of the columns this event carries is, so the honest
     /// rendering of the row is `{}` — an object claiming the row has no columns at all. That is a
     /// false statement about the data rather than a redacted true one.
@@ -197,6 +236,20 @@ pub enum RefusalReason {
     /// decide about a column it cannot name, and a guard that cannot evaluate its own input must
     /// refuse rather than fall through to allow.
     UnnamedValue { index: usize },
+    /// Two of the event's columns have the same name, so a name-keyed policy cannot tell them apart.
+    ///
+    /// This is not hypothetical and it is not a hand-built shape: `CREATE TABLE t (id INTEGER, name
+    /// VARCHAR(8), name VARCHAR(8))` is accepted by this database today, `SELECT *` returns all three
+    /// values, and the binder itself calls the name ambiguous when asked for it. Found by an
+    /// adversarial review, which got a denied value all the way into a SQLite destination: the mask
+    /// decides per POSITION by looking that position's NAME up in the allowlist, both positions
+    /// answered yes, and Go's `encoding/json` keeps the LAST duplicate key — so the withheld
+    /// column's value overwrote the published one in the destination row.
+    ///
+    /// There is no declaration that fixes it: `t: id, name, name` is refused as a duplicate, and
+    /// `t: id` withholds both. So the answer is a refusal, which is what a guard owes a question it
+    /// cannot answer.
+    AmbiguousColumns { name: String },
 }
 
 impl fmt::Display for Refusal {
@@ -204,13 +257,23 @@ impl fmt::Display for Refusal {
         match &self.reason {
             RefusalReason::TableNotPublished => write!(
                 f,
-                "publication {} does not publish table {}, so its changes are refused rather than \
-                 emitted. This is an allowlist: a table it has not been told about is undecided, \
-                 not permitted. The feed will not advance past this commit until either the table \
-                 is added to the publication (with the columns that may leave) or the feed is run \
-                 with a publication that covers it — nothing is lost meanwhile, the commit is \
-                 replayed on the next pump.",
-                self.publication, self.table
+                "publication {} says nothing about table {}, so its changes are refused rather than \
+                 emitted. This is an allowlist: a table it has not been told about is undecided, not \
+                 permitted. No row is lost — the feed will not advance past this commit, and replays \
+                 it once the policy decides — but a stalled feed is not merely a quiet one: the \
+                 consumer's subscription pins the log at this commit, so the WAL cannot be reclaimed \
+                 while the stall lasts. Decide, either way: add `{}: <columns>` to publish it, or \
+                 `exclude {}` to drop its changes and keep the feed moving.",
+                self.publication, self.table, self.table, self.table
+            ),
+            RefusalReason::TableExcluded => write!(
+                f,
+                "publication {} excludes table {}, and this asked to render it anyway. A stream drops \
+                 an excluded table's changes and carries on; a snapshot or a dump names one table \
+                 explicitly, so being handed an excluded one is a caller asking for what the policy \
+                 forbids rather than a row to skip. Remove the `exclude {}` line to publish it, or do \
+                 not ask for that table.",
+                self.publication, self.table, self.table
             ),
             RefusalReason::NothingPublishable { withheld } => write!(
                 f,
@@ -222,6 +285,15 @@ impl fmt::Display for Refusal {
                 self.table,
                 withheld.join(", "),
                 self.table
+            ),
+            RefusalReason::AmbiguousColumns { name } => write!(
+                f,
+                "table {} has two columns named {}, so publication {} cannot decide about either: an \
+                 allowlist is keyed by name and these two positions share one. Refused rather than \
+                 guessed — publishing the name would ship both positions, one of which nobody \
+                 decided about, and a consumer parsing JSON keeps only one of the two values. No \
+                 publication text distinguishes them; the table itself has to.",
+                self.table, name, self.publication
             ),
             RefusalReason::UnnamedValue { index } => write!(
                 f,
@@ -253,7 +325,11 @@ impl Publication {
     /// coming from a file, because a publication that reached production naming no table would
     /// refuse every event in the feed.
     pub fn named(name: &str) -> Self {
-        Publication::Allowlist { name: name.to_string(), tables: BTreeMap::new() }
+        Publication::Allowlist {
+            name: name.to_string(),
+            tables: BTreeMap::new(),
+            excluded: BTreeSet::new(),
+        }
     }
 
     /// Publish `columns` of `table`. Chainable onto [`Publication::named`].
@@ -272,13 +348,49 @@ impl Publication {
                  unrestricted publication already publishes every column of every table. Start \
                  from Publication::named(..) to build an allowlist."
             ),
-            Publication::Allowlist { tables, .. } => {
+            Publication::Allowlist { tables, excluded, .. } => {
                 let set: BTreeSet<String> =
                     columns.into_iter().map(|c| c.as_ref().to_string()).collect();
+                excluded.remove(table);
                 tables.insert(table.to_string(), set);
             }
         }
         self
+    }
+
+    /// Exclude `table`: decided, and decided against. Chainable onto [`Publication::named`].
+    pub fn excluding(mut self, table: &str) -> Self {
+        match &mut self {
+            Publication::Unrestricted => panic!(
+                "Publication::unrestricted() cannot exclude {table}: it publishes everything by \
+                 definition. Start from Publication::named(..) to build an allowlist."
+            ),
+            Publication::Allowlist { tables, excluded, .. } => {
+                tables.remove(table);
+                excluded.insert(table.to_string());
+            }
+        }
+        self
+    }
+
+    /// Whether the operator has decided this table must **not** be published.
+    ///
+    /// Distinct from "not published" in the refusal sense, and the whole reason the form exists:
+    /// [`super::stream::FeedStreamer::pump`] drops an excluded table's events and keeps the cursor
+    /// moving, where an undecided table stops it. Always false under [`Publication::Unrestricted`].
+    pub fn excludes(&self, table: &str) -> bool {
+        match self {
+            Publication::Unrestricted => false,
+            Publication::Allowlist { excluded, .. } => excluded.contains(table),
+        }
+    }
+
+    /// Tables this publication explicitly excludes, in sorted order.
+    pub fn excluded_tables(&self) -> Vec<&str> {
+        match self {
+            Publication::Unrestricted => Vec::new(),
+            Publication::Allowlist { excluded, .. } => excluded.iter().map(String::as_str).collect(),
+        }
     }
 
     /// The publication's name, for messages. `(unrestricted)` when there is no policy, spelled with
@@ -292,10 +404,18 @@ impl Publication {
 
     /// Tables this publication names, in sorted order. Empty for [`Publication::Unrestricted`],
     /// which names none because it covers all.
+    /// Tables this publication publishes, in sorted order. Empty for [`Publication::Unrestricted`],
+    /// which names none because it covers all.
+    ///
+    /// A table whose column set is empty is **not** listed, because `check` refuses it: an accessor
+    /// that reported a table as published while every event for it was refused would put an
+    /// operator-facing report in direct contradiction with the enforced policy.
     pub fn tables(&self) -> Vec<&str> {
         match self {
             Publication::Unrestricted => Vec::new(),
-            Publication::Allowlist { tables, .. } => tables.keys().map(String::as_str).collect(),
+            Publication::Allowlist { tables, .. } => {
+                tables.iter().filter(|(_, c)| !c.is_empty()).map(|(t, _)| t.as_str()).collect()
+            }
         }
     }
 
@@ -303,9 +423,10 @@ impl Publication {
     pub fn columns_of(&self, table: &str) -> Option<Vec<&str>> {
         match self {
             Publication::Unrestricted => None,
-            Publication::Allowlist { tables, .. } => {
-                tables.get(table).map(|c| c.iter().map(String::as_str).collect())
-            }
+            Publication::Allowlist { tables, .. } => tables
+                .get(table)
+                .filter(|c| !c.is_empty())
+                .map(|c| c.iter().map(String::as_str).collect()),
         }
     }
 
@@ -317,15 +438,15 @@ impl Publication {
     pub fn parse(text: &str) -> Result<Self, FerroError> {
         let mut name: Option<String> = None;
         let mut tables: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut excluded: BTreeSet<String> = BTreeSet::new();
 
         for (i, raw) in text.lines().enumerate() {
             let lineno = i + 1;
-            let line = match raw.find('#') {
-                Some(at) => &raw[..at],
-                None => raw,
-            }
-            .trim();
-            if line.is_empty() {
+            let line = raw.trim();
+            // A comment is a WHOLE line. Honouring `#` mid-line let `t: id, ssn#hash` truncate to
+            // `t: id, ssn` and publish `ssn` — see the module docs; that is a widening, and it is the
+            // one direction this format must not have.
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             // Matched on the WORD, not on "publication " with its space: a header line whose name
@@ -347,6 +468,43 @@ impl Publication {
                 name = Some(declared.to_string());
                 continue;
             }
+            // `exclude <table>`: the operator deciding NOT to publish, which is a different thing
+            // from the policy never having heard of the table. See the module docs for why a refusal
+            // needed an alternative at all - a stalled feed pins the WAL.
+            if line == "exclude" || line.starts_with("exclude ") {
+                let table = line["exclude".len()..].trim();
+                if table.is_empty() {
+                    return Err(bad_publication(lineno, "`exclude` with no table name"));
+                }
+                if !is_identifier(table) {
+                    return Err(bad_publication(lineno, &not_an_identifier("table", table)));
+                }
+                if name.is_none() {
+                    return Err(bad_publication(
+                        lineno,
+                        &format!(
+                            "`exclude {table}` appears before any `publication <name>` header, so \
+                             there is no publication for it to belong to"
+                        ),
+                    ));
+                }
+                if tables.contains_key(table) {
+                    return Err(bad_publication(
+                        lineno,
+                        &format!(
+                            "table `{table}` is both published and excluded; one of the two lines is \
+                             a mistake and guessing which would be the wrong kind of helpful"
+                        ),
+                    ));
+                }
+                if !excluded.insert(table.to_string()) {
+                    return Err(bad_publication(
+                        lineno,
+                        &format!("table `{table}` is excluded twice"),
+                    ));
+                }
+                continue;
+            }
             let Some((table, cols)) = line.split_once(':') else {
                 return Err(bad_publication(
                     lineno,
@@ -360,6 +518,9 @@ impl Publication {
             let table = table.trim();
             if table.is_empty() {
                 return Err(bad_publication(lineno, "a column list with no table name"));
+            }
+            if !is_identifier(table) {
+                return Err(bad_publication(lineno, &not_an_identifier("table", table)));
             }
             if name.is_none() {
                 return Err(bad_publication(
@@ -385,6 +546,9 @@ impl Publication {
                         &format!("table `{table}` has an empty column between commas"),
                     ));
                 }
+                if !is_identifier(col) {
+                    return Err(bad_publication(lineno, &not_an_identifier("column", col)));
+                }
                 if !set.insert(col.to_string()) {
                     return Err(bad_publication(
                         lineno,
@@ -397,6 +561,15 @@ impl Publication {
                 // upholds is "no empty set reaches the map", and an unreachable arm that returns the
                 // same refusal is cheaper than an arm that would let one through.
                 return Err(bad_publication(lineno, &empty_column_list(table)));
+            }
+            if excluded.contains(table) {
+                return Err(bad_publication(
+                    lineno,
+                    &format!(
+                        "table `{table}` is both excluded and published; one of the two lines is a \
+                         mistake and guessing which would be the wrong kind of helpful"
+                    ),
+                ));
             }
             if tables.insert(table.to_string(), set).is_some() {
                 return Err(bad_publication(
@@ -421,13 +594,14 @@ impl Publication {
             return Err(bad_publication(
                 0,
                 &format!(
-                    "publication `{name}` names no table, so it would refuse every event in the \
-                     feed. If that is the intent, do not attach a publication at all; if it is \
-                     not, the table lines are missing"
+                    "publication `{name}` publishes no table{}, so nothing would ever be emitted. If \
+                     that is the intent, do not attach a publication at all; if it is not, the table \
+                     lines are missing",
+                    if excluded.is_empty() { "" } else { " (only exclusions)" }
                 ),
             ));
         }
-        Ok(Publication::Allowlist { name, tables })
+        Ok(Publication::Allowlist { name, tables, excluded })
     }
 
     /// Load a publication from a file.
@@ -452,6 +626,21 @@ impl Publication {
                 withheld: Vec::new(),
             });
         };
+        // **Two columns with one name cannot be decided about.** This database accepts
+        // `CREATE TABLE t (id INTEGER, name VARCHAR(8), name VARCHAR(8))`, and the mask is keyed by
+        // name, so both positions would answer the same way - shipping a position nobody decided
+        // about. Checked here rather than in `check` so the table-dump path is covered by the same
+        // decision.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for c in columns {
+            if !seen.insert(c.as_str()) {
+                return Err(Refusal {
+                    publication: self.name().to_string(),
+                    table: table.to_string(),
+                    reason: RefusalReason::AmbiguousColumns { name: c.clone() },
+                });
+            }
+        }
         let withheld: Vec<String> =
             columns.iter().filter(|c| !published.contains(c.as_str())).cloned().collect();
         if !columns.is_empty() && withheld.len() == columns.len() {
@@ -507,17 +696,26 @@ impl Publication {
     fn published_columns(&self, table: &str) -> Result<Option<&BTreeSet<String>>, Refusal> {
         match self {
             Publication::Unrestricted => Ok(None),
-            Publication::Allowlist { name, tables } => match tables.get(table) {
+            Publication::Allowlist { name, tables, excluded } => {
+                if excluded.contains(table) {
+                    return Err(Refusal {
+                        publication: name.clone(),
+                        table: table.to_string(),
+                        reason: RefusalReason::TableExcluded,
+                    });
+                }
+                match tables.get(table) {
                 // An empty set can only arrive through `publishing(t, [])`, since `parse` refuses
                 // it. Treated as the refusal it is rather than as a table with nothing to send: the
                 // two are the same policy and one message for both is one place to fix.
-                Some(cols) if !cols.is_empty() => Ok(Some(cols)),
-                _ => Err(Refusal {
-                    publication: name.clone(),
-                    table: table.to_string(),
-                    reason: RefusalReason::TableNotPublished,
-                }),
-            },
+                    Some(cols) if !cols.is_empty() => Ok(Some(cols)),
+                    _ => Err(Refusal {
+                        publication: name.clone(),
+                        table: table.to_string(),
+                        reason: RefusalReason::TableNotPublished,
+                    }),
+                }
+            }
         }
     }
 }
@@ -532,6 +730,25 @@ fn images(op: &ChangeOp) -> Vec<&[Value]> {
         ChangeOp::Update { old, new } => vec![old.as_slice(), new.as_slice()],
         ChangeOp::Schema { .. } => Vec::new(),
     }
+}
+
+/// Whether `s` is a name this database could have created: the scanner's identifier rule, which is
+/// `[A-Za-z0-9_]+` with no quoted-identifier form (`src/parser/scanner.rs`).
+///
+/// Restricting the declaration to exactly that set is what makes "the name in the file is the name
+/// being matched" true rather than hoped for: nothing the parser accepts can contain a separator, so
+/// no accepted name can be a fragment of a longer one.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn not_an_identifier(kind: &str, name: &str) -> String {
+    format!(
+        "{kind} name `{name}` is not an identifier. Names here are [A-Za-z0-9_], which is everything \
+         this database's scanner can create; anything else is refused rather than trimmed, because a \
+         name containing a separator or a `#` would otherwise be silently shortened into a DIFFERENT \
+         name that may match a real column and publish it"
+    )
 }
 
 /// The one wording for "this table publishes nothing", used by both the blank-list check and the
@@ -633,7 +850,14 @@ mod tests {
     #[test]
     fn a_publication_that_names_no_table_is_refused_at_parse() {
         let err = Publication::parse("publication p\n# nothing yet\n").expect_err("accepted");
-        assert!(format!("{err}").contains("names no table"), "wrong reason: {err}");
+        assert!(format!("{err}").contains("publishes no table"), "wrong reason: {err}");
+
+        // Exclusions alone are the same emptiness with a more misleading look: the file names tables,
+        // and publishes none of them.
+        let err = Publication::parse("publication p\nexclude t\n").expect_err("accepted");
+        let msg = format!("{err}");
+        assert!(msg.contains("publishes no table"), "wrong reason: {msg}");
+        assert!(msg.contains("only exclusions"), "the message does not say what it saw: {msg}");
     }
 
     /// An empty column list is a denial written as a permission, and the two must not look alike.
@@ -684,15 +908,17 @@ mod tests {
         assert!(msg.contains("line 3"), "the message does not locate the line: {msg}");
     }
 
-    /// **The fail-safe direction of a line-oriented format, asserted rather than asserted about.**
+    /// A name the declaration cannot express is withheld rather than published.
     ///
-    /// This database allows a column name containing a comma — `jsonl` has a test with a quote in
-    /// one. The declaration cannot express such a name, so it can never end up in the allowlist, so
-    /// the column is withheld. Every way of mis-splitting this file narrows the allowlist; none of
-    /// them widens it, which is the only property a security guard needs from its own parser.
+    /// The event here carries a column literally named `qty, secret`, which no line in the file can
+    /// name. Such a name cannot be created through SQL — the scanner's identifiers are `[A-Za-z0-9_]`
+    /// — so this is a hand-built event standing in for any name outside that set: it is not in the
+    /// published set, so it does not ship.
     ///
-    /// Breaking shape: a format where a mis-parse could *add* a name — a glob, a prefix rule, or a
-    /// regex — where a typo silently publishes a neighbouring column.
+    /// This test used to carry the claim that mis-parsing the file "can only ever narrow" the
+    /// allowlist. That was wrong — see `a_name_containing_the_comment_character_is_refused_rather
+    /// _than_shortened` for the case that widened it — and the protection is not the splitting, it is
+    /// that a non-identifier name in the FILE is now refused outright.
     #[test]
     fn a_column_name_the_format_cannot_express_is_withheld_never_published() {
         let p = Publication::parse("publication p\nt: id, qty, secret\n").unwrap();
@@ -857,15 +1083,68 @@ mod tests {
         assert!(p.tables().is_empty());
     }
 
-    /// The comment and blank-line handling, including a `#` at end of line.
+    /// Comments are WHOLE lines, and the blank-line handling.
     #[test]
-    fn comments_and_blank_lines_are_ignored() {
+    fn whole_line_comments_and_blank_lines_are_ignored() {
         let p = Publication::parse(
-            "# leading comment\n\npublication p # named here\nt: id, qty # only these two\n",
+            "# leading comment\n\n   # indented comment\npublication p\nt: id, qty\n",
         )
         .unwrap();
         assert_eq!(p.name(), "p");
         assert_eq!(p.columns_of("t"), Some(vec!["id", "qty"]));
+    }
+
+    /// **The widening this format used to have, kept as a regression test.**
+    ///
+    /// Breaking shape: `customers: id, ssn#hash` — a column whose name contains the comment
+    /// character. With `#` honoured mid-line the declaration truncated to `customers: id, ssn` and
+    /// **published `ssn`**, the column the docs here use as the example of what must never leave. Both
+    /// parsers made the same truncation, so reading the file twice could not catch it. Found by an
+    /// adversarial review, not by writing the parser.
+    ///
+    /// The fix has two halves and both are asserted: `#` starts a comment only at the start of a line,
+    /// and a name that is not an identifier is refused by name instead of being trimmed into one.
+    #[test]
+    fn a_name_containing_the_comment_character_is_refused_rather_than_shortened() {
+        let err = Publication::parse("publication p\ncustomers: id, ssn#hash\n")
+            .expect_err("a name containing # was accepted");
+        let msg = format!("{err}");
+        assert!(msg.contains("not an identifier"), "wrong reason: {msg}");
+        assert!(msg.contains("ssn#hash"), "the message does not name the offender: {msg}");
+
+        // The widening the old parser produced, asserted as absent: `ssn` must NOT be published.
+        assert!(
+            Publication::parse("publication p\ncustomers: id, ssn#hash\n").is_err(),
+            "if this ever parses again, check that `ssn` is not in the set before relaxing anything"
+        );
+
+        // Anti-vacuity: the same file with a real comment on its own line parses, and publishes
+        // exactly the two names written.
+        let p = Publication::parse("publication p\n# ssn#hash must not leave\ncustomers: id, name\n")
+            .expect("a whole-line comment was refused");
+        assert_eq!(p.columns_of("customers"), Some(vec!["id", "name"]));
+    }
+
+    /// Every name the declaration accepts is one this database could have created. Anything else is a
+    /// refusal rather than a trim, in both the table and the column position.
+    #[test]
+    fn a_name_that_is_not_an_identifier_is_refused() {
+        for decl in [
+            "publication p\nt: id, qty-2\n",
+            "publication p\nt: id, \"qty\"\n",
+            "publication p\nt able: id\n",
+            "publication p\nt: id, a b\n",
+            "publication p\ncustomers.ssn: id\n",
+        ] {
+            let err = Publication::parse(decl).unwrap_err();
+            assert!(
+                format!("{err}").contains("not an identifier"),
+                "`{decl}` was refused for the wrong reason: {err}"
+            );
+        }
+        // Anti-vacuity: underscores and digits are identifiers and must still be accepted.
+        let p = Publication::parse("publication p\naudit_log_2: id, actor_2\n").unwrap();
+        assert_eq!(p.columns_of("audit_log_2"), Some(vec!["actor_2", "id"]));
     }
 
     /// `mask_for` is the table-dump path: same allowlist, no event.
@@ -881,6 +1160,100 @@ mod tests {
         );
     }
 
+    /// **`exclude` is a decision, and it is not the same decision as silence.**
+    ///
+    /// Breaking shape: any table the policy has not been told about, which stalls the feed AND pins
+    /// the WAL at the stalled commit. Before this form existed the only escape was to publish the
+    /// table - which is the opposite of what an operator excluding it wants.
+    #[test]
+    fn an_excluded_table_is_decided_against_rather_than_undecided() {
+        let p = Publication::parse("publication analytics\ncustomers: id, name\nexclude audit_log\n")
+            .expect("a declaration with an exclusion was refused");
+        assert!(p.excludes("audit_log"), "the exclusion was not recorded");
+        assert!(!p.excludes("customers"), "a published table was reported as excluded");
+        assert!(!p.excludes("never_mentioned"), "an undecided table was reported as excluded");
+        assert_eq!(p.excluded_tables(), vec!["audit_log"]);
+        assert_eq!(p.tables(), vec!["customers"], "an excluded table is not a published one");
+
+        // Rendering one is still a refusal - the stream drops them, but a snapshot or a dump names
+        // one table explicitly and must be told it may not have it.
+        let r = p
+            .check(&event("audit_log", &["id"], insert(vec![Value::Integer(1)])))
+            .expect_err("an excluded table was rendered");
+        assert_eq!(r.reason, RefusalReason::TableExcluded);
+        let msg = format!("{r}");
+        assert!(msg.contains("excludes table audit_log"), "{msg}");
+        assert!(msg.contains("stream drops"), "the message does not distinguish the paths: {msg}");
+
+        // Anti-vacuity: the published table still publishes.
+        p.check(&event("customers", &["id", "name"], insert(vec![
+            Value::Integer(1),
+            Value::Varchar("ada".into()),
+        ])))
+        .expect("the published table was refused");
+    }
+
+    /// A table cannot be both published and excluded: guessing which line won would silently pick a
+    /// policy nobody wrote.
+    #[test]
+    fn a_table_that_is_both_published_and_excluded_is_refused_either_way_round() {
+        for decl in [
+            "publication p\nt: id\nexclude t\n",
+            "publication p\nexclude t\nt: id\n",
+        ] {
+            let err = Publication::parse(decl).unwrap_err();
+            assert!(
+                format!("{err}").contains("mistake"),
+                "`{decl}` was refused for the wrong reason: {err}"
+            );
+        }
+        let err = Publication::parse("publication p\nt: id\nexclude u\nexclude u\n").unwrap_err();
+        assert!(format!("{err}").contains("excluded twice"), "wrong reason: {err}");
+        let err = Publication::parse("publication p\nt: id\nexclude\n").unwrap_err();
+        assert!(format!("{err}").contains("no table name"), "wrong reason: {err}");
+    }
+
+    /// **Two columns with one name cannot be decided about, so the event is refused.**
+    ///
+    /// Breaking shape, and it is real SQL rather than a hand-built event:
+    /// `CREATE TABLE t (id INTEGER, name VARCHAR(8), name VARCHAR(8))` is accepted by this database
+    /// and `SELECT *` returns all three values. The mask is keyed by NAME and applied per POSITION, so
+    /// publishing `name` shipped both positions - and an adversarial review followed the denied value
+    /// into a SQLite destination, where `encoding/json` kept the last duplicate key and the withheld
+    /// value overwrote the published one.
+    ///
+    /// No declaration fixes it: `t: id, name, name` is refused as a duplicate and `t: id` withholds
+    /// both. A guard that cannot answer must refuse.
+    #[test]
+    fn two_columns_with_one_name_are_refused_rather_than_guessed() {
+        let p = Publication::parse("publication analytics\npatients: id, name\n").unwrap();
+        let e = event("patients", &["id", "name", "name"], insert(vec![
+            Value::Integer(1),
+            Value::Varchar("ada".into()),
+            Value::Varchar("000-11-2222".into()),
+        ]));
+        let r = p.check(&e).expect_err("a table with two columns of one name was published");
+        assert_eq!(r.reason, RefusalReason::AmbiguousColumns { name: "name".into() });
+        assert!(format!("{r}").contains("two columns named name"), "{r}");
+
+        // The dump path is the same decision, because it goes through the same mask.
+        let cols = vec!["id".to_string(), "name".to_string(), "name".to_string()];
+        assert_eq!(
+            p.mask_for("patients", &cols).expect_err("the dump published it").reason,
+            RefusalReason::AmbiguousColumns { name: "name".into() }
+        );
+
+        // Anti-vacuity: distinct names are fine, and an unrestricted feed is unaffected - it has no
+        // name-keyed decision to make, and refusing there would break a feed that was working.
+        p.check(&event("patients", &["id", "name"], insert(vec![
+            Value::Integer(1),
+            Value::Varchar("ada".into()),
+        ])))
+        .expect("distinct names were refused");
+        let none = Publication::unrestricted();
+        none.check(&e).expect("unrestricted refused a duplicate-named table");
+    }
+
     /// A refusal renders as an explanation with the publication, the table and what to do — a
     /// message an operator reads once, at the point the feed stalls.
     #[test]
@@ -891,7 +1264,15 @@ mod tests {
             .expect_err("not refused");
         let msg = format!("{r}");
         assert!(msg.contains("analytics") && msg.contains("audit_log"), "{msg}");
-        assert!(msg.contains("replayed"), "the message does not say the commit is not lost: {msg}");
+        assert!(msg.contains("No row is lost"), "the message does not say the commit survives: {msg}");
+        // And it must say the two things an operator needs: that a stall is not free, and what the
+        // two ways out are. The first version said only "nothing is lost meanwhile", which is true
+        // about rows and quietly false about the log - a stalled feed pins the WAL.
+        assert!(msg.contains("WAL cannot be reclaimed"), "the message hides the cost: {msg}");
+        assert!(
+            msg.contains("exclude audit_log"),
+            "the message does not offer the remedy that does NOT publish the table: {msg}"
+        );
         // And it converts into the error class a caller propagates.
         let e: FerroError = r.into();
         assert!(matches!(e, FerroError::Publication(_)), "{e:?}");

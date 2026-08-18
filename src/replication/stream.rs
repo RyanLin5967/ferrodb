@@ -79,7 +79,7 @@ use crate::wal::log::WalManager;
 use super::snapshot::SnapshotBoundary;
 
 use super::jsonl::write_feed;
-use super::logical::{Decoded, LogicalDecoder};
+use super::logical::{ChangeEvent, Decoded, LogicalDecoder};
 use super::publication::{Publication, Refusal};
 
 /// What one pump did.
@@ -117,6 +117,13 @@ pub struct Pumped {
     /// emitting nothing should be able to tell "the snapshot already had all of it" from "the feed
     /// is dropping records", and those look identical from the emitted count alone.
     pub suppressed: usize,
+    /// Events dropped because the publication **excludes** their table.
+    ///
+    /// Not a refusal and not a loss: the operator decided this table is not published, so the events
+    /// are dropped and the cursor moves past them. Counted rather than silent, because a feed that
+    /// drops records must be able to say so - "emitted 0" from an excluded table and "emitted 0"
+    /// because nothing happened are the same number and different facts.
+    pub excluded: usize,
     /// Events this pump decoded and **refused** to write, because the publication does not allow
     /// them out of the database.
     ///
@@ -267,6 +274,7 @@ impl FeedStreamer {
                 withheld: 0,
                 unresolved: 0,
                 suppressed: 0,
+                excluded: 0,
                 refused: 0,
                 refusal: None,
             });
@@ -275,17 +283,15 @@ impl FeedStreamer {
         let to = frontier.min(cursor.saturating_add(self.max_bytes));
         let decoded: Decoded = self.decoder.decode(wal, cursor, to)?;
 
-        // **The cursor rule**, and it has three parts. Two of them were missing at different times
-        // and each cost real data.
+        // **The cursor rule**, and it has FOUR parts now. Three of the four have cost real data.
         //
         // First: only past a commit that was actually decoded. An empty pump does not move.
         //
-        // Second: computed over every event that is still a candidate, *before* either filter below
-        // runs. A commit whose events were suppressed has still been seen and decided about, so the
-        // cursor must move past it; leaving it behind would make a fully-suppressed batch return the
-        // same cursor for ever and hang the loop. "Still a candidate" is the correction B7 made to
-        // this clause, which used to say "every decoded event": a refused event has NOT been decided
-        // about and is removed above, which is the whole of the fourth part.
+        // Second: computed over every event the batch DECIDED about, before the delivery filters
+        // below narrow it. A commit whose events were suppressed by the snapshot boundary, or
+        // excluded by the publication, has been seen and decided about, so the cursor must move past
+        // it; leaving it behind would make such a batch return the same cursor for ever and hang the
+        // loop.
         //
         // Third: NEVER past the earliest record of a transaction still open. Without this, a
         // transaction that is in flight while a LATER-started one commits in the same batch gets
@@ -300,37 +306,81 @@ impl FeedStreamer {
         // Clamping rewinds over T3's already-emitted events, so the `emitted_through` filter below
         // is what stops them being delivered twice.
         //
-        // Fourth, and it is the one that made this comment grow a section in the module docs: a
-        // refused event is truncated away BEFORE any of the above, at the boundary of the COMMIT
-        // that holds it. See the "third instance" section up there for why the commit rather than
-        // the event, and why suppression and refusal must move the cursor differently despite
-        // looking the same from the emitted count.
-        let mut events = decoded.events;
-        let mut refused = 0usize;
-        let mut refusal: Option<Refusal> = None;
+        // Fourth, B7, and the one the module docs grew a section for: the cursor must not pass a
+        // commit holding an event that was REFUSED and still needs delivering. Two things follow, and
+        // the second was found by an adversarial review rather than by writing this:
+        //
+        //   * the boundary is the COMMIT, not the event - see the docs above for why a sibling
+        //     otherwise carries the cursor over the refused row;
+        //   * the refusal is looked for among the events that would ACTUALLY BE DELIVERED, after the
+        //     snapshot and already-delivered filters. Scanning the raw batch instead refuses events
+        //     that nothing was going to emit - an already-delivered commit re-read after an open-txn
+        //     rewind, or a table the snapshot boundary covers - and wedges the cursor at that commit
+        //     for ever while emitting nothing, which is a permanent stall in exchange for protecting
+        //     an event that had already arrived.
+        //
+        // So the order is: decide what would be delivered, find the first refusal among THOSE, then
+        // compute the cursor over everything decided about below that commit.
+        let decoded_events = decoded.events;
+
+        // A table the operator excluded is dropped and the feed carries on - a decision, not an
+        // undecided table, and the difference is a cursor that keeps moving. Counted, because a feed
+        // that drops records must say so.
+        let excluded = decoded_events.iter().filter(|e| self.publication.excludes(&e.table)).count();
+
+        // The two delivery filters, applied FIRST now, and counted the same way as before.
+        let mut candidates: Vec<&ChangeEvent> = decoded_events
+            .iter()
+            .filter(|e| !self.publication.excludes(&e.table))
+            .collect();
+        // The snapshot filter: these events were delivered by the *initial snapshot*, not by this
+        // stream, so they are not "already emitted" in the `emitted_through` sense and must never
+        // move that position.
+        //
+        // Table AND transaction, both asked through the boundary rather than open-coded: a
+        // transaction-only test drops another table's history, and a rule that consults `includes`
+        // instead of `already_delivered` drops DDL. Both defects were real; both guards live in the
+        // value rather than in this caller.
+        let suppressed = match &self.already_snapshotted {
+            None => 0,
+            Some(already) => {
+                let before = candidates.len();
+                candidates.retain(|e| !already.suppresses(&e.table, e.txn_id));
+                before - candidates.len()
+            }
+        };
+        // Then what this stream has already delivered. The cursor is a READ position and is clamped
+        // back for open transactions, so a plain re-read would hand the consumer every committed
+        // transaction after that one again, on every pump, forever.
+        candidates.retain(|e| e.commit_lsn > emitted_through);
+
         // One pass, and the refusal is carried out of it rather than recomputed: asking the
         // publication twice about the same event would work only because `check` is pure, and a
         // second call is exactly the kind of thing that stops being equivalent later.
-        let refused_at = events
+        let refused_at = candidates
             .iter()
             .enumerate()
             .find_map(|(i, e)| self.publication.check(e).err().map(|r| (i, r)));
-        if let Some((at, r)) = refused_at {
-            // Back up to the FIRST event of that commit. Truncating at `at` would write the
-            // publishable siblings ahead of it and then compute the cursor over them - landing on
-            // this commit's own `commit_end_lsn` and stepping over the refused row for good.
-            let commit = events[at].commit_lsn;
-            let boundary = events
-                .iter()
-                .position(|e| e.commit_lsn == commit)
-                .expect("the refused event's own commit is in the batch");
-            refused = events.len() - boundary;
-            refusal = Some(r);
-            events.truncate(boundary);
-        }
+        let (refused, refusal, refused_commit) = match refused_at {
+            None => (0usize, None, None),
+            Some((at, r)) => {
+                let commit = candidates[at].commit_lsn;
+                // Back up to the FIRST candidate of that commit. Truncating at `at` would write the
+                // publishable siblings ahead of it and then compute the cursor over them - landing
+                // on this commit's own `commit_end_lsn` and stepping over the refused row for good.
+                let boundary = candidates
+                    .iter()
+                    .position(|e| e.commit_lsn == commit)
+                    .expect("the refused event's own commit is in the batch");
+                let dropped = candidates.len() - boundary;
+                candidates.truncate(boundary);
+                (dropped, Some(r), Some(commit))
+            }
+        };
 
-        let emitted_max = events
+        let emitted_max = decoded_events
             .iter()
+            .filter(|e| refused_commit.is_none_or(|c| e.commit_lsn < c))
             .map(|e| e.commit_end_lsn)
             .max()
             .unwrap_or(cursor)
@@ -340,34 +390,11 @@ impl FeedStreamer {
             None => emitted_max,
         };
 
-        // Two independent suppressions, counted separately because they mean different things to a
-        // consumer reading the report.
-        //
-        // The snapshot filter first: these events were delivered by the *initial snapshot*, not by
-        // this stream, so they are not "already emitted" in the `emitted_through` sense and must
-        // never move that position.
-        let suppressed = match &self.already_snapshotted {
-            None => 0,
-            Some(already) => {
-                let before = events.len();
-                // Table AND transaction, both asked through the boundary rather than open-coded:
-                // a transaction-only test drops another table's history, and a rule that consults
-                // `includes` instead of `already_delivered` drops DDL. Both defects were real; both
-                // guards now live in the value rather than in this caller.
-                events.retain(|e| !already.suppresses(&e.table, e.txn_id));
-                before - events.len()
-            }
-        };
-
-        // Then what this stream has already delivered. The cursor is a READ position and is clamped
-        // back for open transactions, so a plain re-read would hand the consumer every committed
-        // transaction after that one again, on every pump, forever.
-        events.retain(|e| e.commit_lsn > emitted_through);
-
-        // Refused events are already gone from `events`, so this cannot refuse - and if it ever
+        // Refused events are already gone from `candidates`, so this cannot refuse - and if it ever
         // does, it errors rather than writing a denied column, which is the right way round.
-        let emitted = write_feed(&events, &self.publication, w)?;
-        let delivered_through = events
+        let owned: Vec<ChangeEvent> = candidates.into_iter().cloned().collect();
+        let emitted = write_feed(&owned, &self.publication, w)?;
+        let delivered_through = owned
             .iter()
             .map(|e| e.commit_lsn)
             .max()
@@ -383,6 +410,7 @@ impl FeedStreamer {
             unresolved: decoded.unresolved.values().sum::<usize>()
                 + decoded.undecodable.values().sum::<usize>(),
             suppressed,
+            excluded,
             refused,
             refusal,
         })
@@ -1350,6 +1378,100 @@ mod tests {
         assert_eq!(p2.refused, 0);
         assert!(p2.cursor > start, "the anti-vacuity pump did not advance either: {p2:?}");
         assert!(p2.is_clean(), "{p2:?}");
+    }
+
+    /// **An excluded table does not stall the feed**, which is the whole reason the form exists.
+    ///
+    /// Breaking shape: a table the policy has not been told about. Its first event refuses, the cursor
+    /// stops, and - the part that is easy to miss - a `Subscription`'s pin stops with it, so the WAL
+    /// cannot be reclaimed for as long as the stall lasts. An adversarial review of this lane traced
+    /// that through `WalManager::truncate`. Before `exclude` existed the only way out was to publish
+    /// the table, which is the opposite of what the operator wants.
+    #[test]
+    fn an_excluded_tables_events_are_dropped_and_the_cursor_keeps_moving() {
+        let (_d, w) = wal("excluded");
+        let start = FeedStreamer::start_cursor(&w);
+        for i in 1..=2u64 {
+            w.append(i, 0, &RecKind::Begin).unwrap();
+            insert(&w, i, i as i32, i as i32 * 10);
+            w.append(i, 0, &RecKind::Commit).unwrap();
+        }
+        w.flush().unwrap();
+
+        // The streamer's table is `inventory`, and this publication excludes it by name.
+        let s = FeedStreamer::new(
+            LogicalDecoder::for_table(7, "inventory", schema(), 8),
+            Publication::named("analytics").publishing("other", ["id"]).excluding("inventory"),
+        );
+        let mut buf = Vec::new();
+        let p = s.pump(&w, start, 0, &mut buf).unwrap();
+        assert_eq!(p.emitted, 0, "an excluded table was emitted: {p:?}");
+        assert_eq!(p.excluded, 2, "the drop was not reported: {p:?}");
+        assert_eq!(p.refused, 0, "an excluded table refused instead of being dropped: {p:?}");
+        assert!(
+            p.cursor > start,
+            "the cursor stalled on a table the operator had DECIDED about; the feed stops and the \
+             subscription's pin stops with it, so the WAL grows for ever: {p:?}"
+        );
+        assert!(buf.is_empty(), "bytes were written for an excluded table");
+        assert!(p.is_clean(), "an exclusion is a decision, not a fault: {p:?}");
+
+        // The contrast that makes the test about the exclusion: the SAME log, the same events, a
+        // publication that has merely never heard of the table - and the cursor does not move.
+        let undecided = streamer_publishing_table("other", &["id"]);
+        let mut buf2 = Vec::new();
+        let q = undecided.pump(&w, start, 0, &mut buf2).unwrap();
+        assert_eq!(q.cursor, start, "an undecided table must still stall: {q:?}");
+        assert!(q.refused >= 1 && q.excluded == 0, "{q:?}");
+    }
+
+    /// **A refusal must not fire on an event that was never going to be delivered.**
+    ///
+    /// Breaking shape: an event the `emitted_through` filter would drop - already delivered, then
+    /// re-read because an open transaction clamped the cursor back beneath it - for a table that is no
+    /// longer published. Scanning the raw batch refuses it, truncates at its commit, and wedges the
+    /// cursor there for ever, emitting nothing, to protect an event the consumer already has. Found by
+    /// an adversarial review; the fix is to look for the refusal among the events that would actually
+    /// be delivered.
+    #[test]
+    fn an_already_delivered_event_does_not_wedge_the_cursor_when_it_later_becomes_unpublishable() {
+        let (_d, w) = wal("stale_refusal");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // Delivered under a policy that publishes the table.
+        let wide = streamer_publishing(&["id", "qty"]);
+        let mut buf = Vec::new();
+        let p1 = wide.pump(&w, start, 0, &mut buf).unwrap();
+        assert_eq!(p1.emitted, 1, "{p1:?}");
+
+        // Now the policy no longer covers it, and the same range is re-read from a cursor BELOW the
+        // commit - what an open transaction's clamp leaves behind. `emitted_through` says it has
+        // already been delivered, so nothing needs emitting and nothing needs protecting.
+        let narrow = streamer_publishing_table("other", &["id"]);
+        let mut buf2 = Vec::new();
+        let p2 = narrow.pump(&w, start, p1.emitted_through, &mut buf2).unwrap();
+        assert_eq!(p2.emitted, 0, "{p2:?}");
+        assert_eq!(
+            p2.refused, 0,
+            "an event that had already been delivered was refused, which stops the cursor to protect \
+             something the consumer already has: {p2:?}"
+        );
+        assert!(
+            p2.cursor > start,
+            "the cursor was wedged by a refusal over an already-delivered event: {p2:?}"
+        );
+        assert!(buf2.is_empty());
+
+        // Anti-vacuity: the same narrow policy DOES refuse and wedge when the event has not been
+        // delivered - otherwise this test would pass against a pump that never refuses at all.
+        let mut buf3 = Vec::new();
+        let p3 = narrow.pump(&w, start, 0, &mut buf3).unwrap();
+        assert!(p3.refused >= 1, "{p3:?}");
+        assert_eq!(p3.cursor, start, "{p3:?}");
     }
 
     /// A partially published table is **not** a refusal: the published columns ship and the feed keeps

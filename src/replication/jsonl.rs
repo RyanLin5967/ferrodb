@@ -167,10 +167,18 @@ pub fn value_into(v: &Value, out: &mut String) {
 
 /// Render one row as a JSON object, **through the publication's mask**.
 ///
-/// This is the single function in the codebase that turns a row into bytes, which is why the
-/// allowlist is enforced here rather than at any of the three callers. A column the mask does not
-/// publish is not written: not nulled, not renamed, not emptied — the key is absent, and
-/// [`to_json_line`] declares its name in the event's `withheld` list instead.
+/// The one function that turns a **row** into bytes, which is why the allowlist is enforced here
+/// rather than at any of the callers. A column the mask does not publish is not written: not nulled,
+/// not renamed, not emptied — the key is absent, and **nothing anywhere names it**. An earlier version
+/// of this comment said the name was declared in a `withheld` list; that list was removed for the
+/// reason given where it used to be emitted (a column name is information in its own right), and the
+/// declared shape being projected by the same mask is what keeps the absence honest.
+///
+/// A row is not the only thing this module renders. The `CREATE_TABLE` shape is a list of column
+/// *names* rather than values and has its own masked loop in [`line_with_mask`] — so the column rule
+/// has two enforcement sites, one per kind of payload, and each is fire-checked separately (M2 and M5
+/// in `tests/integration_cdc_publication.rs`). Anything that adds a third payload carrying column
+/// names must mask it too; nothing forces that but a reader of this paragraph.
 ///
 /// A row whose value count disagrees with its column count cannot be keyed honestly. Rather than
 /// emit a half-labelled object, the extra or missing positions are made visible: with no policy in
@@ -211,6 +219,19 @@ fn row_into(
         out.push(':');
         value_into(v, out);
         written += 1;
+    }
+    // **`{}` says the row has no columns.** The schema arm below refuses exactly this claim for a
+    // declared shape, and a row can reach it too: an image shorter than the column list whose present
+    // values are all withheld. Neither upstream check sees that shape - `mask_for` refuses only when
+    // EVERY column of the table is withheld, and `check` inspects only images that are too long - so
+    // it is refused here, where the bytes are. Found by an adversarial review; reachable from any
+    // caller that supplies its own rows, which is the dump and the snapshot's read closure, not the
+    // WAL path (a decoded tuple always matches its schema's width).
+    //
+    // An image with no values at all is a different thing and stays `{}`: nothing was withheld, there
+    // was nothing to withhold.
+    if written == 0 && !values.is_empty() {
+        return Err(mask.refuse_nothing_publishable());
     }
     out.push('}');
     Ok(())
@@ -382,22 +403,40 @@ pub fn write_table_json<W: Write>(
 /// it must assume the write failed, while the consumer already holds the prefix — and for the
 /// snapshot path, that prefix is a partial table that looks like a complete one.
 ///
-/// This is a check-then-act shape, which in this codebase usually means a defect, so: it is sound
-/// here because nothing between the two passes can change the answer. `events` is a shared borrow,
-/// the publication is immutable, and `check` is a pure function of the two. There is no window to
-/// race, unlike the WAL frontier or the log base, which move under a reader by design.
+/// It is not a check-then-act shape, and the difference is the whole of it: every line is **rendered**
+/// before any line is written, so a refusal from anywhere in the batch — including one the renderer
+/// mints that the up-front decision cannot see — returns `Err` with nothing on the wire. The earlier
+/// form checked up front and wrote as it rendered, which was atomic only while one function's
+/// refusals were a superset of the other's. They were not.
+///
+/// The cost is the batch held as strings for the length of the call, which `max_bytes` already bounds
+/// for the stream and which the snapshot path already pays for its rows.
+///
+/// **Atomicity stops at this call.** A caller writing two batches to one sink — the multi-table
+/// snapshot recipe in [`super::snapshot::SnapshotBoundaryBuilder`] does exactly that — can still leave
+/// the first batch on the wire when the second refuses. Check the publication covers every table
+/// first: `publication.columns_of(t).is_some()` for each, before the first `deliver`.
 pub fn write_feed<W: Write>(
     events: &[ChangeEvent],
     publication: &Publication,
     w: &mut W,
 ) -> Result<usize, FerroError> {
-    let masks: Vec<Mask<'_>> =
-        events.iter().map(|e| publication.check(e)).collect::<Result<_, Refusal>>()?;
-    let mut n = 0;
-    for (e, mask) in events.iter().zip(&masks) {
-        let line = line_with_mask(e, mask)?;
+    // Rendered in full before the first byte is written, so the promise above is structural rather
+    // than a property of the two passes agreeing. It used to check every event up front and then
+    // render-and-write in a loop, which held only while `check` refused a superset of what
+    // `line_with_mask` refuses — and it does not: the schema arm mints a refusal from the declared
+    // spec list, which `check` never looks at. An adversarial review built that event and watched the
+    // first line reach the writer under an `Err` return.
+    let lines: Vec<String> = events
+        .iter()
+        .map(|e| {
+            let mask = publication.check(e)?;
+            line_with_mask(e, &mask)
+        })
+        .collect::<Result<_, Refusal>>()?;
+    let n = lines.len();
+    for line in lines {
         writeln!(w, "{line}").map_err(|err| FerroError::Io(format!("write feed: {err}")))?;
-        n += 1;
     }
     w.flush().map_err(|err| FerroError::Io(format!("flush feed: {err}")))?;
     Ok(n)
@@ -896,6 +935,86 @@ mod tests {
         let mut buf2: Vec<u8> = Vec::new();
         assert_eq!(write_feed(&[good.clone(), good], &analytics(), &mut buf2).unwrap(), 2);
         assert_eq!(String::from_utf8(buf2).unwrap().lines().count(), 2);
+    }
+
+    /// **A row whose present values are all withheld is refused, not emitted as `{}`.**
+    ///
+    /// Breaking shape: a row image SHORTER than the table's column list whose present values are all
+    /// withheld — `write_table_json` with rows a caller supplied, or a snapshot's read closure.
+    /// Neither upstream check sees it: `mask_for` refuses only when every column of the table is
+    /// withheld (here `ssn` is published, so it does not), and `check` looks only at images that are
+    /// too long. `{}` is not a redacted row, it is a claim that the row has no columns — the same
+    /// claim the schema arm refuses for a declared shape.
+    #[test]
+    fn a_row_whose_present_values_are_all_withheld_is_refused() {
+        let p = Publication::parse("publication p\ncustomers: ssn\n").unwrap();
+        let columns = vec!["id".to_string(), "name".to_string(), "ssn".to_string()];
+        let short = vec![vec![Value::Integer(1), Value::Varchar("ada".into())]];
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_table_json("customers", &columns, &short, &p, &mut buf)
+            .expect_err("a row rendered as {} instead of being refused");
+        assert!(format!("{err}").contains("empty object"), "wrong reason: {err}");
+        assert!(!String::from_utf8_lossy(&buf).contains("{}"), "an empty row reached the wire");
+
+        // Anti-vacuity: a full row under the same policy ships its published column, and a row with
+        // no values at all is still `{}` — nothing was withheld, there was nothing to withhold.
+        let full = vec![vec![
+            Value::Integer(1),
+            Value::Varchar("ada".into()),
+            Value::Varchar("000-11-2222".into()),
+        ]];
+        let mut ok: Vec<u8> = Vec::new();
+        write_table_json("customers", &columns, &full, &p, &mut ok).expect("a full row was refused");
+        assert!(String::from_utf8_lossy(&ok).contains("000-11-2222"));
+        let mut empty: Vec<u8> = Vec::new();
+        write_table_json("customers", &columns, &[vec![]], &p, &mut empty)
+            .expect("a row with no values was refused");
+        assert_eq!(String::from_utf8_lossy(&empty).trim(), "[{}]");
+    }
+
+    /// **The refusal the up-front decision cannot see must still leave nothing on the wire.**
+    ///
+    /// Breaking shape: a batch whose second event is a `CREATE_TABLE` where the event's column list is
+    /// published but the declared spec list is not — `check` decides from the column list and passes,
+    /// and the refusal is minted from the spec list inside the renderer. An adversarial review built
+    /// exactly this and watched the first line reach the writer under an `Err` return, which is the
+    /// harm `write_feed`'s doc promises not to do.
+    #[test]
+    fn a_refusal_minted_inside_the_renderer_still_writes_nothing() {
+        use crate::replication::logical::ColumnSpec;
+        let p = Publication::parse("publication analytics\ncustomers: id\n").unwrap();
+        let good = ChangeEvent {
+            txn_id: 1,
+            lsn: 10,
+            commit_lsn: 10,
+            commit_end_lsn: 20,
+            table: "customers".into(),
+            columns: Arc::new(vec!["id".into()]),
+            op: ChangeOp::Insert { new: vec![Value::Integer(1)] },
+        };
+        // Column list published; declared shape entirely denied.
+        let mismatched = ChangeEvent {
+            op: ChangeOp::Schema {
+                change: SchemaChange::CreateTable,
+                columns: vec![ColumnSpec {
+                    name: "ssn".into(),
+                    sql_type: "VARCHAR(16)".into(),
+                    nullable: true,
+                }],
+            },
+            ..good.clone()
+        };
+        p.check(&mismatched).expect("the premise is gone: check now refuses this by itself");
+
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_feed(&[good, mismatched], &p, &mut buf)
+            .expect_err("a batch with an unrenderable event was written");
+        assert!(format!("{err}").contains("empty object"), "wrong reason: {err}");
+        assert!(
+            buf.is_empty(),
+            "the first line was written before the second refused: {}",
+            String::from_utf8_lossy(&buf)
+        );
     }
 
     /// **A feed with nothing withheld is byte-for-byte what it was before publications existed.**
