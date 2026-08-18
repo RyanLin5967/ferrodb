@@ -38,6 +38,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::heap_file_manager::RecordId;
 use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::index_page::BPlusTreePage;
 use ferrodb::wal::log::WalManager;
@@ -251,6 +252,18 @@ fn a_value_updated_away_and_back_returns_the_row_exactly_once() {
     charger.sort();
     assert_eq!(charger, vec![1, 2]);
     assert_eq!(d.postings_for("docs", "body", "charger"), vec![1, 2]);
+
+    // The other half of UPDATE maintenance, and the half the away-and-back case cannot see: a word
+    // the row has NEVER held must become findable, which only happens if the update posts it. Every
+    // token above was already posted by the INSERT, so without this assertion an UPDATE path that
+    // maintained nothing at all would satisfy this test.
+    d.sql("UPDATE docs SET body = 'wireless charger for a fridge' WHERE id = 1;");
+    assert_eq!(
+        d.ids("SEARCH docs (body) FOR 'fridge';"),
+        vec![1],
+        "a word introduced by an UPDATE has to be posted, not just left to the next rebuild"
+    );
+    assert_eq!(d.postings_for("docs", "body", "fridge"), vec![1]);
 }
 
 /// Breaking shape: one value containing the same word twice. A secondary index cannot reach this —
@@ -609,6 +622,82 @@ fn a_rebuild_of_a_correct_index_does_not_double_its_postings() {
     let mut charger = d.ids("SEARCH docs (body) FOR 'charger';");
     charger.sort();
     assert_eq!(charger, vec![1, 2]);
+}
+
+/// The rebuild de-duplicates too, over the shape that puts two slots with one primary key in the
+/// heap it scans.
+///
+/// Breaking shape: `DELETE` then re-`INSERT` of one key, then a recovery rebuild. `DELETE` stamps
+/// `end_ts` and leaves the slot, so `rows` inside `rebuild_indexes` holds both versions and every
+/// token they share is reached twice. `insert_entry` appends, so a crash would replace a correct
+/// index with a double-counting one — the search would return that row once per copy, which is worse
+/// than losing the index outright because nothing looks wrong.
+#[test]
+fn a_rebuild_over_a_re_used_primary_key_does_not_double_the_row() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.sql("CREATE FULLTEXT INDEX fx ON t (body);");
+    d.sql("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.sql("DELETE FROM t WHERE id = 1;");
+    d.sql("INSERT INTO t VALUES (1, 'alpha gamma');");
+    // Premise: both versions are in the heap the rebuild will scan, so the duplicate is reachable.
+    let heap_rows = d.catalog.get_table("t").unwrap().first_directory_page_id;
+    let scanned = ferrodb::storage::heap_file_manager::HeapFileManager::open(heap_rows, d.bp.clone())
+        .scan()
+        .count();
+    assert_eq!(scanned, 2, "premise failed: the heap holds {scanned} slots, so there is no duplicate to de-duplicate");
+
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+
+    assert_eq!(
+        d.postings_for("t", "body", "alpha"),
+        vec![1],
+        "one posting for the token both heap versions share"
+    );
+    assert_eq!(d.ids("SEARCH t (body) FOR 'alpha';"), vec![1], "and the row once");
+}
+
+/// **A pre-existing defect this feature found, pinned where it was found.**
+///
+/// The bug is in the *primary* index rebuild, not in anything full-text: `rebuild_indexes` inserted
+/// one entry per heap **slot**, and `DELETE` leaves its slot behind, so a re-used primary key ended
+/// up with two entries under one key. `insert_entry` appends rather than overwrites, so `search`
+/// returned whichever copy binary search landed on — and when that was the tombstone, a point lookup
+/// of a live row answered with nothing.
+///
+/// Breaking shape: `INSERT (1, ..); DELETE id = 1; INSERT (1, ..);` then a recovery rebuild, then a
+/// point lookup. Measured before the fix: primary entries `[(1, {5,1}), (1, {5,0})]`, `search(1)` →
+/// the tombstoned `{5,0}`, `SELECT * FROM t WHERE id = 1;` → zero rows while `SELECT * FROM t;`
+/// returned the row. B8 found it because a full-text search resolves every posting through the
+/// primary index, so the search returned nothing for a row whose postings were correct.
+#[test]
+fn a_rebuild_resolves_a_re_used_primary_key_to_the_live_version() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, body VARCHAR(100));");
+    d.sql("INSERT INTO t VALUES (1, 'alpha beta');");
+    d.sql("DELETE FROM t WHERE id = 1;");
+    d.sql("INSERT INTO t VALUES (1, 'alpha gamma');");
+    d.sql("INSERT INTO t VALUES (2, 'delta');");
+
+    rebuild_indexes(&mut d.catalog, &d.bp).unwrap();
+
+    let entry = d.catalog.get_table("t").unwrap();
+    let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, d.bp.clone());
+    let entries: Vec<(Value, RecordId)> = tree
+        .range_scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(entries.len(), 2, "one entry per key, not one per heap slot: {entries:?}");
+
+    // The entry for key 1 must be the live version, which is the one a scan of the table returns.
+    assert_eq!(
+        d.ids("SELECT * FROM t WHERE id = 1;"),
+        vec![1],
+        "a point lookup must find the live row it plainly has"
+    );
+    assert_eq!(d.rows("SELECT * FROM t;").len(), 2);
+    assert_eq!(d.ids("SELECT * FROM t WHERE id = 2;"), vec![2]);
 }
 
 /// A full-text index must not be mistaken for a B-tree index on the same column.
