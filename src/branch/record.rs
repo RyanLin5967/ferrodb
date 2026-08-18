@@ -1585,6 +1585,23 @@ mod tests {
         assert_eq!(free.envelope, None);
     }
 
+    /// `charge` re-checks rather than trusting `admit`'s answer, because the two are not one
+    /// atomic step — something else may have charged against the same branch in between. Without
+    /// its own test this second check is a redundant guard that no mutant can reach, which is how
+    /// a fire-check certifies nothing.
+    #[test]
+    fn charging_past_the_budget_is_refused_at_the_charge_not_only_at_admit() {
+        let mut e = CapabilityEnvelope::new(Verb::ALL, 3).allow(T, vec![ColumnCapability::open(0)]);
+        e.charge(2).expect("2 of 3 fits");
+        assert_eq!(e.remaining(), 1);
+        let err = e.charge(2).expect_err("4 row-writes fitted in a budget of 3");
+        assert!(format!("{err}").contains("remaining budget of 1"), "got {err}");
+        assert_eq!(e.row_writes(), 2, "a refused charge was applied anyway");
+        // Anti-vacuity: the last one still fits.
+        e.charge(1).expect("the final row-write must fit");
+        assert_eq!(e.remaining(), 0);
+    }
+
     #[test]
     fn a_duplicate_column_keeps_the_tighter_floor() {
         let cap = TableCapability::new(
