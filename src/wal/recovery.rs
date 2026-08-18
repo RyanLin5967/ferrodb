@@ -1,6 +1,6 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, sync::{Arc, atomic::Ordering}};
 
-use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
+use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, heap_page::Page, index::BPlusTreeManager, index_fulltext::{indexed_text, post_tokens}, tuple::Tuple}, wal::{log::RecKind, txn::{TxnEntry, TxnManager, TxnStatus}}};
 
 pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let wal = &txn.wal;
@@ -154,13 +154,49 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
         let mut rows = Vec::new();
         for r in hfm.scan() {
             let (rid, tuple) = r?;
-            rows.push((rid, tuple.deserialize(&entry.schema)?));
+            // `end_ts` is read here because the primary rebuild below has to prefer a live version
+            // over a tombstone when the heap holds both under one key.
+            let deleted = tuple.version_header()?.end_ts != 0;
+            rows.push((rid, tuple.deserialize(&entry.schema)?, deleted));
         }
         let old = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
         old.free_tree()?;
         let fresh = BPlusTreeManager::<Value, RecordId>::create(bp.clone())?;
-        for (rid, vals) in &rows {
-            fresh.insert(vals[0].clone(), *rid)?;
+
+        // **One primary entry per key, pointing at the live version.**
+        //
+        // `insert_entry` appends at the binary-search position rather than overwriting, so one
+        // entry per heap *slot* puts two entries under one key whenever the heap holds two slots
+        // for it — which `DELETE` followed by re-`INSERT` of the same key does, because `DELETE`
+        // stamps `end_ts` in place and leaves the slot where it is. `search` then returns whichever
+        // copy binary search lands on, and when that is the tombstone, a point lookup of a live row
+        // answers with nothing.
+        //
+        // Measured before this guard, through SQL:
+        // `INSERT (1,'alpha beta'); DELETE id=1; INSERT (1,'alpha gamma');` then a rebuild left
+        // primary entries `[(1, {5,1}), (1, {5,0})]`, `search(1)` returned the tombstoned `{5,0}`,
+        // and `SELECT * FROM t WHERE id = 1;` returned **zero rows** while `SELECT * FROM t;`
+        // returned the row. This is the same de-duplication rule E66 established for the write
+        // paths, in the one path that never had it; it was found by B8's full-text search, which
+        // resolves every posting through this index.
+        let mut primary: BTreeMap<Value, (RecordId, bool)> = BTreeMap::new();
+        for (rid, vals, deleted) in &rows {
+            match primary.get_mut(&vals[0]) {
+                // A live version replaces a tombstone. Two live versions of one key is an anomaly
+                // this loop cannot resolve, so it keeps the first and stays deterministic rather
+                // than picking by scan order.
+                Some(slot) => {
+                    if slot.1 && !*deleted {
+                        *slot = (*rid, false);
+                    }
+                }
+                None => {
+                    primary.insert(vals[0].clone(), (*rid, *deleted));
+                }
+            }
+        }
+        for (pk, (rid, _)) in &primary {
+            fresh.insert(pk.clone(), *rid)?;
         }
         entry.primary_index_root = fresh.root_page_id.load(Ordering::SeqCst);
 
@@ -170,8 +206,34 @@ pub fn rebuild_indexes(catalog: &mut Catalog, bp: &Arc<BufferPoolManager>) -> Re
             let old = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
             old.free_tree()?;
             let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
-            for (_, vals) in &rows {
+            for (_, vals, _) in &rows {
                 fresh.insert((vals[col].clone(), vals[0].clone()), ())?;
+            }
+            info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
+        }
+
+        // B8 — full-text indexes, rebuilt from the same `rows` by the same three steps: free the
+        // old tree, create a fresh one, refill it, record the new root. This is all a full-text
+        // index needs to survive a crash, and it is why no WAL record was added for one: index
+        // structure is not logged at all, the heap is authoritative after redo/undo, and every tree
+        // in the database is reconstructed here.
+        //
+        // `post_tokens` rather than a bare `insert`, and the difference is load-bearing twice over.
+        // A value that repeats a word would post that pair once per occurrence, and — the case that
+        // is invisible until it happens — a `DELETE` followed by re-`INSERT` of the same primary key
+        // leaves TWO slots with that key in this heap, so `rows` holds both and every token they
+        // share is posted twice. `insert_entry` appends rather than overwrites, so the search would
+        // then return that row once per copy: a crash would turn a correct index into a
+        // double-counting one, which is worse than losing it.
+        for info in entry.fulltext_indexes.iter_mut() {
+            let col = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
+            let old = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
+            old.free_tree()?;
+            let fresh = BPlusTreeManager::<(Value, Value), ()>::create(bp.clone())?;
+            for (_, vals, _) in &rows {
+                if let Some(text) = indexed_text(&vals[col])? {
+                    post_tokens(&fresh, text, &vals[0])?;
+                }
             }
             info.root_page_id = fresh.root_page_id.load(Ordering::SeqCst);
         }

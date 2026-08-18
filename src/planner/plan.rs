@@ -1,4 +1,4 @@
-use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::IndexHandle, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
+use crate::{binder::binder::{Binder, BoundExpr, Scope}, buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, catalog_page::TableEntry, column::Value}, error::FerroError, execution::{delete::Delete, executor::Executor, filter::Filter, index_handle::{FullTextHandle, IndexHandle}, insert::Insert, seq_scan::SeqScan, update::Update}, optimizer::optimizer::{explain_plan, lower, optimize, pushdown}, parser::{parser::Stmt, scanner::TokenType}, storage::{heap_file_manager::{HeapFileManager, RecordId}, index::BPlusTreeManager}, wal::txn::{ReadView, TxnManager}};
 use std::{ops::Bound, sync::Arc};
 use crate::execution::executor::Modify;
 
@@ -20,7 +20,10 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Delete { table, where_clause } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp.clone(), txn, txn_id)?;
+            // B8: `_fulltext` is dropped on purpose. DELETE removes no posting - it stamps
+            // `end_ts` on the version and leaves every index entry in place, so no full-text tree
+            // is written and no full-text root can move. See `execution::delete`.
+            let (heap, tree, handles, _fulltext) = open_table(entry, bp.clone(), txn, txn_id)?;
             let bound_where = match where_clause {
                 Some(w) => {
                     let binder = Binder::new(catalog);
@@ -36,7 +39,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Insert { table, values } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp, txn, txn_id)?;
+            let (heap, tree, handles, fulltext) = open_table(entry, bp, txn, txn_id)?;
             let binder = Binder::new(catalog);
             let empty = Scope::new();
             // Positional: value i lands in column i, so column i's declared type is what decides
@@ -44,13 +47,13 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let column_types: Vec<&crate::catalog::column::DataType> =
                 entry.schema.columns.iter().map(|c| &c.data_type).collect();
             let bound_vals = binder.bind_row_against(values, &column_types, &empty)?;
-            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, view: view.clone()};
+            let insert = Insert {author: None, table, values: bound_vals, heap, schema: entry.schema.clone(), primary_index: tree, secondary_indexes: handles, fulltext_indexes: fulltext, view: view.clone()};
             return Ok(Plan::Write(Box::new(insert)))
         }
         Stmt::Update { table, assignments, where_clause } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles) = open_table(entry, bp.clone(), txn.clone(), txn_id)?;
+            let (heap, tree, handles, fulltext) = open_table(entry, bp.clone(), txn.clone(), txn_id)?;
             let binder = Binder::new(catalog);
             let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
@@ -72,7 +75,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             let child = build_scan(entry, bound_where, bp.clone(), view.clone())?;
             let mut tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
             tt_heap.set_transaction(txn, txn_id);
-            let update = Update {author: None, table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, view: view.clone(), tt_heap};
+            let update = Update {author: None, table, child, schema: entry.schema.clone(), assignments: resolved, heap, primary_index: tree, secondary_indexes: handles, fulltext_indexes: fulltext, view: view.clone(), tt_heap};
             return Ok(Plan::Write(Box::new(update)))
         }
         _ => return Err(FerroError::OnlyDML)
@@ -90,7 +93,7 @@ pub fn explain(stmt: Stmt, catalog: &Catalog) -> Result<String, FerroError> {
 }
 
 // opens heapfilemanager twice (could cause errors)
-fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, txn_id: u64) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>), FerroError> {
+fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, txn_id: u64) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>, Vec<FullTextHandle>), FerroError> {
     let mut heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
     heap.set_transaction(txn, txn_id);
     let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
@@ -100,7 +103,15 @@ fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManage
         let tree = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
         handles.push(IndexHandle{col_index, tree})
     }
-    Ok((heap, tree, handles))
+    // B8 — the full-text indexes, opened the same way and kept apart for the reason
+    // `FullTextHandle` gives.
+    let mut fulltext = Vec::with_capacity(entry.fulltext_indexes.len());
+    for info in &entry.fulltext_indexes {
+        let col_index = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
+        let tree = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
+        fulltext.push(FullTextHandle{col_index, column_name: info.column_name.clone(), tree})
+    }
+    Ok((heap, tree, handles, fulltext))
 }
 
 fn build_scan(entry: &TableEntry, predicate: Option<BoundExpr>, bp: Arc<BufferPoolManager>, view: Arc<ReadView>) -> Result<Box<dyn Executor>, FerroError> {

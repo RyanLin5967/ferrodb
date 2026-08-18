@@ -192,6 +192,11 @@ impl<'a> Binder<'a> {
             | Stmt::Delete { .. }
             | Stmt::Update { .. }
             | Stmt::CreateIndex { .. }
+            | Stmt::CreateFullTextIndex { .. }
+            // B8's `SEARCH` belongs in this group rather than with SELECT: it is its own access
+            // path with its own bound, executed directly, so there is no logical plan to build and
+            // nothing for the optimizer to choose between.
+            | Stmt::Search { .. }
             | Stmt::DropTable { .. }
             | Stmt::CreateTable { .. } => Err(FerroError::Bind(
                 "DML and DDL are applied directly by the executor and have no logical plan; \
@@ -912,6 +917,8 @@ mod tests {
             "UPDATE users SET name = 'b' WHERE id = 1;",
             "CREATE TABLE t (id INTEGER NOT NULL);",
             "CREATE INDEX ix ON users(id);",
+            "CREATE FULLTEXT INDEX fx ON users(name);",
+            "SEARCH users (name) FOR 'a';",
             "BEGIN;",
             "COMMIT;",
             "ROLLBACK;",

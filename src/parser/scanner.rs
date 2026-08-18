@@ -12,6 +12,9 @@ pub enum TokenType {
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain, Drop,
     Begin, Commit, Rollback,
 
+    // B8 — full-text retrieval: `CREATE FULLTEXT INDEX ... ` and `SEARCH t (col) FOR '...' TOP k`
+    Fulltext, Search, For, Top,
+
     // agent-isolation surface (DESIGN.md section 5)
     Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
     // SIMULATE: K candidate branches off one base, scored, the winners admitted.
@@ -237,6 +240,13 @@ impl Scanner {
             "CANDIDATE" => TokenType::Candidate,
             "ASSERT" => TokenType::Assert,
             "ADMIT" => TokenType::Admit,
+            // B8. `TOP` is a keyword only because `MATCH`-style retrieval needs a bound and this
+            // SQL surface has no LIMIT; `parser::unsupported_keyword` still refuses LIMIT itself,
+            // because a general LIMIT is a different feature from a retrieval operator's own bound.
+            "FULLTEXT" => TokenType::Fulltext,
+            "SEARCH" => TokenType::Search,
+            "FOR" => TokenType::For,
+            "TOP" => TokenType::Top,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);
@@ -304,6 +314,31 @@ mod tests {
         assert_eq!(toks, vec![Select, Star, From, Identifier, As, Of, Branch, Identifier, Semicolon, Eof]);
         let toks = scan("REVERT MERGE m_44 CASCADE;");
         assert_eq!(toks, vec![Revert, Merge, Identifier, Cascade, Semicolon, Eof]);
+    }
+
+    /// B8. Breaking shape: `FULLTEXT`/`SEARCH`/`FOR`/`TOP` left as `Identifier`. The parser would
+    /// then read `SEARCH docs (body) FOR 'x';` as a statement starting with a bare name and answer
+    /// "expected a statement" — the same failure E69 hit with `DROP`, where the keyword was missing
+    /// from this table and the parser never saw the statement at all.
+    #[test]
+    fn test_fulltext_keywords() {
+        use TokenType::*;
+        let toks = scan("CREATE FULLTEXT INDEX ix ON docs (body);");
+        assert_eq!(toks, vec![
+            Create, Fulltext, Index, Identifier, On, Identifier, LeftParen, Identifier,
+            RightParen, Semicolon, Eof
+        ]);
+        let toks = scan("SEARCH docs (body) FOR 'wireless charger' TOP 5;");
+        assert_eq!(toks, vec![
+            Search, Identifier, LeftParen, Identifier, RightParen, For, String, Top, Number,
+            Semicolon, Eof
+        ]);
+        // case-insensitive, like every other keyword here
+        let toks = scan("search docs (body) for 'x' top 2;");
+        assert_eq!(toks, vec![
+            Search, Identifier, LeftParen, Identifier, RightParen, For, String, Top, Number,
+            Semicolon, Eof
+        ]);
     }
 
     #[test]

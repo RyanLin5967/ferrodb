@@ -123,6 +123,7 @@ Here is the SQL syntax that has been implemented so far:
 ```
 CREATE TABLE name (col TYPE [NOT NULL], ...)
 CREATE INDEX name ON table(col);
+CREATE FULLTEXT INDEX name ON table(col);
 
 INSERT INTO table VALUES (...);
 UPDATE table SET col = expr [, ...] [WHERE expr];
@@ -132,6 +133,8 @@ SELECT cols
 FROM table [AS] [alias] 
 [ [INNER | LEFT [OUTER]] JOIN table2 [AS] [alias] ON expr] 
 [WHERE expr];
+
+SEARCH table (col) FOR 'search text' [TOP k];
 ```
 
 - **Types:** INTEGER (i32), BIGINT (i64), DECIMAL / NUMERIC (exact, unbounded digits),
@@ -145,6 +148,19 @@ FROM table [AS] [alias]
   add them. Comparison is numeric, so `1.50` and `1.5` are equal.
 - **Operators:** = != <= > >= + - * / AND OR NOT
 - **Columns:** *, qualified references, table aliases, qualified star
+- **Full-text search.** `CREATE FULLTEXT INDEX` on a VARCHAR column builds a posting list, which
+  here is not a new structure at all: it is the same B+tree a secondary index uses, keyed
+  `(token, primary key)` instead of `(column value, primary key)`. `SEARCH` reads it and returns the
+  best-matching rows by BM25, each row followed by **one extra column holding its score**.
+  - The tokenizer lowercases and splits on every non-alphanumeric character. There is no stemming
+    and no stopword list, `don't` is two tokens, and a run of CJK is one token, because word
+    segmentation for unspaced scripts is not attempted.
+  - There is no `ORDER BY` and no `LIMIT` in this SQL, so **the operator supplies its own bound**:
+    `SEARCH` returns at most 10 rows unless `TOP k` says otherwise. A query with 400 matches returns
+    10 rows by design.
+  - A search sees what a `SELECT` in the same transaction would: a deleted row drops out, and an
+    entry left behind by an `UPDATE` cannot resurrect one, because the operator re-checks the text of
+    the version it resolved.
 
 ### Try it yourself
 Start the REPL (either `cargo run`/`cargo run -- mydb.db` or by unziping then executing the binary).
@@ -183,6 +199,22 @@ ferrodb=> .exit
 bye bye
 ```
 You can also create indexes (`CREATE INDEX idx ON users (age);`), updates (`UPDATE users SET age = 31 WHERE id = 1;`), and deletes (`DELETE FROM posts WHERE id = 2;`).
+
+Full-text search over that same `posts` table. Note the trailing score column, and that the row
+matching both words outranks the two that match one — the two of those tie, and the tie is broken by
+primary key so the result is reproducible:
+
+```
+ferrodb=> CREATE FULLTEXT INDEX ptitle ON posts (title);
+ok
+ferrodb=> INSERT INTO posts VALUES (3, 1, 'hello world again');
+(1 row affected)
+ferrodb=> SEARCH posts (title) FOR 'hello world';
+3 | 1 | hello world again | 0.7082246468086428
+1 | 1 | hello | 0.561960861054684
+2 | 1 | world | 0.561960861054684
+(3 rows)
+```
 
 Here is a resource for the SQL language (refer back to `Supported SQL` to see what syntax is supported): https://www.w3schools.com/sql/default.asp 
 ## How it works
