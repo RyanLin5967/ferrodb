@@ -41,6 +41,10 @@ pub mod logical;
 /// process can read is not a CDC source; this is the representation that leaves the process.
 pub mod jsonl;
 
+/// What the feed is **allowed** to emit — see [`publication`]. Every other guard here is about not
+/// losing a row; this one is about not shipping one, which is the failure no re-read can undo.
+pub mod publication;
+
 /// Initial snapshot and the handoff to the stream — see [`snapshot`]. Without it a consumer learns
 /// only what changes after it connects, and never what was already there.
 pub mod snapshot;

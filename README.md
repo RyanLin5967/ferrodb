@@ -376,6 +376,31 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
 {"op":"DELETE","table":"inventory","after":null}
 ```
 
+### A publication decides what the feed may carry
+
+The feed above carries every column of every table. A **publication** — an allowlist, read by both the
+database and the independent Go consumer — says what may leave:
+
+```
+$ cat pub.txt
+publication analytics
+# ssn must never leave the database
+customers: id, name
+exclude audit_log
+
+$ cargo run --example cdc_feed -- demo.db pub.txt > feed.jsonl
+$ go run . validate ../feed.jsonl -publication ../pub.txt
+OK 6
+```
+
+A column the file does not name is **withheld**: absent from every image, and named nowhere — the
+`CREATE_TABLE` shape is projected by the same rule, so the consumer is told about exactly the columns
+it will receive. A table it does not name at all is **refused**: the feed stops there rather than
+stepping over it, and resumes when the policy decides, either by publishing the table or by excluding
+it. `cdc_server`, `cdc_feed` and `table_dump` each take a publication file as their last argument;
+`cdc-consumer` takes `-publication <file>` on `validate`, `sink`, `follow`, `diff` and `precision`, and
+enforces its own copy of the rule rather than trusting the producer's.
+
 - **Only committed transactions, in commit order.** Changes buffer per transaction and release on
   `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
   than emitted. A consumer shown an aborted transaction's rows has been told about data that never
@@ -535,6 +560,10 @@ $ cargo run --example table_dump cdc_demo.db inventory > source.json
 $ go run . diff ../feed.jsonl ../source.json -key id
 MATCH 2 row(s) from 6 event(s)
 ```
+
+Under a publication both sides take the same one — `table_dump <db> <table> [publication]` and
+`diff ... -publication <file>` — because a dump is egress too, and a projected feed compared against an
+unprojected source would report the withheld column as a data mismatch.
 
 Two rows rather than the three the sink lands, because the sink keeps a **tombstone** for the deleted
 row and the source simply does not have it — the diff compares live state to live state.

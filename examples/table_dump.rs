@@ -1,4 +1,4 @@
-//! `table_dump <db-path> <table>` — the source side of a CDC diff.
+//! `table_dump <db-path> <table> [publication-file]` — the source side of a CDC diff.
 //!
 //! Prints one table's **live rows** as a JSON array of objects on stdout, and nothing else, so it
 //! composes: `cdc-consumer diff <feed.jsonl> <source.json>`.
@@ -21,6 +21,17 @@
 //! Values are rendered by `replication::jsonl::write_table_json`, which shares [`value_into`] with the
 //! feed writer, so a `BigInt` past 2^53, a `DECIMAL` and a `TIMESTAMP` are strings on both sides
 //! without this file knowing that.
+//!
+//! # The publication applies here too
+//!
+//! A dump is egress: these rows go into a file something else reads. Given a publication file, the
+//! dump is projected through it exactly as the feed is, for two reasons — a column withheld from
+//! every change event and printed here has still left the database, and a diff between a projected
+//! feed and an unprojected source would report the withheld column as a data mismatch, which sends
+//! the reader hunting for a pipeline bug that is not there.
+//!
+//! With no publication argument nothing is withheld, and that is the same explicit
+//! `Publication::unrestricted()` every other pre-B7 call site names.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +43,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_table_json;
+use ferrodb::replication::publication::Publication;
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -45,9 +57,19 @@ fn main() {
     let (db, table) = match (args.get(1), args.get(2)) {
         (Some(d), Some(t)) => (d.clone(), t.clone()),
         _ => {
-            eprintln!("usage: table_dump <db-path> <table>");
+            eprintln!("usage: table_dump <db-path> <table> [publication-file]");
             std::process::exit(2);
         }
+    };
+    // A publication that cannot be read is a hard exit rather than a fall back to publishing
+    // everything: the caller asked for a policy, and the failure mode of ignoring that request is a
+    // dump of exactly the columns they were trying to keep in.
+    let publication = match args.get(3) {
+        None => Publication::unrestricted(),
+        Some(path) => Publication::load(Path::new(path)).unwrap_or_else(|e| {
+            eprintln!("table_dump: {e}");
+            std::process::exit(1);
+        }),
     };
 
     // Single-writer lock, as every binary that opens a user-named database takes (E38/E45). Held for
@@ -119,8 +141,22 @@ fn main() {
         }
     };
 
+    // Reported before the rows are written, so an operator reading stderr sees what was held back
+    // even if the write then fails.
+    if let Ok(mask) = publication.mask_for(&table, &columns) {
+        if !mask.withheld().is_empty() {
+            eprintln!("--- withheld by publication: {}", mask.withheld().join(", "));
+        }
+    }
     let mut stdout = std::io::stdout().lock();
-    let n = write_table_json(&columns, &rows, &mut stdout).expect("write dump");
+    let n = write_table_json(&table, &columns, &rows, &publication, &mut stdout)
+        .unwrap_or_else(|e| {
+            // A refusal here is the publication saying this table may not be dumped at all. Exiting
+            // non-zero with the reason matters more than usual: stdout is a JSON document, and a
+            // half-written one plus exit 0 is a diff run against a truncated source.
+            eprintln!("table_dump: {e}");
+            std::process::exit(1);
+        });
     // Counts on stderr, so stdout stays a single JSON document a consumer can read whole.
     eprintln!("--- {n} live row(s) in '{table}'");
 }

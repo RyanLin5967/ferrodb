@@ -1,4 +1,4 @@
-//! E10 — a runnable CDC source. `cdc_feed [db-path]`
+//! E10 — a runnable CDC source. `cdc_feed [db-path] [publication-file]`
 //!
 //! Runs a short workload of real SQL, then prints the change feed as JSON Lines on stdout. Pipe it
 //! anywhere a JSONL consumer lives:
@@ -9,6 +9,15 @@
 //!
 //! Everything on stdout is the feed and nothing else, so it composes. Counts and anything that was
 //! NOT emitted go to stderr, because a feed with a summary line in the middle of it is not a feed.
+//!
+//! With a publication file, the feed carries only what that file publishes — the same argument
+//! `cdc_server` and `table_dump` take, for the same reason: all three write rows out of the database,
+//! and a policy that only one of them honoured would be a policy in name only.
+//!
+//! ```text
+//! printf 'publication demo\ninventory: id, qty\n' > pub.txt
+//! cargo run --example cdc_feed -- demo.db pub.txt | jq -c .after   # no `item` anywhere
+//! ```
 
 use std::sync::Arc;
 
@@ -19,6 +28,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -27,6 +37,14 @@ use ferrodb::wal::txn::TxnManager;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let db = args.get(1).cloned().unwrap_or_else(|| "cdc_demo.db".into());
+    // A policy file that will not parse is a hard exit rather than a feed of everything: the caller
+    // asked for a policy, and the failure mode of ignoring the request is printing exactly the
+    // columns they were holding back.
+    let publication = match args.get(2) {
+        None => Publication::unrestricted(),
+        Some(path) => Publication::load(std::path::Path::new(path))
+            .unwrap_or_else(|e| { eprintln!("cdc_feed: {e}"); std::process::exit(1); }),
+    };
 
     // Single-writer lock, taken before the file is opened. Two processes on one database both build
     // an ArenaPageStore from the same checkpoint and hand the same pages to different branches, and
@@ -73,7 +91,13 @@ fn main() {
         .expect("decode");
 
     let mut stdout = std::io::stdout().lock();
-    let n = write_feed(&out.events, &mut stdout).expect("write feed");
+    let n = write_feed(&out.events, &publication, &mut stdout).unwrap_or_else(|e| {
+        // A refusal means the publication does not cover a table this feed carries. Nothing is
+        // printed, so a caller piping stdout gets an empty feed and a non-zero status rather than a
+        // partial one that looks whole.
+        eprintln!("cdc_feed: {e}");
+        std::process::exit(1);
+    });
 
     // Everything that did NOT become an event, on stderr. A consumer that only reads stdout gets a
     // clean feed; an operator watching the terminal still learns what was skipped and why.
