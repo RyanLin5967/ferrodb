@@ -177,6 +177,19 @@ struct MergeRecord {
     txns: Vec<TxnId>,
 }
 
+/// One row's worth of a staged change, so a whole statement can be checked before any of it lands.
+///
+/// Exists so `stage_all` can take a statement rather than a row: the refusal has to be decided for every
+/// row before any row is recorded, and that is not expressible while the arguments are loose parameters.
+struct Staged {
+    row: RowId,
+    before: Option<Vec<Value>>,
+    after: RowState,
+    ops: Vec<Op>,
+    guard: Option<Guard>,
+}
+
+
 #[derive(Default)]
 struct State {
     workspaces: BTreeMap<u64, Workspace>,
@@ -752,19 +765,23 @@ impl AgentRuntime {
             Some(ws) => ws.txn,
             None => return,
         };
+        // `begin_ts: 0` means "no published version existed when this row was read", and that is a
+        // real observation rather than a null: `state.versions` is written only when a merge
+        // PUBLISHES, so a row nobody has merged yet genuinely has no version to name.
+        //
+        // A baseline sentinel was tried here first and was wrong. Publishing records `begin_ts: seq`
+        // and the first `seq` is 1, so a sentinel of 1 collided with the very first publish and the
+        // premise check silently compared equal. Absence is already the signal; it does not need a
+        // number, and any number picked here is one a real stamp can eventually reach.
         let versions: Vec<VersionRef> = matched
             .iter()
             .map(|(rid, _)| {
-                state
-                    .versions
-                    .get(&(tbl.0, rid.0))
-                    .copied()
-                    .unwrap_or(VersionRef {
-                        tbl,
-                        row: *rid,
-                        rid: RecordId { page_id: 0, slot_num: 0 },
-                        begin_ts: 0,
-                    })
+                state.versions.get(&(tbl.0, rid.0)).copied().unwrap_or(VersionRef {
+                    tbl,
+                    row: *rid,
+                    rid: RecordId { page_id: 0, slot_num: 0 },
+                    begin_ts: 0,
+                })
             })
             .collect();
         let summary = PredicateSummary {
@@ -870,7 +887,7 @@ impl AgentRuntime {
         };
 
         let rows = self.visible_rows(ctx, Some(branch), table)?;
-        let mut touched = 0usize;
+        let mut staged: Vec<Staged> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
@@ -892,9 +909,18 @@ impl AgentRuntime {
                 Some(w) => Some(guard_from_expr(w, tbl, rid, &schema)?),
                 None => None,
             };
-            self.stage(branch, tbl, table, rid, Some(row), RowState::Present(new_row), ops, guard)?;
-            touched += 1;
+            // Collected, not staged: every row of this statement is decided before any of it is
+            // recorded. Staging inside the loop is what let a refusal on row 2 leave row 1 rewritten.
+            staged.push(Staged {
+                row: rid,
+                before: Some(row),
+                after: RowState::Present(new_row),
+                ops,
+                guard,
+            });
         }
+        let touched = staged.len();
+        self.stage_all(branch, tbl, table, staged)?;
         Ok(touched)
     }
 
@@ -967,7 +993,7 @@ impl AgentRuntime {
             None => None,
         };
         let rows = self.visible_rows(ctx, Some(branch), table)?;
-        let mut n = 0;
+        let mut staged: Vec<Staged> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
@@ -979,13 +1005,24 @@ impl AgentRuntime {
                 None => None,
             };
             let op = Op::new(tbl, rid, None, OpKind::RowDelete);
-            self.stage(branch, tbl, table, rid, Some(row), RowState::Deleted, vec![op], guard)?;
-            n += 1;
+            staged.push(Staged {
+                row: rid,
+                before: Some(row),
+                after: RowState::Deleted,
+                ops: vec![op],
+                guard,
+            });
         }
+        let n = staged.len();
+        self.stage_all(branch, tbl, table, staged)?;
         Ok(n)
     }
 
     /// Put one row change into the branch's buffer and append its ops and guard to the frame.
+    ///
+    /// A thin wrapper over [`AgentRuntime::stage_all`] so that single-row callers and multi-row callers
+    /// go through exactly one refusal path. Two paths is how the multi-row case ended up with weaker
+    /// atomicity than the single-row case for months.
     fn stage(
         &self,
         branch: BranchId,
@@ -997,63 +1034,105 @@ impl AgentRuntime {
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        // Write-time escrow. This runs BEFORE anything is recorded, so a refused overdraw leaves
-        // no trace in the workspace, the frame or the log — the statement simply fails, which is
-        // the entire point of moving the check off the merge path. A decrement of `n` on a bounded
-        // cell spends `n` of this branch's reservation.
+        self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
+    }
+
+    /// Stage every row of ONE statement, or none of them.
+    ///
+    /// # The defect this shape exists to prevent
+    ///
+    /// `stage` used to charge escrow and record the row in the same pass, and `branch_update` called it
+    /// per row with `?`. So a two-row `UPDATE` refused on its second row returned an error to the client
+    /// with the FIRST row already written into the workspace, the frame and the log — and with the first
+    /// row's escrow units already spent, so the caller's natural retry ("take less") was refused too,
+    /// against a claim drained by a write that never landed. Measured before this change:
+    /// `[(1, 20), (2, 20)]` became `[(1, 8), (2, 20)]` on a statement that returned an error.
+    ///
+    /// The comment that used to sit here said a refused over-draw "leaves no trace in the workspace, the
+    /// frame or the log". That was true of one row and false of one statement, which is the more useful
+    /// granularity: a client sees statements, not rows.
+    ///
+    /// # Decide, then apply
+    ///
+    /// Every spend across every row is computed and checked as a batch first, under one lock, and only
+    /// then is anything charged or recorded. Summing per cell matters: one statement can lower the same
+    /// cell twice, and checking each half against the full remaining balance would admit a batch that
+    /// overdraws in aggregate.
+    fn stage_all(
+        &self,
+        branch: BranchId,
+        tbl: TableId,
+        table: &str,
+        items: Vec<Staged>,
+    ) -> Result<(), FerroError> {
+        // ---- decide -------------------------------------------------------------------------
         //
-        // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying
-        // off `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so
-        // it walked straight past the bound and landed the counter at -100 against a floor of 0.
-        // A float decrement slipped through the same gap. Comparing before against after catches
-        // every op that lowers the value, including ones not yet invented.
-        if let (Some(before_row), RowState::Present(after_row)) = (&before, &after) {
-            let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
-            {
-                let state = self.state.lock().unwrap();
-                for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
-                    let cell = (tbl, row, ColId(idx as u32));
-                    if !state.escrow.is_bounded(&cell) {
-                        continue;
-                    }
-                    if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
-                        // Only a decrease consumes headroom; raising the value gives it back and
-                        // is always safe, so it is not charged.
-                        let drop = b - a;
-                        if drop > 0 {
-                            spends.push((cell, drop));
+        // Governed by the CHANGE TO THE CELL, not by the shape of the op that produced it. Keying off
+        // `Add(Int(d < 0))` looked equivalent and was not: `SET qty = -100` is an `Assign`, so it walked
+        // straight past the bound and landed the counter at -100 against a floor of 0. A float decrement
+        // slipped through the same gap. Comparing before against after catches every op that lowers the
+        // value, including ones not yet invented.
+        let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
+        {
+            let state = self.state.lock().unwrap();
+            for item in &items {
+                if let (Some(before_row), RowState::Present(after_row)) = (&item.before, &item.after) {
+                    for (idx, (b, a)) in before_row.iter().zip(after_row.iter()).enumerate() {
+                        let cell = (tbl, item.row, ColId(idx as u32));
+                        if !state.escrow.is_bounded(&cell) {
+                            continue;
+                        }
+                        if let (Some(b), Some(a)) = (numeric(b), numeric(a)) {
+                            // Only a decrease consumes headroom; raising the value gives it back and
+                            // is always safe, so it is not charged.
+                            let drop = b - a;
+                            if drop > 0 {
+                                spends.push((cell, drop));
+                            }
                         }
                     }
                 }
             }
-            for (cell, amount) in spends {
-                self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
-            }
+            // The whole statement, before a single unit is charged. This is the line that makes the
+            // refusal atomic.
+            state.escrow.check_all(branch, &spends)?;
         }
 
-        let mirrored = after.clone();
+        // ---- apply --------------------------------------------------------------------------
+        //
+        // Past this point nothing may fail on a per-row basis: `check_all` has already established that
+        // every spend fits, so `spend` cannot refuse.
+        for (cell, amount) in spends {
+            self.state.lock().unwrap().escrow.spend(branch, cell, amount)?;
+        }
+
+        let mut mirrored: Vec<(RowId, RowState)> = Vec::with_capacity(items.len());
         let frame = {
             let mut state = self.state.lock().unwrap();
             let ws = state.workspaces.get_mut(&branch.id).ok_or_else(|| {
                 FerroError::Branch(format!("no agent session on branch {}", branch))
             })?;
-            let key = Workspace::key(tbl, row);
-            ws.base_rows.entry(key).or_insert(before);
             ws.tables.insert(tbl.0, table.to_string());
-            ws.rows.insert(key, after);
-            for op in ops {
-                ws.frame.push_op(op);
-            }
-            if let Some(g) = guard {
-                ws.frame.push_guard(g);
+            for item in items {
+                let key = Workspace::key(tbl, item.row);
+                ws.base_rows.entry(key).or_insert(item.before);
+                ws.rows.insert(key, item.after.clone());
+                for op in item.ops {
+                    ws.frame.push_op(op);
+                }
+                if let Some(g) = item.guard {
+                    ws.frame.push_guard(g);
+                }
+                mirrored.push((item.row, item.after));
             }
             ws.frame.clone()
         };
         // Re-appending the task's frame replaces it rather than adding a second copy: `Add` is
-        // not idempotent and two copies of one frame would double-count.
+        // not idempotent and two copies of one frame would double-count. Appended ONCE for the whole
+        // statement, which is also why the frame is cloned after every row is folded in.
         self.log.append(&frame)?;
 
-        // Mirror the staged row onto the branch's OWN copy-on-write tree, when this runtime has a
+        // Mirror the staged rows onto the branch's OWN copy-on-write tree, when this runtime has a
         // page store. The workspace map above is still what `DIFF` and `MERGE` read; this is the
         // step that makes the branch's state exist as pages, so the isolation between branches is
         // a property of the page graph rather than of a map that happens not to be shared.
@@ -1070,9 +1149,11 @@ impl AgentRuntime {
                 "the caller's TableId disagrees with the table name it passed, so the tree and the \
                  workspace map would key the same row differently"
             );
-            match mirrored {
-                RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
-                RowState::Deleted => self.delete_row(branch, table, row.0)?,
+            for (row, state) in mirrored {
+                match state {
+                    RowState::Present(vals) => self.put_row(branch, table, row.0, &vals)?,
+                    RowState::Deleted => self.delete_row(branch, table, row.0)?,
+                }
             }
         }
         Ok(())
@@ -1480,12 +1561,63 @@ impl AgentRuntime {
             }
         }
 
-        // Gate tier: evaluated for every merge, reported whatever the outcome. It is a
-        // *heuristic* check in DESIGN.md's taxonomy, and the outcome for a heuristic is
-        // quarantine rather than rejection — which does not exist yet — so this tier reports and
-        // does not decide. Deciding on it before quarantine exists would mean either rejecting on
-        // a heuristic or silently ignoring it, and both are worse than saying what was seen.
+        // ---- the verification gate, at the one admission point ---------------------------------
+        //
+        // This used to compute the blind-write metric and stop, with a comment saying the outcome for
+        // a heuristic is quarantine "which does not exist yet". Quarantine has existed end to end
+        // since `integration_quarantine.rs`; the comment outlived it. So the gate now runs here, and
+        // its outcome is honoured.
         let blind = blind_writes_of(&snapshot.rows, &snapshot.reads);
+
+        // The premise check: every version this branch READ, against the version the base holds now.
+        // `state.versions` is the live map the read recorder itself reads from, so this is the same
+        // notion of "current version" on both sides rather than two definitions that can drift.
+        let (moved, approximate) = {
+            let state = self.state.lock().unwrap();
+            let mut moved: Vec<(TableId, RowId, u64, u64)> = Vec::new();
+            let mut approximate = false;
+            for rs in &snapshot.reads {
+                match rs {
+                    crate::provenance::readset::ReadSet::ExactVersions(versions) => {
+                        for v in versions {
+                            // Four cases, and the interesting one is the first. `begin_ts == 0` means
+                            // the branch read a row that no merge had published — so if a version
+                            // exists for it NOW, someone published it in between and the premise moved.
+                            // Treating that zero as "nothing to compare" was the first attempt and it
+                            // silently exempted exactly the rows agents read before anyone had written
+                            // them, which is most of them.
+                            match state.versions.get(&(v.tbl.0, v.row.0)) {
+                                Some(now) if now.begin_ts != v.begin_ts => {
+                                    moved.push((v.tbl, v.row, v.begin_ts, now.begin_ts));
+                                }
+                                // Still unpublished, or the same version: the premise holds.
+                                _ => {}
+                            }
+                        }
+                    }
+                    // A scan retains bounds rather than versions, so the most it can support is "some
+                    // row in this table moved". That is an over-approximation, and it is why the check
+                    // downgrades itself to heuristic rather than pretending to be exact.
+                    crate::provenance::readset::ReadSet::Predicate(_) => approximate = true,
+                }
+            }
+            (moved, approximate)
+        };
+
+        // **Only the premise check gates the merge, and the blind-write metric deliberately does not.**
+        //
+        // `BlindWriteCheck` is `Heuristic`, and its own documentation says why: "a blind write is
+        // genuinely suspicious and genuinely not proof of anything — the agent may have had every right
+        // to set that row without looking." Every INSERT is a blind write by construction. Wiring it in
+        // and honouring the outcome quarantined every ordinary merge in the suite, which is the correct
+        // behaviour for the code and the wrong behaviour for the system: an informational metric that
+        // starts blocking merges has been promoted without anyone deciding to promote it.
+        //
+        // So it stays where it was, reported on `MergeReport::blind_writes`, and the gate carries the
+        // check that is actually decidable.
+        let gate = crate::agent_sql::gate::VerificationGate::new()
+            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)))
+            .run();
 
         let outcome = MergeReport::aggregate(&row_outcomes);
         let merge_id = {
@@ -1493,6 +1625,35 @@ impl AgentRuntime {
             state.next_merge += 1;
             format!("m_{}", state.next_merge)
         };
+
+        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
+        //
+        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
+        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
+        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
+        // retrying blindly would recompute against a base that may move again.
+        //
+        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
+        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
+        // the safe response to not knowing is to hold, not to throw away.
+        if !gate.is_pass() {
+            let detail: Vec<String> = gate
+                .findings()
+                .iter()
+                .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
+                .collect();
+            let reason = format!("{} at merge admission — {}", gate.name(), detail.join("; "));
+            self.quarantine(branch, &reason)?;
+            return Ok(MergeReport {
+                merge_id,
+                from: branch,
+                into: target,
+                outcome,
+                rows: row_outcomes,
+                blind_writes: blind,
+                applied_to_target: false,
+            });
+        }
 
         if outcome.is_conflict() {
             // Nothing is published and the branch stays alive: the agent has the violated

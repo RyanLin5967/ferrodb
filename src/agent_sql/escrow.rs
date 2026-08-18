@@ -133,6 +133,51 @@ impl EscrowLedger {
     ///
     /// An unbounded cell is not this module's business and passes through — escrow applies only
     /// where a bound was declared.
+    /// Would this whole batch of spends fit, *without* charging any of it?
+    ///
+    /// **Why a batch check exists at all.** `spend` charges as it goes, so a caller applying several
+    /// spends in a loop and propagating the first error has already charged everything before it — the
+    /// statement fails and the budget is gone. That is not hypothetical: a two-row `UPDATE` refused on
+    /// its second row left the first row's units spent, so the caller's natural retry ("take less") was
+    /// refused too, against a claim drained by a write that never landed.
+    ///
+    /// Amounts are summed **per cell** before comparing, because one statement can lower the same cell
+    /// more than once and checking each against the full remaining balance would admit a batch that
+    /// overdraws in aggregate.
+    ///
+    /// The refusal text is deliberately the same shape as `spend`'s, so an operator cannot tell from the
+    /// message whether the check or the charge refused them — there is nothing useful in that
+    /// distinction, and two different wordings for one condition is how a message stops being greppable.
+    pub fn check_all(
+        &self,
+        branch: BranchId,
+        spends: &[(Cell, i64)],
+    ) -> Result<(), FerroError> {
+        let mut wanted: BTreeMap<Cell, i64> = BTreeMap::new();
+        for (cell, amount) in spends {
+            if *amount <= 0 {
+                continue; // giving headroom back is always safe, exactly as in `spend`
+            }
+            *wanted.entry(*cell).or_insert(0) += *amount;
+        }
+        for (cell, amount) in wanted {
+            // An unbounded cell has no pool and is not governed; `spend` returns Ok for it.
+            let Some(pool) = self.pools.get(&cell) else {
+                continue;
+            };
+            let claimed = pool.claimed.get(&branch.id).copied().unwrap_or(0);
+            let spent = pool.spent.get(&branch.id).copied().unwrap_or(0);
+            let left = claimed - spent;
+            if amount > left {
+                return Err(FerroError::Constraint(format!(
+                    "write of {amount} exceeds this branch's remaining escrow of {left} on {cell:?} \
+                     (claimed {claimed}, already spent {spent}); claim more before writing"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn spend(&mut self, branch: BranchId, cell: Cell, amount: i64) -> Result<(), FerroError> {
         let Some(pool) = self.pools.get_mut(&cell) else {
             return Ok(());
@@ -195,6 +240,39 @@ mod tests {
     use super::*;
 
     const CELL: Cell = (TableId(1), RowId(1), ColId(1));
+
+    /// **A batch that overdraws only in aggregate must be refused.**
+    ///
+    /// `check_all` sums per cell before comparing. Without that, two spends of 8 against a claim of 10
+    /// each pass individually and the batch overdraws by 6 — while the caller has been told the whole
+    /// statement is affordable, which is the one thing this function exists to answer.
+    ///
+    /// A UNIT test on purpose: a single `UPDATE` sets each column once per row and rows are distinct, so
+    /// no statement reachable today lowers one cell twice. Mutation proved that — replacing the summation
+    /// with a last-wins insert left the entire integration suite green. The summing guards the next
+    /// caller that batches more than one statement, so it gets a test that can reach it.
+    #[test]
+    fn a_batch_that_only_overdraws_in_aggregate_is_refused() {
+        let mut e = EscrowLedger::new();
+        e.open(CELL, 100).unwrap();
+        let branch = b(7);
+        e.claim(branch, CELL, 10).unwrap();
+
+        let err = e
+            .check_all(branch, &[(CELL, 8), (CELL, 8)])
+            .expect_err("a batch spending 16 against a claim of 10 was reported as affordable");
+        assert!(
+            format!("{err}").contains("exceeds this branch's remaining escrow"),
+            "refused, but not by the escrow bound: {err}"
+        );
+
+        // Anti-vacuity: two spends that DO fit are accepted, so the refusal is about the total.
+        e.check_all(branch, &[(CELL, 5), (CELL, 5)])
+            .expect("a batch spending exactly the claim was refused");
+        // A credit in the batch is not charged, matching `spend`'s own rule.
+        e.check_all(branch, &[(CELL, 10), (CELL, -50)])
+            .expect("a negative amount must not be counted as a spend");
+    }
     fn b(n: u64) -> BranchId {
         BranchId::new(n, 0)
     }

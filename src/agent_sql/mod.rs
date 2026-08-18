@@ -31,7 +31,7 @@ pub mod session;
 pub use changeset::{ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome};
 pub use dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
 pub use escrow::{Cell, EscrowLedger};
-pub use gate::{BlindWriteCheck, Check, CheckStatus, Finding, GateOutcome, Tier, VerificationGate};
+pub use gate::{BlindWriteCheck, Check, CheckStatus, Finding, GateOutcome, ReadPremiseCheck, Tier, VerificationGate};
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use paged_rows::PagedRows;
