@@ -1,7 +1,7 @@
 //! The durable-IO seam.
 //!
-//! Every byte this database makes durable leaves through one of six operations. Before this trait
-//! existed there was no way to make any of them misbehave: [`crate::storage::disk_manager::DiskManager`]
+//! Every byte the **page store and the write-ahead log** make durable leaves through one of six
+//! operations. Before this trait existed there was no way to make any of them misbehave: [`crate::storage::disk_manager::DiskManager`]
 //! owned a concrete `File` and called the free `pwrite`/`pread` helpers directly, and
 //! [`crate::wal::log::WalManager`] did the same. So the recovery code — the whole point of a write-ahead
 //! log — could only ever be tested against faults a test could stage by *hand-editing the file after
@@ -16,6 +16,23 @@
 //! `pwrite`/`pread` keep their short-count return, because a real `write_at` is allowed to be short
 //! and both callers already loop. A simulated *torn* write is therefore NOT modelled as a short count
 //! — a short count is a retry, not a loss. See [`crate::storage::sim`].
+//!
+//! # What is NOT behind this seam, stated because the first sentence used to overclaim it
+//!
+//! It said "every byte this database makes durable", and that was false. `run_cli` durably writes five
+//! files and only two of them are here. A fault cannot reach:
+//!
+//! * `<db>.arena` — [`crate::branch::arena::ArenaPageStore::checkpoint`] uses `std::fs::write` plus
+//!   `std::fs::rename`, and fsyncs neither the temporary file nor the directory.
+//! * `<db>.branches` — `branch::catalog::LogBranchCatalog` appends with `write_all` + `sync_data` and
+//!   replays with `read_to_end`. Its `replay` has an explicit torn-tail branch, which is exactly the
+//!   fault class [`crate::storage::sim`] exists to inject and cannot reach there.
+//! * the base backup image and its label — `replication::backup` calls the free `pwrite` on a concrete
+//!   `File`; that module was out of bounds for the change that introduced this trait.
+//! * `<db>.lock` — `storage::db_lock`, which is process coordination rather than recoverable state.
+//!
+//! Converting the first two is the next increment, and it is what would let a crash be aimed at the
+//! branch arena or the branch catalog at all.
 
 use std::fs::File;
 use std::io;

@@ -38,8 +38,9 @@ use ferrodb::catalog::column::{Column, DataType, Value};
 use ferrodb::catalog::schema::Schema;
 use ferrodb::error::FerroError;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
-use ferrodb::storage::heap_file_manager::HeapFileManager;
+use ferrodb::storage::heap_file_manager::{HeapFileManager, RecordId};
 use ferrodb::storage::heap_page::Page;
+use ferrodb::storage::index::BPlusTreeManager;
 use ferrodb::storage::sim::{
     Durability, FaultKind, FaultPlan, OpKind, SimFabric, TraceOp, WriteShape,
 };
@@ -281,10 +282,18 @@ fn reboot_and_recover(surviving: &Arc<SimFabric>, dir_root: u32) -> AfterRecover
     let outcome = recover(&db.txn)
         .map_err(|e| format!("recover: {e:?}"))
         .and_then(|recovered| {
-            // What `run_cli` does when recovery ran: a checkpoint, which is what pushes the pages
-            // recovery rebuilt in memory out to the disk. Without it the reboot leaves everything
-            // recovery did in a buffer pool that is about to be dropped, and a second reboot would
-            // have to redo it all over again from the log.
+            // A checkpoint, which is what pushes the pages recovery rebuilt in memory out to the
+            // disk. Without it the reboot leaves everything recovery did in a buffer pool that is
+            // about to be dropped, and a second reboot would have to redo it all over again.
+            //
+            // **This is a SHORTENED `run_cli`, and the difference matters.** The real sequence is
+            // recover -> `Catalog::open` -> `rebuild_indexes` -> checkpoint (`cli.rs:57-66`); this
+            // one skips the middle two, because the workload above never creates a catalog. That
+            // omission used to mean no fault in this sweep ever landed on `Catalog::persist` or on
+            // `rebuild_indexes` — two of the five write-order sites this branch sorted — and their
+            // only coverage was a fault-free comparison. Found by an audit of this file rather than
+            // by the sweep. `recovery_holds_at_every_fault_point_through_the_catalog` is the sweep
+            // that does run the full sequence.
             if recovered {
                 db.txn.checkpoint().map_err(|e| format!("checkpoint after recovery: {e:?}"))?;
             }
@@ -1545,4 +1554,229 @@ fn missing_pages(wal: &WalManager, db_len: u64) -> Vec<u32> {
         .into_iter()
         .filter(|p| (*p as u64 + 1) * PAGE_SIZE as u64 > db_len)
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// A second sweep, over a workload that goes through the catalog and the indexes.
+// ---------------------------------------------------------------------------------------------
+
+/// Tables in the catalog-bearing workload, deliberately not in name order.
+const CAT_TABLES: [&str; 3] = ["zulu", "alpha", "mike"];
+
+/// Rows per table in the catalog-bearing workload. Enough that the primary index is worth rebuilding
+/// and that "all or nothing" has something to say.
+const CAT_ROWS: i32 = 60;
+
+/// Two tables, one secondary index, rows inserted in one transaction, and a catalog that is persisted.
+///
+/// Deliberately not in name order, so `Catalog::persist`'s sort has something to do.
+fn catalog_workload(fabric: &Arc<SimFabric>) -> Result<(), FerroError> {
+    let db = open(fabric)?;
+    let mut catalog = Catalog::create(db.bp.clone())?;
+    for name in CAT_TABLES {
+        catalog.create_table(name.to_string(), three_column_schema())?;
+    }
+    catalog.create_index("alpha", "age")?;
+    catalog.create_index("mike", "age")?;
+
+    // **Stage one ends durable.** The catalog is written and fsynced before any row exists, which is
+    // what a real `CREATE TABLE` session does and what gives the later fault points something to
+    // recover *to*: the catalog is not WAL-logged in this engine, so without a sync here every crash
+    // under `Durability::SyncOnly` would come back to an empty database and "recovery held" would be
+    // a statement about nothing. Measured before this split: zero of 153 fault points recovered fully
+    // under SyncOnly.
+    catalog.persist()?;
+    db.bp.flush_all()?;
+    db.bp.disk_manager.sync()?;
+
+    // Stage two: the rows, in one transaction, then durable again.
+    let t = db.txn.begin()?;
+    for name in CAT_TABLES {
+        let entry = catalog.require_table(name)?.clone();
+        let mut heap = HeapFileManager::open(entry.first_directory_page_id, db.bp.clone());
+        heap.set_transaction(db.txn.clone(), t);
+        for i in 0..CAT_ROWS {
+            let tuple = Tuple::serialize(
+                &[Value::Integer(i), Value::Integer(i * 2)],
+                &entry.schema,
+                1,
+            )?;
+            heap.insert(tuple)?;
+        }
+    }
+    db.txn.commit(t)?;
+    catalog.persist()?;
+    db.bp.flush_all()?;
+    db.bp.disk_manager.sync()?;
+    Ok(())
+}
+
+/// The reboot, running **`run_cli`'s actual sequence**: recover, open the catalog, rebuild the
+/// indexes, checkpoint. Returns each table's row count, having first checked that every surviving row
+/// is reachable through the index that was just rebuilt for it.
+fn catalog_reboot(surviving: &Arc<SimFabric>) -> Result<Vec<(String, usize)>, String> {
+    let db = open(surviving).map_err(|e| format!("open: {e:?}"))?;
+    let recovered = recover(&db.txn).map_err(|e| format!("recover: {e:?}"))?;
+    let mut catalog =
+        Catalog::open(db.bp.clone(), 1).map_err(|e| format!("catalog open: {e:?}"))?;
+    if recovered {
+        rebuild_indexes(&mut catalog, &db.bp).map_err(|e| format!("rebuild_indexes: {e:?}"))?;
+        db.txn.checkpoint().map_err(|e| format!("checkpoint: {e:?}"))?;
+    }
+
+    let mut names: Vec<String> = catalog.tables.keys().cloned().collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let entry = catalog.require_table(&name).map_err(|e| format!("require {name}: {e:?}"))?;
+        let heap = HeapFileManager::open(entry.first_directory_page_id, db.bp.clone());
+        let rows: Vec<_> = heap
+            .scan()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("scan {name}: {e:?}"))?;
+        // The point of running `rebuild_indexes` under a fault: every row that survived must be
+        // findable through the tree that was rebuilt from it. A tree built over the wrong pages, or
+        // over pages a scrambled rebuild order put somewhere else, fails here.
+        let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, db.bp.clone());
+        for (_, tuple) in &rows {
+            let vals = tuple
+                .deserialize(&entry.schema)
+                .map_err(|e| format!("deserialize a row of {name}: {e:?}"))?;
+            let found = tree
+                .search(&vals[0])
+                .map_err(|e| format!("search {name}: {e:?}"))?;
+            if found.is_none() {
+                return Err(format!(
+                    "{name}: a row that survived is not reachable through its rebuilt primary index"
+                ));
+            }
+        }
+        out.push((name, rows.len()));
+    }
+    Ok(out)
+}
+
+/// **The sweep that aims a fault at the catalog and at the index rebuild.**
+///
+/// Breaking shape: a crash anywhere in a workload that writes *catalog* pages, plus a reboot that
+/// **rebuilds every index tree** the way `run_cli` does. The main sweep does neither — its workload
+/// is `DiskManager` + `WalManager` + `HeapFileManager` and its reboot stops after the checkpoint — so
+/// two of the five write-order sites this branch sorted, `Catalog::persist` and `rebuild_indexes`,
+/// never had a fault aimed at them at all. That gap was found by auditing this file, not by the sweep,
+/// which is the argument for auditing the harness and not only the code under it.
+///
+/// Invariants here are the catalog's rather than the heap's: the catalog comes back with every table
+/// or none; each table's rows are all-or-nothing; every surviving row is reachable **through the index
+/// rebuilt for it**, which is what makes a fault during `rebuild_indexes` mean something; and a refusal
+/// is licensed only where the surviving file was too short to hold the catalog's own page.
+///
+/// **What this sweep does NOT do, measured rather than assumed.** It adds *survivability* coverage of
+/// those two code paths under a crash; it does not detect a wrong write *order* in them. Reverting
+/// either sort and running this test kills it **0 times in 5**, while
+/// `the_catalog_and_its_rebuilt_indexes_land_in_the_same_place_every_run` kills it 5 times in 5 — and
+/// the reason is that the invariants above are all satisfied by a differently-ordered but complete
+/// database. Two different properties, two different tests, and it is worth saying so here because
+/// "the sweep covers the catalog now" would otherwise read as covering both.
+#[test]
+fn recovery_holds_at_every_fault_point_through_the_catalog() {
+    for durability in [Durability::WriteThrough, Durability::SyncOnly] {
+        let census = fabric(None, durability);
+        catalog_workload(&census).expect("the fault-free catalog workload must succeed");
+        let points = census.faultable_ops();
+        assert!(
+            points.len() >= 40,
+            "only {} faultable operations in the catalog workload; that is not a sweep",
+            points.len()
+        );
+
+        let (mut full, mut partial, mut refused) = (0usize, 0usize, 0usize);
+        let mut reasons: BTreeSet<String> = BTreeSet::new();
+        for &n in &points {
+            for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
+                let live = fabric(Some(FaultPlan::at_shaped(n, 0x0B10_5EED, shape)), durability);
+                let ran = std::panic::catch_unwind(AssertUnwindSafe(|| catalog_workload(&live)));
+                let fired = live.fired().expect("a faultable operation fired nothing");
+                assert!(
+                    ran.is_ok(),
+                    "the catalog workload PANICKED with a fault at operation {n} ({fired:?})"
+                );
+                assert!(
+                    !matches!(ran, Ok(Ok(()))),
+                    "the catalog workload reported SUCCESS with a fault at operation {n} \
+                     ({fired:?}); a durable-IO error was swallowed"
+                );
+
+                let rebooted = live.restart();
+                let what = format!("catalog fault at op {n} ({shape:?}): {fired:?}");
+                let after = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    catalog_reboot(&rebooted)
+                })) {
+                    Ok(a) => a,
+                    Err(_) => panic!("the catalog reboot PANICKED after {what}"),
+                };
+                match after {
+                    Ok(tables) => {
+                        // Every table or none: `create_table` persists the catalog after each one,
+                        // so a crash between two of them is the shape that leaves a partial set.
+                        assert!(
+                            tables.len() == CAT_TABLES.len() || tables.is_empty(),
+                            "{what}: the catalog came back with {} tables, not 0 or {}: {tables:?}",
+                            tables.len(),
+                            CAT_TABLES.len()
+                        );
+                        for (name, rows) in &tables {
+                            assert!(
+                                *rows == 0 || *rows == CAT_ROWS as usize,
+                                "{what}: table {name} came back with {rows} of {CAT_ROWS} rows"
+                            );
+                        }
+                        if tables.len() == CAT_TABLES.len()
+                            && tables.iter().all(|(_, r)| *r == CAT_ROWS as usize)
+                        {
+                            full += 1;
+                        } else {
+                            partial += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // **A refusal is licensed only where the catalog could not have survived.**
+                        // The same rule as invariant 6 in the main sweep, applied to the artifact
+                        // this sweep is about: if the surviving file is long enough to hold the
+                        // catalog's own page and recovery still refuses, that is a database that
+                        // existed and cannot be reopened, not a database that was never created.
+                        let db_bytes = rebooted
+                            .durable_image()
+                            .get(DB)
+                            .map(|v| v.len() as u64)
+                            .unwrap_or(0);
+                        let catalog_page_could_exist = db_bytes >= 2 * PAGE_SIZE as u64;
+                        assert!(
+                            !catalog_page_could_exist,
+                            "{what}: the reboot REFUSED while the surviving file is {db_bytes} bytes \
+                             - long enough to hold the catalog page at page 1 - so there was a \
+                             catalog there to reopen. {e}"
+                        );
+                        refused += 1;
+                        reasons.insert(e.split(':').next().unwrap_or(&e).to_string());
+                    }
+                }
+            }
+        }
+        println!(
+            "catalog sweep ({durability:?}): {} ops, full {full}, empty-or-partial {partial}, \
+             refused {refused} {reasons:?}",
+            points.len()
+        );
+        // Anti-vacuity: the sweep saw a database that kept everything, and one that did not, so both
+        // branches of every assertion above were evaluated.
+        assert!(
+            full > 0,
+            "not one fault point recovered every table with its indexes, so the index check was only \
+             ever run on nothing"
+        );
+        assert!(
+            partial + refused > 0,
+            "every fault point recovered everything, so the fault may not be reaching durable state"
+        );
+    }
 }
