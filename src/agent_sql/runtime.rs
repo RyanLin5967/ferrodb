@@ -1590,8 +1590,39 @@ impl AgentRuntime {
                                 Some(now) if now.begin_ts != v.begin_ts => {
                                     moved.push((v.tbl, v.row, v.begin_ts, now.begin_ts));
                                 }
-                                // Still unpublished, or the same version: the premise holds.
-                                _ => {}
+                                // Same version: the premise genuinely holds.
+                                Some(_) => {}
+                                // ABSENT. This used to share an arm with the line above under the
+                                // comment "still unpublished, or the same version: the premise
+                                // holds", which conflates two different facts. A fresh-context
+                                // reader of this code (B9) called that fail-open.
+                                //
+                                // MEASURED, because the conclusion changes what this arm is for: it
+                                // is UNREACHABLE today, and the claim that it closed a live hole was
+                                // wrong. `versions` is written only by `record_applied` and NOTHING
+                                // in the crate removes from it (`grep versions.remove|retain|clear`
+                                // -> no hits, checked across all ten feature branches). And a read
+                                // of a row no merge has published is retained as `begin_ts == 0`,
+                                // not as a real timestamp - pinned by
+                                // `integration_read_premise::a_read_of_an_unpublished_row_is_recorded_as_version_zero`.
+                                // So an absent entry always means "unpublished at read time", and
+                                // the zero case below is the one that actually runs.
+                                //
+                                // The arm is kept, split out, as defence for the day something DOES
+                                // remove from `versions` - a `DROP TABLE` purge being the obvious
+                                // candidate, and B9's own `forget_table` already purges `row_author`
+                                // while leaving `versions` alone. On that day an absent entry against
+                                // a real version would mean "a premise I verified and have since
+                                // lost", and the honest answer is to stop claiming exactness rather
+                                // than to report that it holds.
+                                //
+                                // Deliberately NOT pushed onto `moved`: escalating an unseen row to
+                                // a violation would quarantine branches over rows this gate simply
+                                // cannot see, which is how wiring `BlindWriteCheck` into admission
+                                // took the suite from 871 to 590.
+                                None if v.begin_ts != 0 => approximate = true,
+                                // Read a row nobody had published, and nobody has since. Holds.
+                                None => {}
                             }
                         }
                     }

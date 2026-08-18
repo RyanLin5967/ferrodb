@@ -255,7 +255,20 @@ impl Check for ReadPremiseCheck {
         Tier::Invariants
     }
     fn status(&self) -> CheckStatus {
-        // Exact when every read named its versions; approximate the moment one of them was a scan.
+        // WHAT `SoundAndCrisp` MEANS HERE, stated because it is narrower than it looks. The
+        // comparison feeding `moved` consults `AgentRuntime`'s `versions` map, which is written only
+        // by `record_applied` - so it holds merge-published rows and nothing else.
+        //
+        // That is not a soundness hole, though it was first written up as one. A read of a row no
+        // merge published is retained as `begin_ts == 0`, and the comparison handles that case
+        // explicitly: a zero premise against a present entry means someone published it in between,
+        // which is a moved premise and is detected. The case that would be unverifiable - an absent
+        // entry against a real version - cannot arise while nothing removes from `versions`, and
+        // nothing does. `runtime.rs` keeps it as its own arm, downgrading to `Heuristic` rather than
+        // reporting that the premise holds, against the day a `DROP TABLE` purge changes that.
+        //
+        // Exact when every read named versions this gate can see; approximate the moment one of them
+        // was a scan, or named a version the gate has no record of.
         if self.approximate {
             CheckStatus::Heuristic
         } else {
