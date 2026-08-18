@@ -21,32 +21,29 @@
 //! past the commit, and loses the refused row for ever. That is the third instance of one bug class
 //! here: E74 and E75 both lost rows because a commit_lsn identifies a transaction and not a row.
 
-//! # The fire-checks, and what each mutant turned red
+//! # The fire-checks
 //!
-//! Every guard below was mutated so the property was gone, the build was confirmed to SUCCEED (a
-//! mutant that does not compile prints nothing and looks exactly like a surviving one — that has
-//! produced four false passes in this repo), the tests were run, and the mutation reverted. Each
-//! mutant removes a property outright rather than one of two sufficient sites for it.
+//! Every guard here was mutated so its property was gone, the build was confirmed to SUCCEED before
+//! any red was believed — a mutant that does not compile prints nothing and looks exactly like a
+//! surviving one, which has produced four false passes in this repository — the tests were run, and
+//! the mutation reverted.
 //!
-//! | mutant | property removed | build | what went red |
-//! |---|---|---|---|
-//! | M1  | cursor computed over every DECODED event and refused events merely filtered — the naive refusal | 0 | 3 `stream` unit tests + this file's cursor test; pump reported `emitted: 3, cursor: 821`, past the refused row |
-//! | M1b | truncate at the offending EVENT instead of at its commit boundary | 0 | this file's cursor test only — invisible to every unit test, which is why it lives here |
-//! | M2  | the allowlist inside `jsonl::row_into` | 0 | 6 `jsonl` unit tests + 2 tests here, one of them via the **Go** binary: *line 3: the after image of customers carries column "ssn"* |
-//! | M3  | an undecided table falls through to publishing everything | 0 | 11 lib tests + this file's cursor test |
-//! | M5  | the `CREATE_TABLE` shape is no longer projected | 0 | 1 `jsonl` test + 2 here; the Go consumer named it: *CREATE_TABLE declares column "ssn"* |
-//! | M6  | `write_feed` decides per event inside the write loop instead of up front | 0 | `write_feed_writes_nothing_at_all_when_any_event_is_refused` |
-//! | M7  | a value with no column name no longer refuses | 0 | 2 `publication` unit tests |
-//! | M4  | the Go consumer's forward check (`decodeLine`) | 0 | 5 Go tests + `the_independent_consumer_refuses_...` here |
-//! | M4b | the Go consumer's narrower-producer check | 0 | `TestConsumerRefusesAShapeNarrowerThanItsOwnPolicy` |
+//! That is a claim nobody can check from prose, so it is a script instead: **`bench/b7_fire_checks.py`
+//! applies all 20 mutants and exits non-zero if any of them either fails to build or survives**, and
+//! `bench/b7_fire_checks.txt` is its output. Last run: 20 mutants, 0 survivors, every build exit 0.
+//! Twelve mutants cover the Rust guards (the cursor rule and its commit boundary, the column allowlist
+//! in `row_into`, the projected shape, batch atomicity, the undecided table, the unnamed value, the
+//! ambiguous duplicate name, `exclude`, the refusal-scan ordering, the empty-row refusal, and both
+//! halves of the declaration parser); seven cover the Go consumer's separate copy.
 //!
-//! M1b is the one worth keeping in mind. It is the mistake a careful reader of `pump` would make —
-//! truncate the batch at the refusal, which sounds exactly like what the fix is — and **no unit test
-//! in this repo can see it**. Measured under the mutant rather than argued about: pump one emitted
-//! `grace` (the published sibling of the refused row), the cursor landed on 635, that commit's own
-//! `commit_end_lsn`, and after widening the publication the refused row was **never delivered by any
-//! subsequent pump**. Under the real code the same probe delivers it: pump one emits 1 and refuses 3,
-//! the cursor stays at 365, and the resume carries all three events.
+//! The one worth reading is **M1b**: truncating the batch at the refusal rather than at its commit
+//! boundary is the mistake a careful reader of `pump` would make — it sounds exactly like the fix —
+//! and **no unit test in this repo can see it**. Measured under the mutant rather than argued about:
+//! pump one emitted `grace`, the published sibling of the refused row; the cursor landed on 635, that
+//! commit's own `commit_end_lsn`; and after the publication was widened the refused row was never
+//! delivered by any later pump. Under the shipped code the same probe delivers it — pump one emits 1
+//! and refuses 3, the cursor stays at 365, and the resume carries all three events. That is why the
+//! mixed-commit test below is an integration test and not a unit test.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
