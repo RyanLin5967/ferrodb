@@ -22,6 +22,7 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// The filesystem operations a durable replace is made of.
 ///
@@ -90,12 +91,32 @@ impl FileOps for OsFileOps {
 /// need a fifth operation whose own failure would then have to be handled, and the next successful
 /// replace overwrites it anyway.
 pub fn replace_atomically(ops: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let _serialised = REPLACE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = temp_path(path)?;
     ops.write(&tmp, bytes)?;
     ops.sync_file(&tmp)?;
     ops.rename(&tmp, path)?;
     ops.sync_dir(parent_dir(path))
 }
+
+/// Serialises durable replaces process-wide.
+///
+/// The temporary's name is derived from the target, so two threads replacing one file interleave:
+/// T1 writes the temporary, T2 truncates it, T1 fsyncs and renames a half-written image into place.
+/// That is reachable rather than theoretical — `ArenaPageStore` is `Sync`, both of its checkpoint
+/// triggers deliberately drop the state lock before persisting, and `reopen_from_checkpoint` arms
+/// persisting on every open — and the outcome is a CRC-refusing `<db>.arena`, which is the exact
+/// failure this module exists to prevent.
+///
+/// Process-wide rather than per-path: a replace happens once per extent claimed or freed, so
+/// contention costs nothing worth measuring, and a per-path map would have to be pruned. Two
+/// *processes* over one database are refused earlier, by `storage::db_lock`.
+///
+/// Poisoning is ignored deliberately. What this guards is a path on a filesystem, not an invariant
+/// in memory: a panicking replace leaves at worst a stale temporary, whereas refusing every later
+/// checkpoint because an earlier one panicked would turn a recoverable leak into a database that
+/// cannot record where its arena starts.
+static REPLACE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The temporary that `path` is staged through: its **whole file name** plus `.tmp`.
 ///
@@ -276,6 +297,50 @@ mod tests {
             !temp_path(&target).unwrap().exists(),
             "the temporary must not survive a successful replace"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Two threads replacing one file must not interleave into a half-written image.**
+    ///
+    /// The temporary's name comes from the target, so without serialisation T2's `File::create`
+    /// truncates the temporary T1 is about to fsync and rename — publishing a short or mixed image
+    /// under a name that promises neither. `ArenaPageStore` is `Sync` and persists with its state
+    /// lock dropped, so this is the arena's own shape, not a hypothetical.
+    ///
+    /// Measured with `REPLACE_LOCK` removed: this fails, reporting a published length of 0 rather
+    /// than 262144.
+    #[test]
+    fn concurrent_replaces_of_one_target_never_publish_a_mixture() {
+        const LEN: usize = 256 * 1024;
+        let dir = std::env::temp_dir().join(format!("ferro-atomic-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state.arena");
+        replace_atomically(&OsFileOps, &target, &vec![b'z'; LEN]).unwrap();
+
+        std::thread::scope(|s| {
+            for tag in [b'a', b'b', b'c', b'd'] {
+                let target = target.clone();
+                s.spawn(move || {
+                    let payload = vec![tag; LEN];
+                    for _ in 0..25 {
+                        replace_atomically(&OsFileOps, &target, &payload).unwrap();
+                        let got = std::fs::read(&target).unwrap();
+                        assert_eq!(
+                            got.len(),
+                            LEN,
+                            "a replace published {} bytes: the temporary was truncated under it",
+                            got.len()
+                        );
+                        assert!(
+                            got.iter().all(|b| *b == got[0]),
+                            "a replace published a mixture of two writers' images"
+                        );
+                    }
+                });
+            }
+        });
 
         let _ = std::fs::remove_dir_all(&dir);
     }
