@@ -84,10 +84,43 @@ pub struct WalBuffer {
 }
 
 /// What a [`RecKind::Ddl`] record describes.
-#[derive(Debug, PartialEq, Clone, Copy)]
+///
+/// **No longer `Copy`, on purpose.** `AlterColumn` carries the column names the change is about,
+/// and those cannot be reconstructed from the record's `columns` list: a rename's *old* name is
+/// gone from the new shape, and a retype's *old* type is gone from it too. A reader handed only
+/// the resulting shape sees a rename as one column vanishing and another appearing, which a sink
+/// would apply as DROP + ADD — losing the column's data. So the alteration travels with the op.
+#[derive(Debug, PartialEq, Clone)]
 pub enum DdlOp {
     CreateTable,
     DropTable,
+    /// A column-level change. The record's `columns` still carries the table's **full shape after
+    /// the change**, exactly as `CreateTable` does, so one retained record per table remains a
+    /// complete description of it.
+    AlterColumn(ColumnAlteration),
+}
+
+/// Which column-level change a [`DdlOp::AlterColumn`] describes, and the half of it that the
+/// resulting shape does not record.
+#[derive(Debug, PartialEq, Clone)]
+pub enum ColumnAlteration {
+    /// A column appended at the end. Its type and nullability are in the record's `columns`.
+    Add { column: String },
+    /// A column renamed. `to` is in the record's `columns`; `from` is nowhere else.
+    Rename { from: String, to: String },
+    /// A column's type changed. The new type is in the record's `columns`; `from` is nowhere else.
+    Retype { column: String, from: DataType },
+}
+
+impl ColumnAlteration {
+    /// The column the change is about, named as it is **after** the change.
+    pub fn column(&self) -> &str {
+        match self {
+            ColumnAlteration::Add { column } => column,
+            ColumnAlteration::Rename { to, .. } => to,
+            ColumnAlteration::Retype { column, .. } => column,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -209,6 +242,45 @@ pub(crate) fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroErro
         .map_err(|e| FerroError::Wal(format!("log record holds a non-utf8 string: {e}")))
 }
 
+/// A [`DataType`] as one tag byte plus whatever payload the type carries.
+///
+/// One definition, two call sites: a column in the record's shape list, and the *old* type inside
+/// a [`ColumnAlteration::Retype`]. Written as a function rather than twice inline so a type added
+/// to `DataType` fails to compile here instead of acquiring two different tags.
+fn write_data_type(buffer: &mut Vec<u8>, ty: &DataType) {
+    // Varchar's length is part of the type, so a consumer that recreates the column gets the same
+    // width. Tags 0..3 are fixed by every DDL record already in a log; the wide types took the
+    // next free numbers so an existing WAL still replays.
+    match ty {
+        DataType::Integer => buffer.push(0),
+        DataType::Float => buffer.push(1),
+        DataType::Boolean => buffer.push(2),
+        DataType::Varchar(n) => {
+            buffer.push(3);
+            buffer.extend_from_slice(&n.to_be_bytes());
+        }
+        DataType::BigInt => buffer.push(4),
+        DataType::Decimal => buffer.push(5),
+        DataType::Timestamp => buffer.push(6),
+    }
+}
+
+fn read_data_type(bytes: &[u8], at: &mut usize) -> Result<DataType, FerroError> {
+    Ok(match take_u8(bytes, at)? {
+        0 => DataType::Integer,
+        1 => DataType::Float,
+        2 => DataType::Boolean,
+        3 => DataType::Varchar(take_u16(bytes, at)?),
+        4 => DataType::BigInt,
+        5 => DataType::Decimal,
+        6 => DataType::Timestamp,
+        other => return Err(FerroError::Wal(format!("unknown column type tag {other}"))),
+    })
+}
+
+// `pub(crate)`, which is HEAD's visibility: B10's `storage::sim`, `branch::arena`,
+// `branch::record` and `cow::page_header` all read from this module, and B11's private `fn short`
+// would have made this file's own error helper unreachable from them.
 pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
     FerroError::Wal(format!(
         "log record is truncated: wanted {want} byte(s) at offset {at} but the record is {have} bytes"
@@ -251,29 +323,40 @@ impl RecKind {
             }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
                 buffer.push(9);
-                buffer.push(match op { DdlOp::CreateTable => 0, DdlOp::DropTable => 1 });
+                // Tags 0 and 1 keep their meaning and their position, so every DDL record already
+                // in a log still deserializes byte for byte. The alteration's payload is written
+                // immediately after the op byte and only for tag 2, so nothing that reads an older
+                // record is offset by it.
+                match op {
+                    DdlOp::CreateTable => buffer.push(0),
+                    DdlOp::DropTable => buffer.push(1),
+                    DdlOp::AlterColumn(alt) => {
+                        buffer.push(2);
+                        match alt {
+                            ColumnAlteration::Add { column } => {
+                                buffer.push(0);
+                                write_str(buffer, column);
+                            }
+                            ColumnAlteration::Rename { from, to } => {
+                                buffer.push(1);
+                                write_str(buffer, from);
+                                write_str(buffer, to);
+                            }
+                            ColumnAlteration::Retype { column, from } => {
+                                buffer.push(2);
+                                write_str(buffer, column);
+                                write_data_type(buffer, from);
+                            }
+                        }
+                    }
+                }
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&time_travel_root.to_be_bytes());
                 write_str(buffer, table);
                 buffer.extend_from_slice(&(columns.len() as u16).to_be_bytes());
                 for (name, ty, nullable) in columns {
                     write_str(buffer, name);
-                    // Type tag, then any payload the type carries. Varchar's length is part of the
-                    // type, so a consumer that recreates the column gets the same width.
-                    match ty {
-                        DataType::Integer => buffer.push(0),
-                        DataType::Float => buffer.push(1),
-                        DataType::Boolean => buffer.push(2),
-                        DataType::Varchar(n) => {
-                            buffer.push(3);
-                            buffer.extend_from_slice(&n.to_be_bytes());
-                        }
-                        // Tags 0..3 are fixed by every DDL record already in a log; the wide
-                        // types take the next free numbers so an existing WAL still replays.
-                        DataType::BigInt => buffer.push(4),
-                        DataType::Decimal => buffer.push(5),
-                        DataType::Timestamp => buffer.push(6),
-                    }
+                    write_data_type(buffer, ty);
                     buffer.push(if *nullable { 1 } else { 0 });
                 }
             }
@@ -333,6 +416,22 @@ impl RecKind {
                 let op = match take_u8(bytes, &mut at)? {
                     0 => DdlOp::CreateTable,
                     1 => DdlOp::DropTable,
+                    2 => DdlOp::AlterColumn(match take_u8(bytes, &mut at)? {
+                        0 => ColumnAlteration::Add { column: take_str(bytes, &mut at)? },
+                        1 => ColumnAlteration::Rename {
+                            from: take_str(bytes, &mut at)?,
+                            to: take_str(bytes, &mut at)?,
+                        },
+                        2 => ColumnAlteration::Retype {
+                            column: take_str(bytes, &mut at)?,
+                            from: read_data_type(bytes, &mut at)?,
+                        },
+                        other => {
+                            return Err(FerroError::Wal(format!(
+                                "unknown column alteration tag {other}"
+                            )))
+                        }
+                    }),
                     other => return Err(FerroError::Wal(format!("unknown ddl op {other}"))),
                 };
                 let dir_root = take_u32(bytes, &mut at)?;
@@ -342,18 +441,7 @@ impl RecKind {
                 let mut columns = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     let name = take_str(bytes, &mut at)?;
-                    let ty = match take_u8(bytes, &mut at)? {
-                        0 => DataType::Integer,
-                        1 => DataType::Float,
-                        2 => DataType::Boolean,
-                        3 => DataType::Varchar(take_u16(bytes, &mut at)?),
-                        4 => DataType::BigInt,
-                        5 => DataType::Decimal,
-                        6 => DataType::Timestamp,
-                        other => {
-                            return Err(FerroError::Wal(format!("unknown column type tag {other}")))
-                        }
-                    };
+                    let ty = read_data_type(bytes, &mut at)?;
                     let nullable = take_u8(bytes, &mut at)? != 0;
                     columns.push((name, ty, nullable));
                 }
@@ -1118,5 +1206,100 @@ mod tests {
             let err = RecKind::deserialize(&buf[..cut]);
             assert!(err.is_err(), "a record truncated to {cut} bytes decoded as if it were whole");
         }
+    }
+
+    // ---- B11: column-level DDL records ---------------------------------------------------------
+
+    fn ddl(op: DdlOp, columns: Vec<(String, DataType, bool)>) -> RecKind {
+        RecKind::Ddl { op, table: "inventory".into(), dir_root: 7, time_travel_root: 8, columns }
+    }
+
+    fn round_trip(rec: &RecKind) -> RecKind {
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        RecKind::deserialize(&bytes).expect("a record this code just wrote did not read back")
+    }
+
+    /// **Breaking shape: an alteration whose payload is not recoverable from the resulting shape.**
+    ///
+    /// A rename's old name and a retype's old type exist nowhere except in the op itself. If the
+    /// op byte were written without its payload — as tags 0 and 1 are — these three records would
+    /// all deserialize as the same thing, and a consumer would see a rename as a drop plus an add.
+    #[test]
+    fn every_column_alteration_survives_the_log_round_trip() {
+        let shape = vec![
+            ("id".to_string(), DataType::Integer, false),
+            ("note".to_string(), DataType::Varchar(20), true),
+        ];
+        for op in [
+            DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+            DdlOp::AlterColumn(ColumnAlteration::Rename {
+                from: "memo".into(),
+                to: "note".into(),
+            }),
+            DdlOp::AlterColumn(ColumnAlteration::Retype {
+                column: "note".into(),
+                from: DataType::Varchar(4),
+            }),
+        ] {
+            let rec = ddl(op.clone(), shape.clone());
+            assert_eq!(round_trip(&rec), rec, "{op:?} did not survive serialization");
+        }
+    }
+
+    /// **Anti-vacuity, and the compatibility claim in `serialize`'s comment, measured.**
+    ///
+    /// Tags 0 and 1 must still lay down the exact bytes they laid down before the alteration
+    /// payload existed, or every DDL record already in a log stops replaying. Breaking shape: an
+    /// alteration payload written unconditionally after the op byte.
+    #[test]
+    fn create_and_drop_records_keep_their_byte_layout() {
+        let shape = vec![("id".to_string(), DataType::Integer, false)];
+        for (op, tag) in [(DdlOp::CreateTable, 0u8), (DdlOp::DropTable, 1u8)] {
+            let rec = ddl(op.clone(), shape.clone());
+            let mut bytes = Vec::new();
+            rec.serialize(&mut bytes);
+            assert_eq!(bytes[0], 9, "the record kind tag moved");
+            assert_eq!(bytes[1], tag, "the ddl op tag moved");
+            // dir_root is the next four bytes, exactly as before: nothing was inserted between.
+            assert_eq!(u32::from_be_bytes(bytes[2..6].try_into().unwrap()), 7);
+            assert_eq!(round_trip(&rec), rec);
+        }
+    }
+
+    /// A truncated alteration payload must be refused, not indexed past. These bytes arrive off a
+    /// disk. Breaking shape: a record cut anywhere inside the alteration's strings.
+    #[test]
+    fn a_truncated_alteration_is_refused_rather_than_panicking() {
+        let rec = ddl(
+            DdlOp::AlterColumn(ColumnAlteration::Rename {
+                from: "memo".into(),
+                to: "note".into(),
+            }),
+            vec![("note".to_string(), DataType::Varchar(20), true)],
+        );
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        for cut in 2..bytes.len() {
+            // Every prefix is either a clean refusal or, for a prefix that happens to be a valid
+            // shorter record, something that is not this record. Never a panic.
+            let _ = RecKind::deserialize(&bytes[..cut]);
+        }
+        assert!(RecKind::deserialize(&bytes[..4]).is_err(), "a 4-byte alteration record parsed");
+    }
+
+    /// An alteration tag this build does not know is refused by name, not silently read as one it
+    /// does know. Breaking shape: a log written by a newer build.
+    #[test]
+    fn an_unknown_alteration_tag_is_refused() {
+        let rec = ddl(
+            DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+            vec![("note".to_string(), DataType::Varchar(20), true)],
+        );
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        bytes[2] = 99; // the alteration sub-tag
+        let err = RecKind::deserialize(&bytes).expect_err("an unknown alteration tag was accepted");
+        assert!(format!("{err}").contains("column alteration tag"), "{err}");
     }
 }

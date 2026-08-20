@@ -23,11 +23,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::catalog::alter::{conform_row, resulting_schema};
+use crate::execution::executor::alteration_of;
+use crate::parser::parser::AlterAction;
 use crate::agent_sql::changeset::{
     ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome,
 };
 use crate::branch::catalog::LogBranchCatalog;
 use crate::tel::MemEffectLog;
+use crate::tel::schema_merge::{merge_schema, SchemaEdit};
+use crate::agent_sql::changeset::SchemaMergeReport;
 use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
@@ -153,6 +158,25 @@ struct Workspace {
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
     tables: BTreeMap<u32, String>,
     frame: TxnFrame,
+    // B11's fields, WITHOUT its `reads`: B4 deleted `Workspace::reads` as a second copy of a
+    // read-set the runtime already keeps in `State::captures`, and re-adding it here would restore
+    // the duplication B4 removed. The one consumer below reads it from `captures` instead.
+    /// Column-level schema changes this branch has made but not published — B11.
+    ///
+    /// Pending rather than applied, because a schema is the most visible write there is: applying
+    /// one immediately would make every other connection see the column the moment one agent
+    /// typed the statement, and abandoning the branch would not take it away. Published at
+    /// `MERGE`, after [`crate::tel::schema_merge::merge_schema`] has decided they compose with
+    /// whatever the target's shape has become.
+    schema_edits: Vec<(String, SchemaEdit)>,
+    /// Each touched table's shape **at first touch** — the fork point, in exactly the sense
+    /// `base_rows` is the fork-point row image.
+    ///
+    /// Needed by two things at merge: the three-way schema merge, and conforming this branch's
+    /// rows to a target whose shape a sibling agent has widened since. Without it a branch that
+    /// forked before a concurrent `ADD COLUMN` publishes rows one value short and the failure
+    /// surfaces from inside `Tuple::serialize`.
+    base_shapes: BTreeMap<String, Schema>,
 }
 
 impl Workspace {
@@ -605,6 +629,10 @@ impl AgentRuntime {
             Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
             None => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
         };
+        let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
+            None => (Vec::new(), BTreeMap::new()),
+        };
         state.workspaces.insert(
             branch.id,
             Workspace {
@@ -617,6 +645,11 @@ impl AgentRuntime {
                 base_rows,
                 tables,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
+                // A child forked from a live agent task inherits its parent's pending schema
+                // edits for the same reason it inherits its rows: the child's visible state IS
+                // the parent's state at fork time.
+                schema_edits: parent_schema_edits,
+                base_shapes: parent_base_shapes,
             },
         );
         state.captures.insert(txn.0, TxnCapture::new(txn, prov, branch));
@@ -895,6 +928,19 @@ impl AgentRuntime {
         branch: BranchId,
         stmt: Stmt,
     ) -> Result<usize, FerroError> {
+        // The shape at first touch, for the same reason `base_rows` records the image at first
+        // touch: it is the fork point, and a merge that has to reconcile a shape needs one.
+        if let Some(name) = match &stmt {
+            Stmt::Update { table, .. } | Stmt::Insert { table, .. } | Stmt::Delete { table, .. } => {
+                Some(table.clone())
+            }
+            _ => None,
+        } {
+            if let Some(entry) = ctx.catalog.get_table(&name) {
+                let shape = entry.schema.clone();
+                self.note_base_shape(branch, &name, shape);
+            }
+        }
         match stmt {
             Stmt::Update { table, assignments, where_clause } => {
                 self.branch_update(ctx, branch, &table, assignments, where_clause)
@@ -903,10 +949,102 @@ impl AgentRuntime {
             Stmt::Delete { table, where_clause } => {
                 self.branch_delete(ctx, branch, &table, where_clause)
             }
+            // `ALTER TABLE` does NOT come through here: it is staged by `stage_schema_edit`
+            // before this point, because a schema change is not a row write and must not be
+            // mixed into the effect log's cell algebra, whose `ColId` is the very ordinal an
+            // alteration moves.
             _ => Err(FerroError::Bind(
                 "only INSERT / UPDATE / DELETE run inside an agent session".into(),
             )),
         }
+    }
+
+    /// Record a table's shape at this branch's first touch of it. First-touch-wins, exactly as
+    /// `base_rows` is populated: a later call cannot move the fork point.
+    fn note_base_shape(&self, branch: BranchId, table: &str, shape: Schema) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(ws) = state.workspaces.get_mut(&branch.id) {
+            ws.base_shapes.entry(table.to_string()).or_insert(shape);
+        }
+    }
+
+    /// The shape this branch is working against: its fork point plus its own pending edits.
+    ///
+    /// This is what a *second* `ALTER` in one session is validated against, so `ADD COLUMN note`
+    /// twice in a row is refused when the agent types it rather than at merge.
+    fn branch_shape(&self, branch: BranchId, table: &str, shared: &Schema) -> Schema {
+        let state = self.state.lock().unwrap();
+        let Some(ws) = state.workspaces.get(&branch.id) else { return shared.clone() };
+        let mut shape = ws.base_shapes.get(table).cloned().unwrap_or_else(|| shared.clone());
+        for (t, edit) in &ws.schema_edits {
+            if t == table {
+                let _ = edit.apply(&mut shape);
+            }
+        }
+        shape
+    }
+
+    /// Record an `ALTER TABLE` on a branch — B11.
+    ///
+    /// Validated **now**, against the branch's own projected shape, with the same rules
+    /// [`Catalog::alter_table`] applies (`catalog::alter::resulting_schema`). An agent that types
+    /// an `ADD COLUMN ... NOT NULL` is told so immediately rather than at merge, after everything
+    /// that depended on it.
+    pub fn stage_schema_edit(
+        &self,
+        catalog: &Catalog,
+        branch: BranchId,
+        table: &str,
+        action: &AlterAction,
+    ) -> Result<(), FerroError> {
+        let entry = catalog.require_table(table)?;
+        let shared = entry.schema.clone();
+        let row_count = catalog.stats.get(table).map(|s| s.row_count).unwrap_or(0);
+        self.note_base_shape(branch, table, shared.clone());
+
+        let before = self.branch_shape(branch, table, &shared);
+        // Refuses here or nowhere: this is the same function the shared-catalog path calls.
+        resulting_schema(table, &before, action, row_count)?;
+
+        let edit = match action {
+            AlterAction::AddColumn(col) => SchemaEdit::AddColumn(col.clone()),
+            AlterAction::RenameColumn { from, to } => {
+                SchemaEdit::RenameColumn { from: from.clone(), to: to.clone() }
+            }
+            AlterAction::RetypeColumn { column, to } => {
+                // The type the branch OBSERVED. It is the whole of the precondition the merge
+                // re-checks — DESIGN's rule that a guard must name what was seen, not the
+                // invariant — and the parser has no reason to know it.
+                let from = before
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == column)
+                    .map(|c| c.data_type.clone())
+                    .ok_or_else(|| {
+                        FerroError::Bind(format!("no column '{column}' to retype in '{table}'"))
+                    })?;
+                SchemaEdit::RetypeColumn { column: column.clone(), from, to: to.clone() }
+            }
+        };
+
+        let mut state = self.state.lock().unwrap();
+        let ws = state
+            .workspaces
+            .get_mut(&branch.id)
+            .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
+        ws.schema_edits.push((table.to_string(), edit));
+        Ok(())
+    }
+
+    /// The schema changes a branch is carrying, for `DIFF` and for tests.
+    pub fn pending_schema_edits(&self, branch: BranchId) -> Vec<(String, SchemaEdit)> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .get(&branch.id)
+            .map(|ws| ws.schema_edits.clone())
+            .unwrap_or_default()
     }
 
     fn branch_update(
@@ -1622,11 +1760,100 @@ impl AgentRuntime {
                 tables: ws.tables.clone(),
                 ops: ws.frame.ops.clone(),
                 guards: ws.frame.guards.clone(),
+                // B4's read-set, from `captures` rather than a per-workspace copy.
                 reads: state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default(),
+                schema_edits: ws.schema_edits.clone(),
+                base_shapes: ws.base_shapes.clone(),
             }
         };
 
+        // ---- schema, before rows -----------------------------------------------------------
+        //
+        // B11. The shape a merge publishes rows into is the merged shape, so the schema has to
+        // compose before anything decides what a row means. A schema conflict is reported exactly
+        // as a cell conflict is — same `ConflictReport`, same violated predicate — and publishes
+        // nothing, because a merge that applied half a shape is worse than one that applied none.
+        //
+        // Every table the branch touched is considered, not only the ones it altered: a branch
+        // that forked before a sibling's `ADD COLUMN` has rows one value short of the target, and
+        // that is a schema question about a branch with no schema edits of its own.
+        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
+        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
+        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
+        for (_, name) in &snapshot.tables {
+            altered_tables.insert(name.clone());
+        }
+        for (name, _) in &snapshot.schema_edits {
+            altered_tables.insert(name.clone());
+        }
+        let mut merged_shapes: BTreeMap<String, Schema> = BTreeMap::new();
+        for name in &altered_tables {
+            let entry = ctx
+                .catalog
+                .get_table(name)
+                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
+            let target_now = entry.schema.clone();
+            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
+            let ours: Vec<SchemaEdit> = snapshot
+                .schema_edits
+                .iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, e)| e.clone())
+                .collect();
+            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
+            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
+            merged_shapes.insert(name.clone(), merged.shape.clone());
+            schema_reports.push(SchemaMergeReport {
+                table: name.clone(),
+                outcome: merged.outcome,
+                to_apply: merged.to_apply,
+                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
+            });
+        }
+
         // Current shared state for every table this branch touched.
+        // **B11's schema merge, evaluated here and applied in `publish_evaluation`.**
+        //
+        // B6 split `merge` into a half that decides and a half that applies, so B11's schema
+        // work splits the same way: conflict detection is a question about state and belongs
+        // with every other admission check, while the DDL that changes the shape must not run
+        // until a decision has been taken. Left whole in either half it would be wrong - in
+        // `evaluate` it would alter tables during a dry run, in `publish` its conflicts would
+        // arrive after the gate had already passed the merge.
+        //
+        // `merged_shapes` from B11's version is dropped: it was written and never read.
+        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
+        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
+        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
+        for (_, name) in &snapshot.tables {
+            altered_tables.insert(name.clone());
+        }
+        for (name, _) in &snapshot.schema_edits {
+            altered_tables.insert(name.clone());
+        }
+        for name in &altered_tables {
+            let entry = ctx
+                .catalog
+                .get_table(name)
+                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
+            let target_now = entry.schema.clone();
+            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
+            let ours: Vec<SchemaEdit> = snapshot
+                .schema_edits
+                .iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, e)| e.clone())
+                .collect();
+            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
+            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
+            schema_reports.push(SchemaMergeReport {
+                table: name.clone(),
+                outcome: merged.outcome,
+                to_apply: merged.to_apply,
+                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
+            });
+        }
+
         let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
         let mut table_names: BTreeMap<u32, String> = snapshot.tables.clone();
@@ -1686,6 +1913,33 @@ impl AgentRuntime {
             let schema = schemas.get(t).cloned().unwrap_or_else(|| Schema::new(Vec::new()));
             let before = snapshot.base_rows.get(&(*t, *r)).cloned().flatten();
             let now = current.get(&(*t, *r)).cloned();
+
+            // **B11 — read this branch's images in the shape the target has NOW, before anything
+            // compares them.**
+            //
+            // A branch's rows were written against its fork-point shape. If a sibling agent merged
+            // an `ADD COLUMN` or a widening retype since, those images are the wrong width or the
+            // wrong type for the table they are about to be compared against and published into.
+            // Conforming here rather than at publication is deliberate: the cell loop below walks
+            // `0..v.len().min(b.len())`, so two images of different widths would have their extra
+            // columns silently dropped from the merge — no conflict, no report, `Clean`.
+            let (before, after) = match (snapshot.base_shapes.get(&table), schemas.get(t)) {
+                (Some(base_shape), Some(target_shape)) if base_shape != target_shape => {
+                    let b = match &before {
+                        Some(v) => Some(conform_row(v, base_shape, target_shape)?),
+                        None => None,
+                    };
+                    let a = match after {
+                        RowState::Present(v) => {
+                            RowState::Present(conform_row(v, base_shape, target_shape)?)
+                        }
+                        RowState::Deleted => RowState::Deleted,
+                    };
+                    (b, a)
+                }
+                _ => (before, after.clone()),
+            };
+            let after = &after;
             let mut applied_ops: Vec<Op> = Vec::new();
             let mut discarded = Vec::new();
             let mut conflicts: Vec<ConflictReport> = Vec::new();
@@ -1977,7 +2231,7 @@ impl AgentRuntime {
         }
         let gate = gate.run();
 
-        let outcome = MergeReport::aggregate(&row_outcomes);
+        let outcome = MergeReport::aggregate(&row_outcomes, &schema_reports);
 
         Ok(MergeEvaluation {
             from: branch,
@@ -1997,6 +2251,7 @@ impl AgentRuntime {
                 .filter_map(|w| w.row_key())
                 .filter_map(|k| current.get(&k).map(|row| (k, row.clone())))
                 .collect(),
+            schema: schema_reports,
             pending: pending_writes,
         })
     }
@@ -2074,7 +2329,8 @@ impl AgentRuntime {
         }
 
         let MergeEvaluation {
-            from, into, outcome, rows, blind_writes, snapshot, pending, pre_images, ..
+            from, into, outcome, rows, blind_writes, snapshot, pending, pre_images,
+            schema: schema_reports, ..
         } = eval;
 
         // **The images each row moves BETWEEN, which is what a retained predicate is tested
@@ -2129,6 +2385,16 @@ impl AgentRuntime {
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
+        //
+        // Rows go in under the shape the catalog has NOW — every image was conformed to it above,
+        // where the cell merge could still see both shapes — and the branch's own schema edits are
+        // executed afterwards. Two reasons, and the order is not interchangeable:
+        //
+        // - `ALTER` is refused inside a transaction, so the edits cannot run inside the publish
+        //   transaction at all;
+        // - the alter's own heap rewrite widens every row in the table, which includes the ones
+        //   just published — so publishing narrow and altering after is not a compromise, it is
+        //   the same single pass over the heap that the alter was always going to make.
         let publish_txn = ctx.txn.begin()?;
         let mut published = 0usize;
         for w in pending {
@@ -2142,6 +2408,42 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
+
+        // The schema, last, and outside the publish transaction because DDL is refused inside one.
+        // Executed through exactly the path a non-agent `ALTER TABLE` takes — `Catalog::alter_table`
+        // then a checkpoint then `log_ddl` — so a column an agent added reaches the change feed as
+        // the same in-band, in-log-order event as one a human added, and the retained declaration
+        // is updated the same way. A second producer of schema events would be a second chance to
+        // disagree with the consumer.
+        for report in &schema_reports {
+            for edit in &report.to_apply {
+                let action = edit.as_action();
+                let (dir_root, tt_root, alteration) = {
+                    let entry = ctx.catalog.require_table(&report.table)?;
+                    (
+                        entry.first_directory_page_id,
+                        entry.time_travel_root,
+                        alteration_of(&action, &entry.schema)?,
+                    )
+                };
+                let prov = Arc::clone(self.provenance());
+                let shape =
+                    ctx.catalog.alter_table(&report.table, &action, &ctx.txn, Some(&prov))?;
+                // Flushed rather than checkpointed, for the reason spelled out in the executor's
+                // `AlterTable` arm: truncating the log here would delete the change history of the
+                // very table this merge just published rows into.
+                ctx.bp.flush_all()?;
+                ctx.bp.disk_manager.sync()?;
+                ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
+                    op: crate::wal::log::DdlOp::AlterColumn(alteration),
+                    table: report.table.clone(),
+                    dir_root,
+                    time_travel_root: tt_root,
+                    columns: shape,
+                })?;
+            }
+        }
+
         self.record_applied(
             from,
             snapshot.txn,
@@ -2160,6 +2462,7 @@ impl AgentRuntime {
             into,
             outcome,
             rows,
+            schema: schema_reports,
             applied_to_target: true,
         })
     }
@@ -2630,6 +2933,9 @@ pub struct MergeEvaluation {
     /// too. Captured here because `current` is evaluate-time state and `base_fingerprint` refuses a
     /// base that moved, which is what makes the evaluate-time image still correct at publish.
     pre_images: BTreeMap<(u32, u64), Vec<Value>>,
+    /// One result per table whose shape this merge decided - B11's three-way schema merge, evaluated
+    /// alongside every other admission check and applied by `publish_evaluation`.
+    schema: Vec<SchemaMergeReport>,
 }
 
 impl MergeEvaluation {
@@ -2692,6 +2998,10 @@ impl MergeEvaluation {
             outcome: self.outcome,
             rows: self.rows,
             blind_writes: self.blind_writes,
+            // An unpublished evaluation still reports what the schema merge DECIDED. A refused merge
+            // whose schema half conflicted has to be able to say so, or the caller sees a row-level
+            // report and no reason.
+            schema: self.schema,
             applied_to_target,
         }
     }
@@ -2883,6 +3193,8 @@ struct WorkspaceSnapshot {
     ops: Vec<Op>,
     guards: Vec<Guard>,
     reads: Vec<crate::provenance::readset::ReadSet>,
+    schema_edits: Vec<(String, SchemaEdit)>,
+    base_shapes: BTreeMap<String, Schema>,
 }
 
 /// A cell's value as an integer, for escrow accounting. `None` for anything not numeric.

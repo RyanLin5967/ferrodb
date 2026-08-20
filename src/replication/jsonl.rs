@@ -345,11 +345,17 @@ fn line_with_mask(e: &ChangeEvent, mask: &Mask<'_>) -> Result<String, Refusal> {
         ChangeOp::Schema { change: SchemaChange::DropTable, .. } => out.push_str("null"),
         // A schema event's payload is the table's shape, not a row. Keyed under `columns` so a
         // consumer never confuses it with data.
-        ChangeOp::Schema { columns, .. } => {
-            // **The declared shape goes through the same mask as a row.** A withheld column's name
-            // and type are themselves information that must not leave — and worse, a consumer told
-            // about a column it will never receive a value for creates it and then reports the
-            // column as permanently null, which reads as data loss rather than as policy.
+        // **The declared shape goes through the same mask as a row.** A withheld column's name
+        // and type are themselves information that must not leave — and worse, a consumer told
+        // about a column it will never receive a value for creates it and then reports the
+        // column as permanently null, which reads as data loss rather than as policy.
+        //
+        // **B11 — a column-level change adds `alter` alongside `columns`, and never replaces it.**
+        // The full shape stays, because a sink reconciles its destination positionally against it
+        // exactly as it does for a `CREATE_TABLE`; `alter` says which change produced that shape,
+        // because a rename and a drop-plus-add produce the same shape and only one of them keeps
+        // the column's data. Both halves, or a consumer has to guess one of them.
+        ChangeOp::Schema { change, columns } => {
             out.push_str("{\"columns\":[");
             let mut written = 0usize;
             for c in columns.iter() {
@@ -368,15 +374,58 @@ fn line_with_mask(e: &ChangeEvent, mask: &Mask<'_>) -> Result<String, Refusal> {
                 out.push('}');
                 written += 1;
             }
-            out.push_str("]}");
-            // Unreachable while a `CREATE_TABLE`'s spec list and the event's column list come from
-            // the same DDL record, because the publication refuses an event whose every column is
-            // withheld before this runs. Kept because the byte it would otherwise emit is
-            // `{"columns":[]}`, which claims the table has no columns at all — a different and
-            // false statement, and one the Go consumer refuses by name.
+            out.push(']');
+            // B7's guard, before anything further is emitted: a shape whose every column is withheld
+            // is refused outright rather than described.
             if written == 0 && !columns.is_empty() {
                 return Err(mask.refuse_nothing_publishable());
             }
+            // **B11's `alter`, put through B7's mask.** An alteration NAMES a column, so emitting it
+            // unmasked would leak the one thing the column list above just withheld - the name -
+            // which is precisely what masking the shape exists to prevent. Where the altered column
+            // is not published the alteration is omitted: the shape stays correct and complete for
+            // the columns this consumer may see, and its positional reconciliation still works. What
+            // is lost is the ability to tell a rename from a drop-plus-add for a column it is not
+            // allowed to know about, which is the intended trade.
+            //
+            // A rename requires BOTH names published, because either one identifies the column.
+            //
+            // NOT SETTLED HERE, and recorded in INTEGRATION.md: whether such an event should instead
+            // be withheld whole and counted the way an excluded table is, so a consumer is never
+            // handed a shape change it cannot explain.
+            match change {
+                // A declaration has no alteration to describe: nothing changed one column, the
+                // whole shape is being (re-)stated.
+                SchemaChange::CreateTable | SchemaChange::DropTable => {}
+                SchemaChange::AddColumn { column } if mask.publishes(column) => {
+                    out.push_str(",\"alter\":{\"column\":");
+                    escape_json_into(column, &mut out);
+                    out.push('}');
+                }
+                SchemaChange::RenameColumn { from, to }
+                    if mask.publishes(from) && mask.publishes(to) =>
+                {
+                    out.push_str(",\"alter\":{\"from\":");
+                    escape_json_into(from, &mut out);
+                    out.push_str(",\"to\":");
+                    escape_json_into(to, &mut out);
+                    out.push('}');
+                }
+                SchemaChange::RetypeColumn { column, from, to } if mask.publishes(column) => {
+                    out.push_str(",\"alter\":{\"column\":");
+                    escape_json_into(column, &mut out);
+                    out.push_str(",\"from\":");
+                    escape_json_into(from, &mut out);
+                    out.push_str(",\"to\":");
+                    escape_json_into(to, &mut out);
+                    out.push('}');
+                }
+                // The altered column is withheld: describe the shape, not the change.
+                SchemaChange::AddColumn { .. }
+                | SchemaChange::RenameColumn { .. }
+                | SchemaChange::RetypeColumn { .. } => {}
+            }
+            out.push('}');
         }
         ChangeOp::Read { row } => row_into(mask, &e.columns, row, &mut out)?,
         ChangeOp::Insert { new } | ChangeOp::Update { new, .. } => {
@@ -1140,5 +1189,94 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "one object per line: {text}");
         assert!(text.ends_with('\n'), "the last line must be terminated too");
         assert!(text.contains("\"qty\":null"), "a NULL did not survive: {text}");
+    }
+
+    // ---- B11: column-level schema events -------------------------------------------------------
+
+    use crate::replication::logical::ColumnSpec;
+
+    fn shape() -> Vec<ColumnSpec> {
+        vec![
+            ColumnSpec { name: "id".into(), sql_type: "INTEGER".into(), nullable: false },
+            ColumnSpec { name: "note".into(), sql_type: "VARCHAR(20)".into(), nullable: true },
+        ]
+    }
+
+    /// **Breaking shape: a column-level event that carries the new shape and nothing else.**
+    ///
+    /// A rename and a drop-plus-add produce the same `columns` list. A consumer reconciling from
+    /// the shape alone applies the second reading and the column's data is gone, so the line has
+    /// to carry `alter` as well — and it has to carry `columns` too, because the sinks reconcile
+    /// their destination positionally against it. Both halves.
+    #[test]
+    fn a_rename_line_carries_the_old_name_the_new_shape_cannot() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::RenameColumn { from: "memo".into(), to: "note".into() },
+            columns: shape(),
+        }), &Publication::unrestricted())
+            .expect("the identity policy refused a schema event");
+        assert!(line.contains(r#""op":"RENAME_COLUMN""#), "{line}");
+        assert!(line.contains(r#""before":null"#), "{line}");
+        assert!(line.contains(r#""alter":{"from":"memo","to":"note"}"#), "{line}");
+        assert!(line.contains(r#""name":"note""#), "the new shape is missing: {line}");
+    }
+
+    #[test]
+    fn an_add_column_line_names_the_added_column_and_the_new_shape() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::AddColumn { column: "note".into() },
+            columns: shape(),
+        }), &Publication::unrestricted())
+            .expect("the identity policy refused a schema event");
+        assert!(line.contains(r#""op":"ADD_COLUMN""#), "{line}");
+        assert!(line.contains(r#""alter":{"column":"note"}"#), "{line}");
+        assert!(line.contains(r#"{"name":"note","type":"VARCHAR(20)","nullable":true}"#), "{line}");
+    }
+
+    /// A retype gives both spellings. A destination that stores INTEGER as one thing and BIGINT as
+    /// another needs to know what it is converting *from*, and the new shape cannot say.
+    #[test]
+    fn a_retype_line_gives_both_type_spellings() {
+        let line = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::RetypeColumn {
+                column: "qty".into(),
+                from: "INTEGER".into(),
+                to: "BIGINT".into(),
+            },
+            columns: vec![ColumnSpec {
+                name: "qty".into(),
+                sql_type: "BIGINT".into(),
+                nullable: true,
+            }],
+        }), &Publication::unrestricted())
+            .expect("the identity policy refused a schema event");
+        assert!(line.contains(r#""op":"ALTER_COLUMN_TYPE""#), "{line}");
+        assert!(
+            line.contains(r#""alter":{"column":"qty","from":"INTEGER","to":"BIGINT"}"#),
+            "{line}"
+        );
+    }
+
+    /// **Anti-vacuity for `alter`: the two declarations must NOT grow one.** E69's lesson was that
+    /// a producer and an independent validator disagreeing about one key fails the first real
+    /// event. `CREATE_TABLE` describes no single column, and a consumer told otherwise would look
+    /// for a change that did not happen.
+    #[test]
+    fn a_declaration_carries_no_alteration() {
+        let create = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::CreateTable,
+            columns: shape(),
+        }), &Publication::unrestricted())
+            .expect("the identity policy refused a schema event");
+        assert!(create.contains(r#""op":"CREATE_TABLE""#), "{create}");
+        assert!(!create.contains("alter"), "a CREATE_TABLE grew an alteration: {create}");
+
+        // And a DROP still carries no shape at all — the E69 rule, unchanged by any of this.
+        let drop = to_json_line(&event(ChangeOp::Schema {
+            change: SchemaChange::DropTable,
+            columns: Vec::new(),
+        }), &Publication::unrestricted())
+            .expect("the identity policy refused a schema event");
+        assert!(drop.contains(r#""after":null"#), "a DROP_TABLE grew an after image: {drop}");
     }
 }
