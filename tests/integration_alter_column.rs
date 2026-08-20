@@ -1248,3 +1248,183 @@ fn a_column_name_needing_escaping_survives_the_whole_pipeline() {
         "the destination did not round-trip the name: {cols}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// I20 — the exit criterion on the STREAMING path.
+// ---------------------------------------------------------------------------------------------
+
+/// **THE exit criterion again, this time across a pump boundary — I20, review finding 2.**
+///
+/// `a_column_added_mid_stream_reaches_the_destination` above decodes the whole log in ONE
+/// `decode` call, which is the only shape in which the criterion held. A server does not do that:
+/// `examples/cdc_server.rs` builds one `LogicalDecoder` and calls `FeedStreamer::pump` in a loop,
+/// and a consumer that is caught up — the steady state of a live feed — produces a pump boundary
+/// after every statement.
+///
+/// `decode` used to clone its table map, learn the `ADD COLUMN`'s shape into the clone, and drop
+/// it on return. So the pump that carried the `ADD_COLUMN` event told the consumer the column
+/// existed, and the very next pump re-seeded from the decoder's constructor snapshot and
+/// deserialized the wider rows against the narrower schema — which ignores the trailing bytes
+/// rather than failing. Measured before the fix: `emitted=1, unresolved=0, undecodable=0`, no
+/// error, and `note` simply absent from the row. The destination would hold NULL for that column
+/// on every row for the remaining life of the process.
+#[test]
+fn a_column_added_mid_stream_survives_a_pump_boundary() {
+    use ferrodb::replication::publication::Publication;
+    use ferrodb::replication::stream::FeedStreamer;
+    use std::sync::atomic::Ordering;
+
+    let mut d = db();
+
+    // One decoder, built once from the catalog as it stands before any of this — exactly what
+    // `cdc_server.rs` does at start-up — and one streamer built around it, pumped in a loop.
+    let streamer = FeedStreamer::new(LogicalDecoder::new(&d.catalog), Publication::unrestricted());
+    let mut cursor = FeedStreamer::start_cursor(&d.wal);
+    let mut emitted_through = 0u64;
+    let mut feed = Vec::new();
+
+    // A pump after every statement. That is not a contrivance: a caught-up consumer pumps whenever
+    // the frontier moves, so this is the ordinary case and the single-call decode is the special
+    // one.
+    for sql in [
+        "CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);",
+        "INSERT INTO inv VALUES (1, 10);",
+        "INSERT INTO inv VALUES (2, 20);",
+        "ALTER TABLE inv ADD COLUMN note VARCHAR(20);",
+        "INSERT INTO inv VALUES (3, 30, 'after');",
+    ] {
+        d.sql(sql);
+        d.wal.flush().unwrap();
+        let p = streamer.pump(&d.wal, cursor, emitted_through, &mut feed).expect("pump");
+        assert_eq!(
+            p.undecodable, 0,
+            "a record failed to decode after `{sql}`; the shape the decoder held is not the shape \
+             that wrote the bytes"
+        );
+        assert_eq!(
+            p.unresolved, 0,
+            "a record after `{sql}` named a table the decoder no longer knows; the mapping the \
+             CREATE_TABLE established did not survive to this pump"
+        );
+        cursor = p.cursor;
+        emitted_through = p.emitted_through;
+    }
+    let _ = d.wal.next_lsn.load(Ordering::SeqCst);
+
+    let feed = String::from_utf8(feed).unwrap();
+
+    // The consumer was told the column exists...
+    assert!(
+        feed.contains("\"op\":\"ADD_COLUMN\""),
+        "the ALTER never reached the feed:\n{feed}"
+    );
+    // ...so it must also receive a value for it. This is the whole finding: before the fix the
+    // line for row 3 was `"after":{"id":3,"qty":30}` — the column the consumer had just been told
+    // to create, silently absent, for ever.
+    assert!(
+        feed.contains("\"note\":\"after\""),
+        "the row written after the ALTER reached the feed without the column the ALTER added; \
+         the decoder forgot the shape at the pump boundary:\n{feed}"
+    );
+
+    // And the pre-ALTER rows are still decoded against the shape that wrote them, rather than
+    // being retro-fitted with a column they never had.
+    let rows: Vec<&str> = feed.lines().filter(|l| l.contains("\"op\":\"INSERT\"")).collect();
+    assert_eq!(rows.len(), 3, "expected three inserts in the feed:\n{feed}");
+    assert!(rows[0].contains("\"id\":1"), "{}", rows[0]);
+    assert!(!rows[0].contains("note"), "row 1 predates the column and must not carry it: {}", rows[0]);
+    assert!(rows[2].contains("\"note\":\"after\""), "{}", rows[2]);
+}
+
+/// The half of the fix that is easy to break: **re-decoding a range must not change its answer.**
+///
+/// The obvious repair for the finding above is to let `decode` keep the map it evolved. That is
+/// wrong, and silently so: a range is legitimately walked twice — at-least-once redelivery, and
+/// `pump`'s own cursor rule clamps the cursor BACK below the previous batch's end whenever a
+/// transaction is still open — and rows sitting *below* an `ALTER` must keep decoding against the
+/// shape that was in force where they sit. A sticky map would decode them against the post-ALTER
+/// schema on the second pass and produce a different feed from the same bytes.
+#[test]
+fn decoding_a_range_twice_gives_the_same_answer_across_an_alter() {
+    use std::sync::atomic::Ordering;
+
+    let mut d = db();
+    mid_stream_workload(&mut d);
+    d.wal.flush().unwrap();
+
+    let base = d.wal.base_lsn.load(Ordering::SeqCst);
+    let end = d.wal.next_lsn.load(Ordering::SeqCst);
+
+    let decoder = LogicalDecoder::new(&d.catalog);
+    let first = decoder.decode(&d.wal, base, end).expect("decode");
+    let second = decoder.decode(&d.wal, base, end).expect("re-decode");
+
+    let render = |out: &ferrodb::replication::logical::Decoded| {
+        let mut buf = Vec::new();
+        write_feed(&out.events, &ferrodb::replication::publication::Publication::unrestricted(), &mut buf)
+            .expect("write feed");
+        String::from_utf8(buf).unwrap()
+    };
+    assert_eq!(
+        render(&first),
+        render(&second),
+        "the same log range decoded to two different feeds; the decoder is carrying state that is \
+         only valid going forward"
+    );
+    assert!(first.undecodable.is_empty(), "{:?}", first.undecodable);
+    assert!(second.undecodable.is_empty(), "{:?}", second.undecodable);
+}
+
+/// The same boundary, with the decoder seeded from a catalog that ALREADY has the table — the
+/// server's own shape, and the one the review measured. Here nothing is unresolved and nothing is
+/// undecodable: `Tuple::deserialize` against the narrower schema simply ignores the trailing bytes,
+/// so the added column's value evaporates with every counter reading zero.
+#[test]
+fn a_pump_after_an_alter_does_not_silently_truncate_the_row() {
+    use ferrodb::replication::publication::Publication;
+    use ferrodb::replication::stream::FeedStreamer;
+
+    let mut d = db();
+    // The table exists BEFORE the decoder is built, so its snapshot resolves `inv` from the start
+    // and no record is ever "unresolved". This is `cdc_server.rs` attaching to a running database.
+    d.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    d.sql("INSERT INTO inv VALUES (1, 10);");
+    d.wal.flush().unwrap();
+
+    let streamer = FeedStreamer::new(LogicalDecoder::new(&d.catalog), Publication::unrestricted());
+    let mut cursor = FeedStreamer::start_cursor(&d.wal);
+    let mut emitted_through = 0u64;
+    let mut feed = Vec::new();
+
+    let pump = |d: &mut Db, cursor: &mut u64, et: &mut u64, feed: &mut Vec<u8>| {
+        d.wal.flush().unwrap();
+        let p = streamer.pump(&d.wal, *cursor, *et, feed).expect("pump");
+        *cursor = p.cursor;
+        *et = p.emitted_through;
+        p
+    };
+
+    pump(&mut d, &mut cursor, &mut emitted_through, &mut feed);
+    d.sql("ALTER TABLE inv ADD COLUMN note VARCHAR(20);");
+    let after_alter = pump(&mut d, &mut cursor, &mut emitted_through, &mut feed);
+    assert!(after_alter.emitted > 0, "the ALTER produced no event at all");
+
+    d.sql("INSERT INTO inv VALUES (3, 30, 'after');");
+    let after_row = pump(&mut d, &mut cursor, &mut emitted_through, &mut feed);
+
+    // Every counter reads clean in the broken case too. That is the finding: the loss is invisible
+    // from the pump report, so `is_clean()` is not what catches it — the feed content is.
+    assert_eq!(after_row.emitted, 1, "the row after the ALTER was not emitted");
+    assert!(after_row.is_clean(), "pump reported unclean: {after_row:?}");
+
+    let feed = String::from_utf8(feed).unwrap();
+    let row = feed
+        .lines()
+        .find(|l| l.contains("\"op\":\"INSERT\"") && l.contains("\"id\":3"))
+        .unwrap_or_else(|| panic!("the post-ALTER row is not in the feed:\n{feed}"));
+    assert!(
+        row.contains("\"note\":\"after\""),
+        "the row written after the ALTER lost the column the ALTER added, and every counter on the \
+         pump reported a clean run:\n{row}"
+    );
+}
