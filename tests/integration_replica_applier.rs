@@ -239,3 +239,235 @@ fn streaming_in_batches_converges_on_the_primarys_frontier() {
         "the replica did not converge on the primary's durable frontier"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// I20 — an ALTER on the primary, review finding 11.
+// ---------------------------------------------------------------------------------------------
+
+/// A primary with a catalog and the real SQL surface, so an `ALTER` can actually happen.
+///
+/// The `Pair` above drives a bare `WalManager` with hand-built records, which is right for the
+/// wire-level properties it tests and useless here: an `ALTER` exists only through
+/// `Catalog::alter_table`, and the whole point of this finding is what that function does to pages
+/// *without* writing a record.
+struct RealPrimary {
+    _dir: tempfile::TempDir,
+    catalog: ferrodb::catalog::catalog::Catalog,
+    bp: Arc<BufferPoolManager>,
+    wal: Arc<WalManager>,
+    txn: Arc<ferrodb::wal::txn::TxnManager>,
+    session: ferrodb::execution::session::Session,
+    replica_bp: Arc<BufferPoolManager>,
+}
+
+fn real_primary(tag: &str) -> RealPrimary {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(dir.path().join(format!("{tag}-primary.db"))).unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let catalog = ferrodb::catalog::catalog::Catalog::create(bp.clone()).unwrap();
+    let wal = Arc::new(WalManager::new(dir.path().join(format!("{tag}-primary.wal"))).unwrap());
+    let txn = Arc::new(ferrodb::wal::txn::TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+
+    let rfile = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(dir.path().join(format!("{tag}-replica.db"))).unwrap();
+    let replica_bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(rfile).unwrap())));
+
+    RealPrimary {
+        _dir: dir,
+        catalog,
+        bp,
+        wal,
+        txn,
+        session: ferrodb::execution::session::Session::new(),
+        replica_bp,
+    }
+}
+
+impl RealPrimary {
+    fn sql(&mut self, sql: &str) {
+        use ferrodb::parser::parser::Parser;
+        use ferrodb::parser::scanner::Scanner;
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+        ferrodb::execution::executor::run(
+            stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), &mut self.session,
+        )
+        .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        self.wal.flush().unwrap();
+    }
+
+    /// Ship everything the primary has durably logged to `applier`, in one batch.
+    fn ship(&self, applier: &ReplicaApplier) -> Result<u64, ferrodb::error::FerroError> {
+        let src = ReplicationSource::new(&self.wal);
+        let (bytes, next) = src.read_from(applier.applied_lsn(), 1 << 20).expect("read");
+        if bytes.is_empty() {
+            return Ok(applier.applied_lsn());
+        }
+        applier.apply(next - bytes.len() as u64, &bytes)
+    }
+}
+
+/// The `dir_root` of a table, which is what a heap record names.
+fn dir_root_of(p: &RealPrimary, table: &str) -> u32 {
+    p.catalog.get_table(table).unwrap_or_else(|| panic!("no table {table}")).first_directory_page_id
+}
+
+/// **A replica must not walk past an ALTER it cannot replay — I20, review finding 11.**
+///
+/// The rewrite `ALTER TABLE` performs is unlogged: `Catalog::alter_table` goes through a
+/// `HeapFileManager::open`, whose `txn` is `None`, so every write path in it is gated off and no
+/// record describes the rewrite. The `Ddl` record that follows is the only trace, and the applier's
+/// redo loop used to drop it into `_ => {}` and then advance `applied_lsn` regardless.
+///
+/// So a replica silently kept the pre-ALTER tuple layout, took post-ALTER `HeapInsert` frames into
+/// the same pages, and reported itself caught up over pages holding two incompatible layouts. There
+/// is nothing in this file that can repair that — logging the rewrite is a change to `alter.rs` —
+/// so the replica STOPS and says why.
+#[test]
+fn a_replica_refuses_a_stream_carrying_an_alter_rather_than_advancing_past_it() {
+    let mut p = real_primary("alter");
+    p.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    p.sql("INSERT INTO inv VALUES (1, 10);");
+    p.sql("INSERT INTO inv VALUES (2, 20);");
+
+    let start = ReplicationSource::new(&p.wal).start_lsn();
+    let applier = ReplicaApplier::new(p.replica_bp.clone(), start);
+
+    // Everything before the ALTER ships and converges. Without this the test could pass because
+    // replication never worked at all.
+    p.ship(&applier).expect("the pre-ALTER stream must apply cleanly");
+    assert!(applier.diverged().is_none(), "diverged before an ALTER was ever issued");
+    let root = dir_root_of(&p, "inv");
+    let before = applier.applied_lsn();
+    assert!(before > start, "the replica applied nothing at all; the test would be vacuous");
+
+    // Now the ALTER, and a row written under the NEW shape after it.
+    p.sql("ALTER TABLE inv ADD COLUMN note VARCHAR(20);");
+    p.sql("INSERT INTO inv VALUES (3, 30, 'after');");
+
+    let err = p
+        .ship(&applier)
+        .expect_err("the replica applied a stream carrying an ALTER and reported itself caught up");
+    let text = format!("{err}");
+    assert!(text.contains("DIVERGED"), "refused, but not by this guard: {text}");
+    assert!(text.contains("inv"), "the refusal does not name the table: {text}");
+
+    // It stopped where it was, rather than reporting a position it cannot justify.
+    assert_eq!(
+        applier.applied_lsn(),
+        before,
+        "the replica moved its applied_lsn while refusing the batch"
+    );
+
+    // **Latched.** A reconnect re-sends from `applied_lsn`, so without the latch the same record
+    // would be met, refused, and an operator restarting the replica would see it "catch up" as far
+    // as the ALTER again and again.
+    assert!(applier.diverged().is_some(), "the divergence was not recorded");
+    let second = p.ship(&applier).expect_err("a reconnect walked past the divergence");
+    assert!(format!("{second}").contains("DIVERGED"), "{second}");
+
+    // And the divergence is real, not theoretical: the primary's page for this table is not the
+    // replica's. This is the state the applier used to reach while claiming to be caught up.
+    let primary_page = p.bp.disk_manager.read(root).expect("primary page");
+    let replica_page = p.replica_bp.disk_manager.read(root).expect("replica page");
+    assert_ne!(
+        primary_page.to_vec(),
+        replica_page.to_vec(),
+        "the pages agree, so this test is not exercising the divergence it claims to"
+    );
+}
+
+/// The guard must not fire on the DDL that is in **every** stream.
+///
+/// A `CREATE TABLE` record is re-declared at every checkpoint of the source and a `DROP TABLE`
+/// record is ordinary traffic; neither touches a heap page, so halting on either would stop every
+/// replica in existence. Driven through hand-built frames on the bare `Pair` rather than through
+/// the SQL surface, because `DROP TABLE` checkpoints — which truncates the log out from under a
+/// replica streaming without a base backup, a separate limitation that would make this test about
+/// something else entirely.
+#[test]
+fn a_replica_still_applies_a_stream_carrying_create_and_drop_table() {
+    use ferrodb::catalog::column::DataType;
+    use ferrodb::wal::log::DdlOp;
+
+    let p = pair("createdrop");
+    let start = ferrodb::replication::ReplicationSource::new(&p.primary_wal).start_lsn();
+    let applier = ReplicaApplier::new(p.replica_bp.clone(), start);
+
+    let columns = vec![("id".to_string(), DataType::Integer, false)];
+    for op in [DdlOp::CreateTable, DdlOp::DropTable] {
+        p.primary_wal
+            .append(
+                0,
+                0,
+                &RecKind::Ddl {
+                    op,
+                    table: "inv".into(),
+                    dir_root: 1,
+                    time_travel_root: 2,
+                    columns: columns.clone(),
+                },
+            )
+            .expect("append");
+    }
+    // A real row on either side of the DDL, so "applied" is not vacuously true.
+    primary_insert(&p.primary_wal, 1, 9, 0, 7);
+    p.primary_wal.append(1, 0, &RecKind::Commit).expect("append");
+    p.primary_wal.flush().unwrap();
+
+    ship_all(&p, &applier);
+    assert!(
+        applier.diverged().is_none(),
+        "the guard halted on whole-table DDL: {:?}",
+        applier.diverged()
+    );
+    assert!(applier.applied_lsn() > start, "the replica applied nothing");
+}
+
+/// The guard fires on an `AlterColumn` record **whatever the alteration is** — a rename and a
+/// retype rewrite the heap exactly as an add does, and each was verified separately rather than
+/// assumed from the one the end-to-end test happens to use.
+#[test]
+fn every_column_alteration_halts_the_replica() {
+    use ferrodb::catalog::column::DataType;
+    use ferrodb::wal::log::{ColumnAlteration, DdlOp};
+
+    let alterations = [
+        ColumnAlteration::Add { column: "note".into() },
+        ColumnAlteration::Rename { from: "qty".into(), to: "quantity".into() },
+        ColumnAlteration::Retype { column: "qty".into(), from: DataType::Integer },
+    ];
+    for alteration in alterations {
+        let p = pair("altkinds");
+        let start = ferrodb::replication::ReplicationSource::new(&p.primary_wal).start_lsn();
+        let applier = ReplicaApplier::new(p.replica_bp.clone(), start);
+        p.primary_wal
+            .append(
+                0,
+                0,
+                &RecKind::Ddl {
+                    op: DdlOp::AlterColumn(alteration.clone()),
+                    table: "inv".into(),
+                    dir_root: 1,
+                    time_travel_root: 2,
+                    columns: vec![("id".to_string(), DataType::Integer, false)],
+                },
+            )
+            .expect("append");
+        p.primary_wal.flush().unwrap();
+
+        let src = ferrodb::replication::ReplicationSource::new(&p.primary_wal);
+        let (bytes, next) = src.read_from(applier.applied_lsn(), 1 << 20).expect("read");
+        let err = applier
+            .apply(next - bytes.len() as u64, &bytes)
+            .expect_err(&format!("{alteration:?} was applied rather than halting the replica"));
+        assert!(format!("{err}").contains("DIVERGED"), "{alteration:?}: {err}");
+        assert!(applier.diverged().is_some(), "{alteration:?} did not latch");
+    }
+}

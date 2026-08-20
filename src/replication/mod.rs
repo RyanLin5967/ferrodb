@@ -414,6 +414,13 @@ mod tests {
 pub struct ReplicaApplier {
     bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
     applied_lsn: std::sync::atomic::AtomicU64,
+    /// Why this replica stopped, once it has — I20, review finding 11.
+    ///
+    /// Latched, and deliberately not clearable: a reconnect re-sends the batch from
+    /// `applied_lsn`, so without a latch the replica would meet the same record, refuse it, and be
+    /// restarted into the same refusal for ever — or worse, be restarted by an operator who reads
+    /// "it caught up again" as the problem going away.
+    diverged: std::sync::Mutex<Option<String>>,
 }
 
 impl ReplicaApplier {
@@ -422,7 +429,19 @@ impl ReplicaApplier {
         bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
         start_lsn: u64,
     ) -> Self {
-        ReplicaApplier { bp, applied_lsn: std::sync::atomic::AtomicU64::new(start_lsn) }
+        ReplicaApplier {
+            bp,
+            applied_lsn: std::sync::atomic::AtomicU64::new(start_lsn),
+            diverged: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// `Some(reason)` once this replica has refused something it cannot apply.
+    ///
+    /// Fatal, not transient. `applied_lsn` stays true — everything below it really is applied —
+    /// and it will never advance again. The only way forward is a fresh base backup.
+    pub fn diverged(&self) -> Option<String> {
+        self.diverged.lock().unwrap().clone()
     }
 
     /// How far this replica has applied. This is what it sends in `Hello`.
@@ -480,6 +499,49 @@ impl ReplicaApplier {
 
             at += total;
             lsn += total as u64;
+        }
+
+        // **An ALTER cannot be replayed here, so the replica stops rather than diverging — I20,
+        // review finding 11.**
+        //
+        // `Catalog::alter_table` rewrites every tuple of the table in place through a
+        // `HeapFileManager::open`, which sets `txn: None` (`storage/heap_file_manager.rs`), so
+        // every write path in it is gated off and **not one WAL record describes the rewrite**.
+        // The `Ddl` record logged afterwards is the only trace, and the redo loop below drops it
+        // into `_ => {}`.
+        //
+        // The consequence, before this guard: the replica never rewrites its heap, and the
+        // post-ALTER `HeapInsert` frames then deliver new-shape tuples into pages still holding
+        // old-shape ones. One page, two incompatible layouts, nothing in the bytes to tell them
+        // apart — while `applied_lsn == durable_lsn` reported the replica caught up. Measured on
+        // the primary/replica pair: raw tuple sizes `[38, 38, 43]` against `[36, 36, 43]`.
+        //
+        // This is a HALT, not a repair. Physical replication across a column change needs the
+        // rewrite to be logged, which is a change to `alter.rs` and not to this file. What the
+        // halt buys is that a diverged replica says so instead of answering queries from pages it
+        // has silently misread. Checked before anything is materialised or applied, so the
+        // batch's all-or-nothing property is preserved.
+        if let Some(why) = self.diverged.lock().unwrap().clone() {
+            return Err(FerroError::Wal(why));
+        }
+        for (rec_lsn, rec) in &checked {
+            // Scoped to `AlterColumn`. `CreateTable` and `DropTable` records are in every shipped
+            // stream already — the log re-declares every table at each checkpoint — and neither
+            // touches a heap page, so halting on those would stop every replica that exists.
+            let crate::wal::log::RecKind::Ddl {
+                op: crate::wal::log::DdlOp::AlterColumn(alteration),
+                table,
+                ..
+            } = &rec.kind
+            else {
+                continue;
+            };
+            let why = format!(
+                "replica DIVERGED at lsn {rec_lsn}: the stream carries ALTER TABLE on '{table}'                  ({alteration:?}). The primary rewrote every tuple of that table in place through a                  heap manager with no transaction attached, so no WAL record describes the rewrite                  and there is nothing here to redo. This replica's pages still hold the pre-ALTER                  tuple layout while every frame after this one carries the post-ALTER layout, and                  nothing in the bytes distinguishes them. Stopped at applied_lsn {}; re-seed from a                  base backup taken after the ALTER.",
+                self.applied_lsn()
+            );
+            *self.diverged.lock().unwrap() = Some(why.clone());
+            return Err(FerroError::Wal(why));
         }
 
         // A replica's file does not yet contain the pages the primary is describing, so redo

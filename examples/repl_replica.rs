@@ -119,7 +119,18 @@ fn main() {
             .expect("hello");
         match Message::read_from(&mut reader).expect("reply") {
             Message::Records { start_lsn, bytes } => {
-                applier.apply(start_lsn, &bytes).expect("apply");
+                // I20: a divergence is not a crash and must not read as one. `applied_lsn` is
+                // still true — everything below it really is applied — so it is reported, the
+                // pages already applied are flushed, and the process exits non-zero rather than
+                // panicking or, worse, looping into the same refusal.
+                if let Err(e) = applier.apply(start_lsn, &bytes) {
+                    let _ = bp.flush_all();
+                    record(applier.applied_lsn());
+                    eprintln!("replica stopped: {e}");
+                    println!("DIVERGED {}", applier.applied_lsn());
+                    std::io::stdout().flush().unwrap();
+                    std::process::exit(7);
+                }
                 bp.flush_all().expect("flush replica pages");
                 record(applier.applied_lsn());
                 batches += 1;
