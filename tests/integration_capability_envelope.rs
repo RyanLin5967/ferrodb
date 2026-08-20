@@ -630,8 +630,9 @@ fn the_envelope_governs_agent_session_writes_only() {
 
 /// **The most important gap in this feature, asserted so it is visible, so closing it trips a
 /// test, and so nobody reads the envelope as covering more than it does.** Not one verb that
-/// mutates schema is governed by the envelope. This test names each of them and reaches a table
-/// the envelope forbids with every one.
+/// mutates schema is governed by the envelope. This test names each of them and drives each one
+/// either against a table the envelope refuses by name (`payroll`, `payroll_notes`) or — for
+/// `CREATE TABLE`, where there is no prior table to forbid — against a table it never granted.
 ///
 /// # What is governed, and what is not
 ///
@@ -649,10 +650,19 @@ fn the_envelope_governs_agent_session_writes_only() {
 /// of this comment is about things the envelope cannot see and a reader must not come away
 /// believing reads are among the things it can.
 ///
-/// **Not governed at all:** every statement that is not one of those four. Each falls through that
-/// `match` to the **shared catalog**, with no branch and no `MERGE` — so a governed agent that may
-/// not write one row of `payroll` can still index it, analyse it, and drop it, and every other
-/// connection sees the result immediately.
+/// **Not governed, tier one — the agent verbs.** `is_agent_stmt` diverts `MERGE`, `DIFF`,
+/// `ABANDON`, `REVERT MERGE`, `SIMULATE`, `BEGIN AGENT SESSION` and any `SELECT ... AS OF` at
+/// `src/execution/executor.rs:52-54`, which is **above** the routing described above, so these
+/// never reach either the DML divert or the `match`. Two of them rewrite the rows of a forbidden
+/// table: `merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap`. This tier is
+/// named here because the first version of this comment walked one `match` and concluded it had
+/// enumerated everything.
+///
+/// **Not governed, tier two — the DDL that reaches the `match`.** `ANALYZE`, `CREATE INDEX`,
+/// `CREATE FULLTEXT INDEX`, `CREATE TABLE`, `DROP TABLE`: each falls through to the **shared
+/// catalog**, with no branch and no `MERGE`, so a governed agent that may not write one row of
+/// `payroll` can still index it, analyse it, and drop it, and every other connection sees the
+/// result immediately. That is what this test demonstrates.
 ///
 /// # This pin used to be a strict subset of the hole it claimed to name
 ///
@@ -692,7 +702,9 @@ fn the_envelope_governs_agent_session_writes_only() {
 /// # Why this is pinned rather than closed
 ///
 /// Because closing it is a design decision that is recorded and owned elsewhere, not an oversight
-/// left lying here: the fix is in the executor's statement routing, and it needs an answer to what
+/// left lying here — `LEDGER-INTEGRATION.md` row I15 and `INTEGRATION.md`, both in the
+/// `artie-research` repository and not in this one, so do not go looking for them here. The fix is
+/// in the executor's statement routing, and it needs an answer to what
 /// DDL on a branch *means* — a branch-scoped `CREATE TABLE` has to say what a sibling sees and what
 /// `MERGE` does with it. B11 has already built one answer, for `ALTER` alone. **Anyone reading the
 /// envelope as "a session cannot touch what it was not granted" must read this test first.**
@@ -755,7 +767,7 @@ fn no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap() {
         "CREATE INDEX returned Ok without landing an index on the forbidden table"
     );
 
-    // ---- 3. CREATE FULLTEXT INDEX (B8) makes a forbidden table's TEXT retrievable -------------
+    // ---- 3. CREATE FULLTEXT INDEX (B8) scans a forbidden table's heap into a shared index -----
     //
     // The verb B3's pin could not have named, because B8 added it afterwards. This is the reason
     // the pin had to be widened rather than reworded: the hole grew, and the test that was
@@ -807,7 +819,8 @@ fn no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap() {
 
     // ---- 5. DROP TABLE destroys a table and its rows ------------------------------------------
     //
-    // Last, because it takes `payroll` away from the four checks above. This is the verb B3's pin
+    // Last, because it takes `payroll` away from the two arms above that use it. This is the verb
+    // B3's pin
     // did demonstrate, and it is still the sharpest statement of the gap: the branch may not write
     // one row of `payroll`, and it just deleted all of them.
     assert_eq!(db.salary(1), 1000, "payroll must hold a row for the drop to destroy");
@@ -824,6 +837,119 @@ fn no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap() {
         "the drop was somehow scoped to the branch, which would mean DDL now has branch semantics \
          and this whole test needs rewriting"
     );
+}
+
+/// **The gap is not confined to schema: two agent verbs rewrite the ROWS of a forbidden table.**
+/// `REVERT MERGE ... CASCADE` and `MERGE BRANCH <other>` both return `Ok` on a branch whose
+/// envelope allows only `inventory`, both change `payroll`, and both charge nothing.
+///
+/// # Why the sibling test's enumeration could not see this
+///
+/// `executor::run` has **two** diversions before the `match`, not one, and the sibling pin only
+/// described the second. `is_agent_stmt` (`src/execution/executor.rs:52-54`,
+/// `src/agent_sql/dispatch.rs:72-83`) diverts `MERGE`, `DIFF`, `ABANDON`, `REVERT MERGE`,
+/// `SIMULATE`, `BEGIN AGENT SESSION` and any `SELECT ... AS OF` **one tier above** the
+/// `matches!(Select | Insert | Update | Delete)` at `:57-61`. So those verbs never reach the `match`
+/// at all, and "everything that is not one of those four falls through to the shared catalog" was
+/// never true of them. A pin that enumerates by walking one `match` will miss a whole tier.
+///
+/// # Why this is worse than the DDL gap, not another instance of it
+///
+/// Every verb in the sibling test changes shared *structure* — a table, an index, a statistic. These
+/// two change shared *content*: rows in a table the operator explicitly refused this branch. And
+/// the envelope's defence against exactly this is what makes it defensible: B3's design rests on
+/// "everything that publishes went through `stage_all` first, so the publish path needs no check of
+/// its own". That holds for `MERGE;` — a branch publishing what it staged itself. It does not hold
+/// for either verb here, because neither one is publishing this branch's own staged rows:
+///
+/// - `REVERT MERGE` replays a *previous* merge's writes backwards through
+///   `PendingWrite::apply` (`AgentRuntime::revert_merge` → `undo_txn`), so the rows it writes were
+///   never staged by this branch at all.
+/// - `MERGE BRANCH <name>` takes the branch from the statement, not from the session
+///   (`src/agent_sql/dispatch.rs:118`, `BoundAgentStmt::Merge { branch }`), so a governed session
+///   can publish a *different* agent's private workspace. The other branch's writes were checked
+///   against the *other* branch's envelope — which here is none — and this session's envelope is
+///   never consulted.
+///
+/// Measured, both of them, and `row_writes` stays 0 in each case: the envelope did not refuse them,
+/// it never saw them.
+///
+/// Pinned and not closed, for the same reason as its sibling: this is the design decision about
+/// what the envelope governs, recorded in the integration ledger (`LEDGER-INTEGRATION.md` row I15
+/// and `INTEGRATION.md` in the `artie-research` repository, not in this one). Closing it means
+/// deciding whether a capability is authority over *rows* or authority over *statements* — and
+/// `REVERT MERGE` makes that concrete, because the rows it writes are somebody else's.
+#[test]
+fn merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap() {
+    // ---- REVERT MERGE: undo somebody else's published change to a forbidden table -------------
+    {
+        let mut db = Db::new();
+        db.seed();
+
+        // An UNGOVERNED session publishes a payroll change, so there is a merge to revert.
+        let mut w = db.session();
+        db.begin("writer", &mut w);
+        db.ok("UPDATE payroll SET salary = 4242 WHERE id = 1;", &mut w);
+        db.ok("MERGE;", &mut w);
+        assert_eq!(db.salary(1), 4242, "the setup merge did not land, so there is nothing to revert");
+
+        db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+        let mut a = db.session();
+        let branch = db.begin("reverter", &mut a);
+
+        // Anti-vacuity: this branch cannot write one row of payroll by any governed route.
+        let err = db.refused("UPDATE payroll SET salary = 7 WHERE id = 1;", &mut a);
+        assert!(err.contains("may not write table `payroll`"), "got {err}");
+
+        // ...and it rewrites every row of it anyway.
+        db.ok("REVERT MERGE m_1 CASCADE;", &mut a);
+        assert_eq!(
+            db.salary(1),
+            1000,
+            "if REVERT MERGE is now governed by the envelope, this half of the gap has closed and \
+             the module docs, the summary and this test must say so"
+        );
+        assert_eq!(
+            db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
+            0,
+            "the revert was CHARGED, which would mean it passes through `stage_all` after all and \
+             this test is describing the wrong mechanism"
+        );
+    }
+
+    // ---- MERGE BRANCH: publish a DIFFERENT agent's private writes ------------------------------
+    {
+        let mut db = Db::new();
+        db.seed();
+
+        // An ungoverned agent stages a payroll change on its own branch and does not publish it.
+        let mut w = db.session();
+        db.begin("foreign", &mut w);
+        db.ok("UPDATE payroll SET salary = 1 WHERE id = 1;", &mut w);
+        let foreign = w.agent.as_ref().unwrap().branch_name.clone();
+        assert_eq!(db.salary(1), 1000, "the foreign branch published early; it must still be private");
+
+        db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+        let mut a = db.session();
+        let branch = db.begin("merger", &mut a);
+        let err = db.refused("UPDATE payroll SET salary = 7 WHERE id = 1;", &mut a);
+        assert!(err.contains("may not write table `payroll`"), "got {err}");
+
+        // The governed session publishes the other branch's forbidden write.
+        db.ok(&format!("MERGE BRANCH {foreign};"), &mut a);
+        assert_eq!(
+            db.salary(1),
+            1,
+            "if a governed session can no longer publish a foreign branch, this half of the gap \
+             has closed and the docs must say so"
+        );
+        assert_eq!(
+            db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
+            0,
+            "the foreign publish was charged to this branch's budget, which would mean the \
+             envelope saw it"
+        );
+    }
 }
 
 /// **The ungoverned DDL is not only an escape from the envelope — it is a way to change what the
@@ -857,6 +983,16 @@ fn dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_colum
     let mut a = db.session();
     let branch = db.begin("confuser", &mut a);
 
+    // The key the operator's grant actually holds, read before anything is dropped.
+    let granted_key = db
+        .runtime
+        .envelope_of(branch)
+        .unwrap()
+        .unwrap()
+        .table(table_id("inventory").0)
+        .expect("the fixture must grant `inventory`")
+        .table;
+
     // The grant is live, and it means `inventory.qty` — column 1 of the table seeded above.
     db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut a);
     assert_eq!(db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(), 1);
@@ -870,19 +1006,33 @@ fn dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_colum
         db.catalog.tables["inventory"].schema.columns[1].name, "secret",
         "the recreated table did not take the shape this test needs it to take"
     );
-    assert_eq!(
-        table_id("inventory"),
-        table_id("inventory"),
-        "table identity is the name, which is the whole mechanism"
+    // The grant's key, captured BEFORE the substitution and compared against the table that
+    // exists after it. An earlier version of this test asserted
+    // `table_id("inventory") == table_id("inventory")` here, which is `f(x) == f(x)` over a pure
+    // function: it could not fail under any change to `table_id`, the catalog or the envelope, and
+    // it was captioned as the evidence for the mechanism the test is named after. Found by a
+    // fresh-context review. What carries the claim is that the LIVE envelope still resolves the
+    // substituted table through the key it was granted.
+    assert_eq!(granted_key, table_id("inventory").0, "the substituted table took a different id");
+    assert!(
+        db.runtime
+            .envelope_of(branch)
+            .unwrap()
+            .unwrap()
+            .table(granted_key)
+            .is_some(),
+        "the grant no longer resolves the recreated table, so table identity is not the name any \
+         more and this whole test needs rewriting"
     );
 
     // And the envelope admits a write to it — through `stage_all`, against the same allowlist
     // entry, charged to the same budget. Nothing here can tell that `inventory` is not the table
     // the operator granted.
-    // PREDICTION, stated before it was run and then confirmed by running it
-    // (`[[Integer(1), Integer(5)]]`): the branch's workspace still holds the row staged by the
-    // UPDATE above, so the value written as `qty` reads back under the name `secret`. The branch
-    // reads its own old data through the substituted table's schema.
+    // The branch's workspace still holds the row staged by the UPDATE above, and the substituted
+    // table's schema calls column 1 `secret`, so the value written as `qty` reads back under the
+    // new name: the branch reads its own old data through a schema it swapped underneath itself.
+    // Derived from the mechanism, not read off a run — the workspace is keyed by row and `DROP
+    // TABLE` touches the shared catalog, not the workspace. Measured `[[Integer(1), Integer(5)]]`.
     match db.ok("SELECT id, secret FROM inventory;", &mut a) {
         Outcome::Rows(rows) => assert_eq!(
             rows,
@@ -901,16 +1051,113 @@ fn dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_colum
          and this test is measuring something other than what it claims"
     );
 
-    // Anti-vacuity for the claim that the ENVELOPE is what admitted it: a column index the grant
-    // never covered is still refused on the substituted table, so the allowlist is being consulted
-    // and is simply consulting the wrong table.
-    db.ok("CREATE TABLE payroll_2 (id INTEGER NOT NULL, salary INTEGER);", &mut a);
-    let err = db.refused("INSERT INTO payroll_2 VALUES (1, 1);", &mut a);
-    assert!(
-        err.contains("may not write table"),
-        "a table created inside the session was writable, which would mean the allowlist is not \
-         being consulted at all and this test proves something weaker: {err}"
+    // Anti-vacuity for the claim that the ENVELOPE is what admitted it, and it has to be at the
+    // COLUMN dimension: a table-level refusal on some other table would only show default-deny.
+    // An earlier version of this test did exactly that — it created `payroll_2` and asserted "may
+    // not write table", which is the table gate firing before any column is examined — while its
+    // comment claimed a column index had been tested. Found by a fresh-context review.
+    //
+    // So: substitute a THIRD shape with a column the grant never covered, and show index 2 refused
+    // while the granted indices still admit. The column allowlist is being consulted; it is simply
+    // consulting it against a table nobody granted.
+    db.ok("DROP TABLE inventory;", &mut a);
+    db.ok(
+        "CREATE TABLE inventory (id INTEGER NOT NULL, secret INTEGER, ungranted INTEGER);",
+        &mut a,
     );
+    let err = db.refused("INSERT INTO inventory VALUES (9, 1, 1);", &mut a);
+    assert!(
+        err.contains("column 2") || err.contains("not on the allowlist"),
+        "an INSERT writing a column index the grant never covered was admitted, so the column \
+         dimension is not being consulted against the substituted table and this test proves \
+         something weaker than it claims: {err}"
+    );
+}
+
+/// **The substitution is not merely confusion about what a grant points at — it is a WIDENING, the
+/// one thing the envelope's own design exists to make impossible.** `BranchRecord::restrict` refuses
+/// any envelope that grants more than the one it replaces, because "an envelope its holder can widen
+/// is a suggestion" — and `a_branch_cannot_widen_its_own_envelope` asserts that. `DROP TABLE` +
+/// `CREATE TABLE` walks around it without touching the envelope at all: the envelope bytes never
+/// change, so nothing is ever offered to `restrict`; what changes is the table those bytes describe.
+///
+/// Two consequences, and both are the *value-level* guards rather than the table-level ones, which
+/// is why the sibling test could not show them — its fixture grants `Verb::ALL` over every column
+/// with no floor, the one envelope under which neither can appear.
+///
+/// Found by a fresh-context review of the sibling test, which observed that a fixture chosen to make
+/// the mechanism visible had also been chosen to make its sharpest consequences invisible.
+#[test]
+fn the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete() {
+    // ---- a floor is keyed by column INDEX, so reordering the columns detaches it ---------------
+    {
+        let mut db = Db::new();
+        db.seed();
+        let floored = CapabilityEnvelope::new(Verb::ALL, 1_000).allow(
+            table_id("inventory").0,
+            vec![ColumnCapability::open(ID), ColumnCapability::floored(QTY, 0)],
+        );
+        db.runtime.restrict_branch(BranchId::TRUNK, floored).unwrap();
+
+        let mut a = db.session();
+        db.begin("floor_stripper", &mut a);
+
+        // The floor is live: this is the envelope's only value-level guard.
+        let err = db.refused("UPDATE inventory SET qty = -999 WHERE id = 1;", &mut a);
+        assert!(err.contains("the floor is 0"), "the floor was not the reason: {err}");
+
+        // Same name, same column names, INDICES SWAPPED. Nothing was offered to `restrict`.
+        db.ok("DROP TABLE inventory;", &mut a);
+        db.ok("CREATE TABLE inventory (qty INTEGER NOT NULL, id INTEGER);", &mut a);
+        db.ok("INSERT INTO inventory VALUES (-999, 1);", &mut a);
+
+        // Read on the BRANCH: the insert is staged there and is invisible to a plain session
+        // until MERGE, which is the whole point of an agent session.
+        match db.ok("SELECT qty FROM inventory;", &mut a) {
+            Outcome::Rows(rows) => assert_eq!(
+                rows,
+                vec![vec![Value::Integer(-999)]],
+                "if the value below the floor did not land, the floor survived the substitution \\
+                 and this half of the finding is wrong"
+            ),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // ---- a verb refused only because its column set was withheld becomes permitted -------------
+    {
+        let mut db = Db::new();
+        db.seed();
+        // `Verb::DELETE` granted, but only column 0. A DELETE authors EVERY cell of the row — the
+        // rule `changed_columns` documents — so granting the verb without the columns refuses every
+        // delete. An operator can rely on that: it is how you grant INSERT/UPDATE on one column
+        // without granting the power to remove rows.
+        let narrow = CapabilityEnvelope::new(Verb::ALL, 1_000)
+            .allow(table_id("inventory").0, vec![ColumnCapability::open(ID)]);
+        db.runtime.restrict_branch(BranchId::TRUNK, narrow).unwrap();
+
+        let mut a = db.session();
+        db.begin("delete_unlocker", &mut a);
+        let err = db.refused("DELETE FROM inventory WHERE id = 1;", &mut a);
+        assert!(
+            err.contains("column 1"),
+            "the delete was refused for some other reason, so the standing refusal this test is \\
+             about does not exist: {err}"
+        );
+
+        // Rebuild the table with ONLY the granted column. The row now has one cell, so the delete
+        // authors only what was granted.
+        db.ok("DROP TABLE inventory;", &mut a);
+        db.ok("CREATE TABLE inventory (id INTEGER NOT NULL);", &mut a);
+        db.ok("INSERT INTO inventory VALUES (1);", &mut a);
+        db.ok("DELETE FROM inventory WHERE id = 1;", &mut a);
+        assert_eq!(
+            db.count("inventory"),
+            0,
+            "the delete reported Ok without removing the row, so this measured the refusal \\
+             disappearing rather than the delete succeeding"
+        );
+    }
 }
 
 /// **The envelope is enforced at exactly one funnel, and B11's branch-scoped `ALTER TABLE` reaches
@@ -929,15 +1176,26 @@ fn dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_colum
 ///
 /// B11 was merged onto this commit's parent in a throwaway worktree — branch
 /// `I15-b11-alter-probe`, merge `622a17b`, probe `7581498` — and the question was put to the merged
-/// tree rather than to B11's report. On a session whose envelope allows only `inventory`:
+/// tree rather than to B11's report. **Two probe tests, not one run**, and they are separated here
+/// because an earlier version of this list ran them together and the numbers do not belong to one
+/// session.
+///
+/// `i15_does_the_envelope_govern_an_alter_on_a_table_it_never_granted`, on a session whose envelope
+/// allows only `inventory`:
 ///
 /// - `UPDATE payroll SET salary = 0 WHERE id = 1;` → refused, "not on the allowlist"
 /// - `ALTER TABLE payroll ADD COLUMN note VARCHAR(16);` → **`Ok`**
 /// - `pending_schema_edits(branch)` → `[("payroll", AddColumn(note VARCHAR(16)))]`
 /// - the envelope afterwards → `row_writes: 0`. Nothing was charged, because nothing was seen.
-/// - `MERGE` → `Ok`, and `payroll` carries `note` in the **shared** catalog. The same
-///   `SELECT note FROM payroll` fails before that merge and succeeds after it, so the check is
-///   proven to fire rather than assumed to.
+///   This test never merges.
+///
+/// `i15_does_the_ungoverned_alter_reach_the_shared_table_at_merge`, a separate session that first
+/// makes one *allowed* write (`UPDATE inventory SET qty = 7`) so the merge has a row to carry — so
+/// `row_writes` is 1 there, not 0:
+///
+/// - `MERGE` → `Ok`, and `payroll` then carries `note` in the **shared** catalog. The assertion is
+///   on the post-merge `SELECT note FROM payroll`; the merge's own `Ok` is printed, not asserted.
+///   The same SELECT fails before the merge, so the check is proven to fire rather than assumed to.
 ///
 /// That merge is not part of this commit and is not proposed by it; it existed to answer the
 /// question. One caveat, stated because it changes how much the result is worth: the staging half
@@ -957,22 +1215,42 @@ fn dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_colum
 /// *singular*: exactly one site reads the envelope, exactly one site charges the budget, exactly
 /// one site mutates a workspace's staged writes, and all three are inside `stage_all`.
 ///
-/// **The counts run on whitespace-stripped text, and that is not a nicety — it is the difference
-/// between this test working and not working.** Counted on the raw file, as it was first written,
-/// the needle `workspaces.get_mut(` never appears in B11's `stage_schema_edit` at all: rustfmt
-/// breaks a chain that overruns the line width onto one element per line, so B11 writes
-/// `let ws = state` / `.workspaces` / `.get_mut(&branch.id)`. Measured on
-/// `git show B11:src/agent_sql/runtime.rs`, spliced onto this tree: **raw count 1 — green — and
-/// dense count 2.** The check was silent on the exact merge it was written to catch, and it was a
-/// fresh-context review that found that, not this suite. The token was a fact about the formatter,
-/// not about the code.
+/// **The counts run on whitespace-stripped text, because the raw token is a fact about rustfmt and
+/// not about the code.** rustfmt breaks a chain that overruns the line width onto one element per
+/// line, and B11's `stage_schema_edit` is one of those: it writes `let ws = state` / `.workspaces`
+/// / `.get_mut(&branch.id)`, so the needle `workspaces.get_mut(` appears in that function **zero**
+/// times. Splice the function alone onto this tree and the raw count is 1 — green — while the dense
+/// count is 2.
 ///
-/// Two blind spots remain, stated rather than left to be found. This reads text, so it cannot tell
-/// whether a second funnel consults the envelope — it refuses both cases and says so, because
-/// guessing is worse. And it reads only `src/agent_sql/runtime.rs`, so a funnel built in another
-/// module is invisible to it; the `State` field allowlist below is what makes the *sibling-map*
-/// version of that visible, since staging beside the workspace rather than in it is the shape the
-/// existing `escrow` and `quarantine_reasons` maps already establish.
+/// **An earlier version of this paragraph overstated that, and the correction belongs here rather
+/// than only in a commit message.** It said the raw check "was silent on the exact merge it was
+/// written to catch". It was not. Counted on the real merge —
+/// `git show I15-b11-alter-probe:src/agent_sql/runtime.rs` — the raw count is **2**, not 1, because
+/// `stage_schema_edit` calls `note_base_shape` on every path and that function's chain does fit on
+/// one line. So the raw check would have fired on B11, for a reason adjacent to the real one. What
+/// is true, and is the reason to count dense, is narrower: the raw needle cannot see the staging
+/// site itself, so it would have been reporting a formatting coincidence rather than the funnel —
+/// and a needle whose behaviour depends on line width is not a guard. Found by a fresh-context
+/// review of this file twice: once for the formatter, once for the overstatement about it.
+///
+/// Four blind spots remain, stated rather than left to be found.
+///
+/// 1. It reads text, so it cannot tell whether a second funnel *consults* the envelope. It refuses
+///    both cases and says so, because guessing is worse.
+/// 2. It reads only `src/agent_sql/runtime.rs`, so a funnel built in another module is invisible.
+///    The two field allowlists below are what make the in-`State` and in-`Workspace` versions
+///    visible.
+/// 3. **The needles are call shapes, not properties.** `self.branches.envelope_of(` is not the only
+///    way to read an envelope — `AgentRuntime::envelope_of` itself does it as
+///    `self.branches.get(branch)?.envelope`, outside `stage_all`, and a second funnel spelled that
+///    way passes the count. Likewise `workspaces.get_mut(` is one way to reach a workspace:
+///    `state.workspaces.insert(...)` populates one at fork, and `entry()`, `values_mut()`,
+///    `iter_mut()` or a helper handed `&mut Workspace` would all pass. So "any second funnel trips
+///    this" — which an earlier version of this comment claimed — is false. What is true is
+///    narrower: the three shapes that exist today are pinned to one function, and the field lists
+///    catch the state a new funnel would have to add.
+/// 4. It says nothing about the publish path. `MERGE` and `REVERT MERGE` write rows without
+///    consulting the envelope at all, which is a different hole and has its own test.
 ///
 /// This test fires on the merge that *creates* the hole rather than on the one that fixes it, which
 /// is the only ordering that helps: by the time somebody is looking for why the envelope missed an
@@ -1032,7 +1310,9 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
              can ADD, RENAME or RETYPE a `payroll` column and publish it at MERGE. If it does, \
              the single-funnel premise this test pins is simply gone. Either way this test must \
              stop being a text check: replace it with one that drives the new verb against a \
-             table the envelope forbids, and record which case it was in INTEGRATION.md."
+             table the envelope forbids, and record which case it was in the integration ledger \
+             (LEDGER-INTEGRATION.md / INTEGRATION.md live in the `artie-research` repository, not \
+             in this one)."
         );
         assert!(
             dense_funnel.contains(needle),
@@ -1041,45 +1321,78 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
         );
     }
 
-    // **A funnel can stage BESIDE the workspace instead of in it.** `State` already keeps
-    // per-branch policy in sibling maps — `escrow`, `quarantine_reasons`, `row_author` — so a
-    // schema-edit map next to them is the established pattern here, not a contrivance, and it
-    // would pass every count above. The field list is therefore an allowlist: a new field has to
-    // come here and say whether it is branch write state.
-    let decl_at = runtime
-        .find("struct State {")
-        .expect("`struct State` is gone from src/agent_sql/runtime.rs; this test is reading the \
-                 wrong file and has been asserting nothing");
-    let decl_end = decl_at
-        + runtime[decl_at..].find("\n}\n").expect("`struct State` is unterminated");
-    let fields: Vec<&str> = runtime[decl_at..decl_end]
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            if l.starts_with("//") {
-                return None;
+    // **A funnel can stage BESIDE the workspace, or INSIDE it without going through the funnel.**
+    // Two field lists are pinned, because the two shapes are different and the first version of
+    // this guard covered only one of them — and covered it with the wrong claim. It said "a
+    // schema-edit map is the live example, and B11 needs one"; B11 needs no `State` field at all.
+    // It adds `schema_edits` and `base_shapes` to `struct Workspace`. Found by a fresh-context
+    // review, which is also why `Workspace` is pinned here now.
+    //
+    // `State` covers the sibling-map shape: `escrow`, `quarantine_reasons` and `row_author` are
+    // already per-branch maps, so a schema-edit map next to them is the established pattern.
+    // `Workspace` covers B11's actual shape: per-branch state added to the workspace itself, which
+    // a statement can then write without ever entering `stage_all`.
+    let field_names = |decl: &str, what: &str| -> Vec<String> {
+        let at = runtime
+            .find(decl)
+            .unwrap_or_else(|| panic!("`{decl}` is gone from src/agent_sql/runtime.rs; this test \
+                 is reading the wrong file and has been asserting nothing"));
+        let block = &runtime[at..at + runtime[at..].find("\n}\n").expect("unterminated struct")];
+        let mut out = Vec::new();
+        for line in block.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+                continue;
             }
-            l.split(':')
-                .next()
-                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
-        })
-        .collect();
+            // Strip a visibility modifier before parsing. Without this, `pub schema_edits: T`
+            // yielded "pub schema_edits", failed the identifier test, and was silently DROPPED —
+            // so a `pub` field could be added and this allowlist stayed green. A guard that
+            // cannot parse its own input must refuse, not fall through to allow.
+            let line = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub(super) "))
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let name = line.split(':').next().unwrap_or("");
+            assert!(
+                !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                "this test cannot parse a line of `{what}` as a field declaration: {line:?}. It \
+                 refuses rather than skipping it, because a line it silently dropped is a field \
+                 that never had to come here and declare itself."
+            );
+            out.push(name.to_string());
+        }
+        out
+    };
+
     assert_eq!(
-        fields,
-        vec![
+        field_names("struct State {", "State"),
+        [
             "workspaces", "names", "runs", "next_txn", "next_merge", "apply_seq", "applied",
             "merges", "quarantine_reasons", "escrow", "row_author", "versions", "captures",
             "policy",
         ],
         "the fields of `AgentRuntime`'s `State` have changed. If a new one holds per-branch state \
-         that a statement can write — a schema-edit map is the live example, and B11 needs one — \
-         then it is a second funnel and the envelope does not govern it. Add the field here only \
-         after deciding which it is."
+         that a statement can write, it is a second funnel and the envelope does not govern it. \
+         Add the field here only after deciding which it is."
+    );
+    assert_eq!(
+        field_names("struct Workspace {", "Workspace"),
+        [
+            "name", "prov", "txn", "fork_seq", "fork_root", "rows", "base_rows", "tables", "frame",
+        ],
+        "the fields of `Workspace` have changed. This is B11's shape: it adds `schema_edits` and \
+         `base_shapes` here, and `stage_schema_edit` writes them without passing through \
+         `stage_all`. A new field here is branch state the envelope will not see unless the write \
+         path that fills it is governed."
     );
 
-    // Belt and braces on top of the counts: B11's two symbols, matched as DEFINITIONS rather than
-    // as text, so a doc comment that merely names them does not trip this and a merge that
-    // actually lands them does.
+    // Belt and braces on top of the counts: B11's two symbols, matched with `fn` adjacent to the
+    // name so prose that merely mentions them does not trip this. Two limits, stated because the
+    // matcher does not have the robustness the previous version of this comment claimed: after
+    // whitespace stripping there is no code/comment boundary left, so a doc block quoting the
+    // signature DOES trip it (fails safe); and a definition that grew a generic parameter —
+    // `fn stage_schema_edit<T>(` — would NOT. The counts above are the load-bearing half.
     let dense_dispatch: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
         !dense_dispatch.contains("fnrun_agent_alter("),
@@ -1088,7 +1401,8 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
          Measured on a throwaway merge of B11 (branch `I15-b11-alter-probe`): the ALTER returns \
          Ok, nothing is charged, and MERGE puts the column in the shared catalog. Widen \
          `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap` to demonstrate it with \
-         real SQL, or close the gap — and record which in INTEGRATION.md."
+         real SQL, or close the gap — and record which in the integration ledger, which lives in \
+         the `artie-research` repository and not in this one."
     );
     assert!(
         !dense.contains("fnstage_schema_edit("),

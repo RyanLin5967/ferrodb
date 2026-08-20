@@ -644,12 +644,32 @@ impl From<CapabilityRefusal> for FerroError {
 ///
 /// "Cannot be written" is a claim about ONE funnel — `AgentRuntime::stage_all` — and it is exactly
 /// as wide as that funnel and no wider. A statement that does not reach `stage_all` is not governed
-/// at all, and in this tree that is every verb that changes schema: `ANALYZE`, `CREATE INDEX`,
-/// `CREATE FULLTEXT INDEX`, `CREATE TABLE` and `DROP TABLE` all fall through
-/// `src/execution/executor.rs::run` to the **shared catalog**, with no branch and no `MERGE`. So a
-/// branch that may not write one row of a table can still index it, read every row of it into a
-/// full-text index, and drop it. Demonstrated verb by verb, against a forbidden table, by
-/// `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap`.
+/// at all, and there are **two** tiers of those, not one:
+///
+/// - **The agent verbs**, diverted by `is_agent_stmt` above everything else. Two of them write the
+///   ROWS of a forbidden table: `REVERT MERGE ... CASCADE` replays a previous merge's writes
+///   backwards, and `MERGE BRANCH <other>` publishes a *different* branch's private workspace. Both
+///   return `Ok` and charge nothing on a branch whose envelope forbids the table. This is the
+///   sharper half of the gap — shared *content*, not structure — and it is the half an earlier
+///   version of this paragraph omitted entirely. Pinned by
+///   `merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap`.
+/// - **The DDL that reaches the executor's `match`**: `CREATE INDEX`, `CREATE FULLTEXT INDEX`,
+///   `CREATE TABLE`, `DROP TABLE` and `ANALYZE` all fall through to the **shared catalog**, with no
+///   branch and no `MERGE`, so a branch that may not write one row of a table can still index it,
+///   read every row of it into a full-text index, and drop it. (`ANALYZE` changes no schema and
+///   nothing durable — it writes the in-memory `Catalog::stats` and never calls `persist`; it is
+///   here because it is ungoverned, not because it is DDL.) `BEGIN` / `COMMIT` / `ROLLBACK` are
+///   admitted too, though no row can land through them. Pinned by
+///   `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap`, which drives each verb
+///   against a table the envelope refuses, or — for `CREATE TABLE` — against a table it never
+///   granted.
+///
+/// And the DDL does not only escape the envelope: `DROP TABLE` + `CREATE TABLE` **widens** it,
+/// which `restrict` exists to make impossible. Table identity is the name and a column's is its
+/// index, so rebuilding a granted table detaches a floor from the column it guarded and can turn a
+/// standing refusal into a permission, without the envelope bytes ever changing. Pinned by
+/// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns` and
+/// `the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete`.
 ///
 /// **None of that is a read escalation, because there is nothing to escalate.** The envelope has no
 /// read dimension at all — [`Verb`] is `Insert | Update | Delete`, [`CapabilityEnvelope::admit`]
