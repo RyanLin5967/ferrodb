@@ -69,6 +69,8 @@ type Sink struct {
 	key string
 	// Columns known per table, learned from CREATE_TABLE events or inferred from the first row.
 	columns map[string][]string
+	// The key column's CURRENT name per table, read from the destination. See `keyFor`.
+	keys map[string]string
 }
 
 func openSink(path, key string) (*Sink, error) {
@@ -96,7 +98,7 @@ func openSink(path, key string) (*Sink, error) {
 			return nil, err
 		}
 	}
-	return &Sink{db: db, key: key, columns: map[string][]string{}}, nil
+	return &Sink{db: db, key: key, columns: map[string][]string{}, keys: map[string]string{}}, nil
 }
 
 // sqlType maps a feed type onto a SQLite storage class.
@@ -139,7 +141,14 @@ func quoteIdent(s string) string {
 // checkpoint of the source, because a checkpoint truncates the log and has to re-establish the
 // schema at the new base. A sink that treated each one as "a new table appeared" would fail on the
 // second checkpoint of every table's life.
-func (s *Sink) ensureTable(table string, cols []map[string]any) error {
+//
+// `declared` says where `cols` came from, and it decides whether the type-agreement check below
+// runs at all. A CREATE_TABLE or an ALTER carries the source's own declaration and is authoritative;
+// `ensureFromRow` INFERS types from a row's JSON and marks every column TEXT. Checking a guess
+// against a destination built from a declaration would refuse a correct destination for disagreeing
+// with a fallback — measured: `TestARetractionSurvivesAReplayButNotAFreshWrite` reopens a sink and
+// applies a bare UPDATE, which takes the inference path over an INTEGER destination.
+func (s *Sink) ensureTable(table string, cols []map[string]any, declared bool) error {
 	names, ddl := s.tableDDL(table, cols)
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), ddl)
 	if _, err := s.db.Exec(stmt); err != nil {
@@ -153,29 +162,28 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 	//
 	// SQLite has no equivalent of `checkSchemaAgrees`, so a mismatch here has always surfaced later
 	// as "no such column" at INSERT time. That is unchanged for every case except this one.
-	got, err := s.tableColumns(table)
+	got, gotTypes, err := s.tableShape(table)
 	if err != nil {
 		return err
 	}
-	if len(got) < len(names) {
-		prefix := true
-		for i := range got {
-			if got[i] != names[i] {
-				prefix = false
-				break
-			}
+	// The declared shape in SQLite's own spelling, so the comparison below is like for like: the
+	// feed says DECIMAL, the destination says TEXT, and only `sqlType` knows those are the same
+	// column. Built once and reused by the catch-up and the agreement check.
+	wantTypes := make([]string, len(names))
+	for i := range names {
+		wantTypes[i] = sqlType(fmt.Sprint(cols[i]["type"]))
+	}
+	if grown, err := s.catchUpToDeclaredShape(table, names, wantTypes, got, gotTypes); err != nil {
+		return err
+	} else if grown {
+		got, gotTypes, err = s.tableShape(table)
+		if err != nil {
+			return err
 		}
-		if prefix {
-			for i := len(got); i < len(names); i++ {
-				def := quoteIdent(names[i]) + " " + sqlType(fmt.Sprint(cols[i]["type"]))
-				add := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " + def
-				if _, err := s.db.Exec(add); err != nil {
-					if !strings.Contains(err.Error(), "duplicate column name") {
-						return fmt.Errorf("catch %s up to the declared shape (%s): %w",
-							table, names[i], err)
-					}
-				}
-			}
+	}
+	if declared {
+		if err := s.checkSchemaAgrees(table, names, wantTypes, got, gotTypes); err != nil {
+			return err
 		}
 	}
 	// B5's attribution columns, on the path an OLDER destination takes. The merge dropped this call
@@ -186,6 +194,93 @@ func (s *Sink) ensureTable(table string, cols []map[string]any) error {
 		return err
 	}
 	s.columns[table] = names
+	return nil
+}
+
+// catchUpToDeclaredShape adds columns a declaration has and the destination does not, and reports
+// whether it added any.
+//
+// The SQLite half of what `DuckSink.catchUpToDeclaredShape` does, and now to the same rule. It was
+// written a second time inside `ensureTable` as `if got[i] != names[i]` — **names only** — which is
+// review finding 4: the prefix test the safety argument rests on was only half performed on this
+// side, so a retype rode in under a matching name and the column kept an affinity that silently
+// converted its values.
+//
+// Refuses to do anything unless the destination is a strict PREFIX of the declaration: every column
+// it already has must be the declared one at that ordinal, **by name and by declared type**.
+// Anything else is left for `checkSchemaAgrees` to refuse. A shape diff cannot tell a rename from a
+// drop-plus-add, and guessing there loses the column's data.
+func (s *Sink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTypes []string) (bool, error) {
+	if len(got) >= len(want) {
+		return false, nil
+	}
+	for i := range got {
+		if got[i] != want[i] || !strings.EqualFold(gotTypes[i], wantTypes[i]) {
+			return false, nil
+		}
+	}
+	for i := len(got); i < len(want); i++ {
+		add := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " +
+			quoteIdent(want[i]) + " " + wantTypes[i]
+		if _, err := s.db.Exec(add); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return false, fmt.Errorf("catch %s up to the declared shape (%s): %w",
+					table, want[i], err)
+			}
+		}
+	}
+	return true, nil
+}
+
+// checkSchemaAgrees refuses when the destination table is not the table the event describes.
+//
+// SQLite had no equivalent of the DuckDB sink's check, so a disagreement surfaced later as
+// "no such column" at INSERT time — or, for a type, as nothing at all, because SQLite will happily
+// store a value through the wrong affinity and read it back looking fine. That is exactly the loss
+// `applySchemaChange`'s rebuild recipe exists to prevent, arriving through the one door that
+// bypassed it.
+//
+// Re-emission is the COMMON case, not the exception — a CREATE_TABLE is re-sent at every checkpoint
+// of the source — so agreement stays a silent no-op. Only a genuine difference is an error, and the
+// message names the column and both types, because "schema mismatch" alone sends the reader to diff
+// two schemas by hand.
+func (s *Sink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []string) error {
+	// **Deliberately narrower than the DuckDB sink's check of the same name, and each exclusion is
+	// a case the suite proved legitimate rather than a case nobody thought about.**
+	//
+	// NOT a column-count check. A destination AHEAD of the declaration is the ordinary outcome of
+	// replaying any feed that contains an ADD_COLUMN: the second pass re-delivers the original
+	// CREATE_TABLE, which declares fewer columns than the destination now has, and refusing there
+	// would break every replay (`TestReplayingAFeedWithASchemaChangeIsANoOp`). A destination BEHIND
+	// the declaration has already been offered the catch-up above; if it declined, the missing
+	// column surfaces at INSERT time, loudly.
+	//
+	// NOT a name check. A name differing at an ordinal is a RENAME the source performed and this
+	// consumer's log was truncated past — review finding 8, still open, still surfacing as
+	// "no such column" at INSERT. Refusing here would change that failure's shape without giving it
+	// a way forward, which is not this fix's job.
+	//
+	// A TYPE difference at an ordinal whose NAME agrees is the one case with no other detector, and
+	// it is review finding 4: the value is stored through the wrong affinity, converted on the way
+	// in, and reads back looking fine.
+	n := len(want)
+	if len(got) < n {
+		n = len(got)
+	}
+	for i := 0; i < n; i++ {
+		if want[i] != got[i] {
+			continue
+		}
+		if !strings.EqualFold(wantTypes[i], gotTypes[i]) {
+			return fmt.Errorf(
+				"table %s column %q is declared %s in the destination but the event's shape makes it "+
+					"%s; SQLite's declared type sets the column's affinity, so a value written through "+
+					"the wrong one is converted on the way in and reads back looking fine — a DECIMAL "+
+					"landing in an INTEGER column loses every digit past an i64. Refused rather than "+
+					"warned about. Rebuild the destination table, or drop it and let the feed recreate it",
+				table, got[i], gotTypes[i], wantTypes[i])
+		}
+	}
 	return nil
 }
 
@@ -201,7 +296,10 @@ func (s *Sink) tableDDL(table string, cols []map[string]any) (names []string, de
 		name := fmt.Sprint(c["name"])
 		names = append(names, name)
 		def := quoteIdent(name) + " " + sqlType(fmt.Sprint(c["type"]))
-		if name == s.key {
+		// `keyFor`, not the flag — I20. A rebuild (the retype recipe) re-declares the table from
+		// these definitions, and one built from the flag after the source renamed the key column
+		// would quietly drop the PRIMARY KEY and leave every later upsert without a conflict target.
+		if name == s.keyFor(table) {
 			def += " PRIMARY KEY"
 		}
 		out = append(out, def)
@@ -279,7 +377,7 @@ func (s *Sink) applySchemaChange(e *Event) error {
 	// source truncated its log gets the CREATE_TABLE re-declaration with the evolved shape, but a
 	// consumer whose first event is the ALTER itself must not fail.
 	if _, err := s.db.Exec("SELECT 1 FROM " + quoteIdent(e.Table) + " LIMIT 0"); err != nil {
-		return s.ensureTable(e.Table, cols)
+		return s.ensureTable(e.Table, cols, true)
 	}
 
 	switch e.Op {
@@ -334,6 +432,10 @@ func (s *Sink) applySchemaChange(e *Event) error {
 	// Re-read the shape from the destination rather than trusting the statement above to have
 	// produced it: the column list drives every subsequent INSERT, and one built from what was
 	// asked for rather than from what is there names a column that may not exist.
+	//
+	// I20: the cached key name goes with it. A RENAME_COLUMN may have moved the key, and a retype
+	// rebuild re-declares the table; either way what is cached describes the table as it was.
+	s.forgetKey(e.Table)
 	actual, err := s.tableColumns(e.Table)
 	if err != nil {
 		return err
@@ -392,16 +494,34 @@ func (s *Sink) rebuildTable(table string, cols []map[string]any) error {
 
 // tableColumns asks the destination what a table's data columns actually are, in order.
 func (s *Sink) tableColumns(table string) ([]string, error) {
-	rows, err := s.db.Query("SELECT name FROM pragma_table_info(?) ORDER BY cid", table)
+	names, _, err := s.tableShape(table)
+	return names, err
+}
+
+// tableShape asks the destination for its data columns AND their declared types, in order.
+//
+// **The types are the point — I20, review finding 4.** `tableColumns` read `SELECT name` and the
+// catch-up below compared names only, while the DuckDB sink's `catchUpToDeclaredShape` compared
+// both. The comment on that function and this consumer's own report both said the catch-up fires
+// on "same names, SAME TYPES, in order"; on this side the second half was never written. A source
+// that retyped `qty` to DECIMAL and added `note`, then checkpointed both ALTERs away, handed the
+// destination a declaration whose NAMES still prefix-matched — so `note` was appended, `qty` kept
+// its INTEGER affinity, and a 39-digit decimal arriving as a JSON string was coerced to a float:
+// 1.7014118346046923e+38, storage class `real`, from a run printing `applied 2, skipped 0` and
+// exiting 0.
+//
+// The declared type is what sets a SQLite column's affinity, so it is the thing that decides
+// whether a value is stored as given or converted. Reading it is the whole fix.
+func (s *Sink) tableShape(table string) (names []string, types []string, err error) {
+	rows, err := s.db.Query("SELECT name, type FROM pragma_table_info(?) ORDER BY cid", table)
 	if err != nil {
-		return nil, fmt.Errorf("read %s columns: %w", table, err)
+		return nil, nil, fmt.Errorf("read %s columns: %w", table, err)
 	}
 	defer rows.Close()
-	var out []string
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return nil, err
+		var n, ty string
+		if err := rows.Scan(&n, &ty); err != nil {
+			return nil, nil, err
 		}
 		// **Bookkeeping columns are not data columns**, and the list has to include B5's
 		// attribution columns as well as the three original ones. This filter was written when
@@ -425,11 +545,54 @@ func (s *Sink) tableColumns(table string) ([]string, error) {
 			}
 		}
 		if !bookkeeping {
-			out = append(out, n)
+			names = append(names, n)
+			types = append(types, ty)
 		}
 	}
-	return out, rows.Err()
+	return names, types, rows.Err()
 }
+
+// keyFor is the name the key column carries in `table` RIGHT NOW — I20, review finding 10.
+//
+// The `-key` flag names the key column as it is called when the consumer STARTS. It can move: the
+// source permits renaming the primary key (only RETYPING it is refused, `catalog/alter.rs`), and a
+// rename keeps the column at ordinal 0, which is what still makes it the primary key. Both sinks
+// pinned `s.key` to the flag for ever, so after such a rename every upsert died on
+// `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint` — and `runSink` returns
+// on the first error, so every restart died at the same record.
+//
+// Read from the DESTINATION rather than tracked in memory, which is what makes it survive a
+// restart: the RENAME_COLUMN event is ordinary positioned traffic, so a resume whose cursor is past
+// it never sees it again. SQLite carries the PRIMARY KEY onto the new name across
+// `ALTER TABLE ... RENAME COLUMN` — measured, not assumed: `pragma_table_info` reports `pk=1` on
+// the renamed column and an upsert against it succeeds. So the destination's own catalog is the
+// truth about what `ON CONFLICT` will accept, and the flag is only the fallback for a table that
+// does not exist yet.
+func (s *Sink) keyFor(table string) string {
+	if n, ok := s.keys[table]; ok {
+		return n
+	}
+	rows, err := s.db.Query("SELECT name FROM pragma_table_info(?) WHERE pk != 0 ORDER BY pk", table)
+	if err != nil {
+		return s.key
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return s.key
+		}
+		// The first PK column. This source's primary key is always a single column at ordinal 0
+		// (`catalog.rs`: "first column = primary key"), so there is no composite case to get wrong.
+		s.keys[table] = n
+		return n
+	}
+	return s.key
+}
+
+// forgetKey drops a cached key name. Called wherever the destination's shape changes underneath
+// the cache — a rename moves it, a rebuild re-declares it, and a DROP takes the table with it.
+func (s *Sink) forgetKey(table string) { delete(s.keys, table) }
 
 // ensureFromRow creates a table from a data row, for a feed whose CREATE_TABLE has been truncated
 // away. Types are inferred, which is worse than being told — recorded here so the difference is
@@ -447,14 +610,15 @@ func (s *Sink) ensureFromRow(table string, row map[string]any) error {
 	for _, n := range names {
 		cols = append(cols, map[string]any{"name": n, "type": "TEXT"})
 	}
-	return s.ensureTable(table, cols)
+	// `false`: these types are guesses. See `ensureTable`.
+	return s.ensureTable(table, cols, false)
 }
 
 // apply writes one event, ignoring it if the destination already holds a newer one.
 func (s *Sink) apply(e *Event) error {
 	switch e.Op {
 	case "CREATE_TABLE":
-		return s.ensureTable(e.Table, eventColumns(e))
+		return s.ensureTable(e.Table, eventColumns(e), true)
 
 	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
 		return s.applySchemaChange(e)
@@ -464,6 +628,7 @@ func (s *Sink) apply(e *Event) error {
 			return err
 		}
 		delete(s.columns, e.Table)
+		s.forgetKey(e.Table)
 		return nil
 	}
 
@@ -532,7 +697,7 @@ func (s *Sink) apply(e *Event) error {
 		quoteIdent(e.Table),
 		strings.Join(names, ", "),
 		strings.Join(placeholders, ", "),
-		quoteIdent(s.key),
+		quoteIdent(s.keyFor(e.Table)),
 		strings.Join(sets, ", "),
 		quoteIdent(e.Table),
 		quoteIdent(e.Table),
