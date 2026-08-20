@@ -41,25 +41,81 @@ impl HeapFileManager {
         Ok(tuple)
     }
 
+    /// A page that can hold a tuple of `tuple_len` bytes, making one if no existing page can.
+    ///
+    /// Split out of [`Self::insert`] so a caller can obtain the destination **before** it gives up
+    /// the space it is replacing. This is the only part of an insert that can fail for a reason
+    /// unrelated to the tuple: `new_page` goes to `DiskManager::allocate`, which refuses once the
+    /// table region below the copy-on-write arena floor is full — a real limit, fixed when the
+    /// database is created (`cli::DEFAULT_ARENA_HEADROOM`), not a test contrivance. See the
+    /// relocation branch of [`Self::update`] for what that cost before this split existed.
+    pub fn find_or_make_page(&self, tuple_len: usize) -> Result<u32, FerroError> {
+        if let Some(id) = self.find_page_with_space(tuple_len as u16 + SLOT_ENTRY_SIZE as u16)? {
+            return Ok(id);
+        }
+        let new_page_id = self.buffer_pool_manager.new_page()?;
+        self.buffer_pool_manager.unpin_page(new_page_id, false);
+        let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
+        let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+        let empty_page = Page::empty(new_page_id);
+        frame.data = empty_page.serialize()?;
+        drop(frame);
+        self.buffer_pool_manager.unpin_page(new_page_id, true);
+        let free_space = (PAGE_SIZE - HEADER_SIZE) as u16;
+        self.add_to_directory(new_page_id, free_space)?;
+        Ok(new_page_id)
+    }
+
+    /// Free space this heap holds across every data page, as the page directory reports it.
+    ///
+    /// Used by [`Self::reserve_free_space`]; it is the directory's own numbers rather than a
+    /// re-derivation from the pages, because the directory is what `find_page_with_space` consults.
+    pub fn free_space(&self) -> Result<usize, FerroError> {
+        let mut total = 0usize;
+        let mut dir_page_id = self.first_directory_page_id;
+        loop {
+            let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
+            let frame = self.buffer_pool_manager.frames[frame_i].read().unwrap();
+            let dir = PageDirectory::deserialize(frame.data);
+            drop(frame);
+            self.buffer_pool_manager.unpin_page(dir_page_id, false);
+            total += dir.entries.iter().map(|e| e.free_space as usize).sum::<usize>();
+            if dir.next_page_directory == 0 {
+                return Ok(total);
+            }
+            dir_page_id = dir.next_page_directory;
+        }
+    }
+
+    /// Add empty pages until the heap holds `bytes` of free space, returning how many were added.
+    ///
+    /// For a caller that is about to relocate many tuples and cannot survive discovering half way
+    /// through that the page allocator is exhausted — `catalog::alter::rewrite_heap`, which is
+    /// unlogged and therefore has no undo. Failing here is harmless: the only thing it can leave
+    /// behind is empty pages the heap will use for its next insert, and not one tuple has moved.
+    ///
+    /// **What it does not promise.** Free space in the aggregate is not free space in one page: the
+    /// pages counted may each hold less than the next tuple needs, in which case an insert still
+    /// allocates. It converts the common exhaustion — no room anywhere — into a refusal before the
+    /// first write, and leaves fragmentation to the reserve-before-delete order in [`Self::update`].
+    pub fn reserve_free_space(&self, bytes: usize) -> Result<usize, FerroError> {
+        let mut added = 0usize;
+        let usable = PAGE_SIZE - HEADER_SIZE - SLOT_ENTRY_SIZE;
+        while self.free_space()? < bytes {
+            self.find_or_make_page(usable)?;
+            added += 1;
+        }
+        Ok(added)
+    }
+
     // finds page with space (via page dir), fetch through buffer pool, insert tuple, update directory, unpin
     pub fn insert(&self, tuple: Tuple) -> Result<RecordId, FerroError>{
-        let page_id = match self.find_page_with_space(tuple.data.len() as u16 + SLOT_ENTRY_SIZE as u16)?{ 
-            Some(id) => id,
-            None => {
-                let new_page_id = self.buffer_pool_manager.new_page()?;
-                self.buffer_pool_manager.unpin_page(new_page_id, false);
-                let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
-                let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
-                let empty_page = Page::empty(new_page_id);
-                frame.data = empty_page.serialize()?;
-                drop(frame);
-                self.buffer_pool_manager.unpin_page(new_page_id, true);
-                let free_space = (PAGE_SIZE - HEADER_SIZE) as u16;
-                self.add_to_directory(new_page_id, free_space)?;
-                new_page_id
-            }
-        };
+        let page_id = self.find_or_make_page(tuple.data.len())?;
+        self.insert_into(page_id, tuple)
+    }
 
+    /// Write `tuple` into `page_id`, which the caller has already established can hold it.
+    fn insert_into(&self, page_id: u32, tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
         let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
         let mut page = Page::deserialize(frame.data)?;
@@ -124,6 +180,30 @@ impl HeapFileManager {
                     self.buffer_pool_manager.unpin_page(record_id.page_id, false);
                     return Err(FerroError::NotEnoughSpace);
                 }
+                // **Reserve the destination before freeing the source.** `Page::update` returned
+                // `NotEnoughSpace` without touching the page, so nothing has changed yet; the lock
+                // is released here because `find_or_make_page` fetches directory pages and may
+                // allocate, and holding this frame's write lock across that would deadlock the
+                // moment the allocator handed back a page whose frame is this one.
+                //
+                // A fresh page can hold any tuple up to `MAX_TUPLE_SIZE`, so with the destination
+                // in hand `insert_into` cannot fail for want of space. Obtaining it FIRST is what
+                // makes the size guard above sufficient: the guard answers "can any page hold
+                // this tuple", and this answers "is there a page at all", which is a different
+                // question with a different answer. `DiskManager::allocate` refuses once the table
+                // region below the copy-on-write arena floor is full, and that floor is fixed when
+                // the database is created, so it is an ordinary end-state rather than an exotic
+                // one. Measured under the old order: a 41-row single-page heap with the floor
+                // reached lost row 1 outright to a `ALTER TABLE ... ADD COLUMN` that reported
+                // failure, and left the primary index pointing at the deleted slot — durably,
+                // across checkpoint, flush and a reopen.
+                drop(frame);
+                self.buffer_pool_manager.unpin_page(record_id.page_id, false);
+                let dest = self.find_or_make_page(new_bytes.len())?;
+
+                let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
+                let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+                let mut page = Page::deserialize(frame.data)?;
                 page.delete(record_id.slot_num as usize)?;
                 if let Some(txn) = &self.txn {
                     let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
@@ -132,7 +212,7 @@ impl HeapFileManager {
                 frame.data = page.serialize()?;
                 drop(frame);
                 self.buffer_pool_manager.unpin_page(record_id.page_id, true);
-                let new_record_id = self.insert(clone)?;
+                let new_record_id = self.insert_into(dest, clone)?;
                 self.update_directory_entry(record_id.page_id, page.get_free_space_end() - page.get_free_space_start())?;
                 return Ok(new_record_id)
             }

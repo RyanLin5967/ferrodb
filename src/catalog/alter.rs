@@ -70,12 +70,12 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::{DataType, Value};
 use crate::catalog::schema::Schema;
-use crate::catalog::stats::ColumnStats;
+use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::parser::parser::AlterAction;
 use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
-use crate::storage::heap_page::MAX_TUPLE_SIZE;
+use crate::storage::heap_page::{MAX_TUPLE_SIZE, SLOT_ENTRY_SIZE};
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
@@ -376,6 +376,14 @@ impl Catalog {
         // told at the moment it types the statement exactly what it would be told at merge.
         let new_schema = resulting_schema(table, &old_schema, action, row_count)?;
 
+        // The statistics are carried across the alteration by [`carried_stats`], and they are
+        // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
+        // `finish` runs only after the heap has been converted, so a conversion that fails inside
+        // it is a refusal that cannot leave the table as it was — the same defect as an unchecked
+        // row width, one function further on. Every fallible step now happens while the heap is
+        // still untouched.
+        let carried = carried_stats(&old_schema, &new_schema, self.stats.get(table))?;
+
         match action {
             AlterAction::RenameColumn { from, to } => {
                 // No heap work whatsoever. Column names are not in the tuple bytes — a column is
@@ -415,7 +423,7 @@ impl Catalog {
                         Ok(())
                     },
                 )?;
-                self.finish(table, new_schema, primary_root_now)
+                self.finish(table, new_schema, primary_root_now, carried)
             }
 
             AlterAction::RetypeColumn { column, to } => {
@@ -467,75 +475,34 @@ impl Catalog {
                 // *used* to have, and `Update` leaves the old entry in place for exactly that
                 // reason. Rebuilding from the live heap silently threw that away.
                 let _ = (idx, &indexes);
-                self.finish(table, new_schema, primary_root_now)
+                self.finish(table, new_schema, primary_root_now, carried)
             }
         }
     }
 
-    /// Install the new schema, carry the statistics across it, persist, and hand back the shape.
-    ///
-    /// # The statistics are carried, not dropped, and the difference is not cosmetic
-    ///
-    /// `analyze` stores one `ColumnStats` **positionally**, so a table that gained a column has
-    /// statistics one entry short of its columns. Dropping them is the safe-looking answer and it
-    /// is quietly expensive: with no statistics the cost model falls back to its defaults, and the
-    /// first thing that changes is that it stops choosing index scans. An `ALTER` would therefore
-    /// silently de-optimise every query against the table until somebody thought to run `ANALYZE` —
-    /// a performance cliff triggered by a schema change, with nothing to attribute it to. It is
-    /// also how a fire-check on this module first came back green for the wrong reason: two tests
-    /// meant to prove the indexes survived an alter were quietly running sequential scans.
-    ///
-    /// Carrying them is *exact* here, not a guess, which is the only reason it is allowed:
-    ///
-    /// - an added column is `NULL` in every existing row, so its statistics are exactly
-    ///   `distinct: 0, nulls: row_count, min/max: None` — what `analyze` would compute;
-    /// - a renamed column keeps its position, and statistics are positional;
-    /// - a retyped column's `min`/`max` go through the very [`Widening`] the rows went through, so
-    ///   they are the same values in the new type rather than an estimate of them.
-    ///
-    /// A table with no statistics to begin with still has none afterwards.
+    /// Install the new schema and the statistics [`carried_stats`] computed for it, persist, and
+    /// hand back the shape.
     ///
     /// `primary_root_now` is the primary index's root as [`rewrite_heap`] left it. It is written
     /// back here, in the same `persist` as the schema, rather than through
     /// [`Catalog::update_primary_root`] — two persists would be two chances to store one half of an
     /// alteration.
+    ///
+    /// **Nothing in here may be fallible except the `persist` itself**, and that is a property to
+    /// preserve rather than a coincidence. This function runs after `rewrite_heap` has converted
+    /// every tuple on disk, so an `Err` returned from it produces exactly the state I19 exists to
+    /// eliminate: rows in the new shape under the old catalog, from a statement that reported
+    /// failure. Anything that can refuse belongs before the rewrite, next to the row-width
+    /// precheck. `persist` is the commit point and cannot be moved.
     fn finish(
         &mut self,
         table: &str,
         new_schema: Schema,
         primary_root_now: u32,
+        carried: Option<Vec<ColumnStats>>,
     ) -> Result<Vec<ColumnShape>, FerroError> {
-        let old_len = self.tables.get(table).map(|e| e.schema.columns.len()).unwrap_or(0);
-        let widened: Vec<Option<Widening>> = {
-            let old = self.tables.get(table).map(|e| e.schema.clone());
-            (0..old_len)
-                .map(|i| {
-                    let o = old.as_ref()?.columns.get(i)?.data_type.clone();
-                    let n = new_schema.columns.get(i)?.data_type.clone();
-                    if o == n { None } else { Widening::of(&o, &n) }
-                })
-                .collect()
-        };
-        if let Some(stats) = self.stats.get_mut(table) {
-            for (i, w) in widened.iter().enumerate() {
-                let Some(w) = w else { continue };
-                if let Some(c) = stats.columns.get_mut(i) {
-                    c.min = match &c.min {
-                        Some(v) => Some(w.apply(v)?),
-                        None => None,
-                    };
-                    c.max = match &c.max {
-                        Some(v) => Some(w.apply(v)?),
-                        None => None,
-                    };
-                }
-            }
-            // An appended column is NULL in every row that already exists.
-            let rows = stats.row_count;
-            while stats.columns.len() < new_schema.columns.len() {
-                stats.columns.push(ColumnStats { distinct: 0, nulls: rows, min: None, max: None });
-            }
-            stats.columns.truncate(new_schema.columns.len());
+        if let (Some(columns), Some(stats)) = (carried, self.stats.get_mut(table)) {
+            stats.columns = columns;
         }
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.schema = new_schema;
@@ -544,6 +511,75 @@ impl Catalog {
         self.persist()?;
         Ok(shape)
     }
+}
+
+/// The statistics a table should have after `old -> new`, or `None` if it has none.
+///
+/// # The statistics are carried, not dropped, and the difference is not cosmetic
+///
+/// `analyze` stores one `ColumnStats` **positionally**, so a table that gained a column has
+/// statistics one entry short of its columns. Dropping them is the safe-looking answer and it
+/// is quietly expensive: with no statistics the cost model falls back to its defaults, and the
+/// first thing that changes is that it stops choosing index scans. An `ALTER` would therefore
+/// silently de-optimise every query against the table until somebody thought to run `ANALYZE` —
+/// a performance cliff triggered by a schema change, with nothing to attribute it to. It is
+/// also how a fire-check on this module first came back green for the wrong reason: two tests
+/// meant to prove the indexes survived an alter were quietly running sequential scans.
+///
+/// Carrying them is *exact* here, not a guess, which is the only reason it is allowed:
+///
+/// - an added column is `NULL` in every existing row, so its statistics are exactly
+///   `distinct: 0, nulls: row_count, min/max: None` — what `analyze` would compute;
+/// - a renamed column keeps its position, and statistics are positional;
+/// - a retyped column's `min`/`max` go through the very [`Widening`] the rows went through, so
+///   they are the same values in the new type rather than an estimate of them.
+///
+/// A table with no statistics to begin with still has none afterwards.
+///
+/// # Why it is a separate function called before the rewrite
+///
+/// This is the only fallible part of installing an alteration: `Widening::apply` refuses a stored
+/// value whose variant contradicts its column, which is corruption rather than a conversion
+/// failure. It used to run inside [`Catalog::finish`], i.e. after `rewrite_heap` had already
+/// converted the heap, where refusing leaves the table converted under its old schema — the same
+/// shape of defect as an unchecked row width. It is now evaluated while the heap is untouched.
+///
+/// It is one definition with one caller rather than a dry run next to a real run: two lists that
+/// have to agree about the same conversions is the mistake [`Widening`] was written to avoid.
+///
+/// Reachability, stated rather than implied: no SQL path is known to produce statistics whose
+/// `min`/`max` variant contradicts its column, because `analyze` computes them from rows that
+/// `Tuple::serialize` already type-checked, and a previous alter carried them through the same
+/// widening. This is a `?` removed from a post-mutation path, not a measured failure.
+fn carried_stats(
+    old: &Schema,
+    new: &Schema,
+    stats: Option<&TableStats>,
+) -> Result<Option<Vec<ColumnStats>>, FerroError> {
+    let Some(stats) = stats else { return Ok(None) };
+    let mut columns = stats.columns.clone();
+    for i in 0..old.columns.len() {
+        let (Some(o), Some(n)) = (old.columns.get(i), new.columns.get(i)) else { continue };
+        if o.data_type == n.data_type {
+            continue;
+        }
+        let Some(w) = Widening::of(&o.data_type, &n.data_type) else { continue };
+        let Some(c) = columns.get_mut(i) else { continue };
+        c.min = match &c.min {
+            Some(v) => Some(w.apply(v)?),
+            None => None,
+        };
+        c.max = match &c.max {
+            Some(v) => Some(w.apply(v)?),
+            None => None,
+        };
+    }
+    // An appended column is NULL in every row that already exists.
+    while columns.len() < new.columns.len() {
+        columns.push(ColumnStats { distinct: 0, nulls: stats.row_count, min: None, max: None });
+    }
+    columns.truncate(new.columns.len());
+    Ok(Some(columns))
 }
 
 /// Re-serialize every tuple of a heap under a new schema.
@@ -630,6 +666,9 @@ fn rewrite_heap(
         key: Option<Value>,
         prov: Option<crate::provenance::ProvId>,
         tuple: Tuple,
+        /// The size of the tuple this one replaces. A row that did not grow is written in place and
+        /// needs no space reserved for it.
+        was: usize,
     }
 
     // Pass 1: read, convert, serialize. No write of any kind.
@@ -638,7 +677,10 @@ fn rewrite_heap(
     // function did too — it held every row's decoded `Vec<Value>`, and the packed bytes are the
     // smaller of the two representations for every type in this database.
     let mut prepared: Vec<Prepared> = Vec::new();
-    let mut too_wide: Vec<(RecordId, Option<Value>, usize)> = Vec::new();
+    // Only the widest row is named in the refusal, so only the widest is kept: a table where every
+    // row is oversized would otherwise clone every primary key to build one error message.
+    let mut too_wide = 0usize;
+    let mut widest: Option<(RecordId, Option<Value>, usize)> = None;
     for item in heap.scan() {
         let (rid, tuple) = item?;
         if tuple.data.len() < VERSION_HEADER_SIZE {
@@ -649,6 +691,7 @@ fn rewrite_heap(
         }
         let mut header = [0u8; VERSION_HEADER_SIZE];
         header.copy_from_slice(&tuple.data[..VERSION_HEADER_SIZE]);
+        let was = tuple.data.len();
         let mut values = tuple.deserialize(old)?;
         let key = values.first().cloned();
         transform(&mut values)?;
@@ -656,8 +699,12 @@ fn rewrite_heap(
         // begin_ts and end_ts exactly as they were; prev deliberately cleared.
         converted.data[..16].copy_from_slice(&header[..16]);
         converted.data[16..VERSION_HEADER_SIZE].fill(0);
-        if converted.data.len() > MAX_TUPLE_SIZE {
-            too_wide.push((rid, key.clone(), converted.data.len()));
+        let size = converted.data.len();
+        if size > MAX_TUPLE_SIZE {
+            too_wide += 1;
+            if widest.as_ref().is_none_or(|(_, _, w)| size > *w) {
+                widest = Some((rid, key.clone(), size));
+            }
         }
         let attribution = match prov {
             Some(store) => {
@@ -666,10 +713,10 @@ fn rewrite_heap(
             }
             None => None,
         };
-        prepared.push(Prepared { rid, key, prov: attribution, tuple: converted });
+        prepared.push(Prepared { rid, key, prov: attribution, tuple: converted, was });
     }
 
-    if let Some((rid, key, widest)) = too_wide.iter().max_by_key(|(_, _, n)| *n) {
+    if let Some((rid, key, widest)) = &widest {
         let which = match key {
             Some(k) => format!("the row whose first column is {k:?}"),
             None => format!("the row in heap slot {rid:?}"),
@@ -682,15 +729,39 @@ fn rewrite_heap(
              leave rows in the new shape under the old schema. Narrow the row first (shorten an \
              oversized VARCHAR with UPDATE, or move the wide column into its own table) and run \
              the ALTER again.",
-            too_wide.len(),
+            too_wide,
             prepared.len(),
         )));
+    }
+
+    // Reserve the space the relocations will need, before the first one happens.
+    //
+    // A row whose converted tuple no longer fits its page is relocated, and a relocation may have
+    // to allocate. `DiskManager::allocate` refuses once the table region below the copy-on-write
+    // arena floor is full — a real end-state, since the floor is fixed at `DEFAULT_ARENA_HEADROOM`
+    // when the database is created — and discovering that in the middle of pass 2 leaves rows
+    // converted under the old schema with no log to repair them. Asking for the space first turns
+    // it into a refusal: the worst this can leave behind is empty pages the heap's next insert
+    // will use, and no tuple has moved.
+    //
+    // Only rows that GREW are counted; a row that shrank or stayed the same is written in place.
+    // The count is bytes rather than pages because that is what the page directory reports, and it
+    // is aggregate rather than per-page — `reserve_free_space` says in its own words that
+    // fragmentation can still defeat it, which is why `HeapFileManager::update` also reserves each
+    // relocation's destination before freeing its source.
+    let growth: usize = prepared
+        .iter()
+        .filter(|p| p.tuple.data.len() > p.was)
+        .map(|p| p.tuple.data.len() + SLOT_ENTRY_SIZE)
+        .sum();
+    if growth > 0 {
+        heap.reserve_free_space(growth)?;
     }
 
     // Pass 2: write. Every remaining failure is environmental; see the note above.
     let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
     let mut rewritten = 0usize;
-    for Prepared { rid, key, prov: attribution, tuple } in prepared {
+    for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
             // The row moved pages. The primary index is the only structure that stores a

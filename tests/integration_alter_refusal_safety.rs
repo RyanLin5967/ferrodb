@@ -74,19 +74,33 @@ fn db() -> Db {
 /// Called a second time on the same directory to reopen — which is the point: the `BufferPoolManager`
 /// and the `Catalog` are built fresh, so nothing the first handle cached can carry the answer.
 fn open_at(dir: tempfile::TempDir) -> Db {
+    open_maybe_recovering(dir, false)
+}
+
+/// Reopen the way the CLI does after a crash: build the `TxnManager`, run `recover`, and only then
+/// open the catalog. Used by [`a_refused_alter_survives_a_crash_with_no_clean_flush`], where the
+/// point is what the WAL replays rather than what was written through.
+fn open_recovering(dir: tempfile::TempDir) -> Db {
+    open_maybe_recovering(dir, true)
+}
+
+fn open_maybe_recovering(dir: tempfile::TempDir, recover: bool) -> Db {
     let path = dir.path().join("alter.db");
     let fresh = !path.exists();
     let file =
         std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
     let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let wal = Arc::new(WalManager::new(dir.path().join("alter.wal")).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    if recover {
+        ferrodb::wal::recovery::recover(&txn).expect("recover");
+    }
     let catalog = if fresh {
         Catalog::create(bp.clone()).unwrap()
     } else {
         Catalog::open(bp.clone(), 1).unwrap()
     };
-    let wal = Arc::new(WalManager::new(dir.path().join("alter.wal")).unwrap());
-    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
-    bp.attach_wal(wal.clone());
     let runtime = Arc::new(AgentRuntime::new());
     let session = Session::with_runtime(runtime.clone());
     Db { dir, catalog, wal, bp, txn, runtime, session }
@@ -125,6 +139,16 @@ impl Db {
             Ok(_) => Err(format!("`{sql}` did not return rows")),
             Err(e) => Err(format!("`{sql}` errored: {e}")),
         }
+    }
+
+    /// Run one statement in a caller-supplied session, which is how an agent branch is driven.
+    fn exec(&mut self, sql: &str, session: &mut Session) -> Result<Outcome, FerroError> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens()?;
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "`{sql}` did not parse");
+        assert_eq!(stmts.len(), 1, "expected one statement: {sql}");
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), session)
     }
 
     fn shape(&self, table: &str) -> Vec<(String, DataType)> {
@@ -477,6 +501,137 @@ fn a_refused_alter_survives_a_checkpoint_a_flush_and_a_fresh_buffer_pool() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The other ways in, and the other side of a restart
+// ---------------------------------------------------------------------------------------------
+
+/// The rewrite is also reached from `MERGE`, and that route must be no less safe.
+///
+/// `AgentRuntime::merge` runs a branch's staged schema edits through the same
+/// `Catalog::alter_table`, so an edit an agent typed against a narrow table can meet a row that has
+/// since grown. What is asserted here is the target: its heap, its shape, its index answers and its
+/// rows, byte for byte.
+///
+/// What is deliberately NOT asserted is the shape of the failure the agent sees. It arrives as an
+/// `Err` from `MERGE` rather than as a `MergeReport` saying the merge did not land, which is
+/// `review-B11.md` finding 5 — the publish is committed before the schema edits run — and it is
+/// that row's to fix, not this one's. This test pins that I19 did not make it worse.
+#[test]
+fn a_schema_edit_refused_at_merge_leaves_the_target_exactly_as_it_was() {
+    let keys = [Value::Integer(1), Value::Integer(2)];
+    let big = "x".repeat(2014);
+
+    for (setup, stmt) in [
+        (
+            "CREATE TABLE t (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));",
+            "ALTER TABLE t ALTER COLUMN n TYPE BIGINT;",
+        ),
+        (
+            "CREATE TABLE t (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));",
+            "ALTER TABLE t ADD COLUMN note VARCHAR(20);",
+        ),
+    ] {
+        let mut d = db();
+        d.sql(setup);
+        d.sql("INSERT INTO t VALUES (1, 100, 'small', 'small');");
+        d.sql(&format!("INSERT INTO t VALUES (2, 200, '{big}', '{big}');"));
+        let before = snapshot(&mut d, "t", "SELECT id, n FROM t;", &keys);
+
+        let mut agent = Session::with_runtime(d.runtime.clone());
+        d.exec("BEGIN AGENT SESSION AS 'agent-a';", &mut agent).expect("open a branch");
+        d.exec(stmt, &mut agent).expect("the branch must accept the edit: it is legal against the shape");
+        let merged = d.exec("MERGE;", &mut agent);
+        let e = merged.err().unwrap_or_else(|| panic!("`{stmt}` was not refused at MERGE"));
+        assert_is_the_size_refusal(&e, "t");
+
+        let after = snapshot(&mut d, "t", "SELECT id, n FROM t;", &keys);
+        assert_eq!(before, after, "`{stmt}` refused at MERGE still changed the target ({e})");
+    }
+}
+
+/// A refusal followed by a crash with **no clean flush**, replayed through `recover`.
+///
+/// The rewrite is unlogged on purpose, so the WAL has nothing to say about it either way — which
+/// means a crash after a refusal must not be able to *invent* half of one. The buffer pool is
+/// deliberately not flushed: the reopen sees whatever was written through plus whatever the WAL
+/// replays, which is the only state a real crash leaves.
+#[test]
+fn a_refused_alter_survives_a_crash_with_no_clean_flush() {
+    let dir = {
+        let mut d = db();
+        d.sql("CREATE TABLE t (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));");
+        d.sql("INSERT INTO t VALUES (1, 100, 'small', 'small');");
+        let big = "x".repeat(2014);
+        d.sql(&format!("INSERT INTO t VALUES (2, 200, '{big}', '{big}');"));
+        d.wal.flush().unwrap();
+        d.bp.flush_all().unwrap();
+        d.bp.disk_manager.sync().unwrap();
+
+        let e = d
+            .try_sql("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;")
+            .err()
+            .expect("the fixture must produce a refused ALTER");
+        assert_is_the_size_refusal(&e, "t");
+        // The crash: the WAL is durable, the buffer pool is not flushed, nothing is synced.
+        d.wal.flush().unwrap();
+        d.dir
+    };
+
+    let mut r = open_recovering(dir);
+    assert_eq!(
+        r.shape("t"),
+        vec![
+            ("id".to_string(), DataType::Integer),
+            ("n".to_string(), DataType::Integer),
+            ("a".to_string(), DataType::Varchar(2100)),
+            ("b".to_string(), DataType::Varchar(2100)),
+        ],
+        "recovery installed a shape the refused ALTER never got as far as installing"
+    );
+    let rows = r.rows("SELECT id, n FROM t;").expect("the table must be readable after recovery");
+    assert_eq!(rows.len(), 2, "recovery did not bring both rows back: {rows:?}");
+}
+
+/// Refusing the same statement repeatedly, with a checkpoint each time, changes nothing — and the
+/// statement still works once the row that blocked it is narrowed.
+///
+/// A guard that leaked a little on every attempt would pass a single-shot test. The checkpoint is in
+/// the loop because `review-B11.md` finding 8 turns on what a checkpoint does to schema records.
+#[test]
+fn repeated_refusals_leave_the_table_unchanged_and_the_statement_still_works() {
+    let keys = [Value::Integer(1), Value::Integer(2)];
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));");
+    d.sql("INSERT INTO t VALUES (1, 100, 'small', 'small');");
+    let big = "x".repeat(2014);
+    d.sql(&format!("INSERT INTO t VALUES (2, 200, '{big}', '{big}');"));
+    let before = snapshot(&mut d, "t", "SELECT id, n FROM t;", &keys);
+
+    for attempt in 0..3 {
+        let e = d
+            .try_sql("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;")
+            .err()
+            .unwrap_or_else(|| panic!("attempt {attempt} was not refused"));
+        assert_is_the_size_refusal(&e, "t");
+        assert_eq!(
+            before,
+            snapshot(&mut d, "t", "SELECT id, n FROM t;", &keys),
+            "attempt {attempt} changed the table"
+        );
+        d.txn.checkpoint().expect("checkpoint");
+        assert_eq!(
+            before,
+            snapshot(&mut d, "t", "SELECT id, n FROM t;", &keys),
+            "the checkpoint after attempt {attempt} changed the table"
+        );
+    }
+
+    d.sql("UPDATE t SET b = 'narrow' WHERE id = 2;");
+    d.sql("ALTER TABLE t ALTER COLUMN n TYPE BIGINT;");
+    assert_eq!(d.shape("t")[1], ("n".to_string(), DataType::BigInt));
+    assert_eq!(d.rows("SELECT id, n FROM t;").unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The guard must not fire when it should not
 // ---------------------------------------------------------------------------------------------
 
@@ -608,6 +763,218 @@ fn an_unlogged_update_too_large_for_any_page_refuses_instead_of_deleting_the_row
         heap.scan().map(|r| r.unwrap()).map(|(rid, t)| (rid, t.data)).collect();
     assert_eq!(before, after, "a REFUSED unlogged update destroyed the row it could not grow ({err})");
     assert!(heap.read(rid).is_ok(), "the row's slot was deleted by an update that reported failure");
+}
+
+/// **The table region being full is an ordinary end-state, and a refused ALTER must survive it.**
+///
+/// Found by a fresh-context adversarial pass against the first version of this fix, and confirmed by
+/// an independent skeptic that reproduced it from its own fixture with two controls. The row-width
+/// precheck is not enough on its own: it answers "can any page hold this tuple", and a relocation
+/// also needs there to *be* a page. `DiskManager::allocate` refuses once the region below the
+/// copy-on-write arena floor is full, and that floor is set to `high_water + DEFAULT_ARENA_HEADROOM`
+/// (32736 pages, ~128 MB) when the database is created and cannot be moved afterwards — so every
+/// database has this end-state, and the allocator's own message for it is "the table region is
+/// full". Under the old delete-then-insert order the measured result was row 1 gone, the primary
+/// index still pointing at its deleted slot, and all of it surviving checkpoint, flush and a reopen.
+///
+/// The fixture packs one data page exactly, so **every** row has to relocate when the column is
+/// appended, and then closes the allocator. Two things are asserted, in this order: the same ALTER
+/// on the same heap with the allocator open must SUCCEED and carry all rows (otherwise the fixture
+/// is measuring a shape the ALTER cannot do anyway), and with the allocator closed it must be
+/// refused and change nothing.
+#[test]
+fn a_refused_alter_changes_nothing_when_the_page_allocator_is_exhausted() {
+    // A tuple of 24 header + 1 bitmap + 3 pad + 4 id + 2 + 60 = 94 bytes, so 41 of them plus their
+    // slot entries occupy 4018 of a page's 4073 usable bytes and the 42nd would not fit. The
+    // appended column costs 2 bytes, which the 55 that are left cannot absorb in place.
+    const ROWS: i32 = 41;
+    let pad = "y".repeat(60);
+    let select = "SELECT id, v FROM t;";
+    let keys: Vec<Value> = (1..=ROWS).map(Value::Integer).collect();
+
+    let fill = |d: &mut Db| {
+        d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(120));");
+        for i in 1..=ROWS {
+            d.sql(&format!("INSERT INTO t VALUES ({i}, '{pad}');"));
+        }
+        let pages: std::collections::BTreeSet<u32> =
+            d.heap("t").iter().map(|(rid, _)| rid.page_id).collect();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the fixture must pack exactly one data page or the rows need not relocate: {pages:?}"
+        );
+        assert_eq!(d.heap("t").len(), ROWS as usize);
+    };
+
+    // Control: with the allocator open, this exact ALTER works and every row survives it.
+    {
+        let mut d = db();
+        fill(&mut d);
+        d.sql("ALTER TABLE t ADD COLUMN w VARCHAR(10);");
+        assert_eq!(d.shape("t").len(), 3);
+        assert_eq!(
+            d.rows(select).unwrap().len(),
+            ROWS as usize,
+            "the control lost rows, so the fixture cannot tell exhaustion from an impossible ALTER"
+        );
+    }
+
+    // The real case: close the allocator by putting the arena floor at the high-water mark, which
+    // is what a database that has grown into its headroom looks like.
+    let (dir, before) = {
+        let mut d = db();
+        fill(&mut d);
+        let before = snapshot(&mut d, "t", select, &keys);
+
+        let floor = d.bp.disk_manager.high_water().unwrap();
+        d.bp.disk_manager.reserve_from(floor).unwrap();
+        assert!(
+            d.bp.new_page().is_err(),
+            "the fixture did not actually close the allocator, so it measures nothing"
+        );
+
+        let e = d
+            .try_sql("ALTER TABLE t ADD COLUMN w VARCHAR(10);")
+            .err()
+            .expect("an ALTER that cannot obtain a page must be refused");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("the reserved arena region at page"),
+            "refused for some other reason than the exhausted table region: {msg}"
+        );
+
+        let after = snapshot(&mut d, "t", select, &keys);
+        assert_eq!(
+            before, after,
+            "a REFUSED ALTER changed the table when the page allocator was exhausted ({e})"
+        );
+
+        d.txn.checkpoint().expect("checkpoint");
+        d.bp.flush_all().unwrap();
+        d.bp.disk_manager.sync().unwrap();
+        (d.dir, before)
+    };
+
+    let mut r = open_at(dir);
+    let after = snapshot(&mut r, "t", select, &keys);
+    assert_eq!(
+        before, after,
+        "the damage from a refused ALTER against an exhausted allocator survived a checkpoint, a \
+         flush and a reopen into a fresh buffer pool"
+    );
+}
+
+/// The same exhaustion, but arriving **part way through** the conversion.
+///
+/// The test above fails on its first row, so the reserve-before-delete order alone is enough there.
+/// This one leaves the page just enough slack for the first rows to be widened in place, so the
+/// allocator is not consulted until several tuples on disk are already in the new shape. Refusing at
+/// that point leaves rows of two shapes under one schema — the table reads back as wrong values or a
+/// panic, which is the harm the row-width precheck exists to prevent, arriving by another route.
+/// Only asking for the space **before** pass 2 starts prevents it, and that is what
+/// `reserve_free_space` is for.
+#[test]
+fn a_refused_alter_converts_nothing_when_the_allocator_dies_part_way() {
+    // 39 tuples of 94 bytes plus their slots leave 251 free bytes. Widening one in place costs 96
+    // of them (the grow branch of `Page::update` re-lays the tuple and abandons the old bytes), so
+    // the first two rows convert and the third has to relocate.
+    const ROWS: i32 = 39;
+    let pad = "y".repeat(60);
+    let select = "SELECT id, v FROM t;";
+    let keys: Vec<Value> = (1..=ROWS).map(Value::Integer).collect();
+
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v VARCHAR(120));");
+    for i in 1..=ROWS {
+        d.sql(&format!("INSERT INTO t VALUES ({i}, '{pad}');"));
+    }
+    let pages: std::collections::BTreeSet<u32> =
+        d.heap("t").iter().map(|(rid, _)| rid.page_id).collect();
+    assert_eq!(pages.len(), 1, "the fixture must pack one page: {pages:?}");
+
+    let before = snapshot(&mut d, "t", select, &keys);
+    let floor = d.bp.disk_manager.high_water().unwrap();
+    d.bp.disk_manager.reserve_from(floor).unwrap();
+    assert!(d.bp.new_page().is_err(), "the fixture did not close the allocator");
+
+    let e = d
+        .try_sql("ALTER TABLE t ADD COLUMN w VARCHAR(10);")
+        .err()
+        .expect("an ALTER that cannot obtain a page must be refused");
+
+    let after = snapshot(&mut d, "t", select, &keys);
+    assert_eq!(
+        before, after,
+        "a REFUSED ALTER left some rows converted and some not: rows of two shapes under one \
+         schema is what makes the table unreadable ({e})"
+    );
+}
+
+/// The heap-layer half of the exhaustion case, one level below any `ALTER`.
+///
+/// `update`'s relocation branch used to free the source slot and *then* look for a destination, so
+/// an allocator that had nothing left took the row with it. The `ALTER` above is one caller of that;
+/// this is the branch itself, on an unlogged heap where there is no undo record to fall back on.
+/// The tuple here is well under `MAX_TUPLE_SIZE`, so the size guard cannot be what saves it — the
+/// only thing that can is obtaining the destination before giving up the source.
+#[test]
+fn an_unlogged_update_that_cannot_obtain_a_page_refuses_instead_of_deleting_the_row() {
+    use ferrodb::catalog::column::Column;
+    use ferrodb::catalog::schema::Schema;
+    use ferrodb::storage::tuple::Tuple;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(dir.path().join("heap.db"))
+        .unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let _catalog = Catalog::create(bp.clone()).unwrap();
+    let heap = HeapFileManager::new(bp.clone()).unwrap();
+    let schema = Schema::new(vec![
+        Column::new("id".to_string(), DataType::Integer, false),
+        Column::new("v".to_string(), DataType::Varchar(120), true),
+    ]);
+
+    // Pack one page, so the row that grows cannot stay where it is.
+    let mut rids = Vec::new();
+    let pad = "y".repeat(60);
+    for i in 1..=41 {
+        let t = Tuple::serialize(&[Value::Integer(i), Value::Varchar(pad.clone())], &schema, 1).unwrap();
+        rids.push(heap.insert(t).unwrap());
+    }
+    let pages: std::collections::BTreeSet<u32> = rids.iter().map(|r| r.page_id).collect();
+    assert_eq!(pages.len(), 1, "the fixture must pack exactly one page: {pages:?}");
+
+    // Close the allocator: this is a database that has grown into its arena headroom.
+    let floor = bp.disk_manager.high_water().unwrap();
+    bp.disk_manager.reserve_from(floor).unwrap();
+    assert!(bp.new_page().is_err(), "the fixture did not close the allocator");
+
+    let before: Vec<(RecordId, Vec<u8>)> =
+        heap.scan().map(|r| r.unwrap()).map(|(rid, t)| (rid, t.data)).collect();
+    let grown = Tuple::serialize(
+        &[Value::Integer(1), Value::Varchar("y".repeat(70))],
+        &schema,
+        1,
+    )
+    .unwrap();
+    assert!(
+        grown.data.len() < MAX_TUPLE_SIZE,
+        "the tuple must be one a page could hold, or the size guard is what refuses it"
+    );
+    let err = heap.update(rids[0], grown).err().expect("no page to relocate into must be refused");
+
+    let after: Vec<(RecordId, Vec<u8>)> =
+        heap.scan().map(|r| r.unwrap()).map(|(rid, t)| (rid, t.data)).collect();
+    assert_eq!(
+        before, after,
+        "a REFUSED unlogged update destroyed the row it could not relocate ({err})"
+    );
+    assert!(heap.read(rids[0]).is_ok(), "the row's slot was deleted by an update that failed");
 }
 
 /// `MAX_TUPLE_SIZE` is the number the precheck refuses against, and the precheck is only correct if
