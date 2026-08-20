@@ -312,10 +312,17 @@ fn server_epitaph(child: &mut Child) -> String {
     if status.is_none() {
         let _ = child.kill();
     }
-    let mut err = String::new();
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
+    // A pipe can only be drained once, so this is single-use per child by construction. Saying so
+    // beats printing an empty section, which reads as "the server said nothing on the way out" —
+    // the exact wrong conclusion for whoever is reading the second epitaph.
+    let err = match child.stderr.take() {
+        Some(mut e) => {
+            let mut err = String::new();
+            let _ = e.read_to_string(&mut err);
+            err
+        }
+        None => "(already drained by an earlier epitaph on this server)".to_string(),
+    };
     let _ = child.wait();
     match status {
         Some(st) => format!("The server had ALREADY EXITED ({st:?}).\n--- its stderr ---\n{err}"),
@@ -420,11 +427,10 @@ fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
         if let Some(st) = child.try_wait().expect("query the server") {
-            let mut err = String::new();
-            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
             panic!(
                 "the server died ({st:?}) because its stdout pipe was closed. A closed log pipe \
-                 must not be fatal to a server that is otherwise healthy.\nstderr: {err}"
+                 must not be fatal to a server that is otherwise healthy. {}",
+                server_epitaph(&mut child)
             );
         }
     }

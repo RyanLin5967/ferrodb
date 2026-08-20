@@ -117,9 +117,17 @@ fn main() {
     // - **Written to a sibling path and renamed.** `rename` is atomic within a directory, so a
     //   reader polling for the file sees either nothing or a complete address, never a half-written
     //   line it would then parse into the wrong port.
-    // - **A failed publish is a hard exit.** Carrying on would leave the harness waiting on an
-    //   address that is never coming, so it would spend its entire timeout and then report the
-    //   wrong cause - which is the failure mode that made this bug take six lanes to place.
+    // - **A failed publish is a hard exit - but it drops the database lock on the way out.**
+    //   Carrying on would leave the harness waiting on an address that is never coming, so it would
+    //   spend its entire timeout and then report the wrong cause, which is the failure mode that
+    //   made this bug take six lanes to place. `std::process::exit` runs no destructors, though, and
+    //   `_db_lock` releases only by dropping: exiting straight from here leaves `<db>.lock` behind,
+    //   and `DbLock` refuses a stale lock BY DESIGN rather than reclaiming it - so every later open
+    //   of that database, by any binary, is refused until somebody deletes the file by hand.
+    //   Measured, not reasoned: without the `drop` below, a publish to a non-existent directory left
+    //   `x.db.lock` holding pid 52237 and the next open was refused by a process that no longer
+    //   existed. Note the `bind` above `.expect()`s, which unwinds and therefore does release it;
+    //   this `drop` is what keeps the two failure paths agreeing.
     if let Some(path) = std::env::var_os("FERRODB_LISTEN_FILE") {
         let path = std::path::PathBuf::from(path);
         let tmp = path.with_file_name(format!(
@@ -127,15 +135,16 @@ fn main() {
             path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
         ));
         let bound = listener.local_addr().expect("local_addr of a bound listener");
-        std::fs::write(&tmp, format!("{bound}\n"))
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "cdc_server: bound {bound} but could not publish it to {}: {e}",
-                    path.display()
-                );
-                std::process::exit(1);
-            });
+        if let Err(e) =
+            std::fs::write(&tmp, format!("{bound}\n")).and_then(|()| std::fs::rename(&tmp, &path))
+        {
+            eprintln!(
+                "cdc_server: bound {bound} but could not publish it to {}: {e}",
+                path.display()
+            );
+            drop(_db_lock);
+            std::process::exit(1);
+        }
     }
     // **Writes that tolerate a closed pipe.** `println!` PANICS on EPIPE — proven, not assumed:
     // closing this process's stdout before its first write kills it with
