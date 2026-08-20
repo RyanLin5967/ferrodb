@@ -75,6 +75,7 @@ use crate::error::FerroError;
 use crate::parser::parser::AlterAction;
 use crate::provenance::ProvenanceStore;
 use crate::storage::heap_file_manager::{HeapFileManager, RecordId};
+use crate::storage::heap_page::MAX_TUPLE_SIZE;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::tuple::{Tuple, VERSION_HEADER_SIZE};
 use crate::wal::txn::TxnManager;
@@ -400,8 +401,9 @@ impl Catalog {
                 // every recorded `Op`, `Guard` and merge-policy key holds. The parser refuses any
                 // positional placement for the same reason.
                 let width = old_schema.columns.len();
-                rewrite_heap(
+                let (_, primary_root_now) = rewrite_heap(
                     &self.buffer_pool,
+                    table,
                     dir_root,
                     primary_root,
                     &old_schema,
@@ -413,7 +415,7 @@ impl Catalog {
                         Ok(())
                     },
                 )?;
-                self.finish(table, new_schema)
+                self.finish(table, new_schema, primary_root_now)
             }
 
             AlterAction::RetypeColumn { column, to } => {
@@ -432,8 +434,9 @@ impl Catalog {
                     ))
                 })?;
 
-                rewrite_heap(
+                let (_, primary_root_now) = rewrite_heap(
                     &self.buffer_pool,
+                    table,
                     dir_root,
                     primary_root,
                     &old_schema,
@@ -464,7 +467,7 @@ impl Catalog {
                 // *used* to have, and `Update` leaves the old entry in place for exactly that
                 // reason. Rebuilding from the live heap silently threw that away.
                 let _ = (idx, &indexes);
-                self.finish(table, new_schema)
+                self.finish(table, new_schema, primary_root_now)
             }
         }
     }
@@ -491,10 +494,16 @@ impl Catalog {
     ///   they are the same values in the new type rather than an estimate of them.
     ///
     /// A table with no statistics to begin with still has none afterwards.
+    ///
+    /// `primary_root_now` is the primary index's root as [`rewrite_heap`] left it. It is written
+    /// back here, in the same `persist` as the schema, rather than through
+    /// [`Catalog::update_primary_root`] — two persists would be two chances to store one half of an
+    /// alteration.
     fn finish(
         &mut self,
         table: &str,
         new_schema: Schema,
+        primary_root_now: u32,
     ) -> Result<Vec<ColumnShape>, FerroError> {
         let old_len = self.tables.get(table).map(|e| e.schema.columns.len()).unwrap_or(0);
         let widened: Vec<Option<Widening>> = {
@@ -530,6 +539,7 @@ impl Catalog {
         }
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.schema = new_schema;
+        entry.primary_index_root = primary_root_now;
         let shape = shape_of(&entry.schema);
         self.persist()?;
         Ok(shape)
@@ -538,10 +548,57 @@ impl Catalog {
 
 /// Re-serialize every tuple of a heap under a new schema.
 ///
-/// Returns how many tuples were rewritten. The transform is handed the row's values decoded
-/// against the OLD schema and must leave them matching the NEW one.
+/// Returns how many tuples were rewritten and the primary index's root **as it stands afterwards**.
+/// The transform is handed the row's values decoded against the OLD schema and must leave them
+/// matching the NEW one.
 ///
-/// Two things about the order of operations are load-bearing:
+/// # Nothing is written until every row is known to be writable
+///
+/// The function runs in two passes, and the split is the whole safety argument rather than an
+/// optimisation. Pass 1 reads every tuple, converts it and serializes it — producing exactly the
+/// bytes pass 2 will lay down — and writes nothing at all. Every failure that depends on the data
+/// therefore lands while the heap is still untouched:
+///
+/// - a tuple too short to hold a version header, or one that does not decode under the old schema;
+/// - a stored value whose type disagrees with the column that declares it, which [`Widening::apply`]
+///   reports as corruption;
+/// - a converted row that [`Tuple::serialize`] refuses;
+/// - **a converted row too wide for any page**, which is the one this function was rewritten for.
+///   `INTEGER -> BIGINT` moves the retyped column to an eight-byte boundary and shifts every column
+///   after it, and an appended column costs at least two bytes plus whatever the null bitmap grows
+///   by, so an ordinary row a few bytes under the limit goes over it. Measured: a 22-column table of
+///   `VARCHAR(200)`s, nothing oversized anywhere.
+///
+/// # Why that is a refusal and not a rollback
+///
+/// Because a rollback here cannot be made to mean anything. The rewrite is deliberately unlogged —
+/// [`HeapFileManager::open`] leaves `txn: None`, and the module header explains why the alter is a
+/// direct heap mutation rather than a logged one — so there is no undo record, no CLR, and nothing
+/// for `recover` to read. An undo would have to be a *second* unlogged mutation, replayed from an
+/// in-memory list of the old tuples, whose own failure would have no repair at all; and it would
+/// have to be crash-atomic to be worth writing, because a process that dies part-way through the
+/// undo leaves precisely the state the undo existed to prevent, with nothing on disk saying an undo
+/// was in progress. Deciding before the first write needs none of that: "refused" and "unchanged"
+/// are the same state rather than two states that have to be reconciled afterwards.
+///
+/// It is also the only answer that is honest about `Catalog::finish`. `finish` installs the new
+/// schema and runs only on success, so a rewrite that gets half way and returns `Err` leaves rows
+/// on disk in the NEW shape under the OLD catalog — a table that reads back as a panic in
+/// `Tuple::deserialize`, or as plausible wrong numbers, and stays that way across a checkpoint and
+/// a reopen. That, and not the lost row alone, is what made this the most serious defect in B11.
+///
+/// # What the precheck does not cover, stated here rather than implied
+///
+/// Pass 2 is not infallible; it is free of every failure the *data* can cause. What is left is
+/// environmental — a buffer pool with no evictable frame, a disk write that fails, a B+tree page
+/// that cannot be read — and one data-dependent case that is unreachable rather than handled: the
+/// per-page provenance dictionary is capped at `MAX_PAGE_DICT_ENTRIES` (255) distinct runs, while
+/// the page it belongs to has room for on the order of 135 tuples, so re-stamping the rows that
+/// moved cannot fill it. `attribute` is read-only and has been moved into pass 1 for the same
+/// reason. If any of those does fire, the outcome is the half-rewritten heap described above; the
+/// answer to that is to log the rewrite, which is a larger change than this one.
+///
+/// # Two things about the order of operations are load-bearing
 ///
 /// 1. **Every tuple is read before any tuple is written.** `HeapFileManager::update` relocates a
 ///    tuple that no longer fits its page into a different page — possibly one the scan has not
@@ -553,17 +610,35 @@ impl Catalog {
 ///    written under the old shape. See the module header for why nothing can still want it.
 fn rewrite_heap(
     bp: &Arc<BufferPoolManager>,
+    table: &str,
     dir_root: u32,
     primary_root: u32,
     old: &Schema,
     new: &Schema,
     prov: Option<&Arc<dyn ProvenanceStore>>,
     transform: impl Fn(&mut Vec<Value>) -> Result<(), FerroError>,
-) -> Result<usize, FerroError> {
+) -> Result<(usize, u32), FerroError> {
     let heap = HeapFileManager::open(dir_root, bp.clone());
 
-    // Pass 1: read everything. `(rid, header bytes, values)`.
-    let mut rows: Vec<(RecordId, [u8; VERSION_HEADER_SIZE], Vec<Value>)> = Vec::new();
+    /// One row, converted and serialized, waiting to be written.
+    ///
+    /// `key` is the row's primary key value read BEFORE the transform, which is what the index
+    /// holds. `prov` is its attribution, read here rather than after the move so that pass 2 makes
+    /// no fallible read of its own.
+    struct Prepared {
+        rid: RecordId,
+        key: Option<Value>,
+        prov: Option<crate::provenance::ProvId>,
+        tuple: Tuple,
+    }
+
+    // Pass 1: read, convert, serialize. No write of any kind.
+    //
+    // This holds the whole table's converted tuples in memory, which the previous version of this
+    // function did too — it held every row's decoded `Vec<Value>`, and the packed bytes are the
+    // smaller of the two representations for every type in this database.
+    let mut prepared: Vec<Prepared> = Vec::new();
+    let mut too_wide: Vec<(RecordId, Option<Value>, usize)> = Vec::new();
     for item in heap.scan() {
         let (rid, tuple) = item?;
         if tuple.data.len() < VERSION_HEADER_SIZE {
@@ -574,20 +649,48 @@ fn rewrite_heap(
         }
         let mut header = [0u8; VERSION_HEADER_SIZE];
         header.copy_from_slice(&tuple.data[..VERSION_HEADER_SIZE]);
-        rows.push((rid, header, tuple.deserialize(old)?));
-    }
-
-    // Pass 2: write everything.
-    let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
-    let mut rewritten = 0usize;
-    for (rid, header, mut values) in rows {
+        let mut values = tuple.deserialize(old)?;
         let key = values.first().cloned();
         transform(&mut values)?;
-        let mut tuple = Tuple::serialize(&values, new, 0)?;
+        let mut converted = Tuple::serialize(&values, new, 0)?;
         // begin_ts and end_ts exactly as they were; prev deliberately cleared.
-        tuple.data[..16].copy_from_slice(&header[..16]);
-        tuple.data[16..VERSION_HEADER_SIZE].fill(0);
+        converted.data[..16].copy_from_slice(&header[..16]);
+        converted.data[16..VERSION_HEADER_SIZE].fill(0);
+        if converted.data.len() > MAX_TUPLE_SIZE {
+            too_wide.push((rid, key.clone(), converted.data.len()));
+        }
+        let attribution = match prov {
+            Some(store) => {
+                let who = store.attribute(rid)?;
+                if who.is_none() { None } else { Some(who) }
+            }
+            None => None,
+        };
+        prepared.push(Prepared { rid, key, prov: attribution, tuple: converted });
+    }
 
+    if let Some((rid, key, widest)) = too_wide.iter().max_by_key(|(_, _, n)| *n) {
+        let which = match key {
+            Some(k) => format!("the row whose first column is {k:?}"),
+            None => format!("the row in heap slot {rid:?}"),
+        };
+        return Err(FerroError::Constraint(format!(
+            "this ALTER would widen {} of the {} row(s) in '{table}' past the {MAX_TUPLE_SIZE} \
+             bytes a tuple can occupy: {which} would become {widest} bytes. Nothing has been \
+             written — the rewrite converts the heap in place and is not logged, so it is refused \
+             before the first tuple moves rather than abandoned part way through, which would \
+             leave rows in the new shape under the old schema. Narrow the row first (shorten an \
+             oversized VARCHAR with UPDATE, or move the wide column into its own table) and run \
+             the ALTER again.",
+            too_wide.len(),
+            prepared.len(),
+        )));
+    }
+
+    // Pass 2: write. Every remaining failure is environmental; see the note above.
+    let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
+    let mut rewritten = 0usize;
+    for Prepared { rid, key, prov: attribution, tuple } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
             // The row moved pages. The primary index is the only structure that stores a
@@ -604,26 +707,30 @@ fn rewrite_heap(
             // Provenance is keyed by `RecordId` too (a page-local dictionary slot). Without this
             // the answer to "which agent wrote this row" silently becomes "nobody" for every row
             // the rewrite happened to move.
-            if let Some(store) = prov {
-                let who = store.attribute(rid)?;
-                if !who.is_none() {
-                    store.stamp(new_rid, who)?;
-                }
+            if let (Some(store), Some(who)) = (prov, attribution) {
+                store.stamp(new_rid, who)?;
             }
         }
         rewritten += 1;
     }
 
-    // A split during the repointing above can move the tree's root. `create_index` and
-    // `sync_roots` both do this; a rewrite that forgot it would leave the catalog pointing at an
-    // interior page and every lookup after the next restart would start from the wrong node.
+    // A split during the repointing above can move the tree's root, and the caller records it.
+    //
+    // **This used to be a refusal, and a refusal was the wrong answer.** The observation behind it
+    // is right — the catalog holds the root page id, and a root that is not written back leaves the
+    // next open reading an interior page — but it ran after the entire heap had been rewritten, so
+    // returning `Err` there was one more way for a "refused" ALTER to leave the table converted
+    // under its old schema. A moved root is not an error in the first place: it is what a B+tree
+    // does, and `create_index` and `sync_roots` both simply record the new one. So it is recorded,
+    // in the same `persist` that installs the schema.
+    //
+    // Honest about reachability: no shape tried moved it. The rewrite deletes a key and immediately
+    // re-inserts the same key, so the tree's key set is identical when it finishes, and the root
+    // stayed put at 300 rows x 1300 bytes, 600 x 600 and 1200 x 60 — every row relocating, every
+    // lookup still answering. This is therefore a latent path closed by reasoning rather than a
+    // measured failure, and it is closed the way `create_index` already closes it rather than by
+    // inventing a rule for it.
     let root_now = primary.root_page_id.load(Ordering::Relaxed);
-    if root_now != primary_root {
-        return Err(FerroError::Internal(format!(
-            "the primary index root moved from {primary_root} to {root_now} during an ALTER; \
-             the catalog entry would be stale"
-        )));
-    }
-    Ok(rewritten)
+    Ok((rewritten, root_now))
 }
 

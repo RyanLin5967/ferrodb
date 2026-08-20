@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, heap_scanner::HeapScanner, page_directory::PageDirectory, tuple::Tuple}, wal::txn::TxnManager};
-use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE};
+use crate::storage::heap_page::{SLOT_ENTRY_SIZE, HEADER_SIZE, MAX_TUPLE_SIZE};
 use crate::storage::disk_manager::PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -97,6 +97,33 @@ impl HeapFileManager {
                 return Ok(record_id)
             },
             Err(FerroError::NotEnoughSpace) => {
+                // **Decided here, while the row is still on its page.**
+                //
+                // The relocation below deletes the slot and unpins the page DIRTY before the
+                // insert that is supposed to replace it, so past `page.delete` the row exists
+                // nowhere: if the insert then fails, the `?` unwinds with the row already gone and
+                // no caller can tell that from an update that simply did not happen. `insert`
+                // allocates a fresh page when no existing one has room, and a fresh page holds any
+                // tuple up to `MAX_TUPLE_SIZE`, so the one way it can fail on the data is a tuple
+                // no page can ever hold — and that is decidable before touching anything.
+                //
+                // This is not redundant with the caller's own checks. A logged update survives the
+                // old behaviour by accident: the delete is a WAL record, so the statement's abort
+                // undoes it. Every caller that opens a heap through `HeapFileManager::open` gets
+                // `txn: None` — `catalog::alter::rewrite_heap` is one — and for those there is no
+                // undo record and no recovery: the row is simply gone. Measured before this guard
+                // existed: an unlogged `update` with a 4124-byte tuple took the heap from one live
+                // tuple to zero and left the slot reading `SlotDeleted`.
+                //
+                // Reordering the delete after the insert was the alternative and it is worse: the
+                // insert needs the frame lock this function is holding (deadlock unless the lock is
+                // dropped and the page re-fetched), and it changes the order of the WAL records a
+                // logged update writes, which is the order recovery's undo path reads them in.
+                if new_bytes.len() > MAX_TUPLE_SIZE {
+                    drop(frame);
+                    self.buffer_pool_manager.unpin_page(record_id.page_id, false);
+                    return Err(FerroError::NotEnoughSpace);
+                }
                 page.delete(record_id.slot_num as usize)?;
                 if let Some(txn) = &self.txn {
                     let lsn = txn.log_delete(self.txn_id, self.first_directory_page_id, record_id.page_id, record_id.slot_num, &old_bytes)?;
