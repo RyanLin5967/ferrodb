@@ -837,7 +837,7 @@ impl AgentRuntime {
                 &matched,
                 where_clause.as_ref(),
                 bound_where.as_ref(),
-            );
+            )?;
         }
 
         let mut out = Vec::with_capacity(matched.len());
@@ -865,11 +865,34 @@ impl AgentRuntime {
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
-    ) {
+    ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
+        // **A read whose session is gone REFUSES; it does not report success while retaining
+        // nothing.**
+        //
+        // This was the reachable half of a pair of sequential guards, and the one that got hardened
+        // was the unreachable half: `entry().or_insert_with` below covers a missing *capture*, which
+        // there is no site to produce, while this arm covers a missing *workspace*, which any
+        // connection can produce on demand. Workspace-absent is exactly branch-sealed — `seal`
+        // removes it — and `ABANDON BRANCH b_2` from a second connection seals a live session's
+        // branch by name.
+        //
+        // Measured before this: connection 1 opened a session, connection 2 abandoned its branch,
+        // and connection 1's `SELECT ... WHERE qty >= 20 AND qty < 50` returned `Ok` with two rows
+        // while its retention went on the floor; `REVERT MERGE m_1` then came back unblocked. The
+        // rest of that session's surface already refuses — its next write fails with `no agent
+        // session on branch` and its `MERGE` fails with `has been reaped` — so the read reporting
+        // success was the one operation still lying about it.
         let (txn, prov) = match state.workspaces.get(&reader.id) {
             Some(ws) => (ws.txn, ws.prov),
-            None => return,
+            None => {
+                return Err(FerroError::Branch(format!(
+                    "no agent session on branch {reader}: this read cannot be retained, and a read \
+                     that reports success while retaining nothing is indistinguishable from one \
+                     that had nothing to retain. The branch was sealed — merged, abandoned or \
+                     reaped — while this session still held it."
+                )))
+            }
         };
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
         // real observation rather than a null: `state.versions` is written only when a merge
@@ -913,6 +936,7 @@ impl AgentRuntime {
             .entry(txn.0)
             .or_insert_with(|| TxnCapture::new(txn, prov, reader))
             .on_read(shape, versions, Some(summary), observed_at);
+        Ok(())
     }
 
     // ---- writes on a branch ----------------------------------------------------------------
