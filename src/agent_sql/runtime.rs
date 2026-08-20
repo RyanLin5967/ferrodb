@@ -2479,9 +2479,21 @@ impl AgentRuntime {
         // Not reachable through today's server, which serves one connection at a time
         // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
         // numbering is unchanged: the same ops, in the same order, get the same sequence values.
+        //
+        // **And the reservation is checked for freshness against an INDEPENDENT record before the
+        // publish transaction opens.** The invariant that matters is the one the assertion in
+        // `record_applied` describes and cannot test: no two versions ever share a `begin_ts`. That
+        // assertion compares the reservation to a re-count of the same `rows` list the stamping loop
+        // walks, so both sides are the same sum and no input can falsify it. `State::applied` can:
+        // it is appended to once per stamped version, never pruned, and written by nobody but the
+        // stamping loop, so it answers "has this number been handed out" without consulting the
+        // arithmetic that produced the number. Refused here rather than asserted after `commit`,
+        // because here the rows are not yet visible and a refusal is still a clean one.
         let reserved: std::ops::Range<u64> = {
             let mut state = self.state.lock().unwrap();
             let base = state.apply_seq;
+            fresh_reservation(highest_applied_seq(&state.applied), base)
+                .map_err(FerroError::Merge)?;
             state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
             base..state.apply_seq
         };
@@ -2721,17 +2733,26 @@ impl AgentRuntime {
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
         // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
         // does not borrow-check.
-        // The range `merge` reserved must be exactly the versions consumed here, and the comparison
-        // has to be against the RESERVATION rather than against a re-count of `rows` — the first
-        // version of this assertion re-derived the expected value from `rows`, the same list the loop
-        // above walks, so it compared the loop to itself and would have passed however few versions
-        // `merge` had actually set aside. A fire-check caught that: shortening the reservation left
-        // the assertion green, and only a behavioural test noticed.
+        // **What this assertion is, stated honestly, because it was oversold.** Both sides are the
+        // same sum over the same `&[RowMergeOutcome]`: `reserved.end - reserved.start` is
+        // `rows.iter().map(|r| r.applied.len()).sum()` from the one call site, and
+        // `next_seq - reserved.start` counts iterations of the loop above over that same list, which
+        // nothing mutates in between and which has no interior mutability. So **no input can
+        // falsify it** — it is a structural invariant written as a runtime check, and it earns its
+        // place only as a tripwire on a future edit that changes one of the two expressions without
+        // the other. It is also a `debug_assert`, so it is absent from release builds.
         //
-        // Consuming past the reservation means this merge is stamping `begin_ts` values the next
-        // merge will hand out again, and two versions sharing a `begin_ts` mis-answer every
-        // visibility comparison downstream — including the one that decides whether a scan depended
-        // on a write.
+        // ITS BLIND SPOTS, both measured:
+        //  * it is silent when a merge stamps N versions and publishes fewer rows — the reservation
+        //    counts OPS while the publish loop iterates ROWS, and a two-column UPDATE reserves two
+        //    slots for one published row, so the two quantities are genuinely different and this
+        //    comparison is not between them;
+        //  * it never runs at all when the publish fails, because `record_applied` is not reached.
+        //
+        // The property its old comment claimed — that no two versions share a `begin_ts` — is
+        // guarded by `fresh_reservation` in `publish_evaluation_as`, against `State::applied`
+        // rather than against a re-count of this loop's own list, and it refuses before publishing
+        // rather than asserting afterwards.
         debug_assert_eq!(
             next_seq, reserved.end,
             "merge reserved versions {:?} but record_applied consumed {} of them",
@@ -3395,6 +3416,45 @@ fn blind_writes_of(
         .collect()
 }
 
+/// The highest version sequence any merge has already handed out, read from the record of what was
+/// applied rather than from the counter that produced it.
+///
+/// `State::applied` is the independent record: appended to once per stamped version, never pruned,
+/// and written by nobody but `record_applied`'s stamping loop. Asking it means the freshness check
+/// does not consult `apply_seq`, which is the arithmetic under suspicion — the check this replaced
+/// compared the reservation to a re-count of the SAME list the stamping loop walks, so no input
+/// could falsify it.
+///
+/// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
+/// final element is not necessarily the largest. One pass per merge, the same order of cost
+/// `undo_txn` already pays per revert over the same vector.
+fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
+    applied.iter().map(|a| a.seq).max()
+}
+
+/// Refuse a reservation that would re-issue a version sequence already handed out.
+///
+/// `record_applied` stamps `base + 1 ..= base + n`, so freshness is exactly `base >= highest`.
+///
+/// Two versions sharing a `begin_ts` mis-answer every visibility comparison downstream, including
+/// `DependencyGraphBuilder::build`'s `begin_ts < observed_at` — which is the rule that decides
+/// whether a scan depended on a write, and therefore the whole of exit criterion 10. A reservation
+/// that STARTS above the high water mark is fine and is not refused: a range leaked by a failed
+/// publication only ever shifts later versions upward, which over-reports rather than corrupts.
+fn fresh_reservation(highest: Option<u64>, base: u64) -> Result<(), String> {
+    match highest {
+        Some(h) if base < h => Err(format!(
+            "refusing to publish: this merge would stamp version sequences from {} while {} has \
+             already been handed out. Two versions sharing a begin_ts mis-answer every visibility \
+             comparison downstream, including the one that decides whether a scan depended on a \
+             write.",
+            base + 1,
+            h
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Why a read was taken, which is what decides whether it counts as an INSPECTION.
 ///
 /// **Causality and inspection are different questions, and this is the one place they part.** Both
@@ -3866,5 +3926,62 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
             }
         }
         _ => AccessShape::FullScan,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied_at(seq: u64) -> AppliedOp {
+        AppliedOp {
+            seq,
+            txn: TxnId(1),
+            table: "inventory".into(),
+            tbl: TableId(1),
+            row: RowId(1),
+            col: None,
+            kind: OpKind::RowDelete,
+            before: None,
+            before_row: None,
+        }
+    }
+
+    /// **The guard has to be able to REFUSE**, which the `debug_assert` it stands behind cannot:
+    /// both of that assertion's sides are the same sum over the same list, so no input falsifies it.
+    /// This one is answerable from the record of what was applied, and here is an input it refuses.
+    #[test]
+    fn a_reservation_that_would_re_issue_a_version_sequence_is_refused() {
+        let applied = vec![applied_at(1), applied_at(3), applied_at(2)];
+        // `max`, not `last` — a broken invariant is exactly when the order stops holding.
+        assert_eq!(highest_applied_seq(&applied), Some(3));
+
+        // `record_applied` stamps `base + 1 ..= base + n`, so a base of 2 re-issues 3.
+        let err = fresh_reservation(Some(3), 2).expect_err("re-issuing version 3 was allowed");
+        assert!(err.contains("already been handed out"), "{err}");
+        assert!(err.contains("begin_ts"), "the refusal does not say what breaks: {err}");
+        assert!(err.contains('3'), "the refusal does not name the sequence: {err}");
+
+        // And the shape the reservation arithmetic actually produces when it goes wrong: a merge
+        // that reserved for one row and stamped three leaves `apply_seq` two behind, so the NEXT
+        // merge's base is below the high water mark.
+        assert!(fresh_reservation(Some(3), 1).is_err(), "a base two behind was allowed");
+        assert!(fresh_reservation(Some(1), 0).is_err(), "a base one behind was allowed");
+    }
+
+    /// Anti-vacuity: a guard that refused every merge would satisfy the test above completely.
+    #[test]
+    fn the_ordinary_reservation_and_a_leaked_range_are_both_allowed() {
+        assert!(highest_applied_seq(&[]).is_none(), "a database where nothing has been applied");
+        assert!(fresh_reservation(None, 0).is_ok(), "the first merge of a fresh database");
+        assert!(
+            fresh_reservation(Some(3), 3).is_ok(),
+            "the ordinary case: the next fresh sequence is 4"
+        );
+        assert!(
+            fresh_reservation(Some(3), 9).is_ok(),
+            "a range leaked by a failed publication only shifts later versions upward, which \
+             over-reports rather than corrupts, so it must not be refused"
+        );
     }
 }

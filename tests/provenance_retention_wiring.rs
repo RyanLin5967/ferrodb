@@ -500,3 +500,65 @@ fn an_abandoned_tasks_scan_stops_blocking_the_revert_it_never_depended_on() {
     );
     assert!(!db.has_row(7), "and an unblocked revert actually reverts");
 }
+
+// ---- the version clock across sequential merges -------------------------------------------------
+
+/// **Two sequential merges, the FIRST publishing more than one version.** This is the workload that
+/// makes the reservation arithmetic observable, and nothing covered it: the multi-row test in
+/// `provenance_scan_cascade.rs` has no second merge after the multi-version one, so a reservation
+/// that came out short left `apply_seq` behind the high water mark with no later merge to notice.
+///
+/// Everything here must simply work — both merges land and the causal answers are exact. Its second
+/// job is to be the workload the freshness guard in `publish_evaluation_as` is measured against:
+/// with the reservation shortened to one row, the second merge is refused naming the sequence
+/// instead of silently re-issuing it.
+#[test]
+fn a_multi_version_merge_followed_by_another_merge_keeps_its_causal_answers_exact() {
+    let mut db = Db::new();
+    db.seed();
+
+    // (a) stocker publishes TWO versions in one merge. txn 1.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'stocker' RUN 'r_stock';", &mut a);
+    db.ok("INSERT INTO inventory VALUES (7, 30);", &mut a);
+    db.ok("INSERT INTO inventory VALUES (8, 45);", &mut a);
+    let m_a = report(db.ok("MERGE;", &mut a));
+    assert!(m_a.applied_to_target, "{}", m_a);
+    assert_eq!(m_a.rows.len(), 2, "the first merge must publish two rows: {}", m_a);
+
+    // (b) mid reads the range, then publishes into it, and merges SECOND. txn 2.
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'mid' RUN 'r_mid';", &mut b);
+    let seen = rows(db.ok("SELECT id, qty FROM inventory WHERE qty >= 20 AND qty < 50;", &mut b));
+    assert_eq!(seen.len(), 3, "rows 1, 7 and 8 are in [20, 50): {seen:?}");
+    db.ok("INSERT INTO inventory VALUES (9, 25);", &mut b);
+    let m_b = report(db.ok("MERGE;", &mut b));
+    assert!(m_b.applied_to_target, "{}", m_b);
+
+    // (c) late reads the range after both merges. txn 3.
+    let mut c = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'late' RUN 'r_late';", &mut c);
+    let seen = rows(db.ok("SELECT id, qty FROM inventory WHERE qty >= 20 AND qty < 50;", &mut c));
+    assert_eq!(seen.len(), 4, "rows 1, 7, 8 and 9 are in [20, 50): {seen:?}");
+
+    let mut main = db.session();
+    let a_halted = plan(db.ok(&format!("REVERT MERGE {};", m_a.merge_id), &mut main));
+    let mut named = a_halted.blocked_by.clone();
+    named.sort();
+    assert_eq!(
+        named,
+        vec![TxnId(2), TxnId(3)],
+        "both readers scanned after the two-version merge, got {:?}",
+        a_halted.blocked_by
+    );
+
+    // The anti-vacuity half: `mid` merged BEFORE `late` read and AFTER `mid` itself read, so
+    // reverting `mid` names exactly `late` — one name, not both, and not zero.
+    let b_halted = plan(db.ok(&format!("REVERT MERGE {};", m_b.merge_id), &mut main));
+    assert_eq!(
+        b_halted.blocked_by,
+        vec![TxnId(3)],
+        "only the reader that scanned after mid's merge depends on it, got {:?}",
+        b_halted.blocked_by
+    );
+}
