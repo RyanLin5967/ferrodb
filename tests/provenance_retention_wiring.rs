@@ -21,6 +21,7 @@ use std::sync::Arc;
 use ferrodb::agent_sql::dispatch::AgentOutput;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::agent_sql::MergeReport;
+use ferrodb::branch::types::BranchState;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
@@ -625,5 +626,64 @@ fn a_mirrored_key_equality_is_classified_the_same_as_the_unmirrored_one() {
         vec![TxnId(2)],
         "the mirrored clause still names its dependent, got {:?}",
         halted.blocked_by
+    );
+}
+
+/// **The read-path half of F1b, and the assertion that MEASURES it rather than reasoning it.**
+/// `access_shape` feeds the read-set FORM as well as the write-path purpose, so mirroring it means
+/// `SELECT ... WHERE 7 = id` retains EXACT VERSIONS like `id = 7` instead of a whole-table predicate.
+///
+/// Only exact versions can populate `ReadPremiseCheck`'s `moved` list — a predicate summary can say
+/// at most "something in this table moved" and downgrades the check to `Heuristic`, whose
+/// `evaluate` returns `None` when nothing moved. So the observable that separates the two forms is
+/// whether a branch whose mirrored premise was replaced is HELD. Before mirroring, it published.
+#[test]
+fn a_mirrored_point_read_retains_a_premise_the_gate_can_verify() {
+    let mut db = Db::new();
+    db.seed();
+    let _m = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+
+    // Both agents read row 7 with the MIRRORED spelling — the shared premise.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    db.ok("SELECT id, qty FROM inventory WHERE 7 = id;", &mut a);
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("SELECT id, qty FROM inventory WHERE 7 = id;", &mut b);
+    let b_branch = b.agent.as_ref().unwrap().branch;
+
+    // They write DIFFERENT rows, so nothing the conflict resolver compares overlaps: without a
+    // read-set check there is nothing here to object to.
+    db.ok("UPDATE inventory SET qty = 111 WHERE id = 7;", &mut a);
+    db.ok("UPDATE inventory SET qty = 222 WHERE id = 2;", &mut b);
+
+    // A merges first and moves the row B read.
+    db.ok("MERGE;", &mut a);
+    assert_eq!(db.qty_of(7), 111, "A's merge did not publish, so B's premise never moved");
+
+    // B must not publish: it reasoned from row 7 as it was before A replaced it. THIS is the
+    // discriminating assertion — with `7 = id` classified as a scan, B's read-set holds a predicate,
+    // `moved` comes back empty, the check never fires, and B publishes qty 222.
+    db.ok("MERGE;", &mut b);
+    assert_eq!(
+        db.qty_of(2),
+        5,
+        "B published a write computed from a mirrored premise that had already been replaced, so \
+         the mirrored spelling retained no version the gate could check"
+    );
+
+    let rec = db.runtime.branches().get(b_branch).expect("branch record");
+    assert_eq!(rec.state, BranchState::Quarantined, "a stale premise has to land somewhere visible");
+    let reason = db.runtime.quarantine_reason(b_branch).unwrap_or_default();
+    assert!(
+        reason.contains("read-premise") && reason.contains("changed in the base"),
+        "the reason does not name what happened: {reason}"
+    );
+    // And it claims EXACTNESS, which is only available to an exact-version read-set. If this reads
+    // `heuristic`, the mirrored spelling is still retaining a predicate.
+    assert!(
+        reason.contains("sound"),
+        "a mirrored point read must retain a premise the gate can verify exactly: {reason}"
     );
 }
