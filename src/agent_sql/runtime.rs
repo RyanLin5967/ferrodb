@@ -3907,6 +3907,20 @@ fn guard_expr(
     })
 }
 
+/// Strip any nesting of parentheses. `((x))` is `x`, and an access shape must not depend on how many
+/// of them the writer typed.
+fn ungroup(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Grouping(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+fn ungrouped(e: Option<&Expr>) -> Option<&Expr> {
+    e.map(ungroup)
+}
+
 /// Classify a read by its **shape**, which is the only admissible input to the read-set form.
 /// Size is deliberately not consulted: coarsening scattered point reads into one interval covers
 /// most of the table by `k = 3`.
@@ -3926,10 +3940,14 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
     // that rule applied at the one other place operand order is read, rather than a second copy of
     // it: equality is its own mirror, so there is nothing to translate here beyond accepting the
     // swap.
-    match where_clause {
+    // **Parentheses are not an access shape either.** `guard_expr` already unwraps `Expr::Grouping`
+    // before it looks at anything; this is the same unwrap at the same depth, for the same reason.
+    // Measured before it: `WHERE (id = 7)` and `WHERE ((7 = id))` were both classified as scans
+    // while `WHERE id = 7` was a lookup. Recursive rather than one level, because `((x))` is two.
+    match ungrouped(where_clause) {
         Some(Expr::BinaryOp { left, operator: TokenType::Equal, right }) => {
-            let names_pk = |e: &Expr| matches!(e, Expr::ColumnRef { column, .. } if *column == pk);
-            let is_literal = |e: &Expr| matches!(e, Expr::Literal { .. });
+            let names_pk = |e: &Expr| matches!(ungroup(e), Expr::ColumnRef { column, .. } if *column == pk);
+            let is_literal = |e: &Expr| matches!(ungroup(e), Expr::Literal { .. });
             let points_at_pk = (names_pk(left) && is_literal(right))
                 || (is_literal(left) && names_pk(right));
             if points_at_pk {

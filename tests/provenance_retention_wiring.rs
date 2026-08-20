@@ -687,3 +687,53 @@ fn a_mirrored_point_read_retains_a_premise_the_gate_can_verify() {
         "a mirrored point read must retain a premise the gate can verify exactly: {reason}"
     );
 }
+
+/// **BREAKING SHAPE: `WHERE (id = 7)` — the same predicate in parentheses.** The same defect class as
+/// F1b, one level up: `access_shape` matched `Expr::BinaryOp` directly, so any grouping fell through
+/// to `FullScan`. `guard_expr` has always unwrapped `Expr::Grouping` before looking at anything;
+/// this asserts `access_shape` does the same, at the same depth.
+///
+/// The serious half is the read path, for the reason measured in
+/// `a_mirrored_point_read_retains_a_premise_the_gate_can_verify`: the shape decides the read-set
+/// FORM, so a parenthesised point read retained a whole-table predicate and the premise gate had no
+/// version to check.
+#[test]
+fn parentheses_do_not_change_the_access_shape() {
+    fn blind_after(stmt: &str) -> Vec<u64> {
+        let mut db = Db::new();
+        db.seed();
+        let _m = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+        let mut w = db.session();
+        db.ok("BEGIN AGENT SESSION AS 'writer' RUN 'r_write';", &mut w);
+        let branch = w.agent.as_ref().unwrap().branch;
+        db.ok(stmt, &mut w);
+        let mut v: Vec<u64> =
+            db.runtime.blind_writes(branch).unwrap().into_iter().map(|(_, r)| r.0).collect();
+        v.sort();
+        v
+    }
+
+    let bare = blind_after("UPDATE inventory SET qty = 99 WHERE id = 7;");
+    assert_eq!(bare, vec![7u64], "the fixture must be one where the metric fires at all");
+    for spelling in [
+        "UPDATE inventory SET qty = 99 WHERE (id = 7);",
+        "UPDATE inventory SET qty = 99 WHERE ((7 = id));",
+        "UPDATE inventory SET qty = 99 WHERE (7 = id);",
+    ] {
+        assert_eq!(
+            blind_after(spelling),
+            bare,
+            "`{spelling}` is the same access as `id = 7` and must be classified the same"
+        );
+    }
+
+    // Anti-vacuity: unwrapping parentheses must not turn a genuine scan into a key lookup.
+    assert!(
+        blind_after("UPDATE inventory SET qty = 99 WHERE (qty = 30);").is_empty(),
+        "a parenthesised NON-key equality still compares a value, so it is still an inspection"
+    );
+    assert!(
+        blind_after("UPDATE inventory SET qty = 99 WHERE (qty >= 20 AND qty < 50);").is_empty(),
+        "a parenthesised range is still a range"
+    );
+}
