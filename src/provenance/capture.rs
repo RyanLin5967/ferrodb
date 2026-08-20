@@ -127,6 +127,24 @@ impl TxnCapture {
         self.reads.observe(shape, versions, summary);
     }
 
+    /// Retain the region a WRITE statement's own `WHERE` clause looked at, for the causal graph
+    /// ONLY.
+    ///
+    /// **Causality and inspection are different questions, and this is the one place they part.**
+    /// `UPDATE ... WHERE id = 7` decided which row to write by naming it, so the write causally
+    /// depends on that row: a revert of whatever published it has a dependent here, and
+    /// [`ProvenanceLog::dependency_graph`] has to see the region. It inspected no *value*, so it must
+    /// not enter the read-set builder — `blind_writes` would stop reporting every
+    /// `UPDATE ... WHERE <pk> = <lit>` as a blind write, which is the entire shape DESIGN.md
+    /// section 4's metric exists to catch, and `ReadPremiseCheck` would downgrade itself to
+    /// `Heuristic` for a branch that named exact versions and nothing else.
+    ///
+    /// A clause that compares a value is a different thing and goes through [`TxnCapture::on_read`]
+    /// like any other scan, because it really did look.
+    pub fn on_write_targeting_read(&mut self, summary: PredicateSummary, observed_at: u64) {
+        self.predicates.push(TimedPredicate { summary, observed_at });
+    }
+
     /// Convenience for a single point read.
     pub fn on_point_read(&mut self, v: VersionRef) {
         self.on_read(AccessShape::Point, vec![v], None, 0);

@@ -837,6 +837,7 @@ impl AgentRuntime {
                 &matched,
                 where_clause.as_ref(),
                 bound_where.as_ref(),
+                ReadPurpose::Inspection,
             )?;
         }
 
@@ -855,8 +856,11 @@ impl AgentRuntime {
     ///
     /// `shape` alone decides the form (exact versions for a point or index lookup, a predicate for a
     /// range or scan); `TxnCapture::on_read` performs that routing, so there is no second copy of it
-    /// here. What this function owns is the two things only the runtime knows: which versions the
-    /// rows it returned are at, and **what snapshot the read saw**.
+    /// here. What this function owns is the three things only the runtime knows: which versions the
+    /// rows it returned are at, **what snapshot the read saw**, and whether the read was an
+    /// inspection or a write statement addressing its own rows ([`ReadPurpose`]).
+    ///
+    /// Refuses when the reading session is gone, rather than retaining nothing and reporting success.
     fn record_read(
         &self,
         reader: BranchId,
@@ -865,6 +869,7 @@ impl AgentRuntime {
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
         bound_where: Option<&BoundExpr>,
+        purpose: ReadPurpose,
     ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
         // **A read whose session is gone REFUSES; it does not report success while retaining
@@ -931,12 +936,61 @@ impl AgentRuntime {
         // no error anywhere. There is one workspace-creation site and it opens a capture, so this
         // arm should be unreachable; it is written this way so that a second site cannot make
         // retention optional by forgetting.
-        state
+        let capture = state
             .captures
             .entry(txn.0)
-            .or_insert_with(|| TxnCapture::new(txn, prov, reader))
-            .on_read(shape, versions, Some(summary), observed_at);
+            .or_insert_with(|| TxnCapture::new(txn, prov, reader));
+        match purpose {
+            ReadPurpose::Inspection => capture.on_read(shape, versions, Some(summary), observed_at),
+            ReadPurpose::RowTargeting => capture.on_write_targeting_read(summary, observed_at),
+        }
         Ok(())
+    }
+
+    /// Retain the scan a WRITE statement's own `WHERE` clause performed.
+    ///
+    /// **`UPDATE ... WHERE` and `DELETE ... WHERE` are scans, by this module's own definition.** Both
+    /// call [`AgentRuntime::visible_rows`], which returns *every* row, and then evaluate the bound
+    /// clause against each one. None of that used to be retained anywhere, and `record_read` had
+    /// exactly one caller — `select` — so the read-modify-write shape this lane exists to protect
+    /// found ZERO dependents unless the agent happened to spell the scan as a `SELECT` first.
+    ///
+    /// Measured before this: `INSERT (7, 30); MERGE` then
+    /// `UPDATE inventory SET qty = qty + 1 WHERE qty >= 20 AND qty < 50; MERGE` then
+    /// `REVERT MERGE m_1` gave `blocked_by = []`, the halt-mode revert proceeded, and row 7 —
+    /// carrying the second task's qty 31 — was deleted with no name in any tree. The identical
+    /// workload with one extra `SELECT` over the same range gave `blocked_by = [TxnId(2)]`, so the
+    /// difference was purely whether the scan had been spelled as a `SELECT`.
+    ///
+    /// The shape passed is [`AccessShape::FullScan`] because that is the physical access. Exact
+    /// versions are deliberately NOT retained here even for a key-shaped clause: the merge engine
+    /// already validates the cells a branch wrote against the target's current image with a witness
+    /// per cell, and adding a second staleness mechanism on top of it would promote a resolvable
+    /// cell merge into a hard `Retry`. What varies is the [`ReadPurpose`].
+    fn record_write_scan(
+        &self,
+        branch: BranchId,
+        tbl: TableId,
+        schema: &Schema,
+        matched: &[(RowId, Vec<Value>)],
+        where_clause: Option<&Expr>,
+        bound_where: Option<&BoundExpr>,
+    ) -> Result<(), FerroError> {
+        let purpose = match access_shape(where_clause, schema) {
+            // `WHERE <pk> = <literal>`: the statement named the row, it did not look at anything.
+            AccessShape::Point | AccessShape::IndexLookup => ReadPurpose::RowTargeting,
+            // Anything else compared a value to decide which rows matched. That is looking.
+            AccessShape::Range | AccessShape::FullScan => ReadPurpose::Inspection,
+        };
+        self.record_read(
+            branch,
+            tbl,
+            AccessShape::FullScan,
+            matched,
+            where_clause,
+            bound_where,
+            purpose,
+        )
     }
 
     // ---- writes on a branch ----------------------------------------------------------------
@@ -1127,12 +1181,15 @@ impl AgentRuntime {
 
         let rows = self.visible_rows(ctx, Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
+        // The rows this statement's own scan returned. See `record_write_scan`.
+        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
                     continue;
                 }
             }
+            matched.push((rid, row.clone()));
             let mut new_row = row.clone();
             let mut ops: Vec<Op> = Vec::new();
             for (idx, expr, bound) in &resolved {
@@ -1158,6 +1215,17 @@ impl AgentRuntime {
                 guard,
             });
         }
+        // Retained BEFORE the write is staged, deliberately: the scan happened whether or not
+        // `stage_all` admits the write, and dropping retention when a statement is refused is the
+        // same silent loss in a different place.
+        self.record_write_scan(
+            branch,
+            tbl,
+            &schema,
+            &matched,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let touched = staged.len();
         self.stage_all(branch, tbl, table, staged)?;
         Ok(touched)
@@ -1233,12 +1301,15 @@ impl AgentRuntime {
         };
         let rows = self.visible_rows(ctx, Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
+        // The rows this statement's own scan returned. See `record_write_scan`.
+        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
                     continue;
                 }
             }
+            matched.push((rid, row.clone()));
             let guard = match &where_clause {
                 Some(w) => Some(guard_from_expr(w, tbl, rid, &schema)?),
                 None => None,
@@ -1252,6 +1323,15 @@ impl AgentRuntime {
                 guard,
             });
         }
+        // Same reason as on the UPDATE path: retained before the refusal point.
+        self.record_write_scan(
+            branch,
+            tbl,
+            &schema,
+            &matched,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let n = staged.len();
         self.stage_all(branch, tbl, table, staged)?;
         Ok(n)
@@ -3290,6 +3370,27 @@ fn blind_writes_of(
         .filter(|(t, r)| !looked_at.contains(&(*t, *r)) && !scanned_tables.contains(t))
         .map(|(t, r)| (TableId(*t), RowId(*r)))
         .collect()
+}
+
+/// Why a read was taken, which is what decides whether it counts as an INSPECTION.
+///
+/// **Causality and inspection are different questions, and this is the one place they part.** Both
+/// purposes retain the region for the causal graph, because both really did decide what got written.
+/// Only `Inspection` reaches the read-set builder, and therefore only `Inspection` moves
+/// `blind_writes` and `ReadPremiseCheck`.
+///
+/// `UPDATE ... WHERE id = 7` is the case that forces the distinction. It causally depends on row 7 —
+/// a revert of whatever published that row has a dependent to name — and it inspected no *value*: it
+/// addressed the row. Counting it as an inspection would stop every `UPDATE ... WHERE <pk> = <lit>`
+/// from being a blind write, which is the entire shape DESIGN.md section 4's metric exists to catch,
+/// and would downgrade `ReadPremiseCheck` to `Heuristic` for a branch that named exact versions and
+/// nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPurpose {
+    /// A `SELECT`, or a write whose `WHERE` clause compared a VALUE: the task looked.
+    Inspection,
+    /// A write statement's `WHERE` clause that only addressed rows by key: the task did not look.
+    RowTargeting,
 }
 
 /// The images a merge moved its published rows between. See where it is built in `merge`.

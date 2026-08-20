@@ -221,3 +221,160 @@ fn a_read_whose_session_was_sealed_underneath_it_is_refused_rather_than_silently
     );
     assert!(db.exec("MERGE;", &mut victim).is_err(), "a merge on a sealed branch was admitted");
 }
+
+// ---- the read-modify-write shape ---------------------------------------------------------------
+
+/// **BREAKING SHAPE: the dependent's read is the `WHERE` clause of its own `UPDATE`, with no
+/// hand-written `SELECT` anywhere.** This is the shape agents actually use — read some rows, decide,
+/// write — and it is the shape this lane exists to protect. `branch_update` calls `visible_rows`,
+/// which returns every row, and then evaluates the bound clause against each one: a full scan by the
+/// module's own definition, and none of it was retained, so cascade found ZERO dependents.
+///
+/// Measured before this fix: `blocked_by = []`, the halt-mode revert proceeded, and row 7 —
+/// carrying the decider's qty 31 — was deleted with no name in any tree. The identical workload with
+/// one extra `SELECT` over the same range gave `blocked_by = [TxnId(2)]`.
+#[test]
+fn an_update_whose_where_clause_scanned_names_its_dependents() {
+    let mut db = Db::new();
+    db.seed();
+
+    // (a) restock-agent inserts row 7 INSIDE the range the decider is about to update over. txn 1.
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+    // (b) bulk-agent inserts row 8 well OUTSIDE it, BEFORE the decider reads — so the anti-vacuity
+    //     half below is decided by the region and not by the temporal rule.
+    let m_out = insert_and_merge(&mut db, "bulk-agent", "r_bulk", 8, 500);
+
+    // (c) the decider reads by UPDATE and by nothing else. txn 3.
+    let mut d = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'decider' RUN 'r_decide';", &mut d);
+    let touched = affected(db.ok(
+        "UPDATE inventory SET qty = qty + 1 WHERE qty >= 20 AND qty < 50;",
+        &mut d,
+    ));
+    assert_eq!(touched, 2, "the clause matches rows 1 and 7; that scan is the read under test");
+    let merged = report(db.ok("MERGE;", &mut d));
+    assert!(merged.applied_to_target, "{}", merged);
+    assert_eq!(db.qty_of(7), 31);
+    // Held, not asserted yet. The causal claim is the headline of this test and it has to be the
+    // assertion a lost-retention regression hits FIRST — asserting the metric here instead made
+    // both fire-check mutants die on the metric and never reach the revert at all.
+    let blind = merged.blind_writes.clone();
+
+    // (d) HALT is the default, and the decider is named.
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(halted.is_blocked(), "the UPDATE's own scan consumed row 7");
+    assert_eq!(
+        halted.blocked_by,
+        vec![TxnId(3)],
+        "the decider is txn 3, got {:?}",
+        halted.blocked_by
+    );
+    assert!(db.has_row(7), "a halted revert changes nothing");
+    assert_eq!(db.qty_of(7), 31, "the dependent's work survived the revert it blocked");
+
+    // (e) anti-vacuity: a write outside the scanned region is not a dependency, and its revert
+    //     proceeds and really happens. Both merges are visible to the decider's snapshot, so the
+    //     only thing separating them is the region.
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m_out), &mut main));
+    assert!(!free.is_blocked(), "qty 500 is outside [20, 50): {:?}", free.blocked_by);
+    assert!(!db.has_row(8), "an unblocked revert actually reverts");
+
+    // (f) the second, independent symptom of the same root cause: DESIGN.md section 4's metric
+    //     reported the row the WHERE clause had just compared as never-looked-at.
+    assert!(
+        blind.is_empty(),
+        "the WHERE clause compared a VALUE, so these rows were looked at: {blind:?}"
+    );
+}
+
+/// **BREAKING SHAPE: the same thing for `DELETE ... WHERE`.** A separate test rather than a loop over
+/// two statements, because the two go through different arms of the merge engine — `RowDelete`
+/// against `Assign` — and the published images a retained region is tested against are built
+/// per-arm.
+#[test]
+fn a_delete_whose_where_clause_scanned_names_its_dependents() {
+    let mut db = Db::new();
+    db.seed();
+
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+    let m_out = insert_and_merge(&mut db, "bulk-agent", "r_bulk", 8, 500);
+
+    let mut d = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'pruner' RUN 'r_prune';", &mut d);
+    let touched = affected(db.ok("DELETE FROM inventory WHERE qty >= 20 AND qty < 50;", &mut d));
+    assert_eq!(touched, 2, "the clause matches rows 1 and 7");
+    let merged = report(db.ok("MERGE;", &mut d));
+    assert!(merged.applied_to_target, "{}", merged);
+    assert!(!db.has_row(7), "the delete published");
+    let blind = merged.blind_writes.clone();
+
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(halted.is_blocked(), "the DELETE's own scan consumed row 7");
+    assert_eq!(halted.blocked_by, vec![TxnId(3)], "got {:?}", halted.blocked_by);
+
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m_out), &mut main));
+    assert!(!free.is_blocked(), "qty 500 is outside [20, 50): {:?}", free.blocked_by);
+    assert!(!db.has_row(8), "an unblocked revert actually reverts");
+
+    // The metric last, for the same reason as the UPDATE test above.
+    assert!(blind.is_empty(), "the WHERE clause compared a VALUE: {blind:?}");
+}
+
+/// **BREAKING SHAPE: `UPDATE ... WHERE <pk> = <literal>` — the case where causality and inspection
+/// give opposite answers, in one test, because a fix that conflated them would pass one half and
+/// fail the other.**
+///
+/// CAUSALITY: the statement could only write row 7 because its scan found row 7, so a revert of the
+/// merge that published row 7 has a dependent to name. Without retention this is `blocked_by = []`.
+///
+/// INSPECTION: naming a row by primary key looks at no value, so DESIGN.md section 4's metric must
+/// still report it blind. A fix that routed every write-path scan into the read-set builder would
+/// make no `UPDATE ... WHERE <pk> = <lit>` blind ever again, which is the whole shape that metric
+/// exists to catch.
+#[test]
+fn an_update_that_names_a_row_by_key_names_its_dependent_and_stays_a_blind_write() {
+    let mut db = Db::new();
+    db.seed();
+
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+    // Published BEFORE the setter reads, so the anti-vacuity half at the end is decided by the
+    // region rather than by the temporal rule.
+    let m_out = insert_and_merge(&mut db, "bulk-agent", "r_bulk", 8, 500);
+
+    let mut d = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'setter' RUN 'r_set';", &mut d);
+    let branch = d.agent.as_ref().unwrap().branch;
+    db.ok("UPDATE inventory SET qty = 99 WHERE id = 7;", &mut d);
+
+    let blind: Vec<u64> =
+        db.runtime.blind_writes(branch).unwrap().into_iter().map(|(_, r)| r.0).collect();
+    assert_eq!(
+        blind,
+        vec![7u64],
+        "an UPDATE that addressed the row by key inspected nothing, so the metric must still \
+         report it: {blind:?}"
+    );
+
+    let merged = report(db.ok("MERGE;", &mut d));
+    assert!(merged.applied_to_target, "{}", merged);
+    assert_eq!(
+        merged.blind_writes.iter().map(|(_, r)| r.0).collect::<Vec<_>>(),
+        vec![7u64],
+        "and the merge report carries the same answer: {:?}",
+        merged.blind_writes
+    );
+
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(halted.is_blocked(), "the UPDATE could only write row 7 because its scan found row 7");
+    assert_eq!(halted.blocked_by, vec![TxnId(3)], "got {:?}", halted.blocked_by);
+    assert_eq!(db.qty_of(7), 99, "a halted revert changes nothing");
+
+    // Anti-vacuity: `WHERE id = 7` retains the interval [7, 7] over `id`, not the whole table, so a
+    // merge that published a different row is free — even though the setter's snapshot saw it.
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m_out), &mut main));
+    assert!(!free.is_blocked(), "row 8 is not row 7: {:?}", free.blocked_by);
+    assert!(!db.has_row(8), "an unblocked revert actually reverts");
+}
