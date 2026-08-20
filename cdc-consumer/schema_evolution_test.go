@@ -770,3 +770,53 @@ func TestTheDuckSinkFollowsARenameOfTheKeyColumn(t *testing.T) {
 		t.Fatalf("the destination's primary key did not follow the rename: %q", pk)
 	}
 }
+
+// The declaration a consumer is handed after the source renamed `qty` to `quantity` and a later
+// whole-table DDL checkpointed the RENAME_COLUMN record away. Same column count, one name moved.
+const renamedInv = `{"table":"inv","op":"CREATE_TABLE","txn":0,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,` +
+	`"before":null,"after":{"columns":[` +
+	`{"name":"id","type":"INTEGER","nullable":false},` +
+	`{"name":"quantity","type":"INTEGER","nullable":true}]}}`
+
+// **I20, review finding 8 — a DIAGNOSIS, not a repair.**
+//
+// A rename plus any later checkpoint still strands the SQLite sink, and this test pins that it
+// stalls. What it also pins is that the stall now NAMES ITS CAUSE. Before, the operator met
+// `apply INSERT to inv: SQL logic error: table inv has no column named quantity` at INSERT time,
+// which points at the feed rather than at the destination and says nothing about the rename or
+// about what to do.
+//
+// The sink does not rename the column itself, and that restraint is the finding-9 interaction: a
+// rename and a drop-plus-recreate of a table of the same name are indistinguishable from a shape
+// diff, and guessing wrong keeps a dead table's rows and presents them as live.
+func TestARenameTruncatedAwayStallsTheSinkButNamesTheCause(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "out.sqlite")
+
+	first := filepath.Join(dir, "first.jsonl")
+	writeLines(t, first, []string{createInv, insertLine(1, 10, 10, "")})
+	if err := runSink(first, db, "id", "sqlite"); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	second := filepath.Join(dir, "second.jsonl")
+	writeLines(t, second, []string{renamedInv,
+		`{"table":"inv","op":"INSERT","txn":2,"lsn":30,"commit_lsn":30,"commit_end_lsn":31,` +
+			`"before":null,"after":{"id":2,"quantity":20}}`})
+	err := runSink(second, db, "id", "sqlite")
+	if err == nil {
+		t.Fatal("the sink accepted a declaration whose column names do not match the destination; " +
+			"finding 8 is fixed and this test needs rewriting, or a rename was guessed at")
+	}
+	// The whole point: the message has to be actionable.
+	for _, want := range []string{"RENAME COLUMN", "quantity", "drop the table"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal does not tell the operator %q: %v", want, err)
+		}
+	}
+	// And it refused BEFORE writing anything, rather than half-applying.
+	rows := sqliteRows(t, db, `SELECT id, qty FROM inv ORDER BY id`)
+	if len(rows) != 1 {
+		t.Fatalf("the refusal disturbed the destination: %v", rows)
+	}
+}

@@ -269,6 +269,29 @@ func (s *Sink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []
 	}
 	for i := 0; i < n; i++ {
 		if want[i] != got[i] {
+			// **A diagnosis, not a repair — I20, review finding 8.**
+			//
+			// Equal column counts with a name differing at one ordinal is the signature of a
+			// RENAME the source performed and this consumer's log was truncated past: the alter
+			// record is destroyed by the next whole-table DDL anywhere in the database, and what
+			// arrives is the evolved declaration with no way to tell it from a different table of
+			// the same name (review finding 9, still open — which is exactly why this refuses
+			// rather than renaming the column itself).
+			//
+			// The outcome is the same stall it has always been. What changes is that the operator
+			// is told the cause instead of meeting `table inv has no column named quantity` at
+			// INSERT time, which points at the feed rather than at the destination.
+			if len(want) == len(got) {
+				return fmt.Errorf(
+					"table %s column %d is %q in the destination but %q in the event's shape, and the "+
+						"shapes are otherwise the same size. That is what a RENAME COLUMN on the source "+
+						"looks like once a checkpoint has truncated the alter record away. This sink will "+
+						"not rename the column on a shape diff alone: a rename and a drop-plus-recreate of "+
+						"a table of the same name are indistinguishable here, and guessing wrong keeps a "+
+						"dead table's rows and presents them as live. Rename %q to %q in the destination "+
+						"by hand, or drop the table and let the feed rebuild it",
+					table, i, got[i], want[i], got[i], want[i])
+			}
 			continue
 		}
 		if !strings.EqualFold(wantTypes[i], gotTypes[i]) {
