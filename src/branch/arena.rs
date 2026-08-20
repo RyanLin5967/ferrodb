@@ -320,9 +320,15 @@ impl ArenaPageStore {
         std::mem::take(&mut self.state.lock().unwrap().pending)
     }
 
-    /// Put entries that are still pinned back on the pending-free log.
-    pub fn put_pending(&self, entries: Vec<PendingFree>) {
+    /// Put entries that are still pinned back on the pending-free log, and checkpoint.
+    ///
+    /// This is the closing half of `reaper::drain_pending`'s read-modify-write: by the time it runs,
+    /// the reclaimable pages have been released into their extents' recycled lists and the survivors
+    /// are back on the log. That whole shape lives only in the free-space map, so it persists here
+    /// for the same reason `free_arena` does — once per drain, which is once per reap.
+    pub fn put_pending(&self, entries: Vec<PendingFree>) -> Result<(), FerroError> {
         self.state.lock().unwrap().pending.extend(entries);
+        self.persist_if_configured()
     }
 
     /// True iff `arena` is live and every page ever handed out from it has been released.
@@ -375,6 +381,13 @@ impl ArenaPageStore {
                 }
             }
         }
+        // The slow path changes the durable map every bit as much as the fast one: pages recycled
+        // inside a still-live extent, and a pending-free log that nothing but this map records. Left
+        // unpersisted, a crash after `mark_reaped` (which clears `rec.arenas`) loses both — the
+        // pending entries are gone so `drain_pending` never revisits them, the extent's durable
+        // `next_free` is above its recycled count so `extent_is_empty` refuses, and nothing points
+        // at the arena any more. Once per branch reaped, not once per page.
+        self.persist_if_configured()?;
         Ok(released)
     }
 
@@ -937,6 +950,14 @@ impl PageStore for ArenaPageStore {
             //
             // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
             // as the claim this mirrors, and not per page.
+            //
+            // This also makes `free_arena` fallible where it was not, and the failure lands *after*
+            // the in-memory free. Two consequences, named here rather than left to be discovered:
+            // `reap` can now return `Err` with its own durable records already committed — it is
+            // idempotent, so a retry converges on `Ok(0)`, and the durable map being behind leaks
+            // rather than aliases — and `reap_expired` discards its partial list of reaped branches
+            // on any `Err`, which was already true of every slow-path IO error and which no
+            // production caller sees today, because `runtime.rs` calls `reap` directly.
             self.persist_if_configured()?;
         }
         Ok(allocated)
@@ -1732,6 +1753,78 @@ mod tests {
             target.live_page_count().unwrap(),
             0,
             "the page inside the freed extent is still counted as live"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The slow path's own persist, isolated.
+    ///
+    /// Driving this through `reaper::reap` cannot isolate it: `reap` always ends in `drain_pending`,
+    /// whose `put_pending` persists, and in `sweep_empty_extents`, whose `free_arena` persists — so
+    /// removing this one leaves the end-to-end test green. Measured: it does. The store's contract
+    /// is per-method, so the test is too.
+    #[test]
+    fn parking_pages_by_the_interval_rule_reaches_the_durable_map() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-park-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(parent.branch_id).unwrap();
+        for _ in 0..4 {
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+        }
+        // Forked *after* those pages were born, so it can still see them and the interval rule
+        // parks them rather than releasing them.
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(released, 0, "fixture: the pages were released, not parked, so nothing is pinned");
+        assert_eq!(h.store.pending_len(), 4, "fixture: the rule parked nothing");
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            target.pending_len(),
+            4,
+            "the pending-free log never reached the durable map, so a restart releases pages a \
+             live child can still see"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `put_pending`'s own persist, isolated for the same reason as the test above it.
+    #[test]
+    fn putting_the_pending_log_back_reaches_the_durable_map() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-putpending-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(parent.branch_id).unwrap();
+        for _ in 0..4 {
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        // What `drain_pending` does: take the whole log, decide, put the survivors back.
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), 4, "fixture: nothing was parked");
+        h.store.put_pending(taken[..2].to_vec()).unwrap();
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap());
+        assert_eq!(
+            target.pending_len(),
+            2,
+            "the durable pending-free log still lists entries the drain resolved, so a restart \
+             would park released pages all over again"
         );
         let _ = std::fs::remove_file(&path);
     }
