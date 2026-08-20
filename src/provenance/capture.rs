@@ -119,10 +119,33 @@ impl TxnCapture {
         summary: Option<PredicateSummary>,
         observed_at: u64,
     ) {
-        if let (crate::provenance::readset::ReadSetForm::Predicate, Some(p)) =
-            (shape.form(), summary.clone())
-        {
-            self.predicates.push(TimedPredicate { summary: p, observed_at });
+        use crate::provenance::readset::ReadSetForm;
+        let form = shape.form();
+        // **An exact-version read that returned NOTHING observed an ABSENCE, and an absence has no
+        // version to name.** `ReadSetBuilder::finish` drops an empty exact set entirely, so such a
+        // read used to be retained as *nothing at all* — not even the table it looked in. What it
+        // DID observe is that the region its clause names held no row, and that is precisely
+        // phantom coverage: the one thing a predicate summary exists to express.
+        //
+        // Measured before this: a pruner deletes row 2 and merges; a filler asks
+        // `WHERE id = 2`, gets nothing, and inserts (2, 999) on the strength of that absence;
+        // `REVERT MERGE m_1` is NOT blocked, proceeds, and fails with
+        // `constraint error: duplicate primary key Integer(2)` — an error where the contract
+        // promises either a dependency tree or a completed revert. The identical absence written as
+        // a range (`WHERE id >= 2 AND id < 3`) halted correctly. Identical semantics, opposite
+        // outcomes, decided by syntax.
+        //
+        // The shape's own form is left exactly as it was, which for this case is an empty exact set
+        // the builder still drops. Nothing is double-counted: for a predicate shape `observe` records
+        // the summary itself, so the extra `observe_predicate` runs only in the absence case.
+        let absence = form == ReadSetForm::ExactVersions && versions.is_empty();
+        if let Some(p) = summary.clone() {
+            if form == ReadSetForm::Predicate || absence {
+                self.predicates.push(TimedPredicate { summary: p.clone(), observed_at });
+            }
+            if absence {
+                self.reads.observe_predicate(p);
+            }
         }
         self.reads.observe(shape, versions, summary);
     }

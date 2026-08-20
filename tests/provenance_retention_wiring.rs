@@ -378,3 +378,76 @@ fn an_update_that_names_a_row_by_key_names_its_dependent_and_stays_a_blind_write
     assert!(!free.is_blocked(), "row 8 is not row 7: {:?}", free.blocked_by);
     assert!(!db.has_row(8), "an unblocked revert actually reverts");
 }
+
+// ---- an observation with no version to name ----------------------------------------------------
+
+/// **BREAKING SHAPE: `WHERE <pk> = <literal>` that finds NO ROW.** `access_shape` routes it to
+/// `IndexLookup` -> `ExactVersions`, `versions` comes back empty, and `ReadSetBuilder::finish` drops
+/// an empty exact set entirely — so the observation was retained as nothing at all, not even the
+/// table. The engine full-scans for this query regardless, so the declared shape did not match the
+/// physical access and the phantom coverage a scan would have earned was discarded.
+///
+/// Measured before this fix: the revert was not blocked, proceeded, and failed with
+/// `constraint error: duplicate primary key Integer(2) in 'inventory'` — a constraint error where
+/// the contract promises either a dependency tree or a completed revert. The same absence expressed
+/// as a range halted correctly, so the outcome was decided by syntax.
+#[test]
+fn a_point_lookup_that_observed_an_absence_halts_the_revert_that_would_refill_it() {
+    let mut db = Db::new();
+    db.seed();
+
+    // (a) pruner deletes row 2 and merges. txn 1.
+    let mut p = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'pruner' RUN 'r_prune';", &mut p);
+    db.ok("DELETE FROM inventory WHERE id = 2;", &mut p);
+    let m1 = report(db.ok("MERGE;", &mut p)).merge_id;
+    assert!(!db.has_row(2), "the premise of this test is that the pruner removed row 2");
+
+    // (b) bulk-agent publishes an unrelated row BEFORE the two readers look, so the anti-vacuity
+    //     half at the end is decided by the region and not by the temporal rule. txn 2.
+    let m_out = insert_and_merge(&mut db, "bulk-agent", "r_bulk", 8, 500);
+
+    // (c) filler asks for row 2 BY KEY, sees the absence the pruner caused, and fills it. txn 3.
+    let mut f = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'filler' RUN 'r_fill';", &mut f);
+    let seen = rows(db.ok("SELECT id, qty FROM inventory WHERE id = 2;", &mut f));
+    assert!(seen.is_empty(), "row 2 must be absent for this to be the absence case: {seen:?}");
+    db.ok("INSERT INTO inventory VALUES (2, 999);", &mut f);
+    let merged = report(db.ok("MERGE;", &mut f));
+    assert!(merged.applied_to_target, "{}", merged);
+    assert_eq!(db.qty_of(2), 999);
+
+    // (d) auditor asks by key for a row nothing has ever touched — the anti-vacuity half, and the
+    //     one that keeps this fix from meaning "an empty exact read blocks everything". txn 4.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'auditor' RUN 'r_audit';", &mut a);
+    let none = rows(db.ok("SELECT id, qty FROM inventory WHERE id = 42;", &mut a));
+    assert!(none.is_empty(), "row 42 was never seeded: {none:?}");
+
+    // (e) the revert HALTS, and names only the filler.
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(
+        halted.is_blocked(),
+        "the filler's decision came from an absence this merge caused; the revert must not proceed \
+         and then fail on a duplicate key"
+    );
+    assert_eq!(
+        halted.blocked_by,
+        vec![TxnId(3)],
+        "the filler is txn 3 and the auditor looked somewhere else, got {:?}",
+        halted.blocked_by
+    );
+    assert_eq!(db.qty_of(2), 999, "a halted revert changes nothing");
+    assert!(db.has_row(1), "and nothing else moved");
+
+    // (f) anti-vacuity: neither absence covers row 8, so its merge is free — even though both
+    //     readers' snapshots saw it.
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m_out), &mut main));
+    assert!(
+        !free.is_blocked(),
+        "an absence observed at key 2 or 42 says nothing about row 8: {:?}",
+        free.blocked_by
+    );
+    assert!(!db.has_row(8), "an unblocked revert actually reverts");
+}
