@@ -295,6 +295,41 @@ fn a_dead_server_is_reported_as_dead_rather_than_retried() {
     );
 }
 
+/// Ask the one question every failure in the test below needs answered first: is the server still
+/// alive, and if not, what did it say on the way out?
+///
+/// The original occurrence of this flake answered neither. It reported "the server never accepted a
+/// connection" and nothing else, which is consistent with a dead server, a wedged one, and a port
+/// that had been taken by another process — three different bugs — and it took six lanes hitting it
+/// to tell them apart. Every panic below routes through here so that never costs that again.
+///
+/// Kills the server first when it is still running: the read end of a pipe held open by a live
+/// child blocks to EOF, and a diagnostic that hangs is worse than no diagnostic.
+fn server_epitaph(child: &mut Child) -> String {
+    use std::io::Read as _;
+
+    let status = child.try_wait().expect("query the server process");
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    // A pipe can only be drained once, so this is single-use per child by construction. Saying so
+    // beats printing an empty section, which reads as "the server said nothing on the way out" —
+    // the exact wrong conclusion for whoever is reading the second epitaph.
+    let err = match child.stderr.take() {
+        Some(mut e) => {
+            let mut err = String::new();
+            let _ = e.read_to_string(&mut err);
+            err
+        }
+        None => "(already drained by an earlier epitaph on this server)".to_string(),
+    };
+    let _ = child.wait();
+    match status {
+        Some(st) => format!("The server had ALREADY EXITED ({st:?}).\n--- its stderr ---\n{err}"),
+        None => format!("The server was still running when asked.\n--- its stderr ---\n{err}"),
+    }
+}
+
 /// **A server must not die because nobody is reading its stdout.**
 ///
 /// This is the bug behind an intermittent CI failure on ubuntu and windows that macOS never showed.
@@ -307,19 +342,50 @@ fn a_dead_server_is_reported_as_dead_rather_than_retried() {
 /// server's first write, which makes the failure deterministic: against the old code the server dies
 /// every time. Both ends were fixed — the harness now holds the reader open, and the server ignores
 /// stdout write errors — and this pins the half that does not depend on the harness behaving.
+///
+/// # I16 — the port is the server's, and was never anybody else's
+///
+/// This test used to open its own `TcpListener` on `127.0.0.1:0` purely to *discover* a free port,
+/// drop the listener, and hand the bare number to a server it spawned afterwards. That is a
+/// discover-then-race, and the gap is not small: between the drop and the server's own `bind` sit a
+/// process spawn, the single-writer lock, opening the database, a buffer pool, a catalog and a
+/// `CREATE TABLE`. Anything else on the machine may take the port in that window, after which the
+/// server's `bind` fails or it listens somewhere this test is not looking, and the connect loop
+/// simply runs out.
+///
+/// It ran out on six independent lanes. The measurement that settles which mechanism it was:
+/// binding took 30ms at the median and 838ms at the worst over 50 spawns at load 91, **with zero
+/// failures to bind** — so the server was not merely slow, and the budget being too tight was not
+/// the whole story either.
+///
+/// **The fix is not a retry.** Retrying the connect leaves the port unowned and relabels a stolen
+/// port as a slow start, which is the same flake with the evidence removed. Instead the port is
+/// never unowned: the server binds `:0` and reports the address it got. Every other harness in this
+/// file learns that from the `LISTENING` line, which this test cannot read — closing stdout before
+/// the first write is the entire point of it — so the server writes the same address to
+/// `FERRODB_LISTEN_FILE`, by atomic rename, before it prints anything.
+///
+/// What is still being tested is unchanged and not made vacuous by the handshake: the server
+/// publishes its address *before* its first stdout write, so arriving at the file proves nothing
+/// about EPIPE — but serving a feed afterwards means it went through both writes to a closed pipe
+/// and kept running, which is the property.
 #[test]
 fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
     use std::io::{Read, Write as _};
-    use std::net::{TcpListener, TcpStream};
-
-    // A port to hand the server, so this test never needs to read its stdout for the address.
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    use std::net::TcpStream;
 
     let dir = tempfile::tempdir().unwrap();
+    // The address the server will publish once it has bound it. Inside the tempdir so it is removed
+    // with everything else, and so a stale file from a previous run can never be read as this one's.
+    let addr_file = dir.path().join("listen.addr");
+
     let mut child = Command::new(example_bin("cdc_server"))
         .arg(dir.path().join("cdc.db"))
-        .arg(format!("127.0.0.1:{port}"))
+        // `:0` — the server picks, the kernel decides, and it holds the port from that moment until
+        // it exits. Nothing here ever owns a port it then gives up.
+        .arg("127.0.0.1:0")
         .arg("12")
+        .env("FERRODB_LISTEN_FILE", &addr_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -328,10 +394,7 @@ fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
     // Close the read end before the server has written anything.
     drop(child.stdout.take().expect("piped"));
 
-    // Give it a moment to reach its first write, then require it to still be serving.
-    // A real delay between attempts. The first version of this loop had none, and `connect` to an
-    // unbound port fails instantly, so 600 attempts elapsed in 0.02s and the test reported that the
-    // server "never accepted a connection" when it simply had not finished starting.
+    // Wait for the server to say where it is, not for a connection to succeed.
     //
     // **1200 x 50ms = 60s, and the number is measured rather than picked.** The other three tests
     // in this binary shell out to `go run .`, which COMPILES AND STATICALLY LINKS DuckDB on any run
@@ -345,40 +408,91 @@ fn the_server_survives_a_consumer_that_stops_reading_its_stdout() {
     // spread rather than outside it — and it failed exactly once, on the first run after a new Go
     // file was added, with `the server never accepted a connection` and the server still alive.
     //
-    // The budget is a liveness bound and not an assertion: the loop exits the instant `connect`
-    // succeeds, so a healthy run costs what it always did, and a server that DIES still fails
+    // The budget is a liveness bound and not an assertion: the loop exits the instant the address
+    // appears, so a healthy run costs what it always did, and a server that DIES still fails
     // immediately through the `try_wait` branch below rather than waiting the timeout out. Raising
     // it weakens nothing that is being tested — the property is "a closed stdout pipe is not fatal",
     // and every check of that is below.
-    let mut stream = None;
+    //
+    // `read_to_string` is safe against a torn read because the server renames the file into place;
+    // the emptiness check is belt and braces for a platform where that is less atomic than it looks.
+    let mut published = None;
     for _ in 0..1200 {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-            stream = Some(s);
-            break;
+        if let Ok(text) = std::fs::read_to_string(&addr_file) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                published = Some(text);
+                break;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
         if let Some(st) = child.try_wait().expect("query the server") {
-            let mut err = String::new();
-            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
             panic!(
                 "the server died ({st:?}) because its stdout pipe was closed. A closed log pipe \
-                 must not be fatal to a server that is otherwise healthy.\nstderr: {err}"
+                 must not be fatal to a server that is otherwise healthy. {}",
+                server_epitaph(&mut child)
             );
         }
     }
-    let mut stream = stream.expect(
-        "the server never accepted a connection within 60s, and it was still alive every time it \
-         was asked. That is not the failure this test is about — a server killed by a closed stdout \
-         pipe is caught by the `try_wait` branch above — so either the machine is far more loaded \
-         than the 27.5s worst case measured for this binary, or the server is wedged before its \
-         `TcpListener::bind`.",
+    let addr = published.unwrap_or_else(|| {
+        panic!(
+            "the server never published a listening address within 60s, and it was alive every \
+             time it was asked. That is not the failure this test is about — a server killed by a \
+             closed stdout pipe is caught by the `try_wait` branch above — so it is wedged before \
+             or inside its own `bind`. {}",
+            server_epitaph(&mut child)
+        )
+    });
+
+    // Anti-vacuity. `127.0.0.1:0` is what was ASKED for, so reading it back would mean the server
+    // published the request rather than the result, and every connect below would go nowhere.
+    let port: u16 = addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("the server published an address this test cannot parse: {addr:?}"));
+    assert_ne!(
+        port, 0,
+        "the server published {addr:?} — the wildcard it was asked for, not the port it was given, \
+         so nothing below would be testing a real connection"
     );
 
+    // **One connect, no retry loop, and that is the point of I16.** The port was bound before the
+    // address was published and stays bound for the life of the process, so there is no window for
+    // anything to take it and nothing here to retry. A failure at this line is a fact about the
+    // server, and reporting it as one is what a retry loop would have thrown away.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| {
+        panic!(
+            "the server published {addr:?} and then refused a connection to it ({e}). The port is \
+             the server's own and was never released, so this is not a port race. {}",
+            server_epitaph(&mut child)
+        )
+    });
+
+    // The last unbounded wait in this test, made bounded. `read` on a healthy server returns
+    // immediately — it starts writing as soon as it has accepted — so the only thing this changes is
+    // that a server which accepts and then wedges is REPORTED after a minute instead of hanging the
+    // run until CI's own timeout kills it and says nothing about why. Sixty seconds for the same
+    // reason the loop above uses sixty: it is a liveness bound on a machine that can be very busy,
+    // not an assertion about how fast the feed should be.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .expect("set a read timeout");
+
     // Alive is not enough — it has to still deliver a feed.
-    stream.write_all(b"0\n").expect("send cursor");
+    stream.write_all(b"0\n").unwrap_or_else(|e| {
+        panic!("the cursor could not be sent to the server ({e}). {}", server_epitaph(&mut child))
+    });
     let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).expect("read the feed");
-    assert!(n > 0, "the server accepted the connection but sent nothing");
+    let n = stream.read(&mut buf).unwrap_or_else(|e| {
+        panic!("the feed could not be read ({e}). {}", server_epitaph(&mut child))
+    });
+    assert!(
+        n > 0,
+        "the server accepted the connection but sent nothing, which is what a server that died \
+         between accepting and writing looks like. {}",
+        server_epitaph(&mut child)
+    );
 
     let _ = child.kill();
     let _ = child.wait();
