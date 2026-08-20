@@ -451,3 +451,52 @@ fn a_point_lookup_that_observed_an_absence_halts_the_revert_that_would_refill_it
     );
     assert!(!db.has_row(8), "an unblocked revert actually reverts");
 }
+
+// ---- a task that was discarded -----------------------------------------------------------------
+
+/// **BREAKING SHAPE: a task scans, is then explicitly ABANDONed, and a revert is attempted.**
+/// Captures are keyed by txn and were never dropped, including on `abandon`, so a discarded task
+/// kept generating dependency edges forever. `undo_txn` finds no applied ops for it, so `CASCADE`
+/// "reverts" a task that published nothing — which leaves the dangerous mode as the ONLY way past a
+/// name that has nothing behind it, training the operator away from the default that protects them.
+///
+/// Both halves are the SAME reader, before and after `ABANDON`, so this test cannot pass by
+/// retention being broken outright: the first half requires it to work.
+#[test]
+fn an_abandoned_tasks_scan_stops_blocking_the_revert_it_never_depended_on() {
+    let mut db = Db::new();
+    db.seed();
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+
+    let mut ghost = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'ghost' RUN 'r_ghost';", &mut ghost);
+    let seen = rows(db.ok(
+        "SELECT id, qty FROM inventory WHERE qty >= 20 AND qty < 50;",
+        &mut ghost,
+    ));
+    assert_eq!(seen.len(), 2, "rows 1 and 7 are in [20, 50): {seen:?}");
+
+    // The anti-vacuity half, and it comes first: while the task is LIVE its scan is a real
+    // dependent and the revert must halt.
+    let mut main = db.session();
+    let blocked = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(blocked.is_blocked(), "a live scanner must still block the revert");
+    assert_eq!(
+        blocked.blocked_by,
+        vec![TxnId(2)],
+        "the ghost is txn 2, got {:?}",
+        blocked.blocked_by
+    );
+    assert!(db.has_row(7), "a halted revert changes nothing");
+
+    // Now discard the task. It published nothing, so there is nothing downstream to protect.
+    db.ok("ABANDON;", &mut ghost);
+
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(
+        !free.is_blocked(),
+        "a task that was discarded and published nothing still blocks the revert: {:?}",
+        free.blocked_by
+    );
+    assert!(!db.has_row(7), "and an unblocked revert actually reverts");
+}

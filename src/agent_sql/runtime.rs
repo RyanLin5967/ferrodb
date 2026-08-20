@@ -2794,7 +2794,11 @@ impl AgentRuntime {
             .collect();
         let mut state = self.state.lock().unwrap();
         for (id, name, bid) in &gone {
-            state.workspaces.remove(id);
+            // Reaped without client cooperation, so nothing this branch buffered was published:
+            // the same reasoning as the ABANDON arm of `seal`, and reached by a different door.
+            if let Some(ws) = state.workspaces.remove(id) {
+                state.captures.remove(&ws.txn.0);
+            }
             state.names.remove(name);
             state.escrow.release(*bid);
             state.quarantine_reasons.remove(id);
@@ -2833,6 +2837,25 @@ impl AgentRuntime {
             }
             if let Some(ws) = state.workspaces.remove(&branch.id) {
                 state.names.remove(&ws.name);
+                // **A task that published nothing is not a dependent of anything.**
+                //
+                // Captures outlive the workspace on purpose, and that is right for a MERGE: it
+                // retires the branch at the moment its rows become readable, so the graph has to
+                // survive `seal` for the same reason `row_author` does. An ABANDON is the opposite
+                // case. The buffered writes never landed, so there is nothing downstream to
+                // protect — and keeping the capture made every scan the task ever ran block
+                // reverts FOREVER.
+                //
+                // Measured before this: a ghost task scans `WHERE qty >= 20 AND qty < 50`, runs
+                // `ABANDON`, and `REVERT MERGE m_1` reports `blocked_by = [TxnId(2)]`
+                // permanently. `undo_txn` then finds no applied ops for it, so `CASCADE`
+                // "reverts" a task that published nothing — which means the only way past the
+                // name is the dangerous mode, training the operator away from the default that
+                // exists to protect them. Over-reporting is the safe direction for a REGION; a
+                // name with nothing behind it is not a region error, it is a dead entry.
+                if !published {
+                    state.captures.remove(&ws.txn.0);
+                }
             }
         }
         // With a reaper attached, retiring a branch means reclaiming it: the reaper does
