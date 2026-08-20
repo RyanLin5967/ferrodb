@@ -562,3 +562,68 @@ fn a_multi_version_merge_followed_by_another_merge_keeps_its_causal_answers_exac
         b_halted.blocked_by
     );
 }
+
+// ---- operand order ------------------------------------------------------------------------------
+
+/// **BREAKING SHAPE: `WHERE 7 = id` — the mirrored spelling of `WHERE id = 7`.** `access_shape`
+/// matched only `<column> = <literal>`, so the mirrored form fell through to `FullScan` and was
+/// classified as a scan. Every consumer of the shape then answered differently for two spellings of
+/// one predicate.
+///
+/// Measured before the fix: `UPDATE inventory SET qty = 99 WHERE id = 7` reported row 7 blind and
+/// `... WHERE 7 = id` reported nothing, because the second counted as an inspection. Identical
+/// semantics, opposite outcome, decided by syntax — the same defect shape as the point-lookup
+/// absence case, and `comparison_range` already mirrors for exactly this reason.
+///
+/// The anti-vacuity half is in the same test and it matters here more than usual: mirroring must not
+/// swallow a clause that genuinely IS a scan. `WHERE qty = 30` compares a value on a non-key column
+/// and must stay an inspection, and `WHERE id >= 7 AND id <= 7` is a range by access shape even
+/// though it selects one row — see the boundary note in the row summary.
+#[test]
+fn a_mirrored_key_equality_is_classified_the_same_as_the_unmirrored_one() {
+    fn blind_after(stmt: &str) -> Vec<u64> {
+        let mut db = Db::new();
+        db.seed();
+        let _m = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+        let mut w = db.session();
+        db.ok("BEGIN AGENT SESSION AS 'writer' RUN 'r_write';", &mut w);
+        let branch = w.agent.as_ref().unwrap().branch;
+        db.ok(stmt, &mut w);
+        let mut v: Vec<u64> =
+            db.runtime.blind_writes(branch).unwrap().into_iter().map(|(_, r)| r.0).collect();
+        v.sort();
+        v
+    }
+
+    let plain = blind_after("UPDATE inventory SET qty = 99 WHERE id = 7;");
+    let mirrored = blind_after("UPDATE inventory SET qty = 99 WHERE 7 = id;");
+    assert_eq!(
+        mirrored, plain,
+        "`7 = id` and `id = 7` are one predicate written two ways and must not get different \
+         answers: mirrored {mirrored:?} vs plain {plain:?}"
+    );
+    assert_eq!(plain, vec![7u64], "the fixture must be one where the metric fires at all");
+
+    // Anti-vacuity: mirroring must not turn every equality into a key lookup.
+    assert!(
+        blind_after("UPDATE inventory SET qty = 99 WHERE qty = 30;").is_empty(),
+        "a non-key equality compares a VALUE and is still an inspection"
+    );
+
+    // And the causal half still holds for the mirrored spelling: it names its dependent.
+    let mut db = Db::new();
+    db.seed();
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+    let mut w = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'writer' RUN 'r_write';", &mut w);
+    db.ok("UPDATE inventory SET qty = 99 WHERE 7 = id;", &mut w);
+    assert!(report(db.ok("MERGE;", &mut w)).applied_to_target);
+    let mut main = db.session();
+    let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert_eq!(
+        halted.blocked_by,
+        vec![TxnId(2)],
+        "the mirrored clause still names its dependent, got {:?}",
+        halted.blocked_by
+    );
+}

@@ -3915,10 +3915,23 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
         Some(c) => c.name.clone(),
         None => return AccessShape::FullScan,
     };
+    // **Both operand orders.** `7 = id` is `id = 7`, and classifying only one of them is not a
+    // neutral omission: the two spellings then get different answers out of every consumer of the
+    // shape. Measured before this was mirrored — `UPDATE inventory SET qty = 99 WHERE id = 7`
+    // reported row 7 as a blind write and `... WHERE 7 = id` reported nothing, because the second
+    // fell through to `FullScan` and so counted as an inspection. Identical semantics, opposite
+    // outcome, decided by syntax, which is the same defect shape as the point-lookup absence case.
+    //
+    // `comparison_range` already mirrors, with the same reasoning written out at `mirror`. This is
+    // that rule applied at the one other place operand order is read, rather than a second copy of
+    // it: equality is its own mirror, so there is nothing to translate here beyond accepting the
+    // swap.
     match where_clause {
         Some(Expr::BinaryOp { left, operator: TokenType::Equal, right }) => {
-            let points_at_pk = matches!(&**left, Expr::ColumnRef { column, .. } if *column == pk)
-                && matches!(&**right, Expr::Literal { .. });
+            let names_pk = |e: &Expr| matches!(e, Expr::ColumnRef { column, .. } if *column == pk);
+            let is_literal = |e: &Expr| matches!(e, Expr::Literal { .. });
+            let points_at_pk = (names_pk(left) && is_literal(right))
+                || (is_literal(left) && names_pk(right));
             if points_at_pk {
                 AccessShape::IndexLookup
             } else {
