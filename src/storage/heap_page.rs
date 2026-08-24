@@ -18,6 +18,23 @@ pub struct Page {
 
 pub const HEADER_SIZE: usize = 23;
 pub const SLOT_ENTRY_SIZE: usize = 4;
+
+/// The largest tuple any page can ever hold, and therefore the only size question that can be
+/// answered *before* touching a page.
+///
+/// A fresh page's whole free span is `PAGE_SIZE - HEADER_SIZE`, and `insert` also has to fit the
+/// one slot entry it appends, so `HEADER_SIZE + SLOT_ENTRY_SIZE` is what a tuple can never have.
+/// `Page::insert` derives the same number at runtime from `get_free_space_start`/
+/// `get_free_space_end`; this constant is not a second opinion about the layout but the same
+/// arithmetic evaluated for an empty page, and
+/// `integration_alter_refusal_safety::max_tuple_size_is_the_boundary_page_insert_actually_enforces`
+/// pins the two against each other in both directions.
+///
+/// It exists because "will this tuple fit *somewhere*" has to be answerable while the heap is
+/// still untouched. `HeapFileManager::update` relocates a tuple by deleting it and re-inserting
+/// it, so a caller that discovers the answer from the failed insert discovers it one step too
+/// late — see the refusal in `update` and the precheck in `catalog::alter::rewrite_heap`.
+pub const MAX_TUPLE_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_ENTRY_SIZE;
 const HEAP_PAGE_TYPE:u8 = 0;
 // HEADER LAYOUT: |page_type (u8, 1)|page_id (u32, 4)|num_slots (u16, 2)|
 // free_space_start (u16, 2)|free_space_end (u16, 2)|lsn (u64, 8)|checksum (u32, 4)
