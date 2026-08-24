@@ -737,3 +737,63 @@ fn parentheses_do_not_change_the_access_shape() {
         "a parenthesised range is still a range"
     );
 }
+
+// ---- a task that staged nothing, whose CHILD published work of its own ---------------------------
+
+/// **The precision half of the fork rule, and nothing else pinned it.**
+///
+/// A capture must SURVIVE an `ABANDON` when a descendant published writes this task staged, because
+/// a fork snapshots the parent's staged rows and the child's `MERGE` publishes them
+/// (`adv_f6_dropped_capture` is that direction). The converse has to hold just as hard: a task that
+/// staged NOTHING handed its child nothing to publish, so its own discarded scan must stop blocking
+/// reverts exactly as F6 requires -- fork or no fork.
+///
+/// Measured as unpinned before this test existed. Making `Workspace::inherited` chain the parent
+/// unconditionally, instead of only when the parent had staged rows or schema edits to hand over,
+/// left all 18 tests across `provenance_retention_wiring`, `provenance_scan_cascade` and
+/// `adv_f6_dropped_capture` GREEN -- while restoring F6's forever-blocking ghost for every task
+/// that happens to have a child. A guard no test can kill is a guard that will be deleted by
+/// accident.
+///
+/// Anti-vacuity first, as everywhere else in this file: the same reader blocks while the parent is
+/// live, so this cannot pass by retention being broken outright.
+#[test]
+fn a_ghost_parent_that_staged_nothing_stops_blocking_once_its_child_has_merged() {
+    let mut db = Db::new();
+    db.seed();
+    let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
+
+    let mut ghost = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'ghost' RUN 'r_ghost';", &mut ghost);
+    let seen = rows(db.ok(
+        "SELECT id, qty FROM inventory WHERE qty >= 20 AND qty < 50;",
+        &mut ghost,
+    ));
+    assert_eq!(seen.len(), 2, "rows 1 and 7 are in [20, 50): {seen:?}");
+    let gbranch = ghost.agent.as_ref().unwrap().branch;
+    let gtxn = ghost.agent.as_ref().unwrap().txn;
+
+    let mut main = db.session();
+    let blocked = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(blocked.is_blocked(), "a live scanner must still block the revert");
+    assert_eq!(blocked.blocked_by, vec![gtxn], "got {:?}", blocked.blocked_by);
+
+    // A CHILD forks off the live parent and merges a write of ITS OWN. The parent staged nothing,
+    // so nothing of the parent's reaches the shared tables through this merge.
+    let cs = db.runtime.begin_session("ghost-child", Some("r_child"), gbranch).unwrap();
+    let mut child = db.session();
+    child.agent = Some(cs);
+    db.ok("INSERT INTO inventory VALUES (11, 4);", &mut child);
+    let r = report(db.ok("MERGE;", &mut child));
+    assert!(r.applied_to_target, "the child failed to merge: {r}");
+
+    db.ok("ABANDON;", &mut ghost);
+
+    let free = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
+    assert!(
+        !free.is_blocked(),
+        "the parent staged nothing for its child to publish, so its discarded scan must stop \
+         blocking the revert: {:?}",
+        free.blocked_by
+    );
+}

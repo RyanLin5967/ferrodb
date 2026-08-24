@@ -156,6 +156,17 @@ struct Workspace {
     rows: BTreeMap<(u32, u64), RowState>,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
+    /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
+    ///
+    /// A fork takes a snapshot of the parent's `rows`/`schema_edits` rather than a link, so a
+    /// child's `MERGE` publishes writes its ANCESTORS staged. Those ancestors' captures are the
+    /// read premises for rows that are now in the shared tables, and F6's discriminator
+    /// (`published`, meaning "did *this* branch's own seal come from a merge") cannot see that:
+    /// the ancestor's own seal is an ABANDON or a reap. Without this list, dropping its capture
+    /// silently deletes the premise of a published row -- measured as
+    /// `REVERT MERGE m1` reporting `blocked_by = []` and then removing the row the published row
+    /// was derived from.
+    inherited: Vec<TxnId>,
     tables: BTreeMap<u32, String>,
     frame: TxnFrame,
     // B11's fields, WITHOUT its `reads`: B4 deleted `Workspace::reads` as a second copy of a
@@ -260,6 +271,14 @@ struct State {
     /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
     /// become visible to everyone else, which is the moment they can start being read.
     captures: BTreeMap<u64, TxnCapture>,
+    /// Txns whose staged writes reached the shared tables -- by their own `MERGE`, or by a
+    /// DESCENDANT's merge publishing writes the descendant inherited at fork time.
+    ///
+    /// A capture may only be dropped for a task that published nothing (F6). "Published" is a
+    /// property of the WRITES, not of which branch happened to call `MERGE`, so it is recorded
+    /// here when the publish happens rather than re-derived at seal time from a flag that cannot
+    /// answer for an ancestor.
+    published_txns: BTreeSet<u64>,
     policy: PolicyTable,
 }
 
@@ -633,6 +652,18 @@ impl AgentRuntime {
             Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
             None => (Vec::new(), BTreeMap::new()),
         };
+        // Which ancestors' staged writes did that snapshot just hand us? Only recorded when the
+        // parent actually had staged state to hand over: a parent that staged nothing has no
+        // published write for a descendant to protect, and naming it here would re-open exactly
+        // the leak F6 closed -- a ghost task's scan blocking every revert forever.
+        let inherited: Vec<TxnId> = match state.workspaces.get(&parent.id) {
+            Some(p) if !p.rows.is_empty() || !p.schema_edits.is_empty() => {
+                let mut v = p.inherited.clone();
+                v.push(p.txn);
+                v
+            }
+            _ => Vec::new(),
+        };
         state.workspaces.insert(
             branch.id,
             Workspace {
@@ -644,6 +675,7 @@ impl AgentRuntime {
                 rows,
                 base_rows,
                 tables,
+                inherited,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
                 // A child forked from a live agent task inherits its parent's pending schema
                 // edits for the same reason it inherits its rows: the child's visible state IS
@@ -2815,10 +2847,13 @@ impl AgentRuntime {
             .collect();
         let mut state = self.state.lock().unwrap();
         for (id, name, bid) in &gone {
-            // Reaped without client cooperation, so nothing this branch buffered was published:
-            // the same reasoning as the ABANDON arm of `seal`, and reached by a different door.
+            // Reaped without client cooperation, so nothing this branch buffered was published
+            // BY IT: the same reasoning as the ABANDON arm of `seal`, and reached by a different
+            // door. A descendant may still have published what this branch staged, so the same
+            // helper decides -- the reaper is the door the fixture reaches this through with no
+            // client cooperation at all.
             if let Some(ws) = state.workspaces.remove(id) {
-                state.captures.remove(&ws.txn.0);
+                forget_captures_unless_published(&mut state, &ws);
             }
             state.names.remove(name);
             state.escrow.release(*bid);
@@ -2856,6 +2891,19 @@ impl AgentRuntime {
             } else {
                 state.escrow.release(branch);
             }
+            // Record WHOSE writes just became readable, before the workspace goes. A merge
+            // publishes this branch's staged rows and every ancestor's row it inherited at fork
+            // time, so all of those captures are now the premises of published rows and none of
+            // them may be dropped by a later abandon or reap.
+            if published {
+                if let Some(ws) = state.workspaces.get(&branch.id) {
+                    let mut newly: Vec<u64> = ws.inherited.iter().map(|t| t.0).collect();
+                    newly.push(ws.txn.0);
+                    for t in newly {
+                        state.published_txns.insert(t);
+                    }
+                }
+            }
             if let Some(ws) = state.workspaces.remove(&branch.id) {
                 state.names.remove(&ws.name);
                 // **A task that published nothing is not a dependent of anything.**
@@ -2874,8 +2922,17 @@ impl AgentRuntime {
                 // name is the dangerous mode, training the operator away from the default that
                 // exists to protect them. Over-reporting is the safe direction for a REGION; a
                 // name with nothing behind it is not a region error, it is a dead entry.
+                //
+                // **But "published" here means THIS branch's seal came from a merge, and that is
+                // not the same question as whether its staged writes reached the shared tables.**
+                // A fork copies the parent's staged rows, so a child's `MERGE` publishes writes
+                // its ancestors staged; the ancestor then seals through ABANDON or the reaper with
+                // `published = false`, and dropping its capture deletes the read premise of a row
+                // that is live in the shared tables right now. Measured before this:
+                // `REVERT MERGE m1` reported `blocked_by = []` and went on to remove row 7, the
+                // row that published row 9 was derived from. So the decision is delegated.
                 if !published {
-                    state.captures.remove(&ws.txn.0);
+                    forget_captures_unless_published(&mut state, &ws);
                 }
             }
         }
@@ -3491,6 +3548,46 @@ struct PublishedImages {
 /// code in the tree that composes read-after-write edges over exact versions with the edges derived
 /// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
 /// does not keep a second copy of it, which is the reconciliation this lane exists to make.
+/// Drop the captures of a workspace that is going away WITHOUT having published anything -- and of
+/// any ancestor whose protection lapsed at the same moment.
+///
+/// F6's rule is right: a task that published nothing is not a dependent of anything, and keeping its
+/// capture made every scan it ever ran block reverts forever. What F6 got wrong is WHO published.
+/// `seal`'s `published` flag answers "did this branch's own seal come from a merge", while the
+/// question a capture's lifetime turns on is "did the writes this capture is the premise for reach
+/// the shared tables". Those differ whenever a fork is involved, because a fork snapshots the
+/// parent's staged rows: the child's `MERGE` publishes them and the parent then seals through
+/// ABANDON or the reaper with `published = false`.
+///
+/// So a capture survives while any of these holds:
+///
+/// - its own writes were published (`published_txns`, recorded by `seal` at the publish);
+/// - a descendant already published writes it staged (also `published_txns`, because `seal` records
+///   the whole inherited chain, not just the merging branch);
+/// - a LIVE workspace still carries its staged writes and could publish them yet.
+///
+/// Ancestors are considered deepest-first: an ancestor's protection can only lapse once the
+/// descendant that was holding it is gone, and the caller has already removed `ws` from the map.
+fn forget_captures_unless_published(state: &mut State, ws: &Workspace) {
+    let mut candidates: Vec<TxnId> = ws.inherited.clone();
+    candidates.push(ws.txn);
+    for txn in candidates.into_iter().rev() {
+        if capture_is_protected(state, txn) {
+            continue;
+        }
+        state.captures.remove(&txn.0);
+    }
+}
+
+/// Is anything still relying on `txn`'s capture -- a publish that happened, or one that still could?
+fn capture_is_protected(state: &State, txn: TxnId) -> bool {
+    state.published_txns.contains(&txn.0)
+        || state
+            .workspaces
+            .values()
+            .any(|w| w.txn == txn || w.inherited.contains(&txn))
+}
+
 fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
     let mut log = ProvenanceLog::new();
     for c in captures.values() {
