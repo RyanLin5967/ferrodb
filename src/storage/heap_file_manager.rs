@@ -53,6 +53,19 @@ impl HeapFileManager {
         if let Some(id) = self.find_page_with_space(tuple_len as u16 + SLOT_ENTRY_SIZE as u16)? {
             return Ok(id);
         }
+        self.add_empty_page()
+    }
+
+    /// Allocate one empty data page and record it in the directory. **Always allocates.**
+    ///
+    /// Separate from [`Self::find_or_make_page`] because "give me somewhere to put this tuple" and
+    /// "give me one more page" are different requests, and conflating them does not terminate: an
+    /// empty page has exactly `PAGE_SIZE - HEADER_SIZE` free, which satisfies the search for the
+    /// largest tuple a page can hold, so a loop calling `find_or_make_page` to grow the heap finds
+    /// the page it added last time and adds nothing. That is not hypothetical — it hung
+    /// `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`, a 200-row
+    /// ALTER needing eleven pages, for eighteen minutes with no output.
+    fn add_empty_page(&self) -> Result<u32, FerroError> {
         let new_page_id = self.buffer_pool_manager.new_page()?;
         self.buffer_pool_manager.unpin_page(new_page_id, false);
         let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
@@ -99,10 +112,15 @@ impl HeapFileManager {
     /// allocates. It converts the common exhaustion — no room anywhere — into a refusal before the
     /// first write, and leaves fragmentation to the reserve-before-delete order in [`Self::update`].
     pub fn reserve_free_space(&self, bytes: usize) -> Result<usize, FerroError> {
+        // `free_space` walks the whole directory chain, so it is read ONCE and then advanced by
+        // what each added page is worth. Re-reading it per iteration made growing the heap by n
+        // pages cost n directory walks, which is quadratic in the size of the table being altered.
+        let mut free = self.free_space()?;
+        let per_page = PAGE_SIZE - HEADER_SIZE;
         let mut added = 0usize;
-        let usable = PAGE_SIZE - HEADER_SIZE - SLOT_ENTRY_SIZE;
-        while self.free_space()? < bytes {
-            self.find_or_make_page(usable)?;
+        while free < bytes {
+            self.add_empty_page()?;
+            free += per_page;
             added += 1;
         }
         Ok(added)

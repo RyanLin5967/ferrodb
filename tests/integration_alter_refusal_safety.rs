@@ -977,6 +977,49 @@ fn an_unlogged_update_that_cannot_obtain_a_page_refuses_instead_of_deleting_the_
     assert!(heap.read(rids[0]).is_ok(), "the row's slot was deleted by an update that failed");
 }
 
+/// An ALTER that needs **many** reserved pages must finish, and must carry every row.
+///
+/// `reserve_free_space` grows the heap before pass 2 so an exhausted allocator is a refusal rather
+/// than a half-converted heap. Its first version asked `find_or_make_page` for the space, which
+/// *found* the empty page it had just added — an empty page has exactly the free span that search
+/// looks for — so it added one page and then spun. Every fixture in this file needed at most one
+/// page and passed; `integration_alter_column::a_lookup_by_key_still_finds_a_row_the_rewrite_moved`
+/// is the test that hung, and it hung with no output rather than failing, which is why a bound is
+/// on this one.
+///
+/// 200 rows of ~214 bytes fill a dozen pages with almost no slack, so appending a column has to
+/// reserve about eleven more. The assertion is not just that it terminates: every row must come
+/// back, by key as well as by scan, because a reservation that grows the heap is also a reservation
+/// that moves rows between pages.
+#[test]
+fn an_alter_that_must_reserve_many_pages_completes_and_keeps_every_row() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, pad VARCHAR(200));");
+    let pad = "z".repeat(180);
+    for i in 1..=200 {
+        d.sql(&format!("INSERT INTO t VALUES ({i}, '{pad}');"));
+    }
+    let pages: std::collections::BTreeSet<u32> =
+        d.heap("t").iter().map(|(rid, _)| rid.page_id).collect();
+    assert!(
+        pages.len() >= 10,
+        "the fixture must span enough pages to need more than one reserved: {} page(s)",
+        pages.len()
+    );
+
+    d.sql("ALTER TABLE t ADD COLUMN note VARCHAR(20);");
+
+    assert_eq!(d.shape("t").len(), 3);
+    let rows = d.rows("SELECT id, note FROM t;").unwrap();
+    assert_eq!(rows.len(), 200, "the rewrite lost rows");
+    assert!(rows.iter().all(|r| r[1] == Value::Null), "the appended column is not NULL everywhere");
+    let keys: Vec<Value> = (1..=200).map(Value::Integer).collect();
+    let answers = d.by_key("t", &keys);
+    let unreachable: Vec<&Value> =
+        answers.iter().filter(|(_, rid)| rid.is_none()).map(|(k, _)| k).collect();
+    assert!(unreachable.is_empty(), "rows the primary index can no longer find: {unreachable:?}");
+}
+
 /// `MAX_TUPLE_SIZE` is the number the precheck refuses against, and the precheck is only correct if
 /// it is the real boundary of `Page::insert`. Pinned by measurement in both directions rather than
 /// by restating the arithmetic: a fresh page takes a tuple of exactly `MAX_TUPLE_SIZE` bytes and
