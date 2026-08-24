@@ -634,20 +634,6 @@ impl LogicalDecoder {
         Ok(())
     }
 
-    /// Drop a remembered DDL that says nothing its predecessor did not.
-    ///
-    /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
-    /// against the log's base, and a live subscription pins the base, so under a held pin nothing
-    /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
-    /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
-    /// for every table after every truncation, so a long-running database mints one entry per table
-    /// per checkpoint, all carrying the identical shape.
-    ///
-    /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
-    /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
-    /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
-    /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
-    /// ranges in between.
     /// Fold newly-seen DDL into the remembered history.
     ///
     /// Merged rather than assigned, and keyed on `(lsn, dir_root)`: two threads may pump
@@ -669,6 +655,20 @@ impl LogicalDecoder {
         Self::collapse_repeats(shapes);
     }
 
+    /// Drop a remembered DDL that says nothing its predecessor did not.
+    ///
+    /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
+    /// against the log's base, and a live subscription pins the base, so under a held pin nothing
+    /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
+    /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
+    /// for every table after every truncation, so a long-running database mints one entry per table
+    /// per checkpoint, all carrying the identical shape.
+    ///
+    /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
+    /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
+    /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
+    /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
+    /// ranges in between.
     fn collapse_repeats(shapes: &mut Vec<ShapeAt>) {
         let mut newest: HashMap<u32, usize> = HashMap::new();
         let mut drop: Vec<usize> = Vec::new();
