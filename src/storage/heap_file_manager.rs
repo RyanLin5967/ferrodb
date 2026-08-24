@@ -107,10 +107,28 @@ impl HeapFileManager {
     /// unlogged and therefore has no undo. Failing here is harmless: the only thing it can leave
     /// behind is empty pages the heap will use for its next insert, and not one tuple has moved.
     ///
-    /// **What it does not promise.** Free space in the aggregate is not free space in one page: the
-    /// pages counted may each hold less than the next tuple needs, in which case an insert still
+    /// **What it does not promise, one.** Free space in the aggregate is not free space in one page:
+    /// the pages counted may each hold less than the next tuple needs, in which case an insert still
     /// allocates. It converts the common exhaustion — no room anywhere — into a refusal before the
     /// first write, and leaves fragmentation to the reserve-before-delete order in [`Self::update`].
+    ///
+    /// An adversarial pass tried to reach that fragmentation case through `ADD COLUMN` and a retype
+    /// and could not, with a reason worth keeping: those alterations grow *every* row by the same
+    /// amount, so a page whose own rows need more space than it has free is exactly a page that
+    /// contributed that shortfall to the aggregate — per-page free space cannot be short while the
+    /// total is sufficient. It did **not** test whether a hole left by `DELETE` (whose bytes are
+    /// never reclaimed, since nothing compacts a heap page) breaks that argument, so it is narrowed
+    /// rather than closed.
+    ///
+    /// **What it does not promise, two.** A reservation that adds pages and *then* fails leaves
+    /// those pages in the heap. They are empty and in the page directory, so the next insert uses
+    /// them; no row, value, shape, index answer or feed record differs, and a reader cannot tell.
+    /// The file is one page per added page longer, which is a durable difference produced by a
+    /// statement that reported failure, and it is left that way on purpose: giving them back means
+    /// removing directory entries and calling `DiskManager::deallocate`, and a page freed while a
+    /// directory still lists it is handed to another table — real corruption traded for a leak that
+    /// costs nothing and is reused. Pinned by
+    /// `integration_alter_refusal_safety::a_refusal_after_a_partial_reservation_leaves_only_empty_pages`.
     pub fn reserve_free_space(&self, bytes: usize) -> Result<usize, FerroError> {
         // `free_space` walks the whole directory chain, so it is read ONCE and then advanced by
         // what each added page is worth. Re-reading it per iteration made growing the heap by n

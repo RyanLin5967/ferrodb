@@ -1039,6 +1039,67 @@ fn an_alter_that_must_reserve_many_pages_completes_and_keeps_every_row() {
     assert!(unreachable.is_empty(), "rows the primary index can no longer find: {unreachable:?}");
 }
 
+/// The one durable difference a refusal is allowed to leave, asserted rather than glossed over.
+///
+/// `reserve_free_space` grows the heap before pass 2. If the allocator dies *part way through that
+/// growth* — headroom for three pages when eleven are wanted — the pages already added stay. This
+/// test pins both halves of that: nothing a reader can see differs, and the heap really is bigger.
+/// Stating it as an assertion is the point; a residual that no test names is a residual the next
+/// reader will not know about. `reserve_free_space`'s own doc says why the pages are not given back.
+///
+/// Found by a fresh-context durability pass, which measured the same thing on a wedged ALTER: the
+/// file grew from 28672 to 32768 bytes while the WAL stayed byte-identical.
+#[test]
+fn a_refusal_after_a_partial_reservation_leaves_only_empty_pages() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, pad VARCHAR(200));");
+    let pad = "z".repeat(180);
+    for i in 1..=200 {
+        d.sql(&format!("INSERT INTO t VALUES ({i}, '{pad}');"));
+    }
+    let keys: Vec<Value> = (1..=200).map(Value::Integer).collect();
+    let before = snapshot(&mut d, "t", "SELECT id, pad FROM t;", &keys);
+    let feed_before = d.schema_changes();
+    let root = d.catalog.get_table("t").unwrap().first_directory_page_id;
+    let heap = HeapFileManager::open(root, d.bp.clone());
+    let free_before = heap.free_space().unwrap();
+
+    // Headroom for three more pages; the alteration wants about eleven.
+    let floor = d.bp.disk_manager.high_water().unwrap() + 3;
+    d.bp.disk_manager.reserve_from(floor).unwrap();
+
+    let e = d
+        .try_sql("ALTER TABLE t ADD COLUMN note VARCHAR(20);")
+        .err()
+        .expect("three pages of headroom must not be enough for a 200-row rewrite");
+    assert!(
+        e.to_string().contains("the reserved arena region at page"),
+        "refused for some reason other than the exhausted table region: {e}"
+    );
+
+    // Nothing a reader can see moved.
+    let after = snapshot(&mut d, "t", "SELECT id, pad FROM t;", &keys);
+    assert_eq!(before, after, "the refusal changed reader-visible state ({e})");
+    assert_eq!(feed_before, d.schema_changes(), "the refusal reached the change feed");
+
+    // And the documented exception: the heap is bigger, by whole empty pages.
+    let free_after = heap.free_space().unwrap();
+    assert!(
+        free_after > free_before,
+        "the fixture never got as far as adding a page, so it does not measure the exception: \
+         free space {free_before} -> {free_after}"
+    );
+    assert_eq!(
+        (free_after - free_before) % (4096 - 23),
+        0,
+        "the extra free space is not a whole number of empty pages: {free_before} -> {free_after}"
+    );
+
+    // The pages are reused rather than leaked: an insert lands without asking the dead allocator.
+    d.sql("INSERT INTO t VALUES (201, 'after');");
+    assert_eq!(d.rows("SELECT id FROM t;").unwrap().len(), 201, "the reserved pages were not reusable");
+}
+
 /// `MAX_TUPLE_SIZE` is the number the precheck refuses against, and the precheck is only correct if
 /// it is the real boundary of `Page::insert`. Pinned by measurement in both directions rather than
 /// by restating the arithmetic: a fresh page takes a tuple of exactly `MAX_TUPLE_SIZE` bytes and
