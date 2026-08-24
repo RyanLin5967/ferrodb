@@ -1428,3 +1428,111 @@ fn a_pump_after_an_alter_does_not_silently_truncate_the_row() {
          pump reported a clean run:\n{row}"
     );
 }
+
+/// **The history must not grow for the life of the process — I20, adversarial pass.**
+///
+/// `forget_truncated` prunes against the log's BASE, and a live consumer PINS that base so the
+/// records it still needs are not discarded. Under a held pin nothing was ever pruned, and the
+/// entries are mostly not schema changes at all: `replay_schema` re-appends a `CreateTable` for
+/// every table after every truncation, so a long-running database mints one entry per table per
+/// checkpoint, every one carrying the identical shape. Measured before `collapse_repeats` at 603
+/// entries and still climbing.
+///
+/// The pin is what makes this test not vacuous — a first version without one passed against the
+/// unfixed code, because an advancing base pruned the history for free.
+#[test]
+fn the_decoders_history_does_not_grow_with_every_checkpoint() {
+    use std::sync::atomic::Ordering;
+
+    let mut d = db();
+    d.sql("CREATE TABLE a (id INTEGER NOT NULL);");
+    d.sql("CREATE TABLE b (id INTEGER NOT NULL);");
+    d.sql("CREATE TABLE c (id INTEGER NOT NULL);");
+    d.wal.flush().unwrap();
+
+    let decoder = LogicalDecoder::new(&d.catalog);
+    let base0 = d.wal.base_lsn.load(Ordering::SeqCst);
+    // Exactly what a live `Subscription` does: hold the log at this consumer's cursor.
+    let _pin = d.wal.pin(base0).expect("pin");
+
+    let mut cursor = base0;
+    for round in 0..60 {
+        d.sql(&format!("INSERT INTO a VALUES ({round});"));
+        d.txn.checkpoint().expect("checkpoint");
+        d.wal.flush().unwrap();
+        let to = d.wal.next_lsn.load(Ordering::SeqCst);
+        decoder.decode(&d.wal, cursor, to).expect("decode");
+        cursor = to;
+    }
+
+    assert_eq!(
+        d.wal.base_lsn.load(Ordering::SeqCst),
+        base0,
+        "the pin did not hold the base still; this test would be measuring the wrong thing"
+    );
+    let len = decoder.history_len();
+    assert!(
+        len <= 12,
+        "the history grew to {len} entries over 60 checkpoints that changed no shape; it is \
+         unbounded in the life of the process"
+    );
+}
+
+/// **An LSN means nothing outside its own log — I20, adversarial pass.**
+///
+/// `decode` takes the log as an argument, so one decoder can legitimately be pointed at two. Before
+/// the history was bound to a log, a `DROP TABLE` in log A sitting at an LSN below log B's range
+/// removed the table from log B's feed — the rows came back unresolved and the feed lost them
+/// silently.
+///
+/// The control decoder is the load-bearing part: it fixes what the answer SHOULD be without any
+/// reference to log A, so this cannot pass by both paths being equally broken.
+#[test]
+fn history_learned_from_one_log_is_not_applied_to_another() {
+    use std::sync::atomic::Ordering;
+
+    let mut a = db();
+    a.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    a.sql("INSERT INTO inv VALUES (1, 10);");
+    let root_a = a.catalog.get_table("inv").unwrap().first_directory_page_id;
+    a.sql("DROP TABLE inv;");
+    a.wal.flush().unwrap();
+
+    let mut b = db();
+    b.sql("CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);");
+    b.wal.flush().unwrap();
+    let root_b = b.catalog.get_table("inv").unwrap().first_directory_page_id;
+    assert_eq!(root_a, root_b, "the two logs use different dir_roots; this test needs the same one");
+
+    // Log B is written well past log A's LSNs, so log A's DROP sits BELOW the range decoded here
+    // and would therefore be replayed into its seeding.
+    for i in 0..40 {
+        b.sql(&format!("INSERT INTO inv VALUES ({i}, {i});"));
+    }
+    b.wal.flush().unwrap();
+    let split = b.wal.next_lsn.load(Ordering::SeqCst);
+    b.sql("INSERT INTO inv VALUES (777, 70);");
+    b.sql("INSERT INTO inv VALUES (888, 80);");
+    b.wal.flush().unwrap();
+    let end = b.wal.next_lsn.load(Ordering::SeqCst);
+    assert!(
+        a.wal.next_lsn.load(Ordering::SeqCst) < split,
+        "log A's records are not below log B's range; this test would be vacuous"
+    );
+
+    let control = LogicalDecoder::new(&b.catalog).decode(&b.wal, split, end).expect("control");
+
+    let shared = LogicalDecoder::new(&b.catalog);
+    shared
+        .decode(&a.wal, a.wal.base_lsn.load(Ordering::SeqCst), a.wal.next_lsn.load(Ordering::SeqCst))
+        .expect("decode log A");
+    let after = shared.decode(&b.wal, split, end).expect("decode log B");
+
+    assert_eq!(
+        (after.events.len(), after.unresolved.clone()),
+        (control.events.len(), control.unresolved.clone()),
+        "walking a DIFFERENT log first changed what this log decodes to: a DROP TABLE in log A at \
+         an LSN below log B's range removed the table from log B's feed"
+    );
+    assert!(control.events.len() >= 2, "the control decoded nothing; this test would be vacuous");
+}

@@ -471,3 +471,40 @@ fn every_column_alteration_halts_the_replica() {
         assert!(applier.diverged().is_some(), "{alteration:?} did not latch");
     }
 }
+
+/// The halt unwraps a `Clr` — I20, adversarial pass.
+///
+/// Nothing in this codebase can produce a `Clr` wrapping a `Ddl`: DDL is refused inside a
+/// transaction and a `Clr` is only written while rolling one back. The arm exists anyway, and this
+/// test hand-builds the record to prove it, because a guard over what may be applied should be an
+/// allowlist rather than a list of the shapes somebody happened to think of — and the cost of being
+/// wrong about reachability is a silently diverged replica.
+#[test]
+fn an_alter_wrapped_in_a_clr_still_halts_the_replica() {
+    use ferrodb::catalog::column::DataType;
+    use ferrodb::wal::log::{ColumnAlteration, DdlOp};
+
+    let p = pair("clralter");
+    let start = ferrodb::replication::ReplicationSource::new(&p.primary_wal).start_lsn();
+    let applier = ReplicaApplier::new(p.replica_bp.clone(), start);
+
+    let inner = RecKind::Ddl {
+        op: DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+        table: "inv".into(),
+        dir_root: 1,
+        time_travel_root: 2,
+        columns: vec![("id".to_string(), DataType::Integer, false)],
+    };
+    p.primary_wal
+        .append(1, 0, &RecKind::Clr { undone_lsn: 0, undo_next: 0, redo: Box::new(inner) })
+        .expect("append");
+    p.primary_wal.flush().unwrap();
+
+    let src = ferrodb::replication::ReplicationSource::new(&p.primary_wal);
+    let (bytes, next) = src.read_from(applier.applied_lsn(), 1 << 20).expect("read");
+    let err = applier
+        .apply(next - bytes.len() as u64, &bytes)
+        .expect_err("an AlterColumn wrapped in a Clr walked straight past the guard");
+    assert!(format!("{err}").contains("DIVERGED"), "{err}");
+    assert!(applier.diverged().is_some(), "the divergence was not latched");
+}

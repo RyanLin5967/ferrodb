@@ -353,6 +353,14 @@ enum RowResult {
     Undecodable,
 }
 
+/// The DDL one log has taught this decoder, and which log that was.
+#[derive(Default)]
+struct Learned {
+    /// The log these LSNs refer to. `None` until the first decode.
+    log: Option<std::path::PathBuf>,
+    shapes: Vec<ShapeAt>,
+}
+
 /// One shape a DDL record put into force, and where in the log it did so.
 ///
 /// See [`LogicalDecoder::history`] for what this is for. `entry` is `None` for a `DROP TABLE`:
@@ -391,7 +399,13 @@ pub struct LogicalDecoder {
     /// sit. So what is kept is the DDL *with its LSN*, and a decode of `[from, to)` seeds itself by
     /// replaying only the entries strictly below `from`. Decoding the same range twice therefore
     /// produces the same answer both times, and decoding the next range forward carries the shape.
-    history: Mutex<Vec<ShapeAt>>,
+    ///
+    /// **An LSN only means something within ONE log**, so the history is bound to the first log
+    /// this decoder walks and discarded if it is handed a different one. Nothing stops a caller
+    /// passing two `WalManager`s to one decoder — `decode` takes the log as an argument — and
+    /// without this a `DROP TABLE` in log A at an LSN below log B's range removed the table from
+    /// log B's feed. Found by an adversarial pass, not by reasoning about it.
+    history: Mutex<Learned>,
 }
 
 impl LogicalDecoder {
@@ -412,7 +426,7 @@ impl LogicalDecoder {
             );
             time_travel.insert(entry.time_travel_root);
         }
-        LogicalDecoder { tables, time_travel, history: Mutex::new(Vec::new()) }
+        LogicalDecoder { tables, time_travel, history: Mutex::new(Learned::default()) }
     }
 
     /// Build a decoder for a single table, without a catalog.
@@ -434,7 +448,7 @@ impl LogicalDecoder {
         LogicalDecoder {
             tables,
             time_travel: BTreeSet::from([time_travel_root]),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(Learned::default()),
         }
     }
 
@@ -448,7 +462,7 @@ impl LogicalDecoder {
         LogicalDecoder {
             tables: HashMap::new(),
             time_travel: BTreeSet::new(),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(Learned::default()),
         }
     }
 
@@ -501,6 +515,55 @@ impl LogicalDecoder {
         if let Some(root) = shape.time_travel_root {
             time_travel.insert(root);
         }
+    }
+
+    /// Drop a remembered DDL that says nothing its predecessor did not.
+    ///
+    /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
+    /// against the log's base, and a live subscription pins the base, so under a held pin nothing
+    /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
+    /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
+    /// for every table after every truncation, so a long-running database mints one entry per table
+    /// per checkpoint, all carrying the identical shape.
+    ///
+    /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
+    /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
+    /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
+    /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
+    /// ranges in between.
+    fn collapse_repeats(shapes: &mut Vec<ShapeAt>) {
+        let mut newest: HashMap<u32, usize> = HashMap::new();
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, s) in shapes.iter().enumerate() {
+            if let Some(&prev) = newest.get(&s.dir_root) {
+                let p: &ShapeAt = &shapes[prev];
+                let same = match (&p.entry, &s.entry) {
+                    (None, None) => true,
+                    (Some((pn, ps, _)), Some((sn, ss, _))) => pn == sn && ps == ss,
+                    _ => false,
+                };
+                if same && p.time_travel_root == s.time_travel_root {
+                    drop.push(i);
+                    continue;
+                }
+            }
+            newest.insert(s.dir_root, i);
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut i = 0usize;
+        shapes.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
+    /// How many DDL records this decoder is remembering. Read-only, for tests that need to show the
+    /// history is bounded rather than infer it from the absence of a symptom.
+    pub fn history_len(&self) -> usize {
+        self.history.lock().unwrap().shapes.len()
     }
 
     /// Drop remembered DDL that no range can ever ask about again.
@@ -559,8 +622,21 @@ impl LogicalDecoder {
         let mut time_travel = self.time_travel.clone();
         {
             let mut history = self.history.lock().unwrap();
-            Self::forget_truncated(&mut history, wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst));
-            for shape in history.iter().filter(|s| s.lsn < from_lsn) {
+            // One decoder, one log. See the field's doc: LSNs from a different file name different
+            // records, and applying them would delete or re-shape tables at random.
+            match &history.log {
+                Some(seen) if seen != &wal.path => {
+                    history.shapes.clear();
+                    history.log = Some(wal.path.clone());
+                }
+                None => history.log = Some(wal.path.clone()),
+                _ => {}
+            }
+            Self::forget_truncated(
+                &mut history.shapes,
+                wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
                 Self::apply_shape(&mut tables, &mut time_travel, shape);
             }
         }
@@ -864,13 +940,17 @@ impl LogicalDecoder {
         if !learned.is_empty() {
             let mut history = self.history.lock().unwrap();
             for shape in learned {
-                match history.iter().position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root)
+                match history
+                    .shapes
+                    .iter()
+                    .position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root)
                 {
-                    Some(at) => history[at] = shape,
-                    None => history.push(shape),
+                    Some(at) => history.shapes[at] = shape,
+                    None => history.shapes.push(shape),
                 }
             }
-            history.sort_by_key(|s| s.lsn);
+            history.shapes.sort_by_key(|s| s.lsn);
+            Self::collapse_repeats(&mut history.shapes);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
@@ -957,7 +1037,7 @@ mod tests {
             ),
         );
         // dir_root 8 is the table's time-travel heap: MVCC's own archive of superseded versions.
-        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]), history: Mutex::new(Vec::new()) }
+        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]), history: Mutex::new(Learned::default()) }
     }
 
     fn tuple_bytes(id: i32, qty: Option<i32>) -> Vec<u8> {
@@ -1380,7 +1460,7 @@ mod tests {
         let d = LogicalDecoder {
             tables: HashMap::new(),
             time_travel: BTreeSet::new(),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(Learned::default()),
         };
         assert_eq!(d.known_tables(), 0);
 

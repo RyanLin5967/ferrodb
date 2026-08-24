@@ -528,11 +528,21 @@ impl ReplicaApplier {
             // Scoped to `AlterColumn`. `CreateTable` and `DropTable` records are in every shipped
             // stream already — the log re-declares every table at each checkpoint — and neither
             // touches a heap page, so halting on those would stop every replica that exists.
+            // A `Clr` is unwrapped as well. Nothing in this codebase can produce a `Clr` wrapping a
+            // `Ddl` — DDL is refused inside a transaction and a `Clr` is only written while rolling
+            // one back — so this arm is unreachable today. It is here because the cost of being
+            // wrong about that is a silently diverged replica, and the cost of the arm is one line:
+            // a guard over what may be applied should be an allowlist, not a list of the shapes
+            // somebody happened to think of.
+            let kind = match &rec.kind {
+                crate::wal::log::RecKind::Clr { redo, .. } => redo.as_ref(),
+                other => other,
+            };
             let crate::wal::log::RecKind::Ddl {
                 op: crate::wal::log::DdlOp::AlterColumn(alteration),
                 table,
                 ..
-            } = &rec.kind
+            } = kind
             else {
                 continue;
             };
