@@ -10,4 +10,5 @@ pub mod index_fulltext;
 pub mod heap_scanner;
 pub mod range_scan;
 pub mod storage;
+pub mod atomic_file;
 pub mod sim;

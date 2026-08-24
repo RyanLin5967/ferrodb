@@ -22,8 +22,13 @@
 //! It said "every byte this database makes durable", and that was false. `run_cli` durably writes five
 //! files and only two of them are here. A fault cannot reach:
 //!
-//! * `<db>.arena` — [`crate::branch::arena::ArenaPageStore::checkpoint`] uses `std::fs::write` plus
-//!   `std::fs::rename`, and fsyncs neither the temporary file nor the directory.
+//! * `<db>.arena` — [`crate::branch::arena::ArenaPageStore::checkpoint`] now goes through
+//!   [`crate::storage::atomic_file`], which fsyncs the temporary **and** — on every platform but
+//!   Windows, where a directory cannot be opened as a `File` without a dependency this crate does
+//!   not have — the directory the rename changes; until I14 it fsynced neither, and this list said
+//!   so. What is still true is the part
+//!   this list is about: it reaches the filesystem through `std::fs` rather than through this trait,
+//!   so a fault cannot be *injected* there.
 //! * `<db>.branches` — `branch::catalog::LogBranchCatalog` appends with `write_all` + `sync_data` and
 //!   replays with `read_to_end`. Its `replay` has an explicit torn-tail branch, which is exactly the
 //!   fault class [`crate::storage::sim`] exists to inject and cannot reach there.

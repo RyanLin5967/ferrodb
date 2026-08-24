@@ -92,11 +92,27 @@ impl TwoTierReaper {
     /// returns zero, the interval rule over an extent that has gone finds no pages, and detaching
     /// from a parent that has already forgotten this child is a no-op.
     pub fn resume_interrupted_reaps(&self) -> Result<Vec<BranchId>, FerroError> {
-        let interrupted: Vec<BranchId> = self
+        let mut interrupted: Vec<BranchRecord> = self
             .catalog
             .all_records()
             .into_iter()
             .filter(|r| r.state == BranchState::Reaping && !r.branch_id.is_trunk())
+            .collect();
+        // Deepest first — the same key `reap_expired` uses, for the same reason plus one more.
+        //
+        // Reaping a child removes its epoch from the parent's live-children array, which is what
+        // lets the parent's own reap take the fast path AND what lets `release_id` hand the parent's
+        // id slot back: `release_id` refuses while `live_children` is non-empty, and `mark_reaped`
+        // does not clear that array, so nothing ever calls it for that slot again. Walked
+        // parent-first, the parent's slot is leaked for the lifetime of the database.
+        //
+        // `all_records` is ordered by branch id and a parent's id is normally below its child's, so
+        // unordered-by-depth here means *reliably* parent-first. Before this the hash order made it
+        // a coin flip; the ordering that made the durable sweep reproducible made the losing side
+        // of that flip certain, which is why the key belongs here rather than at the source.
+        interrupted.sort_by(|a, b| b.depth.cmp(&a.depth).then(b.fork_epoch.cmp(&a.fork_epoch)));
+        let interrupted: Vec<BranchId> = interrupted
+            .into_iter()
             .map(|r| BranchId::new(r.branch_id.id, r.generation))
             .collect();
         let mut done = Vec::with_capacity(interrupted.len());
@@ -291,7 +307,7 @@ impl Reaper for TwoTierReaper {
                     moved = true;
                 }
             }
-            self.store.put_pending(still_pinned);
+            self.store.put_pending(still_pinned)?;
             if !moved {
                 break;
             }
@@ -516,6 +532,128 @@ mod tests {
         assert_eq!(h.store.arena_owner(arena), None, "the extent went back whole");
         assert_eq!(h.store.reserved_page_count(), 0);
         assert_eq!(h.store.pending_len(), 0);
+    }
+
+    /// The same fast path as above, but asked what a **restart** sees. `free_arena` reaches the
+    /// durable free-space map only if it checkpoints, and until it did, a reap that a crash
+    /// followed left the extent charged to a branch that no longer exists.
+    #[test]
+    fn a_fast_path_reap_reaches_the_durable_map_not_just_memory() {
+        let (h, reaper) = setup();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-reap-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        write_pages(&h, b.branch_id, 11);
+        assert_eq!(reaper.reap(b.branch_id).unwrap(), 11);
+
+        let restarted = h.fresh_store();
+        assert!(restarted.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            restarted.arena_owner(arena),
+            None,
+            "after a restart the reaped branch's extent is still charged to it"
+        );
+        assert_eq!(
+            restarted.reserved_page_count(),
+            0,
+            "the space the reap reclaimed was lost again by the restart"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A parent resumed before its own child never gets its id slot back.**
+    ///
+    /// `release_id` refuses while `live_children` is non-empty, and `mark_reaped` does not clear
+    /// that array, so nothing calls it for that slot ever again. Resuming in branch-id order — the
+    /// ordering that made the record sweep reproducible — makes parent-first the *certain* order,
+    /// because a parent's id is below its child's. Deepest-first is the key `reap_expired` already
+    /// used, and this is the second reason for it.
+    #[test]
+    fn an_interrupted_reap_resumes_deepest_first_so_no_id_slot_is_stranded() {
+        let (h, reaper) = setup();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        write_pages(&h, parent.branch_id, 3);
+        write_pages(&h, child.branch_id, 3);
+        assert!(
+            parent.branch_id.id < child.branch_id.id,
+            "fixture: ids are not parent-below-child, so id order is not parent-first here"
+        );
+
+        // What a crash mid-reap leaves behind: the record durably `Reaping`, nothing freed yet.
+        for b in [parent.branch_id, child.branch_id] {
+            let mut rec = h.catalog.get_raw(b.id).unwrap();
+            rec.state = BranchState::Reaping;
+            h.catalog.put(&rec).unwrap();
+        }
+
+        assert_eq!(reaper.resume_interrupted_reaps().unwrap().len(), 2, "both reaps must finish");
+
+        let mut recycled: Vec<u64> = (0..2)
+            .map(|_| h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id.id)
+            .collect();
+        recycled.sort_unstable();
+        assert_eq!(
+            recycled,
+            vec![parent.branch_id.id, child.branch_id.id],
+            "an id slot was stranded: the next forks minted new ids instead of recycling both"
+        );
+    }
+
+    /// The **slow** path end to end: it frees no extent at all — it parks pages against the
+    /// parent's live-children array — and that shape exists nowhere but the free-space map, so a
+    /// crash after `mark_reaped` (which clears `rec.arenas`) loses it with nothing left pointing at
+    /// the arena.
+    ///
+    /// This pins the composite path and deliberately claims no more. It cannot isolate which persist
+    /// carried it, because `reap` ends in both `drain_pending`'s `put_pending` and
+    /// `sweep_empty_extents`'s `free_arena`: measured, removing either one on its own leaves this
+    /// test green. The per-method guards are `arena.rs`'s
+    /// `parking_pages_by_the_interval_rule_reaches_the_durable_map` and
+    /// `putting_the_pending_log_back_reaches_the_durable_map`.
+    #[test]
+    fn a_slow_path_reap_and_the_drain_that_follows_both_reach_the_durable_map() {
+        let (h, reaper) = setup();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-slow-reap-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        // Born BEFORE the child forks, so the child can see them and the interval rule parks them.
+        write_pages(&h, parent.branch_id, 4);
+        let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        assert!(!h.catalog.get(parent.branch_id).unwrap().is_childless_leaf());
+
+        reaper.reap(parent.branch_id).unwrap();
+        let parked = h.store.pending_len();
+        assert!(parked > 0, "fixture: nothing was parked, so this took the fast path instead");
+
+        let after_park = h.fresh_store();
+        assert!(after_park.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            after_park.pending_len(),
+            parked,
+            "the pending-free log a restart needs did not reach the durable map"
+        );
+
+        // Reaping the child empties the parent's live-children array, so the drain releases the
+        // parked pages. That is `put_pending`'s persist rather than `free_arena`'s.
+        reaper.reap(child.branch_id).unwrap();
+        assert_eq!(h.store.pending_len(), 0, "fixture: the drain did not run");
+        let after_drain = h.fresh_store();
+        assert!(after_drain.restore(&path).unwrap());
+        assert_eq!(
+            after_drain.pending_len(),
+            0,
+            "the drained pending-free log is still on disk, so a restart would re-park released pages"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -43,6 +43,7 @@ use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::cow::page_header::{flags, stamp_checksum, verify_checksum, PageHeader, PageType};
 use crate::cow::{CowPage, PageHandle, PageStore, PAGE_HEADER_SIZE};
 use crate::error::FerroError;
+use crate::storage::atomic_file::{replace_atomically, FileOps, OsFileOps};
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::wal::log::crc32;
 
@@ -113,7 +114,7 @@ pub struct ArenaPageStore {
     /// Extent pages currently reserved by some branch. Returns to baseline only if freed extents
     /// are genuinely recycled, which is the stronger claim exit criterion 8 actually wants.
     reserved_pages: AtomicU32,
-    /// Where to persist the free-space map when a new extent is claimed, if anywhere.
+    /// Where to persist the free-space map when an extent is claimed or freed, if anywhere.
     ///
     /// Without this the map reaches disk only when the owner remembers to call `checkpoint`, which
     /// for the CLI is at clean exit — so a `kill -9` leaves a durable map older than the durable
@@ -319,9 +320,15 @@ impl ArenaPageStore {
         std::mem::take(&mut self.state.lock().unwrap().pending)
     }
 
-    /// Put entries that are still pinned back on the pending-free log.
-    pub fn put_pending(&self, entries: Vec<PendingFree>) {
+    /// Put entries that are still pinned back on the pending-free log, and checkpoint.
+    ///
+    /// This is the closing half of `reaper::drain_pending`'s read-modify-write: by the time it runs,
+    /// the reclaimable pages have been released into their extents' recycled lists and the survivors
+    /// are back on the log. That whole shape lives only in the free-space map, so it persists here
+    /// for the same reason `free_arena` does — once per drain, which is once per reap.
+    pub fn put_pending(&self, entries: Vec<PendingFree>) -> Result<(), FerroError> {
         self.state.lock().unwrap().pending.extend(entries);
+        self.persist_if_configured()
     }
 
     /// True iff `arena` is live and every page ever handed out from it has been released.
@@ -332,10 +339,20 @@ impl ArenaPageStore {
         recycled >= ext.next_free
     }
 
-    /// Every live arena and its owner. Used by the reaper to find extents whose owning branch is
-    /// gone.
+    /// Every live arena and its owner, **in arena-id order**. Used by the reaper to find extents
+    /// whose owning branch is gone.
+    ///
+    /// Sorted because this order reaches durable state rather than a diagnostic:
+    /// `reaper::sweep_empty_extents` frees empty extents in exactly this sequence, each
+    /// `free_arena` pushes the freed extent's start page onto `free_extent_starts`, and
+    /// `ArenaSpaceManager::reserve` **pops** that stack. So the `extents` map's hash order decided
+    /// which page range the next arena was handed, and two runs of one workload laid their extents
+    /// out differently.
     pub fn live_arenas(&self) -> Vec<(ArenaId, BranchId)> {
-        self.state.lock().unwrap().extents.iter().map(|(a, e)| (*a, e.owner)).collect()
+        let mut live: Vec<(ArenaId, BranchId)> =
+            self.state.lock().unwrap().extents.iter().map(|(a, e)| (*a, e.owner)).collect();
+        live.sort_unstable();
+        live
     }
 
     /// Slow path: hand every page still allocated in `rec`'s arenas to the interval rule at
@@ -364,6 +381,13 @@ impl ArenaPageStore {
                 }
             }
         }
+        // The slow path changes the durable map every bit as much as the fast one: pages recycled
+        // inside a still-live extent, and a pending-free log that nothing but this map records. Left
+        // unpersisted, a crash after `mark_reaped` (which clears `rec.arenas`) loses both — the
+        // pending entries are gone so `drain_pending` never revisits them, the extent's durable
+        // `next_free` is above its recycled count so `extent_is_empty` refuses, and nothing points
+        // at the arena any more. Once per branch reaped, not once per page.
+        self.persist_if_configured()?;
         Ok(released)
     }
 
@@ -414,8 +438,16 @@ impl ArenaPageStore {
         }
         drop(free);
 
-        b.extend_from_slice(&(st.extents.len() as u32).to_be_bytes());
-        for (arena, ext) in st.extents.iter() {
+        // The two maps below are walked in **key order**, not hash order, because this function
+        // decides the bytes of a durable file and the CRC32 over them. Iterated as `HashMap`s, one
+        // arena state serialised by two processes produced two different images with two different
+        // checksums: no test can pin such an image, and a crash sweep over `<db>.arena` — the
+        // obvious next use of `storage::sim` — would be as unreplayable as `flush_all` was.
+        let mut extents: Vec<_> = st.extents.iter().collect();
+        extents.sort_unstable_by_key(|(arena, _)| **arena);
+
+        b.extend_from_slice(&(extents.len() as u32).to_be_bytes());
+        for (arena, ext) in extents {
             b.extend_from_slice(&arena.0.to_be_bytes());
             b.extend_from_slice(&ext.owner.id.to_be_bytes());
             b.extend_from_slice(&ext.owner.generation.to_be_bytes());
@@ -430,8 +462,11 @@ impl ArenaPageStore {
             }
         }
 
-        b.extend_from_slice(&(st.current.len() as u32).to_be_bytes());
-        for (branch, arena) in st.current.iter() {
+        let mut current: Vec<_> = st.current.iter().collect();
+        current.sort_unstable_by_key(|(branch, _)| **branch);
+
+        b.extend_from_slice(&(current.len() as u32).to_be_bytes());
+        for (branch, arena) in current {
             b.extend_from_slice(&branch.id.to_be_bytes());
             b.extend_from_slice(&branch.generation.to_be_bytes());
             b.extend_from_slice(&arena.0.to_be_bytes());
@@ -579,12 +614,31 @@ impl ArenaPageStore {
         }
     }
 
-    /// Write the free-space map to `path`, via a temporary file and a rename, so a crash leaves
-    /// either the previous checkpoint or the new one and never a half-written map.
+    /// Write the free-space map to `path` durably, so a crash leaves either the previous checkpoint
+    /// or the new one and never a half-written map.
+    ///
+    /// That sentence was already here while the body was `std::fs::write` plus `std::fs::rename` —
+    /// two of the four steps the idiom needs. Neither call makes anything durable, so a power cut
+    /// could leave the *rename* on the device while the bytes it named were still in the page cache:
+    /// exactly the half-written map the promise excludes. `<db>.arena` is the only thing on disk
+    /// that says where the branch arena starts, and [`ArenaPageStore::load_state`] verifies a CRC32
+    /// over it, so the observable outcome was a database that will not open at all.
+    ///
+    /// The four steps live in [`crate::storage::atomic_file`], which is also where they can be
+    /// *asserted*: an fsync is invisible to any test that merely reads the file back.
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), FerroError> {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.state_bytes()).map_err(|e| FerroError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| FerroError::Io(e.to_string()))
+        self.checkpoint_with(&OsFileOps, path)
+    }
+
+    /// [`ArenaPageStore::checkpoint`] against an injected [`FileOps`], so a test can see the order
+    /// of the four operations rather than only their result.
+    pub(crate) fn checkpoint_with(
+        &self,
+        ops: &dyn FileOps,
+        path: &std::path::Path,
+    ) -> Result<(), FerroError> {
+        replace_atomically(ops, path, &self.state_bytes())
+            .map_err(|e| FerroError::Io(e.to_string()))
     }
 
     /// Restore from a checkpoint written by [`ArenaPageStore::checkpoint`]. A missing file is not
@@ -881,6 +935,30 @@ impl PageStore for ArenaPageStore {
             self.space.give_back(start);
             self.reserved_pages.fetch_sub(self.space.extent_pages, Ordering::SeqCst);
             self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
+            // Persist the shrunk map, for the same reason `alloc_arena` persists the grown one.
+            // Without this only *claims* were durable and frees never were, so a crash after a reap
+            // left an image still charging the extent to a branch that no longer exists — and the
+            // next open could not collect it either: `reaper::sweep_empty_extents` asks
+            // `extent_is_empty`, and the durable extent's `next_free` sits above its recycled count
+            // because the fast path frees the extent whole and never releases its pages one by one.
+            // The extent leaked until the file was rebuilt, and it is the reserved-page count that
+            // exit criterion 8 is stated in.
+            //
+            // Ordered after the in-memory free so a crash in between leaves the extent recorded as
+            // still-live: a leak, which is the safe direction. The other order publishes a page
+            // range as reusable while a durable record may still point into it.
+            //
+            // Cost: one small write per whole-extent free. That is the reaper's fast path — as rare
+            // as the claim this mirrors, and not per page.
+            //
+            // This also makes `free_arena` fallible where it was not, and the failure lands *after*
+            // the in-memory free. Two consequences, named here rather than left to be discovered:
+            // `reap` can now return `Err` with its own durable records already committed — it is
+            // idempotent, so a retry converges on `Ok(0)`, and the durable map being behind leaks
+            // rather than aliases — and `reap_expired` discards its partial list of reaped branches
+            // on any `Err`, which was already true of every slow-path IO error and which no
+            // production caller sees today, because `runtime.rs` calls `reap` directly.
+            self.persist_if_configured()?;
         }
         Ok(allocated)
     }
@@ -1430,6 +1508,325 @@ mod tests {
         // and the good image still loads
         target.load_state(&good).unwrap();
         assert_eq!(target.arena_owner(a), Some(b.branch_id));
+    }
+
+    /// **The checkpoint's "atomic rename" is only atomic if both fsyncs happen.**
+    ///
+    /// `<db>.arena` is the only thing on disk that says where the branch arena starts, and it was
+    /// written with `std::fs::write` + `std::fs::rename`, neither of which makes anything durable.
+    /// A power cut could therefore leave the directory entry pointing at bytes that never reached
+    /// the device — and `load_state`'s CRC32 then refuses the image, so the database does not open.
+    ///
+    /// Asserted as an operation *order*, because that is the only way to see it: every test that
+    /// reads the file back is answered by the page cache whether the fsyncs happened or not.
+    #[test]
+    fn the_checkpoint_syncs_the_image_before_the_rename_and_the_directory_after_it() {
+        use crate::storage::atomic_file::{Op, RecordingOps};
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+
+        // A path that does not exist: nothing here may touch a real filesystem, which is the point
+        // of recording the operations instead of their aftermath.
+        let path = std::path::Path::new("/ferro-no-such-dir/db.arena");
+        let ops = RecordingOps::new();
+        h.store.checkpoint_with(&ops, path).unwrap();
+
+        let tmp = std::path::PathBuf::from("/ferro-no-such-dir/db.arena.tmp");
+        assert_eq!(
+            ops.shape(),
+            vec![
+                ("write", tmp.clone()),
+                ("sync_file", tmp.clone()),
+                ("rename", tmp.clone()),
+                ("sync_dir", std::path::PathBuf::from("/ferro-no-such-dir")),
+            ],
+            "the free-space map must be on the device before the rename names it, and the rename \
+             must be on the device after it"
+        );
+        match &ops.ops()[0] {
+            Op::Write(_, bytes) => assert_eq!(
+                bytes,
+                &h.store.state_bytes(),
+                "the temporary must receive this store's free-space map"
+            ),
+            other => panic!("the first operation was {other:?}"),
+        }
+        match &ops.ops()[2] {
+            Op::Rename(from, to) => {
+                assert_eq!(from, &tmp);
+                assert_eq!(to, path, "the temporary must land on the checkpoint path itself");
+            }
+            other => panic!("the third operation was {other:?}"),
+        }
+    }
+
+    /// A store holding `n` branches, each with its own arena and one page in it.
+    ///
+    /// Every `Harness` builds fresh `HashMap`s, and `RandomState` gives each instance different
+    /// hash keys — so two stores built by this function hold the same logical map in two different
+    /// iteration orders, which is exactly the difference a durable image must not show.
+    fn store_with_n_arenas(n: u64) -> (Harness, Vec<ArenaId>) {
+        let h = Harness::new();
+        let mut arenas = Vec::new();
+        for _ in 0..n {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let a = h.store.arena_for(b.branch_id).unwrap();
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+            arenas.push(a);
+        }
+        (h, arenas)
+    }
+
+    /// Read the two key sequences straight out of a checkpoint image, using the format documented
+    /// above `state_bytes`.
+    ///
+    /// An independent reader on purpose: `load_state` puts every entry back into a `HashMap`, so it
+    /// cannot see the order they arrived in — which is the whole property under test.
+    fn key_order_in_image(b: &[u8]) -> (Vec<u32>, Vec<(u64, u32)>) {
+        let u32_at = |at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+        // version u8, then base_page, next_extent_start, next_arena_id, live, reserved.
+        let mut at = 1 + 4 * 5;
+        at += 4 + 4 * u32_at(at) as usize; // free_starts
+
+        let n_extents = u32_at(at) as usize;
+        at += 4;
+        let mut arenas = Vec::new();
+        for _ in 0..n_extents {
+            arenas.push(u32_at(at));
+            // arena, owner.id, owner.generation, start_page, page_count, next_free
+            at += 4 + 8 + 4 + 4 + 4 + 4;
+            at += 4 + 4 * u32_at(at) as usize; // recycled
+        }
+
+        let n_current = u32_at(at) as usize;
+        at += 4;
+        let mut current = Vec::new();
+        for _ in 0..n_current {
+            current.push((u64_at(at), u32_at(at + 8)));
+            at += 8 + 4 + 4;
+        }
+        (arenas, current)
+    }
+
+    /// **A durable image whose byte order comes from a `HashMap` cannot be replayed.**
+    ///
+    /// B10's finding 4. Nothing here is a correctness bug on its own — `load_state` is
+    /// count-prefixed, so any order reloads the same logical map — but the same arena state
+    /// checkpointed twice produced two different files with two different CRC32s. That makes the
+    /// image impossible to pin in a test and a crash sweep over `<db>.arena` impossible to replay,
+    /// which is the premise of aiming a crash at all.
+    #[test]
+    fn two_stores_in_the_same_state_checkpoint_byte_identical_images() {
+        let (a, _) = store_with_n_arenas(16);
+        let (b, _) = store_with_n_arenas(16);
+        assert_eq!(
+            a.store.base_page(),
+            b.store.base_page(),
+            "fixture: the two stores describe different regions, so this proves nothing"
+        );
+        let left = a.store.state_bytes();
+        let right = b.store.state_bytes();
+        assert_eq!(
+            &left[left.len() - 4..],
+            &right[right.len() - 4..],
+            "the same free-space map produced two different checksums"
+        );
+        assert_eq!(left, right, "the same free-space map produced two different durable images");
+    }
+
+    #[test]
+    fn the_checkpoint_image_lists_extents_and_current_arenas_in_key_order() {
+        let (h, arenas) = store_with_n_arenas(16);
+        let (in_image, current) = key_order_in_image(&h.store.state_bytes());
+
+        assert_eq!(in_image.len(), arenas.len(), "fixture: the image lost extents");
+        let mut sorted = in_image.clone();
+        sorted.sort_unstable();
+        assert_eq!(in_image, sorted, "the extents section is in hash order, not arena-id order");
+
+        assert_eq!(current.len(), arenas.len(), "fixture: the image lost current arenas");
+        let mut sorted_current = current.clone();
+        sorted_current.sort_unstable();
+        assert_eq!(
+            current, sorted_current,
+            "the current-arena section is in hash order, not branch-id order"
+        );
+    }
+
+    /// The reaper frees empty extents in this order and `reserve` pops the stack those frees build,
+    /// so a `HashMap`'s order here decided which page range the next arena got.
+    #[test]
+    fn live_arenas_comes_back_in_arena_id_order() {
+        let (h, arenas) = store_with_n_arenas(16);
+        let live: Vec<ArenaId> = h.store.live_arenas().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(live.len(), arenas.len(), "fixture: an arena went missing");
+        let mut sorted = live.clone();
+        sorted.sort_unstable();
+        assert_eq!(live, sorted, "live_arenas is in hash order");
+    }
+
+    /// Guards the **production** entry point, which the recorder cannot reach: `checkpoint` itself
+    /// has to go through [`crate::storage::atomic_file`] rather than growing its own copy of the
+    /// idiom again.
+    ///
+    /// The observable is the temporary's *name*, which is chosen in exactly one place. Blocking
+    /// `<target>.tmp` with a directory makes the real call fail; the version this replaced staged
+    /// through `path.with_extension("tmp")` — `db.tmp`, a different file — and would sail past.
+    #[test]
+    fn the_public_checkpoint_stages_through_the_durable_helper() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap();
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("ferro-arena-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("db.arena");
+        h.store.checkpoint(&target).unwrap();
+        let good = std::fs::read(&target).unwrap();
+
+        // Occupy the one path a durable replace must stage through.
+        std::fs::create_dir(dir.join("db.arena.tmp")).unwrap();
+        let err = h.store.checkpoint(&target);
+        assert!(
+            err.is_err(),
+            "checkpoint did not stage through db.arena.tmp, so it is not using the durable replace"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            good,
+            "a failed checkpoint must leave the previous map exactly as it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A freed extent that never reaches the durable map is space no restart gets back.**
+    ///
+    /// Recorded by B10 as an aside and confirmed here: `alloc_arena` checkpointed, `free_arena` did
+    /// not, so only claims were durable. The image a crash left still charged the extent to a
+    /// branch that no longer exists, and the sweep that would otherwise collect it refuses —
+    /// `extent_is_empty` compares recycled pages against `next_free`, and the fast path frees an
+    /// extent whole without ever releasing its pages one at a time. Measured before the fix, the
+    /// restored store below reported `owner=Some(BranchId { id: 1, generation: 0 })`, 256 pages
+    /// still reserved and its page still live — for an arena that had been freed.
+    #[test]
+    fn freeing_an_extent_checkpoints_the_map_so_a_restart_gets_the_space_back() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-free-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(b.branch_id).unwrap(); // claims the extent, and checkpoints it
+        h.store.alloc_in_arena(a, PageType::Heap, Epoch(3)).unwrap();
+        // Checkpoint the *allocated* state explicitly, so the durable image the assertions below
+        // read is one where every counter is non-zero. Without this the last image predates the
+        // page and `live_page_count` reads 0 whether the free was persisted or not.
+        h.store.checkpoint(&path).unwrap();
+        assert_eq!(
+            h.store.reserved_page_count(),
+            ARENA_EXTENT_PAGES,
+            "fixture: no extent was reserved, so freeing one proves nothing"
+        );
+
+        h.store.free_arena(a).unwrap();
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            target.arena_owner(a),
+            None,
+            "the durable map still charges the freed extent to its dead owner"
+        );
+        assert_eq!(
+            target.reserved_page_count(),
+            0,
+            "reserved pages never come back after a restart, which is exit criterion 8"
+        );
+        assert_eq!(
+            target.live_page_count().unwrap(),
+            0,
+            "the page inside the freed extent is still counted as live"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The slow path's own persist, isolated.
+    ///
+    /// Driving this through `reaper::reap` cannot isolate it: `reap` always ends in `drain_pending`,
+    /// whose `put_pending` persists, and in `sweep_empty_extents`, whose `free_arena` persists — so
+    /// removing this one leaves the end-to-end test green. Measured: it does. The store's contract
+    /// is per-method, so the test is too.
+    #[test]
+    fn parking_pages_by_the_interval_rule_reaches_the_durable_map() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-park-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(parent.branch_id).unwrap();
+        for _ in 0..4 {
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+        }
+        // Forked *after* those pages were born, so it can still see them and the interval rule
+        // parks them rather than releasing them.
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        let released = h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+        assert_eq!(released, 0, "fixture: the pages were released, not parked, so nothing is pinned");
+        assert_eq!(h.store.pending_len(), 4, "fixture: the rule parked nothing");
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap(), "fixture: nothing was ever checkpointed");
+        assert_eq!(
+            target.pending_len(),
+            4,
+            "the pending-free log never reached the durable map, so a restart releases pages a \
+             live child can still see"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `put_pending`'s own persist, isolated for the same reason as the test above it.
+    #[test]
+    fn putting_the_pending_log_back_reaches_the_durable_map() {
+        let h = Harness::new();
+        let path = std::env::temp_dir()
+            .join(format!("ferro-arena-putpending-ckpt-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        h.store.checkpoint_to(path.clone());
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let a = h.store.arena_for(parent.branch_id).unwrap();
+        for _ in 0..4 {
+            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+        }
+        h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
+        h.store.retire_arenas_by_rule(&rec, h.catalog.next_epoch()).unwrap();
+
+        // What `drain_pending` does: take the whole log, decide, put the survivors back.
+        let taken = h.store.take_pending();
+        assert_eq!(taken.len(), 4, "fixture: nothing was parked");
+        h.store.put_pending(taken[..2].to_vec()).unwrap();
+
+        let target = h.fresh_store();
+        assert!(target.restore(&path).unwrap());
+        assert_eq!(
+            target.pending_len(),
+            2,
+            "the durable pending-free log still lists entries the drain resolved, so a restart \
+             would park released pages all over again"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

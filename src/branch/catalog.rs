@@ -99,6 +99,11 @@ impl LogBranchCatalog {
                 free_ids.push(*id);
             }
         }
+        // `records` is a `HashMap`, so the loop above collected these in hash order — and `fork`
+        // **pops** this vector to choose which id a recycled slot hands out, which is then
+        // serialised into a durable branch record. Two opens of one log gave the same fork two
+        // different ids. Sorted, `pop` takes the highest reaped slot and does it reproducibly.
+        free_ids.sort_unstable();
 
         Ok(LogBranchCatalog {
             state: RwLock::new(CatalogState { records, free_ids }),
@@ -157,9 +162,21 @@ impl LogBranchCatalog {
             .ok_or_else(|| BranchError::NotFound(BranchId::new(id, 0)).into())
     }
 
-    /// Every record, live or reaped.
+    /// Every record, live or reaped, **in branch-id order**.
+    ///
+    /// Ordered so that a sweep over every record is reproducible at all: each reap this feeds
+    /// appends durable branch records and frees pages, and a `HashMap`'s order made that sequence
+    /// depend on nothing a test or a replay can pin.
+    ///
+    /// Id order is **not** the order a reap wants, and `reaper::resume_interrupted_reaps` re-sorts
+    /// deepest-first before acting — a parent resumed before its own child cannot release its id
+    /// slot. Ordering here is what makes *this* accessor deterministic; the reap key belongs to the
+    /// reaper, which states why at its sort.
     pub fn all_records(&self) -> Vec<BranchRecord> {
-        self.state.read().unwrap().records.values().cloned().collect()
+        let mut out: Vec<BranchRecord> =
+            self.state.read().unwrap().records.values().cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        out
     }
 
     /// Mark an id slot reusable. Refuses while the slot's record still lists live children,
@@ -174,8 +191,16 @@ impl LogBranchCatalog {
             .get(&id)
             .map(|r| r.state == BranchState::Reaped && r.live_children.is_empty())
             .unwrap_or(false);
-        if reusable && !st.free_ids.contains(&id) {
-            st.free_ids.push(id);
+        // Inserted in order rather than pushed. `open` rebuilds this vector sorted and `fork`
+        // pops it, so a push would make the id a fork recycles depend on whether a restart
+        // intervened: reaping a chain deepest-first releases 2 then 1, and `pop` on the pushed
+        // order hands out 1 while `pop` after a reopen of the very same log hands out 2. The binary
+        // search subsumes the membership check it replaces — `Err(pos)` is exactly "not present,
+        // and this is where it belongs".
+        if reusable {
+            if let Err(pos) = st.free_ids.binary_search(&id) {
+                st.free_ids.insert(pos, id);
+            }
         }
     }
 
@@ -257,12 +282,20 @@ impl BranchCatalog for LogBranchCatalog {
 
     fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
         let st = self.state.read().unwrap();
-        Ok(st.records.values().filter(|r| r.state == BranchState::Live).cloned().collect())
+        // Same `HashMap` as `all_records`, and sorted for the same reason: the lease scan feeds
+        // this straight into `reap_expired`, whose `sort_by_key` is stable, so hash order survives
+        // as its tie-break and reaches every record and page that reap makes durable.
+        let mut out: Vec<BranchRecord> =
+            st.records.values().filter(|r| r.state == BranchState::Live).cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
     }
 
     fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
         let st = self.state.read().unwrap();
-        Ok(st.records.values().cloned().collect())
+        let mut out: Vec<BranchRecord> = st.records.values().cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
@@ -420,6 +453,140 @@ mod tests {
         let n = c2.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         assert!(!ids.contains(&n.branch_id));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// **Which id a fork recycles is a durable choice, and it was made by a `HashMap`.**
+    ///
+    /// B10's finding 4, the catalog half. `open` rebuilds `free_ids` by walking the record map, and
+    /// `fork` pops that vector and serialises the id it got into an appended record. Replayed twice
+    /// — two processes opening one log, or one process opening it after a crash — the same log
+    /// handed the same fork different ids.
+    ///
+    /// Both copies below start from byte-identical logs, so any disagreement is iteration order.
+    #[test]
+    fn two_opens_of_one_log_recycle_branch_ids_in_the_same_order() {
+        let dir = std::env::temp_dir().join(format!("ferro-cat-recycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.log");
+        let _ = std::fs::remove_file(&base);
+
+        // Twelve children of trunk, every one of them reaped and childless: twelve reusable slots.
+        {
+            let c = LogBranchCatalog::open(&base, 1).unwrap();
+            let kids: Vec<BranchId> = (0..12)
+                .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id)
+                .collect();
+            for k in kids {
+                let mut rec = c.get_raw(k.id).unwrap();
+                rec.mark_reaped();
+                c.put(&rec).unwrap();
+            }
+        }
+
+        let recycled_from = |name: &str| -> Vec<u64> {
+            let copy = dir.join(name);
+            std::fs::copy(&base, &copy).unwrap();
+            let c = LogBranchCatalog::open(&copy, 1).unwrap();
+            (0..6)
+                .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id.id)
+                .collect()
+        };
+        let left = recycled_from("left.log");
+        let right = recycled_from("right.log");
+
+        assert_eq!(
+            left, right,
+            "one log replayed twice recycled two different id sequences, so which id a durable \
+             record gets depends on a HashMap"
+        );
+        assert_eq!(
+            left,
+            vec![12, 11, 10, 9, 8, 7],
+            "sorted free ids are popped highest-first; this is the sequence, not an arbitrary one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Which slot is next must not depend on whether a restart intervened.**
+    ///
+    /// `open` rebuilds `free_ids` sorted; `release_id` used to push. Reaping a chain deepest-first
+    /// releases 2 then 1, so `pop` handed out **1** — while `pop` after reopening the very same log
+    /// handed out **2**. The id a durable branch record receives is not allowed to turn on that.
+    #[test]
+    fn a_runtime_release_and_a_reload_agree_on_which_slot_is_next() {
+        let dir = std::env::temp_dir().join(format!("ferro-cat-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live_log = dir.join("chain.log");
+        let reload_log = dir.join("chain-reload.log");
+        for f in [&live_log, &reload_log] {
+            let _ = std::fs::remove_file(f);
+        }
+
+        let from_running_catalog = {
+            let c = LogBranchCatalog::open(&live_log, 1).unwrap();
+            let a = c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let b = c.fork(a.branch_id, LeaseDeadline(0)).unwrap();
+            assert_eq!((a.branch_id.id, b.branch_id.id), (1, 2), "fixture: the ids moved");
+
+            // Retire the chain deepest-first, the order `reap_expired` reaps in.
+            let mut child = c.get_raw(b.branch_id.id).unwrap();
+            child.mark_reaped();
+            c.put(&child).unwrap();
+            c.release_id(b.branch_id.id);
+
+            let mut parent = c.get_raw(a.branch_id.id).unwrap();
+            parent.remove_live_child(b.fork_epoch);
+            parent.mark_reaped();
+            c.put(&parent).unwrap();
+            c.release_id(a.branch_id.id);
+
+            // Copy the log *before* the fork below appends to it, so the reload sees exactly the
+            // durable state this catalog is holding in memory right now.
+            std::fs::copy(&live_log, &reload_log).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id.id
+        };
+
+        let from_reloaded_log = {
+            let c = LogBranchCatalog::open(&reload_log, 1).unwrap();
+            c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap().branch_id.id
+        };
+
+        assert_eq!(
+            from_running_catalog, from_reloaded_log,
+            "one durable log handed the same fork slot {from_running_catalog} while running and \
+             slot {from_reloaded_log} after a restart"
+        );
+        assert_eq!(
+            from_running_catalog, 2,
+            "both paths must take the highest retired slot, not whichever was released last"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resume_interrupted_reaps` walks `all_records` and reaps in the order it arrives, and every
+    /// reap appends durable records and frees pages.
+    #[test]
+    fn every_record_sweep_comes_back_in_branch_id_order() {
+        let c = cat();
+        for _ in 0..16 {
+            c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        }
+        // One reaped slot, so `all_records` and `live_branches` are not the same list.
+        let mut rec = c.get_raw(3).unwrap();
+        rec.mark_reaped();
+        c.put(&rec).unwrap();
+
+        let sweeps: Vec<(&str, Vec<u64>)> = vec![
+            ("all_records", c.all_records().iter().map(|r| r.branch_id.id).collect()),
+            ("live_branches", c.live_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
+            ("all_branches", c.all_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
+        ];
+        for (name, ids) in sweeps {
+            assert_eq!(ids.len(), if name == "live_branches" { 16 } else { 17 }, "fixture: {name}");
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(ids, sorted, "{name} came back in hash order");
+        }
     }
 
     #[test]
