@@ -32,7 +32,7 @@ use ferrodb::branch::types::BranchId;
 use ferrodb::branch::{BranchCatalog, CapabilityEnvelope, ColumnCapability, Verb};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
+use ferrodb::catalog::column::{DataType, Value};
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -1188,7 +1188,12 @@ fn the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete() {
 ///
 /// Still pinned, not closed: closing it is the design decision recorded in the integration ledger
 /// (`LEDGER-INTEGRATION.md` row I15 / `INTEGRATION.md`, both in the `artie-research` repository and
-/// not in this one). Every assertion here asserts the bypass, so closing it trips this test.
+/// not in this one). Closing the gap trips this test — but not because every assertion here asserts
+/// the bypass, which an earlier version of this sentence claimed and which is not true. Two of them
+/// assert the opposite on purpose: the opening refusal is anti-vacuity (it fails if the envelope
+/// stops governing at all) and the pre-merge check asserts B11 behaving *correctly*, keeping a
+/// branch edit out of the shared catalog until `MERGE`. The bypass is carried by the four in
+/// between.
 #[test]
 fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap() {
     let mut db = Db::new();
@@ -1201,6 +1206,18 @@ fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap()
     // Anti-vacuity: the envelope is live and `payroll` is refused by the governed route.
     let err = db.refused("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut a);
     assert!(err.contains("may not write table `payroll`"), "got {err}");
+
+    // A control for the budget assertion further down. Without it, `row_writes == 0` proves
+    // nothing here: the only other DML is the refusal above, and a refused statement charges
+    // nothing by design, so the counter would read 0 even if the gap were fully closed. One
+    // ALLOWED write, so the counter is known to move in this session before it is used as evidence.
+    db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut a);
+    assert_eq!(
+        db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
+        1,
+        "the budget counter did not move on an allowed write, so it cannot be read as evidence \
+         about the schema edits below"
+    );
 
     // All three `AlterAction` variants, because naming a subset is exactly how the pin this
     // replaces became untrue: B3 named four verbs and drove one.
@@ -1224,9 +1241,10 @@ fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap()
     );
     assert_eq!(
         db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
-        0,
-        "the schema edits were CHARGED, which would mean they passed through `stage_all` and the \
-         envelope saw them — if so this gap has closed and the docs must say so"
+        1,
+        "the counter moved past the one allowed write above, so the three schema edits were \
+         CHARGED — which would mean they passed through `stage_all` and the envelope saw them. If \
+         so this gap has closed and the docs must say so"
     );
 
     // Not yet in the shared catalog: this is a branch edit, invisible until MERGE. Without this
@@ -1246,17 +1264,44 @@ fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap()
          module docs, the summary and this test must say so. Shared `payroll` is now: {cols:?}"
     );
 
-    // A plain connection sees it, so it is the shared catalog and not the branch that changed.
-    let mut plain = db.session();
-    db.ok("SELECT pay FROM payroll;", &mut plain);
+    // **The retype, checked by TYPE and not by name.** An earlier version of this test asserted
+    // only the column names, so `AddColumn` and `RenameColumn` were verified and `RetypeColumn`
+    // was not — its entire observable effect is the data type, and nothing read it. Three variants
+    // staged, two demonstrated: the exact shape of the defect this whole pin exists to record,
+    // one level down. Found by a fresh-context review of the commit that introduced it.
+    let pay = db.catalog.tables["payroll"]
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.name == "pay")
+        .expect("the renamed column is gone, so the assertion above did not mean what it said");
+    assert_eq!(
+        pay.data_type,
+        DataType::BigInt,
+        "the RETYPE did not publish: `payroll.pay` is still {:?}. Names alone cannot see this, \
+         which is why it is asserted separately",
+        pay.data_type
+    );
+
+    // NOT asserted here, deliberately: "a plain connection sees it, so it is the shared catalog".
+    // The harness holds exactly ONE `Catalog` and hands it to every statement regardless of
+    // session, so a plain read could not have been a branch view even in principle. The claim was
+    // circular; `db.catalog` above IS the shared catalog.
 }
 
 /// **The single-funnel premise is gone, so what is pinned now is how many funnels there are.**
 ///
-/// `stage_all` is still the only site that reads the envelope and the only one that charges budget
-/// — but it is no longer the only way into a branch's staged state. As of `398e361` there are
-/// **three** sites that mutate a workspace, and two of them are B11's (`note_base_shape` and
-/// `stage_schema_edit`), neither of which consults the envelope.
+/// `stage_all` is still the only site that reads the envelope **through this spelling** and the
+/// only one that charges budget — but it is no longer the only way into a branch's staged state.
+/// As of `398e361` there are **three** sites that mutate a workspace, and two of them are B11's
+/// (`note_base_shape` and `stage_schema_edit`), neither of which consults the envelope.
+///
+/// "Through this spelling" is load-bearing and an earlier version of this comment dropped it:
+/// `AgentRuntime::envelope_of` (`src/agent_sql/runtime.rs:1295`) reads the same envelope as
+/// `self.branches.get(branch)?.envelope`, outside `stage_all`, and the needle below cannot see it.
+/// It enforces nothing, so it is not a governance site — but a second funnel written that way
+/// would pass this count, and saying "the only site that reads the envelope" without the
+/// qualification is the kind of overclaim this whole pin exists to remove.
 ///
 /// This is a count and not a list of names so that a **fourth** funnel trips it, whatever it is
 /// called. It reads whitespace-stripped text, because the raw token is a fact about rustfmt and not
@@ -1293,25 +1338,45 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     let dense_funnel: String =
         body[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
-    for (needle, count, what) in [
-        ("self.branches.envelope_of(", 1, "reads the capability envelope"),
-        ("self.branches.charge_row_writes(", 1, "charges the row-write budget"),
-        ("workspaces.get_mut(", 3, "mutates a branch workspace"),
+    // One message per needle, because the UP and DOWN directions do not mean the same thing for
+    // all three. An earlier version shared a single message that read "up = a new ungoverned
+    // funnel, down = the gap closing" — true for the mutator count and backwards for the other
+    // two, which is a lie told in the single most likely scenario: somebody governs the schema
+    // path, the enforcement count goes UP, and the pin tells them a new funnel appeared.
+    for (needle, count, up, down) in [
+        (
+            "self.branches.envelope_of(",
+            1,
+            "a NEW site reads the envelope. That is probably somebody GOVERNING one of the two              ungoverned funnels, which would be this gap closing",
+            "an enforcement point was DELETED, which widens the gap",
+        ),
+        (
+            "self.branches.charge_row_writes(",
+            1,
+            "a new site charges budget — again, probably the gap closing",
+            "the only site that charges budget is gone, so the row-write budget is unenforced",
+        ),
+        (
+            "workspaces.get_mut(",
+            3,
+            "a new way into branch write state exists, and the envelope does not govern it unless              whoever added it also added an enforcement call: drive the new verb against a table              the envelope forbids, the way              `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap` does",
+            "a funnel was removed. It cannot go below 1 — `stage_all` must mutate the workspace to              stage anything at all — so 1 means both of B11's are gone or folded into the funnel",
+        ),
     ] {
+        let actual = dense.matches(needle).count();
         assert_eq!(
-            dense.matches(needle).count(),
+            actual,
             count,
-            "`{needle}` — the site that {what} — no longer occurs {count} time(s) in \
-             src/agent_sql/runtime.rs. If this went UP, a new way into branch write state exists \
-             and the envelope does not govern it unless somebody made it: drive the new verb \
-             against a table the envelope forbids, the way \
-             `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap` does. \
-             If it went DOWN, a funnel was removed or governed and this gap is closing — record \
-             which in the integration ledger, which lives in the `artie-research` repository."
+            "`{needle}` occurs {actual} time(s) in src/agent_sql/runtime.rs, expected {count}. \
+             Higher: {up}. Lower: {down}. Either way, record which in the integration ledger, \
+             which lives in the `artie-research` repository and not in this one."
         );
     }
-    // The two that enforce are still inside `stage_all`; the workspace mutators are not, and that
-    // asymmetry IS the gap.
+    // The two that enforce are still inside `stage_all` — and so is ONE of the three workspace
+    // mutators, the funnel's own. The other two are B11's, outside it, and THAT asymmetry is the
+    // gap: 2 of 3, not 3 of 3. An earlier version of this comment said no mutator was inside the
+    // funnel, which contradicted this test's own doc comment and would mislead the next reader
+    // into expecting a closed gap to read 0 rather than 1.
     for needle in ["self.branches.envelope_of(", "self.branches.charge_row_writes("] {
         assert!(
             dense_funnel.contains(needle),
@@ -1388,10 +1453,34 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
          path that fills it is governed."
     );
 
+    // **The schema funnel is ungoverned, asserted on ITS OWN body.**
+    //
+    // What stood here was `!dense_funnel.contains("fnstage_schema_edit(")` — a tautology. The span
+    // is cut at the signature of the next method, so a function defined anywhere else is outside
+    // it by construction and that assertion could never fire. Worse, it had replaced the one check
+    // in the previous test that DID fire on `398e361`. A live tripwire was swapped for a check
+    // that detects nothing while carrying a message claiming it watches the gap. Found by a
+    // fresh-context review; this is the property that assertion was reaching for.
+    let edit_at = runtime
+        .find("pub fn stage_schema_edit(")
+        .expect("`stage_schema_edit` is gone — B11's schema funnel was removed or renamed, which \
+                 would be this gap closing or moving; either way update this test");
+    let edit_body = &runtime[edit_at..];
+    let edit_end = edit_body[1..]
+        .find("\n    pub fn ")
+        .into_iter()
+        .chain(edit_body[1..].find("\n    fn "))
+        .min()
+        .map(|i| i + 1)
+        .unwrap_or(edit_body.len());
+    let dense_edit: String =
+        edit_body[..edit_end].chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        !dense_funnel.contains("fnstage_schema_edit("),
-        "`stage_schema_edit` is inside `stage_all` now, which would mean the schema path is \
-         governed and this gap has closed"
+        !dense_edit.contains("envelope_of(") && !dense_edit.contains("charge_row_writes("),
+        "`stage_schema_edit` now reads the envelope or charges budget, so the schema path is \
+         governed and THIS GAP HAS CLOSED. That is good news, and it means the pin must go: delete \
+         `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap`, correct \
+         the `CapabilityEnvelope` doc, and record the closure in the integration ledger."
     );
 }
 

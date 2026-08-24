@@ -644,7 +644,8 @@ impl From<CapabilityRefusal> for FerroError {
 ///
 /// "Cannot be written" is a claim about ONE funnel — `AgentRuntime::stage_all` — and it is exactly
 /// as wide as that funnel and no wider. A statement that does not reach `stage_all` is not governed
-/// at all, and there are **two** tiers of those, not one:
+/// at all, and there are **three** tiers of those. (This sentence has said "one" and then "two";
+/// each time a review found another tier. Treat the number as the current floor, not a total.)
 ///
 /// - **The agent verbs**, diverted by `is_agent_stmt` above everything else. Two of them write the
 ///   ROWS of a forbidden table: `REVERT MERGE ... CASCADE` replays a previous merge's writes
@@ -678,6 +679,12 @@ impl From<CapabilityRefusal> for FerroError {
 /// shared *structure*, and, through `DROP TABLE` + `CREATE TABLE`, authority over what the
 /// branch's own grant points at — see
 /// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns`.
+///
+/// - **The branch-scoped schema path.** `ALTER TABLE` inside an agent session is diverted at
+///   `src/execution/executor.rs:216` to `run_agent_alter`, which calls `stage_schema_edit` — so it
+///   reaches a branch's *own* staged state without passing `stage_all`. It is neither of the two
+///   tiers above: not an agent verb, and it never reaches the executor's `match`. Detailed
+///   immediately below, because it is also what falsified the single-funnel premise.
 ///
 /// **And `stage_all` is no longer the only way into a branch's own staged state.** That was a
 /// premise, not a guarantee, and B11's branch-scoped `ALTER TABLE` — merged at `398e361` — breaks
