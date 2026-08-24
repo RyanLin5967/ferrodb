@@ -128,6 +128,32 @@ func sqlType(t string) string {
 	}
 }
 
+// sqliteAffinity is the storage class a DECLARED type resolves to, by SQLite's own rules.
+//
+// **Affinity, not spelling — I20.** A first cut of the type check compared the declared strings and
+// refused a destination declared `VARCHAR(20)` against an event mapping to `TEXT`, which are the
+// same column: both have TEXT affinity, and nothing is converted going in or out. The declared
+// string is a label; the affinity is the behaviour, and the behaviour is what finding 4 is about.
+//
+// The rules are SQLite's documented five, in order, and the order matters: `VARCHAR` contains
+// neither "INT" nor "BLOB" but does contain "CHAR", and a rule set applied in any other sequence
+// gets it wrong.
+func sqliteAffinity(declared string) string {
+	d := strings.ToUpper(strings.TrimSpace(declared))
+	switch {
+	case strings.Contains(d, "INT"):
+		return "INTEGER"
+	case strings.Contains(d, "CHAR"), strings.Contains(d, "CLOB"), strings.Contains(d, "TEXT"):
+		return "TEXT"
+	case d == "" || strings.Contains(d, "BLOB"):
+		return "BLOB"
+	case strings.Contains(d, "REAL"), strings.Contains(d, "FLOA"), strings.Contains(d, "DOUB"):
+		return "REAL"
+	default:
+		return "NUMERIC"
+	}
+}
+
 // quoteIdent quotes an identifier for SQLite. Doubling embedded quotes is the whole of the escape,
 // and it is applied to every identifier rather than only to ones that look suspicious — a column
 // named `"; DROP TABLE` is a column name, not an attack, and it should round-trip.
@@ -173,7 +199,7 @@ func (s *Sink) ensureTable(table string, cols []map[string]any, declared bool) e
 	for i := range names {
 		wantTypes[i] = sqlType(fmt.Sprint(cols[i]["type"]))
 	}
-	if grown, err := s.catchUpToDeclaredShape(table, names, wantTypes, got, gotTypes); err != nil {
+	if grown, err := s.catchUpToDeclaredShape(table, names, wantTypes, got, gotTypes, declared); err != nil {
 		return err
 	} else if grown {
 		got, gotTypes, err = s.tableShape(table)
@@ -210,12 +236,21 @@ func (s *Sink) ensureTable(table string, cols []map[string]any, declared bool) e
 // it already has must be the declared one at that ordinal, **by name and by declared type**.
 // Anything else is left for `checkSchemaAgrees` to refuse. A shape diff cannot tell a rename from a
 // drop-plus-add, and guessing there loses the column's data.
-func (s *Sink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTypes []string) (bool, error) {
+func (s *Sink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTypes []string, declared bool) (bool, error) {
 	if len(got) >= len(want) {
 		return false, nil
 	}
 	for i := range got {
-		if got[i] != want[i] || !strings.EqualFold(gotTypes[i], wantTypes[i]) {
+		if got[i] != want[i] {
+			return false, nil
+		}
+		// **Only a DECLARATION's types are worth comparing.** `ensureFromRow` infers every column
+		// as TEXT from a row's JSON, and comparing a guess against a destination built from the
+		// source's own CREATE_TABLE refuses on every column — which would strand exactly the
+		// consumer the catch-up exists for: one that resumed after its CREATE_TABLE was truncated
+		// away and now sees a row carrying a column the source added. Measured before this
+		// exemption: `table inv has no column named zz`.
+		if declared && sqliteAffinity(gotTypes[i]) != sqliteAffinity(wantTypes[i]) {
 			return false, nil
 		}
 	}
@@ -294,13 +329,30 @@ func (s *Sink) checkSchemaAgrees(table string, want, wantTypes, got, gotTypes []
 			}
 			continue
 		}
-		if !strings.EqualFold(wantTypes[i], gotTypes[i]) {
+		// **One direction only, and the set of retypes this source can perform is what makes that
+		// exact rather than a guess.** `Widening::of` in `catalog/alter.rs` is a closed allowlist:
+		// Integer->BigInt, Integer->Decimal, BigInt->Decimal, Varchar(n)->Varchar(m>=n). Mapped
+		// through `sqlType`, the first and last change no affinity at all; the only affinity a
+		// retype can move is INTEGER -> TEXT.
+		//
+		// So a destination with INTEGER affinity under a declaration with TEXT affinity is a retype
+		// the destination has NOT applied — finding 4's silent conversion, refused. Every other
+		// difference is the destination being AHEAD of the declaration or a shape that never came
+		// from a declaration at all, and refusing those strands a consumer over nothing:
+		//   * a destination already retyped to TEXT, re-handed the ORIGINAL CREATE_TABLE on a
+		//     replay. `bypassesCursor` makes a declaration re-run on every replay, so this is the
+		//     ordinary case, not an edge one.
+		//   * a destination built by `ensureFromRow` inference (all TEXT), later handed the
+		//     source's real declaration.
+		// Both were refused by a first cut of this check and are now allowed, deliberately.
+		if sqliteAffinity(gotTypes[i]) == "INTEGER" && sqliteAffinity(wantTypes[i]) == "TEXT" {
 			return fmt.Errorf(
 				"table %s column %q is declared %s in the destination but the event's shape makes it "+
 					"%s; SQLite's declared type sets the column's affinity, so a value written through "+
 					"the wrong one is converted on the way in and reads back looking fine — a DECIMAL "+
-					"landing in an INTEGER column loses every digit past an i64. Refused rather than "+
-					"warned about. Rebuild the destination table, or drop it and let the feed recreate it",
+					"landing in an INTEGER column loses every digit past an i64. That is a retype this "+
+					"destination has not applied. Refused rather than warned about: rebuild the table, "+
+					"or drop it and let the feed recreate it",
 				table, got[i], gotTypes[i], wantTypes[i])
 		}
 	}

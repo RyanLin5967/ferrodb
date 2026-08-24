@@ -665,7 +665,7 @@ func TestTheSqliteCatchUpComparesTypesAndNotOnlyNames(t *testing.T) {
 	// Same names, one type moved: NOT a prefix, so nothing may be added.
 	grown, err := s.catchUpToDeclaredShape("inv",
 		[]string{"id", "qty", "note"}, []string{"INTEGER", "TEXT", "TEXT"},
-		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"})
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -673,11 +673,33 @@ func TestTheSqliteCatchUpComparesTypesAndNotOnlyNames(t *testing.T) {
 		t.Fatal("the catch-up grew a destination whose second column is a different type; a " +
 			"retype is not an append and the values already stored are not in the new type")
 	}
+	// ...but on the INFERENCE path the same shapes MUST grow, because those types are guesses
+	// (`ensureFromRow` marks every column TEXT) and comparing them would refuse on every column,
+	// stranding exactly the consumer the catch-up exists for. A real destination here, because
+	// this path reaches the ALTER.
+	real, err := openSink(filepath.Join(t.TempDir(), "grow.sqlite"), "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer real.Close()
+	if _, err := real.db.Exec(`CREATE TABLE inv ("id" INTEGER PRIMARY KEY, "qty" INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	grown, err = real.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty", "note"}, []string{"TEXT", "TEXT", "TEXT"},
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error on the inference path: %v", err)
+	}
+	if !grown {
+		t.Fatal("a column the source added could not be caught up on the inference path; a " +
+			"consumer that resumed after its CREATE_TABLE was truncated away is stranded")
+	}
 	// A genuine prefix still qualifies — otherwise this test would pass with a catch-up that
 	// refuses everything, which fixes nothing.
 	if _, err := s.catchUpToDeclaredShape("inv",
 		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"},
-		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}); err != nil {
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, true); err != nil {
 		t.Fatalf("a matching shape was refused: %v", err)
 	}
 }
