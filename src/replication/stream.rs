@@ -109,6 +109,15 @@ pub struct Pumped {
     /// Records the decoder could not attribute to a table. Non-zero means the feed is incomplete
     /// and a caller should say so rather than present it as a clean run.
     pub unresolved: usize,
+    /// Records whose table IS known and whose bytes do not match the schema the decoder holds for
+    /// it — I20.
+    ///
+    /// `Decoded` has counted these since logical decoding existed and `Pumped` did not carry the
+    /// number, so on the STREAMING path — the one a server actually runs — a shape mismatch was
+    /// indistinguishable from a quiet feed. That is exactly the state B11 made reachable: an
+    /// `ALTER` puts old-shape and new-shape tuples in one log, and a decoder holding the wrong one
+    /// for a range produces no event, no error and, until now, no number either.
+    pub undecodable: usize,
     /// Events decoded and deliberately **not** written, because the initial snapshot this streamer
     /// was handed already contained the transaction that produced them. Always zero on a streamer
     /// with no snapshot boundary.
@@ -161,7 +170,11 @@ impl Pumped {
     /// Says nothing about attribution on purpose: a database nobody runs agents against ships rows
     /// with no writer and is not thereby unclean. [`Pumped::unattributed`] is the separate question.
     pub fn is_clean(&self) -> bool {
-        self.unresolved == 0 && self.refused == 0
+        // `undecodable` is named explicitly rather than left to `unresolved`. Splitting the two
+        // counters in I20 would otherwise have quietly narrowed this guard: `unresolved` used to
+        // be the sum of both, so every caller of `is_clean` was already refusing a shape mismatch
+        // and would have stopped without anything saying so.
+        self.unresolved == 0 && self.undecodable == 0 && self.refused == 0
     }
 
     /// How far behind the log this consumer is, in bytes.
@@ -286,6 +299,7 @@ impl FeedStreamer {
                 frontier,
                 withheld: 0,
                 unresolved: 0,
+                undecodable: 0,
                 suppressed: 0,
                 excluded: 0,
                 refused: 0,
@@ -426,8 +440,12 @@ impl FeedStreamer {
             emitted_through: delivered_through,
             frontier,
             withheld: decoded.open.len(),
-            unresolved: decoded.unresolved.values().sum::<usize>()
-                + decoded.undecodable.values().sum::<usize>(),
+            // Two different facts, and they were one number until I20. `unresolved` is "no table
+            // has this dir_root"; `undecodable` is "the table is known and the bytes do not fit the
+            // schema", which is what an ALTER makes routine and what the doc above already claimed
+            // this field did not mean.
+            unresolved: decoded.unresolved.values().sum::<usize>(),
+            undecodable: decoded.undecodable.values().sum::<usize>(),
             suppressed,
             excluded,
             refused,

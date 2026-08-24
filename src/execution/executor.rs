@@ -138,8 +138,12 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 .iter()
                 .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
                 .collect();
-            catalog.create_table(table, Schema{columns})?;
-            txn.checkpoint()?;
+            // A8 — the catalog mutation and the checkpoint go through ONE barrier, because a
+            // refusal must not be able to half-happen. `checkpoint` refuses while any transaction
+            // is attached, and doing it the other way round (mutate, then ask) meant a refused
+            // `CREATE TABLE` had already created the table, with no `Ddl` record and no retained
+            // shape, so no consumer would ever learn of it. See `TxnManager::ddl_checkpointed`.
+            txn.ddl_checkpointed(|| catalog.create_table(table, Schema{columns}))?;
 
             // Logged AFTER the checkpoint, and that ordering is not stylistic: `checkpoint`
             // truncates the WAL, so a DDL record written before it would be discarded by the very
@@ -186,8 +190,11 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 let entry = catalog.require_table(&table)?;
                 (entry.first_directory_page_id, entry.time_travel_root)
             };
-            catalog.drop_table(&table)?;
-            txn.checkpoint()?;
+            // Through the same barrier as `CreateTable`, for the same reason and with the same
+            // consequence reversed: a refused DROP that had already dropped the table left it gone
+            // from the catalog with no `DROP_TABLE` record logged, so a consumer would keep the
+            // table in its own schema forever and simply never hear of it again.
+            txn.ddl_checkpointed(|| catalog.drop_table(&table))?;
             txn.log_ddl(DdlRecord {
                 op: DdlOp::DropTable,
                 table: table.clone(),

@@ -65,7 +65,7 @@
 //!   needs a base backup, exactly as a replica does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::{Column, DataType, Value};
@@ -353,12 +353,83 @@ enum RowResult {
     Undecodable,
 }
 
+/// The DDL one log has taught this decoder, and which log that was.
+#[derive(Default)]
+struct Learned {
+    /// The log these LSNs refer to. `None` until the first decode.
+    log: Option<std::path::PathBuf>,
+    shapes: Vec<ShapeAt>,
+    /// **`shapes` is known-COMPLETE for `[base_lsn, covered_through)`.**
+    ///
+    /// Without this, the seed was a property of *the decoder's traversal* rather than of the log,
+    /// and that is a correctness bug, not an optimisation detail. `decode` seeds a range by
+    /// replaying the shapes it has walked past that sit below `from_lsn` — so a decoder asked only
+    /// for `[split, end)` had never walked an `ALTER` below `split`, never learned the column, and
+    /// dropped it from every row; while a decoder that happened to walk `[base, split)` first
+    /// emitted it. **Same log, same range, two different feeds**, and every cleanliness counter on
+    /// the wrong one read clean (`undecodable = 0`, `unresolved = 0`), so nothing downstream could
+    /// detect it. Two threads pumping one `Arc<FeedStreamer>` — a shape this module's own docs name
+    /// as supported — reached the same defect by call order instead of by argument, losing the
+    /// column in **40 of 40** trials.
+    ///
+    /// So the history stays a *cache*, but a cache with a coverage watermark: `decode` fills any
+    /// gap below `from_lsn` by scanning the log for DDL before it seeds, which makes the seed a
+    /// pure function of `(log, from_lsn)`. A cold decoder scans the prefix once and then agrees
+    /// with the warm one; a sequential pump loop has no gap to fill and scans nothing extra, so the
+    /// performance reason the history exists is preserved.
+    ///
+    /// Two invariants this must keep, both of which reopen a fixed defect if dropped: it is reset
+    /// to 0 whenever the log changes (an LSN means nothing across files — the A9 defect), and it is
+    /// clamped UP to `base_lsn` on truncation, because records below the floor are gone and can
+    /// never be scanned again.
+    covered_through: u64,
+}
+
+/// One shape a DDL record put into force, and where in the log it did so.
+///
+/// See [`LogicalDecoder::history`] for what this is for. `entry` is `None` for a `DROP TABLE`:
+/// from that LSN onwards the `dir_root` resolves to nothing again.
+#[derive(Clone)]
+struct ShapeAt {
+    lsn: u64,
+    dir_root: u32,
+    entry: Option<(String, Schema, Arc<Vec<String>>)>,
+    time_travel_root: Option<u32>,
+}
+
 /// Reads a WAL range and produces committed row-level changes.
 pub struct LogicalDecoder {
-    /// `dir_root` -> (table name, schema, column names).
+    /// `dir_root` -> (table name, schema, column names). The mapping the decoder was BUILT with —
+    /// a catalog snapshot, one hand-written table, or nothing. Never mutated; see `history`.
     tables: HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
     /// Time-travel heap roots. Records against these are MVCC's own bookkeeping.
     time_travel: BTreeSet<u32>,
+    /// **Every DDL this decoder has ever walked past, kept so a later call can seed from it — I20.**
+    ///
+    /// `decode` used to clone `tables`, evolve the clone as it walked, and drop it on return. That
+    /// is correct for one call spanning a whole log and wrong for every caller that walks the log in
+    /// pieces, which is what a server does: `FeedStreamer::pump` calls `decode` once per pump, so an
+    /// `ADD COLUMN` learned in pump *N* was forgotten by pump *N+1*, which re-seeded from the
+    /// constructor's snapshot. `Tuple::deserialize` against the narrower schema then ignored the
+    /// trailing bytes, so the added column's value was dropped from **every row for the remaining
+    /// life of the process** — silently, with `undecodable = 0` and no error. B11's own exit
+    /// criterion "a column added mid-stream reaches the destination" held only because its test
+    /// decodes the whole log in one call.
+    ///
+    /// Remembering the evolved map instead of the history would fix the pump and break a re-decode:
+    /// a range is legitimately walked more than once (at-least-once redelivery, and `pump`'s cursor
+    /// clamps BACK below the previous batch's end whenever a transaction is still open), and rows
+    /// that sit *below* an `ALTER` must still decode against the shape that was in force where they
+    /// sit. So what is kept is the DDL *with its LSN*, and a decode of `[from, to)` seeds itself by
+    /// replaying only the entries strictly below `from`. Decoding the same range twice therefore
+    /// produces the same answer both times, and decoding the next range forward carries the shape.
+    ///
+    /// **An LSN only means something within ONE log**, so the history is bound to the first log
+    /// this decoder walks and discarded if it is handed a different one. Nothing stops a caller
+    /// passing two `WalManager`s to one decoder — `decode` takes the log as an argument — and
+    /// without this a `DROP TABLE` in log A at an LSN below log B's range removed the table from
+    /// log B's feed. Found by an adversarial pass, not by reasoning about it.
+    history: Mutex<Learned>,
 }
 
 impl LogicalDecoder {
@@ -379,7 +450,7 @@ impl LogicalDecoder {
             );
             time_travel.insert(entry.time_travel_root);
         }
-        LogicalDecoder { tables, time_travel }
+        LogicalDecoder { tables, time_travel, history: Mutex::new(Learned::default()) }
     }
 
     /// Build a decoder for a single table, without a catalog.
@@ -398,7 +469,11 @@ impl LogicalDecoder {
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let mut tables = HashMap::new();
         tables.insert(dir_root, (name.to_string(), schema, Arc::new(columns)));
-        LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
+        LogicalDecoder {
+            tables,
+            time_travel: BTreeSet::from([time_travel_root]),
+            history: Mutex::new(Learned::default()),
+        }
     }
 
     /// A decoder that knows nothing at all.
@@ -408,7 +483,11 @@ impl LogicalDecoder {
     /// That is the difference between a feed that needs a catalog handed to it out of band and one
     /// that is self-describing.
     pub fn blank() -> Self {
-        LogicalDecoder { tables: HashMap::new(), time_travel: BTreeSet::new() }
+        LogicalDecoder {
+            tables: HashMap::new(),
+            time_travel: BTreeSet::new(),
+            history: Mutex::new(Learned::default()),
+        }
     }
 
     /// Number of tables this decoder can resolve. A decoder that knows no tables would report every
@@ -442,6 +521,220 @@ impl LogicalDecoder {
         }
     }
 
+    /// Put one remembered DDL back into a mapping being seeded. The inverse of what the walk below
+    /// does when it meets the record itself, so the two cannot disagree about what a record means.
+    fn apply_shape(
+        tables: &mut HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
+        time_travel: &mut BTreeSet<u32>,
+        shape: &ShapeAt,
+    ) {
+        match &shape.entry {
+            Some(entry) => {
+                tables.insert(shape.dir_root, entry.clone());
+            }
+            None => {
+                tables.remove(&shape.dir_root);
+            }
+        }
+        if let Some(root) = shape.time_travel_root {
+            time_travel.insert(root);
+        }
+    }
+
+    /// What one `Ddl` record does to the mapping, as a value, derived from the RECORD ALONE.
+    ///
+    /// This is the same shape the main walk remembers, and it must stay that way: it is what makes
+    /// a prefix scan and a full walk agree. It can be built without the evolving map because every
+    /// `Ddl` record carries the table's **full shape after the change** — `CreateTable` and
+    /// `AlterColumn` both re-establish the entry outright, and `DropTable` removes it — so nothing
+    /// here depends on what came before.
+    fn shape_of_ddl(
+        lsn: u64,
+        op: &DdlOp,
+        table: &str,
+        dir_root: u32,
+        time_travel_root: u32,
+        columns: &[(String, DataType, bool)],
+    ) -> Result<ShapeAt, FerroError> {
+        // Refused for the same reason the main walk refuses it, and deliberately not softened to a
+        // skip: if a malformed record made the prefix scan give up quietly, a cold decode would
+        // succeed where the warm one errors, which is the very warm/cold divergence this scan
+        // exists to remove.
+        if let DdlOp::AlterColumn(alt) = op {
+            let subject = alt.column();
+            if !columns.iter().any(|(n, _, _)| n == subject) {
+                return Err(FerroError::Wal(format!(
+                    "ddl record alters column '{subject}' of '{table}' but the shape it carries has \
+                     no such column: {:?}",
+                    columns.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+                )));
+            }
+        }
+        let entry = match op {
+            DdlOp::DropTable => None,
+            _ => {
+                let schema = Schema::new(
+                    columns
+                        .iter()
+                        .map(|(name, ty, nullable)| Column {
+                            name: name.clone(),
+                            data_type: ty.clone(),
+                            nullable: *nullable,
+                        })
+                        .collect(),
+                );
+                let names: Vec<String> = columns.iter().map(|(n, _, _)| n.clone()).collect();
+                Some((table.to_string(), schema, Arc::new(names)))
+            }
+        };
+        Ok(ShapeAt {
+            lsn,
+            dir_root,
+            entry,
+            time_travel_root: match op {
+                DdlOp::DropTable => None,
+                _ => Some(time_travel_root),
+            },
+        })
+    }
+
+    /// Read `[from, to)` and push every DDL in it into `shapes`, ignoring everything else.
+    ///
+    /// This is the gap fill behind `Learned::covered_through`. It reads records rather than rows:
+    /// no tuple is deserialized, nothing is staged, and no event is produced, so the cost is one
+    /// pass over the record headers of a range the caller was going to skip anyway.
+    fn scan_ddl(
+        wal: &WalManager,
+        from: u64,
+        to: u64,
+        shapes: &mut Vec<ShapeAt>,
+    ) -> Result<(), FerroError> {
+        let mut lsn = from;
+        while lsn < to {
+            let (rec, next) = wal.read_record(lsn)?;
+            if let RecKind::Ddl { op, table, dir_root, time_travel_root, columns } = &rec.kind {
+                shapes.push(Self::shape_of_ddl(
+                    lsn,
+                    op,
+                    table,
+                    *dir_root,
+                    *time_travel_root,
+                    columns,
+                )?);
+            }
+            // Same guard the main walk carries: a record that does not advance would spin here
+            // forever, and a hang is harder to diagnose than an error.
+            if next <= lsn {
+                return Err(FerroError::Wal(format!(
+                    "log walk did not advance at lsn {lsn}; refusing to loop forever"
+                )));
+            }
+            lsn = next;
+        }
+        Ok(())
+    }
+
+    /// Fold newly-seen DDL into the remembered history.
+    ///
+    /// Merged rather than assigned, and keyed on `(lsn, dir_root)`: two threads may pump
+    /// concurrently through one `Arc<FeedStreamer>`, and a range walked twice — or a prefix scanned
+    /// after the walk that learned it — must not double-record. Both the walk's merge-back and the
+    /// `covered_through` gap fill go through here, so the two cannot drift apart.
+    fn merge_shapes(shapes: &mut Vec<ShapeAt>, incoming: Vec<ShapeAt>) {
+        if incoming.is_empty() {
+            return;
+        }
+        for shape in incoming {
+            match shapes.iter().position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root) {
+                Some(at) => shapes[at] = shape,
+                None => shapes.push(shape),
+            }
+        }
+        // `apply_shape` is order-sensitive: two shapes for one `dir_root` must land newest-last.
+        shapes.sort_by_key(|s| s.lsn);
+        Self::collapse_repeats(shapes);
+    }
+
+    /// Drop a remembered DDL that says nothing its predecessor did not.
+    ///
+    /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
+    /// against the log's base, and a live subscription pins the base, so under a held pin nothing
+    /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
+    /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
+    /// for every table after every truncation, so a long-running database mints one entry per table
+    /// per checkpoint, all carrying the identical shape.
+    ///
+    /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
+    /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
+    /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
+    /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
+    /// ranges in between.
+    fn collapse_repeats(shapes: &mut Vec<ShapeAt>) {
+        let mut newest: HashMap<u32, usize> = HashMap::new();
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, s) in shapes.iter().enumerate() {
+            if let Some(&prev) = newest.get(&s.dir_root) {
+                let p: &ShapeAt = &shapes[prev];
+                let same = match (&p.entry, &s.entry) {
+                    (None, None) => true,
+                    (Some((pn, ps, _)), Some((sn, ss, _))) => pn == sn && ps == ss,
+                    _ => false,
+                };
+                if same && p.time_travel_root == s.time_travel_root {
+                    drop.push(i);
+                    continue;
+                }
+            }
+            newest.insert(s.dir_root, i);
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut i = 0usize;
+        shapes.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
+    /// How many DDL records this decoder is remembering. Read-only, for tests that need to show the
+    /// history is bounded rather than infer it from the absence of a symptom.
+    pub fn history_len(&self) -> usize {
+        self.history.lock().unwrap().shapes.len()
+    }
+
+    /// Drop remembered DDL that no range can ever ask about again.
+    ///
+    /// Without this the history grows for the life of the process. `base_lsn` is the floor of the
+    /// retained log and `pump` refuses a cursor below it, so nothing can ever be decoded from lower
+    /// than there — but the newest record per table AT OR BELOW the floor is still needed, because a
+    /// range starting exactly at the floor is seeded by everything strictly below it. Only records a
+    /// later one for the same `dir_root` has already superseded are dropped.
+    fn forget_truncated(history: &mut Vec<ShapeAt>, base_lsn: u64) {
+        let mut superseded: Vec<usize> = Vec::new();
+        for (i, s) in history.iter().enumerate() {
+            if s.lsn >= base_lsn {
+                continue;
+            }
+            if history
+                .iter()
+                .any(|later| later.dir_root == s.dir_root && later.lsn > s.lsn && later.lsn <= base_lsn)
+            {
+                superseded.push(i);
+            }
+        }
+        if superseded.is_empty() {
+            return;
+        }
+        let mut i = 0usize;
+        history.retain(|_| {
+            let keep = !superseded.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
     /// Decode `[from_lsn, to_lsn)`.
     ///
     /// Walks once, buffering per transaction and releasing on commit.
@@ -458,8 +751,61 @@ impl LogicalDecoder {
         // was in force where they sit rather than against whatever the catalog looks like now.
         // Without this, decoding any history that contains a `CREATE TABLE` requires a catalog from
         // the future, and a `DROP TABLE` makes the past undecodable entirely.
+        //
+        // I20: the starting point is the constructor's map plus every DDL this decoder has already
+        // walked past that sits BELOW `from_lsn`. See `LogicalDecoder::history` — that is what
+        // carries an `ALTER` across a pump boundary without corrupting a re-decode of an earlier
+        // range. `learned` collects this call's DDL and is merged back in on the way out.
         let mut tables = self.tables.clone();
         let mut time_travel = self.time_travel.clone();
+        {
+            let mut history = self.history.lock().unwrap();
+            // One decoder, one log. See the field's doc: LSNs from a different file name different
+            // records, and applying them would delete or re-shape tables at random.
+            match &history.log {
+                Some(seen) if seen != &wal.path => {
+                    history.shapes.clear();
+                    // The watermark describes the log it was measured against, so it cannot outlive
+                    // it. Leaving it set here would claim coverage of a prefix of the NEW log that
+                    // nothing has read, which is A9 re-opened through the watermark instead of
+                    // through the shapes.
+                    history.covered_through = 0;
+                    history.log = Some(wal.path.clone());
+                }
+                None => history.log = Some(wal.path.clone()),
+                _ => {}
+            }
+            let base_lsn = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            Self::forget_truncated(&mut history.shapes, base_lsn);
+            // Clamped UP, not down. Everything below the floor has been truncated away and can
+            // never be scanned again, so the prefix `[base_lsn, ...)` is as complete as it will
+            // ever get; without this the fill below would try to read records that are gone.
+            history.covered_through = history.covered_through.max(base_lsn);
+
+            // **The gap fill — this is what makes the seed a property of the LOG, not of what this
+            // decoder happens to have walked.** See `Learned::covered_through`. A sequential pump
+            // has already covered everything below its cursor, so this is a no-op for it; a decoder
+            // handed an upper range cold scans the prefix once and then agrees with the warm one.
+            //
+            // It happens under the same lock the merge-back takes, so a concurrent pump cannot
+            // observe a half-filled history and seed from it — that is the 40/40 column loss.
+            if history.covered_through < from_lsn {
+                let gap_from = history.covered_through;
+                let mut found = Vec::new();
+                Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
+                // Through the shared merge: a decoder that walked an UPPER range first already holds
+                // shapes inside the gap, and appending blindly would duplicate them.
+                let mut shapes = std::mem::take(&mut history.shapes);
+                Self::merge_shapes(&mut shapes, found);
+                history.shapes = shapes;
+                history.covered_through = from_lsn;
+            }
+
+            for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
+                Self::apply_shape(&mut tables, &mut time_travel, shape);
+            }
+        }
+        let mut learned: Vec<ShapeAt> = Vec::new();
 
         // txn_id -> changes staged so far, in the order they were written.
         let mut staged: HashMap<u64, Vec<(u64, String, Arc<Vec<String>>, ChangeOp)>> = HashMap::new();
@@ -653,14 +999,30 @@ impl LogicalDecoder {
                         tables.insert(*dir_root, (table.clone(), schema, Arc::new(names)));
                     };
 
+                    // I20: what this record does to the mapping, remembered with its LSN so the
+                    // NEXT call to `decode` starts where this one ended. Built here rather than by
+                    // diffing the map afterwards, so a record that changes nothing is still
+                    // recorded at its own LSN.
+                    let remember = |tables: &HashMap<u32, (String, Schema, Arc<Vec<String>>)>| ShapeAt {
+                        lsn,
+                        dir_root: *dir_root,
+                        entry: tables.get(dir_root).cloned(),
+                        time_travel_root: match op {
+                            DdlOp::DropTable => None,
+                            _ => Some(*time_travel_root),
+                        },
+                    };
+
                     let change = match op {
                         DdlOp::CreateTable => {
                             adopt_shape(&mut tables);
                             time_travel.insert(*time_travel_root);
+                            learned.push(remember(&tables));
                             SchemaChange::CreateTable
                         }
                         DdlOp::DropTable => {
                             tables.remove(dir_root);
+                            learned.push(remember(&tables));
                             SchemaChange::DropTable
                         }
                         DdlOp::AlterColumn(alt) => {
@@ -682,6 +1044,7 @@ impl LogicalDecoder {
                                 })?;
                             adopt_shape(&mut tables);
                             time_travel.insert(*time_travel_root);
+                            learned.push(remember(&tables));
                             match alt {
                                 ColumnAlteration::Add { column } => {
                                     SchemaChange::AddColumn { column: column.clone() }
@@ -734,6 +1097,20 @@ impl LogicalDecoder {
                 )));
             }
             lsn = next;
+        }
+
+        // I20: publish what this walk learned, so the next range starts from it. Merged rather than
+        // assigned — two threads may pump concurrently through one `Arc<FeedStreamer>`, and a range
+        // walked twice must not double-record.
+        {
+            let mut history = self.history.lock().unwrap();
+            let mut shapes = std::mem::take(&mut history.shapes);
+            Self::merge_shapes(&mut shapes, learned);
+            history.shapes = shapes;
+            // The walk reached `to_lsn`, so the history is now complete up to there — and this must
+            // happen even when the range held NO DDL, or a pump over a quiet stretch would leave a
+            // gap behind it and re-scan the same records on every later call.
+            history.covered_through = history.covered_through.max(to_lsn);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
@@ -820,7 +1197,7 @@ mod tests {
             ),
         );
         // dir_root 8 is the table's time-travel heap: MVCC's own archive of superseded versions.
-        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]) }
+        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]), history: Mutex::new(Learned::default()) }
     }
 
     fn tuple_bytes(id: i32, qty: Option<i32>) -> Vec<u8> {
@@ -1240,7 +1617,11 @@ mod tests {
     #[test]
     fn a_decoder_with_no_tables_reports_everything_as_unresolved() {
         let (_d, w) = wal("empty");
-        let d = LogicalDecoder { tables: HashMap::new(), time_travel: BTreeSet::new() };
+        let d = LogicalDecoder {
+            tables: HashMap::new(),
+            time_travel: BTreeSet::new(),
+            history: Mutex::new(Learned::default()),
+        };
         assert_eq!(d.known_tables(), 0);
 
         w.append(1, 0, &RecKind::Begin).unwrap();

@@ -60,6 +60,8 @@ type DuckSink struct {
 	// Columns known per table, learned from CREATE_TABLE events, from the destination catalog, or
 	// inferred from the first row — in that order of preference.
 	columns map[string][]string
+	// The key column's CURRENT name per table, read from the destination catalog. See `keyFor`.
+	keys map[string]string
 }
 
 // bookkeeping names the columns this sink adds to every destination table. They are prefixed so
@@ -126,7 +128,7 @@ func openDuckSink(path, key string) (*DuckSink, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DuckSink{db: db, key: key, columns: map[string][]string{}}, nil
+	return &DuckSink{db: db, key: key, columns: map[string][]string{}, keys: map[string]string{}}, nil
 }
 
 // duckTypes is the closed set of types this sink will ever put into DDL.
@@ -238,7 +240,10 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		names = append(names, name)
 		types = append(types, typ)
 		def := quoteIdent(name) + " " + typ
-		if name == s.key {
+		// `keyFor`, not the flag — I20. For a table that does not exist yet this IS the flag; for
+		// one whose key column the source has renamed it is the name the destination actually
+		// carries the PRIMARY KEY on.
+		if name == s.keyFor(table) {
 			def += " PRIMARY KEY"
 			sawKey = true
 		}
@@ -248,7 +253,7 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		// Refuse rather than warn. A table without the key column has no conflict target, so every
 		// upsert against it would be a plain INSERT — the ordering guard would be absent, not
 		// degraded, and the destination would corrupt silently on the first replay.
-		return fmt.Errorf("table %s has no key column %q; the ordering guard needs one", table, s.key)
+		return fmt.Errorf("table %s has no key column %q; the ordering guard needs one", table, s.keyFor(table))
 	}
 	defs = append(defs, `"_commit_lsn" BIGINT NOT NULL`, `"_lsn" BIGINT NOT NULL DEFAULT 0`,
 		`"_deleted" BOOLEAN NOT NULL DEFAULT false`)
@@ -450,6 +455,42 @@ func (s *DuckSink) catalogSchema(table string) (names, types []string, err error
 }
 
 // catalogColumns is catalogSchema when only the names are wanted.
+// keyFor is the name the key column carries in `table` RIGHT NOW — I20, review finding 10.
+//
+// See `Sink.keyFor` for the whole argument; this is the DuckDB half of it. `duckdb_constraints()`
+// is the catalog that answers what `ON CONFLICT` will accept, and it follows the rename — measured,
+// not assumed: after `ALTER TABLE inv RENAME "id" TO "sku"` it reports `PRIMARY KEY [sku]`, and an
+// upsert on `sku` succeeds. Pinning `s.key` to the `-key` flag instead produced
+// `INSERT event for inv has no key column "id"` on every row, on every restart, for ever.
+func (s *DuckSink) keyFor(table string) string {
+	if n, ok := s.keys[table]; ok {
+		return n
+	}
+	rows, err := s.db.Query(
+		`SELECT constraint_column_names FROM duckdb_constraints()
+		  WHERE table_name = ? AND schema_name = 'main' AND constraint_type = 'PRIMARY KEY'`, table)
+	if err != nil {
+		return s.key
+	}
+	defer rows.Close()
+	for rows.Next() {
+		// The driver hands the column-name list back as a slice; this source's primary key is
+		// always the single column at ordinal 0 (`catalog.rs`: "first column = primary key"), so
+		// there is no composite case to get wrong.
+		var names []any
+		if err := rows.Scan(&names); err != nil || len(names) == 0 {
+			return s.key
+		}
+		n := fmt.Sprint(names[0])
+		s.keys[table] = n
+		return n
+	}
+	return s.key
+}
+
+// forgetKey drops a cached key name, wherever the destination's shape moves underneath it.
+func (s *DuckSink) forgetKey(table string) { delete(s.keys, table) }
+
 func (s *DuckSink) catalogColumns(table string) ([]string, error) {
 	names, _, err := s.catalogSchema(table)
 	return names, err
@@ -595,6 +636,9 @@ func (s *DuckSink) applyDuckSchemaChange(e *Event) error {
 	// Re-read from the catalog rather than trusting the statement to have produced what was asked
 	// for. `s.columns` drives every subsequent upsert, and one built from the request rather than
 	// from the destination names a column that may not exist.
+	//
+	// I20: the cached key name goes with it — a RENAME_COLUMN may have just moved it.
+	s.forgetKey(e.Table)
 	after, err := s.catalogColumns(e.Table)
 	if err != nil {
 		return err
@@ -627,6 +671,7 @@ func (s *DuckSink) apply(e *Event) error {
 			return err
 		}
 		delete(s.columns, e.Table)
+		s.forgetKey(e.Table)
 		return nil
 	}
 
@@ -642,10 +687,11 @@ func (s *DuckSink) apply(e *Event) error {
 	if err := s.ensureDuckFromRow(e.Table, row); err != nil {
 		return err
 	}
-	if _, ok := row[s.key]; !ok {
+	key := s.keyFor(e.Table)
+	if _, ok := row[key]; !ok {
 		// Without the key there is no conflict target, so the row would land as a fresh insert every
 		// time it was re-delivered. Say so rather than duplicating it.
-		return fmt.Errorf("%s event for %s has no key column %q", e.Op, e.Table, s.key)
+		return fmt.Errorf("%s event for %s has no key column %q", e.Op, e.Table, key)
 	}
 
 	cols := s.columns[e.Table]
@@ -680,7 +726,7 @@ func (s *DuckSink) apply(e *Event) error {
 	// path that goes through this function inherits it, and there is no path that does not.
 	sets := make([]string, 0, len(cols)+2)
 	for _, c := range cols {
-		if c == s.key {
+		if c == key {
 			// Left out because it is a no-op by construction: the row matched on this column, so it
 			// already holds this value. (DuckDB 1.4.1 accepts the assignment — measured, not
 			// assumed — so this is about the statement saying what it means, not about being
@@ -704,7 +750,7 @@ func (s *DuckSink) apply(e *Event) error {
 		quoteIdent(e.Table),
 		strings.Join(names, ", "),
 		strings.Join(placeholders, ", "),
-		quoteIdent(s.key),
+		quoteIdent(key),
 		strings.Join(sets, ", "),
 		quoteIdent(e.Table),
 		quoteIdent(e.Table),
