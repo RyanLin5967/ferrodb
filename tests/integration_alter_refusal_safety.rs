@@ -504,19 +504,38 @@ fn a_refused_alter_survives_a_checkpoint_a_flush_and_a_fresh_buffer_pool() {
 // The other ways in, and the other side of a restart
 // ---------------------------------------------------------------------------------------------
 
-/// The rewrite is also reached from `MERGE`, and that route must be no less safe.
+/// The rewrite is also reached from `MERGE`, and on that route the refusal must be no less safe.
 ///
 /// `AgentRuntime::merge` runs a branch's staged schema edits through the same
 /// `Catalog::alter_table`, so an edit an agent typed against a narrow table can meet a row that has
-/// since grown. What is asserted here is the target: its heap, its shape, its index answers and its
+/// since grown. What is asserted is the target: its heap, its shape, its index answers and its
 /// rows, byte for byte.
 ///
-/// What is deliberately NOT asserted is the shape of the failure the agent sees. It arrives as an
-/// `Err` from `MERGE` rather than as a `MergeReport` saying the merge did not land, which is
-/// `review-B11.md` finding 5 — the publish is committed before the schema edits run — and it is
-/// that row's to fix, not this one's. This test pins that I19 did not make it worse.
+/// # The scope of this test is exactly one staged edit on a branch that wrote no rows, and that is
+/// not an accident of the fixture
+///
+/// `MERGE` is not atomic across its parts. It commits the branch's row writes in one transaction
+/// and *then* applies the staged schema edits one at a time, each with its own `Catalog::finish`,
+/// `persist`, flush and DDL record. So a refusal on any edit leaves everything before it durable:
+///
+/// - a branch that also wrote rows has those rows on the target — measured as `SELECT id, n`
+///   going from 2 rows to 3 with `id=1`'s value changed, after a `MERGE` that returned `Err`;
+/// - a branch staging `RENAME COLUMN a TO a2` *then* the retype has the rename permanently applied
+///   — `SELECT a` answers before the refusal and errors after it, and a `RenameColumn` DDL record
+///   reaches the feed.
+///
+/// Both were found by a fresh-context adversarial pass and confirmed by an independent skeptic,
+/// which also established what is NOT wrong with them: across each refusal the heap is
+/// byte-identical, no tuple moved, no row was lost and no value changed. The refused ALTER does
+/// what this row requires of it; what is not atomic is the statement wrapped around it, which is
+/// `review-B11.md` finding 5 and needs the publish and the edits to share one commit point.
+/// Reproductions: branch `I19-atk4-paths` commit `0dee647`, and `I19-atk4-LENS` commits `7078256`
+/// and `502d8ed`.
+///
+/// So this test says what it can honestly say — a lone edit, no row writes — and the paragraph
+/// above says what it cannot, rather than a name implying the whole route is covered.
 #[test]
-fn a_schema_edit_refused_at_merge_leaves_the_target_exactly_as_it_was() {
+fn a_lone_schema_edit_refused_at_merge_leaves_the_target_exactly_as_it_was() {
     let keys = [Value::Integer(1), Value::Integer(2)];
     let big = "x".repeat(2014);
 
