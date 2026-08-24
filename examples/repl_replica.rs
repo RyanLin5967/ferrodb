@@ -55,15 +55,28 @@ fn main() {
     // Resume from where a previous run got to. Checked after the backup branch on purpose: a fresh
     // restore must start at the label, and a restart must not silently rewind to an older backup's
     // position.
-    let state_path = format!("{db}.replstate");
+    let state = ferrodb::replication::ReplicaState::at(std::path::Path::new(&db));
     let mut resuming = false;
     if backup_dir.is_none() {
-        if let Ok(text) = std::fs::read_to_string(&state_path) {
-            if let Ok(lsn) = text.trim().parse::<u64>() {
+        // B6 — `resume` reads the position and checks the divergence latch as ONE operation, so
+        // this cannot read the number and forget the latch. A divergence recorded by a previous
+        // run is FATAL and outlives that run: the records that caused it are gone from the
+        // primary, so restarting would resume from the primary's base and report the replica
+        // caught up over pages that do not match it. Exiting here is the whole point — the halt
+        // that only lives in memory buys nothing, because the operator restarts the process.
+        match state.resume() {
+            Err(e) => {
+                eprintln!("repl_replica: {e}");
+                println!("DIVERGED-REFUSED");
+                std::io::stdout().flush().unwrap();
+                std::process::exit(7);
+            }
+            Ok(Some(lsn)) => {
                 start_lsn = lsn;
                 resuming = true;
                 println!("RESUMED {lsn}");
             }
+            Ok(None) => {}
         }
     }
 
@@ -94,13 +107,7 @@ fn main() {
 
     // Record progress only after the pages it describes are durable. Never the other way round.
     let record = |lsn: u64| {
-        use std::io::Write as _;
-        let tmp = format!("{state_path}.tmp");
-        let mut f = std::fs::File::create(&tmp).expect("create replstate");
-        write!(f, "{lsn}").expect("write replstate");
-        f.sync_all().expect("fsync replstate");
-        // Rename so a reader never sees a half-written number.
-        std::fs::rename(&tmp, &state_path).expect("rename replstate");
+        state.record_applied(lsn).expect("record replica position");
     };
 
     let abort_after: Option<u32> = std::env::var("FERRODB_REPLICA_ABORT_AFTER_BATCHES")
@@ -119,7 +126,22 @@ fn main() {
             .expect("hello");
         match Message::read_from(&mut reader).expect("reply") {
             Message::Records { start_lsn, bytes } => {
-                applier.apply(start_lsn, &bytes).expect("apply");
+                // I20: a divergence is not a crash and must not read as one. `applied_lsn` is
+                // still true — everything below it really is applied — so it is reported, the
+                // pages already applied are flushed, and the process exits non-zero rather than
+                // panicking or, worse, looping into the same refusal.
+                if let Err(e) = applier.apply(start_lsn, &bytes) {
+                    let _ = bp.flush_all();
+                    // Recorded DURABLY, not just latched in memory — B6. The next start reads this
+                    // and refuses, instead of resuming from the primary's base over stale pages.
+                    state
+                        .record_divergence(applier.applied_lsn(), &e.to_string())
+                        .expect("record replica divergence");
+                    eprintln!("replica stopped: {e}");
+                    println!("DIVERGED {}", applier.applied_lsn());
+                    std::io::stdout().flush().unwrap();
+                    std::process::exit(7);
+                }
                 bp.flush_all().expect("flush replica pages");
                 record(applier.applied_lsn());
                 batches += 1;

@@ -592,3 +592,253 @@ func TestTheFeedLandsInDuckdbAcrossAMissedAlter(t *testing.T) {
 		t.Errorf("the catch-up lost rows: %d", n)
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// I20 — review findings 4 and 10.
+// ---------------------------------------------------------------------------------------------
+
+// The evolved declaration a consumer is handed after the source retyped `qty` to DECIMAL, added
+// `note`, and then checkpointed both ALTER records away. The NAMES still prefix-match what a
+// destination created from `createInv` holds, which is the whole trap.
+const retypedAndWiderInv = `{"table":"inv","op":"CREATE_TABLE","txn":0,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,` +
+	`"before":null,"after":{"columns":[` +
+	`{"name":"id","type":"INTEGER","nullable":false},` +
+	`{"name":"qty","type":"DECIMAL","nullable":true},` +
+	`{"name":"note","type":"VARCHAR(20)","nullable":true}]}}`
+
+// A row whose `qty` is a 39-digit decimal. The feed ships DECIMAL as a JSON **string** precisely so
+// no digit is lost in transit; an INTEGER-affinity column at the far end throws that away anyway.
+func bigDecimalRow(id, lsn int) string {
+	return fmt.Sprintf(
+		`{"table":"inv","op":"INSERT","txn":%d,"lsn":%d,"commit_lsn":%d,"commit_end_lsn":%d,`+
+			`"before":null,"after":{"id":%d,"qty":"170141183460469231731687303715884105727","note":"x"}}`,
+		id, lsn, lsn, lsn+1, id)
+}
+
+// **The SQLite catch-up must not ignore a retype — I20, review finding 4.**
+//
+// `ensureTable`'s prefix test was `if got[i] != names[i]`: names only. The DuckDB sink's
+// `catchUpToDeclaredShape` compared names AND types, and both this consumer's comment and its
+// report claimed the catch-up fired only on "same names, same types, in order". On this side the
+// second half was never written, and SQLite has no `checkSchemaAgrees` to catch it downstream.
+//
+// So the declaration rode in on a matching name prefix: `note` was appended, `qty` kept its INTEGER
+// declaration, and a 39-digit decimal arriving as a JSON string was converted by INTEGER affinity —
+// measured before the fix as `1.7014118346046923e+38`, storage class `real`, 39 digits reduced to
+// 17, from a run that printed `applied 2, skipped 0` and exited 0.
+func TestTheSqliteCatchUpRefusesARetypeInTheDeclaration(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "out.sqlite")
+
+	// Pass one: the destination is created at the ORIGINAL shape and takes a row.
+	first := filepath.Join(dir, "first.jsonl")
+	writeLines(t, first, []string{createInv, insertLine(1, 10, 10, "")})
+	if err := runSink(first, db, "id", "sqlite"); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// Pass two: the consumer resumes and is handed only the evolved declaration.
+	second := filepath.Join(dir, "second.jsonl")
+	writeLines(t, second, []string{retypedAndWiderInv, bigDecimalRow(2, 30)})
+	err := runSink(second, db, "id", "sqlite")
+	if err == nil {
+		// If it did not refuse, say exactly what was lost rather than only that it did not fail.
+		got := sqliteRows(t, db, `SELECT qty, typeof(qty) FROM inv WHERE id = 2`)
+		t.Fatalf("the sink accepted a declaration that retypes a column it will not retype, and "+
+			"stored the value through the old affinity: %v", got)
+	}
+	if !strings.Contains(err.Error(), "affinity") {
+		t.Fatalf("refused, but not by the type check: %v", err)
+	}
+
+	// The row before the retype is untouched: a refusal must not be a partial apply.
+	rows := sqliteRows(t, db, `SELECT id, qty FROM inv ORDER BY id`)
+	if len(rows) != 1 || fmt.Sprint(rows[0][0]) != "1" {
+		t.Fatalf("the refusal disturbed the rows already landed: %v", rows)
+	}
+}
+
+// The unit-level twin of `TestTheCatchUpRefusesAnythingThatIsNotAPrefix`, which called only the
+// DuckDB function — which is why a mutation sweep never saw the SQLite copy at all.
+func TestTheSqliteCatchUpComparesTypesAndNotOnlyNames(t *testing.T) {
+	s := &Sink{key: "id", columns: map[string][]string{}, keys: map[string]string{}}
+	// Same names, one type moved: NOT a prefix, so nothing may be added.
+	grown, err := s.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty", "note"}, []string{"INTEGER", "TEXT", "TEXT"},
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if grown {
+		t.Fatal("the catch-up grew a destination whose second column is a different type; a " +
+			"retype is not an append and the values already stored are not in the new type")
+	}
+	// ...but on the INFERENCE path the same shapes MUST grow, because those types are guesses
+	// (`ensureFromRow` marks every column TEXT) and comparing them would refuse on every column,
+	// stranding exactly the consumer the catch-up exists for. A real destination here, because
+	// this path reaches the ALTER.
+	real, err := openSink(filepath.Join(t.TempDir(), "grow.sqlite"), "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer real.Close()
+	if _, err := real.db.Exec(`CREATE TABLE inv ("id" INTEGER PRIMARY KEY, "qty" INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	grown, err = real.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty", "note"}, []string{"TEXT", "TEXT", "TEXT"},
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, false)
+	if err != nil {
+		t.Fatalf("unexpected error on the inference path: %v", err)
+	}
+	if !grown {
+		t.Fatal("a column the source added could not be caught up on the inference path; a " +
+			"consumer that resumed after its CREATE_TABLE was truncated away is stranded")
+	}
+	// A genuine prefix still qualifies — otherwise this test would pass with a catch-up that
+	// refuses everything, which fixes nothing.
+	if _, err := s.catchUpToDeclaredShape("inv",
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"},
+		[]string{"id", "qty"}, []string{"INTEGER", "INTEGER"}, true); err != nil {
+		t.Fatalf("a matching shape was refused: %v", err)
+	}
+}
+
+// The key column itself, renamed. The source permits this — only RETYPING the primary key is
+// refused — and the rename keeps the column at ordinal 0, which is what still makes it the key.
+func renameKeyLine(lsn int) string {
+	return fmt.Sprintf(
+		`{"table":"inv","op":"RENAME_COLUMN","txn":0,"lsn":%d,"commit_lsn":%d,"commit_end_lsn":%d,`+
+			`"before":null,"after":{"columns":[`+
+			`{"name":"sku","type":"INTEGER","nullable":false},`+
+			`{"name":"qty","type":"INTEGER","nullable":true}],`+
+			`"alter":{"from":"id","to":"sku"}}}`, lsn, lsn, lsn+1)
+}
+
+func keyedInsertLine(sku, qty, lsn int) string {
+	return fmt.Sprintf(
+		`{"table":"inv","op":"INSERT","txn":%d,"lsn":%d,"commit_lsn":%d,"commit_end_lsn":%d,`+
+			`"before":null,"after":{"sku":%d,"qty":%d}}`, sku, lsn, lsn, lsn+1, sku, qty)
+}
+
+// **Renaming the primary-key column must not stall the sink — I20, review finding 10.**
+//
+// The in-memory fold follows the rename (`Table.apply`: `if t.key == from { t.key = to }`); both
+// sinks pinned `s.key` to the `-key` flag for ever. Measured before the fix:
+// `apply INSERT to inv: SQL logic error: ON CONFLICT clause does not match any PRIMARY KEY or
+// UNIQUE constraint` — and `runSink` returns on the first error, so every restart died at the same
+// record. Three consumers off one feed reached three different answers.
+func TestTheSqliteSinkFollowsARenameOfTheKeyColumn(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.jsonl")
+	db := filepath.Join(dir, "out.sqlite")
+	writeLines(t, feed, []string{
+		createInv,
+		insertLine(1, 10, 10, ""),
+		renameKeyLine(20),
+		keyedInsertLine(1, 99, 30),
+	})
+	if err := runSink(feed, db, "id", "sqlite"); err != nil {
+		t.Fatalf("the sink failed after the source renamed its primary key: %v", err)
+	}
+
+	// **The COUNT is the load-bearing assertion**, not the value: it separates "the sink followed
+	// the rename" from "the sink lost its conflict target and appended a second row". Exactly one
+	// row, holding the later value, is the only state that proves the upsert matched on the
+	// renamed key.
+	rows := sqliteRows(t, db, `SELECT sku, qty FROM inv ORDER BY sku`)
+	if len(rows) != 1 {
+		t.Fatalf("expected one row after an upsert on the renamed key, got %d: %v", len(rows), rows)
+	}
+	if fmt.Sprint(rows[0][1]) != "99" {
+		t.Fatalf("the upsert did not replace the row: %v", rows[0])
+	}
+	// And the destination still HAS a primary key on the new name, or the guard is gone rather
+	// than moved.
+	pk := sqliteRows(t, db, `SELECT name FROM pragma_table_info('inv') WHERE pk != 0`)
+	if len(pk) != 1 || fmt.Sprint(pk[0][0]) != "sku" {
+		t.Fatalf("the destination's primary key did not follow the rename: %v", pk)
+	}
+}
+
+// The same for DuckDB, whose failure wore a different face — `INSERT event for inv has no key
+// column "id"` — from the same cause.
+func TestTheDuckSinkFollowsARenameOfTheKeyColumn(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.jsonl")
+	db := filepath.Join(dir, "out.duckdb")
+	writeLines(t, feed, []string{
+		createInv,
+		insertLine(1, 10, 10, ""),
+		renameKeyLine(20),
+		keyedInsertLine(1, 99, 30),
+	})
+	if err := runSink(feed, db, "id", "duckdb"); err != nil {
+		t.Fatalf("the sink failed after the source renamed its primary key: %v", err)
+	}
+	got, err := duckSQL(db, `SELECT sku, qty FROM inv ORDER BY sku`)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != "1|99" {
+		t.Fatalf("expected exactly one row carrying the later value, got %q", got)
+	}
+	pk, err := duckSQL(db, `SELECT constraint_column_names FROM duckdb_constraints()
+	                        WHERE table_name = 'inv' AND constraint_type = 'PRIMARY KEY'`)
+	if err != nil {
+		t.Fatalf("read constraints: %v", err)
+	}
+	if !strings.Contains(pk, "sku") {
+		t.Fatalf("the destination's primary key did not follow the rename: %q", pk)
+	}
+}
+
+// The declaration a consumer is handed after the source renamed `qty` to `quantity` and a later
+// whole-table DDL checkpointed the RENAME_COLUMN record away. Same column count, one name moved.
+const renamedInv = `{"table":"inv","op":"CREATE_TABLE","txn":0,"lsn":1,"commit_lsn":1,"commit_end_lsn":2,` +
+	`"before":null,"after":{"columns":[` +
+	`{"name":"id","type":"INTEGER","nullable":false},` +
+	`{"name":"quantity","type":"INTEGER","nullable":true}]}}`
+
+// **I20, review finding 8 — a DIAGNOSIS, not a repair.**
+//
+// A rename plus any later checkpoint still strands the SQLite sink, and this test pins that it
+// stalls. What it also pins is that the stall now NAMES ITS CAUSE. Before, the operator met
+// `apply INSERT to inv: SQL logic error: table inv has no column named quantity` at INSERT time,
+// which points at the feed rather than at the destination and says nothing about the rename or
+// about what to do.
+//
+// The sink does not rename the column itself, and that restraint is the finding-9 interaction: a
+// rename and a drop-plus-recreate of a table of the same name are indistinguishable from a shape
+// diff, and guessing wrong keeps a dead table's rows and presents them as live.
+func TestARenameTruncatedAwayStallsTheSinkButNamesTheCause(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "out.sqlite")
+
+	first := filepath.Join(dir, "first.jsonl")
+	writeLines(t, first, []string{createInv, insertLine(1, 10, 10, "")})
+	if err := runSink(first, db, "id", "sqlite"); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	second := filepath.Join(dir, "second.jsonl")
+	writeLines(t, second, []string{renamedInv,
+		`{"table":"inv","op":"INSERT","txn":2,"lsn":30,"commit_lsn":30,"commit_end_lsn":31,` +
+			`"before":null,"after":{"id":2,"quantity":20}}`})
+	err := runSink(second, db, "id", "sqlite")
+	if err == nil {
+		t.Fatal("the sink accepted a declaration whose column names do not match the destination; " +
+			"finding 8 is fixed and this test needs rewriting, or a rename was guessed at")
+	}
+	// The whole point: the message has to be actionable.
+	for _, want := range []string{"RENAME COLUMN", "quantity", "drop the table"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal does not tell the operator %q: %v", want, err)
+		}
+	}
+	// And it refused BEFORE writing anything, rather than half-applying.
+	rows := sqliteRows(t, db, `SELECT id, qty FROM inv ORDER BY id`)
+	if len(rows) != 1 {
+		t.Fatalf("the refusal disturbed the destination: %v", rows)
+	}
+}

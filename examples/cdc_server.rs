@@ -223,6 +223,18 @@ fn main() {
             };
             cursor = pumped.cursor;
             emitted_through = pumped.emitted_through;
+            // I20: a shape mismatch is not a refusal and not a silence. It means this pump held a
+            // schema that does not describe the bytes it read, which since B11 is a thing a running
+            // server can reach — and it produced no event, no error and, until `Pumped` carried the
+            // count, no number either. Said out loud rather than left for someone to notice as a
+            // permanently-null column at the destination.
+            if pumped.undecodable > 0 || pumped.unresolved > 0 {
+                eprintln!(
+                    "cdc_server: WARNING at cursor {cursor}: {} record(s) did not match the schema \
+                     this decoder holds and {} named no known table; the feed is INCOMPLETE",
+                    pumped.undecodable, pumped.unresolved
+                );
+            }
             // Before the caught-up test, because a refusal also emits nothing and would otherwise be
             // read as "caught up" or spun on for ever.
             if let Some(refusal) = &pumped.refusal {
