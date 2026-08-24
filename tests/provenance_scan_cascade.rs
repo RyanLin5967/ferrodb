@@ -112,16 +112,38 @@ impl Db {
     }
 
     /// Open an agent session and run one scan on it, leaving the session open. The scan is the
-    /// read whose retained region is under test.
-    fn scanning_session(&mut self, agent: &str, run_id: &str, where_clause: &str) -> Session {
+    /// read whose retained region is under test. `expect_rows` is how many rows the region really
+    /// holds at this point in the fixture.
+    ///
+    /// **The count is exact, and it used to be `seen.len() <= 3`.** That bound could never bind: no
+    /// fixture in this file reaches three rows through here, and — the part that mattered — it is
+    /// satisfied by `seen.len() == 0`, which is the clean negative result it was commented as
+    /// preventing. A failed statement already panics inside `Db::ok`, so it added nothing at all.
+    ///
+    /// What the exact count DOES prove: the scan saw the rows the fixture believes are in range, so
+    /// a test asserting "no edge" cannot be passing because the read quietly matched nothing. What
+    /// it does NOT prove, stated because a zero here reads like a hole: for an expected-zero scan
+    /// (the phantom case, where an absence is the whole observation) the count cannot distinguish an
+    /// empty region from a read that returned nothing for another reason. That is why the claim that
+    /// retention HAPPENED is made on the graph and on the blind-write metric, never on this number.
+    fn scanning_session(
+        &mut self,
+        agent: &str,
+        run_id: &str,
+        where_clause: &str,
+        expect_rows: usize,
+    ) -> Session {
         let mut s = self.session();
         self.ok(&format!("BEGIN AGENT SESSION AS '{}' RUN '{}';", agent, run_id), &mut s);
         let sql = format!("SELECT id, qty FROM inventory{};", where_clause);
         let seen = rows(self.ok(&sql, &mut s));
-        // A scan that returned nothing is still a retained region — that is the phantom case — but
-        // an assertion that the statement ran at all keeps a silently-failed read from reading as a
-        // clean negative result.
-        assert!(seen.len() <= 3, "unexpected row count from {}", sql);
+        assert_eq!(
+            seen.len(),
+            expect_rows,
+            "the scan did not see the rows this fixture puts in range: {} returned {:?}",
+            sql,
+            seen
+        );
         s
     }
 }
@@ -183,7 +205,7 @@ fn a_dependent_reached_by_a_scan_is_named_by_cascade() {
 
     // (b) reporting-agent scans that range — a full scan with a residual, which is what the surface
     //     gives an agent — and then writes on the strength of what it saw.
-    let mut b = db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50");
+    let mut b = db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50", 2);
     db.ok("UPDATE inventory SET qty = qty + 1 WHERE id = 2;", &mut b);
     let second = report(db.ok("MERGE;", &mut b));
     assert!(second.applied_to_target, "{}", second);
@@ -213,24 +235,54 @@ fn a_dependent_reached_by_a_scan_is_named_by_cascade() {
 /// dependents, and the one that scanned first cannot be: the row did not exist when it looked. This
 /// is the anti-vacuity half of the test above, run against the same predicate so that the only
 /// difference between the two branches is *when* they read.
+///
+/// **This test used to be unable to fail from lost retention, which is the one failure it exists to
+/// rule out.** Its only positive claim was that the late branch appears, and the early branch being
+/// ABSENT is satisfied equally by "the temporal rule excluded it" and by "its read was never
+/// retained at all". Measured: a planted one-liner at the top of `TxnCapture::on_read`,
+/// `if observed_at == 1 { return; }`, deletes retention for exactly any read taken before anything
+/// has been published — precisely this early branch — and all five tests in this file stayed green.
+/// That is a plausible regression shape rather than a contrived one: an `apply_seq == 0` early-out
+/// or a sentinel guard produces it.
+///
+/// So the early branch's retention is now asserted DIRECTLY, and it has to be asserted on something
+/// that works at `observed_at == 1`: there is by definition no published write for the early branch
+/// to depend on, so no dependency edge can carry the claim. The blind-write metric can. The early
+/// branch's scan looked at the whole `inventory` table, so a row it then writes without reading is
+/// NOT reported blind — and with its retention dropped it is. That row's qty is put OUTSIDE the
+/// scanned range so it cannot itself become the dependency the rest of the test is about.
 #[test]
 fn a_branch_that_scanned_before_the_write_is_not_a_dependent() {
     let mut db = Db::new();
     db.seed();
 
     // (a) early-agent scans first, at a snapshot where row 7 does not exist. txn 1.
-    let _early = db.scanning_session("early-agent", "r_early", " WHERE qty >= 20 AND qty < 50");
+    let mut early =
+        db.scanning_session("early-agent", "r_early", " WHERE qty >= 20 AND qty < 50", 1);
+
+    // (a2) THE RETENTION CLAIM, without which the absence in (d) below is indistinguishable from a
+    //      read that retained nothing.
+    db.ok("INSERT INTO inventory VALUES (9, 500);", &mut early);
+    let early_report = report(db.ok("MERGE;", &mut early));
+    assert!(early_report.applied_to_target, "{}", early_report);
+    assert!(
+        early_report.blind_writes.is_empty(),
+        "the early branch scanned the whole inventory table, so the row it wrote without reading \
+         must not be reported blind. This is the assertion that fails when the early branch's \
+         retention is silently dropped: {:?}",
+        early_report.blind_writes
+    );
 
     // (b) restock-agent inserts into that range and merges. txn 2.
     let m1 = insert_and_merge(&mut db, "restock-agent", "r_restock", 7, 30);
 
     // (c) late-agent scans the same range afterwards, and DOES see the row. txn 3.
-    let _late = db.scanning_session("late-agent", "r_late", " WHERE qty >= 20 AND qty < 50");
+    let _late = db.scanning_session("late-agent", "r_late", " WHERE qty >= 20 AND qty < 50", 2);
 
     let mut main = db.session();
     let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
-    // The forced-to-fire half: the write is inside both regions, so if timestamps were ignored both
-    // tasks would appear here.
+    // (d) The forced-to-fire half: the write is inside both regions, so if timestamps were ignored
+    //     both tasks would appear here.
     assert!(halted.is_blocked(), "late-agent read the inserted row and must be named");
     assert_eq!(
         halted.blocked_by,
@@ -255,7 +307,8 @@ fn a_write_outside_the_scanned_range_is_not_a_dependency() {
     let m_in = insert_and_merge(&mut db, "restock-agent", "r_restock", 9, 30);
 
     // One scanner, reading after BOTH merges, so timestamps cannot be what separates them.
-    let _reader = db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50");
+    let _reader =
+        db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50", 2);
 
     let mut main = db.session();
     // Out of range: nothing depends on it, and the revert proceeds and really happens.
@@ -337,9 +390,11 @@ fn a_scan_depends_on_the_write_that_moved_a_row_out_of_its_range() {
 
     // The reporter scans that range afterwards and finds it empty — an observation it made only
     // because of the write above.
-    let _reader = db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50");
+    let _reader =
+        db.scanning_session("reporting-agent", "r_report", " WHERE qty >= 20 AND qty < 50", 0);
     // The anti-vacuity half: a scan of a region that NEITHER image touches must not be named.
-    let _elsewhere = db.scanning_session("audit-agent", "r_audit", " WHERE qty >= 1000 AND qty < 2000");
+    let _elsewhere =
+        db.scanning_session("audit-agent", "r_audit", " WHERE qty >= 1000 AND qty < 2000", 0);
 
     let mut main = db.session();
     let halted = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));

@@ -119,12 +119,53 @@ impl TxnCapture {
         summary: Option<PredicateSummary>,
         observed_at: u64,
     ) {
-        if let (crate::provenance::readset::ReadSetForm::Predicate, Some(p)) =
-            (shape.form(), summary.clone())
-        {
-            self.predicates.push(TimedPredicate { summary: p, observed_at });
+        use crate::provenance::readset::ReadSetForm;
+        let form = shape.form();
+        // **An exact-version read that returned NOTHING observed an ABSENCE, and an absence has no
+        // version to name.** `ReadSetBuilder::finish` drops an empty exact set entirely, so such a
+        // read used to be retained as *nothing at all* — not even the table it looked in. What it
+        // DID observe is that the region its clause names held no row, and that is precisely
+        // phantom coverage: the one thing a predicate summary exists to express.
+        //
+        // Measured before this: a pruner deletes row 2 and merges; a filler asks
+        // `WHERE id = 2`, gets nothing, and inserts (2, 999) on the strength of that absence;
+        // `REVERT MERGE m_1` is NOT blocked, proceeds, and fails with
+        // `constraint error: duplicate primary key Integer(2)` — an error where the contract
+        // promises either a dependency tree or a completed revert. The identical absence written as
+        // a range (`WHERE id >= 2 AND id < 3`) halted correctly. Identical semantics, opposite
+        // outcomes, decided by syntax.
+        //
+        // The shape's own form is left exactly as it was, which for this case is an empty exact set
+        // the builder still drops. Nothing is double-counted: for a predicate shape `observe` records
+        // the summary itself, so the extra `observe_predicate` runs only in the absence case.
+        let absence = form == ReadSetForm::ExactVersions && versions.is_empty();
+        if let Some(p) = summary.clone() {
+            if form == ReadSetForm::Predicate || absence {
+                self.predicates.push(TimedPredicate { summary: p.clone(), observed_at });
+            }
+            if absence {
+                self.reads.observe_predicate(p);
+            }
         }
         self.reads.observe(shape, versions, summary);
+    }
+
+    /// Retain the region a WRITE statement's own `WHERE` clause looked at, for the causal graph
+    /// ONLY.
+    ///
+    /// **Causality and inspection are different questions, and this is the one place they part.**
+    /// `UPDATE ... WHERE id = 7` decided which row to write by naming it, so the write causally
+    /// depends on that row: a revert of whatever published it has a dependent here, and
+    /// [`ProvenanceLog::dependency_graph`] has to see the region. It inspected no *value*, so it must
+    /// not enter the read-set builder — `blind_writes` would stop reporting every
+    /// `UPDATE ... WHERE <pk> = <lit>` as a blind write, which is the entire shape DESIGN.md
+    /// section 4's metric exists to catch, and `ReadPremiseCheck` would downgrade itself to
+    /// `Heuristic` for a branch that named exact versions and nothing else.
+    ///
+    /// A clause that compares a value is a different thing and goes through [`TxnCapture::on_read`]
+    /// like any other scan, because it really did look.
+    pub fn on_write_targeting_read(&mut self, summary: PredicateSummary, observed_at: u64) {
+        self.predicates.push(TimedPredicate { summary, observed_at });
     }
 
     /// Convenience for a single point read.
