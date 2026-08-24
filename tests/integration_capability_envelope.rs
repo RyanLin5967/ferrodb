@@ -695,9 +695,9 @@ fn the_envelope_governs_agent_session_writes_only() {
 /// business. It is named so the list above is not read as "everything else is refused". `SEARCH`
 /// and `EXPLAIN` genuinely are refused or read-only inside a session.
 ///
-/// `ALTER TABLE` is a sixth case and a structurally different one — it reaches *branch* state
-/// rather than the shared catalog — so it is pinned separately, by
-/// `the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another`.
+/// `ALTER TABLE` (B11, merged at `398e361`) is a sixth case and a structurally different one — it
+/// reaches *branch* state through a second funnel rather than the shared catalog — so it is pinned
+/// separately, by `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap`.
 ///
 /// # Why this is pinned rather than closed
 ///
@@ -1160,122 +1160,127 @@ fn the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete() {
     }
 }
 
-/// **The envelope is enforced at exactly one funnel, and B11's branch-scoped `ALTER TABLE` reaches
-/// branch state through a second one — so the envelope structurally cannot see it.** This test
-/// pins that premise, and fails the moment the premise stops holding.
+/// **B11's branch-scoped `ALTER TABLE` reaches a table the envelope forbids, and publishes it to
+/// the shared catalog at `MERGE`.** Driven as SQL, because as of `398e361` the verb exists.
 ///
-/// # Why this one is a structural check and not a SQL statement
+/// # This test used to be a text check, and it fired on the merge that brought B11
 ///
-/// Every other case in this file drives real SQL. This one cannot: `ALTER TABLE` does not exist in
-/// this tree — there is no `Stmt::Alter`, and the scanner has no `ALTER` keyword. It arrives with
-/// **B11**, unmerged as of this commit, as `src/agent_sql/dispatch.rs::run_agent_alter` calling
-/// `AgentRuntime::stage_schema_edit`, which pushes onto `state.workspaces[branch].schema_edits` and
-/// publishes at `MERGE`. That function performs no envelope read and no charge.
+/// Its predecessor —
+/// `the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another` —
+/// could not drive `ALTER`, because there was no `Stmt::Alter` in the tree. So it pinned the
+/// *premise* B3's design rests on instead: `stage_all` is the only way into a branch's write state,
+/// which is what makes one enforcement point sufficient. It asserted exactly one site reads the
+/// envelope, one charges budget, one mutates a workspace, and said in its failure message that
+/// whoever tripped it must "replace it with one that drives the new verb against a table the
+/// envelope forbids, and record which case it was".
 ///
-/// # Measured, not inferred
+/// It tripped on `398e361` — `workspaces.get_mut(` went from 1 to **3** — and this is that
+/// replacement. **The case it was: `stage_schema_edit` (`src/agent_sql/runtime.rs:993`) consults no
+/// envelope and charges no budget.** So the premise is not merely unproven now; it is false, and
+/// the envelope has a hole it structurally cannot see.
 ///
-/// B11 was merged onto this commit's parent in a throwaway worktree — branch
-/// `I15-b11-alter-probe`, merge `622a17b`, probe `7581498` — and the question was put to the merged
-/// tree rather than to B11's report. **Two probe tests, not one run**, and they are separated here
-/// because an earlier version of this list ran them together and the numbers do not belong to one
-/// session.
+/// # What that costs, measured below
 ///
-/// `i15_does_the_envelope_govern_an_alter_on_a_table_it_never_granted`, on a session whose envelope
-/// allows only `inventory`:
+/// A branch granted `inventory` and nothing else can `ADD`, `RENAME` and `RETYPE` the columns of
+/// `payroll` — the table it may not write one row of — and `MERGE` puts every one of those edits
+/// into the **shared** catalog, where every other connection sees them. Schema is the most visible
+/// write there is, and it is the one the capability envelope does not govern.
 ///
-/// - `UPDATE payroll SET salary = 0 WHERE id = 1;` → refused, "not on the allowlist"
-/// - `ALTER TABLE payroll ADD COLUMN note VARCHAR(16);` → **`Ok`**
-/// - `pending_schema_edits(branch)` → `[("payroll", AddColumn(note VARCHAR(16)))]`
-/// - the envelope afterwards → `row_writes: 0`. Nothing was charged, because nothing was seen.
-///   This test never merges.
-///
-/// `i15_does_the_ungoverned_alter_reach_the_shared_table_at_merge`, a separate session that first
-/// makes one *allowed* write (`UPDATE inventory SET qty = 7`) so the merge has a row to carry — so
-/// `row_writes` is 1 there, not 0:
-///
-/// - `MERGE` → `Ok`, and `payroll` then carries `note` in the **shared** catalog. The assertion is
-///   on the post-merge `SELECT note FROM payroll`; the merge's own `Ok` is printed, not asserted.
-///   The same SELECT fails before the merge, so the check is proven to fire rather than assumed to.
-///
-/// That merge is not part of this commit and is not proposed by it; it existed to answer the
-/// question. One caveat, stated because it changes how much the result is worth: the staging half
-/// above is B11's code verbatim, but the merge-publish half rests on the probe's own conflict
-/// resolution of B11 against B6's split `evaluate_merge` / `publish_evaluation`.
-///
-/// Writing a test that *executes* that verb would mean merging B11 here, which is a separate,
-/// ordered integration step (`src/agent_sql/runtime.rs` goes B4 → B6 → B11 → B9) and is not this
-/// commit's business. So what is pinned instead is the premise B3's design rests on and B11
-/// falsifies: **`stage_all` is the only way into a branch's write state, which is what makes one
-/// enforcement point sufficient.**
-///
-/// # It is a count, not a list of names — and the first draft of that count did not work
-///
-/// Asserting "`run_agent_alter` is absent" alone would be a denylist, and a denylist only catches
-/// the one bypass somebody already thought of. So the load-bearing assertion is that the funnel is
-/// *singular*: exactly one site reads the envelope, exactly one site charges the budget, exactly
-/// one site mutates a workspace's staged writes, and all three are inside `stage_all`.
-///
-/// **The counts run on whitespace-stripped text, because the raw token is a fact about rustfmt and
-/// not about the code.** rustfmt breaks a chain that overruns the line width onto one element per
-/// line, and B11's `stage_schema_edit` is one of those: it writes `let ws = state` / `.workspaces`
-/// / `.get_mut(&branch.id)`, so the needle `workspaces.get_mut(` appears in that function **zero**
-/// times. Splice the function alone onto this tree and the raw count is 1 — green — while the dense
-/// count is 2.
-///
-/// **An earlier version of this paragraph overstated that, and the correction belongs here rather
-/// than only in a commit message.** It said the raw check "was silent on the exact merge it was
-/// written to catch". It was not. Counted on the real merge —
-/// `git show I15-b11-alter-probe:src/agent_sql/runtime.rs` — the raw count is **2**, not 1, because
-/// `stage_schema_edit` calls `note_base_shape` on every path and that function's chain does fit on
-/// one line. So the raw check would have fired on B11, for a reason adjacent to the real one. What
-/// is true, and is the reason to count dense, is narrower: the raw needle cannot see the staging
-/// site itself, so it would have been reporting a formatting coincidence rather than the funnel —
-/// and a needle whose behaviour depends on line width is not a guard. Found by a fresh-context
-/// review of this file twice: once for the formatter, once for the overstatement about it.
-///
-/// Four blind spots remain, stated rather than left to be found.
-///
-/// 1. It reads text, so it cannot tell whether a second funnel *consults* the envelope. It refuses
-///    both cases and says so, because guessing is worse.
-/// 2. It reads only `src/agent_sql/runtime.rs`, so a funnel built in another module is invisible.
-///    The two field allowlists below are what make the in-`State` and in-`Workspace` versions
-///    visible.
-/// 3. **The needles are call shapes, not properties.** `self.branches.envelope_of(` is not the only
-///    way to read an envelope — `AgentRuntime::envelope_of` itself does it as
-///    `self.branches.get(branch)?.envelope`, outside `stage_all`, and a second funnel spelled that
-///    way passes the count. Likewise `workspaces.get_mut(` is one way to reach a workspace:
-///    `state.workspaces.insert(...)` populates one at fork, and `entry()`, `values_mut()`,
-///    `iter_mut()` or a helper handed `&mut Workspace` would all pass. So "any second funnel trips
-///    this" — which an earlier version of this comment claimed — is false. What is true is
-///    narrower: the three shapes that exist today are pinned to one function, and the field lists
-///    catch the state a new funnel would have to add.
-/// 4. It says nothing about the publish path. `MERGE` and `REVERT MERGE` write rows without
-///    consulting the envelope at all, which is a different hole and has its own test.
-///
-/// This test fires on the merge that *creates* the hole rather than on the one that fixes it, which
-/// is the only ordering that helps: by the time somebody is looking for why the envelope missed an
-/// `ALTER`, the branch has already published it.
+/// Still pinned, not closed: closing it is the design decision recorded in the integration ledger
+/// (`LEDGER-INTEGRATION.md` row I15 / `INTEGRATION.md`, both in the `artie-research` repository and
+/// not in this one). Every assertion here asserts the bypass, so closing it trips this test.
 #[test]
-fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another() {
+fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap() {
+    let mut db = Db::new();
+    db.seed();
+    db.runtime.restrict_branch(BranchId::TRUNK, inventory_only()).unwrap();
+
+    let mut a = db.session();
+    let branch = db.begin("alterer", &mut a);
+
+    // Anti-vacuity: the envelope is live and `payroll` is refused by the governed route.
+    let err = db.refused("UPDATE payroll SET salary = 0 WHERE id = 1;", &mut a);
+    assert!(err.contains("may not write table `payroll`"), "got {err}");
+
+    // All three `AlterAction` variants, because naming a subset is exactly how the pin this
+    // replaces became untrue: B3 named four verbs and drove one.
+    db.ok("ALTER TABLE payroll ADD COLUMN note VARCHAR(16);", &mut a);
+    db.ok("ALTER TABLE payroll RENAME COLUMN salary TO pay;", &mut a);
+    // Retyping `pay` and not `id`: the primary key's type is refused by a rule about the primary
+    // index holding keys of two types, which has nothing to do with the envelope. A refusal from
+    // somewhere else must not be mistaken for governance.
+    db.ok("ALTER TABLE payroll ALTER COLUMN pay TYPE BIGINT;", &mut a);
+
+    let pending = db.runtime.pending_schema_edits(branch);
+    assert_eq!(
+        pending.len(),
+        3,
+        "the three ALTERs did not all stage on the branch, so what follows is not measuring what \
+         it claims: {pending:?}"
+    );
+    assert!(
+        pending.iter().all(|(t, _)| t == "payroll"),
+        "an edit staged against a table other than the forbidden one: {pending:?}"
+    );
+    assert_eq!(
+        db.runtime.envelope_of(branch).unwrap().unwrap().row_writes(),
+        0,
+        "the schema edits were CHARGED, which would mean they passed through `stage_all` and the \
+         envelope saw them — if so this gap has closed and the docs must say so"
+    );
+
+    // Not yet in the shared catalog: this is a branch edit, invisible until MERGE. Without this
+    // the assertion after the merge could be describing an edit that had already landed.
+    assert!(
+        !db.catalog.tables["payroll"].schema.columns.iter().any(|c| c.name == "note"),
+        "the ALTER reached the shared catalog before MERGE, which is a different finding"
+    );
+
+    // ...and MERGE publishes every one of them to the shared catalog.
+    db.ok("MERGE;", &mut a);
+    let cols: Vec<&str> =
+        db.catalog.tables["payroll"].schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        cols.contains(&"note") && cols.contains(&"pay") && !cols.contains(&"salary"),
+        "if a governed branch's schema edits no longer publish, this gap has closed and the \
+         module docs, the summary and this test must say so. Shared `payroll` is now: {cols:?}"
+    );
+
+    // A plain connection sees it, so it is the shared catalog and not the branch that changed.
+    let mut plain = db.session();
+    db.ok("SELECT pay FROM payroll;", &mut plain);
+}
+
+/// **The single-funnel premise is gone, so what is pinned now is how many funnels there are.**
+///
+/// `stage_all` is still the only site that reads the envelope and the only one that charges budget
+/// — but it is no longer the only way into a branch's staged state. As of `398e361` there are
+/// **three** sites that mutate a workspace, and two of them are B11's (`note_base_shape` and
+/// `stage_schema_edit`), neither of which consults the envelope.
+///
+/// This is a count and not a list of names so that a **fourth** funnel trips it, whatever it is
+/// called. It reads whitespace-stripped text, because the raw token is a fact about rustfmt and not
+/// about the code: `stage_schema_edit` writes `let ws = state` / `.workspaces` / `.get_mut(...)`,
+/// so a raw count cannot see it at all.
+///
+/// Blind spots, stated rather than left to be found: this reads text, so it cannot tell whether a
+/// new site consults the envelope; it reads only `src/agent_sql/runtime.rs`; `workspaces.get_mut(`
+/// is one spelling among several (`entry()`, `values_mut()`, `insert()`, or a helper handed
+/// `&mut Workspace` would all pass), which is what the `State` and `Workspace` field allowlists
+/// below are for; and it says nothing about the publish path, which `MERGE` and `REVERT MERGE`
+/// reach without any envelope check at all.
+#[test]
+fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let runtime = std::fs::read_to_string(root.join("src/agent_sql/runtime.rs")).unwrap();
-    let dispatch = std::fs::read_to_string(root.join("src/agent_sql/dispatch.rs")).unwrap();
 
-    // Anti-vacuity for the instrument itself. A moved or renamed file would otherwise make every
-    // assertion below pass against an empty string, and this test would report "one funnel" about
-    // a file it never read — the exact failure mode a zero-result check is supposed to refuse.
+    // Anti-vacuity for the instrument: a moved or renamed file would otherwise make every
+    // assertion below pass against an empty string.
     let funnel_at = runtime.find("fn stage_all(").expect(
         "`stage_all` is not in src/agent_sql/runtime.rs any more: either the funnel was renamed, \
          in which case update this test, or this test is reading the wrong file and has been \
          asserting nothing",
     );
-    assert!(
-        dispatch.contains("pub fn run_agent_stmt("),
-        "src/agent_sql/dispatch.rs does not contain run_agent_stmt, so this test is not reading \
-         the dispatcher it thinks it is"
-    );
-
-    // The span of `stage_all`, from its signature to the next item at the same indentation.
     let body = &runtime[funnel_at..];
     let end = body[1..]
         .find("\n    fn ")
@@ -1284,49 +1289,41 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
         .min()
         .map(|i| i + 1)
         .unwrap_or(body.len());
-    let stage_all = &body[..end];
-
-    // Whitespace-stripped, because the raw token is a fact about rustfmt and not about the code.
-    // See the doc comment: counted raw, `workspaces.get_mut(` appears ZERO times in B11's own
-    // `stage_schema_edit`, and this test was green on the merge it exists to catch.
     let dense: String = runtime.chars().filter(|c| !c.is_whitespace()).collect();
-    let dense_funnel: String = stage_all.chars().filter(|c| !c.is_whitespace()).collect();
+    let dense_funnel: String =
+        body[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
-    // Exactly one of each, and each one inside `stage_all`. Counted over the whole file so a
-    // second call site anywhere in it trips this, wherever somebody puts it.
-    for (needle, what) in [
-        ("self.branches.envelope_of(", "reads the capability envelope"),
-        ("self.branches.charge_row_writes(", "charges the row-write budget"),
-        ("workspaces.get_mut(", "mutates a branch workspace's staged writes"),
+    for (needle, count, what) in [
+        ("self.branches.envelope_of(", 1, "reads the capability envelope"),
+        ("self.branches.charge_row_writes(", 1, "charges the row-write budget"),
+        ("workspaces.get_mut(", 3, "mutates a branch workspace"),
     ] {
         assert_eq!(
             dense.matches(needle).count(),
-            1,
-            "a second site in src/agent_sql/runtime.rs {what}. The envelope is enforced at ONE \
-             funnel, `stage_all`, and that is only sufficient while nothing else reaches branch \
-             write state ({needle}). This check reads text, so it CANNOT tell whether the new \
-             site consults the envelope. If it does not — B11's `stage_schema_edit` does not — \
-             the envelope has a hole it cannot see, and a branch whose envelope forbids `payroll` \
-             can ADD, RENAME or RETYPE a `payroll` column and publish it at MERGE. If it does, \
-             the single-funnel premise this test pins is simply gone. Either way this test must \
-             stop being a text check: replace it with one that drives the new verb against a \
-             table the envelope forbids, and record which case it was in the integration ledger \
-             (LEDGER-INTEGRATION.md / INTEGRATION.md live in the `artie-research` repository, not \
-             in this one)."
-        );
-        assert!(
-            dense_funnel.contains(needle),
-            "`{needle}` has moved out of `stage_all`. Whatever now holds it is a second funnel, \
-             and the envelope only governs the one."
+            count,
+            "`{needle}` — the site that {what} — no longer occurs {count} time(s) in \
+             src/agent_sql/runtime.rs. If this went UP, a new way into branch write state exists \
+             and the envelope does not govern it unless somebody made it: drive the new verb \
+             against a table the envelope forbids, the way \
+             `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap` does. \
+             If it went DOWN, a funnel was removed or governed and this gap is closing — record \
+             which in the integration ledger, which lives in the `artie-research` repository."
         );
     }
-
+    // The two that enforce are still inside `stage_all`; the workspace mutators are not, and that
+    // asymmetry IS the gap.
+    for needle in ["self.branches.envelope_of(", "self.branches.charge_row_writes("] {
+        assert!(
+            dense_funnel.contains(needle),
+            "`{needle}` has moved out of `stage_all`, so the one enforcement point is somewhere \
+             else now and this test no longer describes the code."
+        );
+    }
     // **A funnel can stage BESIDE the workspace, or INSIDE it without going through the funnel.**
-    // Two field lists are pinned, because the two shapes are different and the first version of
-    // this guard covered only one of them — and covered it with the wrong claim. It said "a
-    // schema-edit map is the live example, and B11 needs one"; B11 needs no `State` field at all.
-    // It adds `schema_edits` and `base_shapes` to `struct Workspace`. Found by a fresh-context
-    // review, which is also why `Workspace` is pinned here now.
+    // Two field lists, because the two shapes are different. `Workspace` is the one that mattered:
+    // B11 needed no `State` field at all, and an earlier version of this guard asserted it did.
+    // B11 has since landed, and its two `Workspace` fields are now part of the expected list —
+    // which is the point of an allowlist, that a new field has to come here and be declared.
     //
     // `State` covers the sibling-map shape: `escrow`, `quarantine_reasons` and `row_author` are
     // already per-branch maps, so a schema-edit map next to them is the established pattern.
@@ -1380,6 +1377,10 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
         field_names("struct Workspace {", "Workspace"),
         [
             "name", "prov", "txn", "fork_seq", "fork_root", "rows", "base_rows", "tables", "frame",
+            // B11's two, added by the merge at `398e361`. `stage_schema_edit` writes
+            // `schema_edits` without passing through `stage_all`, which is the gap
+            // `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap` drives.
+            "schema_edits", "base_shapes",
         ],
         "the fields of `Workspace` have changed. This is B11's shape: it adds `schema_edits` and \
          `base_shapes` here, and `stage_schema_edit` writes them without passing through \
@@ -1387,27 +1388,10 @@ fn the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_
          path that fills it is governed."
     );
 
-    // Belt and braces on top of the counts: B11's two symbols, matched with `fn` adjacent to the
-    // name so prose that merely mentions them does not trip this. Two limits, stated because the
-    // matcher does not have the robustness the previous version of this comment claimed: after
-    // whitespace stripping there is no code/comment boundary left, so a doc block quoting the
-    // signature DOES trip it (fails safe); and a definition that grew a generic parameter —
-    // `fn stage_schema_edit<T>(` — would NOT. The counts above are the load-bearing half.
-    let dense_dispatch: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        !dense_dispatch.contains("fnrun_agent_alter("),
-        "B11's branch-scoped ALTER TABLE has landed in src/agent_sql/dispatch.rs. It reaches the \
-         runtime without passing through `stage_all`, so the capability envelope cannot see it. \
-         Measured on a throwaway merge of B11 (branch `I15-b11-alter-probe`): the ALTER returns \
-         Ok, nothing is charged, and MERGE puts the column in the shared catalog. Widen \
-         `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap` to demonstrate it with \
-         real SQL, or close the gap — and record which in the integration ledger, which lives in \
-         the `artie-research` repository and not in this one."
-    );
-    assert!(
-        !dense.contains("fnstage_schema_edit("),
-        "`AgentRuntime::stage_schema_edit` (B11) is a second funnel into branch state and performs \
-         no envelope check. See the message above."
+        !dense_funnel.contains("fnstage_schema_edit("),
+        "`stage_schema_edit` is inside `stage_all` now, which would mean the schema path is \
+         governed and this gap has closed"
     );
 }
 

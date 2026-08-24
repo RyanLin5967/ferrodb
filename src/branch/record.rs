@@ -679,14 +679,22 @@ impl From<CapabilityRefusal> for FerroError {
 /// branch's own grant points at — see
 /// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns`.
 ///
-/// That single funnel is also a premise rather than a guarantee, and B11's branch-scoped
-/// `ALTER TABLE` breaks it: it reaches a branch's own staged state through `stage_schema_edit`, not
-/// through `stage_all`, so no envelope check runs. `ALTER` is not in this tree yet;
-/// `the_envelope_is_enforced_at_one_funnel_and_branch_scoped_alter_table_arrives_through_another`
-/// fails on the merge that brings it.
+/// **And `stage_all` is no longer the only way into a branch's own staged state.** That was a
+/// premise, not a guarantee, and B11's branch-scoped `ALTER TABLE` — merged at `398e361` — breaks
+/// it: `AgentRuntime::stage_schema_edit` reaches the workspace directly, consulting no envelope and
+/// charging no budget. A branch granted only `inventory` can `ADD`, `RENAME` and `RETYPE` the
+/// columns of `payroll`, and `MERGE` publishes every one of those edits into the shared catalog.
+/// Driven as SQL by `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap`;
+/// the funnel count itself is pinned by `the_envelope_reads_one_funnel_while_three_reach_branch_state`,
+/// which is where the number to watch lives — one site reads the envelope, three reach branch state.
 ///
-/// Both are recorded gaps rather than oversights — but read them before reading the paragraph above
-/// as "a session cannot touch what it was not granted", because that is not what it says.
+/// (The predecessor of those two was a text check written while `ALTER` did not exist in this tree.
+/// It asserted the single-funnel premise and fired on the merge that falsified it, which is what it
+/// was for.)
+///
+/// All of these are recorded gaps rather than oversights — but read them before reading the
+/// paragraph above as "a session cannot touch what it was not granted", because that is not what it
+/// says.
 ///
 /// A branch with **no** envelope (`BranchRecord::envelope == None`) is ungoverned. That is stated
 /// rather than implied, and `an_ungoverned_branch_writes_exactly_as_before` asserts it. It is the
