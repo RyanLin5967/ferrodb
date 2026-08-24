@@ -712,9 +712,55 @@ impl TxnManager {
     }
 
     pub fn checkpoint(&self) -> Result<(), FerroError> {
+        // Deliberately a SHORT hold — the guard is a temporary and is released before the body
+        // runs, which is exactly what this function did before `ddl_checkpointed` existed. Every
+        // existing caller therefore keeps its old concurrency behaviour; only the DDL path below
+        // needs the answer to stay true while it is acted on, and only it pays for that.
         if !self.att.lock().unwrap().is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
+        self.checkpoint_locked()
+    }
+
+    /// Do a DDL statement's irreversible catalog mutation and its checkpoint as ONE unit, with the
+    /// attach table held shut for the whole of it.
+    ///
+    /// **A8: without this, a refused `CREATE TABLE` had already created the table.** The executor
+    /// mutated the catalog and only then called `checkpoint`, which refuses while any transaction
+    /// is attached — so the statement returned `Err` over a table that existed, was queryable, and
+    /// accepted inserts. Worse, the `Ddl` record is logged *after* the checkpoint, and `log_ddl` is
+    /// what puts a table into the retained `schema_log`, so no later checkpoint ever re-declared
+    /// it: the table was invisible to every self-describing consumer PERMANENTLY, with its rows
+    /// arriving as `unresolved`. The session's own `DDL not allowed in txn` guard does not catch
+    /// this, because that guard is per-SESSION while checkpoint admissibility is global — the
+    /// transaction that blocks the checkpoint can belong to any other session.
+    ///
+    /// Taking the decision before the mutation is what I19 did for the same class of defect (a
+    /// refused `ALTER` that had already destroyed rows). Merely *asking* first would leave a window:
+    /// `begin` takes this same lock, so a transaction starting between the question and the
+    /// checkpoint would put the statement right back into the half-done state. Holding the guard
+    /// across both closes it — the answer cannot go stale while it is being acted on.
+    ///
+    /// Nothing reachable from `f` or from `checkpoint_locked` takes `att`, so this cannot deadlock
+    /// on itself, and the lock order here (`att`, then the buffer pool) is the order `checkpoint`
+    /// already used.
+    pub fn ddl_checkpointed<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, FerroError>,
+    ) -> Result<T, FerroError> {
+        let att = self.att.lock().unwrap();
+        if !att.is_empty() {
+            return Err(FerroError::Wal("checkpoint with active txns".into()));
+        }
+        let out = f()?;
+        self.checkpoint_locked()?;
+        Ok(out)
+    }
+
+    /// The body of `checkpoint`, with the attach table ALREADY held shut by the caller.
+    ///
+    /// Must not take `att` — the callers above hold it, and `Mutex` is not re-entrant.
+    fn checkpoint_locked(&self) -> Result<(), FerroError> {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;

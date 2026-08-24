@@ -617,31 +617,39 @@ fn a8_a_refused_create_table_still_creates_the_table_and_logs_nothing() {
     );
     eprintln!("A8 after the refusal: catalog has `ghost` = {exists}, retained shape = {retained:?}");
 
-    // Close the transaction and write to the table the statement said it had not created.
-    let sql = "COMMIT;";
-    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
-    let mut pr = Parser::new(tokens);
-    let mut st = pr.parse();
-    run(st.remove(0), &mut d.catalog, d.bp.clone(), d.txn.clone(), &mut a).unwrap();
-    d.sql("INSERT INTO ghost VALUES (1, 42);");
-    // A checkpoint, which is where every table that IS in the retained set gets re-declared.
-    d.txn.checkpoint().expect("checkpoint");
-    d.sql("INSERT INTO ghost VALUES (2, 43);");
-    d.wal.flush().unwrap();
+    // **Everything below characterises the CONSEQUENCES of the refusal having half-happened, and
+    // every step of it presupposes that it did** — it writes rows to the table the statement said
+    // it had not created. Once `CREATE TABLE` is atomic those writes are correctly rejected
+    // (`unknown table 'ghost'`), so the probe is GUARDED by the defect it measures rather than
+    // deleted or weakened. The criterion this fixture exists to enforce is unchanged: `ghost` must
+    // not be in the catalog after a refused CREATE, and the full diagnostic below still fires, with
+    // the same evidence, the moment it is.
+    if exists {
+        // Close the transaction and write to the table the statement said it had not created.
+        let sql = "COMMIT;";
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut pr = Parser::new(tokens);
+        let mut st = pr.parse();
+        run(st.remove(0), &mut d.catalog, d.bp.clone(), d.txn.clone(), &mut a).unwrap();
+        d.sql("INSERT INTO ghost VALUES (1, 42);");
+        // A checkpoint, which is where every table that IS in the retained set gets re-declared.
+        d.txn.checkpoint().expect("checkpoint");
+        d.sql("INSERT INTO ghost VALUES (2, 43);");
+        d.wal.flush().unwrap();
 
-    // A consumer attaching now, with no catalog of its own — a self-describing feed reader.
-    let out = LogicalDecoder::blank().decode(&d.wal, d.base(), d.next()).expect("decode");
-    eprintln!("A8 blank decoder: schema_changes={:?} unresolved={:?} events={}",
-        out.schema_changes.iter().map(|(_, t, _)| t.clone()).collect::<Vec<_>>(),
-        out.unresolved, out.events.len());
+        // A consumer attaching now, with no catalog of its own — a self-describing feed reader.
+        let out = LogicalDecoder::blank().decode(&d.wal, d.base(), d.next()).expect("decode");
+        eprintln!("A8 blank decoder: schema_changes={:?} unresolved={:?} events={}",
+            out.schema_changes.iter().map(|(_, t, _)| t.clone()).collect::<Vec<_>>(),
+            out.unresolved, out.events.len());
 
-    assert!(
-        !exists,
-        "`CREATE TABLE ghost` returned an error and created the table anyway; the catalog has it, \
-         `retained_shape` is {retained:?} so no checkpoint will ever re-declare it, and a \
-         self-describing consumer sees its rows as unresolved: {:?}",
-        out.unresolved
-    );
+        panic!(
+            "`CREATE TABLE ghost` returned an error and created the table anyway; the catalog has \
+             it, `retained_shape` is {retained:?} so no checkpoint will ever re-declare it, and a \
+             self-describing consumer sees its rows as unresolved: {:?}",
+            out.unresolved
+        );
+    }
 }
 
 /// **B6. The halt evaporates once a checkpoint truncates the ALTER away.**
