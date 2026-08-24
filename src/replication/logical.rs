@@ -359,6 +359,30 @@ struct Learned {
     /// The log these LSNs refer to. `None` until the first decode.
     log: Option<std::path::PathBuf>,
     shapes: Vec<ShapeAt>,
+    /// **`shapes` is known-COMPLETE for `[base_lsn, covered_through)`.**
+    ///
+    /// Without this, the seed was a property of *the decoder's traversal* rather than of the log,
+    /// and that is a correctness bug, not an optimisation detail. `decode` seeds a range by
+    /// replaying the shapes it has walked past that sit below `from_lsn` — so a decoder asked only
+    /// for `[split, end)` had never walked an `ALTER` below `split`, never learned the column, and
+    /// dropped it from every row; while a decoder that happened to walk `[base, split)` first
+    /// emitted it. **Same log, same range, two different feeds**, and every cleanliness counter on
+    /// the wrong one read clean (`undecodable = 0`, `unresolved = 0`), so nothing downstream could
+    /// detect it. Two threads pumping one `Arc<FeedStreamer>` — a shape this module's own docs name
+    /// as supported — reached the same defect by call order instead of by argument, losing the
+    /// column in **40 of 40** trials.
+    ///
+    /// So the history stays a *cache*, but a cache with a coverage watermark: `decode` fills any
+    /// gap below `from_lsn` by scanning the log for DDL before it seeds, which makes the seed a
+    /// pure function of `(log, from_lsn)`. A cold decoder scans the prefix once and then agrees
+    /// with the warm one; a sequential pump loop has no gap to fill and scans nothing extra, so the
+    /// performance reason the history exists is preserved.
+    ///
+    /// Two invariants this must keep, both of which reopen a fixed defect if dropped: it is reset
+    /// to 0 whenever the log changes (an LSN means nothing across files — the A9 defect), and it is
+    /// clamped UP to `base_lsn` on truncation, because records below the floor are gone and can
+    /// never be scanned again.
+    covered_through: u64,
 }
 
 /// One shape a DDL record put into force, and where in the log it did so.
@@ -517,6 +541,99 @@ impl LogicalDecoder {
         }
     }
 
+    /// What one `Ddl` record does to the mapping, as a value, derived from the RECORD ALONE.
+    ///
+    /// This is the same shape the main walk remembers, and it must stay that way: it is what makes
+    /// a prefix scan and a full walk agree. It can be built without the evolving map because every
+    /// `Ddl` record carries the table's **full shape after the change** — `CreateTable` and
+    /// `AlterColumn` both re-establish the entry outright, and `DropTable` removes it — so nothing
+    /// here depends on what came before.
+    fn shape_of_ddl(
+        lsn: u64,
+        op: &DdlOp,
+        table: &str,
+        dir_root: u32,
+        time_travel_root: u32,
+        columns: &[(String, DataType, bool)],
+    ) -> Result<ShapeAt, FerroError> {
+        // Refused for the same reason the main walk refuses it, and deliberately not softened to a
+        // skip: if a malformed record made the prefix scan give up quietly, a cold decode would
+        // succeed where the warm one errors, which is the very warm/cold divergence this scan
+        // exists to remove.
+        if let DdlOp::AlterColumn(alt) = op {
+            let subject = alt.column();
+            if !columns.iter().any(|(n, _, _)| n == subject) {
+                return Err(FerroError::Wal(format!(
+                    "ddl record alters column '{subject}' of '{table}' but the shape it carries has \
+                     no such column: {:?}",
+                    columns.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+                )));
+            }
+        }
+        let entry = match op {
+            DdlOp::DropTable => None,
+            _ => {
+                let schema = Schema::new(
+                    columns
+                        .iter()
+                        .map(|(name, ty, nullable)| Column {
+                            name: name.clone(),
+                            data_type: ty.clone(),
+                            nullable: *nullable,
+                        })
+                        .collect(),
+                );
+                let names: Vec<String> = columns.iter().map(|(n, _, _)| n.clone()).collect();
+                Some((table.to_string(), schema, Arc::new(names)))
+            }
+        };
+        Ok(ShapeAt {
+            lsn,
+            dir_root,
+            entry,
+            time_travel_root: match op {
+                DdlOp::DropTable => None,
+                _ => Some(time_travel_root),
+            },
+        })
+    }
+
+    /// Read `[from, to)` and push every DDL in it into `shapes`, ignoring everything else.
+    ///
+    /// This is the gap fill behind `Learned::covered_through`. It reads records rather than rows:
+    /// no tuple is deserialized, nothing is staged, and no event is produced, so the cost is one
+    /// pass over the record headers of a range the caller was going to skip anyway.
+    fn scan_ddl(
+        wal: &WalManager,
+        from: u64,
+        to: u64,
+        shapes: &mut Vec<ShapeAt>,
+    ) -> Result<(), FerroError> {
+        let mut lsn = from;
+        while lsn < to {
+            let (rec, next) = wal.read_record(lsn)?;
+            if let RecKind::Ddl { op, table, dir_root, time_travel_root, columns } = &rec.kind {
+                shapes.push(Self::shape_of_ddl(
+                    lsn,
+                    op,
+                    table,
+                    *dir_root,
+                    *time_travel_root,
+                    columns,
+                )?);
+            }
+            // Same guard the main walk carries: a record that does not advance would spin here
+            // forever, and a hang is harder to diagnose than an error.
+            if next <= lsn {
+                return Err(FerroError::Wal(format!(
+                    "log walk did not advance at lsn {lsn}; refusing to loop forever"
+                )));
+            }
+            lsn = next;
+        }
+        Ok(())
+    }
+
     /// Drop a remembered DDL that says nothing its predecessor did not.
     ///
     /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
@@ -531,6 +648,27 @@ impl LogicalDecoder {
     /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
     /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
     /// ranges in between.
+    /// Fold newly-seen DDL into the remembered history.
+    ///
+    /// Merged rather than assigned, and keyed on `(lsn, dir_root)`: two threads may pump
+    /// concurrently through one `Arc<FeedStreamer>`, and a range walked twice — or a prefix scanned
+    /// after the walk that learned it — must not double-record. Both the walk's merge-back and the
+    /// `covered_through` gap fill go through here, so the two cannot drift apart.
+    fn merge_shapes(shapes: &mut Vec<ShapeAt>, incoming: Vec<ShapeAt>) {
+        if incoming.is_empty() {
+            return;
+        }
+        for shape in incoming {
+            match shapes.iter().position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root) {
+                Some(at) => shapes[at] = shape,
+                None => shapes.push(shape),
+            }
+        }
+        // `apply_shape` is order-sensitive: two shapes for one `dir_root` must land newest-last.
+        shapes.sort_by_key(|s| s.lsn);
+        Self::collapse_repeats(shapes);
+    }
+
     fn collapse_repeats(shapes: &mut Vec<ShapeAt>) {
         let mut newest: HashMap<u32, usize> = HashMap::new();
         let mut drop: Vec<usize> = Vec::new();
@@ -627,15 +765,42 @@ impl LogicalDecoder {
             match &history.log {
                 Some(seen) if seen != &wal.path => {
                     history.shapes.clear();
+                    // The watermark describes the log it was measured against, so it cannot outlive
+                    // it. Leaving it set here would claim coverage of a prefix of the NEW log that
+                    // nothing has read, which is A9 re-opened through the watermark instead of
+                    // through the shapes.
+                    history.covered_through = 0;
                     history.log = Some(wal.path.clone());
                 }
                 None => history.log = Some(wal.path.clone()),
                 _ => {}
             }
-            Self::forget_truncated(
-                &mut history.shapes,
-                wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
-            );
+            let base_lsn = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            Self::forget_truncated(&mut history.shapes, base_lsn);
+            // Clamped UP, not down. Everything below the floor has been truncated away and can
+            // never be scanned again, so the prefix `[base_lsn, ...)` is as complete as it will
+            // ever get; without this the fill below would try to read records that are gone.
+            history.covered_through = history.covered_through.max(base_lsn);
+
+            // **The gap fill — this is what makes the seed a property of the LOG, not of what this
+            // decoder happens to have walked.** See `Learned::covered_through`. A sequential pump
+            // has already covered everything below its cursor, so this is a no-op for it; a decoder
+            // handed an upper range cold scans the prefix once and then agrees with the warm one.
+            //
+            // It happens under the same lock the merge-back takes, so a concurrent pump cannot
+            // observe a half-filled history and seed from it — that is the 40/40 column loss.
+            if history.covered_through < from_lsn {
+                let gap_from = history.covered_through;
+                let mut found = Vec::new();
+                Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
+                // Through the shared merge: a decoder that walked an UPPER range first already holds
+                // shapes inside the gap, and appending blindly would duplicate them.
+                let mut shapes = std::mem::take(&mut history.shapes);
+                Self::merge_shapes(&mut shapes, found);
+                history.shapes = shapes;
+                history.covered_through = from_lsn;
+            }
+
             for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
                 Self::apply_shape(&mut tables, &mut time_travel, shape);
             }
@@ -937,20 +1102,15 @@ impl LogicalDecoder {
         // I20: publish what this walk learned, so the next range starts from it. Merged rather than
         // assigned — two threads may pump concurrently through one `Arc<FeedStreamer>`, and a range
         // walked twice must not double-record.
-        if !learned.is_empty() {
+        {
             let mut history = self.history.lock().unwrap();
-            for shape in learned {
-                match history
-                    .shapes
-                    .iter()
-                    .position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root)
-                {
-                    Some(at) => history.shapes[at] = shape,
-                    None => history.shapes.push(shape),
-                }
-            }
-            history.shapes.sort_by_key(|s| s.lsn);
-            Self::collapse_repeats(&mut history.shapes);
+            let mut shapes = std::mem::take(&mut history.shapes);
+            Self::merge_shapes(&mut shapes, learned);
+            history.shapes = shapes;
+            // The walk reached `to_lsn`, so the history is now complete up to there — and this must
+            // happen even when the range held NO DDL, or a pump over a quiet stretch would leave a
+            // gap behind it and re-scan the same records on every later call.
+            history.covered_through = history.covered_through.max(to_lsn);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
