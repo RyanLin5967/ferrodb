@@ -7,24 +7,45 @@
 # file that no longer existed — a broken instruction in the two places a fresh pass is told to look
 # first. Anything a ledger tells the future to execute has to be versioned with the code.
 #
-# WHAT IT GUARDS. Three ways this project has produced a wrong test count before:
+# WHAT IT GUARDS. Four ways this project has produced a wrong test count before:
 #   1. a run whose tree moved underneath it (a mid-write sample once read 375 against a real 374),
 #   2. `cargo test | head`, where the pipe SIGPIPEs cargo and the partial total reads as a regression,
 #   3. a run killed by too short a timeout, whose partial count looks like a finished one.
-# So: no pipe, a generous bound, and HEAD plus the dirty-file count compared before and after. If
-# either moved, it refuses to print a number at all rather than printing one that cannot be trusted.
+#   4. a suite run against STALE EXAMPLE BINARIES. `cargo test` does not rebuild `examples/`, and
+#      eight integration tests carry a guard that FAILS when the binary they spawn is older than
+#      `src/` or `examples/`. So any run taken straight after a merge that touched `src/` reports a
+#      wave of failures that are the harness working, not the code breaking. This bit the project
+#      before: a suite count "is meaningless unless examples were rebuilt after the last src/ edit".
+#      The build is therefore part of the measurement, not a thing the caller is trusted to remember.
+# So: no pipe, a generous bound, examples rebuilt first, and HEAD plus the dirty-file count compared
+# before and after. If either moved, it refuses to print a number at all rather than printing one
+# that cannot be trusted.
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.." || exit 1
 
 LABEL=${1:-verify}
 OUT=${VERIFY_OUT:-$(mktemp -d)}
+# `mktemp -d` creates its directory; a caller-supplied VERIFY_OUT may not exist. Without this, every
+# redirect below fails, which makes the build step look like it failed and the guard refuse with the
+# wrong reason — a fail-safe direction, but a false diagnosis. Found by fire-checking the guard.
+mkdir -p "$OUT" || { echo "$LABEL: REFUSING — cannot create output dir $OUT"; exit 1; }
 LOG="$OUT/suite-$LABEL.log"
 BOUND=${VERIFY_TIMEOUT:-7200}
 
 command -v timeout >/dev/null || { echo "$LABEL: REFUSING — no \`timeout\`; an unbounded suite can wedge a pass"; exit 1; }
 
 h0=$(git log -1 --format=%h); d0=$(git status --short | wc -l | tr -d ' ')
+
+# Examples first — see note 4 above. A failure here is a real build failure and must stop the run:
+# continuing would measure the previous binaries and call the result a suite.
+if ! timeout "$BOUND" cargo build --examples > "$LOG.examples" 2>&1; then
+    echo "$LABEL: REFUSING — \`cargo build --examples\` failed, so the suite would spawn stale binaries"
+    tail -20 "$LOG.examples"
+    echo "  log: $LOG.examples"
+    exit 1
+fi
+
 timeout "$BOUND" cargo test --no-fail-fast > "$LOG" 2>&1; rc=$?
 h1=$(git log -1 --format=%h); d1=$(git status --short | wc -l | tr -d ' ')
 
