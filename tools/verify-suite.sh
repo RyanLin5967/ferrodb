@@ -55,7 +55,71 @@ if ! timeout "$BOUND" cargo build --examples > "$LOG.examples" 2>&1; then
     exit 1
 fi
 
-timeout "$BOUND" cargo test --no-fail-fast > "$LOG" 2>&1; rc=$?
+# MODE=whole runs one `cargo test`; MODE=per-target runs the lib and each tests/*.rs separately and
+# concatenates their output into the same $LOG, so everything downstream — the parsers, the
+# zero-collected refusal, the tree-moved check, the Go stage — is shared and cannot drift between
+# the two. Per-target exists because a single whole-suite run on this machine is not durable: with
+# an agent fleet live it gets starved or SIGTERMed mid-suite, and a partial log's total reads as a
+# regression (that has happened here: `1067` from a run killed inside integration_pgwire). Splitting
+# it means a starved or flaky target is one short line to re-run instead of a whole suite to redo,
+# and the failure is attributable to a named target. Coverage is the same set of binaries either way.
+MODE=${VERIFY_MODE:-whole}
+case "$MODE" in whole|per-target) ;; *)
+    echo "$LABEL: REFUSING — VERIFY_MODE must be 'whole' or 'per-target', got '$MODE'. A mode that"
+    echo "  silently fell back to one of them could measure less than the caller asked for."; exit 1 ;;
+esac
+
+if [ "$MODE" = whole ]; then
+    timeout "$BOUND" cargo test --no-fail-fast > "$LOG" 2>&1; rc=$?
+else
+    : > "$LOG"; rc=0
+    # `--lib` first, then every integration target by name. `ls tests/*.rs` and not a glob in a
+    # for-list: under zsh a non-matching bare glob aborts the command, and an aborted loop prints
+    # nothing, which the parser below would read as zero collected rather than as a broken sweep.
+    targets=$(ls tests/*.rs 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.rs$//')
+    if [ -z "$targets" ]; then
+        echo "$LABEL: REFUSING — per-target mode found no tests/*.rs to run. That is a broken sweep,"
+        echo "  not an empty suite."; exit 1
+    fi
+    # A verdict must appear AFTER this target's own marker. `tail -N | grep` is WRONG here and was
+    # the first version: a killed target emits only a few lines, so a fixed window still contains
+    # the PREVIOUS target's `test result:` and the check passes on a stale verdict. Fire-checked with
+    # a deliberately hanging fixture: the window version waved it through (its verdict line sat 2
+    # lines before the marker) and the sweep carried on, dropping the target silently from the total.
+    verdict_since_marker() {
+        local from
+        from=$(grep -n '^=== target ' "$LOG" | tail -1 | cut -d: -f1)
+        [ -n "$from" ] || return 1
+        tail -n +"$from" "$LOG" | grep -q '^test result:'
+    }
+
+    echo "=== per-target sweep: --lib plus $(echo "$targets" | wc -l | tr -d ' ') integration targets" >> "$LOG"
+    echo "=== target --lib" >> "$LOG"
+    timeout "$BOUND" cargo test --lib --no-fail-fast >> "$LOG" 2>&1 || rc=$?
+    # The lib run needs the same verdict-line check as every integration target below. Without it a
+    # killed `--lib` contributes no `test result:` line, the loop's check never looks at it, and the
+    # only remaining net is the zero-collected refusal — which does not fire, because the integration
+    # targets still collect plenty. The total would come back ~778 short and green. Found by reading
+    # this block back after writing it, not by a test.
+    if ! verdict_since_marker; then
+        echo "$LABEL: REFUSING — \`cargo test --lib\` produced no 'test result:' line, so it was"
+        echo "  killed, timed out, or failed to build. Its ~778 tests would silently vanish from the"
+        echo "  total and the remaining targets would still report green."
+        echo "  log: $LOG"; exit 1
+    fi
+    for t in $targets; do
+        echo "=== target $t" >> "$LOG"
+        timeout "$BOUND" cargo test --test "$t" --no-fail-fast >> "$LOG" 2>&1 || rc=$?
+        # Every target must produce a verdict line. A target that produced none was killed, timed
+        # out, or failed to build, and its silence must not be averaged away into a green total.
+        if ! verdict_since_marker; then
+            echo "$LABEL: REFUSING — target '$t' produced no 'test result:' line, so it was killed,"
+            echo "  timed out, or failed to build. A silent target is not a passing one, and its"
+            echo "  tests would vanish from the total while every other target still reported green."
+            echo "  log: $LOG"; exit 1
+        fi
+    done
+fi
 
 # The Go module, AFTER the Rust suite and never beside it. Both suites bind TCP ports, and this
 # project has a documented load-sensitive port race; row I19's own resume state carries the same
@@ -101,7 +165,7 @@ if [ "${p:-0}" -eq 0 ]; then
     echo "$LABEL: REFUSING — zero tests collected (rc=$rc). That is a broken run, not a green one."
     echo "  log: $LOG"; exit 1
 fi
-echo "$LABEL: rc=$rc passed=$p failed=$f build_errors=$be head=$h1 log=$LOG"
+echo "$LABEL: mode=$MODE rc=$rc passed=$p failed=$f build_errors=$be head=$h1 log=$LOG"
 if [ "$go_ran" = yes ]; then
     echo "$LABEL: go rc=$gorc passed=$gp failed=$gf log=$GOLOG"
 else
