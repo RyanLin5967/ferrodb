@@ -154,6 +154,14 @@ fn a_frame_whose_crc_fails_is_refused() {
 
 /// A frame claiming an LSN other than its position in the stream must be refused — that is the
 /// signature of records arriving out of order, which would corrupt the replica silently.
+///
+/// **The stream must be genuinely out of order, not merely misplaced.** This test used to hand the
+/// applier one record's bytes and *tell* it they began at `start + 8`, which since B6 is a GAP
+/// (`start_lsn > applied_lsn`) and is caught by the divergence check several lines earlier — so it
+/// asserted the ordering message while exercising the gap branch, and went red when B6 landed. The
+/// input below reaches the ordering check the only way anything can: it begins exactly at the
+/// frontier, so there is no gap, and every frame carries its own intact CRC. Only the ORDER is
+/// wrong, which is what the doc comment above claims and what the wire failure actually looks like.
 #[test]
 fn a_frame_at_the_wrong_lsn_is_refused() {
     let p = pair("order");
@@ -161,14 +169,67 @@ fn a_frame_at_the_wrong_lsn_is_refused() {
     let applier = ReplicaApplier::new(Arc::clone(&p.replica_bp), src.start_lsn());
 
     primary_insert(&p.primary_wal, 1, 40, 0, 0x33);
+    primary_insert(&p.primary_wal, 1, 41, 0, 0x34);
     let (bytes, next) = src.read_from(src.start_lsn(), 1 << 20).unwrap();
     let start = next - bytes.len() as u64;
 
-    // Same bytes, told they begin somewhere else.
+    // Split the batch on its own length prefix and put the second record first. Neither frame is
+    // edited, so both CRCs still verify and the only thing wrong is the sequence.
+    let first_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    assert!(first_len < bytes.len(), "expected two frames, got one of {first_len} in {}", bytes.len());
+    let (one, two) = bytes.split_at(first_len);
+    let mut swapped = Vec::with_capacity(bytes.len());
+    swapped.extend_from_slice(two);
+    swapped.extend_from_slice(one);
+
+    let err = applier
+        .apply(start, &swapped)
+        .expect_err("a frame was applied at an lsn it does not claim");
+    let text = format!("{err}");
+    assert!(text.contains("out of order"), "refused for the wrong reason: {text}");
+    assert!(!text.contains("CRC"), "the frames were re-ordered, not corrupted: {text}");
+    assert_eq!(
+        applier.applied_lsn(),
+        src.start_lsn(),
+        "the replica advanced despite refusing an out-of-order batch"
+    );
+}
+
+/// **A batch that begins ABOVE the replica's frontier is a gap, and a gap is not a catch-up — B6.**
+///
+/// Pinned here because nothing pinned it: the divergence branch `28aae7e` added to
+/// `ReplicaApplier::apply` had no test of its own, and the only fixture that reached it did so by
+/// accident (see the test above) while asserting a different message. The records in `[applied,
+/// start)` are missing and are not coming back — the primary checkpointed them away — so applying
+/// the batch would leave every page below the gap stale while `applied_lsn` reported the replica
+/// current. It must refuse, must not advance, and the refusal must latch.
+#[test]
+fn a_batch_beginning_above_the_frontier_is_refused_as_a_gap() {
+    let p = pair("gap");
+    let src = ReplicationSource::new(&p.primary_wal);
+    let applier = ReplicaApplier::new(Arc::clone(&p.replica_bp), src.start_lsn());
+
+    primary_insert(&p.primary_wal, 1, 60, 0, 0x66);
+    let (bytes, next) = src.read_from(src.start_lsn(), 1 << 20).unwrap();
+    let start = next - bytes.len() as u64;
+    let frontier = applier.applied_lsn();
+
     let err = applier
         .apply(start + 8, &bytes)
-        .expect_err("a frame was applied at an lsn it does not claim");
-    assert!(format!("{err}").contains("out of order"), "refused for the wrong reason: {err}");
+        .expect_err("a batch starting past the replica's frontier was applied");
+    let text = format!("{err}");
+    assert!(text.contains("DIVERGED"), "a gap was refused, but not as divergence: {text}");
+    assert!(text.contains("GAP"), "the refusal does not name the gap: {text}");
+    assert_eq!(applier.applied_lsn(), frontier, "the replica advanced across a gap");
+
+    // The latch: divergence is not transient, so a subsequent well-formed batch must still refuse.
+    let second = applier
+        .apply(start, &bytes)
+        .expect_err("a diverged replica accepted a later batch");
+    assert!(
+        format!("{second}").contains("DIVERGED"),
+        "the divergence did not latch: {second}"
+    );
 }
 
 /// A batch is all-or-nothing: a bad frame at the end must prevent the good ones before it from
