@@ -1535,3 +1535,38 @@ fn the_reserved_no_claim_value_is_never_produced_by_a_real_digest() {
     assert_eq!(never_zero(1), 1);
     assert_eq!(never_zero(u64::MAX), u64::MAX);
 }
+
+#[test]
+fn adopting_a_new_leader_retracts_everything_established_with_the_last_one() {
+    // The mutant that survived the first battery: `agreed` was never reset when this node changed
+    // leaders, and the test that should have caught it started from a node whose `agreed` was
+    // already zero, so the reset was a no-op there. Here it is not.
+    let mut b = Consensus::new(N2, cfg3(), 116);
+    follower_of(&mut b, 2, N3);
+
+    // N3 leads term 2 and establishes four rounds with this node.
+    let e: Vec<Entry> =
+        (1..=4u64).map(|r| Entry { term: 2, round: r, command: wal(r as u8) }).collect();
+    b.step(Event::Recv(append_msg(N3, N2, 2, 0, 0, e, 0)));
+    let ack = b.step(Event::Persisted { term: 2, round: 4 });
+    assert_eq!(
+        resp_of(&only_send(&ack)).1,
+        4,
+        "the setup is wrong: four rounds were not established with the previous leader"
+    );
+
+    // N1 wins term 3 holding a different round 3. Its append is REFUSED, so nothing is established
+    // with it — but this node has already accepted N1 as its leader.
+    let refusal = b.step(Event::Recv(append_msg(N1, N2, 3, 3, 3, vec![], 0)));
+    assert!(!resp_of(&only_send(&refusal)).0, "the setup is wrong: N1's append was accepted");
+    assert_eq!(b.leader(), Some(N1));
+
+    let ack = b.step(Event::Persisted { term: 2, round: 4 });
+    let (_, matched, _, digest) = resp_of(&only_send(&ack));
+    assert_eq!(
+        matched, 0,
+        "four rounds established with the PREVIOUS leader were claimed to the new one. N1 has \
+         never sent this node a round, so it would count a replica of entries it does not have"
+    );
+    assert_eq!(digest, 0, "and a claim of nothing carries no digest");
+}
