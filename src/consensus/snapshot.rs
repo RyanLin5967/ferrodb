@@ -820,13 +820,20 @@ impl Consensus {
             // has. Ignored rather than clamped: a claim this wrong is not evidence about anything.
             return;
         }
-        if received_through <= cur.acked {
-            // A duplicate, a reorder, or the receiver's "I accepted nothing" (which is also what
-            // `mod.rs`'s stale-term refusal sends). The cursor never moves backwards; the next
-            // heartbeat re-sends the chunk at `acked`, which is where it already was.
+        if received_through == cur.acked {
+            // Nothing new. Not an error — a duplicated frame — and answering it with another chunk
+            // would answer a duplicate with a duplicate for ever.
             return;
         }
 
+        // **A lower report moves the cursor BACKWARDS, deliberately.** The receiver is the only
+        // authority on what it holds, and the case that decides this is a follower that crashes
+        // mid-transfer: it comes back holding nothing and says so, and a sender that treated its
+        // own cursor as monotonic would go on sending chunks from the middle of a payload the
+        // receiver can never complete — a follower that is never repaired, with both nodes healthy
+        // and both behaving. A duplicated stale report costs one re-sent chunk and then converges,
+        // because the receiver answers its real position to the very next one. Bandwidth is the
+        // cheaper of the two failures by an unbounded margin.
         let done = received_through == cur.total();
         {
             let p = self.progress.entry(from).or_default();
@@ -906,38 +913,61 @@ impl Consensus {
         }
 
         let held = self.snapshot_incoming().cloned();
-        let mut cur = match held {
-            // A transfer of a *different* snapshot supersedes whatever was in flight: a new leader,
-            // or a newer snapshot from the same one. Restarted rather than merged — two payloads
-            // interleaved by offset would digest correctly and be neither.
-            Some(c) if c.meta == meta => c,
-            _ => {
-                if offset != 0 {
-                    // The sender is resuming a transfer this node is not holding — it crashed, or
-                    // this is a reorder. Answer 0 so it restarts from the header, which is the only
-                    // offset at which a payload can be validated.
-                    self.ack_snapshot(from, 0, out);
+        let mut cur = if offset == 0 {
+            // **A chunk at offset 0 is a transfer starting, and the header decides whether it is
+            // THIS transfer.**
+            //
+            // Keying on the meta alone is not enough and the difference is not academic: two
+            // captures of the same round have the same `(last_round, last_term, config,
+            // total_bytes)` and different bytes, because a base backup copies pages while writes
+            // land and is a smear of states rather than an instant (`backup.rs`'s own header says
+            // so). So a transfer interrupted by a leader change and resumed by the new leader's
+            // capture would splice two images by offset, digest to nothing at the end, and — since
+            // a refusal does not destroy the cursor — do it again for ever.
+            //
+            // The header carries `body_digest`, so header equality is payload equality. Equal
+            // means this is a duplicate of a first chunk already accepted and the cursor stands;
+            // different means a different payload and the cursor restarts.
+            let Ok(header) = PayloadHeader::decode(&data) else {
+                self.refuse_snapshot(from, out);
+                return;
+            };
+            if header.last_round != meta.last_round
+                || header.last_term != meta.last_term
+                || header.total_bytes() != meta.total_bytes
+            {
+                // The envelope and the payload disagree about what this is. Refused rather than
+                // resolved in favour of either: nothing here can tell which is lying.
+                self.refuse_snapshot(from, out);
+                return;
+            }
+            match held {
+                Some(c) if c.header == header && c.received > 0 => {
+                    // A duplicate of the first chunk of a transfer already under way. Answering the
+                    // real cursor rather than restarting is what keeps one duplicated frame from
+                    // costing a transfer that is nearly finished.
+                    let n = c.received;
+                    self.progress.entry(self.self_id).or_default().receiving = Some(c);
+                    self.ack_snapshot(from, n, out);
                     return;
                 }
-                let Ok(header) = PayloadHeader::decode(&data) else {
-                    self.refuse_snapshot(from, out);
-                    return;
-                };
-                if header.last_round != meta.last_round
-                    || header.last_term != meta.last_term
-                    || header.total_bytes() != meta.total_bytes
-                {
-                    // The envelope and the payload disagree about what this is. Refused rather
-                    // than resolved in favour of either: nothing here can tell which is lying.
-                    self.refuse_snapshot(from, out);
-                    return;
-                }
-                RecvCursor {
+                _ => RecvCursor {
                     meta: meta.clone(),
                     header,
                     received: 0,
                     body_digest: super::replicate::FNV_OFFSET,
                     complete: false,
+                },
+            }
+        } else {
+            match held {
+                Some(c) if c.meta == meta => c,
+                _ => {
+                    // The sender is resuming a transfer this node is not holding — it crashed, or
+                    // this is a reorder. Answer 0 so it restarts from the header, which is the only
+                    // offset at which a payload can be validated at all.
+                    self.ack_snapshot(from, 0, out);
+                    return;
                 }
             }
         };

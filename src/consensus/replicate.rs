@@ -694,6 +694,10 @@ impl Consensus {
         p.matched = durable;
         p.needs_snapshot = false;
         p.sending = None;
+        // A node that has just won an election is not a node being re-seeded. Abandoning the
+        // incoming transfer here is what stops a `Persisted` for its round arriving later and
+        // installing somebody else's image over a leader's own state.
+        p.receiving = None;
     }
 
     /// Everything a node must do on winning an election: per-peer state, the term-establishing
