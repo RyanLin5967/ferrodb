@@ -812,6 +812,78 @@ fn a_relative_link_target_resolves_against_the_links_own_directory() {
 
 #[cfg(unix)]
 #[test]
+fn a_directory_component_symlink_cannot_redirect_the_key() {
+    // **This broke my SECOND fix, and it is the same mistake one level up.** The hop walk asked
+    // `symlink_metadata` about each final name — but the kernel has already silently resolved every
+    // directory above that name to get there, so a symlink among the *directory* components is a
+    // name in the resolution the walk never saw.
+    //
+    //     a/k  ->  b/dl/real       and  b/dl -> c
+    //
+    // `b` holds the link `dl`. It is an ancestor of NEITHER endpoint — not of the configured path
+    // `a/k`, not of the file finally opened — so it is not the documented ancestry limit either. An
+    // attacker who can write to `b` repoints `dl` at a directory the node already owns, holding a
+    // file it can already read: a rotated key, a backup. They author no key and own nothing.
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    let c = root.path().join("c");
+    for d in [&a, &b, &c] {
+        std::fs::create_dir(d).unwrap();
+    }
+    write_key_file(&c, "real", &key_bytes(56));
+
+    // b/dl -> c, and a/k -> b/dl/real
+    std::os::unix::fs::symlink(&c, b.join("dl")).unwrap();
+    std::os::unix::fs::symlink(b.join("dl").join("real"), a.join("k")).unwrap();
+    let configured = a.join("k");
+
+    for d in [&a, &b, &c] {
+        chmod(d, 0o700);
+    }
+    let ok = Key::load(&configured).expect("every directory in the resolution closed: it loads");
+    assert_eq!(ok.tag(b"probe"), a_key(56).tag(b"probe"), "and it is the key at the end");
+
+    // Only `b` changes — the directory holding the DIRECTORY symlink. Both endpoints stay 0700.
+    chmod(&b, 0o777);
+    let err = Key::load(&configured).expect_err(
+        "the directory holding a directory-component symlink is 0777: repointing it redirects the \
+         key without touching either endpoint",
+    );
+    let text = err.to_string();
+    assert!(text.contains("writable by group or other"), "{text}");
+    assert!(
+        text.contains(&b.display().to_string()),
+        "the error must name b, the directory nobody was checking: {text}"
+    );
+    chmod(&b, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn every_directory_above_the_key_is_inspected_not_only_its_parent() {
+    // The ancestry limit this module used to state is gone, and this is what replaced it. A
+    // group-writable directory anywhere above the key is a refusal, because whoever can write to it
+    // can replace the directory below and redirect everything under it.
+    let root = tempfile::tempdir().unwrap();
+    let mid = root.path().join("mid");
+    let leaf = mid.join("leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    let p = write_key_file(&leaf, "k", &key_bytes(57));
+
+    chmod(&mid, 0o700);
+    chmod(&leaf, 0o700);
+    Key::load(&p).expect("a closed ancestry loads");
+
+    // Two levels up from the key, not its parent.
+    chmod(&mid, 0o777);
+    let err = Key::load(&p).expect_err("a world-writable grandparent must be refused");
+    assert!(err.to_string().contains(&mid.display().to_string()), "must name the grandparent: {err}");
+    chmod(&mid, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_symlink_cycle_is_refused_by_the_shape_check_before_the_walk_begins() {
     // **Renamed from "...refused rather than followed", which overclaimed.** A mutant that removed
     // the walk's `MAX_HOPS` bound did NOT make this test fail, so the test was not evidence for the
