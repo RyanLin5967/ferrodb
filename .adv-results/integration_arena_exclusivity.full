@@ -1,0 +1,71 @@
+warning: multiple fields are never read
+   --> src/consensus/mod.rs:352:16
+    |
+324 | pub struct Consensus {
+    |            --------- fields in this struct
+...
+352 |     pub(crate) acked: std::collections::BTreeMap<NodeId, config::CfgAt>,
+    |                ^^^^^
+...
+384 |     pub(crate) since_quorum: u32,
+    |                ^^^^^^^^^^^^
+...
+387 |     pub(crate) election_timeout: u32,
+    |                ^^^^^^^^^^^^^^^^
+388 |     /// The base election timeout; the drawn one lies in `[base, 2*base)`.
+389 |     pub(crate) election_base: u32,
+    |                ^^^^^^^^^^^^^
+...
+398 |     pub(crate) heartbeat: u32,
+    |                ^^^^^^^^^
+399 |     pub(crate) since_heartbeat: u32,
+    |                ^^^^^^^^^^^^^^^
+...
+407 |     pub(crate) progress: std::collections::BTreeMap<NodeId, replicate::Progress>,
+    |                ^^^^^^^^
+...
+412 |     pub(crate) applied: Round,
+    |                ^^^^^^^
+...
+415 |     pub(crate) durable: Round,
+    |                ^^^^^^^
+...
+418 |     pub(crate) last_term: Term,
+    |                ^^^^^^^^^
+419 |     pub(crate) last_round: Round,
+    |                ^^^^^^^^^^
+...
+423 |     pub(crate) snapshot_round: Round,
+    |                ^^^^^^^^^^^^^^
+424 |     pub(crate) snapshot_term: Term,
+    |                ^^^^^^^^^^^^^
+...
+430 |     pub(crate) rng: Rng,
+    |                ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `may_campaign` is never used
+   --> src/consensus/mod.rs:494:19
+    |
+433 | impl Consensus {
+    | -------------- method in this implementation
+...
+494 |     pub(crate) fn may_campaign(&self) -> bool {
+    |                   ^^^^^^^^^^^^
+
+warning: `ferrodb` (lib) generated 2 warnings
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F4-adversarial)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.64s
+     Running tests/integration_arena_exclusivity.rs (target/debug/deps/integration_arena_exclusivity-27e6f0b07fe7940c)
+
+running 5 tests
+test the_bitmap_allocator_refuses_rather_than_crossing_the_floor ... ok
+test an_arena_page_cannot_be_freed_through_the_bitmap ... ok
+test a_second_lower_arena_region_is_refused ... ok
+test an_unreserved_database_allocates_exactly_as_before ... ok
+test the_legacy_allocator_never_hands_out_a_page_inside_an_arena_extent ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+exit=0
