@@ -1,1 +1,882 @@
-//! Placeholder — the reference machine and the detector tests land in the next commit.
+//! F8 — the simulator's own evidence: a reference state machine, one deliberate defect per rule,
+//! and the sweeps that require each detector to fire and then to stay quiet.
+//!
+//! # Why there is a second state machine in here
+//!
+//! `election.rs` and `replicate.rs` are being written in parallel with this file and their handlers
+//! are still `unimplemented!()`. A simulator checked only against a state machine that panics is a
+//! simulator nobody has ever seen work, so this file supplies [`RefNode`]: a reference Raft written
+//! against the same frozen contract — the same [`Event`]s in, the same [`Action`]s out — whose rules
+//! can be switched off one at a time.
+//!
+//! It is a **fixture, not a second implementation**. It lives under `#[cfg(test)]` so it cannot be
+//! mistaken for the shipped state machine or accidentally depended on, and it exists to answer one
+//! question: *would this simulator notice?* The answer for every detector is below, with the mutant
+//! that produces it. `the_real_consensus_state_machine_is_driven_by_this_simulator_...` runs the
+//! real [`Consensus`] through the identical harness and starts asserting the moment F1 and F2 land,
+//! with nobody having to remember to un-ignore anything.
+//!
+//! # The defects, and the detector each one is aimed at
+//!
+//! | Defect | Rule it breaks | Detector it must fire |
+//! |---|---|---|
+//! | [`D_NO_RESTRICTION`] | Raft §5.4.1 election restriction | `a new leader was missing a committed round` |
+//! | [`D_COMMIT_INHERITED`] | Raft §5.4.2 — an inherited round committed by counting | a committed round is lost |
+//! | [`D_QUORUM_OVER_NEXT`] | quorum counted over `matched`, never `next` | a committed round is lost |
+//! | [`D_NO_VOTE_FSYNC`] | `PersistHardState` before the `Send` of a vote | `a vote was sent before its hard state was durable` |
+//! | [`D_VOTE_TWICE`] | one vote per term | `two leaders in one term` |
+//! | [`D_ACK_ON_RECEIPT`] | ack on `Persisted`, never on receipt | `an append was acknowledged before it was durable` |
+//! | [`D_NO_LEASE`] | a leader demotes itself on its own lease | `two leaders overlapped for longer than the lease` |
+//! | [`D_PREVOTE_RAISES_TERM`] | a pre-vote does not raise anybody's term | a partitioned node deposes a healthy leader |
+
+use std::collections::{BTreeMap, BTreeSet};
+
+// `super` is `sim`, not `consensus`: this module is attached from inside `sim.rs`. The glob picks
+// up both the simulator's own items and the contract types `sim.rs` imports from `mod.rs`.
+use super::*;
+use crate::error::FerroError;
+
+// ---------------------------------------------------------------------------------------------
+// The deliberate defects
+// ---------------------------------------------------------------------------------------------
+
+/// Grant a vote to a candidate whose log is behind. Raft §5.4.1.
+pub const D_NO_RESTRICTION: u32 = 1 << 0;
+/// Send a vote without recording it durably first.
+pub const D_NO_VOTE_FSYNC: u32 = 1 << 1;
+/// Vote for a second candidate in a term already voted in.
+pub const D_VOTE_TWICE: u32 = 1 << 2;
+/// Acknowledge an append on receipt rather than on `Event::Persisted`.
+pub const D_ACK_ON_RECEIPT: u32 = 1 << 3;
+/// Commit a round inherited from an earlier term by counting replicas. Raft §5.4.2, figure 8.
+pub const D_COMMIT_INHERITED: u32 = 1 << 4;
+/// Count quorum over `Progress::next` — optimism — rather than over `matched`.
+pub const D_QUORUM_OVER_NEXT: u32 = 1 << 5;
+/// Keep the office after losing contact with a majority.
+pub const D_NO_LEASE: u32 = 1 << 6;
+/// Treat an incoming pre-vote as a real later term, raising this node's own.
+pub const D_PREVOTE_RAISES_TERM: u32 = 1 << 7;
+
+/// The reference machine with every rule intact.
+type Correct = RefNode<0>;
+
+// ---------------------------------------------------------------------------------------------
+// The reference state machine
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Prog {
+    next: Round,
+    matched: Round,
+    silent: u32,
+}
+
+/// A reference Raft over the frozen contract, parameterised by a bitmask of deliberate defects.
+///
+/// Const-generic rather than a runtime flag so that a mutant is a distinct *type*: there is no way
+/// to leave a defect switched on by accident, and `sweep::<Correct>` and `sweep::<RefNode<D>>` are
+/// visibly different calls at the site that makes the claim.
+struct RefNode<const D: u32> {
+    id: NodeId,
+    cfg: Config,
+    role: Role,
+    term: Term,
+    voted_for: Option<NodeId>,
+    leader: Option<NodeId>,
+    /// Rounds are contiguous from 1, so `log[i].round == i + 1`.
+    log: Vec<Entry>,
+    commit: Round,
+    applied: Round,
+    /// What the caller has told us is on the disk. Never inferred — only [`Event::Persisted`] moves
+    /// it, which is the whole of the fsync-before-ack rule.
+    durable: Round,
+    votes: BTreeSet<NodeId>,
+    progress: BTreeMap<NodeId, Prog>,
+    since_heard: u32,
+    since_heartbeat: u32,
+    election_timeout: u32,
+    election_base: u32,
+    lease: u32,
+    heartbeat: u32,
+    rng: Rng,
+    /// An append was accepted and handed to the disk; the acknowledgement is owed until it lands.
+    ack_owed: bool,
+    /// The round the **last accepted append confirmed** — `prev_round + entries.len()`.
+    ///
+    /// Not the log's length, and the difference is a data-loss bug the simulator found in this very
+    /// file. A follower holding a stale suffix from a deposed leader matches on `prev_round`, keeps
+    /// the suffix when `entries` is empty, and — acknowledging its own length — tells the leader it
+    /// holds rounds that are somebody else's. The leader counts that toward quorum and commits a
+    /// round only a minority really has.
+    ack_through: Round,
+}
+
+/// Entries per `Append`, so a follower that is far behind catches up over several rounds and the
+/// multi-entry path is exercised rather than being a special case nothing reaches.
+const MAX_ENTRIES_PER_APPEND: usize = 16;
+
+impl<const D: u32> RefNode<D> {
+    fn has(bit: u32) -> bool {
+        D & bit != 0
+    }
+
+    fn last_round(&self) -> Round {
+        self.log.len() as Round
+    }
+
+    fn last_term(&self) -> Term {
+        self.log.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    fn term_at(&self, r: Round) -> Term {
+        if r == 0 {
+            return 0;
+        }
+        self.log.get((r - 1) as usize).map(|e| e.term).unwrap_or(0)
+    }
+
+    /// A rolling hash of the durable prefix, for the divergence detector `AppendResp` carries.
+    fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in self.log.iter().take(self.durable as usize) {
+            for v in [e.term, e.round] {
+                h ^= v;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// **Raft §5.4.1.** `(last_term, last_round)` compared lexicographically — a later term wins
+    /// however short its log, and only within one term does length decide.
+    fn log_is_up_to_date(&self, cand_term: Term, cand_round: Round) -> bool {
+        if Self::has(D_NO_RESTRICTION) {
+            return true;
+        }
+        (cand_term, cand_round) >= (self.last_term(), self.last_round())
+    }
+
+    fn voters(&self) -> Vec<NodeId> {
+        self.cfg.members().to_vec()
+    }
+
+    fn peers(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self.cfg.members().to_vec();
+        v.extend_from_slice(self.cfg.learners());
+        v.retain(|n| *n != self.id);
+        v
+    }
+
+    fn granted_by_voters(&self) -> usize {
+        self.votes.iter().filter(|n| self.cfg.contains(**n)).count()
+    }
+
+    fn send(&self, to: NodeId, term: Term, body: Body) -> Action {
+        Action::Send(Message { from: self.id, to, term, body })
+    }
+
+    fn become_follower(&mut self, term: Term, leader: Option<NodeId>, out: &mut Vec<Action>) {
+        let changed = self.role != Role::Follower || self.term != term || self.leader != leader;
+        if self.term != term {
+            self.term = term;
+            self.voted_for = None;
+            out.push(Action::PersistHardState { term, voted_for: None });
+        }
+        self.role = Role::Follower;
+        self.leader = leader;
+        self.votes.clear();
+        self.since_heard = 0;
+        if changed {
+            out.push(Action::RoleChanged { role: Role::Follower, term, leader });
+        }
+    }
+
+    // -- ticks -------------------------------------------------------------------------------
+
+    fn on_tick(&mut self, out: &mut Vec<Action>) {
+        if self.role == Role::Leader {
+            for p in self.progress.values_mut() {
+                p.silent = p.silent.saturating_add(1);
+            }
+            // **The leader lease.** A leader that has stopped hearing from a majority gives up the
+            // office before anybody tells it to. Counted over voters only, and including itself.
+            if !Self::has(D_NO_LEASE) {
+                let lease = self.lease;
+                let alive = 1 + self
+                    .voters()
+                    .iter()
+                    .filter(|n| **n != self.id)
+                    .filter(|n| self.progress.get(n).map(|p| p.silent < lease).unwrap_or(false))
+                    .count();
+                if !self.cfg.has_quorum(alive) {
+                    let t = self.term;
+                    self.become_follower(t, None, out);
+                    return;
+                }
+            }
+            self.since_heartbeat += 1;
+            if self.since_heartbeat >= self.heartbeat {
+                self.since_heartbeat = 0;
+                for p in self.peers() {
+                    self.send_append(p, out);
+                }
+            }
+            return;
+        }
+        self.since_heard = self.since_heard.saturating_add(1);
+        if self.since_heard >= self.election_timeout {
+            self.start_pre_campaign(out);
+        }
+    }
+
+    /// Pre-vote: ask whether a campaign could be won **without raising anybody's term**.
+    fn start_pre_campaign(&mut self, out: &mut Vec<Action>) {
+        if !self.cfg.contains(self.id) {
+            self.since_heard = 0;
+            return;
+        }
+        self.role = Role::PreCandidate;
+        // **The office is vacant as far as this node is concerned.** Standing for election means
+        // giving up the leader you had -- and it is also what lets peers that have done the same
+        // grant each other a pre-vote. Without it every node's `since_heard` is reset by its own
+        // campaign a tick before anyone can observe it as expired, and no pre-vote is ever granted
+        // by anybody: the cluster sends pre-votes for ever and elects nobody. Measured, not
+        // guessed: that is exactly what the first run of this file did.
+        self.leader = None;
+        self.since_heard = 0;
+        self.election_timeout = self.election_base + (self.rng.next_u32() % self.election_base);
+        self.votes.clear();
+        self.votes.insert(self.id);
+        if self.cfg.has_quorum(self.granted_by_voters()) {
+            self.start_campaign(out);
+            return;
+        }
+        let (lt, lr) = (self.last_term(), self.last_round());
+        for p in self.peers() {
+            // `term + 1` on the envelope while this node's own term is untouched: the receiver is
+            // being asked about a hypothetical term, not told about a real one.
+            out.push(self.send(p, self.term + 1, Body::PreVote { last_term: lt, last_round: lr }));
+        }
+    }
+
+    fn start_campaign(&mut self, out: &mut Vec<Action>) {
+        self.role = Role::Candidate;
+        self.leader = None;
+        self.term += 1;
+        self.voted_for = Some(self.id);
+        self.votes.clear();
+        self.votes.insert(self.id);
+        self.since_heard = 0;
+        // **Durable before spoken.** A node that votes, crashes and forgets can vote twice in one
+        // term, which elects two leaders of that term.
+        if !Self::has(D_NO_VOTE_FSYNC) {
+            out.push(Action::PersistHardState { term: self.term, voted_for: Some(self.id) });
+        }
+        if self.cfg.has_quorum(self.granted_by_voters()) {
+            self.become_leader(out);
+            return;
+        }
+        let (lt, lr) = (self.last_term(), self.last_round());
+        for p in self.peers() {
+            out.push(self.send(p, self.term, Body::RequestVote { last_term: lt, last_round: lr }));
+        }
+    }
+
+    fn become_leader(&mut self, out: &mut Vec<Action>) {
+        self.role = Role::Leader;
+        self.leader = Some(self.id);
+        self.votes.clear();
+        self.since_heartbeat = 0;
+        let next = self.last_round() + 1;
+        self.progress = self
+            .peers()
+            .into_iter()
+            .map(|n| (n, Prog { next, matched: 0, silent: 0 }))
+            .collect();
+        out.push(Action::RoleChanged {
+            role: Role::Leader,
+            term: self.term,
+            leader: Some(self.id),
+        });
+        // The term-establishing entry. Without a round of its own term a leader can never commit,
+        // because §5.4.2 forbids committing an inherited one by counting.
+        let e = Entry { term: self.term, round: self.last_round() + 1, command: Command::NoOp };
+        self.log.push(e.clone());
+        out.push(Action::Persist { entries: vec![e] });
+        for p in self.peers() {
+            self.send_append(p, out);
+        }
+    }
+
+    // -- votes -------------------------------------------------------------------------------
+
+    fn on_vote_msg(&mut self, m: Message, out: &mut Vec<Action>) {
+        match m.body {
+            Body::PreVote { last_term, last_round } => {
+                // Granted only if this node has itself given up on its leader -- either it never
+                // had one, or it has not heard from the one it has for a whole election timeout.
+                // Without this a healthy cluster answers every partitioned peer's hypothetical
+                // with a yes and the pre-vote filters nothing; with it and nothing else, a cold
+                // cluster grants nobody, because a node's own campaign resets the very counter its
+                // peers are asking about.
+                let no_leader_lately =
+                    self.leader.is_none() || self.since_heard >= self.election_timeout;
+                let granted = m.term > self.term
+                    && no_leader_lately
+                    && self.log_is_up_to_date(last_term, last_round);
+                out.push(self.send(m.from, self.term, Body::PreVoteResp { granted }));
+            }
+            Body::PreVoteResp { granted } => {
+                if self.role != Role::PreCandidate {
+                    return;
+                }
+                if granted {
+                    self.votes.insert(m.from);
+                    if self.cfg.has_quorum(self.granted_by_voters()) {
+                        self.start_campaign(out);
+                    }
+                }
+            }
+            Body::RequestVote { last_term, last_round } => {
+                let free = Self::has(D_VOTE_TWICE)
+                    || self.voted_for.is_none()
+                    || self.voted_for == Some(m.from);
+                let granted = m.term == self.term
+                    && free
+                    && self.log_is_up_to_date(last_term, last_round);
+                if granted {
+                    self.voted_for = Some(m.from);
+                    self.since_heard = 0;
+                    if !Self::has(D_NO_VOTE_FSYNC) {
+                        out.push(Action::PersistHardState {
+                            term: self.term,
+                            voted_for: Some(m.from),
+                        });
+                    }
+                }
+                out.push(self.send(m.from, self.term, Body::RequestVoteResp { granted }));
+            }
+            Body::RequestVoteResp { granted } => {
+                if self.role != Role::Candidate || m.term != self.term {
+                    return;
+                }
+                if granted {
+                    self.votes.insert(m.from);
+                    if self.cfg.has_quorum(self.granted_by_voters()) {
+                        self.become_leader(out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // -- replication -------------------------------------------------------------------------
+
+    fn send_append(&mut self, to: NodeId, out: &mut Vec<Action>) {
+        let last = self.last_round();
+        let next = self.progress.get(&to).map(|p| p.next).unwrap_or(1).clamp(1, last + 1);
+        let prev_round = next - 1;
+        let prev_term = self.term_at(prev_round);
+        let end = (next as usize - 1 + MAX_ENTRIES_PER_APPEND).min(self.log.len());
+        let entries: Vec<Entry> = self.log[(next as usize - 1)..end].to_vec();
+        let sent_through = prev_round + entries.len() as Round;
+        out.push(self.send(
+            to,
+            self.term,
+            Body::Append { prev_round, prev_term, entries, commit: self.commit },
+        ));
+        // Optimism, corrected by the answer. `next` is what to send; it is deliberately NOT what
+        // quorum is counted over.
+        if let Some(p) = self.progress.get_mut(&to) {
+            p.next = sent_through + 1;
+        }
+    }
+
+    fn on_append_msg(&mut self, m: Message, out: &mut Vec<Action>) {
+        match m.body {
+            Body::Append { prev_round, prev_term, entries, commit } => {
+                if self.role != Role::Follower || self.leader != Some(m.from) {
+                    self.become_follower(m.term, Some(m.from), out);
+                }
+                self.since_heard = 0;
+
+                if prev_round > self.last_round() {
+                    let hint = self.last_round() + 1;
+                    // `matched: 0` claims nothing: a refusal is not the place to make an assertion
+                    // about a log this node has just said it cannot line up.
+                    out.push(self.send(
+                        m.from,
+                        self.term,
+                        Body::AppendResp { success: false, matched: 0, hint, digest: 0 },
+                    ));
+                    return;
+                }
+                if prev_round > 0 && self.term_at(prev_round) != prev_term {
+                    // The **hint** walks back over the whole conflicting term, so the leader
+                    // corrects in one step rather than probing backwards a round at a time. The
+                    // **truncation** does not: only `prev_round` is known to conflict, and the
+                    // rounds below it have not been examined. Deleting the whole term instead was
+                    // a real defect in this file, and the simulator named it -- seed 7 dropped
+                    // committed round 1 because rounds 1..4 all happened to share one term.
+                    let bad = self.term_at(prev_round);
+                    let mut first = prev_round;
+                    while first > 1 && self.term_at(first - 1) == bad {
+                        first -= 1;
+                    }
+                    out.push(Action::Truncate { from: prev_round });
+                    self.log.truncate((prev_round - 1) as usize);
+                    self.durable = self.durable.min(self.last_round());
+                    self.ack_through = self.ack_through.min(self.last_round());
+                    out.push(self.send(
+                        m.from,
+                        self.term,
+                        Body::AppendResp { success: false, matched: 0, hint: first, digest: 0 },
+                    ));
+                    return;
+                }
+
+                // What THIS append confirms, fixed before the entries are consumed.
+                let confirmed = prev_round + entries.len() as Round;
+                let mut fresh = Vec::new();
+                for e in entries {
+                    let idx = (e.round - 1) as usize;
+                    if idx < self.log.len() {
+                        if self.log[idx].term == e.term {
+                            continue;
+                        }
+                        out.push(Action::Truncate { from: e.round });
+                        self.log.truncate(idx);
+                        self.durable = self.durable.min(self.last_round());
+                    }
+                    self.log.push(e.clone());
+                    fresh.push(e);
+                }
+                if !fresh.is_empty() {
+                    out.push(Action::Persist { entries: fresh.clone() });
+                }
+                self.ack_through = confirmed;
+
+                // **`min(leaderCommit, index of last new entry)`**, and the second half is
+                // `confirmed`, not this node's log length. A heartbeat carrying no entries confirms
+                // nothing past `prev_round`, so a follower still holding a deposed leader's entry
+                // above that point would otherwise apply it on the new leader's authority. The
+                // simulator found exactly that: round 19 applied as term 2 where term 3 was
+                // already committed.
+                let c = commit.min(confirmed);
+                if c > self.commit {
+                    self.commit = c;
+                }
+                if self.commit > self.applied {
+                    self.applied = self.commit;
+                    out.push(Action::Apply { through: self.commit });
+                }
+
+                if fresh.is_empty() {
+                    // Nothing was handed to the disk, so the durable watermark is already honest.
+                    let d = self.ack_through.min(self.durable);
+                    let dig = self.digest();
+                    out.push(self.send(
+                        m.from,
+                        self.term,
+                        Body::AppendResp { success: true, matched: d, hint: 0, digest: dig },
+                    ));
+                } else if Self::has(D_ACK_ON_RECEIPT) {
+                    let claimed = self.ack_through;
+                    let dig = self.digest();
+                    out.push(self.send(
+                        m.from,
+                        self.term,
+                        Body::AppendResp { success: true, matched: claimed, hint: 0, digest: dig },
+                    ));
+                } else {
+                    // The acknowledgement is owed until `Event::Persisted` says the bytes landed.
+                    self.ack_owed = true;
+                }
+            }
+            Body::AppendResp { success, matched, hint, .. } => {
+                if self.role != Role::Leader || m.term != self.term {
+                    return;
+                }
+                if let Some(p) = self.progress.get_mut(&m.from) {
+                    p.silent = 0;
+                    if success {
+                        p.matched = p.matched.max(matched);
+                        p.next = p.matched + 1;
+                    } else {
+                        p.next = hint.max(1);
+                    }
+                }
+                if success {
+                    self.try_commit(out);
+                } else {
+                    self.send_append(m.from, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **Raft §5.4.2.** A round of the leader's own term commits when a majority holds it; a round
+    /// inherited from an earlier term commits only as a side effect of one that is.
+    fn try_commit(&mut self, out: &mut Vec<Action>) {
+        let mut held: Vec<Round> = self
+            .voters()
+            .iter()
+            .map(|n| {
+                if *n == self.id {
+                    self.durable
+                } else if Self::has(D_QUORUM_OVER_NEXT) {
+                    self.progress.get(n).map(|p| p.next.saturating_sub(1)).unwrap_or(0)
+                } else {
+                    self.progress.get(n).map(|p| p.matched).unwrap_or(0)
+                }
+            })
+            .collect();
+        held.sort_unstable();
+        held.reverse();
+        let q = self.cfg.quorum();
+        if q == 0 || held.len() < q {
+            return;
+        }
+        let cand = held[q - 1].min(self.last_round());
+        if cand <= self.commit {
+            return;
+        }
+        if self.term_at(cand) != self.term && !Self::has(D_COMMIT_INHERITED) {
+            return;
+        }
+        self.commit = cand;
+        if self.commit > self.applied {
+            self.applied = self.commit;
+            out.push(Action::Apply { through: self.commit });
+        }
+    }
+
+    fn on_persisted(&mut self, _term: Term, round: Round, out: &mut Vec<Action>) {
+        // Follow the store exactly rather than taking the maximum: a truncation lowers the durable
+        // watermark, and a node that refused to hear that would acknowledge a round it no longer has.
+        self.durable = round.min(self.last_round());
+        if self.role == Role::Leader {
+            self.try_commit(out);
+            return;
+        }
+        if self.ack_owed {
+            if let Some(l) = self.leader {
+                self.ack_owed = false;
+                let d = self.ack_through.min(self.durable);
+                let dig = self.digest();
+                out.push(self.send(
+                    l,
+                    self.term,
+                    Body::AppendResp { success: true, matched: d, hint: 0, digest: dig },
+                ));
+            }
+        }
+    }
+
+    fn on_propose(&mut self, c: Command, out: &mut Vec<Action>) {
+        if self.role != Role::Leader {
+            out.push(Action::Refuse {
+                why: FerroError::NotLeader { leader: self.leader.map(|n| n.to_string()) },
+            });
+            return;
+        }
+        let e = Entry { term: self.term, round: self.last_round() + 1, command: c };
+        self.log.push(e.clone());
+        out.push(Action::Persist { entries: vec![e] });
+        for p in self.peers() {
+            self.send_append(p, out);
+        }
+    }
+
+    /// The universal term rules, copied from `mod.rs` because a reference machine that skipped them
+    /// would be testing the simulator against a protocol nobody is implementing.
+    fn on_message(&mut self, m: Message, out: &mut Vec<Action>) {
+        if m.term < self.term {
+            if m.body.is_request() {
+                let body = stale_refusal(&m.body);
+                out.push(self.send(m.from, self.term, body));
+            }
+            return;
+        }
+        let hypothetical = !Self::has(D_PREVOTE_RAISES_TERM)
+            && matches!(m.body, Body::PreVote { .. } | Body::PreVoteResp { .. });
+        if m.term > self.term && !hypothetical {
+            self.become_follower(m.term, None, out);
+        }
+        match m.body {
+            Body::PreVote { .. }
+            | Body::PreVoteResp { .. }
+            | Body::RequestVote { .. }
+            | Body::RequestVoteResp { .. } => self.on_vote_msg(m, out),
+            _ => self.on_append_msg(m, out),
+        }
+    }
+}
+
+/// `mod.rs` keeps its own copy private, so the reference machine carries one. Kept identical on
+/// purpose: a refusal that differed would be a difference in the protocol, not in the fixture.
+fn stale_refusal(b: &Body) -> Body {
+    match b {
+        Body::PreVote { .. } => Body::PreVoteResp { granted: false },
+        Body::RequestVote { .. } => Body::RequestVoteResp { granted: false },
+        Body::Append { .. } => Body::AppendResp { success: false, matched: 0, hint: 0, digest: 0 },
+        Body::InstallSnapshot { .. } => Body::InstallSnapshotResp { received_through: 0 },
+        other => unreachable!("stale_refusal called on a response body: {other:?}"),
+    }
+}
+
+impl<const D: u32> Peer for RefNode<D> {
+    fn boot(id: NodeId, cfg: Config, seed: u64, hard: HardState, log: &[Entry]) -> Self {
+        // The same windows `Consensus::new` draws, so a claim proved here is a claim about the
+        // numbers the shipped state machine uses.
+        let election_base = 10;
+        let mut rng = Rng::new(seed);
+        let election_timeout = election_base + (rng.next_u32() % election_base);
+        RefNode {
+            id,
+            cfg,
+            role: Role::Follower,
+            term: hard.term,
+            voted_for: hard.voted_for,
+            leader: None,
+            log: log.to_vec(),
+            commit: 0,
+            applied: 0,
+            durable: log.len() as Round,
+            votes: BTreeSet::new(),
+            progress: BTreeMap::new(),
+            since_heard: 0,
+            since_heartbeat: 0,
+            election_timeout,
+            election_base,
+            lease: election_base - 2,
+            heartbeat: 3,
+            rng,
+            ack_owed: false,
+            ack_through: 0,
+        }
+    }
+
+    fn step(&mut self, ev: Event) -> Vec<Action> {
+        let mut out = Vec::new();
+        match ev {
+            Event::Tick => self.on_tick(&mut out),
+            Event::Recv(m) => self.on_message(m, &mut out),
+            Event::Persisted { term, round } => self.on_persisted(term, round, &mut out),
+            Event::Propose(c) => self.on_propose(c, &mut out),
+        }
+        out
+    }
+
+    fn id(&self) -> NodeId { self.id }
+    fn role(&self) -> Role { self.role }
+    fn term(&self) -> Term { self.term }
+    fn lease_window(&self) -> u32 { self.lease }
+    fn tail(&self) -> (Term, Round) { (self.last_term(), self.last_round()) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared shapes for the sweeps
+// ---------------------------------------------------------------------------------------------
+
+/// Seed bases are distinct per sweep so that two tests never claim the same evidence twice, and so
+/// that a failure names which sweep found it.
+const SEED_SAFETY: u64 = 0x5EED_0001;
+const SEED_MUTANT: u64 = 0x5EED_1000;
+const SEED_LIVENESS: u64 = 0x5EED_2000;
+
+/// How many seeds the default `cargo test` run sweeps.
+///
+/// Overridable **upwards only**, and an unparseable value is refused rather than defaulted: a knob
+/// that silently fell back to the floor would let a CI run that meant to sweep ten thousand sweep
+/// four hundred and report success. `FERRODB_SIM_SEEDS=10000 cargo test --release` is the number
+/// `DISTRIBUTED.md`'s exit criterion 1 asks for.
+fn sweep_seeds(floor: u64) -> u64 {
+    match std::env::var("FERRODB_SIM_SEEDS") {
+        Err(_) => floor,
+        Ok(v) => {
+            let n: u64 = v.parse().unwrap_or_else(|_| {
+                panic!(
+                    "FERRODB_SIM_SEEDS is {v:?}; it takes a seed count. Refusing to guess, because \
+                     guessing the floor would report a ten-thousand-seed sweep that never ran."
+                )
+            });
+            assert!(
+                n >= floor,
+                "FERRODB_SIM_SEEDS={n} is below this sweep's floor of {floor}. The knob raises \
+                 coverage; it does not lower it."
+            );
+            n
+        }
+    }
+}
+
+fn chaos_cfg() -> SimConfig {
+    SimConfig::chaos(5, 240)
+}
+
+/// Assert a sweep found nothing **and** did enough to be able to find something. A sweep that
+/// elected no leader and committed no round violates nothing and proves nothing.
+fn expect_quiet(s: &Sweep, what: &str) {
+    if let Some(v) = &s.violation {
+        panic!("{what}: the simulator found a real violation on seed {}\n{v}", v.seed);
+    }
+    let t = &s.totals;
+    assert!(
+        t.elections > 0,
+        "{what}: {} seeds elected nobody, so nothing here could have violated a leader rule: {t:?}",
+        s.seeds_run
+    );
+    assert!(
+        t.committed_rounds > 0,
+        "{what}: {} seeds committed no round, so 'a committed round is never lost' is vacuous: {t:?}",
+        s.seeds_run
+    );
+}
+
+/// Run one seed to a leader, or say how long it waited. Used by the scenario tests, which need a
+/// cluster in a known state before they break anything.
+fn run_to_leader<P: Peer>(sim: &mut Sim<P>, max_ticks: u64) -> Option<NodeId> {
+    for _ in 0..max_ticks {
+        sim.run_ticks(1).expect("no violation while merely electing");
+        if let Some(l) = sim.leader() {
+            return Some(l);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------------------------
+// The harness itself
+// ---------------------------------------------------------------------------------------------
+
+/// **Breaking shape:** a reference machine that cannot elect or commit would make every sweep below
+/// green for the wrong reason.
+#[test]
+fn a_healthy_five_node_cluster_elects_one_leader_and_commits_what_clients_propose() {
+    let mut sim = Sim::<Correct>::new(7, SimConfig::healthy(5, 200));
+    let report = sim.run().expect("a healthy cluster violated an invariant");
+    assert!(report.elections > 0, "fixture: nobody was ever elected: {report:?}");
+    assert_eq!(sim.leaders().len(), 1, "a healthy cluster ended with {:?}", sim.leaders());
+    assert!(
+        report.committed_rounds >= 20,
+        "only {} rounds committed in 200 ticks; the load is too light for the safety sweeps to \
+         mean anything: {report:?}",
+        report.committed_rounds
+    );
+    assert_eq!(
+        report.max_overlap_ticks, 0,
+        "two nodes believed they led at once on a network that was never partitioned"
+    );
+    assert!(report.refusals > 0, "fixture: no proposal ever reached a follower, so the NotLeader path is untested");
+}
+
+/// **Breaking shape:** anything drawn from outside the seed — a clock, a `HashMap` iteration order —
+/// would make a failing seed unreplayable, which is the one thing this simulator has to promise.
+#[test]
+fn the_same_seed_replays_the_same_run() {
+    for seed in [1u64, 2, 99, 0x5EED_BEEF] {
+        let a = Sim::<Correct>::new(seed, chaos_cfg()).run().expect("seed a");
+        let b = Sim::<Correct>::new(seed, chaos_cfg()).run().expect("seed b");
+        assert_eq!(
+            a.digest, b.digest,
+            "seed {seed} produced two different runs, so no failure it finds can be replayed"
+        );
+        assert_eq!(a, b, "seed {seed} produced different totals across two runs");
+    }
+}
+
+/// The anti-vacuity twin of the test above: a digest that was constant would pass that one and
+/// prove nothing at all.
+#[test]
+fn two_different_seeds_do_not_produce_the_same_run() {
+    let mut seen = BTreeSet::new();
+    for seed in 1..=24u64 {
+        let r = Sim::<Correct>::new(seed, chaos_cfg()).run().expect("clean run");
+        seen.insert(r.digest);
+    }
+    assert!(
+        seen.len() >= 22,
+        "24 seeds produced only {} distinct runs; the seed is barely being read",
+        seen.len()
+    );
+}
+
+/// **Breaking shape:** a fault model that never fires. Every knob is asserted to have actually done
+/// something, because a sweep under a network that behaved perfectly is a sweep of the happy path
+/// wearing a chaos label.
+#[test]
+fn the_fault_model_injects_every_fault_it_claims_to() {
+    let s = sweep::<Correct>(SEED_SAFETY, 60, &chaos_cfg());
+    let t = &s.totals;
+    assert!(s.violation.is_none(), "unexpected violation:\n{}", s.violation.as_ref().unwrap());
+    assert!(t.dropped_loss > 0, "no message was ever dropped: {t:?}");
+    assert!(t.duplicated > 0, "no message was ever duplicated: {t:?}");
+    assert!(t.dropped_partition > 0, "no message was ever cut off by a partition: {t:?}");
+    assert!(
+        t.one_way_partitions > 0,
+        "every partition was symmetric, so the one-way case DISTRIBUTED.md singles out was never \
+         reached: {t:?}"
+    );
+    assert!(t.crashes > 0, "no node ever crashed: {t:?}");
+    assert!(t.restarts > 0, "no node ever came back: {t:?}");
+    assert!(
+        t.discarded_entries > 0,
+        "no crash ever took away an unfsynced entry, so 'loses everything not persisted' is a \
+         claim this model never tested: {t:?}"
+    );
+    assert!(t.heals > 0, "the network never healed, so nothing could make progress: {t:?}");
+    eprintln!("fault model over {} seeds: {t:?}", s.seeds_run);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The two properties DISTRIBUTED.md §F8 names
+// ---------------------------------------------------------------------------------------------
+
+/// **At most one leader per term**, across a seeded chaos sweep.
+///
+/// Breaking shape: a vote counted twice — most often a vote sent before its `PersistHardState`
+/// landed, cast again by the same node after a crash.
+#[test]
+fn at_most_one_leader_per_term_across_a_chaos_sweep() {
+    let n = sweep_seeds(400);
+    let s = sweep::<Correct>(SEED_SAFETY, n, &chaos_cfg());
+    expect_quiet(&s, "at most one leader per term");
+    eprintln!(
+        "at_most_one_leader_per_term: {} seeds, {} elections, {} committed rounds, max term {}",
+        s.seeds_run, s.totals.elections, s.totals.committed_rounds, s.totals.max_term
+    );
+}
+
+/// **A committed round is never lost**, across a seeded chaos sweep.
+///
+/// Breaking shape: the figure-8 scenario — an inherited round committed by counting replicas, then
+/// overwritten by a later leader that never held it.
+#[test]
+fn a_committed_round_is_never_lost_across_a_chaos_sweep() {
+    let n = sweep_seeds(400);
+    let s = sweep::<Correct>(SEED_SAFETY + 500_000, n, &chaos_cfg());
+    expect_quiet(&s, "a committed round is never lost");
+    eprintln!(
+        "a_committed_round_is_never_lost: {} seeds, {} committed rounds, {} crashes, {} restarts",
+        s.seeds_run, s.totals.committed_rounds, s.totals.crashes, s.totals.restarts
+    );
+}
+
+/// The same properties under partitions but no crashes, so that a failure here names the network
+/// rather than the disk.
+#[test]
+fn the_safety_properties_hold_under_partitions_alone() {
+    let mut cfg = chaos_cfg();
+    cfg.faults = Faults::partitioned();
+    let s = sweep::<Correct>(SEED_SAFETY + 900_000, sweep_seeds(300), &cfg);
+    expect_quiet(&s, "safety under partitions alone");
+    assert!(
+        s.totals.one_way_partitions > 0,
+        "fixture: the partition-only preset produced no one-way cut: {:?}",
+        s.totals
+    );
+}
+

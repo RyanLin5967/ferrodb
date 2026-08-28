@@ -421,7 +421,15 @@ pub struct Report {
     pub crashes: u64,
     pub restarts: u64,
     pub partitions: u64,
+    /// Of those, how many were **one-way**. Reported because a sweep that only ever cut both
+    /// directions has not exercised the case `DISTRIBUTED.md` §F8 singles out, and a report that
+    /// did not distinguish them would let that go unnoticed.
+    pub one_way_partitions: u64,
     pub heals: u64,
+    /// Entries a crash discarded because they had been written but not fsynced. Zero means the
+    /// crash model never actually took anything away, which makes every "survived a restart" claim
+    /// in this file vacuous — so it is asserted on, not merely reported.
+    pub discarded_entries: u64,
     /// Transitions into [`Role::Leader`].
     pub elections: u64,
     pub proposals: u64,
@@ -448,7 +456,9 @@ impl Report {
         self.crashes += other.crashes;
         self.restarts += other.restarts;
         self.partitions += other.partitions;
+        self.one_way_partitions += other.one_way_partitions;
         self.heals += other.heals;
+        self.discarded_entries += other.discarded_entries;
         self.elections += other.elections;
         self.proposals += other.proposals;
         self.refusals += other.refusals;
@@ -891,6 +901,8 @@ impl<P: Peer> Sim<P> {
             return;
         }
         self.nodes[i].peer = None;
+        let lost = self.nodes[i].store.log.len() - self.nodes[i].store.durable_len;
+        self.report.discarded_entries += lost as u64;
         self.nodes[i].store.crash();
         self.nodes[i].applied = 0;
         self.nodes[i].overlap = 0;
@@ -991,12 +1003,14 @@ impl<P: Peer> Sim<P> {
                 let k = self.pick_node();
                 self.isolate_inbound(k);
                 self.report.partitions += 1;
+                self.report.one_way_partitions += 1;
                 self.log_line(format!("NET isolate-inbound {k} (one-way)"));
             }
             ChurnKind::IsolateOut => {
                 let k = self.pick_node();
                 self.isolate_outbound(k);
                 self.report.partitions += 1;
+                self.report.one_way_partitions += 1;
                 self.log_line(format!("NET isolate-outbound {k} (one-way)"));
             }
             ChurnKind::Cut | ChurnKind::CutOneWay => {
@@ -1010,6 +1024,7 @@ impl<P: Peer> Sim<P> {
                 } else {
                     self.cut_one_way(&side);
                     self.log_line(format!("NET cut-one-way {side:?} -> rest"));
+                    self.report.one_way_partitions += 1;
                 }
                 self.report.partitions += 1;
             }
@@ -1019,6 +1034,7 @@ impl<P: Peer> Sim<P> {
                 if a != b {
                     self.block(a, b);
                     self.report.partitions += 1;
+                    self.report.one_way_partitions += 1;
                     self.log_line(format!("NET block {a}->{b}"));
                 }
             }
