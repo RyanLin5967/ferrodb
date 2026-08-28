@@ -19,7 +19,9 @@ mkdir -p "$LOGDIR"
 touch "$RESULTS"
 
 run_one() {
-    local target="$1" flag="$2" log="$LOGDIR/$target.log"
+    local target="$1"
+    local flag="$2"
+    local log="$LOGDIR/$target.log"
     if grep -q "^$target	" "$RESULTS" 2>/dev/null; then
         echo "skip   $target (already recorded)"
         return 0
@@ -46,7 +48,7 @@ if ! timeout 1800 cargo build --examples > "$LOGDIR/examples.log" 2>&1; then
 fi
 
 silent=0
-run_one "--lib" "--lib" || silent=$((silent+1))
+run_one "lib" "--lib" || silent=$((silent+1))
 for f in tests/*.rs; do
     t=$(basename "$f" .rs)
     run_one "$t" "--test $t" || silent=$((silent+1))
