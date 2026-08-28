@@ -1,0 +1,43 @@
+KILLED           contiguity check removed from append
+                 -> assertion `left == right` failed: the log accepted round 2 as its first round, which is a hole nothing later can see | left: Ok(()) | right: Err(NonContiguous { expected: 1, got: 2 })
+KILLED           batch validated as it writes, not before
+                 -> assertion `left == right` failed: a refused batch moved the log's end | left: 4 | right: 3
+KILLED           term-goes-backwards check removed from append
+                 -> assertion `left == right` failed: a term went backwards along the log, which means a stale frame was accepted as a new one | left: Ok(()) | right: Err(TermWentBackwards { last: 5, got: 4 })
+KILLED           crc32 check removed from the recovery scan
+                 -> assertion `left == right` failed: the scan trusted a frame whose crc32 does not hold | left: 6 | right: 5
+KILLED           round-equals-position check removed from the scan
+                 -> assertion `left == right` failed: the scan walked past a frame claiming round 9 where round 3 belongs, so a hole in this log is not visible by arithmetic after all | left: 5 | right: 2
+KILLED           term-monotonic check removed from the scan
+                 -> assertion `left == right` failed: the scan accepted a frame whose term went backwards | left: 3 | right: 2
+KILLED           frame length bound removed from the scan
+                 -> thread 'consensus::log::tests_log::a_frame_length_that_runs_past_the_file_ends_the_scan_without_allocating_for_it' (16817348) panicked at src/consensus/tests_log.rs:247:34:
+KILLED           snapshot floor check removed from every read
+                 -> thread 'consensus::log::tests_log::a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor' (16843037) panicked at src/consensus/log.rs:887:24:
+KILLED           truncate_from skips the floor check
+                 -> thread 'consensus::log::tests_log::a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor' (16885423) panicked at src/consensus/log.rs:706:19:
+KILLED           checkpoint writes its header before syncing the data it describes
+                 -> thread 'consensus::log::tests_log::a_checkpoint_syncs_its_data_before_it_writes_the_header_that_makes_it_live' (16908348) panicked at src/consensus/tests_log.rs:604:5:
+KILLED           checkpoint rewrites the live file instead of the spare
+                 -> thread 'consensus::log::tests_log::a_crash_at_any_point_during_a_checkpoint_loses_nothing' (16927961) panicked at src/consensus/tests_log.rs:635:30:
+KILLED           checkpoint accepts a term that disagrees with the log
+                 -> assertion `left == right` failed | left: Ok(()) | right: Err(TermMismatch { round: 3, held: 4, claimed: 9 })
+KILLED           append advances the durable frontier without an fsync
+                 -> assertion `left == right` failed: an append moved the durable frontier without an fsync | left: 10 | right: 5
+SURVIVED         the zero terminator is not written after a batch
+KILLED           an unreadable header reinitializes over the entries
+                 -> thread 'consensus::log::tests_log::a_live_header_that_cannot_be_read_is_refused_rather_than_reinitialized_over' (17016749) panicked at src/consensus/tests_log.rs:712:18:
+KILLED           two files at one generation are guessed between
+                 -> thread 'consensus::log::tests_log::two_files_claiming_one_generation_are_refused' (17029410) panicked at src/consensus/tests_log.rs:737:18:
+KILLED           a newer on-disk format version is accepted
+                 -> thread 'consensus::log::tests_log::a_log_written_at_a_newer_format_version_is_refused_rather_than_reinitialized' (17048938) panicked at src/consensus/tests_log.rs:757:18:
+KILLED           the entry size limit is removed
+                 -> thread 'consensus::log::tests_log::an_entry_too_large_for_the_transport_is_refused_at_append' (17061083) panicked at src/consensus/tests_log.rs:1081:18:
+KILLED           the command decoder accepts trailing bytes
+                 -> thread 'consensus::log::tests_log::the_command_decoder_refuses_trailing_bytes' (17079752) panicked at src/consensus/tests_log.rs:919:5:
+KILLED           the node list bound becomes an unchecked slice
+                 -> thread 'consensus::log::tests_log::a_node_list_claiming_more_entries_than_the_record_holds_is_refused_rather_than_allocated_for' (17091782) panicked at src/consensus/log.rs:1270:23:
+KILLED           the Timestamp column tag drifts from the wal's
+                 -> assertion `left == right` failed: this module encodes Timestamp as [7] and the wal encodes it as [6] | left: [7] | right: [6]
+KILLED           a frame is served without checking the position the index claims
+                 -> thread 'consensus::log::tests_log::a_frame_is_cross_checked_against_the_position_the_index_says_it_holds' (17117991) panicked at src/consensus/tests_log.rs:795:5:
