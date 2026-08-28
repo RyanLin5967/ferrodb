@@ -1191,7 +1191,19 @@ fn a_directory_component_symlink_redirects_the_key_with_every_checked_directory_
     // The one directory the attacker can write. Every OTHER directory stays 0700.
     chmod(&root.path().join("b"), 0o777);
 
-    let honest = Key::load(&configured).expect("all checked directories are 0700, so it loads");
+    // `b` holds the name `dl`, which is part of the resolution. A walk over every COMPONENT
+    // refuses here; one over the final name of each hop does not.
+    let honest = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the directory holding the dir-component link: {e}");
+            assert!(
+                e.to_string().contains("/b,") && e.to_string().contains("0777"),
+                "refused, but not for `b`: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
     assert_eq!(identify(&honest, &[("real", REAL), ("old", OLD)]), "real");
 
     // The attacker's entire move: repoint the DIRECTORY symlink. No key is authored, nothing is
@@ -1212,4 +1224,74 @@ fn a_directory_component_symlink_redirects_the_key_with_every_checked_directory_
          directory the walk checked was 0700 -- the directory holding that name is never checked",
     );
     assert!(err.to_string().contains("writable by group or other"), "{err}");
+}
+
+// =============================================================================================
+// J. The cost of dropping the ancestry limit, measured against real layouts
+// =============================================================================================
+
+/// **A second opinion, asked for: which ordinary layouts does "any ancestor" now refuse?**
+///
+/// Measured on this machine: `/opt/homebrew/etc` is `drwxrwxr-x idide:admin` -- group-writable and
+/// not sticky. That is the stock Homebrew config directory on Apple Silicon, and `/usr/local` is
+/// the same shape on Intel. A key at `<prefix>/etc/ferrodb/cluster.key` sits in a directory the
+/// operator made at 0755, so the immediate-parent rule accepted it; the ancestor rule does not.
+///
+/// The refusal is CORRECT -- anyone in `admin` can rename the whole `ferrodb` directory and swap
+/// the key. It is recorded here because it is common, not because it is wrong.
+#[test]
+fn the_ancestor_rule_refuses_a_stock_homebrew_layout() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o755);
+
+    // /opt/homebrew           drwxr-xr-x
+    // /opt/homebrew/etc       drwxrwxr-x   <- stock Homebrew, group-writable
+    // /opt/homebrew/etc/ferrodb  drwxr-xr-x  <- the operator's own directory
+    let prefix = root.path().join("homebrew");
+    let etc = prefix.join("etc");
+    let app = etc.join("ferrodb");
+    std::fs::create_dir_all(&app).unwrap();
+    let key = write_key(&app, "cluster.key");
+    chmod(&app, 0o755);
+    chmod(&etc, 0o775);
+    chmod(&prefix, 0o755);
+
+    let verdict = Key::load(&key);
+    match &verdict {
+        Ok(_) => println!("loads: only the immediate parent is inspected"),
+        Err(e) => println!("refused: {e}"),
+    }
+    let err = verdict.err().expect("the ancestor rule is what this test is about");
+    assert!(err.to_string().contains("0775"), "the offending mode must be named: {err}");
+    // The directory named is an ANCESTOR, not the key's own directory. An operator reading this
+    // is being told to chmod something their package manager owns and will reset.
+    assert!(
+        err.to_string().contains("etc") && !err.to_string().contains("ferrodb,"),
+        "the error names the ancestor rather than the key's own directory: {err}"
+    );
+}
+
+/// The layouts that must keep working, so the rule above is not mistaken for "refuses everything".
+#[test]
+fn the_ancestor_rule_still_accepts_the_ordinary_layouts() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o755);
+    for (name, modes) in [
+        ("etc-style 0755 all the way down", [0o755u32, 0o755, 0o700]),
+        ("a private tree", [0o700, 0o700, 0o700]),
+        ("group-readable but not writable", [0o755, 0o750, 0o750]),
+        ("sticky shared parent", [0o1777, 0o755, 0o755]),
+    ] {
+        let a = root.path().join(name.replace(' ', "_"));
+        let b = a.join("mid");
+        let c = b.join("app");
+        std::fs::create_dir_all(&c).unwrap();
+        let key = write_key(&c, "cluster.key");
+        chmod(&c, modes[2]);
+        chmod(&b, modes[1]);
+        chmod(&a, modes[0]);
+        let r = Key::load(&key);
+        println!("  {name:<34} {modes:?} -> {}", if r.is_ok() { "loads".into() } else { format!("REFUSED: {}", r.as_ref().err().unwrap()) });
+        r.unwrap_or_else(|e| panic!("PROBE HIT: {name} is an ordinary layout and must load: {e}"));
+    }
 }
