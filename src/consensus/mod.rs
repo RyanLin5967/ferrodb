@@ -48,6 +48,10 @@ pub mod config;
 pub mod election;
 pub mod log;
 pub mod membership;
+/// The driver: the clock, the socket and the disk. `Consensus` performs none of the three, so
+/// nothing runs the state machine without this. Declared here because a module `mod.rs` does not
+/// name is not compiled at all.
+pub mod node;
 pub mod replicate;
 pub mod signing;
 /// F8 -- the deterministic simulator. Declared here because a module that `mod.rs` does not name is

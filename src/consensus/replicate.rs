@@ -65,7 +65,9 @@
 //! [`Consensus::init_leader_progress`] to (re)initialise per-peer state; it preserves the log.
 
 use super::config::Config;
-use super::{Action, Body, BranchOp, Command, Consensus, Entry, Message, NodeId, Role, Round, Term};
+use super::{
+    Action, Body, BranchOp, Command, Consensus, Entry, HardState, Message, NodeId, Role, Round, Term,
+};
 use crate::catalog::column::DataType;
 use crate::error::FerroError;
 use crate::wal::log::{ColumnAlteration, DdlOp};
@@ -422,6 +424,66 @@ impl Consensus {
                 );
             }
         }
+    }
+
+    /// Restore a node's durable state on start, before any event is stepped.
+    ///
+    /// The driver (`node.rs`) owns the disk; this is the one seam through which what it read gets
+    /// back into the state machine. It exists because `LogTail` is private to this module — the
+    /// node cannot rebuild the tail itself without also owning the digest chain, and two places
+    /// computing that chain is how they come to disagree.
+    ///
+    /// **This is not a general setter.** It is only sound on a freshly constructed `Consensus`,
+    /// which is asserted rather than documented: applying it to a running node would install a log
+    /// under live `progress` entries that describe a different one.
+    ///
+    /// `voted_for` is restored with the term, and that is the whole point of the hard state: a node
+    /// that comes back having forgotten its vote can vote twice in one term, electing two leaders
+    /// of that term.
+    pub(crate) fn restore(
+        &mut self,
+        hard: HardState,
+        snapshot_round: Round,
+        snapshot_term: Term,
+        entries: Vec<Entry>,
+    ) {
+        assert!(
+            self.role == Role::Follower && self.last_round == 0 && self.snapshot_round == 0,
+            "restore() is only sound on a freshly constructed Consensus; node {:?} is {:?} at \
+             round {} with snapshot floor {}",
+            self.self_id,
+            self.role,
+            self.last_round,
+            self.snapshot_round
+        );
+
+        self.hard = hard;
+        self.snapshot_round = snapshot_round;
+        self.snapshot_term = snapshot_term;
+        self.last_round = snapshot_round;
+        self.last_term = snapshot_term;
+
+        // The floor is where the log starts, so the tail is rebased there before anything is
+        // pushed. `base_digest` is 0 because no snapshot is installed (F6): a zero digest means
+        // "not claiming anything below me", which is what `AppendResp` already reads it as.
+        let tail = self.progress.entry(self.self_id).or_default();
+        tail.own_log = Some(LogTail::rebased(snapshot_round, 0));
+
+        for e in entries {
+            if e.round <= snapshot_round {
+                continue;
+            }
+            let (term, round) = (e.term, e.round);
+            self.tail_mut().push(e);
+            self.last_term = term;
+            self.last_round = round;
+        }
+
+        // Everything on this node's disk is by definition durable. `commit` deliberately stays at
+        // zero: durability is a local fact, and whether a round was COMMITTED is a fact about a
+        // quorum that only a leader's `Append` can re-establish. Restoring a commit index from
+        // local disk is how a node applies a round the cluster later truncated.
+        self.durable = self.last_round;
     }
 
     /// The highest round this node's log is confirmed to agree with its current leader's.
