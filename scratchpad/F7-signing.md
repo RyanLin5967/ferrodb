@@ -303,6 +303,37 @@ inside the argument. So the read returned an empty string and the file was rewri
 Recorded here rather than quietly fixed because it is the same class as the earlier harness bug: an
 edit that assumes it is the only thing touching a file, when it is not — in this case, itself.
 
+## The ancestry rule's cost, measured rather than argued
+
+The change to inspect every ancestor is the one I most wanted a second opinion on, and the reviewer
+gave a measurement instead of one. On this machine `/opt/homebrew/etc` is `drwxrwxr-x idide:admin` —
+group-writable and not sticky — so a key at `<prefix>/etc/ferrodb/cluster.key` is refused even
+though the operator made its own directory `0755`. `/usr/local` has the same shape on Intel Macs.
+
+Their judgement, which I took: **keep the rule, fix the message.** The refusal is correct — anyone
+in `admin` can rename the `ferrodb` directory and swap the key, which the old
+immediate-parent-only rule was quietly accepting. What was wrong was the advice. It said
+`chmod go-w /opt/homebrew/etc`, naming a directory a package manager owns and resets on its next
+operation, and nothing in the text told the operator the problem was three levels above their key
+rather than in it. **A security refusal an operator cannot act on is one they work around.**
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M23 | Every refusal uses the immediate-parent wording | `an_ancestor_refusal_does_not_tell_the_operator_to_chmod_somebody_elses_directory` | `it must say the offender is an ancestor: io error: the directory holding the consensus signing key, .../homebrew/etc, has mode 0775 ...` |
+
+The reviewer also confirmed the rule does not refuse the ordinary layouts: `0755` all the way down,
+a private tree, a group-readable-but-not-writable parent, and a sticky shared parent all still load.
+
+## The final mutant tally
+
+Twenty-three fired. **Twenty killed** by the test named against each. **Two survived**, and both are
+recorded above rather than quietly re-aimed: M20 showed a cycle test was passing for the wrong
+reason (renamed, and it now pins the real cause), and M22 showed a line of code was redundant (the
+line was deleted). **One — M13 — has no deterministic test in this suite**: the reviewer demonstrated
+the branch is reachable by racing a rename, at a measured 320–402 hits per 50,000 iterations against
+the fixed code, but a test that needs a race to land is not one this suite will carry. The branch
+refuses; the claim that it is *detected* is not made.
+
 ## A misattribution of the reviewer's work, corrected
 
 Twice I told the reviewer they had measured an old commit. Once that was true. Once it was not:
