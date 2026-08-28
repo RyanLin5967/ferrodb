@@ -88,6 +88,18 @@
 //!   write to as fast as the network allows, so a forgery probability of 2^-64 *per attempt* is a
 //!   budget, not a bound. A 256-bit tag costs 32 bytes on a frame whose limit is 8 MiB.
 //!
+//! # Two key files can be one key, which matters when rotating
+//!
+//! Consequences of RFC 2104's key preparation, not defects, but an operator changing a key should
+//! know them because neither is a change:
+//!
+//! * **A key and the same key zero-padded to at most 64 bytes are the same key.** Appending NULs to
+//!   a 32-byte key file mints identical tags, and each file verifies the other's frames. (A
+//!   trailing *newline* is not in this class — `0x0a` is not padding.)
+//! * **A key longer than 64 bytes and its own SHA-256 are the same key**, because that is exactly
+//!   the substitution RFC 2104 specifies for an over-long key. Exactly 64 bytes is not in the class;
+//!   the rule is strictly greater than the block.
+//!
 //! # The key file
 //!
 //! Read from a **file**, never from a command-line value: an argument is in the process list, which
@@ -357,6 +369,32 @@ impl Key {
     /// never reaches this process's memory.
     pub fn load_with(path: impl AsRef<Path>, check: PermissionCheck) -> Result<Key, FerroError> {
         let path = path.as_ref();
+        // **The shape is checked by NAME, before the file is opened.** Not redundant with the
+        // `is_file` on the descriptor below, and not a security check: opening a FIFO for reading
+        // **blocks until a writer appears**, so a node configured with a FIFO as its key path hung
+        // at startup for ever instead of refusing — found by an adversarial pass. `is_file()` on
+        // the descriptor cannot help, because control never reaches it.
+        //
+        // The race between this lookup and the open below does not matter, precisely because this
+        // is a shape check: the authoritative mode check is still `fstat` on the descriptor, and
+        // that descriptor's own `is_file` is kept below so the name-based answer is never trusted
+        // on its own. `fs::metadata` follows symlinks, so a link to a FIFO is caught here too.
+        let shape = fs::metadata(path).map_err(|e| {
+            FerroError::Io(format!(
+                "the consensus signing key at {} could not be inspected: {e}. A node configured to \
+                 sign its traffic and unable to load its key refuses to start rather than falling \
+                 back to sending unsigned frames",
+                path.display()
+            ))
+        })?;
+        if !shape.is_file() {
+            return Err(FerroError::Io(format!(
+                "{} is not a regular file, so it cannot be a signing key. Refused here, by name, \
+                 rather than after opening it: a FIFO blocks its opener until a writer appears, so \
+                 a node pointed at one would hang at startup instead of telling anybody why.",
+                path.display()
+            )));
+        }
         let mut file = fs::File::open(path).map_err(|e| {
             FerroError::Io(format!(
                 "the consensus signing key at {} could not be opened: {e}. A node configured to \
@@ -385,6 +423,30 @@ impl Key {
         file.read_to_end(&mut bytes).map_err(|e| {
             FerroError::Io(format!("the consensus signing key at {} could not be read: {e}", path.display()))
         })?;
+        // **A file of zeros is what a failed generator leaves behind, and it passes every other
+        // rule here.** `truncate -s 32 cluster.key`, a sparse copy, or a script that wrote nothing
+        // and exited 0 all produce a file of exactly the right length holding a key nobody chose —
+        // and every node given it agrees with every other, so the cluster comes up and looks
+        // healthy. Found by an adversarial pass. Refused, for the same reason a run that collected
+        // nothing has not passed.
+        //
+        // **The limit of this check, stated rather than implied:** it is a "the generator produced
+        // nothing" test, not an entropy test. A key of 32 identical `0xff` bytes, or a passphrase
+        // somebody typed, is accepted. Judging randomness is not something this can do, and a check
+        // that pretended to would be worse than one that says what it is.
+        if !bytes.is_empty() && bytes.iter().all(|b| *b == 0) {
+            let n = bytes.len();
+            let mut bytes = bytes;
+            wipe(&mut bytes);
+            return Err(FerroError::Io(format!(
+                "the consensus signing key at {} is {n} zero bytes. That is not a key — it is what \
+                 `truncate`, a sparse copy, or a generator that wrote nothing and exited 0 leaves \
+                 behind, and its length alone cannot tell it from a real one. Generate one with \
+                 `head -c 32 /dev/urandom > {}`",
+                path.display(),
+                path.display()
+            )));
+        }
         if bytes.len() < MIN_KEY_BYTES {
             // The length is named; the bytes are not, here or anywhere else in this module.
             let n = bytes.len();

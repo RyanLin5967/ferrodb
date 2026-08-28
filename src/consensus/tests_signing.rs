@@ -444,6 +444,65 @@ fn a_key_file_under_thirty_two_bytes_is_refused() {
 }
 
 #[test]
+fn a_key_file_of_zeros_is_refused_because_that_is_what_a_failed_generator_leaves() {
+    // **Found by an adversarial pass, and the length rule alone could not see it.** A file of
+    // exactly 32 zero bytes is what `truncate -s 32`, a sparse copy, or a key-generation script
+    // that wrote nothing and exited 0 leaves behind. It passes every other check here, and every
+    // node given it agrees with every other one — so the cluster comes up, signs, verifies, and
+    // looks healthy while its key is a value nobody chose and anybody can guess.
+    let dir = tempfile::tempdir().unwrap();
+    for n in [32usize, 33, 64, 100] {
+        let p = write_key_file(dir.path(), &format!("z{n}"), &vec![0u8; n]);
+        let err = load_for_rule_under_test(&p)
+            .err()
+            .unwrap_or_else(|| panic!("a {n}-byte file of zeros must be refused"));
+        let text = err.to_string();
+        assert!(text.contains("zero bytes"), "the error must name what it saw: {text}");
+        assert!(text.contains("/dev/urandom"), "the error must name the fix: {text}");
+    }
+
+    // The anti-vacuity half: one non-zero byte anywhere makes it a key again, so this rule refuses
+    // the failed-generator shape and not "keys that contain zeros".
+    for at in [0usize, 1, 16, 31] {
+        let mut bytes = vec![0u8; 32];
+        bytes[at] = 1;
+        let p = write_key_file(dir.path(), &format!("nz{at}"), &bytes);
+        load_for_rule_under_test(&p)
+            .unwrap_or_else(|e| panic!("a key with a non-zero byte at {at} must load: {e}"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_as_a_key_is_refused_rather_than_hanging_the_node() {
+    // **Found by an adversarial pass.** Opening a FIFO for reading blocks until a writer appears,
+    // so a node configured with one as its key path used to hang at startup for ever — the
+    // `is_file()` check sat on the descriptor, and control never reached it. Refusing by name
+    // before the open is what makes this a refusal instead of a silent hang.
+    //
+    // The test would hang rather than fail if the rule were removed, so it carries its own
+    // deadline: the load runs on a thread and this asserts it finished. A test that hangs is a CI
+    // job that times out with no message, which is barely better than the bug.
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("k");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable to test this");
+    assert!(status.success(), "mkfifo failed");
+
+    let p = fifo.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Key::load(&p).is_err());
+    });
+    let refused = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("Key::load blocked on a FIFO instead of refusing it — a node pointed at one hangs");
+    assert!(refused, "a FIFO is not a regular file and must be refused");
+}
+
+#[test]
 fn a_missing_key_file_is_refused_rather_than_leaving_the_node_unsigned() {
     let dir = tempfile::tempdir().unwrap();
     let err = load_for_rule_under_test(&dir.path().join("nothing-here")).expect_err("must refuse");
