@@ -116,18 +116,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # --user on the runners' system python. A venv would need every later step to activate it,
-          # and the tests shell out to a bare `python3`.
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user asyncpg pg8000
-          # ASSERT THE IMPORT, not the install. `pip install` reporting success and the module being
-          # importable are different facts: a --user install goes somewhere `python3` may not search,
-          # and the failure then arrives inside cargo test as the same ModuleNotFoundError this step
-          # was added to prevent. Name it here instead.
+          # A VENV, not `pip install --user`. The first version of this step used --user and failed
+          # on the macOS runner with `error: externally-managed-environment` (PEP 668): that image's
+          # python3 is managed by Homebrew and refuses to have packages installed into it.
+          #
+          # The obvious escape is --break-system-packages. Not used: it works by switching off a
+          # safety mechanism, and the name is accurate about what it does. A venv gets the same
+          # result by not fighting the system installer at all, and behaves identically on all three
+          # runners rather than needing a per-platform branch.
+          #
+          # The venv's bin directory goes on GITHUB_PATH because the tests shell out to a BARE
+          # `python3` (`Command::new("python3")` in tests/integration_pgwire.rs), so what matters is
+          # which python3 later steps resolve — not which interpreter ran pip here.
+          python3 -m venv "$RUNNER_TEMP/pgdrivers"
+          # Windows venvs put executables in Scripts/, every other platform in bin/.
+          if [ -d "$RUNNER_TEMP/pgdrivers/Scripts" ]; then
+            VBIN="$RUNNER_TEMP/pgdrivers/Scripts"
+          else
+            VBIN="$RUNNER_TEMP/pgdrivers/bin"
+          fi
+          "$VBIN/python" -m pip install --upgrade pip
+          "$VBIN/python" -m pip install asyncpg pg8000
+          # A Windows venv creates python.exe but not always python3.exe, and the tests ask for
+          # `python3` by name. Provide it rather than discover the gap as a "program not found" three
+          # steps later.
+          if [ ! -e "$VBIN/python3" ] && [ ! -e "$VBIN/python3.exe" ]; then
+            cp "$VBIN/python.exe" "$VBIN/python3.exe" 2>/dev/null \
+              || ln -s "$VBIN/python" "$VBIN/python3" 2>/dev/null \
+              || { echo "cannot provide a python3 in $VBIN" >&2; exit 1; }
+          fi
+          echo "$VBIN" >> "$GITHUB_PATH"
+
+      # Separate step, so the assertion runs against the PATH the TESTS will see. GITHUB_PATH only
+      # takes effect for SUBSEQUENT steps, so asserting inside the step above would check the old
+      # PATH and pass while the tests still failed - which is the exact shape of check this file
+      # keeps warning about.
+      - name: Verify the wire drivers are importable by the python3 the tests invoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "python3 is $(command -v python3)"
           for m in asyncpg pg8000; do
-            python3 -c "import $m; print('$m', $m.__version__ if hasattr($m,'__version__') else 'ok')" || {
-              echo "$m installed but is not importable by the python3 the tests invoke." >&2
-              echo "python3 is $(command -v python3); sys.path follows:" >&2
+            python3 -c "import $m; print('$m ok')" || {
+              echo "$m is not importable by the python3 on PATH." >&2
               python3 -c "import sys; print('\n'.join(sys.path))" >&2
               exit 1
             }
