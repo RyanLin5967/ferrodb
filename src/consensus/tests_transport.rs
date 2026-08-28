@@ -1408,10 +1408,24 @@ fn a_configuration_naming_more_nodes_than_the_wire_allows_is_refused_before_any_
     // this frame costs nothing at all. The body being far too short to hold the claim is the point.
     b.extend_from_slice(&1_000_000u32.to_be_bytes());
 
+    // The FRAME budget fires first for a claim this large, and that is the outer of two guards.
     let e = decode(&b).unwrap_err();
     assert!(
-        format!("{e}").contains("over the") && format!("{e}").contains("limit"),
-        "a million-member configuration was not refused by the node cap: {e}"
+        format!("{e}").contains("budget is left"),
+        "a million-member configuration was not refused by the frame budget: {e}"
+    );
+
+    // **The inner guard, tested separately.** A count between MAX_CONFIG_NODES and the frame budget
+    // passes the outer one and must still be refused: 2000 nodes is under the 4096-id frame budget
+    // and over the 1024-node per-configuration cap. Without this case the per-config cap has no
+    // detector at all, because the frame budget shadows it for every larger number.
+    assert!(MAX_CONFIG_NODES < 2000 && 2000 < MAX_FRAME_CONFIG_NODES, "the two caps no longer straddle 2000");
+    let mut b2 = b[..b.len() - 4].to_vec();
+    b2.extend_from_slice(&2000u32.to_be_bytes());
+    let e2 = decode(&b2).unwrap_err();
+    assert!(
+        format!("{e2}").contains("over the") && format!("{e2}").contains("limit"),
+        "a 2000-member configuration was not refused by the per-configuration cap: {e2}"
     );
 
     // Anti-vacuity: a configuration at the cap is legal and decodes, so the refusal is about the
@@ -1997,4 +2011,80 @@ fn the_spawn_failure_teardown_actually_stops_the_threads_it_is_given() {
     stop_started(&stop, &[Arc::clone(&ob)], vec![h]);
     assert!(stop.load(Ordering::SeqCst), "the teardown did not raise the stop flag");
     assert!(ob.state.lock().unwrap().stopped, "the teardown did not stop the outbox");
+}
+
+
+#[test]
+fn one_frame_cannot_spend_more_config_nodes_than_its_whole_budget() {
+    // **The finding the per-configuration cap did NOT close.** `Config::with_learners` retains
+    // learners with `Vec::contains` (config.rs, not this row's file), so a configuration of n ids
+    // costs ~(n/2)^2 comparisons however this file validates it. Capping ONE configuration at 1024
+    // therefore bounds nothing about a frame carrying a thousand of them: measured, an 8 MiB Append
+    // holds ~1018 max-size configs, and 1018 * 1024 * 1024 is 1.07e9 comparisons for one frame.
+    //
+    // So the budget is per FRAME. Five configurations of 1024 members each is 5120 ids against a
+    // 4096 budget: the first four fit, the fifth must be refused.
+    let per_cfg = MAX_CONFIG_NODES as u32;
+    let mut b = Vec::new();
+    b.extend_from_slice(&1u32.to_be_bytes()); // from
+    b.extend_from_slice(&2u32.to_be_bytes()); // to
+    b.extend_from_slice(&1u64.to_be_bytes()); // term
+    b.push(4); // Append
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&5u32.to_be_bytes()); // five entries
+    for e in 0..5u64 {
+        b.extend_from_slice(&1u64.to_be_bytes()); // entry term
+        b.extend_from_slice(&(e + 1).to_be_bytes()); // entry round
+        b.push(7); // Membership
+        b.extend_from_slice(&1u64.to_be_bytes()); // config version
+        b.extend_from_slice(&1u64.to_be_bytes()); // config term
+        b.extend_from_slice(&per_cfg.to_be_bytes()); // members
+        for i in 1..=per_cfg {
+            b.extend_from_slice(&i.to_be_bytes());
+        }
+        b.extend_from_slice(&0u32.to_be_bytes()); // no learners
+    }
+
+    let e = decode(&b).unwrap_err();
+    assert!(
+        format!("{e}").contains("budget is left"),
+        "five max-size configurations in one frame were accepted, so the cap still bounds only \
+         each configuration and not the frame: {e}"
+    );
+    // Named in the failure so a reader knows WHICH entry exhausted it, not merely that something did.
+    assert!(format!("{e}").contains("entry 4 of 5"), "the refusal does not say where: {e}");
+
+    // Anti-vacuity: four of them fit exactly (4 * 1024 == 4096), so the refusal is about crossing
+    // the budget and not about multiple configurations being disallowed.
+    let mut ok = Vec::new();
+    ok.extend_from_slice(&1u32.to_be_bytes());
+    ok.extend_from_slice(&2u32.to_be_bytes());
+    ok.extend_from_slice(&1u64.to_be_bytes());
+    ok.push(4);
+    ok.extend_from_slice(&0u64.to_be_bytes());
+    ok.extend_from_slice(&0u64.to_be_bytes());
+    ok.extend_from_slice(&0u64.to_be_bytes());
+    ok.extend_from_slice(&4u32.to_be_bytes());
+    for e in 0..4u64 {
+        ok.extend_from_slice(&1u64.to_be_bytes());
+        ok.extend_from_slice(&(e + 1).to_be_bytes());
+        ok.push(7);
+        ok.extend_from_slice(&1u64.to_be_bytes());
+        ok.extend_from_slice(&1u64.to_be_bytes());
+        ok.extend_from_slice(&per_cfg.to_be_bytes());
+        for i in 1..=per_cfg {
+            ok.extend_from_slice(&i.to_be_bytes());
+        }
+        ok.extend_from_slice(&0u32.to_be_bytes());
+    }
+    assert_eq!(
+        MAX_CONFIG_NODES * 4,
+        MAX_FRAME_CONFIG_NODES,
+        "this test's arithmetic depends on four max-size configurations exactly filling the budget"
+    );
+    let m = decode(&ok).expect("four configurations totalling exactly the budget must decode");
+    let Body::Append { entries, .. } = &m.body else { panic!("shape changed") };
+    assert_eq!(entries.len(), 4);
 }
