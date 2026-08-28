@@ -192,6 +192,51 @@ fn a_key_longer_than_the_block_is_replaced_by_its_own_digest() {
 }
 
 #[test]
+fn key_tag_agrees_with_an_independent_hmac_over_the_same_bytes() {
+    // **The whole tag, cross-checked against something that is not this crate.**
+    //
+    // Everything else about `Key::tag` is a relation between two values this file computed:
+    // `hashing_the_pieces_is_hashing_their_join` proves the streamed form equals the joined form,
+    // but both sides of that are ferrodb's own SHA-256, so a bug shared by both would satisfy it.
+    // `hmac_sha256_agrees_with_rfc_4231` pins the primitive against published vectors, but says
+    // nothing about the domain prefix or about how `Key::tag` assembles its input.
+    //
+    // These digests come from CPython's `hmac`/`hashlib` — OpenSSL's — computed over the exact
+    // byte string `DOMAIN || body`:
+    //
+    //     python3 -c "import hmac,hashlib
+    //     D=b'ferrodb/consensus/mac/1\x00C\x02'
+    //     k=bytes(((i*7)+60)%256 for i in range(32))
+    //     b=bytes(i%251 for i in range(N))
+    //     print(hmac.new(k, D+b, hashlib.sha256).hexdigest())"
+    //
+    // The lengths straddle SHA-256's 64-byte block, which is where a streaming bug in the
+    // multi-part update would live: 63/64/65 and 127/128/129 sit either side of the two boundaries
+    // the domain prefix shifts the body across.
+    let k = Key::from_bytes_for_test(key_bytes(60)).unwrap();
+    assert_eq!(
+        to_hex(&key_bytes(60)),
+        "3c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e15",
+        "the key these digests were computed over"
+    );
+    let cases: [(usize, &str); 9] = [
+        (0, "34f5383437fb09372131512f63085339f6bb0bfb159695f4a3106ec7e481e2a5"),
+        (37, "bec233790ac961983893581f26bb79402a50744e722813526aa7a37d9ff9d554"),
+        (63, "56ab9acacd305cc2bdae3db02d022a1b8b4a932281a935603c8de45bd28d616e"),
+        (64, "5ac6bd970f7810de6d4832752f37b3c99c5d258fc55f2de24fe36ea7c255bdb9"),
+        (65, "4e8b7ca6dabfc97fbd5683227a637e6236503539522ed976c7173c8dffe49ce3"),
+        (127, "c6fd98b74c706dfdbda90ce1f9cc3159c17955c9e6eab001d67e6a9c7be4a97b"),
+        (128, "39a6aaadba03ad5e996325ef97f1da4acf54872c1cefaf0d9e5ecddabd9dbec6"),
+        (129, "7af0fe1ecea97284327d56335d4f89268c495b2f043430bf183c3dd46b4f03e5"),
+        (1000, "8178b27652b8109ecc637879db92e879720413766433435f5c86dbf8be0b164e"),
+    ];
+    for (n, want) in cases {
+        let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        assert_eq!(to_hex(&k.tag(&body)), want, "Key::tag over a {n}-byte body");
+    }
+}
+
+#[test]
 fn hashing_the_pieces_is_hashing_their_join() {
     // `Key::tag` streams `DOMAIN` and then the body into one hash rather than joining them, to
     // avoid copying the whole frame on every sign and every verify. This is the assertion that the
@@ -521,15 +566,15 @@ fn a_key_whose_directory_is_gone_is_refused() {
     // What this proves: the disappearance of the key's directory produces a refusal and never an
     // `Ok`. The refusal comes from the `File::open`, which is the first thing that fails.
     //
-    // **Stated blind spot, because it shaped the code.** The other half of the same defect — the
-    // directory `stat` itself failing — was `if let Ok(dmeta) = fs::metadata(dir)`, which fell
-    // through to "allowed", and it is now a refusal. That branch has **no killing test and cannot
-    // have one here**: `File::open` has already resolved the path by the time the directory is
-    // stat'd, so every way to make the stat fail also makes the open fail, and the open reports
-    // first. The only remaining route is a genuine race — the directory removed between the two
-    // calls — which a test cannot schedule. So the change is a refuse-by-default posture rather
-    // than a detected rule, and it is recorded as such in `scratchpad/F7-signing.md` rather than
-    // counted as a mutant that was killed.
+    // **A claim that was made here and was wrong, corrected rather than quietly dropped.** This
+    // comment used to say the other half of the same defect — the directory `stat` failing and
+    // falling through to "allowed" — could have no killing test, on the argument that `File::open`
+    // resolves the path first so anything breaking the stat breaks the open. An adversarial pass
+    // refuted that by *racing* it: renaming the parent directory back and forth in a second thread
+    // while loading a 0600 key from a 0777 directory produced **46,895 successful loads** of a key
+    // the rule refuses. The branch is reachable; a deterministic test for it is what is missing,
+    // not the reachability. `signing.rs` now refuses there, and the reversal is logged in
+    // `scratchpad/F7-signing.md` beside the original claim.
     let outer = tempfile::tempdir().unwrap();
     let inner = outer.path().join("gone");
     std::fs::create_dir(&inner).unwrap();
