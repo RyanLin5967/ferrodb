@@ -346,6 +346,36 @@ is required not to. It is correctly insensitive to M24 now (it never dials), and
 inbound path instead — makes its positive control fire, which is the evidence that the control is
 real rather than decorative.
 
+## The one red mark in the suite, and why it is not this row's
+
+`integration_base_backup::synchronous_commit_waits_for_a_replica_and_says_so_when_there_is_none`
+failed twice during full-suite runs of this branch. **Settled by measurement rather than by
+argument**, because "it looks unrelated" is exactly the claim that should not be taken on trust.
+
+Instrument: a fresh worktree at `af77d8a` — the commit immediately before any F7 work — examples
+rebuilt, then the target run three times while the agent fleet and this branch's suite loaded the
+machine.
+
+```text
+baseline af77d8a run 1: FAILED. 4 passed; 1 failed;  finished in 215.92s
+baseline af77d8a run 2: ok.     5 passed; 0 failed;  finished in  23.19s
+baseline af77d8a run 3: ok.     5 passed; 0 failed;  finished in  23.21s
+```
+
+Same failure mode as on this branch: `examples/repl_replica.rs:118` gets `ConnectionRefused`, and
+the test's own diagnostic reports the primary's status as `Some(ExitStatus(0))` — it had already
+exited. A process race between the primary exiting and the replica dialling it, which widens under
+contention: 216 seconds of wall clock for the same five tests against 23.
+
+Corroborating structurally, though the measurement is what settles it: this row's diff is six files
+— `PROGRESS.md`, `scratchpad/F7-signing.md`, and `src/consensus/{node,signing,tests_signing,
+transport}.rs`. Nothing in `src/replication/`, nothing in `examples/`, nothing in `tests/`. The
+failing test drives `examples/repl_primary.rs` and `examples/repl_replica.rs` over
+`src/replication/`, none of which this row can reach.
+
+It is a real flake in the existing suite and worth someone's attention; it is not F7's, and it is
+not fixed here.
+
 ## The final mutant tally
 
 Twenty-five fired. **Twenty-two killed** by the test named against each. **Two survived**, and both are
