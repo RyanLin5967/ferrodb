@@ -336,6 +336,122 @@ pub fn conform_row(values: &[Value], from: &Schema, to: &Schema) -> Result<Vec<V
     Ok(out)
 }
 
+/// Everything a chain of alterations on one table has decided, with nothing yet written.
+///
+/// # Why a plan exists, and why it holds a SEQUENCE rather than one action
+///
+/// [`Catalog::alter_table`] was already two halves — decide everything the data can refuse, then
+/// write — and [`prepare_rewrite`]'s header argues at length why that split is the whole safety
+/// property rather than an optimisation: the rewrite is unlogged, so "refused" and "unchanged"
+/// have to be the same state rather than two states something has to reconcile afterwards.
+///
+/// That argument covers ONE alteration and says nothing whatsoever about several. A branch merged
+/// by `AgentRuntime::merge` carries however many schema edits its agent staged, and executing them
+/// one `alter_table` call at a time made each individually atomic and the group not atomic at all:
+/// an edit refused at position *k* left `1..k-1` installed in the catalog, flushed to disk and
+/// emitted to the change feed, by a statement that reported failure. E82. A plan is the same split
+/// raised to the group.
+///
+/// The chain is executed as a **single** pass over the heap, so no intermediate shape ever reaches
+/// the disk — but each step is still measured on its own (see [`prepare_rewrite`]), because the
+/// semantics being implemented are "these alterations, in this order", and collapsing them into
+/// one pass must not accept a chain that running the statements by hand would have refused.
+pub struct AlterPlan {
+    table: String,
+    /// The shape the heap on disk is written against, followed by the shape each action produces.
+    /// Always one longer than `actions`.
+    shapes: Vec<Schema>,
+    actions: Vec<AlterAction>,
+    /// Every tuple of the table, carried through the whole chain and serialized under the last
+    /// shape. Empty is a legitimate plan: a table with no rows.
+    prepared: Vec<Prepared>,
+    carried: Option<Vec<ColumnStats>>,
+    prov: Option<Arc<dyn ProvenanceStore>>,
+    dir_root: u32,
+    primary_root: u32,
+}
+
+impl AlterPlan {
+    /// The shape the table will have once this plan is applied — which is the shape any row
+    /// written after it has to be in.
+    pub fn final_shape(&self) -> &Schema {
+        self.shapes.last().expect("a plan always holds the shape it starts from")
+    }
+
+    /// The table this plan alters.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Each action paired with the shape it is applied **to**.
+    ///
+    /// That pairing is what `execution::executor::alteration_of` needs, and it is exactly what
+    /// stops existing the moment the plan is applied: a rename's old name and a retype's old type
+    /// live only in the shape before the action. A caller that logs the alterations reads them
+    /// from here rather than from the catalog, for the same reason `alter_table` returns the shape
+    /// it produced instead of letting the caller re-read it.
+    pub fn steps(&self) -> impl Iterator<Item = (&AlterAction, &Schema)> {
+        self.actions.iter().zip(self.shapes.iter())
+    }
+}
+
+/// Refuse a row that will not fit a page once it is written under `schema`.
+///
+/// **The second caller is the reason this is a function and not an expression inside
+/// [`prepare_rewrite`].** `AgentRuntime::merge` publishes a branch's rows into a table the same
+/// merge is altering, and "will this row fit the shape it is about to land in" is the identical
+/// question pass 1 asks about the rows already there. Asking it with a second copy of
+/// [`MAX_TUPLE_SIZE`] is how two answers to one question start to disagree.
+///
+/// `which` names the row for the message — the caller knows whether it has a key to quote.
+pub fn refuse_if_too_wide(
+    table: &str,
+    schema: &Schema,
+    values: &[Value],
+    which: &str,
+) -> Result<(), FerroError> {
+    let size = width_under(values, schema)?;
+    if size <= MAX_TUPLE_SIZE {
+        return Ok(());
+    }
+    Err(FerroError::Constraint(format!(
+        "this MERGE would publish a row into '{table}' that does not fit: {which} would occupy \
+         {size} bytes under the shape this merge leaves '{table}' in, past the {MAX_TUPLE_SIZE} \
+         bytes a tuple can occupy. Nothing has been written — the schema edits and the rows are \
+         decided together and refused together, because a merge that applied one without the \
+         other is exactly the half-applied state a merge exists to avoid."
+    )))
+}
+
+/// How many bytes `values` occupies once written under `schema`.
+///
+/// One definition of the measurement, so [`prepare_rewrite`] and [`refuse_if_too_wide`] cannot
+/// answer the same question two ways.
+fn width_under(values: &[Value], schema: &Schema) -> Result<usize, FerroError> {
+    Ok(Tuple::serialize(values, schema, 0)?.data.len())
+}
+
+/// **No transaction may be in flight while a table is rewritten in place.**
+///
+/// Checked next to the rewrite that depends on it rather than in the executor, where it would be
+/// one caller's discipline; see the module header for the two properties that rest on it. It is
+/// checked twice — once when a plan is made and again when one is applied — because the guard
+/// protects the rewrite, and between deciding and writing is exactly where a transaction that was
+/// not there before could appear.
+fn quiesce_guard(table: &str, txn: &TxnManager) -> Result<(), FerroError> {
+    let active = txn.read_snapshot().active;
+    if active.is_empty() {
+        return Ok(());
+    }
+    let mut ids: Vec<u64> = active.into_iter().collect();
+    ids.sort_unstable();
+    Err(FerroError::Txn(format!(
+        "ALTER TABLE rewrites '{table}' in place and cannot run while a transaction is open; {} \
+         still active: {ids:?}. COMMIT or ROLLBACK first.",
+        ids.len()
+    )))
+}
+
 impl Catalog {
     /// Apply one column-level change, returning the table's **full shape after it**.
     ///
@@ -344,6 +460,10 @@ impl Catalog {
     /// [`TxnManager::log_ddl`]). Returning it rather than making the caller re-read the catalog is
     /// deliberate: the caller must log exactly the shape that was applied, and two reads of a
     /// mutable catalog are two chances to log a different one.
+    ///
+    /// One alteration is the one-element case of [`Catalog::plan_alters`] and is executed as one,
+    /// so there is a single implementation of what an alteration refuses and a single
+    /// implementation of what it writes.
     pub fn alter_table(
         &mut self,
         table: &str,
@@ -351,30 +471,59 @@ impl Catalog {
         txn: &TxnManager,
         prov: Option<&Arc<dyn ProvenanceStore>>,
     ) -> Result<Vec<ColumnShape>, FerroError> {
-        // The quiesce guard. Checked here, next to the rewrite that depends on it, rather than in
-        // the executor where it would be one caller's discipline. See the module header for the
-        // two properties that rest on it.
-        let active = txn.read_snapshot().active;
-        if !active.is_empty() {
-            let mut ids: Vec<u64> = active.into_iter().collect();
-            ids.sort_unstable();
-            return Err(FerroError::Txn(format!(
-                "ALTER TABLE rewrites '{table}' in place and cannot run while a transaction is \
-                 open; {} still active: {ids:?}. COMMIT or ROLLBACK first.",
-                ids.len()
+        let plan = self.plan_alters(table, std::slice::from_ref(action), txn, prov)?;
+        let mut shapes = self.apply_plan(plan, txn)?;
+        shapes.pop().ok_or_else(|| {
+            FerroError::Internal(format!("a plan over one alteration of '{table}' produced no shape"))
+        })
+    }
+
+    /// **Decide a chain of alterations against `table`, and write nothing at all.**
+    ///
+    /// Every refusal any of `actions` can earn happens here, with the table exactly as it was: the
+    /// shape rules in [`resulting_schema`], the statistics conversion in [`carried_stats`], and
+    /// every data-dependent failure of the heap rewrite — including the row-width one that
+    /// [`prepare_rewrite`] exists for. [`Catalog::apply_plan`] then writes what this decided.
+    ///
+    /// `actions` are applied in order, each against the shape the one before it produces, so an
+    /// edit that only becomes illegal once its predecessor has landed is refused here rather than
+    /// half way through the group.
+    ///
+    /// Asking for a plan over no actions is refused rather than answered with an empty one. An
+    /// empty plan would still rewrite every tuple of the table for no change, and a caller with
+    /// nothing to do has to be able to tell that from a caller with something to do.
+    pub fn plan_alters(
+        &self,
+        table: &str,
+        actions: &[AlterAction],
+        txn: &TxnManager,
+        prov: Option<&Arc<dyn ProvenanceStore>>,
+    ) -> Result<AlterPlan, FerroError> {
+        if actions.is_empty() {
+            return Err(FerroError::Internal(format!(
+                "plan_alters was asked for a plan over no alterations of '{table}'; applying it \
+                 would rewrite every tuple of the table for no change. A caller with nothing to \
+                 do must not ask for a plan."
             )));
         }
+        quiesce_guard(table, txn)?;
 
         let entry = self.require_table(table)?;
         let old_schema = entry.schema.clone();
         let dir_root = entry.first_directory_page_id;
         let primary_root = entry.primary_index_root;
-        let indexes = entry.indexes.clone();
         let row_count = self.stats.get(table).map(|s| s.row_count).unwrap_or(0);
 
         // Every refusal lives in `resulting_schema`, shared with the branch path, so an agent is
-        // told at the moment it types the statement exactly what it would be told at merge.
-        let new_schema = resulting_schema(table, &old_schema, action, row_count)?;
+        // told at the moment it types the statement exactly what it would be told at merge — and
+        // it runs for EVERY action, against the shape the action before it produces, rather than
+        // for the first one only.
+        let mut shapes = vec![old_schema.clone()];
+        for action in actions {
+            let next = resulting_schema(table, shapes.last().unwrap(), action, row_count)?;
+            shapes.push(next);
+        }
+        let new_schema = shapes.last().unwrap().clone();
 
         // The statistics are carried across the alteration by [`carried_stats`], and they are
         // computed HERE, before the rewrite, rather than inside `finish` where they used to be.
@@ -382,102 +531,106 @@ impl Catalog {
         // it is a refusal that cannot leave the table as it was — the same defect as an unchecked
         // row width, one function further on. Every fallible step now happens while the heap is
         // still untouched.
+        //
+        // Computed from the first shape to the last rather than step by step, which is the same
+        // answer: an appended column is NULL under every later shape too, and a chain of widenings
+        // is itself a widening — `Integer -> BigInt -> Decimal` and `Integer -> Decimal` both take
+        // `Integer(5)` to `Decimal("5")`, through the same [`Widening`] table.
         let carried = carried_stats(&old_schema, &new_schema, self.stats.get(table))?;
 
-        match action {
-            AlterAction::RenameColumn { from, to } => {
-                // No heap work whatsoever. Column names are not in the tuple bytes — a column is
-                // found by its ordinal — so a rename is the one alteration that moves nothing.
-                let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
-                entry.schema = new_schema;
-                // An index records the column it covers by NAME (`IndexInfo.column_name`) and the
-                // planner re-resolves it to an ordinal with `position()` on every statement. Miss
-                // this and the index is not stale, it is unfindable: `open_table` turns the failed
-                // lookup into `KeyNotFound` and every query against the table stops working.
+        let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
+
+        // Reserve the space the relocations will need, before the first one happens.
+        //
+        // A row whose converted tuple no longer fits its page is relocated, and a relocation may
+        // have to allocate. `DiskManager::allocate` refuses once the table region below the
+        // copy-on-write arena floor is full — a real end-state, since the floor is fixed at
+        // `DEFAULT_ARENA_HEADROOM` when the database is created — and discovering that in the
+        // middle of the writing pass leaves rows converted under the old schema with no log to
+        // repair them. Asking for the space first turns it into a refusal: the worst this can
+        // leave behind is empty pages the heap's next insert will use, and no tuple has moved.
+        //
+        // Only rows that GREW are counted; a row that shrank or stayed the same is written in
+        // place. The count is bytes rather than pages because that is what the page directory
+        // reports, and it is aggregate rather than per-page — `reserve_free_space` says in its own
+        // words that fragmentation can still defeat it, which is why `HeapFileManager::update`
+        // also reserves each relocation's destination before freeing its source.
+        let growth: usize = prepared
+            .iter()
+            .filter(|p| p.tuple.data.len() > p.was)
+            .map(|p| p.tuple.data.len() + SLOT_ENTRY_SIZE)
+            .sum();
+        if growth > 0 {
+            HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
+        }
+
+        Ok(AlterPlan {
+            table: table.to_string(),
+            shapes,
+            actions: actions.to_vec(),
+            prepared,
+            carried,
+            prov: prov.cloned(),
+            dir_root,
+            primary_root,
+        })
+    }
+
+    /// **Execute a plan.** Returns the table's full shape after each of its actions, in order, so
+    /// a caller can log one DDL record per action carrying the shape that action produced.
+    ///
+    /// Everything the data could refuse was refused by [`Catalog::plan_alters`] while the heap was
+    /// still untouched. What is left here is the writing pass and the catalog install, and the
+    /// failures it can still meet are environmental — a buffer pool with no evictable frame, a
+    /// disk write that fails, a B+tree page that cannot be read. See [`prepare_rewrite`] for what
+    /// that boundary is and why the answer to crossing it is to log the rewrite rather than to
+    /// pretend it cannot happen.
+    pub fn apply_plan(
+        &mut self,
+        plan: AlterPlan,
+        txn: &TxnManager,
+    ) -> Result<Vec<Vec<ColumnShape>>, FerroError> {
+        // Re-checked at the moment of the rewrite rather than trusted from the plan: the guard is
+        // about what is in flight while tuples move, and a plan can be held across a statement.
+        quiesce_guard(&plan.table, txn)?;
+
+        let AlterPlan { table, shapes, actions, prepared, carried, prov, dir_root, primary_root } =
+            plan;
+        let primary_root_now =
+            commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
+
+        // An index records the column it covers by NAME (`IndexInfo.column_name`) and the planner
+        // re-resolves it to an ordinal with `position()` on every statement. Miss this and the
+        // index is not stale, it is unfindable: `open_table` turns the failed lookup into
+        // `KeyNotFound` and every query against the table stops working. Applied in the chain's
+        // own order, so `a -> b` followed by `b -> c` leaves the index covering `c`.
+        //
+        // Before `finish`, which is the `persist` both halves of the install ride on: two persists
+        // would be two chances to store one half of an alteration.
+        let renames: Vec<(&String, &String)> = actions
+            .iter()
+            .filter_map(|a| match a {
+                AlterAction::RenameColumn { from, to } => Some((from, to)),
+                _ => None,
+            })
+            .collect();
+        if !renames.is_empty() {
+            let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
+            for (from, to) in renames {
                 for ind in entry.indexes.iter_mut() {
                     if &ind.column_name == from {
                         ind.column_name = to.clone();
                     }
                 }
-                let shape = shape_of(&entry.schema);
-                self.persist()?;
-                Ok(shape)
-            }
-
-            AlterAction::AddColumn(_) => {
-                // Appended at the end, so every existing column keeps its ordinal — which is what
-                // every recorded `Op`, `Guard` and merge-policy key holds. The parser refuses any
-                // positional placement for the same reason.
-                let width = old_schema.columns.len();
-                let (_, primary_root_now) = rewrite_heap(
-                    &self.buffer_pool,
-                    table,
-                    dir_root,
-                    primary_root,
-                    &old_schema,
-                    &new_schema,
-                    prov,
-                    |values| {
-                        debug_assert_eq!(values.len(), width);
-                        values.push(Value::Null);
-                        Ok(())
-                    },
-                )?;
-                self.finish(table, new_schema, primary_root_now, carried)
-            }
-
-            AlterAction::RetypeColumn { column, to } => {
-                let idx = old_schema
-                    .columns
-                    .iter()
-                    .position(|c| &c.name == column)
-                    .ok_or_else(|| no_such_column(table, column, &old_schema))?;
-                let from = old_schema.columns[idx].data_type.clone();
-                // `resulting_schema` already refused every pair outside the allowlist, so this
-                // cannot be `None`; it is unwrapped through the same function rather than a second
-                // list so the two can never disagree about what is allowed.
-                let widening = Widening::of(&from, to).ok_or_else(|| {
-                    FerroError::Internal(format!(
-                        "resulting_schema allowed {from} -> {to} but Widening does not"
-                    ))
-                })?;
-
-                let (_, primary_root_now) = rewrite_heap(
-                    &self.buffer_pool,
-                    table,
-                    dir_root,
-                    primary_root,
-                    &old_schema,
-                    &new_schema,
-                    prov,
-                    |values| {
-                        values[idx] = widening.apply(&values[idx])?;
-                        Ok(())
-                    },
-                )?;
-
-                // **A secondary index over the retyped column is deliberately NOT rebuilt, and
-                // this reverses what an earlier version of this code did.**
-                //
-                // It rebuilt, on the stated grounds that `Value` orders by type rank so an
-                // `Integer` key and a `BigInt` key sort into different regions of the tree and a
-                // lookup for the new type walks past the old entries. That is **false**, and a
-                // fire-check is what exposed it: `Value::cmp` compares the whole numeric band —
-                // `Integer`, `BigInt`, `Float`, `Decimal` — against each other by VALUE, and falls
-                // through to `type_rank` only for pairs outside it (`catalog::column`, and the
-                // tests there pin exactly this). Every conversion in [`Widening`] stays inside that
-                // band or does not change the type at all, so an entry written before the retype
-                // compares equal to the same value written after it and the tree stays ordered.
-                //
-                // The rebuild was therefore unnecessary work — and worse than unnecessary. It
-                // discarded every historical `(value, primary key)` entry the index holds, which
-                // E66 keeps ON PURPOSE: a secondary entry is how a reader finds a row by a value it
-                // *used* to have, and `Update` leaves the old entry in place for exactly that
-                // reason. Rebuilding from the live heap silently threw that away.
-                let _ = (idx, &indexes);
-                self.finish(table, new_schema, primary_root_now, carried)
             }
         }
+
+        let new_schema = shapes
+            .last()
+            .cloned()
+            .ok_or_else(|| FerroError::Internal(format!("a plan for '{table}' held no shape")))?;
+        self.finish(&table, new_schema, primary_root_now, carried)?;
+        Ok(shapes[1..].iter().map(shape_of).collect())
     }
 
     /// Install the new schema and the statistics [`carried_stats`] computed for it, persist, and
@@ -582,18 +735,51 @@ fn carried_stats(
     Ok(Some(columns))
 }
 
-/// Re-serialize every tuple of a heap under a new schema.
+/// One row, carried through a chain of alterations and serialized, waiting to be written.
 ///
-/// Returns how many tuples were rewritten and the primary index's root **as it stands afterwards**.
-/// The transform is handed the row's values decoded against the OLD schema and must leave them
-/// matching the NEW one.
+/// `key` is the row's primary key value read BEFORE any conversion, which is what the index holds.
+/// `prov` is its attribution, read in the deciding pass rather than after the move so that the
+/// writing pass makes no fallible read of its own.
+struct Prepared {
+    rid: RecordId,
+    key: Option<Value>,
+    prov: Option<crate::provenance::ProvId>,
+    tuple: Tuple,
+    /// The size of the tuple this one replaces. A row that did not grow is written in place and
+    /// needs no space reserved for it.
+    was: usize,
+}
+
+/// Whether any shape in the chain changes what a row's bytes are.
+///
+/// True when a step changes a row's arity or any column's type. False for a chain of renames,
+/// which touch only the catalog. `Schema` equality would be the wrong test: it compares names too,
+/// so a rename would read as a change to the rows and it is not one.
+fn rewrites_rows(shapes: &[Schema]) -> bool {
+    shapes.windows(2).any(|w| {
+        w[0].columns.len() != w[1].columns.len()
+            || w[0]
+                .columns
+                .iter()
+                .zip(w[1].columns.iter())
+                .any(|(a, b)| a.data_type != b.data_type || a.nullable != b.nullable)
+    })
+}
+
+/// Re-serialize every tuple of a heap through a chain of shapes. **Reads only.**
+///
+/// `shapes` is the shape the heap is written against followed by the shape each action produces,
+/// so `shapes.len()` is one more than `actions.len()`. Each row is carried from one shape to the
+/// next by [`conform_row`] — the same function that carries a branch's rows across a sibling's
+/// merged `ADD COLUMN`, because "this row was written under shape A and has to become a row under
+/// shape B" is one question and deserves one answer.
 ///
 /// # Nothing is written until every row is known to be writable
 ///
-/// The function runs in two passes, and the split is the whole safety argument rather than an
-/// optimisation. Pass 1 reads every tuple, converts it and serializes it — producing exactly the
-/// bytes pass 2 will lay down — and writes nothing at all. Every failure that depends on the data
-/// therefore lands while the heap is still untouched:
+/// The rewrite runs in two passes, and the split is the whole safety argument rather than an
+/// optimisation. This pass reads every tuple, converts it and serializes it — producing exactly
+/// the bytes [`commit_rewrite`] will lay down — and writes nothing at all. Every failure that
+/// depends on the data therefore lands while the heap is still untouched:
 ///
 /// - a tuple too short to hold a version header, or one that does not decode under the old schema;
 /// - a stored value whose type disagrees with the column that declares it, which [`Widening::apply`]
@@ -605,7 +791,18 @@ fn carried_stats(
 ///   by, so an ordinary row a few bytes under the limit goes over it. Measured: a 22-column table of
 ///   `VARCHAR(200)`s, nothing oversized anywhere.
 ///
-/// # Why that is a refusal and not a rollback
+/// # Every step is measured, not only the last one
+///
+/// A chain is applied by [`commit_rewrite`] as one pass, so only the final bytes ever reach the
+/// disk and only the final width is a physical constraint. The width is checked after **every**
+/// action anyway. What is being implemented is "these alterations, in this order" — the same thing
+/// the agent would have got by typing the statements one at a time — and a group that accepts a
+/// chain the individual statements would have refused is a group with different semantics from its
+/// parts. Today the two can only ever agree, because no alteration in this database narrows a row;
+/// checking each step is what keeps that a fact about `AlterAction` rather than an assumption
+/// buried here.
+///
+/// # Why an oversized row is a refusal and not a rollback
 ///
 /// Because a rollback here cannot be made to mean anything. The rewrite is deliberately unlogged —
 /// [`HeapFileManager::open`] leaves `txn: None`, and the module header explains why the alter is a
@@ -625,14 +822,14 @@ fn carried_stats(
 ///
 /// # What the precheck does not cover, stated here rather than implied
 ///
-/// Pass 2 is not infallible; it is free of every failure the *data* can cause. What is left is
-/// environmental — a buffer pool with no evictable frame, a disk write that fails, a B+tree page
-/// that cannot be read — and one data-dependent case that is unreachable rather than handled: the
-/// per-page provenance dictionary is capped at `MAX_PAGE_DICT_ENTRIES` (255) distinct runs, while
-/// the page it belongs to has room for on the order of 135 tuples, so re-stamping the rows that
-/// moved cannot fill it. `attribute` is read-only and has been moved into pass 1 for the same
-/// reason. If any of those does fire, the outcome is the half-rewritten heap described above; the
-/// answer to that is to log the rewrite, which is a larger change than this one.
+/// [`commit_rewrite`] is not infallible; it is free of every failure the *data* can cause. What is
+/// left is environmental — a buffer pool with no evictable frame, a disk write that fails, a
+/// B+tree page that cannot be read — and one data-dependent case that is unreachable rather than
+/// handled: the per-page provenance dictionary is capped at `MAX_PAGE_DICT_ENTRIES` (255) distinct
+/// runs, while the page it belongs to has room for on the order of 135 tuples, so re-stamping the
+/// rows that moved cannot fill it. `attribute` is read-only and is therefore done here, for the
+/// same reason. If any of those does fire, the outcome is the half-rewritten heap described above;
+/// the answer to that is to log the rewrite, which is a larger change than this one.
 ///
 /// # Two things about the order of operations are load-bearing
 ///
@@ -644,45 +841,41 @@ fn carried_stats(
 ///    fresh header, so `end_ts` would be lost and a deleted row would come back to life. The
 ///    `prev` pointer is deliberately not carried: it points into the time-travel heap at a version
 ///    written under the old shape. See the module header for why nothing can still want it.
-fn rewrite_heap(
+fn prepare_rewrite(
     bp: &Arc<BufferPoolManager>,
     table: &str,
     dir_root: u32,
-    primary_root: u32,
-    old: &Schema,
-    new: &Schema,
+    shapes: &[Schema],
+    actions: &[AlterAction],
     prov: Option<&Arc<dyn ProvenanceStore>>,
-    transform: impl Fn(&mut Vec<Value>) -> Result<(), FerroError>,
-) -> Result<(usize, u32), FerroError> {
-    let heap = HeapFileManager::open(dir_root, bp.clone());
-
-    /// One row, converted and serialized, waiting to be written.
-    ///
-    /// `key` is the row's primary key value read BEFORE the transform, which is what the index
-    /// holds. `prov` is its attribution, read here rather than after the move so that pass 2 makes
-    /// no fallible read of its own.
-    struct Prepared {
-        rid: RecordId,
-        key: Option<Value>,
-        prov: Option<crate::provenance::ProvId>,
-        tuple: Tuple,
-        /// The size of the tuple this one replaces. A row that did not grow is written in place and
-        /// needs no space reserved for it.
-        was: usize,
+) -> Result<Vec<Prepared>, FerroError> {
+    // **A chain that cannot change a single byte of a single row does no heap work at all.**
+    //
+    // Column names are not in the tuple bytes — a column is found by its ordinal — so a rename is
+    // the one alteration that moves nothing, and a chain of nothing but renames moves nothing
+    // either. Deciding that here rather than at the call site keeps it one rule: what makes a
+    // rewrite necessary is that some shape in the chain changes a row's arity or a column's type,
+    // which is a property of `shapes` and not of which `AlterAction` produced them. Rewriting
+    // anyway would not be merely wasteful — `commit_rewrite` calls `HeapFileManager::update` on
+    // every row, which is entitled to relocate one, for a change that by construction is not there.
+    if !rewrites_rows(shapes) {
+        return Ok(Vec::new());
     }
 
-    // Pass 1: read, convert, serialize. No write of any kind.
-    //
+    let heap = HeapFileManager::open(dir_root, bp.clone());
+
     // This holds the whole table's converted tuples in memory, which the previous version of this
     // function did too — it held every row's decoded `Vec<Value>`, and the packed bytes are the
     // smaller of the two representations for every type in this database.
     let mut prepared: Vec<Prepared> = Vec::new();
+    let mut scanned = 0usize;
     // Only the widest row is named in the refusal, so only the widest is kept: a table where every
     // row is oversized would otherwise clone every primary key to build one error message.
     let mut too_wide = 0usize;
-    let mut widest: Option<(RecordId, Option<Value>, usize)> = None;
+    let mut widest: Option<(RecordId, Option<Value>, usize, usize)> = None;
     for item in heap.scan() {
         let (rid, tuple) = item?;
+        scanned += 1;
         if tuple.data.len() < VERSION_HEADER_SIZE {
             return Err(FerroError::Internal(format!(
                 "tuple at {rid:?} is {} bytes, shorter than a version header",
@@ -692,20 +885,35 @@ fn rewrite_heap(
         let mut header = [0u8; VERSION_HEADER_SIZE];
         header.copy_from_slice(&tuple.data[..VERSION_HEADER_SIZE]);
         let was = tuple.data.len();
-        let mut values = tuple.deserialize(old)?;
+        let mut values = tuple.deserialize(&shapes[0])?;
         let key = values.first().cloned();
-        transform(&mut values)?;
-        let mut converted = Tuple::serialize(&values, new, 0)?;
+
+        let mut converted: Option<Tuple> = None;
+        let mut over = false;
+        for step in 1..shapes.len() {
+            values = conform_row(&values, &shapes[step - 1], &shapes[step])?;
+            let bytes = Tuple::serialize(&values, &shapes[step], 0)?;
+            if bytes.data.len() > MAX_TUPLE_SIZE {
+                too_wide += 1;
+                if widest.as_ref().is_none_or(|(_, _, w, _)| bytes.data.len() > *w) {
+                    widest = Some((rid, key.clone(), bytes.data.len(), step - 1));
+                }
+                // No point carrying a row that has already refused the alteration through the rest
+                // of the chain; the whole plan is about to be discarded.
+                over = true;
+                break;
+            }
+            converted = Some(bytes);
+        }
+        if over {
+            continue;
+        }
+        let mut converted = converted.ok_or_else(|| {
+            FerroError::Internal(format!("a rewrite of '{table}' converted a row through no shape"))
+        })?;
         // begin_ts and end_ts exactly as they were; prev deliberately cleared.
         converted.data[..16].copy_from_slice(&header[..16]);
         converted.data[16..VERSION_HEADER_SIZE].fill(0);
-        let size = converted.data.len();
-        if size > MAX_TUPLE_SIZE {
-            too_wide += 1;
-            if widest.as_ref().is_none_or(|(_, _, w)| size > *w) {
-                widest = Some((rid, key.clone(), size));
-            }
-        }
         let attribution = match prov {
             Some(store) => {
                 let who = store.attribute(rid)?;
@@ -716,51 +924,52 @@ fn rewrite_heap(
         prepared.push(Prepared { rid, key, prov: attribution, tuple: converted, was });
     }
 
-    if let Some((rid, key, widest)) = &widest {
+    if let Some((rid, key, widest, step)) = &widest {
         let which = match key {
             Some(k) => format!("the row whose first column is {k:?}"),
             None => format!("the row in heap slot {rid:?}"),
         };
+        // A single alteration reads exactly as it always did. A chain names the edit that did it,
+        // because "one of your five staged edits does not fit" is not an actionable message.
+        let at = if actions.len() > 1 {
+            format!(
+                " at edit {} of {}, {:?},",
+                step + 1,
+                actions.len(),
+                actions.get(*step).ok_or_else(|| FerroError::Internal(
+                    "a rewrite refused at a step with no action".into()
+                ))?
+            )
+        } else {
+            String::new()
+        };
         return Err(FerroError::Constraint(format!(
-            "this ALTER would widen {} of the {} row(s) in '{table}' past the {MAX_TUPLE_SIZE} \
-             bytes a tuple can occupy: {which} would become {widest} bytes. Nothing has been \
-             written — the rewrite converts the heap in place and is not logged, so it is refused \
-             before the first tuple moves rather than abandoned part way through, which would \
-             leave rows in the new shape under the old schema. Narrow the row first (shorten an \
-             oversized VARCHAR with UPDATE, or move the wide column into its own table) and run \
-             the ALTER again.",
-            too_wide,
-            prepared.len(),
+            "this ALTER would widen {too_wide} of the {scanned} row(s) in '{table}'{at} past the \
+             {MAX_TUPLE_SIZE} bytes a tuple can occupy: {which} would become {widest} bytes. \
+             Nothing has been written — the rewrite converts the heap in place and is not logged, \
+             so it is refused before the first tuple moves rather than abandoned part way \
+             through, which would leave rows in the new shape under the old schema. Narrow the row \
+             first (shorten an oversized VARCHAR with UPDATE, or move the wide column into its own \
+             table) and run the ALTER again."
         )));
     }
 
-    // Reserve the space the relocations will need, before the first one happens.
-    //
-    // A row whose converted tuple no longer fits its page is relocated, and a relocation may have
-    // to allocate. `DiskManager::allocate` refuses once the table region below the copy-on-write
-    // arena floor is full — a real end-state, since the floor is fixed at `DEFAULT_ARENA_HEADROOM`
-    // when the database is created — and discovering that in the middle of pass 2 leaves rows
-    // converted under the old schema with no log to repair them. Asking for the space first turns
-    // it into a refusal: the worst this can leave behind is empty pages the heap's next insert
-    // will use, and no tuple has moved.
-    //
-    // Only rows that GREW are counted; a row that shrank or stayed the same is written in place.
-    // The count is bytes rather than pages because that is what the page directory reports, and it
-    // is aggregate rather than per-page — `reserve_free_space` says in its own words that
-    // fragmentation can still defeat it, which is why `HeapFileManager::update` also reserves each
-    // relocation's destination before freeing its source.
-    let growth: usize = prepared
-        .iter()
-        .filter(|p| p.tuple.data.len() > p.was)
-        .map(|p| p.tuple.data.len() + SLOT_ENTRY_SIZE)
-        .sum();
-    if growth > 0 {
-        heap.reserve_free_space(growth)?;
-    }
+    Ok(prepared)
+}
 
-    // Pass 2: write. Every remaining failure is environmental; see the note above.
+/// Lay down the tuples [`prepare_rewrite`] produced, and return the primary index's root **as it
+/// stands afterwards**.
+///
+/// Every remaining failure is environmental; see [`prepare_rewrite`]'s note on that boundary.
+fn commit_rewrite(
+    bp: &Arc<BufferPoolManager>,
+    dir_root: u32,
+    primary_root: u32,
+    prepared: Vec<Prepared>,
+    prov: Option<&Arc<dyn ProvenanceStore>>,
+) -> Result<u32, FerroError> {
+    let heap = HeapFileManager::open(dir_root, bp.clone());
     let primary = BPlusTreeManager::<Value, RecordId>::open(primary_root, bp.clone());
-    let mut rewritten = 0usize;
     for Prepared { rid, key, prov: attribution, tuple, was: _ } in prepared {
         let new_rid = heap.update(rid, tuple)?;
         if new_rid != rid {
@@ -782,7 +991,6 @@ fn rewrite_heap(
                 store.stamp(new_rid, who)?;
             }
         }
-        rewritten += 1;
     }
 
     // A split during the repointing above can move the tree's root, and the caller records it.
@@ -801,7 +1009,5 @@ fn rewrite_heap(
     // lookup still answering. This is therefore a latent path closed by reasoning rather than a
     // measured failure, and it is closed the way `create_index` already closes it rather than by
     // inventing a rule for it.
-    let root_now = primary.root_page_id.load(Ordering::Relaxed);
-    Ok((rewritten, root_now))
+    Ok(primary.root_page_id.load(Ordering::Relaxed))
 }
-
