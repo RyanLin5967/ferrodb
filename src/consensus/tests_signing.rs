@@ -861,6 +861,58 @@ fn a_directory_component_symlink_cannot_redirect_the_key() {
 
 #[cfg(unix)]
 #[test]
+fn an_ancestor_refusal_does_not_tell_the_operator_to_chmod_somebody_elses_directory() {
+    // **Measured against a stock layout by an adversarial pass, not imagined.** On this machine
+    // `/opt/homebrew/etc` is `drwxrwxr-x idide:admin` — group-writable, not sticky — so a key at
+    // `<prefix>/etc/ferrodb/cluster.key` is refused by the ancestry rule even though the operator
+    // made its own directory 0755.
+    //
+    // The refusal is CORRECT and stays: anyone in `admin` can rename the `ferrodb` directory and
+    // swap the key, which the old immediate-parent-only rule was quietly accepting. What was wrong
+    // was the advice — `chmod go-w /opt/homebrew/etc` names a directory a package manager owns and
+    // resets, and nothing in the text said the problem was three levels above the key. A security
+    // refusal an operator cannot act on is one they work around.
+    let root = tempfile::tempdir().unwrap();
+    let prefix = root.path().join("homebrew").join("etc");
+    let own = prefix.join("ferrodb");
+    std::fs::create_dir_all(&own).unwrap();
+    let key = write_key_file(&own, "cluster.key", &key_bytes(58));
+
+    chmod(&own, 0o755);
+    chmod(&prefix, 0o775); // the Homebrew shape: group-writable, not sticky
+    let err = Key::load(&key).expect_err("a group-writable ancestor must still be refused");
+    let text = err.to_string();
+
+    assert!(text.contains("ANCESTOR"), "it must say the offender is an ancestor: {text}");
+    assert!(
+        text.contains(&prefix.display().to_string()),
+        "it must name the ancestor, not the key's own directory: {text}"
+    );
+    assert!(
+        text.contains(&key.display().to_string()),
+        "and it must name the key, so the operator can connect the two: {text}"
+    );
+    assert!(
+        text.contains("key's own directory is not the problem"),
+        "it must say the key's own directory is fine, or the operator chmods the wrong thing: {text}"
+    );
+    assert!(
+        !text.contains(&format!("chmod go-w {}", prefix.display())),
+        "it must NOT tell them to chmod a directory a package manager owns and will reset: {text}"
+    );
+
+    // And the immediate-parent case keeps its own, different advice — `chmod go-w` IS the fix there.
+    chmod(&prefix, 0o755);
+    chmod(&own, 0o777);
+    let parent_err = Key::load(&key).expect_err("the key's own directory being open is refused too");
+    let ptext = parent_err.to_string();
+    assert!(ptext.contains("chmod go-w"), "the parent case must still name the chmod: {ptext}");
+    assert!(!ptext.contains("ANCESTOR"), "and must not call the parent an ancestor: {ptext}");
+    chmod(&own, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
 fn every_directory_above_the_key_is_inspected_not_only_its_parent() {
     // The ancestry limit this module used to state is gone, and this is what replaced it. A
     // group-writable directory anywhere above the key is a refusal, because whoever can write to it

@@ -633,8 +633,10 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
     // So the rule needs both. The name's directory matters because whoever can write there can
     // repoint the link; the inode's directory matters because whoever can write THERE can replace
     // what the link points at. Either one being open is enough to lose the key.
-    for dir in directories_to_check(path)? {
-        check_directory(&dir)?;
+    let (dirs, immediate_parent) = directories_to_check(path)?;
+    for dir in dirs {
+        let is_parent = immediate_parent.as_ref() == Some(&dir);
+        check_directory(&dir, path, is_parent)?;
     }
     Ok(())
 }
@@ -697,13 +699,18 @@ fn steps_of(p: &Path) -> Vec<Step> {
 /// ask which directory holds the inode behind a descriptor, so the walk is strings. Winning that
 /// race needs write access to a directory in the chain — which is exactly what this refuses.
 #[cfg(unix)]
-fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
+fn directories_to_check(path: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>), FerroError> {
     use std::collections::VecDeque;
 
     /// Bounded so a symlink cycle is refused rather than looped on.
     const MAX_HOPS: usize = 40;
 
     let mut checked: Vec<PathBuf> = Vec::new();
+    // Which of them holds the key file itself. Tracked rather than taken as "the last one",
+    // because deduplication means the last directory *pushed* need not be the last one *reached*.
+    // It exists only so a refusal can tell an operator whether the problem is the directory they
+    // put the key in or one far above it, which are different problems with different fixes.
+    let mut immediate_parent: Option<PathBuf> = None;
     // The prefix resolved so far. Empty means "relative to the process's current directory".
     let mut resolved = PathBuf::new();
     let mut queue: VecDeque<Step> = steps_of(path).into();
@@ -770,17 +777,29 @@ fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
                         queue.push_front(step);
                     }
                 } else {
+                    if queue.is_empty() {
+                        immediate_parent = Some(dir);
+                    }
                     resolved = here;
                 }
             }
         }
     }
-    Ok(checked)
+    Ok((checked, immediate_parent))
 }
 
-/// The mode rule for one directory holding a key.
+/// The mode rule for one directory in a key's resolution.
+///
+/// `is_immediate_parent` changes only the message, and it earns its place: an adversarial pass
+/// measured this rule against a stock Homebrew layout, where `/opt/homebrew/etc` is `drwxrwxr-x`
+/// and group-writable. The refusal there is **correct** — anyone in `admin` can rename the
+/// directory below it and swap the key, which the old immediate-parent-only rule was quietly
+/// accepting — but the advice was not: it said `chmod go-w /opt/homebrew/etc`, which is a directory
+/// a package manager owns and resets on its next operation, and nothing in the text told the
+/// operator the problem was three levels above the key rather than in it. A security refusal an
+/// operator cannot act on is one they work around.
 #[cfg(unix)]
-fn check_directory(dir: &Path) -> Result<(), FerroError> {
+fn check_directory(dir: &Path, key: &Path, is_immediate_parent: bool) -> Result<(), FerroError> {
     use std::os::unix::fs::PermissionsExt;
     // **Refused, not skipped, when the directory cannot be inspected.** This was `if let Ok(..)`,
     // which fell through to "allowed" whenever the `stat` failed — a guard that cannot read its own
@@ -799,15 +818,31 @@ fn check_directory(dir: &Path) -> Result<(), FerroError> {
     let dmode = dmeta.permissions().mode();
     let sticky = dmode & 0o1000 != 0;
     if dmode & 0o022 != 0 && !sticky {
-        return Err(FerroError::Io(format!(
-            "the directory holding the consensus signing key, {}, has mode {:04o}: it is \
-             writable by group or other and is not sticky, so anyone who can write there can \
-             replace the key with one they chose. The key file's own mode does not help — the \
-             attacker does not need to read it. Fix with `chmod go-w {}`",
-            dir.display(),
-            dmode & 0o7777,
-            dir.display()
-        )));
+        return Err(FerroError::Io(if is_immediate_parent {
+            format!(
+                "the directory holding the consensus signing key, {}, has mode {:04o}: it is \
+                 writable by group or other and is not sticky, so anyone who can write there can \
+                 replace the key with one they chose. The key file's own mode does not help — the \
+                 attacker does not need to read it. Fix with `chmod go-w {}`",
+                dir.display(),
+                dmode & 0o7777,
+                dir.display()
+            )
+        } else {
+            format!(
+                "{}, an ANCESTOR of the consensus signing key at {}, has mode {:04o}: it is \
+                 writable by group or other and is not sticky. **The key's own directory is not \
+                 the problem** — anyone who can write to that ancestor can rename or replace the \
+                 directories below it and redirect the key without ever touching the key's own \
+                 permissions. If it belongs to a package manager (a Homebrew or `/usr/local` \
+                 prefix, say), do NOT `chmod go-w` it: that directory's owner will reset it. Put \
+                 the key somewhere the node's own user controls all the way up, such as \
+                 `/etc/ferrodb/` or a directory in the service account's home.",
+                dir.display(),
+                key.display(),
+                dmode & 0o7777
+            )
+        }));
     }
     Ok(())
 }
