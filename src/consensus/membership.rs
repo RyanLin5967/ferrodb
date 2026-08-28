@@ -411,21 +411,35 @@ impl Consensus {
     /// the *next* change begin must wait for the caller's report after its fsync — which is the same
     /// rule as "a follower that acks a round it has not fsynced converts a correlated power loss
     /// into acknowledged data loss", applied to this node.
-    // TRANSITIONAL `dead_code` ALLOW — tracked by ledger row **F-cleanup**, the same set as the two
-    // remaining ones in `election.rs`.
+    // TRANSITIONAL `dead_code` ALLOW — tracked by ledger row **F-cleanup**.
     //
-    // Its caller does not exist yet: `replicate.rs::on_propose` is `unimplemented!()` on this
-    // branch, because F5 is a wave-B row and F2 has not merged. CI builds with `-D dead_code`, so
-    // without this the branch cannot be green.
+    // **Corrected 2026-08-28.** This comment used to say the caller "does not exist yet" because
+    // `replicate.rs::on_propose` was `unimplemented!()` and F2 had not merged. Both of those
+    // stopped being true when F2 merged; the removal condition below is still unmet, but for a
+    // different and more serious reason, so do not read this allow as "waiting on a merge".
+    //
+    // **Measured on this tree:** `on_propose` is implemented and appends *every* command — including
+    // `Command::Membership` — via `append_own_entry` without calling this gate or `check_membership`.
+    // The only production caller of `check_membership` is `plan_change`, which is the *pure planner*
+    // and documents in its own header that a check performed only in the planner is one a retry
+    // walks around. So the proposal path is ungated: two membership changes can be in flight at
+    // once, and no test in this file can see it because every test drives `begin_membership`
+    // directly rather than going through `step(Event::Propose(..))`.
+    //
+    // It is not reachable in the shipped path today — `consensus/node.rs` never drives membership at
+    // all — which is why this is filed rather than hot-fixed. Closing it is a design change, not a
+    // wiring change: `begin_membership` needs `OwnTermCommitted`, which no internal state tracks, so
+    // the caller must either derive it (new state: the round of the leader's own `NoOp`, compared
+    // against `commit_round`) or thread it through `Event::Propose` — and `Event` is the frozen
+    // contract that every lane branched from. That decision is deliberately left to its owner.
     //
     // Scoped to this one method and NOT to the impl block or the module, deliberately: a wider allow
     // would also silence genuinely dead code added to this file later, which is the defect the gate
     // exists to catch.
     //
-    // **Removal condition, exact:** delete it once `on_propose` calls this. If the build still passes
-    // with it gone, it was doing nothing; if it fails, `on_propose` is not calling the gate and THAT
-    // is the bug — an ungated proposal path means two membership changes can be in flight at once,
-    // which no test in this file can see.
+    // **Removal condition, exact and UNMET:** delete it once `on_propose` calls this. Verified unmet
+    // 2026-08-28 by grep for every caller of `begin_membership` and `check_membership`; the only
+    // callers of the former are in `tests_membership.rs`.
     #[allow(dead_code)]
     pub(crate) fn begin_membership(
         &mut self,

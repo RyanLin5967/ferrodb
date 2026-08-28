@@ -330,22 +330,13 @@ pub struct HardState {
 /// several: `role`, `term`, `voted_for`, `cfg` and `campaign` are read together on every vote, and
 /// a rule that reads a stale combination of them elects two leaders.
 ///
-/// # The `dead_code` allow is scoped to this struct on purpose, and it is temporary
-///
-/// CI builds with `-D dead_code` (see `.github/workflows/tests.yml` — it is half of the
-/// disabled-test gate). Every field below is read by `election.rs` and `replicate.rs`, which are
-/// **stubs at this commit**: the contract had to land before its implementations so that eight
-/// agents could branch from one frozen type set instead of inventing eight.
-///
-/// It is on the STRUCT and not the module, deliberately. A module-wide allow would also silence
-/// genuinely dead code added to `consensus/` later, which is the exact defect the gate exists to
-/// catch — the lint would still be "on" while protecting nothing.
-///
-/// **Removal condition, which is exact:** delete this attribute when `election.rs` and
-/// `replicate.rs` are implemented. If the build still passes with it gone, it was doing nothing;
-/// if it fails, the named field is genuinely unread and that is a bug in the implementation, not a
-/// reason to keep the allow.
-#[allow(dead_code)]
+/// This struct carried a transitional `#[allow(dead_code)]` while `election.rs` and `replicate.rs`
+/// were stubs — the contract had to land before its implementations so that eight agents could
+/// branch from one frozen type set instead of inventing eight. Both are implemented now, so the
+/// allow was **removed 2026-08-28** and the build was re-run under CI's exact flags
+/// (`RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"`, see `.github/workflows/tests.yml`)
+/// to prove every field below is genuinely read. Do not reintroduce it: a field that goes unread
+/// here is a bug in the implementation, not a reason to silence the lint.
 pub struct Consensus {
     pub(crate) self_id: NodeId,
     pub(crate) role: Role,
@@ -515,11 +506,8 @@ impl Consensus {
     /// Whether this node may stand for election at all.
     ///
     /// Both flags are checked here rather than at each call site, so a new campaign path cannot be
-    /// added that forgets one.
-    ///
-    /// `allow(dead_code)` for the same reason and with the same removal condition as the struct
-    /// above: its only caller is `election.rs`, which is a stub at this commit.
-    #[allow(dead_code)]
+    /// added that forgets one. Its transitional `allow(dead_code)` was removed with the struct's,
+    /// once `election.rs` landed and became its caller.
     pub(crate) fn may_campaign(&self) -> bool {
         !self.behind && !self.unjoined && self.cfg.contains(self.self_id)
     }
