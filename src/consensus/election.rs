@@ -445,23 +445,25 @@ impl Consensus {
     /// whatever about whether it holds a single round of the log, so a node added to a running
     /// cluster would be told the configuration and campaign on its very next tick — holding
     /// nothing, with a term one above everybody's.
-    // TRANSITIONAL `dead_code` ALLOW — one of the set tracked by ledger row **F-cleanup**.
+    // F-cleanup, ledger row: this set is now EMPTY, and the comment is kept only to say so.
+    // Three methods here once carried a transitional `#[allow(dead_code)]` because CI builds with
+    // `-D dead_code` and their callers lived in lanes that had not landed. All three callers exist:
+    // `replicate.rs` calls `observe_quorum_watermark`, and `membership.rs`'s
+    // `apply_committed_config` — the applier that runs a committed `Command::Membership` — calls
+    // `apply_config`. The attributes were deleted with the lanes that supplied the callers, and the
+    // build is green with none of them, which is the removal condition those attributes named.
     //
-    // `apply_config`'s caller is not built yet: the command applier that runs a committed
-    // `Command::Membership` is F5's row. (`observe_quorum_watermark` and `observe_config_at` were
-    // in this set too; `replicate.rs` calls both now, so their attributes are gone.) CI builds with
-    // `-D dead_code`, so without this the branch cannot be green between one lane landing and the
-    // next.
+    // `observe_config_at` is called, but deliberately NOT from the acknowledgement path. A follower
+    // that has fsynced a change its leader has not yet committed legitimately holds a NEWER
+    // configuration than that leader, so treating that as evidence of staleness would mark a
+    // healthy leader stale in the middle of its own change.
     //
-    // Scoped to these three methods and NOT to the impl block or the module, deliberately: a wider
-    // allow would also silence genuinely dead code added to this file later, which is the defect
-    // the gate exists to catch — the lint would read as "on" while protecting nothing.
-    //
-    // **Removal condition, exact:** delete each attribute once its named caller exists. If the
-    // build still passes with it gone, it was doing nothing; if it fails, that caller is missing
-    // and THAT is the bug — `replicate.rs` failing to call `observe_quorum_watermark` means no node
-    // added to a running cluster can ever campaign, which no test in this file can see.
-    #[allow(dead_code)]
+    // If a future lane needs another such allow: scope it to the method, never to the impl block or
+    // the module — a wider allow silences genuinely dead code added later, so the lint reads as
+    // "on" while protecting nothing. Delete it once its named caller exists. If the build still
+    // passes with it gone, it was doing nothing; if it fails, that caller is missing and THAT is the
+    // bug — nothing calling `observe_quorum_watermark` means no node added to a running cluster can
+    // ever campaign, which no test in this file can see.
     pub(crate) fn apply_config(&mut self, cfg: Config, out: &mut Vec<Action>) {
         self.cfg = cfg;
         self.behind = false;

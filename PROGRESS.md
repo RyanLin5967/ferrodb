@@ -1,3 +1,12 @@
+# Phase F — per-lane working notes
+
+Each section below is one agent's own scratch record, kept verbatim from its lane branch at the
+point that lane was merged into `agent-isolation`. They are HISTORY, not status: a "next action"
+here describes what that agent was about to do inside its own worktree, and every lane named in
+this file has since been merged. The authority for current state is `LEDGER.md`.
+
+---
+
 # F3 — transport
 
 **Done and committed.**
@@ -25,3 +34,16 @@ mutant batch 2 (`/private/tmp/.../mutants2.py`, M17/M20–M23) plus `m04_evidenc
 
 **Machine note.** Six or seven sibling agents run cargo concurrently; builds take minutes, not
 seconds. Judge a run by its output advancing, never by elapsed time.
+
+---
+
+# F5 — membership changes
+
+**Done:** read DISTRIBUTED.md §F5, mod.rs (frozen), config.rs, election.rs, F1's tests and mutant
+driver. Design written to `scratchpad/F5-design.md` and committed.
+
+**Now:** adversarial review of the design (the precondition's counting set is the whole row), then
+implement `src/consensus/membership.rs`.
+
+**Next action:** write `src/consensus/membership.rs` — `Change`, `plan_change`, `begin_membership`,
+`note_config_in_log`, `note_config_ack`, `apply_committed_config`.
