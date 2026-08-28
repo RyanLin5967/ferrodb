@@ -1392,22 +1392,45 @@ fn a_peer_that_does_not_sign_is_refused_by_a_node_that_does() {
 
 #[test]
 fn a_signed_peer_is_refused_by_a_node_with_no_key() {
-    // The other direction of the same misconfiguration. It fails too — as the header says it must,
-    // because there is no negotiation and no fallback-to-unsigned. Asserted so that "a mixed
-    // cluster cannot talk to itself, in both directions" is a tested claim and not a hope.
-    let (signed_sender, unsigned_receiver) = pair(Some(35), None);
-    signed_sender
-        .send(&Message { from: NodeId(1), to: NodeId(2), term: 4, body: Body::RequestVoteResp { granted: true } })
-        .unwrap();
-    expect_nothing(&unsigned_receiver, Duration::from_millis(500));
-    assert_eq!(unsigned_receiver.received(), 0, "a tag it cannot strip is not a message it can read");
+    // The other direction of the mixed-cluster misconfiguration. It fails too — as the header says
+    // it must, because there is no negotiation and no fallback-to-unsigned.
+    //
+    // **This test used to be vacuous and a reviewer's mutant proved it.** It asserted
+    // `received() == 0` and `unauthenticated() == 0` on a pair of `Transport`s, and both of those
+    // hold when nothing ever connects: mutating `dial` to never connect left it PASSING while three
+    // sibling tests correctly failed. Two zeros are not evidence of a refusal; they are equally
+    // evidence of a dead network.
+    //
+    // So it now drives a raw socket and carries its own positive control: an UNSIGNED frame over
+    // the same address must arrive first, proving the path is live, before a SIGNED frame over that
+    // same path is required not to. A dead network fails the first assertion.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = Transport::from_listener(NodeId(1), listener, BTreeMap::new(), fast()).unwrap();
+    assert!(!node.signs_its_traffic(), "this node has no key");
+
+    let m = Message {
+        from: NodeId(2),
+        to: NodeId(1),
+        term: 4,
+        body: Body::RequestVoteResp { granted: true },
+    };
+
+    // Positive control: the path works.
+    raw_send(addr, &encode(&m).unwrap());
+    let got = expect_recv(&node, Duration::from_secs(5));
+    assert_eq!(got, m, "the unsigned path must deliver, or the refusal below proves nothing");
+
+    // The refusal: a tag this node cannot strip is not a message it can read.
+    raw_send(addr, &encode_signed(&m, Some(&a_key(35))).unwrap());
+    expect_nothing(&node, Duration::from_millis(500));
+    assert_eq!(node.received(), 1, "only the unsigned frame was ever delivered");
     assert_eq!(
-        unsigned_receiver.unauthenticated(),
+        node.unauthenticated(),
         0,
         "and it is not counted as an authentication failure, because this node checks nothing"
     );
-    signed_sender.shutdown();
-    unsigned_receiver.shutdown();
+    node.shutdown();
 }
 
 /// Speak the handshake and hand over one frame, as a peer that is not this crate's transport.
