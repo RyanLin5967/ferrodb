@@ -306,9 +306,18 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
             // every present and future truncation in an encoder this file does not own.
             match RecKind::deserialize(&rec_bytes) {
                 Ok(back) => {
+                    // The VALUE is compared, not only the bytes. Byte equality would leave the
+                    // question of whether `serialize` is injective open, and it is not obviously
+                    // so once `as u16` can truncate; comparing what came back against what went in
+                    // settles it without needing the argument.
+                    let same = matches!(
+                        &back,
+                        RecKind::Ddl { op: o, table: t, dir_root: 0, time_travel_root: 0, columns: c }
+                            if o == op && t == table && c == columns
+                    );
                     let mut again = Vec::new();
                     back.serialize(&mut again);
-                    if again != rec_bytes {
+                    if !same || again != rec_bytes {
                         return Err(FerroError::Wal(format!(
                             "a Catalog command for table {table:?} does not survive its own \
                              encoding, so the frame would be misparsed by the peer rather than \
@@ -979,6 +988,13 @@ fn send_handshake(stream: &mut TcpStream) -> Result<(), FerroError> {
 pub struct TransportOptions {
     /// Messages held for one peer before the **oldest** is dropped. See [`Transport::send`].
     pub queue_depth: usize,
+    /// Bytes of queued frames held for one peer before the **oldest** is dropped.
+    ///
+    /// A depth in messages is not a bound on memory: a message is anything from 18 bytes to 8 MiB,
+    /// so `queue_depth: 1024` alone permits 8.6 GB per peer. Both bounds apply and whichever binds
+    /// first wins — the count keeps a flood of tiny heartbeats from growing without limit, and the
+    /// byte bound keeps a run of maximal `Append`s from doing it faster.
+    pub queue_bytes: usize,
     /// Socket read timeout, and the listener's accept poll. Bounds shutdown latency.
     pub poll_interval: Duration,
     /// How long a sender thread waits after a failed dial before trying that peer again.
@@ -1007,6 +1023,17 @@ pub struct TransportOptions {
     /// state whenever the state machine is applying or fsyncing — accumulates every frame it sends.
     /// Bounded in bytes rather than messages because a message is anything from 18 bytes to 8 MiB,
     /// so a depth in messages is not a bound on anything.
+    ///
+    /// **What it measures, stated exactly, because it is not the whole of held memory.** The charge
+    /// is the message's *wire* length. A decoded `Message` occupies more than its wire form — a
+    /// `Vec<Entry>` is pointers and capacity, not bytes — so this bounds what arrived, not what it
+    /// costs on the heap; treat it as a throttle with a known unit rather than a heap ceiling.
+    /// Two further allocations sit outside it and are bounded separately: each connection's
+    /// `FrameReader` holds up to one frame (so at most `max_inbound_conns * MAX_FRAME_BYTES`), and
+    /// each peer's outbound queue is bounded by `queue_bytes`.
+    ///
+    /// Must be at least `MAX_FRAME_BYTES`, or a maximal frame could never be admitted at all;
+    /// refused at construction rather than left to look like an uncatchable follower.
     pub inbox_bytes: usize,
 }
 
@@ -1014,6 +1041,7 @@ impl Default for TransportOptions {
     fn default() -> Self {
         TransportOptions {
             queue_depth: 1024,
+            queue_bytes: 64 * 1024 * 1024,
             poll_interval: Duration::from_millis(50),
             reconnect_delay: Duration::from_millis(100),
             handshake_deadline: Duration::from_secs(5),
@@ -1056,11 +1084,14 @@ struct Outbox {
     state: Mutex<OutboxState>,
     woken: Condvar,
     depth: usize,
+    max_bytes: usize,
     dropped: AtomicU64,
 }
 
 struct OutboxState {
     queue: VecDeque<Vec<u8>>,
+    /// Sum of `queue`'s frame lengths, maintained alongside it so the byte bound costs no walk.
+    bytes: usize,
     /// A clone of the live socket, held **only** so that [`Transport::shutdown`] can call
     /// `shutdown(Both)` on it. A sender thread parked in `write_all` against a peer whose receive
     /// window is full is otherwise unreachable, and joining it would hang for ever.
@@ -1080,10 +1111,19 @@ impl Outbox {
         if st.stopped {
             return;
         }
-        while st.queue.len() >= self.depth {
-            st.queue.pop_front();
-            self.dropped.fetch_add(1, Ordering::SeqCst);
+        // Both bounds, whichever binds first. A frame at the byte bound's own size is still
+        // admitted — the loop stops when the queue is empty — so no message is permanently
+        // unsendable however large.
+        while !st.queue.is_empty()
+            && (st.queue.len() >= self.depth
+                || st.bytes.saturating_add(frame.len()) > self.max_bytes)
+        {
+            if let Some(old) = st.queue.pop_front() {
+                st.bytes -= old.len();
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
+        st.bytes += frame.len();
         st.queue.push_back(frame);
         self.woken.notify_all();
     }
@@ -1184,6 +1224,10 @@ impl Transport {
             ("poll_interval", opts.poll_interval),
             ("reconnect_delay", opts.reconnect_delay),
             ("handshake_deadline", opts.handshake_deadline),
+            // Added after the first three and initially missed: a zero here closes every inbound
+            // connection before its first frame, which is a node that accepts and instantly hangs
+            // up on the whole cluster.
+            ("idle_deadline", opts.idle_deadline),
         ] {
             // std documents a zero duration as an error for both `set_read_timeout` and
             // `connect_timeout`, so a zero here does not mean "no wait" — it means every socket
@@ -1196,6 +1240,26 @@ impl Transport {
                      `invalid input` rather than anything about the peer"
                 )));
             }
+        }
+        if opts.max_inbound_conns == 0 {
+            return Err(FerroError::Internal(
+                "`max_inbound_conns` is zero, so every inbound connection would be refused. That \
+                 is a node that accepts nothing while its outbound meters read healthy"
+                    .to_string(),
+            ));
+        }
+        // **The inbox budget must be able to hold one maximal frame.** A budget below
+        // `MAX_FRAME_BYTES` makes an 8 MiB `Append` permanently undeliverable: the charge can never
+        // fit however patiently the caller drains, so the frame is refused, re-sent, refused again,
+        // and the follower never catches up — a partition that looks like a slow peer.
+        if opts.inbox_bytes < MAX_FRAME_BYTES {
+            return Err(FerroError::Internal(format!(
+                "`inbox_bytes` is {}, below the {MAX_FRAME_BYTES}-byte frame limit. A frame larger \
+                 than the whole budget can never be admitted, so it would be refused for ever \
+                 rather than delayed — and consensus would read that as a peer that cannot be \
+                 caught up rather than as a misconfiguration here",
+                opts.inbox_bytes
+            )));
         }
         if opts.queue_depth == 0 {
             return Err(FerroError::Internal(
@@ -1232,11 +1296,13 @@ impl Transport {
                 addr,
                 state: Mutex::new(OutboxState {
                     queue: VecDeque::new(),
+                    bytes: 0,
                     live: None,
                     stopped: false,
                 }),
                 woken: Condvar::new(),
                 depth: opts.queue_depth,
+                max_bytes: opts.queue_bytes,
                 dropped: AtomicU64::new(0),
             });
             outboxes.insert(peer, Arc::clone(&ob));
@@ -1481,6 +1547,7 @@ impl Transport {
             let mut st = ob.state.lock().unwrap();
             st.stopped = true;
             st.queue.clear();
+            st.bytes = 0;
             if let Some(s) = st.live.take() {
                 let _ = s.shutdown(Shutdown::Both);
             }
@@ -1507,6 +1574,7 @@ fn stop_started(stop: &Arc<AtomicBool>, outboxes: &[Arc<Outbox>], threads: Vec<J
         let mut st = ob.state.lock().unwrap();
         st.stopped = true;
         st.queue.clear();
+        st.bytes = 0;
         if let Some(s) = st.live.take() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -1586,7 +1654,16 @@ fn sender_loop(
                     counters.connect_failures.fetch_add(1, Ordering::SeqCst);
                     // Wait on the condvar rather than sleeping, so a shutdown does not have to
                     // wait out a reconnect delay it has already made pointless.
+                    //
+                    // The predicate is re-checked UNDER the lock before waiting. Without that, a
+                    // shutdown whose `notify_all` lands between the failed dial and this wait is a
+                    // lost wakeup, and the join costs a whole `reconnect_delay` for nothing — the
+                    // classic condvar mistake, and the reason the flag is checked and not just
+                    // waited on.
                     let st = ob.state.lock().unwrap();
+                    if st.stopped || stop.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
                     continue;
                 }
@@ -1606,7 +1683,11 @@ fn sender_loop(
             if st.stopped {
                 break;
             }
-            st.queue.pop_front()
+            let taken = st.queue.pop_front();
+            if let Some(f) = taken.as_ref() {
+                st.bytes -= f.len();
+            }
+            taken
         };
         let Some(frame) = frame else { continue };
 
@@ -1720,6 +1801,10 @@ fn accept_loop(
                         counters.refused_conns.fetch_add(1, Ordering::SeqCst);
                         drop(map);
                         let _ = stream.shutdown(Shutdown::Both);
+                        // Sleep before accepting again. Refusing in a tight loop hands a peer that
+                        // loops `connect()` a whole core of this process for free — the accept
+                        // thread would spin on accept-refuse-accept with nothing to slow it.
+                        std::thread::sleep(opts.poll_interval);
                         continue;
                     }
                     map.insert(id, mine);
@@ -1730,6 +1815,20 @@ fn accept_loop(
                 if stream.set_nonblocking(false).is_err()
                     || stream.set_read_timeout(Some(opts.poll_interval)).is_err()
                 {
+                    // **The slot was reserved above, so it must be released here.** This path used
+                    // to `continue` without removing the entry, and that turned the cap into the
+                    // very hole it was added to close: `mine` is a `try_clone`, so the entry kept a
+                    // descriptor and an ESTABLISHED connection with nothing reading it, and after
+                    // `max_inbound_conns` occurrences every real peer was refused for ever while
+                    // `live_inbound_conns()` sat pinned at the cap and no counter moved.
+                    //
+                    // Not hypothetical: a peer that connects and RSTs before this thread calls
+                    // `accept` leaves a socket on which `SO_RCVTIMEO` returns EINVAL, measured
+                    // deterministically on this platform. Since this module does not authenticate,
+                    // that is an unauthenticated remote making the node permanently deaf.
+                    conns.lock().unwrap().remove(&id);
+                    counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
