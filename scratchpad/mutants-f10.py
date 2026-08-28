@@ -7,6 +7,13 @@ exact edit that breaks it, and the test that has to notice. Run from the worktre
     PATH="$HOME/.cargo/bin:$PATH" python3 scratchpad/mutants-f10.py
 
 Refuses if the tree is dirty, and restores every file it touched even on a crash.
+
+**Two mutants kill by aborting the test binary rather than failing an assertion** — the ones that
+remove a recursion bound, where the detection IS the stack overflow. On macOS an abort wakes
+`ReportCrash` and `spindump`, which held the dead process for over two minutes in the 2026-08-28
+run at load 6, so budget minutes rather than seconds for those two points. The `timeout 600` per
+test is what bounds it. Measured, not guessed: `ps -o state=` showed the aborted binary at 0.0%%
+CPU in state SN with `ReportCrash daemon` and `spindump` both live.
 """
 import subprocess, sys, os, shutil, tempfile
 
@@ -103,20 +110,48 @@ def run(cmd, timeout=900):
 
 
 def named_tests_fail(tests):
-    """Run each named test alone. Returns (all_failed, per_test_verdict)."""
+    """Run each named test alone. Returns (all_failed, per_test_verdict).
+
+    ONE cargo invocation per test, filtered by the bare function name — `cargo test`'s filter is a
+    substring match on the full test path, and every name here is unique in the crate. An earlier
+    version chained two invocations with `||` and then parsed their concatenated output, which
+    classified a KILLED mutant as "collected nothing": the second run's "0 passed; 0 failed" landed
+    in the same buffer as the first run's "1 failed". A harness that mis-reports a killed mutant as
+    a survivor is worse than no harness, so the verdicts below are mutually exclusive and anything
+    unrecognised is an explicit error rather than a default.
+    """
     verdicts = {}
     for t in tests:
-        r = run(f'timeout 600 cargo test --lib tel::log::tests_durable_log::{t} -- --exact 2>&1'
-                f' || timeout 600 cargo test --lib tel::log::tests::{t} -- --exact 2>&1')
+        # 150s and not 600. Two mutants kill by aborting the test binary, and macOS's ReportCrash
+        # then holds the corpse — measured at over three minutes at load 6 — so a generous timeout
+        # buys nothing but wall clock. The abort message reaches the pipe immediately, before the
+        # hold, so it is still in `out` when the timeout fires; a timeout that carries it is a kill,
+        # and one that carries nothing is reported as a timeout rather than counted either way.
+        r = run(f"timeout 150 cargo test --lib {t} 2>&1")
         out = r.stdout + r.stderr
-        if "1 passed" in out and "0 failed" in out:
-            verdicts[t] = "PASSED (mutant survived)"
-        elif "0 passed" in out and "0 failed" in out and "filtered out" in out:
-            verdicts[t] = "COLLECTED NOTHING"
-        elif "error[E" in out or "could not compile" in out:
+        timed_out = r.returncode == 124
+        if "error[E" in out or "could not compile" in out:
             verdicts[t] = "BUILD ERROR"
-        else:
+        elif "0 passed; 0 failed" in out:
+            verdicts[t] = "COLLECTED NOTHING (the filter matched no test)"
+        elif "1 passed; 0 failed" in out:
+            verdicts[t] = "PASSED (mutant survived)"
+        elif "0 passed; 1 failed" in out or "panicked" in out:
             verdicts[t] = "failed (killed)"
+        elif ("overflowed its stack" in out or "fatal runtime error" in out
+              or "SIGABRT" in out or "signal: 6" in out or "signal: 11" in out):
+            # A mutant that removes a recursion bound does not fail a test, it aborts the whole
+            # test binary. That is the mutant being killed, loudly — and it has to be recognised
+            # explicitly, because an abort prints no `test result:` line at all and would otherwise
+            # fall through to UNRECOGNISED and read as a survivor.
+            verdicts[t] = "failed (killed by a process abort: %s)" % (
+                "stack overflow" if "overflowed its stack" in out else "signal")
+        elif timed_out:
+            verdicts[t] = "TIMED OUT with no verdict in its output"
+        else:
+            verdicts[t] = "UNRECOGNISED: " + " / ".join(
+                l.strip() for l in out.splitlines() if "test result:" in l
+            )
     return all(v.startswith("failed") for v in verdicts.values()), verdicts
 
 
