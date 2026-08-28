@@ -41,6 +41,24 @@
 //! 3. the applied configuration is held durably by a **majority of its own voters**, counted over
 //!    `cfg.members()` so that neither a learner nor a departed member can make up the number.
 //!
+//! ## Condition 3 counts a majority of the set now in force, which is STRONGER than the words
+//!
+//! `DISTRIBUTED.md` §F5 says "a majority of the set that **created** it". That set is one
+//! single-node change back, and **no field in the frozen set retains it** — once the change
+//! applies, `cfg` is the new set and the old one is gone. So the check is made in the set now in
+//! force, and the difference is deliberate rather than an approximation:
+//!
+//! * it is **never weaker**, because a majority of the new set intersects every majority of the
+//!   creating set (the arithmetic above, applied the other way round), so the evidence condition 3
+//!   demands implies the evidence the words demand;
+//! * it costs availability only in the growth direction, and only until the node that was just
+//!   promoted acknowledges — and that node was promoted *because* its `matched` had reached the
+//!   leader's committed round, so it holds the configuration entry already;
+//! * the creating set **is** counted, at the one moment it is available: while the change is in
+//!   flight, `cfg` still *is* the set that created it, and
+//!   [`Consensus::pending_change_is_acknowledged`] is that count. That is `acked` doing exactly
+//!   what `mod.rs` says it exists for, and it is where the words are implemented literally.
+//!
 //! # Why a configuration takes effect at COMMIT here, and why that is safe
 //!
 //! `election.rs` fixes this: `apply_config` is "called when a `Command::Membership` commits". So
@@ -460,10 +478,19 @@ impl Consensus {
                 return Err(FerroError::Constraint(format!(
                     "refused a membership change while the previous one (version {}, term {}) is \
                      still in this node's log unapplied, over the configuration in force (version \
-                     {}, term {}). Two changes in flight over an unacknowledged one is how a \
-                     single-node change stops being safe: the first and third sets are two apart, \
-                     and their majorities need not intersect.",
-                    in_log.version, in_log.term, held.version, held.term
+                     {}, term {}); it is {} by a majority of the {} voters that created it. Two \
+                     changes in flight over an unacknowledged one is how a single-node change stops \
+                     being safe: the first and third sets are two apart, and their majorities need \
+                     not intersect.",
+                    in_log.version,
+                    in_log.term,
+                    held.version,
+                    held.term,
+                    match self.pending_change_is_acknowledged() {
+                        Some(true) => "already held",
+                        _ => "not yet held",
+                    },
+                    self.cfg.len()
                 )));
             }
         } else {
@@ -499,6 +526,32 @@ impl Consensus {
             )));
         }
         Ok(())
+    }
+
+    /// While a change is in flight: whether it is held durably by a **majority of the set that
+    /// created it** — the literal precondition of `DISTRIBUTED.md` §F5.
+    ///
+    /// This is the one moment at which that set can be counted. A configuration takes effect at
+    /// commit, so the set in force while a change is in flight *is* the set that created it; once
+    /// the change applies, `cfg` is the new set and nothing retains the old one. So the count lives
+    /// here rather than in [`Consensus::check_precondition`], which is evaluated after the fact and
+    /// therefore counts the set now in force (see the module header).
+    ///
+    /// `None` when no change is in flight — distinguishable from `Some(false)`, because "there is
+    /// nothing to acknowledge" and "the change has not reached a majority" call for opposite
+    /// actions: begin the next change, or wait.
+    pub fn pending_change_is_acknowledged(&self) -> Option<bool> {
+        let pending = *self.acked.get(&self.self_id)?;
+        if pending <= self.cfg.at() {
+            return None;
+        }
+        let holders = self
+            .cfg
+            .members()
+            .iter()
+            .filter(|m| self.acked.get(m).is_some_and(|a| *a >= pending))
+            .count();
+        Some(self.cfg.has_quorum(holders))
     }
 
     /// Whether this node's log holds a configuration newer than the one applied — a change begun
