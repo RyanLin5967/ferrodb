@@ -208,6 +208,22 @@ pub const DOMAIN: [u8; 26] = {
 /// what a cluster actually signs with — the primitive and the policy are separable and are
 /// separated.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    hmac_sha256_parts(key, &[message])
+}
+
+/// The same, over a message given in pieces rather than as one slice.
+///
+/// The reason this exists rather than a `concat`: [`Key::tag`] authenticates [`DOMAIN`] followed by
+/// the frame body, and joining them would allocate and copy the **whole body** — up to
+/// [`MAX_FRAME_BYTES`] — for every frame signed and every frame verified. SHA-256 is a streaming
+/// hash and this is what streaming it is for. The pieces are concatenated *in the hash*, which is
+/// the same value the joined slice would have produced and is asserted to be in `tests_signing.rs`.
+///
+/// The pieces are **not** length-prefixed and do not need to be: every caller uses a
+/// fixed-length prefix, so the split point is not something an attacker can move. A caller that
+/// passed two variable-length pieces would be building an ambiguous encoding, which is why there is
+/// no public caller that can.
+fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     // RFC 2104: a key longer than the block is replaced by its own digest; a shorter one is
     // zero-padded to the block. Both branches produce exactly `BLOCK` bytes, which is what makes
     // the two pads below well-defined.
@@ -227,7 +243,9 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 
     let mut inner = Sha256::new();
     inner.update(&ipad);
-    inner.update(message);
+    for part in parts {
+        inner.update(part);
+    }
     let inner = inner.finish();
 
     let mut outer = Sha256::new();
@@ -409,10 +427,9 @@ impl Key {
 
     /// The tag over one authenticated region, domain-separated.
     pub fn tag(&self, message: &[u8]) -> [u8; MAC_LEN] {
-        let mut primed = Vec::with_capacity(DOMAIN.len() + message.len());
-        primed.extend_from_slice(&DOMAIN);
-        primed.extend_from_slice(message);
-        hmac_sha256(&self.bytes, &primed)
+        // Streamed, not joined: joining would copy the whole frame body on every sign AND every
+        // verify. See [`hmac_sha256_parts`].
+        hmac_sha256_parts(&self.bytes, &[&DOMAIN, message])
     }
 
     /// Whether `mac` is the tag this key would produce over `message`.

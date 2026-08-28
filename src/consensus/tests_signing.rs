@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::consensus::transport::{decode, encode, encode_signed, Transport, TransportOptions};
+use crate::consensus::transport::{
+    decode, decode_verified, encode, encode_signed, Transport, TransportOptions,
+};
 use crate::consensus::{Body, Message, NodeId};
 use crate::provenance::sha256::{from_hex, sha256, to_hex};
 use crate::replication::{read_handshake, write_handshake, CONSENSUS_TAG, MAX_FRAME_BYTES};
@@ -184,6 +186,25 @@ fn a_key_longer_than_the_block_is_replaced_by_its_own_digest() {
                 "a {len}-byte key fits the block and must NOT be folded"
             );
         }
+    }
+}
+
+#[test]
+fn hashing_the_pieces_is_hashing_their_join() {
+    // `Key::tag` streams `DOMAIN` and then the body into one hash rather than joining them, to
+    // avoid copying the whole frame on every sign and every verify. This is the assertion that the
+    // optimisation changed nothing: the streamed value is the joined value, at every length that
+    // straddles SHA-256's 64-byte block.
+    let k = key_bytes(29);
+    for n in [0usize, 1, 37, 63, 64, 65, 127, 128, 129, 1000] {
+        let body: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let mut joined = DOMAIN.to_vec();
+        joined.extend_from_slice(&body);
+        assert_eq!(
+            Key::from_bytes_for_test(k.clone()).unwrap().tag(&body),
+            hmac_sha256(&k, &joined),
+            "a {n}-byte body: streaming the domain and the body must equal hashing their join"
+        );
     }
 }
 
@@ -613,6 +634,36 @@ fn every_byte_of_the_message_is_inside_the_mac() {
         bad[i] ^= 0x01;
         assert!(verify_frame(&k, &bad[5..]).is_err(), "flipping a bit of tag byte {} verified", i - 5);
     }
+}
+
+#[test]
+fn decode_verified_authenticates_before_it_parses() {
+    // The composition `transport` exposes for a caller that holds a whole frame body. With a key it
+    // is verify-then-decode; without one it is exactly `decode`, for a transport that was not given
+    // a key. Both halves asserted, because "without a key it is exactly decode" is the sentence a
+    // later edit could quietly make false.
+    let k = a_key(39);
+    let m = vote_at(11);
+    let signed = signed_frame(&k, &m);
+    let plain = encode(&m).unwrap();
+
+    assert_eq!(decode_verified(&signed[5..], Some(&k)).unwrap(), m);
+    assert_eq!(decode_verified(&plain[5..], None).unwrap(), m);
+
+    // Crossed over, both directions refuse.
+    assert!(decode_verified(&plain[5..], Some(&k)).is_err(), "an unsigned body must not verify");
+    assert!(decode_verified(&signed[5..], None).is_err(), "a tag is not a message prefix");
+
+    // And a body that would NOT decode is refused for the authentication, not for the parse: the
+    // tag is checked first, so `decode` never runs on it.
+    let payload = vec![0xffu8; 8];
+    let mut junk = k.tag(&payload).to_vec();
+    junk.extend_from_slice(&payload);
+    let err = decode_verified(&junk, Some(&k)).expect_err("the payload is not a message");
+    assert!(
+        !err.to_string().contains("did not authenticate"),
+        "a correctly tagged frame must reach the parser: {err}"
+    );
 }
 
 #[test]
