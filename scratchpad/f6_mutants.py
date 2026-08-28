@@ -71,7 +71,7 @@ M = [
      "a_chunk_at_the_wrong_offset_is_answered_with_the_resume_point_and_never_buffered", "lib"),
     ("M18", SNAP, "        if cur.received + data.len() as u64 > meta.total_bytes {", "        if false {",
      "a_chunk_that_would_run_past_the_declared_length_is_refused", "lib"),
-    ("M19", SNAP, "            if cur.body_digest != cur.header.body_digest {", "            if false {",
+    ("M19", SNAP, "    if body_digest != claimed {", "    if false {",
      "a_payload_whose_body_digest_does_not_match_is_refused_before_the_driver_is_told", "lib"),
     ("M20", SNAP, "            if header.last_round != meta.last_round\n                || header.last_term != meta.last_term\n                || header.total_bytes() != meta.total_bytes\n            {",
      "            if false {",
