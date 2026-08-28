@@ -35,6 +35,17 @@ fn entry(term: Term, round: Round) -> Entry {
     Entry { term, round, command: cmd(round) }
 }
 
+/// An entry whose encoded frame is the **same length** whatever its term, round or `v`. Needed
+/// wherever a fixture has to put a different entry in exactly the bytes an old one occupied, which
+/// is the shape a lost truncation leaves behind.
+fn fixed(term: Term, round: Round, v: u8) -> Entry {
+    Entry {
+        term,
+        round,
+        command: Command::WalBatch { start_lsn: round, bytes: vec![v; 32] },
+    }
+}
+
 fn fill(log: &mut RoundLog, term: Term, rounds: std::ops::RangeInclusive<Round>) {
     let batch: Vec<Entry> = rounds.map(|r| entry(term, r)).collect();
     log.append(&batch).expect("appending a contiguous batch");
@@ -239,46 +250,68 @@ fn a_frame_length_that_runs_past_the_file_ends_the_scan_without_allocating_for_i
 
 #[test]
 fn a_zero_terminator_stops_the_scan_before_a_frame_left_over_from_an_earlier_life() {
-    // The narrow case the terminator exists for: bytes from a longer previous life of this file,
-    // sitting exactly where the next frame would start, with the right round and a valid crc. The
-    // fixture builds precisely that and requires the scan to stop.
+    // The narrow case the terminator exists for, staged exactly: a truncation whose `set_len` never
+    // reached the device, followed by a replacement frame of the same size. Round 5's old frame is
+    // then sitting precisely where the scan would look for round 5 next, with a valid crc and a
+    // term that does not go backwards -- so every other check in the scan passes it.
+    //
+    // The test proves its own fixture. The same image WITHOUT the four zero bytes must resurrect
+    // round 5; if that half ever stops holding, the other half is measuring nothing. An earlier
+    // version of this test spliced two images four bytes out of alignment and passed for that
+    // reason, which is why the dangerous state is now built and *demonstrated* before it is denied.
     let fabric = SimFabric::clean(Durability::WriteThrough);
     let mut log = open_on(&fabric).unwrap();
-    fill(&mut log, 1, 1..=5);
-    let long = fabric.durable_image();
-    let live = live_file(&long);
-    let long_img = long.get(live).unwrap().clone();
+    let original: Vec<Entry> = (1..=5).map(|r| fixed(1, r, 0xA1)).collect();
+    log.append(&original).unwrap();
+    log.sync().unwrap();
 
-    // A second, shorter log on the same file: rounds 1..=3 only.
-    let fabric2 = SimFabric::clean(Durability::WriteThrough);
-    let mut log2 = open_on(&fabric2).unwrap();
-    fill(&mut log2, 1, 1..=3);
-    let short = fabric2.durable_image();
-    let live2 = live_file(&short);
-    let mut short_img = short.get(live2).unwrap().clone();
+    let images = fabric.durable_image();
+    let live = live_file(&images);
+    let base = images[live].clone();
+    let frames = frames_in(&base);
+    assert_eq!(frames.len(), 5, "the fixture did not write five frames");
+    let width = frames[0].1;
+    assert!(frames.iter().all(|(_, n)| *n == width), "the fixture needs equal-length frames");
 
-    // Splice the longer log's tail back on, so rounds 4 and 5 sit immediately after round 3 exactly
-    // as they did before, crc and all.
-    let boundary = short_img.len();
-    assert!(
-        long_img.len() > boundary,
-        "the fixture needs the five-round image to be longer than the three-round one"
+    // A replacement round 4: same term, same round, same encoded length, different bytes -- what an
+    // append writes over a suffix whose removal was lost.
+    let replacement = fixed(1, 4, 0x5E);
+    let raw = encode_frame(&replacement).unwrap();
+    assert_eq!(raw.len(), width, "the replacement is not the width of the frame it overwrites");
+    let mut resurrecting = base.clone();
+    resurrecting[frames[3].0..frames[3].0 + width].copy_from_slice(&raw);
+
+    // Half one: without the terminator the old round 5 is reachable and the scan takes it.
+    let f = SimFabric::from_images(
+        [(live.to_string(), resurrecting.clone())].into_iter().collect(),
+        None,
+        Durability::WriteThrough,
     );
-    short_img.extend_from_slice(&long_img[boundary..]);
-    // ...except for the four terminator bytes the shorter log wrote, which the splice overwrote.
-    // Put them back: that is the state a real file is in after an append.
-    let terminator_at = boundary - 4;
-    short_img[terminator_at..boundary].copy_from_slice(&[0u8; 4]);
-
-    let spliced: BTreeMap<String, Vec<u8>> =
-        [(live2.to_string(), short_img)].into_iter().collect();
-    let f = SimFabric::from_images(spliced, None, Durability::WriteThrough);
-    let after = open_on(&f).unwrap();
+    let bad = open_on(&f).unwrap();
     assert_eq!(
-        after.last_round(),
-        3,
-        "the scan walked past the terminator and resurrected rounds that had been truncated away"
+        bad.last_round(),
+        5,
+        "the fixture does not stage a resurrection at all, so the other half of this test proves \
+         nothing -- the leftover frame was rejected by some other check"
     );
+    assert_eq!(bad.entry(4).unwrap(), replacement);
+
+    // Half two: the four bytes an append writes after its last frame land on the leftover's length
+    // field, and the scan stops.
+    let mut terminated = resurrecting;
+    terminated[frames[4].0..frames[4].0 + 4].copy_from_slice(&[0u8; 4]);
+    let f2 = SimFabric::from_images(
+        [(live.to_string(), terminated)].into_iter().collect(),
+        None,
+        Durability::WriteThrough,
+    );
+    let good = open_on(&f2).unwrap();
+    assert_eq!(
+        good.last_round(),
+        4,
+        "the scan walked past the terminator and resurrected a round that had been truncated away"
+    );
+    assert_eq!(good.entry(4).unwrap(), replacement);
 }
 
 #[test]
@@ -581,69 +614,81 @@ fn a_crash_at_any_point_during_a_checkpoint_loses_nothing() {
     // The sweep. Every faultable operation of a checkpoint, in every shape a write can misbehave,
     // with the requirement that reopening finds either the old log or the new one and never a
     // mixture -- and that no round above whichever floor survived has gone missing.
-    let fabric = SimFabric::clean(Durability::WriteThrough);
+    //
+    // **Both durability models, and that is not thoroughness for its own sake.** Under
+    // `WriteThrough` every write is durable the instant it returns, so an fsync deleted from the
+    // checkpoint would change no outcome here and the sweep would call a missing flush green.
+    // `SyncOnly` is the model in which the ordering of the two fsyncs is load-bearing.
+    let mut total = 0usize;
+    for durability in [Durability::WriteThrough, Durability::SyncOnly] {
+        total += sweep_a_checkpoint(durability);
+    }
+    assert!(total >= 24, "the sweep ran {total} points across both models, which is not a sweep");
+}
+
+fn sweep_a_checkpoint(durability: Durability) -> usize {
+    let fabric = SimFabric::clean(durability);
     let mut log = open_on(&fabric).unwrap();
     fill(&mut log, 6, 1..=10);
-    // A first checkpoint, so the spare the swept one writes into holds a previous generation's
-    // bytes. Sweeping onto an empty spare would never exercise the reclaim.
+    // A first checkpoint, so the swept one runs on a log that has already switched files once --
+    // which is what puts the *retirement* of the superseded file inside the swept window too.
     log.discard_prefix(3, 6).unwrap();
     drop(log);
     let base = fabric.restart().durable_image();
 
-    let census = SimFabric::from_images(base.clone(), None, Durability::WriteThrough);
+    let census = SimFabric::from_images(base.clone(), None, durability);
     let mut l = open_on(&census).unwrap();
     let mark = census.op_count();
     l.discard_prefix(6, 6).unwrap();
     let points: Vec<u64> = census.faultable_ops().into_iter().filter(|i| *i >= mark).collect();
-    assert!(points.len() >= 4, "a checkpoint performed only {} faultable operations", points.len());
+    assert!(
+        points.len() >= 4,
+        "a checkpoint under {durability:?} performed only {} faultable operations",
+        points.len()
+    );
 
     let mut ran = 0usize;
     for at in points {
         for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
             let plan = FaultPlan::at_shaped(at, 0xF0B, shape);
-            let f = SimFabric::from_images(base.clone(), Some(plan), Durability::WriteThrough);
+            let f = SimFabric::from_images(base.clone(), Some(plan), durability);
             let mut broken = open_on(&f).unwrap();
             let _ = broken.discard_prefix(6, 6);
             let fired = f.fired();
-            assert!(
-                fired.is_some(),
-                "seed 0xF0B at op {at} shape {shape:?}: no fault fired, so this point tested nothing"
-            );
+            let where_ = format!("{durability:?} seed 0xF0B at op {at} shape {shape:?}");
+            assert!(fired.is_some(), "{where_}: no fault fired, so this point tested nothing");
             drop(broken);
 
             let restarted = f.restart();
             let after = match open_on(&restarted) {
                 Ok(a) => a,
-                Err(e) => panic!(
-                    "seed 0xF0B at op {at} shape {shape:?} ({:?}) left a log that will not open: {e}",
-                    fired.unwrap()
-                ),
+                Err(e) => panic!("{where_} ({:?}) left a log that will not open: {e}", fired.unwrap()),
             };
             let floor = after.snapshot_round();
             assert!(
                 floor == 3 || floor == 6,
-                "seed 0xF0B at op {at} shape {shape:?} ({:?}) left floor {floor}, which is neither \
-                 the checkpoint that was in place nor the one being installed",
+                "{where_} ({:?}) left floor {floor}, which is neither the checkpoint that was in \
+                 place nor the one being installed",
                 fired.clone().unwrap()
             );
             assert_eq!(
                 after.last_round(),
                 10,
-                "seed 0xF0B at op {at} shape {shape:?} ({:?}) lost rounds off the end",
+                "{where_} ({:?}) lost rounds off the end",
                 fired.clone().unwrap()
             );
             for r in floor + 1..=10 {
                 assert_eq!(
                     after.entry(r).unwrap(),
                     entry(6, r),
-                    "seed 0xF0B at op {at} shape {shape:?} ({:?}) lost or changed round {r}",
+                    "{where_} ({:?}) lost or changed round {r}",
                     fired.clone().unwrap()
                 );
             }
             ran += 1;
         }
     }
-    assert!(ran >= 12, "the sweep ran {ran} points, which is not a sweep");
+    ran
 }
 
 #[test]
@@ -851,7 +896,7 @@ fn a_membership_command_carries_its_learners() {
     // removed, and removing a learner is a membership change nobody proposed.
     let cfg = Config::new([NodeId(1), NodeId(2)], 3, 4).with_learners([NodeId(5)]);
     let mut buf = Vec::new();
-    encode_command(&Command::Membership { config: cfg.clone() }, &mut buf);
+    encode_command(&Command::Membership { config: cfg.clone() }, &mut buf).unwrap();
     let back = decode_command(&buf).unwrap();
     match back {
         Command::Membership { config } => {
@@ -868,7 +913,7 @@ fn the_command_decoder_refuses_trailing_bytes() {
     // Two encodings of one command mean two nodes can hold byte-different logs that decode
     // identically, which defeats every byte comparison built on top of this.
     let mut buf = Vec::new();
-    encode_command(&Command::NoOp, &mut buf);
+    encode_command(&Command::NoOp, &mut buf).unwrap();
     assert_eq!(decode_command(&buf).unwrap(), Command::NoOp);
     buf.push(0);
     assert!(
@@ -879,19 +924,21 @@ fn the_command_decoder_refuses_trailing_bytes() {
 
 #[test]
 fn the_command_decoder_refuses_a_truncated_record_rather_than_panicking() {
-    let mut buf = Vec::new();
-    encode_command(
-        &Command::Membership {
-            config: Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 1),
-        },
-        &mut buf,
-    );
-    for cut in 1..buf.len() {
-        assert!(
-            decode_command(&buf[..cut]).is_err(),
-            "a command truncated to {cut} of {} bytes decoded successfully",
-            buf.len()
-        );
+    // Every variant, at every cut. These bytes arrive from a disk or a socket, so a decoder that
+    // indexes past the end of a short record is a denial of service triggered by a corrupt log --
+    // and the Catalog arms are the ones that matter most, being the only ones with strings and a
+    // counted loop.
+    for c in every_command() {
+        let mut buf = Vec::new();
+        encode_command(&c, &mut buf).unwrap();
+        assert_eq!(decode_command(&buf).unwrap(), c, "a command did not round trip");
+        for cut in 1..buf.len() {
+            assert!(
+                decode_command(&buf[..cut]).is_err(),
+                "{c:?} truncated to {cut} of {} bytes decoded successfully",
+                buf.len()
+            );
+        }
     }
 }
 
@@ -945,9 +992,14 @@ fn an_unknown_tag_is_refused_at_every_level() {
     }
 }
 
-/// The tag the WAL gives a column type, derived from the WAL's own encoder rather than from a
-/// number copied into this test.
-fn wal_type_tag(ty: &DataType, reference: &DataType) -> (u8, u8) {
+/// The bytes the WAL uses to encode a column type, derived from the WAL's own encoder rather than
+/// from a number copied into this test.
+///
+/// Two records differing only in one column's type share a prefix and a suffix; the middle is
+/// exactly the type's encoding. Comparing the whole middle rather than the first differing byte is
+/// what makes a divergence in `Varchar`'s **width** visible -- comparing tags alone would let the
+/// two files disagree about whether the width is a `u8` or a `u16` and call it agreement.
+fn wal_type_bytes(ty: &DataType, reference: &DataType) -> (Vec<u8>, Vec<u8>) {
     let ser = |t: &DataType| {
         let mut b = Vec::new();
         RecKind::Ddl {
@@ -962,44 +1014,49 @@ fn wal_type_tag(ty: &DataType, reference: &DataType) -> (u8, u8) {
     };
     let a = ser(reference);
     let b = ser(ty);
-    let at = a
+    let pre = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let suf = a
         .iter()
-        .zip(b.iter())
-        .position(|(x, y)| x != y)
-        .expect("two different column types serialized identically");
-    (a[at], b[at])
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
+        .min(a.len() - pre)
+        .min(b.len() - pre);
+    (a[pre..a.len() - suf].to_vec(), b[pre..b.len() - suf].to_vec())
 }
 
 #[test]
 fn the_column_type_tags_agree_with_the_wals() {
     // `Command::Catalog` and `RecKind::Ddl` describe the same schema change through two encoders,
-    // because `wal::log`'s is private and `mod.rs` is frozen. If they disagreed about a tag, a
-    // Timestamp column replicated through consensus would arrive as a Decimal in the change feed.
+    // because `wal::log`'s is private and `mod.rs` is frozen. If they disagreed, a Timestamp column
+    // replicated through consensus would arrive as a Decimal in the change feed.
     let reference = DataType::Float;
     let mine = |t: &DataType| {
         let mut v = Vec::new();
         write_data_type(&mut v, t);
-        v[0]
+        v
     };
     for ty in [
         DataType::Integer,
         DataType::Boolean,
         DataType::Varchar(7),
+        DataType::Varchar(65535),
         DataType::BigInt,
         DataType::Decimal,
         DataType::Timestamp,
     ] {
-        let (ref_tag, tag) = wal_type_tag(&ty, &reference);
+        let (ref_bytes, ty_bytes) = wal_type_bytes(&ty, &reference);
         assert_eq!(
             mine(&reference),
-            ref_tag,
-            "this module gives {reference:?} tag {} and the wal gives it {ref_tag}",
+            ref_bytes,
+            "this module encodes {reference:?} as {:?} and the wal encodes it as {ref_bytes:?}",
             mine(&reference)
         );
         assert_eq!(
             mine(&ty),
-            tag,
-            "this module gives {ty:?} tag {} and the wal gives it {tag}",
+            ty_bytes,
+            "this module encodes {ty:?} as {:?} and the wal encodes it as {ty_bytes:?}",
             mine(&ty)
         );
     }
@@ -1042,7 +1099,7 @@ fn the_entry_encoding_transport_will_reuse_round_trips() {
     for (i, c) in every_command().into_iter().enumerate() {
         let e = Entry { term: 2, round: 1 + i as u64, command: c };
         let mut buf = Vec::new();
-        encode_entry(&e, &mut buf);
+        encode_entry(&e, &mut buf).unwrap();
         assert_eq!(decode_entry(&buf).unwrap(), e);
         buf.push(0);
         assert!(decode_entry(&buf).is_err(), "a trailing byte was accepted after an entry");
@@ -1129,4 +1186,402 @@ fn a_long_life_of_appends_truncations_and_checkpoints_stays_consistent() {
         fabric = fabric.restart();
     }
     assert!(!model.is_empty(), "the history ended with nothing in the log, so it proved little");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rules the adversarial review found untested, and the two data-loss windows it found untried
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_live_file_is_the_one_at_the_greater_generation() {
+    // The comparison that decides which file is the log. It is never exercised by an ordinary
+    // reopen -- a retired file carries no header, so the `(Some, None)` arm answers -- which is
+    // exactly why it needs a fixture that puts two valid headers side by side.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 2, 1..=6);
+    let gen1 = fabric.durable_image();
+    assert_eq!(live_file(&gen1), A, "the fixture assumed the first file is initialized live");
+    log.discard_prefix(4, 2).unwrap();
+    let gen2 = fabric.durable_image();
+    assert_eq!(live_file(&gen2), B);
+
+    // A's generation-1 image, which still holds rounds 1..=6 at floor 0, beside B's generation-2
+    // image at floor 4. Both headers validate; only the generation separates them.
+    let both: BTreeMap<String, Vec<u8>> =
+        [(A.to_string(), gen1[A].clone()), (B.to_string(), gen2[B].clone())].into_iter().collect();
+    let f = SimFabric::from_images(both, None, Durability::WriteThrough);
+    let l = open_on(&f).unwrap();
+    assert_eq!(l.live_generation(), 2, "the log opened on the older generation");
+    assert_eq!(l.snapshot_round(), 4);
+    assert_eq!(l.last_round(), 6);
+    assert_eq!(l.entry(5).unwrap(), entry(2, 5));
+    assert_eq!(l.entry(4).unwrap_err(), LogError::Compacted { asked: 4, floor: 4 });
+}
+
+#[test]
+fn a_superseded_file_is_retired_so_a_damaged_header_cannot_rewind_the_log() {
+    // The module header states this as a safety property: once the switch is durable the old file
+    // is emptied, so an unreadable live header is a hard refusal rather than a quiet fall-back to a
+    // generation that has forgotten every round appended since. Nothing enforced it until the
+    // retirement was made durable -- under a device that only makes writes durable at an fsync, an
+    // unsynced `set_len(0)` leaves the whole previous generation on the platter.
+    for durability in [Durability::WriteThrough, Durability::SyncOnly] {
+        let fabric = SimFabric::clean(durability);
+        let mut log = open_on(&fabric).unwrap();
+        fill(&mut log, 7, 1..=8);
+        log.discard_prefix(4, 7).unwrap();
+        // Rounds that exist ONLY in the new generation. These are what a fall-back would forget.
+        fill(&mut log, 7, 9..=12);
+        drop(log);
+
+        let mut images = fabric.restart().durable_image();
+        let live = live_file(&images);
+        let stale = if live == A { B } else { A };
+        assert_eq!(
+            images.get(stale).map_or(0, |b| b.len()),
+            0,
+            "under {durability:?} the superseded file survived the switch, so it is still a \
+             candidate the recovery could fall back to"
+        );
+
+        images.get_mut(live).unwrap()[9] ^= 0xFF;
+        let f = SimFabric::from_images(images, None, durability);
+        match open_on(&f) {
+            Err(LogError::Corrupt(m)) => {
+                assert!(m.contains("refusing to reinitialize"), "unexpected refusal: {m}")
+            }
+            Err(e) => panic!("expected a corruption refusal under {durability:?}, got {e:?}"),
+            Ok(l) => panic!(
+                "under {durability:?} a damaged live header fell back to {l:?}, silently forgetting \
+                 rounds 9..=12"
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_checkpoint_that_cannot_be_made_durable_poisons_rather_than_returning_an_ordinary_error() {
+    // The window: `pwrite` of the generation+1 header returns Ok and reaches the device, then its
+    // fsync fails. The switch has happened on disk and not in memory. A handle that returned a
+    // plain error here and kept going would append rounds into the file it still believes is live,
+    // `sync()` would return Ok, the node would ack them -- and the next open would pick the OTHER
+    // file at the greater generation and come up holding none of them.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 3, 1..=8);
+    let base = fabric.restart().durable_image();
+
+    let census = SimFabric::from_images(base.clone(), None, Durability::WriteThrough);
+    let mut l = open_on(&census).unwrap();
+    let mark = census.op_count();
+    l.discard_prefix(4, 3).unwrap();
+    let spare = if live_file(&base) == A { B } else { A };
+    let header_write = census
+        .trace()
+        .into_iter()
+        .find(|o| {
+            o.index >= mark
+                && o.file == spare
+                && o.kind == OpKind::Pwrite
+                && o.offset == 0
+                && o.len == HEADER_SIZE
+        })
+        .expect("a checkpoint writes the spare's header exactly once");
+
+    // The fault fires at the first faultable op at or above the header write. That is the header
+    // write itself, or -- because the plan cannot name a sync directly -- the fsync behind it.
+    for at in [header_write.index, header_write.index + 1] {
+        let f = SimFabric::from_images(
+            base.clone(),
+            Some(FaultPlan::at_shaped(at, 11, WriteShape::Drop)),
+            Durability::WriteThrough,
+        );
+        let mut broken = open_on(&f).unwrap();
+        let err = broken.discard_prefix(4, 3).unwrap_err();
+        assert!(f.fired().is_some(), "op {at}: no fault fired, so this point tested nothing");
+        assert!(
+            matches!(err, LogError::Poisoned(_)),
+            "a checkpoint that failed at or after the header write returned {err:?} instead of \
+             poisoning; a caller that kept this handle would ack rounds the next open cannot find"
+        );
+        // `check_live` runs before any I/O, so this is the handle refusing and not the storage.
+        assert!(matches!(broken.append(&[entry(3, 9)]), Err(LogError::Poisoned(_))));
+        assert!(matches!(broken.sync(), Err(LogError::Poisoned(_))));
+        assert!(matches!(broken.discard_prefix(6, 3), Err(LogError::Poisoned(_))));
+    }
+}
+
+#[test]
+fn a_failed_fsync_poisons_rather_than_letting_the_next_one_report_success() {
+    // A writeback error is delivered to one fsync and then cleared, and the pages are marked clean.
+    // So the obvious recovery -- call `sync()` again -- returns Ok about bytes that never reached
+    // the device, and would move `durable_round` over exactly the rounds the failure dropped.
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=4);
+    let base = fabric.restart().durable_image();
+
+    let census = SimFabric::from_images(base.clone(), None, Durability::SyncOnly);
+    let mut l = open_on(&census).unwrap();
+    l.append(&[entry(1, 5)]).unwrap();
+    let mark = census.op_count();
+    l.sync().unwrap();
+    let target = census
+        .faultable_ops()
+        .into_iter()
+        .find(|i| *i >= mark)
+        .expect("a sync performs at least one faultable operation");
+
+    let f = SimFabric::from_images(
+        base,
+        Some(FaultPlan::at_shaped(target, 13, WriteShape::Drop)),
+        Durability::SyncOnly,
+    );
+    let mut broken = open_on(&f).unwrap();
+    broken.append(&[entry(1, 5)]).unwrap();
+    let err = broken.sync().unwrap_err();
+    assert!(f.fired().is_some(), "no fault fired, so this test proved nothing");
+    assert!(
+        matches!(err, LogError::Poisoned(_)),
+        "a failed fsync returned {err:?}; a caller that simply retried would be told the rounds are \
+         durable when they are not"
+    );
+    assert_eq!(broken.durable_round(), 4, "a failed fsync advanced the durable frontier");
+    assert!(matches!(broken.sync(), Err(LogError::Poisoned(_))), "a retried fsync reported success");
+}
+
+#[test]
+fn a_torn_first_header_write_does_not_brick_a_log_that_has_nothing_in_it() {
+    // The refusal that protects a full log from being reinitialized over must not fire on a log
+    // whose very first header write was caught by a crash. Frames begin at HEADER_SIZE, so a file
+    // no longer than the header has never held an entry -- that is the boundary, and it is why the
+    // check is `> HEADER_SIZE` rather than `> 0`.
+    let census = SimFabric::clean(Durability::WriteThrough);
+    let _ = open_on(&census).unwrap();
+    let header_write = census
+        .trace()
+        .into_iter()
+        .find(|o| o.kind == OpKind::Pwrite && o.len == HEADER_SIZE)
+        .expect("opening a fresh log writes a header");
+
+    let f = SimFabric::with_fault(
+        FaultPlan::at_shaped(header_write.index, 17, WriteShape::Tear),
+        Durability::WriteThrough,
+    );
+    assert!(open_on(&f).is_err(), "the torn write did not fail the open");
+    let fired = f.fired().expect("no fault fired, so this test proved nothing");
+    assert!(fired.kept > 0 && fired.kept < HEADER_SIZE, "the header write was not torn: {fired:?}");
+
+    let restarted = f.restart();
+    let survivors: usize = restarted.durable_image().values().map(|b| b.len()).sum();
+    assert!(survivors > 0, "nothing survived, so the reopen is not the case this test is about");
+    let l = open_on(&restarted).expect("a torn first header bricked a log that held nothing");
+    assert_eq!(l.last_round(), 0);
+    assert_eq!(l.first_round(), 1);
+}
+
+#[test]
+fn the_scan_refuses_a_frame_longer_than_the_maximum_before_allocating_for_it() {
+    // MAX_FRAME is what stands between a corrupt length field and an eight-megabyte allocation. In
+    // a small file the companion clause `offset + total > file_len` answers first, so this calls
+    // the scan with a file length it does NOT have -- leaving MAX_FRAME as the only clause that can
+    // fire, which is the only way to know it works.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=2);
+    let images = fabric.durable_image();
+    let live = live_file(&images);
+    let frames = frames_in(&images[live]);
+    let mut damaged = images[live].clone();
+    let (off, _) = frames[1];
+    damaged[off..off + 4].copy_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
+
+    let f = SimFabric::from_images(
+        [(live.to_string(), damaged)].into_iter().collect(),
+        None,
+        Durability::WriteThrough,
+    );
+    let st = f.open(live);
+    let scan = scan_frames(&*st, 0, 0, u64::MAX / 2).expect("the scan errored instead of stopping");
+    assert_eq!(
+        scan.frames.len(),
+        1,
+        "the scan accepted a frame claiming {} bytes, over the {MAX_FRAME}-byte maximum",
+        MAX_FRAME + 1
+    );
+}
+
+#[test]
+fn a_header_with_the_wrong_magic_is_not_a_header() {
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=3);
+    let mut images = fabric.durable_image();
+    let live = live_file(&images);
+    {
+        let img = images.get_mut(live).unwrap();
+        img[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let crc = crc32(&img[0..32]);
+        img[32..36].copy_from_slice(&crc.to_be_bytes());
+    }
+    let f = SimFabric::from_images(images, None, Durability::WriteThrough);
+    match open_on(&f) {
+        Err(LogError::Corrupt(m)) => {
+            assert!(m.contains("refusing to reinitialize"), "unexpected refusal: {m}")
+        }
+        other => panic!("a file whose magic is another format's opened as {other:?}"),
+    }
+}
+
+#[test]
+fn a_checkpoint_streams_survivors_larger_than_one_copy_batch() {
+    // The mid-loop flush in `discard_prefix` writes at an offset computed from a running total, and
+    // an off-by-one there would land a megabyte of frames in the wrong place. Nothing smaller than
+    // COPY_BATCH of survivors reaches that branch at all.
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let mut log = open_on(&fabric).unwrap();
+    let big: Vec<Entry> = (1..=40)
+        .map(|r| Entry {
+            term: 1,
+            round: r,
+            command: Command::WalBatch { start_lsn: r, bytes: vec![(r % 251) as u8; 64 * 1024] },
+        })
+        .collect();
+    log.append(&big).unwrap();
+    log.sync().unwrap();
+    assert!(
+        35 * 64 * 1024 > COPY_BATCH,
+        "the fixture's survivors do not exceed one batch, so the flush branch is not reached"
+    );
+    log.discard_prefix(5, 1).unwrap();
+
+    let restarted = fabric.restart();
+    let after = open_on(&restarted).unwrap();
+    assert_eq!(after.snapshot_round(), 5);
+    assert_eq!(after.last_round(), 40);
+    for e in big.iter().filter(|e| e.round > 5) {
+        assert_eq!(&after.entry(e.round).unwrap(), e, "round {} moved in the rewrite", e.round);
+    }
+}
+
+#[test]
+fn a_value_the_length_fields_cannot_express_is_refused_before_it_becomes_durable() {
+    // `wal::log`'s `write_str` writes `s.len() as u16`. A 65536-byte name would be written with a
+    // length prefix of ZERO, and the frame -- crc valid over exactly the bytes intended -- would be
+    // durable and permanently undecodable. Nothing downstream can catch it, because everything
+    // downstream checks the bytes against a checksum of themselves.
+    let too_long = Command::Catalog {
+        op: DdlOp::CreateTable,
+        table: "a".repeat(u16::MAX as usize + 1),
+        columns: Vec::new(),
+    };
+    let mut out = Vec::new();
+    assert!(
+        matches!(
+            encode_command(&too_long, &mut out),
+            Err(LogError::Unrepresentable { what: "table name", .. })
+        ),
+        "a table name too long for the length field was encoded anyway"
+    );
+
+    let too_many = Command::Catalog {
+        op: DdlOp::CreateTable,
+        table: "t".into(),
+        columns: (0..=u16::MAX as usize)
+            .map(|i| (format!("c{i}"), DataType::Integer, false))
+            .collect(),
+    };
+    out.clear();
+    assert!(matches!(
+        encode_command(&too_many, &mut out),
+        Err(LogError::Unrepresentable { what: "column count", .. })
+    ));
+
+    // And through the log, where the refusal has to happen before anything is written.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    assert!(matches!(
+        log.append(&[Entry { term: 1, round: 1, command: too_long }]),
+        Err(LogError::Unrepresentable { .. })
+    ));
+    assert_eq!(log.last_round(), 0, "a refused entry moved the log's end");
+
+    // The boundary is a boundary and not a wall: the longest representable name round trips.
+    let at_the_limit = Command::Catalog {
+        op: DdlOp::CreateTable,
+        table: "a".repeat(u16::MAX as usize),
+        columns: Vec::new(),
+    };
+    log.append(&[Entry { term: 1, round: 1, command: at_the_limit.clone() }]).unwrap();
+    log.sync().unwrap();
+    let restarted = fabric.restart();
+    let after = open_on(&restarted).unwrap();
+    assert_eq!(after.entry(1).unwrap().command, at_the_limit);
+}
+
+#[test]
+fn crossing_into_ferro_error_keeps_a_corruption_a_corruption() {
+    // `into_ferro` is the one deliberate, greppable crossing out of `LogError`. The mapping it
+    // performs is the thing that keeps a damaged log from being reported to an operator as an
+    // ordinary write failure -- and a corruption nobody pages on is the failure mode `FerroError`'s
+    // own doc comment says the `Corruption` variant exists to prevent.
+    assert!(matches!(
+        LogError::Corrupt("bad frame".into()).into_ferro(),
+        FerroError::Corruption(_)
+    ));
+    assert!(matches!(
+        LogError::Compacted { asked: 1, floor: 5 }.into_ferro(),
+        FerroError::Wal(_)
+    ));
+    assert!(matches!(LogError::Io("device".into()).into_ferro(), FerroError::Wal(_)));
+    assert!(matches!(LogError::Poisoned("x".into()).into_ferro(), FerroError::Wal(_)));
+}
+
+#[test]
+fn a_device_error_reading_the_log_is_reported_as_io_and_not_as_corruption() {
+    // `pread_all` and the bounds-checked decoders both speak `FerroError`, and mapping every one of
+    // them to `Corrupt` sends an operator looking for a bad checksum that does not exist.
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    let mut log = open_on(&fabric).unwrap();
+    fill(&mut log, 1, 1..=3);
+    let images = fabric.durable_image();
+    let live = live_file(&images);
+    // Truncate the image so the last frame's bytes are simply not there. The index still points at
+    // them, so the read fails at the device rather than at a checksum.
+    let mut short = images[live].clone();
+    let frames = frames_in(&short);
+    short.truncate(frames[2].0 + 4);
+    let f = SimFabric::from_images(
+        [(live.to_string(), short)].into_iter().collect(),
+        None,
+        Durability::WriteThrough,
+    );
+    let st = f.open(live);
+    let mut buf = vec![0u8; frames[2].1];
+    match read_at(&*st, &mut buf, frames[2].0 as u64) {
+        Err(LogError::Io(_)) => {}
+        other => panic!("a read that ran off the end of the device was reported as {other:?}"),
+    }
+}
+
+#[test]
+fn the_generation_rises_by_one_at_every_checkpoint_and_survives_a_restart() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let mut fabric = fabric;
+    let mut floor = 0u64;
+    let mut expected = 1u64;
+    for step in 0..5u64 {
+        let mut log = open_on(&fabric).unwrap();
+        assert_eq!(log.live_generation(), expected, "step {step}: the generation drifted");
+        let start = floor + log.len() as u64 + 1;
+        log.append(&(start..start + 3).map(|r| entry(1, r)).collect::<Vec<_>>()).unwrap();
+        log.sync().unwrap();
+        floor = start;
+        log.discard_prefix(floor, 1).unwrap();
+        expected += 1;
+        assert_eq!(log.live_generation(), expected);
+        drop(log);
+        fabric = fabric.restart();
+    }
 }

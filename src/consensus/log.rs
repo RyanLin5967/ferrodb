@@ -137,6 +137,17 @@ pub enum LogError {
     TermMismatch { round: Round, held: Term, claimed: Term },
     /// An entry too large for the transport to ever carry. See [`MAX_ENTRY_BYTES`].
     TooLarge { bytes: usize, limit: usize },
+    /// A value the encoding's length fields cannot express.
+    ///
+    /// Its own variant rather than a flavour of [`LogError::TooLarge`], because they are refused
+    /// for opposite reasons: `TooLarge` is a policy — the transport's frame size — while this is
+    /// arithmetic. `write_str` is `wal::log`'s and writes `s.len() as u16`, so a 65536-byte table
+    /// name would be written with a **length prefix of zero** and the frame, complete with a valid
+    /// CRC over exactly the bytes intended, would be durable and permanently undecodable. Silent
+    /// truncation on the way in is the worst shape a bug can have here: nothing downstream can tell
+    /// the difference, because everything downstream checks the bytes against a checksum of
+    /// themselves.
+    Unrepresentable { what: &'static str, len: usize, limit: usize },
     /// Bytes on disk are not what was written, or are a shape this build cannot read.
     Corrupt(String),
     /// The underlying storage refused.
@@ -198,6 +209,11 @@ impl std::fmt::Display for LogError {
                 "an entry of {bytes} bytes is over the {limit}-byte limit, so no follower could \
                  ever be sent it"
             ),
+            LogError::Unrepresentable { what, len, limit } => write!(
+                f,
+                "a {what} of {len} does not fit this encoding's {limit}-wide length field, and \
+                 writing it would truncate the length rather than the value"
+            ),
             LogError::Corrupt(s) => write!(f, "DATA CORRUPTION: {s}"),
             LogError::Io(s) => write!(f, "io error: {s}"),
             LogError::Poisoned(s) => write!(f, "the log is poisoned and refuses to mutate: {s}"),
@@ -207,8 +223,15 @@ impl std::fmt::Display for LogError {
 
 impl std::error::Error for LogError {}
 
-/// The bounds-checked readers in `wal::log` speak [`FerroError`]; every failure they can produce
-/// here is a record that ends mid-field, which is corruption.
+/// **Only the decoders convert this way.** The bounds-checked readers in `wal::log`
+/// (`take_u64`, `take_str`, ...) speak [`FerroError`] and the only failure they can produce is a
+/// record that ends mid-field, which is corruption.
+///
+/// `pread_all`/`pwrite_all` also speak [`FerroError`] and are **not** covered by this: they wrap an
+/// operating-system error, and a failing device reported as `DATA CORRUPTION` sends an operator to
+/// look for a bad checksum that does not exist. Those two go through [`read_at`]/[`write_at`]
+/// instead, which classify as [`LogError::Io`]. That is why every call in this file names one of
+/// those helpers rather than using `?` on the free function.
 impl From<FerroError> for LogError {
     fn from(e: FerroError) -> Self {
         LogError::Corrupt(e.to_string())
@@ -217,6 +240,16 @@ impl From<FerroError> for LogError {
 
 fn io<E: std::fmt::Display>(e: E) -> LogError {
     LogError::Io(e.to_string())
+}
+
+/// A positional read of log bytes, classified as I/O rather than as corruption.
+fn read_at(file: &dyn Storage, buf: &mut [u8], offset: u64) -> Result<(), LogError> {
+    pread_all(file, buf, offset).map_err(io)
+}
+
+/// A positional write of log bytes, classified as I/O rather than as corruption.
+fn write_at(file: &dyn Storage, bytes: &[u8], offset: u64) -> Result<(), LogError> {
+    pwrite_all(file, bytes, offset).map_err(io)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -376,29 +409,38 @@ impl RoundLog {
             lens[i] = files[i].len().map_err(io)?;
             if lens[i] >= HEADER_SIZE as u64 {
                 let mut buf = [0u8; HEADER_SIZE];
-                pread_all(&*files[i], &mut buf, 0)?;
+                read_at(&*files[i], &mut buf, 0)?;
                 headers[i] = Header::decode(&buf)?;
             }
         }
 
         let live = match (headers[0], headers[1]) {
             (None, None) => {
-                // Nothing readable. Initializing is only safe if there is nothing to lose: a file
-                // holding bytes but no valid header is either a compaction a crash caught before
-                // its header (in which case the *other* file is live and we would not be here), or
-                // both headers were destroyed. The second is unrecoverable by this code, and the
-                // one thing it must not do is quietly reinitialize over the entries.
-                if lens[0] > 0 || lens[1] > 0 {
+                // Nothing readable. Initializing is only safe if there is nothing to lose, and the
+                // boundary is exact: **frames begin at `HEADER_SIZE`**, so a file no longer than
+                // the header cannot contain a byte of any entry. Anything longer might, and the one
+                // thing recovery must not do is quietly reinitialize over entries a cluster agreed
+                // to — which is what a garbled header on a full log would otherwise produce, with
+                // no error anywhere.
+                //
+                // The boundary is `>` and not `> 0` for a reason a stricter test would get wrong:
+                // the very first thing a brand-new log does is write this header, and a crash that
+                // tears that write leaves a few bytes and no entries. Refusing there would brick a
+                // log at first start over a file that has never held anything.
+                if lens[0] > HEADER_SIZE as u64 || lens[1] > HEADER_SIZE as u64 {
                     return Err(LogError::Corrupt(format!(
                         "neither round log file carries a readable header, but they hold {} and {} \
-                         bytes; refusing to reinitialize over them",
+                         bytes, which is room for entries; refusing to reinitialize over them",
                         lens[0], lens[1]
                     )));
                 }
                 let h = Header { generation: 1, snapshot_round: 0, snapshot_term: 0 };
+                // Truncated first, so a torn header from an earlier attempt cannot leave trailing
+                // bytes that a later scan would walk into.
+                files[0].set_len(0).map_err(io)?;
                 // Written and fsynced before a single entry may be appended. A header that is not
                 // durable when the entries above it are is a log that reopens as empty.
-                pwrite_all(&*files[0], &h.encode(), 0)?;
+                write_at(&*files[0], &h.encode(), 0)?;
                 files[0].sync_all().map_err(io)?;
                 headers[0] = Some(h);
                 0
@@ -615,9 +657,23 @@ impl RoundLog {
     /// `sync_data` and not `sync_all`: the only metadata that matters is the file's length, which
     /// `fdatasync` is required to flush because the data cannot be read back without it. The WAL's
     /// `flush` makes the same call for the same reason.
+    ///
+    /// **A failed fsync poisons.** Not caution: on Linux a writeback error is reported to *one*
+    /// fsync and then cleared, and the pages are marked clean, so the obvious recovery — call
+    /// `sync()` again — returns `Ok` about bytes that never reached the device and would move
+    /// `durable_round` over rounds the failure dropped. There is no way to retry durability from
+    /// here, so the handle refuses and a reopen re-derives the frontier from what actually survived.
     pub fn sync(&mut self) -> Result<Round, LogError> {
         self.check_live()?;
-        self.files[self.live].sync_data().map_err(io)?;
+        if let Err(e) = self.files[self.live].sync_data() {
+            let why = format!(
+                "an fsync through round {} failed, and a second fsync cannot be trusted to report \
+                 the same failure twice: {e}",
+                self.last_round()
+            );
+            self.poisoned = Some(why.clone());
+            return Err(LogError::Poisoned(why));
+        }
         self.durable_round = self.last_round();
         Ok(self.durable_round)
     }
@@ -723,23 +779,42 @@ impl RoundLog {
             at += raw.len() as u64;
             batch.extend_from_slice(&raw);
             if batch.len() >= COPY_BATCH {
-                pwrite_all(&*dst, &batch, at - batch.len() as u64)?;
+                write_at(&*dst, &batch, at - batch.len() as u64)?;
                 batch.clear();
             }
         }
         batch.extend_from_slice(&[0u8; 4]);
-        pwrite_all(&*dst, &batch, at + 4 - batch.len() as u64)?;
+        write_at(&*dst, &batch, at + 4 - batch.len() as u64)?;
         dst.sync_data().map_err(io)?;
 
-        // 3. The header. Until its fsync returns, the old file is still the live one and the whole
-        //    pre-compaction log is intact.
+        // 3. The header, and **the point of no return**. Until its fsync returns, the old file is
+        //    still the live one and the whole pre-compaction log is intact. From the moment the
+        //    write is issued, whether the switch has happened is no longer something this handle can
+        //    know: a `pwrite` that returned `Ok` reaches the device even if the `fsync` behind it
+        //    reports an error, and on Linux an fsync error is reported once and then cleared, so the
+        //    *next* fsync says `Ok` about bytes that never landed.
+        //
+        //    So a failure here **poisons**. Returning a plain error and carrying on is the shape
+        //    that loses acknowledged data: the caller keeps the handle, appends rounds 11..20 into
+        //    what it believes is the live file, `sync()` returns `Ok(20)` and the node acks them —
+        //    and then a restart finds the *other* file live at the greater generation and comes up
+        //    holding neither. Refusing everything from here and letting a reopen re-derive the
+        //    truth from the bytes is the only answer that cannot lose a round.
         let h = Header {
             generation: self.generation + 1,
             snapshot_round: through,
             snapshot_term: term,
         };
-        pwrite_all(&*dst, &h.encode(), 0)?;
-        dst.sync_all().map_err(io)?;
+        if let Err(e) = write_at(&*dst, &h.encode(), 0).and_then(|()| dst.sync_all().map_err(io))
+        {
+            let why = format!(
+                "a checkpoint at round {through} could not be made durable, so whether the \
+                 generation-{} header is live is no longer knowable from this handle: {e}",
+                h.generation
+            );
+            self.poisoned = Some(why.clone());
+            return Err(LogError::Poisoned(why));
+        }
 
         let stale = self.live;
         self.live = spare;
@@ -750,11 +825,30 @@ impl RoundLog {
         self.end_offset = at;
         self.durable_round = self.last_round();
 
-        // 4. Hygiene, and the error is deliberately dropped. The switch is already durable, so this
-        //    call cannot affect what the log holds; its only job is to give the space back, and the
-        //    very next compaction's step 1 is the same `set_len(0)` on the same file. Reporting a
-        //    failure here would report a compaction that succeeded as one that did not.
-        let _ = self.files[stale].set_len(0);
+        // 4. **Retire the old file, durably.** Not hygiene: while it still carries a valid header it
+        //    is still a candidate to be chosen as live, and the module header's promise that an
+        //    unreadable live header is a hard refusal rather than a quiet rewind rests on it not
+        //    being one. If the newer file's header is later damaged, an old file left intact is
+        //    exactly the "resilient" fall-back that silently forgets every round appended since the
+        //    switch. `set_len(0)` alone is not enough — under a device that only makes writes
+        //    durable at an fsync, an unsynced truncate leaves the previous generation whole on the
+        //    platter.
+        //
+        //    A failure poisons rather than being dropped. The switch itself already succeeded, so
+        //    this is not a success reported as a failure: it is a refusal to keep operating in a
+        //    state whose failure mode is silent. A reopen is unaffected — the new generation is the
+        //    greater one and wins.
+        let retire = self.files[stale]
+            .set_len(0)
+            .and_then(|()| self.files[stale].sync_all());
+        if let Err(e) = retire {
+            let why = format!(
+                "the checkpoint at round {through} is durable, but the superseded file could not be \
+                 retired, so it is still a candidate the recovery could fall back to: {e}"
+            );
+            self.poisoned = Some(why.clone());
+            return Err(LogError::Poisoned(why));
+        }
         Ok(())
     }
 
@@ -795,7 +889,7 @@ impl RoundLog {
 
     fn read_frame(&self, f: &Frame) -> Result<Vec<u8>, LogError> {
         let mut buf = vec![0u8; f.len as usize];
-        pread_all(&*self.files[self.live], &mut buf, f.offset)?;
+        read_at(&*self.files[self.live], &mut buf, f.offset)?;
         Ok(buf)
     }
 
@@ -811,7 +905,7 @@ impl RoundLog {
         let mut buf = Vec::with_capacity(bytes.len() + 4);
         buf.extend_from_slice(bytes);
         buf.extend_from_slice(&[0u8; 4]);
-        pwrite_all(&*self.files[self.live], &buf, offset)?;
+        write_at(&*self.files[self.live], &buf, offset)?;
         Ok(())
     }
 }
@@ -853,13 +947,13 @@ fn scan_frames(
             break;
         }
         let mut len_buf = [0u8; 4];
-        pread_all(file, &mut len_buf, offset)?;
+        read_at(file, &mut len_buf, offset)?;
         let total = u32::from_be_bytes(len_buf) as usize;
         if total < MIN_FRAME || total > MAX_FRAME || offset + total as u64 > file_len {
             break;
         }
         let mut frame = vec![0u8; total];
-        pread_all(file, &mut frame, offset)?;
+        read_at(file, &mut frame, offset)?;
         let stored = u32::from_be_bytes(frame[total - 4..].try_into().unwrap());
         if crc32(&frame[..total - 4]) != stored {
             break;
@@ -882,10 +976,30 @@ fn scan_frames(
 // The frame, and the encoding of a Command
 // ---------------------------------------------------------------------------------------------
 
+/// Every length field in this encoding is narrower than a `usize`, and a cast that silently wraps
+/// is how a value becomes undecodable *after* it is durable. One helper per width, called at every
+/// site that would otherwise write `len as u16` / `len as u32`.
+fn fits_u16(len: usize, what: &'static str) -> Result<u16, LogError> {
+    u16::try_from(len)
+        .map_err(|_| LogError::Unrepresentable { what, len, limit: u16::MAX as usize })
+}
+
+fn fits_u32(len: usize, what: &'static str) -> Result<u32, LogError> {
+    u32::try_from(len)
+        .map_err(|_| LogError::Unrepresentable { what, len, limit: u32::MAX as usize })
+}
+
+/// `write_str` with the guard `wal::log`'s own `write_str` does not have.
+fn put_str(out: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), LogError> {
+    fits_u16(s.len(), what)?;
+    write_str(out, s);
+    Ok(())
+}
+
 /// `total_len | term | round | payload | crc32`, the WAL's shape with a round where its LSN goes.
 fn encode_frame(e: &Entry) -> Result<Vec<u8>, LogError> {
     let mut payload = Vec::new();
-    encode_command(&e.command, &mut payload);
+    encode_command(&e.command, &mut payload)?;
     let total = 4 + 8 + 8 + payload.len() + 4;
     if total > MAX_ENTRY_BYTES {
         return Err(LogError::TooLarge { bytes: total, limit: MAX_ENTRY_BYTES });
@@ -939,10 +1053,10 @@ fn decode_frame(frame: &[u8], round: Round, term: Term) -> Result<Entry, LogErro
 /// This is what `transport.rs` puts inside an `Append`: the log's own framing is a property of the
 /// file, and re-sending a length and a CRC that the transport already provides would be two
 /// answers to one question.
-pub fn encode_entry(e: &Entry, out: &mut Vec<u8>) {
+pub fn encode_entry(e: &Entry, out: &mut Vec<u8>) -> Result<(), LogError> {
     out.extend_from_slice(&e.term.to_be_bytes());
     out.extend_from_slice(&e.round.to_be_bytes());
-    encode_command(&e.command, out);
+    encode_command(&e.command, out)
 }
 
 /// The inverse of [`encode_entry`], refusing trailing bytes.
@@ -959,21 +1073,21 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, LogError> {
 /// Tags are assigned once and never recycled: a tag that changes meaning turns an old log into a
 /// plausible new one. Every arm is written out rather than derived, so adding a variant to
 /// `Command` fails to compile here instead of silently acquiring a tag someone else already used.
-pub fn encode_command(c: &Command, out: &mut Vec<u8>) {
+pub fn encode_command(c: &Command, out: &mut Vec<u8>) -> Result<(), LogError> {
     match c {
         Command::WalBatch { start_lsn, bytes } => {
             out.push(0);
             out.extend_from_slice(&start_lsn.to_be_bytes());
-            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&fits_u32(bytes.len(), "wal batch")?.to_be_bytes());
             out.extend_from_slice(bytes);
         }
         Command::Catalog { op, table, columns } => {
             out.push(1);
-            write_ddl_op(out, op);
-            write_str(out, table);
-            out.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+            write_ddl_op(out, op)?;
+            put_str(out, table, "table name")?;
+            out.extend_from_slice(&fits_u16(columns.len(), "column count")?.to_be_bytes());
             for (name, ty, nullable) in columns {
-                write_str(out, name);
+                put_str(out, name, "column name")?;
                 write_data_type(out, ty);
                 out.push(u8::from(*nullable));
             }
@@ -1023,10 +1137,11 @@ pub fn encode_command(c: &Command, out: &mut Vec<u8>) {
         Command::Checkpoint => out.push(6),
         Command::Membership { config } => {
             out.push(7);
-            write_config(out, config);
+            write_config(out, config)?;
         }
         Command::NoOp => out.push(8),
     }
+    Ok(())
 }
 
 /// The inverse of [`encode_command`].
@@ -1113,17 +1228,18 @@ fn read_command(bytes: &[u8], at: &mut usize) -> Result<Command, LogError> {
 ///
 /// Both lists travel. A configuration that shipped only its voters would arrive as one whose
 /// learners had been removed, and removing a learner is a membership change nobody proposed.
-fn write_config(out: &mut Vec<u8>, cfg: &Config) {
+fn write_config(out: &mut Vec<u8>, cfg: &Config) -> Result<(), LogError> {
     out.extend_from_slice(&cfg.version.to_be_bytes());
     out.extend_from_slice(&cfg.term.to_be_bytes());
-    out.extend_from_slice(&(cfg.members().len() as u32).to_be_bytes());
+    out.extend_from_slice(&fits_u32(cfg.members().len(), "voter count")?.to_be_bytes());
     for n in cfg.members() {
         out.extend_from_slice(&n.0.to_be_bytes());
     }
-    out.extend_from_slice(&(cfg.learners().len() as u32).to_be_bytes());
+    out.extend_from_slice(&fits_u32(cfg.learners().len(), "learner count")?.to_be_bytes());
     for n in cfg.learners() {
         out.extend_from_slice(&n.0.to_be_bytes());
     }
+    Ok(())
 }
 
 fn read_config(bytes: &[u8], at: &mut usize) -> Result<Config, LogError> {
@@ -1168,7 +1284,7 @@ fn take_bytes(bytes: &[u8], at: &mut usize, n: usize) -> Result<Vec<u8>, LogErro
     Ok(slice.to_vec())
 }
 
-fn write_ddl_op(out: &mut Vec<u8>, op: &DdlOp) {
+fn write_ddl_op(out: &mut Vec<u8>, op: &DdlOp) -> Result<(), LogError> {
     match op {
         DdlOp::CreateTable => out.push(0),
         DdlOp::DropTable => out.push(1),
@@ -1177,21 +1293,22 @@ fn write_ddl_op(out: &mut Vec<u8>, op: &DdlOp) {
             match alt {
                 ColumnAlteration::Add { column } => {
                     out.push(0);
-                    write_str(out, column);
+                    put_str(out, column, "column name")?;
                 }
                 ColumnAlteration::Rename { from, to } => {
                     out.push(1);
-                    write_str(out, from);
-                    write_str(out, to);
+                    put_str(out, from, "column name")?;
+                    put_str(out, to, "column name")?;
                 }
                 ColumnAlteration::Retype { column, from } => {
                     out.push(2);
-                    write_str(out, column);
+                    put_str(out, column, "column name")?;
                     write_data_type(out, from);
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn read_ddl_op(bytes: &[u8], at: &mut usize) -> Result<DdlOp, LogError> {
