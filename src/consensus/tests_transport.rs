@@ -1147,9 +1147,26 @@ fn a_frame_with_an_unknown_tag_closes_the_connection_rather_than_being_skipped()
     // is `ConnectionReset`, and anything else is a failure.
     let mut rest = Vec::new();
     match s.read_to_end(&mut rest) {
+        // A clean close, or an abortive one. Both mean the listener closed.
         Ok(0) => {}
-        Ok(n) => panic!("the connection stayed open and sent {n} byte(s): {:?}", &rest[..n.min(16)]),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Ok(n) => panic!("the connection stayed open and sent {n} byte(s): {:?}", &rest[..n.min(16)]),
+        // **The mutant's signature, named explicitly.** A read timeout expiring means the socket is
+        // STILL OPEN with nothing to read — the listener kept the connection after a frame it
+        // cannot route. Reported as that, rather than as "some other error": a mutant run of this
+        // test hit exactly this arm and the old message blamed the read instead of the listener.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            panic!(
+                "the connection was still open after a frame under a tag this listener does not \
+                 route (the read timed out rather than seeing a close), so the reader carried on \
+                 over a stream it cannot claim to be parsing correctly"
+            )
+        }
         Err(e) => panic!("reading after an unroutable frame failed for another reason: {e}"),
     }
 
