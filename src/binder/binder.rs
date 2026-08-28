@@ -1094,6 +1094,44 @@ mod tests {
         }
     }
 
+    /// **E79b rule: the binder carries the prompt through unchanged, and refuses nothing.**
+    ///
+    /// The agent id and run id are refused when blank because they are names a person reads back.
+    /// A prompt is not: its only use is to be hashed, so a blank one is a fact about the run rather
+    /// than a mistake in the statement — and it is the single input that proves the omitted clause
+    /// is not silently the empty string.
+    #[test]
+    fn a_bound_session_carries_the_prompt_verbatim() {
+        match bind_agent("BEGIN AGENT SESSION AS 'a' PROMPT 'top up below reorder';", None).unwrap()
+        {
+            BoundAgentStmt::BeginAgentSession { prompt, .. } => {
+                assert_eq!(prompt.as_deref(), Some("top up below reorder"))
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Absent stays absent; it must not become Some("").
+        match bind_agent("BEGIN AGENT SESSION AS 'a';", None).unwrap() {
+            BoundAgentStmt::BeginAgentSession { prompt, .. } => assert_eq!(prompt, None),
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Empty and blank both bind, unlike a blank agent id or run id.
+        for (sql, want) in [
+            ("BEGIN AGENT SESSION AS 'a' PROMPT '';", ""),
+            ("BEGIN AGENT SESSION AS 'a' PROMPT '   ';", "   "),
+        ] {
+            match bind_agent(sql, None).unwrap() {
+                BoundAgentStmt::BeginAgentSession { prompt, .. } => {
+                    assert_eq!(prompt.as_deref(), Some(want), "{sql}")
+                }
+                other => panic!("expected BeginAgentSession, got {:?}", other),
+            }
+        }
+        assert!(
+            bind_agent("BEGIN AGENT SESSION AS '  ' PROMPT 'p';", None).is_err(),
+            "a blank AGENT id is still refused; only the prompt is exempt"
+        );
+    }
+
     #[test]
     fn test_bind_diff_merge_abandon_default_to_the_session_branch() {
         let current = Some(BranchId::new(2, 0));

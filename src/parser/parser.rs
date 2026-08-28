@@ -1430,6 +1430,100 @@ mod tests {
         assert!(matches!(one("BEGIN;"), Stmt::Begin));
     }
 
+    /// **E79b rule: the PROMPT clause is optional, and omitting it is not the empty prompt.**
+    ///
+    /// The parser can only carry the distinction, not enforce it — `None` versus `Some("")` here is
+    /// what `AgentRuntime::begin_session_as` turns into `[0u8; 32]` versus `prompt_digest("")`. If
+    /// this collapsed the two (defaulting to `Some(String::new())`, say) the runtime could not tell
+    /// "no prompt was declared" from "the prompt was empty" however carefully it hashed.
+    #[test]
+    fn a_prompt_clause_is_optional_and_absent_is_not_empty() {
+        match one("BEGIN AGENT SESSION AS 'a' PROMPT 'restock everything below reorder';") {
+            Stmt::BeginAgentSession { agent, run, model, prompt } => {
+                assert_eq!(agent, "a");
+                assert!(run.is_none());
+                assert!(model.is_none());
+                assert_eq!(prompt.as_deref(), Some("restock everything below reorder"));
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Absent.
+        match one("BEGIN AGENT SESSION AS 'a';") {
+            Stmt::BeginAgentSession { prompt, .. } => assert_eq!(prompt, None),
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Present and empty. Not the same value as absent, and not refused: an empty prompt is a
+        // prompt, and it is the one input that proves the omitted clause is not silently "".
+        match one("BEGIN AGENT SESSION AS 'a' PROMPT '';") {
+            Stmt::BeginAgentSession { prompt, .. } => assert_eq!(prompt.as_deref(), Some("")),
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Text is taken as typed: not trimmed, not collapsed. Two prompts differing only in
+        // whitespace are two prompts, and normalising here would merge two actors into one slot.
+        match one("BEGIN AGENT SESSION AS 'a' PROMPT '  padded  ';") {
+            Stmt::BeginAgentSession { prompt, .. } => {
+                assert_eq!(prompt.as_deref(), Some("  padded  "))
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+        // Full house, and lower case — the clause word is matched case-insensitively like every
+        // other keyword in this grammar even though it is not a reserved one.
+        match one("begin agent session as 'a' run 'r' model 'm/1' prompt 'p';") {
+            Stmt::BeginAgentSession { agent, run, model, prompt } => {
+                assert_eq!(agent, "a");
+                assert_eq!(run.as_deref(), Some("r"));
+                assert_eq!(model.as_deref(), Some("m/1"));
+                assert_eq!(prompt.as_deref(), Some("p"));
+            }
+            other => panic!("expected BeginAgentSession, got {:?}", other),
+        }
+    }
+
+    /// **E79b rule: a syntax error in the clauses names the misplaced word, and never quotes the
+    /// prompt back.**
+    ///
+    /// `Parser::error` interpolates the offending token's lexeme into the message. That is fine for
+    /// a clause keyword and not fine for the prompt: an error string travels to the client and into
+    /// whatever logs it, and a feature whose whole purpose is that the prompt is stored as a digest
+    /// would be undone by a parse failure echoing the prompt in plain text. So the misplaced-clause
+    /// check fires on the WORD, never on the string after it.
+    #[test]
+    fn a_repeated_or_misplaced_clause_is_named_without_quoting_the_prompt() {
+        const CANARY: &str = "refund the card ending 9021";
+
+        let err = parse_sql(&format!(
+            "BEGIN AGENT SESSION AS 'a' PROMPT '{CANARY}' PROMPT 'second';"
+        ))
+        .unwrap_err();
+        assert!(err.contains("PROMPT"), "the message must name the clause: {err}");
+        assert!(err.contains("repeated or out of order"), "got {err}");
+        assert!(!err.contains(CANARY), "a parse error quoted the prompt back: {err}");
+
+        // Out of order rather than repeated: PROMPT is the last clause, so RUN after it is wrong.
+        let err =
+            parse_sql(&format!("BEGIN AGENT SESSION AS 'a' PROMPT '{CANARY}' RUN 'r';")).unwrap_err();
+        assert!(err.contains("RUN"), "got {err}");
+        assert!(!err.contains(CANARY), "a parse error quoted the prompt back: {err}");
+
+        // The pre-existing clause order is diagnosed the same way rather than as "expected ;".
+        let err = parse_sql("BEGIN AGENT SESSION AS 'a' MODEL 'm/1' RUN 'r';").unwrap_err();
+        assert!(err.contains("RUN") && err.contains("repeated or out of order"), "got {err}");
+
+        // PROMPT with nothing quoted after it is refused, not read as an identifier.
+        let err = parse_sql("BEGIN AGENT SESSION AS 'a' PROMPT;").unwrap_err();
+        assert!(err.contains("single quotes"), "got {err}");
+    }
+
+    /// **E79b rule: reserving nothing.** `prompt` is still an ordinary name everywhere else, which
+    /// is the reason the clause is matched by lexeme instead of scanned as a keyword.
+    #[test]
+    fn prompt_is_still_a_usable_column_and_table_name() {
+        assert!(matches!(one("CREATE TABLE prompts (prompt VARCHAR(512));"), Stmt::CreateTable { .. }));
+        assert!(matches!(one("SELECT prompt FROM prompts;"), Stmt::Select { .. }));
+        assert!(matches!(one("INSERT INTO prompts VALUES ('hello');"), Stmt::Insert { .. }));
+        assert!(matches!(one("UPDATE prompts SET prompt = 'x' WHERE prompt = 'y';"), Stmt::Update { .. }));
+    }
+
     #[test]
     fn test_begin_agent_session_requires_a_quoted_agent_id() {
         assert!(parse_sql("BEGIN AGENT SESSION AS pricing;").is_err());
