@@ -848,6 +848,13 @@ impl Consensus {
         // Matched. Skip the leading entries this node already holds — that is what makes a
         // duplicate or a re-sent overlapping suffix idempotent instead of a truncation.
         let entries_len = entries.len();
+        let newest_config = entries
+            .iter()
+            .filter_map(|e| match &e.command {
+                Command::Membership { config } => Some(config.at()),
+                _ => None,
+            })
+            .max();
         let mut i = 0usize;
         let mut conflict: Option<Round> = None;
         while i < entries.len() {
@@ -922,12 +929,25 @@ impl Consensus {
             self.commit = learned;
         }
 
-        // `unjoined` is cleared by an OBSERVABLE and never by a timer: the leader's `commit` is
-        // how many rounds a quorum holds, and this node's `durable` is how many it holds. A
-        // cluster whose log is empty reports zero, so joining an empty cluster clears on the first
-        // append rather than leaving a member that can never stand.
-        if self.unjoined && self.durable >= leader_commit {
-            self.unjoined = false;
+        // **The observable that clears `unjoined`, and this is its only call site.** The rule
+        // itself is F1's (`election.rs::observe_quorum_watermark`) because F1 owns what may
+        // campaign; the *evidence* only ever arrives here, in a leader's `commit`. Keeping a second
+        // copy of the comparison in this file would be two rules that drift; not calling it at all
+        // means no node added to a running cluster can ever campaign, and no test in either lane
+        // can see that.
+        //
+        // The RAW `leader_commit` and not `self.commit`: the latter is already clamped to this
+        // node's own tail, so a node holding nothing would compare zero against zero and clear the
+        // flag it exists to hold.
+        self.observe_quorum_watermark(leader_commit);
+
+        // The other seam: a member has reported a configuration newer than the one this node
+        // holds, so this node now *knows* it is stale and must not campaign until it has caught up.
+        // A `Command::Membership` riding the log is the only form that report takes on this path.
+        // Observing is not applying — `election.rs::apply_config` runs when the round commits, and
+        // that is F5's row.
+        if let Some(at) = newest_config {
+            self.observe_config_at(at);
         }
 
         self.advance_apply(out);

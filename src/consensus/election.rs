@@ -32,7 +32,7 @@
 
 use super::config::{CfgAt, Config};
 use super::replicate::Progress;
-use super::{Action, Body, Command, Consensus, Entry, Message, NodeId, Role, Round, Term};
+use super::{Action, Body, Consensus, Message, NodeId, Role, Round, Term};
 
 #[cfg(test)]
 #[path = "tests_election.rs"]
@@ -150,29 +150,17 @@ impl Consensus {
         ages.get(self.cfg.quorum().saturating_sub(1)).copied().unwrap_or(u32::MAX)
     }
 
-    /// The heartbeat, which is an `Append` carrying no entries.
+    /// The heartbeat, which is an `Append` — carrying entries when the peer is behind, and none
+    /// when it is not.
     ///
-    /// `prev` is this leader's own tail and not the peer's `next - 1`, because `Consensus` holds no
-    /// log — it emits `Action::Persist` and never reads back — so the leader's tail is the only
-    /// position it can name truthfully. A follower that is behind answers `success: false` with a
-    /// `hint`, which is the documented back-up mechanism rather than a special case: "the first
-    /// round the follower *can* accept, so a leader backs up in one step".
-    ///
-    /// Learners are heartbeated too. They receive the log; they are simply never counted.
+    /// This once sent an empty `Append` anchored at the leader's own tail, because `Consensus` held
+    /// no log and the tail was the only position it could name truthfully. `replicate.rs` now holds
+    /// one, so the heartbeat is the ordinary replication path anchored at each peer's own `next`:
+    /// a follower that is behind gets the entries it is missing instead of a refusal it can only
+    /// answer with a `hint`. Learners are included. They receive the log; they are simply never
+    /// counted.
     fn broadcast_heartbeat(&mut self, out: &mut Vec<Action>) {
-        for to in self.peer_ids() {
-            out.push(Action::Send(Message {
-                from: self.self_id,
-                to,
-                term: self.hard.term,
-                body: Body::Append {
-                    prev_round: self.last_round,
-                    prev_term: self.last_term,
-                    entries: Vec::new(),
-                    commit: self.commit,
-                },
-            }));
-        }
+        self.bcast_append(out);
     }
 
     // ---------------------------------------------------------------- vote messages
@@ -425,39 +413,26 @@ impl Consensus {
         self.since_quorum = 0;
         self.since_heartbeat = 0;
 
-        // A new term knows nothing about any peer's log. `matched` starts at zero — the leader has
-        // no evidence — and `next` at its own tail plus one, which is optimism and is corrected by
-        // the first refusal. Quorum is counted over `matched` and never over `next`.
-        self.progress.clear();
-        let next = self.last_round.saturating_add(1);
-        for id in self.peer_ids() {
-            self.progress.insert(
-                id,
-                Progress { next, matched: 0, silent: 0, needs_snapshot: false },
-            );
-        }
-
         out.push(Action::RoleChanged {
             role: Role::Leader,
             term: self.hard.term,
             leader: Some(self.self_id),
         });
 
-        // **The term-establishing entry, and it is required rather than decorative.** Raft §5.4.2
-        // forbids committing an inherited round by counting replicas, so a leader needs a round of
-        // its *own* term to commit before any earlier round may commit as a side effect. Without
-        // it, a leader that is never given a write cannot advance the commit index at all and its
-        // followers never learn what is committed — the cluster is live and stuck at once.
-        let round = self.last_round.saturating_add(1);
-        let entry = Entry { term: self.hard.term, round, command: Command::NoOp };
-        self.last_round = round;
-        self.last_term = self.hard.term;
-        out.push(Action::Persist { entries: vec![entry] });
-
-        // Assert the office immediately rather than on the next heartbeat boundary: every follower
-        // is already counting down, and up to a whole heartbeat interval of that countdown is
-        // avoidable.
-        self.broadcast_heartbeat(out);
+        // Everything replication-shaped belongs to `replicate.rs`, which owns the log, and it does
+        // all three things a new leader must do, in order:
+        //
+        // 1. per-peer progress — `matched` at zero because a new term knows nothing about any
+        //    peer's log, `next` at this leader's tail plus one, which is optimism corrected by the
+        //    first refusal. It does NOT clear the map: the self-keyed entry holds this node's own
+        //    round log, and `progress.clear()` here used to destroy it;
+        // 2. **the term-establishing `NoOp`, required rather than decorative.** Raft §5.4.2 forbids
+        //    committing an inherited round by counting replicas, so a leader needs a round of its
+        //    *own* term to commit before any earlier round may commit as a side effect. Appended
+        //    through `append_own_entry`, so the log and the scalars describing it stay together;
+        // 3. the first `Append` to every peer — immediately, rather than on the next heartbeat
+        //    boundary, because every follower is already counting down.
+        self.on_became_leader(out);
     }
 
     // ---------------------------------------------------------------- the two flags
@@ -472,9 +447,9 @@ impl Consensus {
     /// nothing, with a term one above everybody's.
     // TRANSITIONAL `dead_code` ALLOW — one of the set tracked by ledger row **F-cleanup**.
     //
-    // These three are the seams between F1's rules and the evidence that drives them, and their
-    // callers are not built yet: `replicate.rs` must call `observe_quorum_watermark` and
-    // `observe_config_at`, and the command applier must call `apply_config`. CI builds with
+    // `apply_config`'s caller is not built yet: the command applier that runs a committed
+    // `Command::Membership` is F5's row. (`observe_quorum_watermark` and `observe_config_at` were
+    // in this set too; `replicate.rs` calls both now, so their attributes are gone.) CI builds with
     // `-D dead_code`, so without this the branch cannot be green between one lane landing and the
     // next.
     //
@@ -495,12 +470,17 @@ impl Consensus {
             // Peers may have come or gone. A departed peer's progress is dropped so it cannot be
             // counted; an arrived one starts with no evidence, exactly as at election time.
             let known = self.peer_ids();
-            self.progress.retain(|id, _| known.contains(id));
+            // The self-keyed entry is retained whatever the configuration says, because it holds
+            // this node's own round log (`replicate.rs`) and not a peer record. `peer_ids` excludes
+            // this node, so without the first arm every configuration change would delete the log.
+            let me = self.self_id;
+            self.progress.retain(|id, _| *id == me || known.contains(id));
             let next = self.last_round.saturating_add(1);
             for id in known {
-                self.progress
-                    .entry(id)
-                    .or_insert(Progress { next, matched: 0, silent: 0, needs_snapshot: false });
+                // `..Default::default()` rather than every field by name: `Progress` carries state
+                // that belongs to `replicate.rs` (a divergence latch, and the log in the self
+                // entry), and a literal here would silently need editing each time that changes.
+                self.progress.entry(id).or_insert(Progress { next, ..Default::default() });
             }
             if !self.cfg.contains(self.self_id) {
                 let term = self.hard.term;
@@ -515,7 +495,6 @@ impl Consensus {
     /// Without this a node with an old configuration stands on its own timeout, raises the term,
     /// and fences a healthy leader out of office — repeatedly, in a livelock where no node with an
     /// up-to-date configuration can hold the office and no node without one can win it.
-    #[allow(dead_code)]
     pub(crate) fn observe_config_at(&mut self, at: CfgAt) {
         if at > self.cfg.at() {
             self.behind = true;
@@ -535,7 +514,6 @@ impl Consensus {
     /// **And a cluster with an empty log reports a watermark of zero**, which every node matches —
     /// so joining an empty cluster clears the flag at once and does not leave a member that can
     /// never stand. That case is why the rule is a comparison and not merely "have some rounds".
-    #[allow(dead_code)]
     pub(crate) fn observe_quorum_watermark(&mut self, watermark: Round) {
         if self.unjoined && self.durable >= watermark {
             self.unjoined = false;
