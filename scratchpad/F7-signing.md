@@ -119,6 +119,39 @@ product uses. `NodeOptions::signed_with` closes it, and
 `a_keyless_peer_cannot_raise_the_term_of_a_node_built_through_the_driver` carries both halves: the
 signed node's term does not move, and the identical bytes at an unsigned node do set it to 500.
 
+## Four more, from a second adversarial pass with its own worktree
+
+Two attackers were given their own trees and told to break the thing rather than review it. One
+(`forge-a-tag`) could not forge anything — 914 expected values from CPython's `hmac`, 576 single-bit
+flips, 157 frame splices, 256 near-keys, and a working length-extension forgery demonstrated
+against `sha256(key||msg)` and then failed against this HMAC. That is a clean result and it is
+recorded as one. The other (`load-a-bad-key`) found three defects and one correction.
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M16 | The shape is not checked by name, so a FIFO blocks the open for ever | `a_fifo_named_as_a_key_is_refused_rather_than_hanging_the_node` | `Key::load blocked on a FIFO instead of refusing it — a node pointed at one hangs: Timeout` |
+| M17 | A file of zeros is accepted as a key | `a_key_file_of_zeros_is_refused_because_that_is_what_a_failed_generator_leaves` | `a 32-byte file of zeros must be refused` |
+
+**M16 hung the node rather than refusing it.** Opening a FIFO for reading blocks until a writer
+appears, and the `is_file()` check sat on the descriptor — so control never reached it and a node
+configured with a FIFO as its key path hung at startup with no message. The shape is now checked by
+*name* first. That lookup is deliberately not a security check (the authoritative mode check is
+still `fstat` on the descriptor), so its race with the open does not matter. Note the test carries
+its own 10-second deadline: without one it would *hang* under the mutant rather than fail, and a CI
+job that times out with no message is barely better than the bug.
+
+**M17 was a key nobody chose, passing every rule.** A file of exactly 32 zero bytes is what
+`truncate -s 32`, a sparse copy, or a generation script that wrote nothing and exited 0 leaves
+behind. Every node given it agrees with every other, so the cluster comes up, signs, verifies, and
+reads healthy — on a key an attacker guesses first. Its limit is stated in the code: this is a
+"the generator produced nothing" test, not an entropy test, and 32 identical `0xff` bytes still
+load.
+
+**Two facts about key identity, from the same pass, that are RFC 2104 consequences rather than
+defects** — both now in the module header, because an operator rotating a key needs them: a key and
+the same key zero-padded to at most 64 bytes are the *same key*; and a key longer than 64 bytes and
+its own SHA-256 are the *same key*. Appending NULs to a key file is not a rotation.
+
 ## A correction to this file's own method
 
 The first run of the M12/M13 harness was made against a tree with **uncommitted** work in it. The

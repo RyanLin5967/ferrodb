@@ -444,6 +444,65 @@ fn a_key_file_under_thirty_two_bytes_is_refused() {
 }
 
 #[test]
+fn a_key_file_of_zeros_is_refused_because_that_is_what_a_failed_generator_leaves() {
+    // **Found by an adversarial pass, and the length rule alone could not see it.** A file of
+    // exactly 32 zero bytes is what `truncate -s 32`, a sparse copy, or a key-generation script
+    // that wrote nothing and exited 0 leaves behind. It passes every other check here, and every
+    // node given it agrees with every other one — so the cluster comes up, signs, verifies, and
+    // looks healthy while its key is a value nobody chose and anybody can guess.
+    let dir = tempfile::tempdir().unwrap();
+    for n in [32usize, 33, 64, 100] {
+        let p = write_key_file(dir.path(), &format!("z{n}"), &vec![0u8; n]);
+        let err = load_for_rule_under_test(&p)
+            .err()
+            .unwrap_or_else(|| panic!("a {n}-byte file of zeros must be refused"));
+        let text = err.to_string();
+        assert!(text.contains("zero bytes"), "the error must name what it saw: {text}");
+        assert!(text.contains("/dev/urandom"), "the error must name the fix: {text}");
+    }
+
+    // The anti-vacuity half: one non-zero byte anywhere makes it a key again, so this rule refuses
+    // the failed-generator shape and not "keys that contain zeros".
+    for at in [0usize, 1, 16, 31] {
+        let mut bytes = vec![0u8; 32];
+        bytes[at] = 1;
+        let p = write_key_file(dir.path(), &format!("nz{at}"), &bytes);
+        load_for_rule_under_test(&p)
+            .unwrap_or_else(|e| panic!("a key with a non-zero byte at {at} must load: {e}"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_as_a_key_is_refused_rather_than_hanging_the_node() {
+    // **Found by an adversarial pass.** Opening a FIFO for reading blocks until a writer appears,
+    // so a node configured with one as its key path used to hang at startup for ever — the
+    // `is_file()` check sat on the descriptor, and control never reached it. Refusing by name
+    // before the open is what makes this a refusal instead of a silent hang.
+    //
+    // The test would hang rather than fail if the rule were removed, so it carries its own
+    // deadline: the load runs on a thread and this asserts it finished. A test that hangs is a CI
+    // job that times out with no message, which is barely better than the bug.
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("k");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable to test this");
+    assert!(status.success(), "mkfifo failed");
+
+    let p = fifo.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Key::load(&p).is_err());
+    });
+    let refused = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("Key::load blocked on a FIFO instead of refusing it — a node pointed at one hangs");
+    assert!(refused, "a FIFO is not a regular file and must be refused");
+}
+
+#[test]
 fn a_missing_key_file_is_refused_rather_than_leaving_the_node_unsigned() {
     let dir = tempfile::tempdir().unwrap();
     let err = load_for_rule_under_test(&dir.path().join("nothing-here")).expect_err("must refuse");
@@ -644,6 +703,75 @@ fn a_symlink_cannot_launder_a_key_out_of_a_world_writable_directory() {
          path must still refuse — otherwise the node signs and verifies with the attacker's key"
     );
     chmod(&open, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn no_hop_of_the_symlink_chain_escapes_the_directory_rule() {
+    // **This broke my first fix, deterministically, and an adversarial pass found it.** Checking
+    // the path as given and the canonicalised path checks the two ENDPOINTS of resolution and no
+    // hop in between — and `canonicalize` collapses the chain, so the middle is invisible to it:
+    //
+    //     safe/cluster.key   parent 0700   <- the path as given: checked
+    //       -> open/k        parent 0777   <- checked by NOBODY
+    //         -> known       parent 0700   <- the canonicalised path: checked
+    //
+    // What makes it worse than a wrong verdict is that **the attacker never authors a key file**.
+    // They rename a symlink over the middle name, pointing it at a file the node can already read,
+    // and the mode check passes because it inspects that file's own 0600. Nothing about ownership
+    // or mode can catch that; only the directory rule can, and it was not running on `open/`.
+    let root = tempfile::tempdir().unwrap();
+    let safe = root.path().join("safe");
+    let open = root.path().join("open");
+    let other = root.path().join("other");
+    for d in [&safe, &open, &other] {
+        std::fs::create_dir(d).unwrap();
+    }
+
+    // `known` is any file the node can already read: node-owned, 0600, in a private directory.
+    let known = write_key_file(&other, "known", &key_bytes(53));
+    let middle = open.join("k");
+    std::os::unix::fs::symlink(&known, &middle).unwrap();
+    let entry = safe.join("cluster.key");
+    std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+    chmod(&safe, 0o700);
+    chmod(&other, 0o700);
+
+    chmod(&open, 0o700);
+    let ok = Key::load(&entry).expect("every hop closed: the chain loads");
+    assert_eq!(ok.tag(b"probe"), a_key(53).tag(b"probe"), "and it is the key at the end of it");
+
+    // The only change is the MIDDLE hop's directory. Both endpoints are still 0700.
+    chmod(&open, 0o777);
+    let err = Key::load(&entry).expect_err(
+        "the middle hop sits in a 0777 directory: an attacker who can write there repoints it at \
+         any file this node can read, without ever authoring a key",
+    );
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    assert!(
+        err.to_string().contains("open"),
+        "the error must name the directory that is open, not one of the safe endpoints: {err}"
+    );
+    chmod(&open, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_cycle_is_refused_rather_than_followed() {
+    // The walk is bounded, so a cycle is a refusal instead of a hang or an ELOOP from somewhere
+    // deeper. Named here because the bound is the thing that makes the walk safe to write at all.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let err = Key::load(&a).expect_err("a symlink cycle must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("cycle") || text.contains("could not be inspected"),
+        "the refusal must say what it met: {text}"
+    );
 }
 
 #[cfg(unix)]

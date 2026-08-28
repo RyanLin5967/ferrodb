@@ -88,6 +88,18 @@
 //!   write to as fast as the network allows, so a forgery probability of 2^-64 *per attempt* is a
 //!   budget, not a bound. A 256-bit tag costs 32 bytes on a frame whose limit is 8 MiB.
 //!
+//! # Two key files can be one key, which matters when rotating
+//!
+//! Consequences of RFC 2104's key preparation, not defects, but an operator changing a key should
+//! know them because neither is a change:
+//!
+//! * **A key and the same key zero-padded to at most 64 bytes are the same key.** Appending NULs to
+//!   a 32-byte key file mints identical tags, and each file verifies the other's frames. (A
+//!   trailing *newline* is not in this class — `0x0a` is not padding.)
+//! * **A key longer than 64 bytes and its own SHA-256 are the same key**, because that is exactly
+//!   the substitution RFC 2104 specifies for an over-long key. Exactly 64 bytes is not in the class;
+//!   the rule is strictly greater than the block.
+//!
 //! # The key file
 //!
 //! Read from a **file**, never from a command-line value: an argument is in the process list, which
@@ -357,6 +369,32 @@ impl Key {
     /// never reaches this process's memory.
     pub fn load_with(path: impl AsRef<Path>, check: PermissionCheck) -> Result<Key, FerroError> {
         let path = path.as_ref();
+        // **The shape is checked by NAME, before the file is opened.** Not redundant with the
+        // `is_file` on the descriptor below, and not a security check: opening a FIFO for reading
+        // **blocks until a writer appears**, so a node configured with a FIFO as its key path hung
+        // at startup for ever instead of refusing — found by an adversarial pass. `is_file()` on
+        // the descriptor cannot help, because control never reaches it.
+        //
+        // The race between this lookup and the open below does not matter, precisely because this
+        // is a shape check: the authoritative mode check is still `fstat` on the descriptor, and
+        // that descriptor's own `is_file` is kept below so the name-based answer is never trusted
+        // on its own. `fs::metadata` follows symlinks, so a link to a FIFO is caught here too.
+        let shape = fs::metadata(path).map_err(|e| {
+            FerroError::Io(format!(
+                "the consensus signing key at {} could not be inspected: {e}. A node configured to \
+                 sign its traffic and unable to load its key refuses to start rather than falling \
+                 back to sending unsigned frames",
+                path.display()
+            ))
+        })?;
+        if !shape.is_file() {
+            return Err(FerroError::Io(format!(
+                "{} is not a regular file, so it cannot be a signing key. Refused here, by name, \
+                 rather than after opening it: a FIFO blocks its opener until a writer appears, so \
+                 a node pointed at one would hang at startup instead of telling anybody why.",
+                path.display()
+            )));
+        }
         let mut file = fs::File::open(path).map_err(|e| {
             FerroError::Io(format!(
                 "the consensus signing key at {} could not be opened: {e}. A node configured to \
@@ -385,6 +423,30 @@ impl Key {
         file.read_to_end(&mut bytes).map_err(|e| {
             FerroError::Io(format!("the consensus signing key at {} could not be read: {e}", path.display()))
         })?;
+        // **A file of zeros is what a failed generator leaves behind, and it passes every other
+        // rule here.** `truncate -s 32 cluster.key`, a sparse copy, or a script that wrote nothing
+        // and exited 0 all produce a file of exactly the right length holding a key nobody chose —
+        // and every node given it agrees with every other, so the cluster comes up and looks
+        // healthy. Found by an adversarial pass. Refused, for the same reason a run that collected
+        // nothing has not passed.
+        //
+        // **The limit of this check, stated rather than implied:** it is a "the generator produced
+        // nothing" test, not an entropy test. A key of 32 identical `0xff` bytes, or a passphrase
+        // somebody typed, is accepted. Judging randomness is not something this can do, and a check
+        // that pretended to would be worse than one that says what it is.
+        if !bytes.is_empty() && bytes.iter().all(|b| *b == 0) {
+            let n = bytes.len();
+            let mut bytes = bytes;
+            wipe(&mut bytes);
+            return Err(FerroError::Io(format!(
+                "the consensus signing key at {} is {n} zero bytes. That is not a key — it is what \
+                 `truncate`, a sparse copy, or a generator that wrote nothing and exited 0 leaves \
+                 behind, and its length alone cannot tell it from a real one. Generate one with \
+                 `head -c 32 /dev/urandom > {}`",
+                path.display(),
+                path.display()
+            )));
+        }
         if bytes.len() < MIN_KEY_BYTES {
             // The length is named; the bytes are not, here or anywhere else in this module.
             let n = bytes.len();
@@ -576,41 +638,82 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
 
 /// Every directory whose contents could be swapped for the key this path names.
 ///
-/// Deduplicated, because for an ordinary file the two are the same directory and reporting it twice
-/// would produce two identical refusals for one problem.
+/// **A walk of the resolution chain, hop by hop — not the two endpoints.** Checking only the
+/// endpoints was a fix that looked right and was broken deterministically by an adversarial pass:
+///
+/// ```text
+/// safe/cluster.key   parent 0700   <- the path as given: checked
+///   -> open/k        parent 0777   <- an intermediate name: checked by NOBODY
+///     -> known       parent 0700   <- the canonicalised path: checked
+/// ```
+///
+/// `canonicalize` collapses the whole chain, so its parent is the *final* target's directory and
+/// every hop between the two ends is invisible to it. An attacker who can write to `open/` renames
+/// a symlink over that middle name, pointing it at any file the node can already read — a rotated
+/// key, a fixture, a log — and the mode check passes, because it inspects that file's own `0600`.
+/// **The attacker never authors a key file at all**, so nothing about ownership or mode catches
+/// them: the lever is redirection, not authorship, and only the directory rule can stop it.
+///
+/// So every name in the chain has its directory checked, because every one of them is a name
+/// somebody with write access to its directory could repoint.
+///
+/// **This part is necessarily by NAME, and that is a real asymmetry worth stating.** The *mode*
+/// check is `fstat` on the descriptor the key is read from and cannot be raced. This cannot be:
+/// `std` offers no way to ask "which directory holds the inode behind this descriptor", so the
+/// chain is walked as strings. What that costs is a race — the chain could change between this walk
+/// and the open — and what it buys is the only defence against the redirection above. The race
+/// needs write access to a directory in the chain, which is exactly what this refuses.
 #[cfg(unix)]
 fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
+    /// Bounded so a symlink cycle is refused rather than looped on. `std` would report `ELOOP`
+    /// eventually; this reports it as what it is, before spending the syscalls.
+    const MAX_HOPS: usize = 40;
+
     let mut out: Vec<PathBuf> = Vec::new();
-
-    // The directory the NAME sits in. `Path::parent` of a bare relative name is `Some("")`, which
-    // means the CURRENT directory and not "there is no directory" — filtering that out as
-    // nothing-to-check made the *spelling* of the path decide whether this rule ran at all.
-    // `None` is the only case with genuinely nothing above it: a path that is a root.
-    match path.parent() {
-        None => {}
-        Some(p) if p.as_os_str().is_empty() => out.push(PathBuf::from(".")),
-        Some(p) => out.push(p.to_path_buf()),
-    }
-
-    // The directory the INODE sits in, which is a different directory exactly when a symlink is
-    // involved. Refused rather than skipped if the path cannot be resolved: this whole function
-    // exists to answer "who could swap this file", and a build that cannot resolve the name cannot
-    // answer it.
-    let real = fs::canonicalize(path).map_err(|e| {
-        FerroError::Io(format!(
-            "the consensus signing key at {} could not be resolved to a real path: {e}. Refused \
-             rather than assumed safe: a symlink's own directory says nothing about who can replace \
-             the file it points at, so the target's directory has to be inspected too.",
-            path.display()
-        ))
-    })?;
-    if let Some(p) = real.parent() {
-        let p = p.to_path_buf();
-        if !out.contains(&p) {
-            out.push(p);
+    let mut current = path.to_path_buf();
+    for hop in 0..MAX_HOPS {
+        // `Path::parent` of a bare relative name is `Some("")`, which means the CURRENT directory
+        // and NOT "there is no directory". Treating the empty parent as nothing-to-check made the
+        // *spelling* of the path decide whether this rule ran at all.
+        let dir = match current.parent() {
+            // A root. It has no parent to inspect, and it is not a file either, so the shape check
+            // has already refused it.
+            None => break,
+            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
+            Some(p) => p.to_path_buf(),
+        };
+        if !out.contains(&dir) {
+            out.push(dir.clone());
         }
+
+        // `symlink_metadata` does NOT follow, which is the point: this asks what `current` itself
+        // is, so a link is seen as a link rather than as the file at the end of it.
+        let link_meta = fs::symlink_metadata(&current).map_err(|e| {
+            FerroError::Io(format!(
+                "hop {hop} of the consensus signing key's path, {}, could not be inspected: {e}. \
+                 Refused rather than assumed safe: an unwalkable chain is one whose directories \
+                 cannot be shown to be closed.",
+                current.display()
+            ))
+        })?;
+        if !link_meta.file_type().is_symlink() {
+            return Ok(out);
+        }
+        let target = fs::read_link(&current).map_err(|e| {
+            FerroError::Io(format!(
+                "the symlink at {} could not be read: {e}",
+                current.display()
+            ))
+        })?;
+        // A relative target resolves against the directory the LINK sits in, not the process's cwd.
+        current = if target.is_absolute() { target } else { dir.join(target) };
     }
-    Ok(out)
+    Err(FerroError::Io(format!(
+        "the consensus signing key at {} is behind more than {MAX_HOPS} symlinks, or behind a \
+         cycle of them. Refused rather than followed: a chain nobody can walk is a chain whose \
+         directories nobody can show are closed.",
+        path.display()
+    )))
 }
 
 /// The mode rule for one directory holding a key.
