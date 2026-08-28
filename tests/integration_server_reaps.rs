@@ -549,6 +549,60 @@ fn a_live_lease_survives_a_server_that_scans_continuously() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// The cooperative door: a branch that ENDS must give its pages back too.
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_merged_branch_gives_its_extent_back_without_any_lease_scan() {
+    // The quieter half of what F11 wired. `AgentRuntime::seal` has two paths, and without a reaper
+    // attached it takes the one that marks a merged or abandoned branch `Reaped` through the
+    // `BranchCatalog` trait and **never frees the extents the branch allocated**. Both shipped
+    // binaries were on that path, so every `MERGE` and every `ABANDON` leaked the branch's pages
+    // until the file was rebuilt.
+    //
+    // `NEVER_SCAN_MILLIS` is the whole point: no lease scan can fire, so what is measured here is
+    // the reaper being attached to the runtime and nothing else.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("merged.db");
+    cli_run(
+        &db,
+        NEVER_SCAN_MILLIS,
+        "CREATE TABLE inv (id INTEGER NOT NULL, qty INTEGER);\n\
+         INSERT INTO inv VALUES (1, 10);\n",
+    );
+    let baseline = arena_state(&db);
+
+    let out = cli_run(
+        &db,
+        NEVER_SCAN_MILLIS,
+        "BEGIN AGENT SESSION AS 'pricing' RUN 'r_1';\n\
+         INSERT INTO inv VALUES (2, 20);\n\
+         MERGE;\n",
+    );
+    assert!(out.contains("Clean"), "a merge with no competing write was not Clean:\n{out}");
+    assert!(!out.contains("lease: reaped"), "a lease scan fired and stole the claim:\n{out}");
+
+    let after = arena_state(&db);
+    let branch = after.only_agent_branch();
+    assert_eq!(branch.state, BranchState::Reaped, "the merged branch was not retired");
+    assert!(branch.arenas.is_empty(), "the merged branch still holds arenas: {:?}", branch.arenas);
+    assert!(
+        !after.arenas.iter().any(|(_, owner)| owner.id == branch.branch_id.id),
+        "the store still lists an extent owned by the merged branch: {:?}",
+        after.arenas
+    );
+    // `reserved` and not `live`: publishing the merged row writes into TRUNK's own tree, which
+    // legitimately leaves trunk holding more pages than the baseline. What must come back is the
+    // *branch's* extent, and that is exactly what this number counts.
+    assert_eq!(
+        after.reserved, baseline.reserved,
+        "the merged branch's extent never went back to the free space map ({} at baseline, {} \
+         after the merge): every MERGE leaks it",
+        baseline.reserved, after.reserved
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
 // A crash mid-reap must not strand a branch.
 // ------------------------------------------------------------------------------------------------
 
