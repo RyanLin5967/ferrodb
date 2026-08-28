@@ -327,6 +327,26 @@ impl<const D: u32> RefNode<D> {
                 out.push(self.send(m.from, self.term, Body::PreVoteResp { granted }));
             }
             Body::PreVoteResp { granted } => {
+                // **A refused pre-vote carries a real term, and this is the only place it can be
+                // acted on.** `mod.rs` exempts every `PreVoteResp` from the "a later term takes its
+                // receiver with it" rule, which is right for a *granted* one — that is an answer
+                // about a hypothetical term nobody has entered. A *refusal* is different: the
+                // responder is saying "my term is already at least as high as the one you asked
+                // about", and that term is real.
+                //
+                // Without this, a node that restarts behind the cluster can only learn the current
+                // term from an `Append` or a `RequestVote`, so if no leader is reachable it is
+                // stuck for ever: its pre-votes are refused for being at a term nobody considers
+                // future, and it never raises its own. The simulator deadlocked on exactly that in
+                // figure 8 step 4 — four live nodes, two with the only complete log and a stale
+                // term, two with a short log and the current term, and no election possible in
+                // either direction. This is a **finding about the contract**, not a licence to
+                // ignore it: the exemption in `mod.rs` is deliberate, so the handler carries the
+                // repair. F1 has to do the same thing in `on_vote_msg`.
+                if !granted && m.term > self.term {
+                    self.become_follower(m.term, None, out);
+                    return;
+                }
                 if self.role != Role::PreCandidate {
                     return;
                 }
@@ -880,3 +900,501 @@ fn the_safety_properties_hold_under_partitions_alone() {
     );
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// The mutants: every detector forced to fire, and then required to stay quiet
+// ---------------------------------------------------------------------------------------------
+
+/// Run a mutant until it trips something, and insist that it did.
+///
+/// Returns the violation so the caller can name the seed in the test output — which is the whole
+/// point of the exercise: a detector that fires without saying which seed is a detector nobody can
+/// act on.
+fn expect_fires<P: Peer>(defect: &str, want: &[&str], seeds: u64, cfg: &SimConfig) -> Violation {
+    let s = sweep::<P>(SEED_MUTANT, seeds, cfg);
+    let v = s.violation.unwrap_or_else(|| {
+        panic!(
+            "the {defect} mutant survived {} seeds ({} elections, {} committed rounds). A detector \
+             that cannot be made to fire is not a detector: {:?}",
+            s.seeds_run, s.totals.elections, s.totals.committed_rounds, s.totals
+        )
+    });
+    assert!(
+        want.contains(&v.rule),
+        "the {defect} mutant tripped {:?}, which is not one of the rules this defect is supposed \
+         to break ({want:?}). A detector firing for the wrong reason is not evidence.\n{v}",
+        v.rule
+    );
+    eprintln!(
+        "MUTANT {defect}: killed on seed {} at unit {} after {} seeds -- {}\n  {}",
+        v.seed, v.at, s.seeds_run, v.rule, v.detail
+    );
+    v
+}
+
+/// The quiet half. The same sweep with every rule intact must find nothing.
+fn expect_correct_is_quiet(defect: &str, seeds: u64, cfg: &SimConfig) {
+    let s = sweep::<Correct>(SEED_MUTANT, seeds, cfg);
+    expect_quiet(&s, &format!("{defect}: the rule restored"));
+}
+
+/// **Raft §5.4.1.** A vote granted to a candidate whose log is behind loses acknowledged data.
+#[test]
+fn removing_the_election_restriction_is_caught_and_the_seed_is_named() {
+    let cfg = chaos_cfg();
+    expect_fires::<RefNode<D_NO_RESTRICTION>>(
+        "no election restriction",
+        &[
+            "a new leader was missing a committed round",
+            "two different commands were committed at one round",
+            "a committed round was dropped from a node's log",
+            "a committed round was overwritten",
+        ],
+        200,
+        &cfg,
+    );
+    expect_correct_is_quiet("no election restriction", 200, &cfg);
+}
+
+/// Quorum counted over `Progress::next` — optimism — commits rounds nobody holds.
+#[test]
+fn counting_quorum_over_next_instead_of_matched_is_caught_and_the_seed_is_named() {
+    let cfg = chaos_cfg();
+    expect_fires::<RefNode<D_QUORUM_OVER_NEXT>>(
+        "quorum over next",
+        &[
+            "two different commands were committed at one round",
+            "a committed round was dropped from a node's log",
+            "a committed round was overwritten",
+            "a new leader was missing a committed round",
+            "a node applied a round it does not hold",
+        ],
+        200,
+        &cfg,
+    );
+    expect_correct_is_quiet("quorum over next", 200, &cfg);
+}
+
+/// A follower that acknowledges a round it has not fsynced turns a correlated power loss into
+/// acknowledged data loss. Caught structurally, at the moment the acknowledgement leaves the state
+/// machine, rather than statistically after a crash — so it does not need luck to fire.
+#[test]
+fn acknowledging_an_append_before_the_fsync_is_caught_and_the_seed_is_named() {
+    let cfg = chaos_cfg();
+    expect_fires::<RefNode<D_ACK_ON_RECEIPT>>(
+        "ack on receipt",
+        &["an append was acknowledged before it was durable"],
+        20,
+        &cfg,
+    );
+    expect_correct_is_quiet("ack on receipt", 20, &cfg);
+}
+
+/// `PersistHardState` must reach the disk before the `Send` of any vote. A node that votes, crashes
+/// and forgets the vote can vote twice in one term, which elects two leaders of that term.
+#[test]
+fn sending_a_vote_before_its_hard_state_is_durable_is_caught_and_the_seed_is_named() {
+    let cfg = chaos_cfg();
+    expect_fires::<RefNode<D_NO_VOTE_FSYNC>>(
+        "no hard-state fsync before a vote",
+        &["a vote was sent before its hard state was durable"],
+        20,
+        &cfg,
+    );
+    expect_correct_is_quiet("no hard-state fsync before a vote", 20, &cfg);
+}
+
+/// One vote per term. Two grants in one term is the two-leader bug arriving through the front door.
+#[test]
+fn voting_twice_in_one_term_is_caught_and_the_seed_is_named() {
+    let cfg = chaos_cfg();
+    expect_fires::<RefNode<D_VOTE_TWICE>>(
+        "vote twice in a term",
+        &[
+            "two leaders in one term",
+            "two different commands were committed at one round",
+            "a committed round was dropped from a node's log",
+            "a committed round was overwritten",
+            "a new leader was missing a committed round",
+        ],
+        200,
+        &cfg,
+    );
+    expect_correct_is_quiet("vote twice in a term", 200, &cfg);
+}
+
+/// The replay promise, tested rather than asserted: a violation's seed, fed back in, produces the
+/// same violation at the same instant — and this time with the trace attached.
+#[test]
+fn a_failing_seed_replays_to_the_same_failure_with_a_trace() {
+    let cfg = chaos_cfg();
+    let first = expect_fires::<RefNode<D_ACK_ON_RECEIPT>>(
+        "ack on receipt (for replay)",
+        &["an append was acknowledged before it was durable"],
+        20,
+        &cfg,
+    );
+    assert!(first.trace.is_empty(), "fixture: a sweep should not be paying for tracing");
+
+    let again = Sim::<RefNode<D_ACK_ON_RECEIPT>>::replay(first.seed, cfg)
+        .expect_err("the replay of a failing seed did not fail");
+    assert_eq!(again.rule, first.rule, "the replay tripped a different rule");
+    assert_eq!(again.at, first.at, "the replay failed at a different instant");
+    assert_eq!(again.detail, first.detail, "the replay failed with a different detail");
+    assert!(
+        !again.trace.is_empty(),
+        "the replay produced no trace, so a failing seed still cannot be looked at"
+    );
+    eprintln!("REPLAY seed {} reproduced at unit {} with {} trace lines", again.seed, again.at, again.trace.len());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scripted scenarios — the rules a random fault process reaches too rarely to be evidence
+// ---------------------------------------------------------------------------------------------
+
+/// A network that does nothing wrong and a fault process that does nothing at all: the scenario
+/// tests below break the cluster themselves, at instants they choose.
+fn scripted() -> SimConfig {
+    let mut c = SimConfig::scripted(5, 0);
+    c.trace = false;
+    c
+}
+
+/// Advance a unit at a time until `f` holds, or give up. Unit granularity because a role change and
+/// the messages it emits are separated by less than one tick.
+fn advance_until<P: Peer>(
+    sim: &mut Sim<P>,
+    units: u64,
+    mut f: impl FnMut(&Sim<P>) -> bool,
+) -> Result<bool, Violation> {
+    for _ in 0..units {
+        if f(sim) {
+            return Ok(true);
+        }
+        sim.run_units(1)?;
+    }
+    Ok(f(sim))
+}
+
+fn wait_for_leader<P: Peer>(sim: &mut Sim<P>, ticks: u64) -> Result<Option<NodeId>, Violation> {
+    advance_until(sim, ticks * UNITS_PER_TICK, |s| s.leader().is_some())?;
+    Ok(sim.leader())
+}
+
+/// **`DISTRIBUTED.md` exit criterion 4.** A partitioned leader cannot commit, and demotes itself on
+/// its own lease without being told.
+#[test]
+fn a_partitioned_leader_demotes_itself_before_anybody_tells_it() {
+    let mut sim = Sim::<Correct>::new(11, scripted());
+    let l = wait_for_leader(&mut sim, 60).unwrap().expect("fixture: nobody was elected");
+    let lease = 8u64; // `Consensus::new`: election_base - 2, and `RefNode` draws the same window.
+    sim.isolate(l);
+    let demoted = advance_until(&mut sim, (lease + 4) * UNITS_PER_TICK, |s| {
+        s.role_of(l) != Some(Role::Leader)
+    })
+    .unwrap();
+    assert!(
+        demoted,
+        "{l} still believed it led {} ticks after losing every peer; its lease is {lease}",
+        lease + 4
+    );
+    let next = wait_for_leader(&mut sim, 80).unwrap();
+    assert!(next.is_some(), "the majority never elected a replacement for {l}");
+    assert_ne!(next, Some(l), "the isolated node was somehow re-elected");
+}
+
+/// **The asymmetric case.** Only the *acknowledgements* are cut off: the leader's heartbeats still
+/// arrive, so no peer times out and nobody will ever tell this leader it has been replaced. It has
+/// to work that out from its own lease, which is the whole reason the lease exists.
+#[test]
+fn a_leader_whose_acknowledgements_are_cut_off_one_way_still_gives_up_the_office() {
+    let mut sim = Sim::<Correct>::new(23, scripted());
+    let l = wait_for_leader(&mut sim, 60).unwrap().expect("fixture: nobody was elected");
+    sim.isolate_inbound(l);
+    let demoted =
+        advance_until(&mut sim, 14 * UNITS_PER_TICK, |s| s.role_of(l) != Some(Role::Leader))
+            .unwrap();
+    assert!(
+        demoted,
+        "{l} kept the office while hearing from nobody, because its own heartbeats kept its peers \
+         from ever telling it"
+    );
+
+    // And the mutant does not, which is what makes the assertion above a claim about the rule
+    // rather than about the scenario.
+    let mut broken = Sim::<RefNode<D_NO_LEASE>>::new(23, scripted());
+    let bl = wait_for_leader(&mut broken, 60).unwrap().expect("fixture: nobody was elected");
+    broken.isolate_inbound(bl);
+    let broken_demoted =
+        advance_until(&mut broken, 14 * UNITS_PER_TICK, |s| s.role_of(bl) != Some(Role::Leader))
+            .unwrap();
+    assert!(
+        !broken_demoted,
+        "the no-lease mutant gave up the office anyway, so this scenario is not testing the lease"
+    );
+    eprintln!("LEASE: {l} demoted itself on its own lease; the mutant {bl} did not");
+}
+
+/// The lease detector inside the simulator, forced to fire: with the rule removed, a partitioned
+/// leader and its replacement both hold the office for longer than any lease allows.
+#[test]
+fn a_leader_that_never_gives_up_its_lease_is_caught_and_the_seed_is_named() {
+    let mut sim = Sim::<RefNode<D_NO_LEASE>>::new(11, scripted());
+    let l = wait_for_leader(&mut sim, 60).unwrap().expect("fixture: nobody was elected");
+    sim.isolate(l);
+    let err = (|| -> Violation {
+        for _ in 0..120 {
+            if let Err(v) = sim.run_ticks(1) {
+                return v;
+            }
+        }
+        panic!(
+            "the no-lease mutant led alongside a replacement for 120 ticks without tripping the \
+             overlap detector; max overlap seen was {} ticks",
+            sim.report().max_overlap_ticks
+        )
+    })();
+    assert_eq!(err.rule, "two leaders overlapped for longer than the lease", "{err}");
+    eprintln!("MUTANT no lease expiry: killed on seed {} at unit {} -- {}", err.seed, err.at, err.detail);
+
+    // The quiet half, in the same scenario.
+    let mut ok = Sim::<Correct>::new(11, scripted());
+    let l2 = wait_for_leader(&mut ok, 60).unwrap().expect("fixture: nobody was elected");
+    ok.isolate(l2);
+    ok.run_ticks(120).expect("the rule restored, the same scenario must be clean");
+    assert_eq!(
+        ok.report().max_overlap_ticks,
+        0,
+        "with the lease intact no two nodes should have overlapped at all"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Figure 8
+// ---------------------------------------------------------------------------------------------
+
+/// What one run of the figure-8 script did.
+struct FigureEight {
+    /// The inherited round the script sets up to be committed and then overwritten.
+    round: Round,
+    /// Whether the simulator recorded that round as committed at all.
+    committed: bool,
+    /// The node that ends up able to overwrite it, if it won its election.
+    usurper_led: bool,
+    violation: Option<Violation>,
+}
+
+/// Raft's figure 8, driven rather than waited for.
+///
+/// `DISTRIBUTED.md` §F2 asks for this scenario by name, and the reason it is scripted rather than
+/// swept for is measured, not assumed: **400 seeds of chaos — 1262 elections, 11279 committed
+/// rounds, 1641 crashes — never once produced it.** The sequence needs a leader to partially
+/// replicate, be deposed, come back, and re-replicate the same rounds under a new term while a node
+/// holding a *higher-term* but *shorter* log is still alive to be elected around it. Random faults
+/// reach that arrangement far too rarely to be evidence, so the script builds it:
+///
+/// 1. `L1` leads and commits a common prefix of `p` rounds.
+/// 2. `L1` is cut down to one follower `F` and appends 16 more rounds — replicated to `F`, held by
+///    two nodes out of five, committed by nobody. The last is round `r`.
+/// 3. `L1` and `F` stop. The other three elect `L2`, which appends its term-establishing entry at
+///    round `p+1` — a *different* entry at a round `L1` and `F` already hold — and is cut off
+///    before it reaches anyone.
+/// 4. `L2` stops, `L1` and `F` return. One of them wins, because their logs are longer, and
+///    re-replicates rounds `p+1..=r` to a majority. **Those rounds are of an earlier term.**
+/// 5. The instant `r` is reported committed, the two long-logged nodes stop and `L2` returns. Its
+///    log is *shorter* but its last term is *higher*, so the election restriction lets it win — and
+///    it overwrites round `r`.
+///
+/// With §5.4.2 enforced, step 4 does not commit `r` on its own, `r` only becomes committed once a
+/// round of the new leader's term is, and by then the majority's last term is high enough that
+/// `L2` can never win step 5. With §5.4.2 removed, `r` is committed at step 4 and gone at step 5.
+fn figure_8<P: Peer>(seed: u64) -> FigureEight {
+    let mut sim = Sim::<P>::new(seed, scripted());
+    let run = |sim: &mut Sim<P>, units: u64| -> Option<Violation> { sim.run_units(units).err() };
+
+    macro_rules! bail {
+        ($sim:expr, $v:expr, $round:expr) => {
+            if let Some(v) = $v {
+                return FigureEight {
+                    round: $round,
+                    committed: $sim.committed().contains_key(&$round),
+                    usurper_led: false,
+                    violation: Some(v),
+                };
+            }
+        };
+    }
+
+    // 1. A common prefix everybody holds.
+    let l1 = match wait_for_leader(&mut sim, 60) {
+        Ok(Some(l)) => l,
+        Ok(None) => panic!("fixture: figure 8 needs a leader to start from and none was elected"),
+        Err(v) => panic!("fixture: a violation before the scenario even began\n{v}"),
+    };
+    for _ in 0..3 {
+        let cmd = Command::WalBatch { start_lsn: 900, bytes: vec![9] };
+        if let Err(v) = sim.propose_to(l1, cmd) {
+            panic!("fixture: {v}");
+        }
+        bail!(sim, run(&mut sim, 2 * UNITS_PER_TICK), 0);
+    }
+    let p = sim.durable_log(l1).len() as Round;
+    assert!(p >= 4, "fixture: the common prefix is only {p} rounds, too short to cut into");
+
+    // 2. Cut L1 down to one follower and append a batch that reaches exactly two nodes of five.
+    //    The other three are isolated from each other too, so nobody elects a replacement yet.
+    let others: Vec<NodeId> = (1..=5u32).map(NodeId).filter(|n| *n != l1).collect();
+    let f = others[0];
+    for n in &others[1..] {
+        sim.isolate(*n);
+    }
+    for k in 0..MAX_ENTRIES_PER_APPEND {
+        let cmd = Command::WalBatch { start_lsn: 1000 + k as u64, bytes: vec![k as u8] };
+        if let Err(v) = sim.propose_to(l1, cmd) {
+            panic!("fixture: {v}");
+        }
+        bail!(sim, run(&mut sim, 1), 0);
+    }
+    bail!(sim, run(&mut sim, 2 * UNITS_PER_TICK), 0);
+    let r = p + MAX_ENTRIES_PER_APPEND as Round;
+    assert_eq!(
+        sim.durable_log(l1).len() as Round,
+        r,
+        "fixture: the partitioned leader did not append the whole batch"
+    );
+    assert_eq!(
+        sim.durable_log(f).len() as Round,
+        r,
+        "fixture: the one reachable follower did not receive the batch, so only one node holds it"
+    );
+    assert!(
+        !sim.committed().contains_key(&r),
+        "fixture: round {r} was committed while only two nodes of five held it"
+    );
+
+    // 3. The long-logged pair stops; the other three elect L2, which is cut off the instant it wins
+    //    so its term-establishing entry reaches nobody.
+    sim.crash(l1);
+    sim.crash(f);
+    sim.heal();
+    let l2 = match wait_for_leader(&mut sim, 120) {
+        Ok(Some(l)) => l,
+        Ok(None) => panic!("fixture: the remaining three never elected a leader"),
+        Err(v) => panic!("fixture: {v}"),
+    };
+    sim.isolate(l2);
+    bail!(sim, run(&mut sim, 2 * UNITS_PER_TICK), r);
+    for n in &others[1..] {
+        if *n != l2 {
+            assert_eq!(
+                sim.durable_log(*n).len() as Round,
+                p,
+                "fixture: {l2}'s entry escaped to {n}, so there is no divergent round to lose"
+            );
+        }
+    }
+    assert!(
+        sim.durable_log(l2).len() as Round > p,
+        "fixture: {l2} never appended its own term-establishing entry"
+    );
+
+    // 4. L2 stops, the long-logged pair returns, and one of them re-replicates the earlier term's
+    //    rounds to a majority.
+    sim.crash(l2);
+    sim.restart(l1);
+    sim.restart(f);
+    sim.heal();
+    let l3 = match wait_for_leader(&mut sim, 160) {
+        Ok(Some(l)) => l,
+        Ok(None) => panic!("fixture: nobody was elected in step 4"),
+        Err(v) => {
+            return FigureEight { round: r, committed: false, usurper_led: false, violation: Some(v) }
+        }
+    };
+    assert!(
+        l3 == l1 || l3 == f,
+        "fixture: {l3} won step 4 despite a shorter log; the election restriction is not doing what \
+         this script assumes"
+    );
+
+    // 5. The instant the inherited round is reported committed, stop the pair that holds it and let
+    //    the shorter-but-higher-term node stand.
+    let saw = match advance_until(&mut sim, 60 * UNITS_PER_TICK, |s| s.committed().contains_key(&r))
+    {
+        Ok(b) => b,
+        Err(v) => {
+            return FigureEight { round: r, committed: true, usurper_led: false, violation: Some(v) }
+        }
+    };
+    sim.crash(l1);
+    sim.crash(f);
+    sim.restart(l2);
+    sim.heal();
+    let usurper = match wait_for_leader(&mut sim, 160) {
+        Ok(l) => l,
+        Err(v) => {
+            return FigureEight { round: r, committed: saw, usurper_led: false, violation: Some(v) }
+        }
+    };
+    let v = run(&mut sim, 40 * UNITS_PER_TICK);
+    FigureEight { round: r, committed: saw, usurper_led: usurper == Some(l2), violation: v }
+}
+
+/// **Raft §5.4.2, figure 8.** An inherited round committed by counting replicas is the classic way
+/// to lose acknowledged data on a leader change — and this is the simulator being shown to catch it.
+#[test]
+fn committing_an_inherited_round_by_counting_replicas_loses_it_in_the_figure_8_scenario() {
+    let seed = 4242;
+    let broken = figure_8::<RefNode<D_COMMIT_INHERITED>>(seed);
+    assert!(
+        broken.committed,
+        "fixture: the mutant never committed round {}, so there was nothing to lose",
+        broken.round
+    );
+    let v = broken.violation.unwrap_or_else(|| {
+        panic!(
+            "the §5.4.2 mutant committed round {} and the shorter-but-higher-term node {} win its \
+             election, and the simulator said nothing. A detector that cannot be made to fire is \
+             not a detector.",
+            broken.round,
+            if broken.usurper_led { "did" } else { "did not" }
+        )
+    });
+    // Leader completeness is the one that fires, and it fires *before* any byte is deleted: the
+    // moment a node holding none of round `r` wins an election, `r` is lost whatever happens next.
+    // The three truncation rules are listed with it because a different implementation may reach
+    // the same loss by the slower route.
+    assert!(
+        [
+            "a new leader was missing a committed round",
+            "a committed round was dropped from a node's log",
+            "a committed round was overwritten",
+            "two different commands were committed at one round",
+        ]
+        .contains(&v.rule),
+        "figure 8 tripped {:?}, which is not a loss of the committed round\n{v}",
+        v.rule
+    );
+    eprintln!(
+        "MUTANT commit inherited round: killed by figure 8 on seed {} at unit {} -- {}\n  {}",
+        v.seed, v.at, v.rule, v.detail
+    );
+
+    // The quiet half: the identical script with §5.4.2 enforced.
+    let ok = figure_8::<Correct>(seed);
+    if let Some(v) = ok.violation {
+        panic!("figure 8 with §5.4.2 enforced still lost data:\n{v}");
+    }
+    assert!(
+        ok.committed,
+        "fixture: with the rule enforced round {} was never committed at all, so 'and it was not \
+         lost' says nothing",
+        ok.round
+    );
+    assert!(
+        !ok.usurper_led,
+        "with §5.4.2 enforced the shorter log must not have been electable once round {} was \
+         committed",
+        ok.round
+    );
+}

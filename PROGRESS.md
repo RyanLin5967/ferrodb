@@ -1,22 +1,19 @@
 # F8 — deterministic simulator
 
 **Done**
-- `src/consensus/sim.rs`: the simulator. `Peer` trait, seeded fault model (asymmetric partitions,
-  drops, reorder, duplication, crash/restart losing everything unfsynced), per-node durable `Store`,
-  11 named detectors, `sweep()`, `Violation` that prints its replay seed.
-- One line added to the frozen `mod.rs`: `pub mod sim;`.
-- `src/consensus/tests_sim.rs`: `RefNode`, a reference Raft over the same contract with a
-  const-generic defect mask, plus the harness/safety tests. 8 tests green; 400-seed chaos sweeps
-  commit 11k+ rounds over 1643 crashes with zero violations.
-- The simulator found THREE real defects in the reference machine while being built: a follower
-  acking its own log length instead of the confirmed position; truncating the whole conflicting
-  term instead of from `prev_round`; and advancing commit to `min(leaderCommit, own log length)`
-  instead of `min(leaderCommit, last new entry)`. All three are data-loss bugs.
+- `src/consensus/sim.rs` — the simulator (one added line in the frozen `mod.rs`: `pub mod sim;`).
+- `src/consensus/tests_sim.rs` — `RefNode` reference Raft + 7 const-generic defects. 17 tests green.
+- Every detector forced to fire and then shown quiet. Two mutants needed scripted scenarios rather
+  than sweeps, and that is measured, not assumed: 400 seeds of chaos never produced figure 8.
+- Contract findings so far: (1) `Consensus` has no log and no way to read one, so `Body::Append`
+  cannot be populated; (2) `mod.rs` exempts every `PreVoteResp` from the later-term rule, and a
+  *refused* one carries a real term — without acting on it a restarted node can deadlock.
 
 **Doing now**
-- The mutants: one deliberate defect per rule, each required to fire its named detector and then to
-  leave it quiet when switched off.
+- The remaining coverage: the pre-vote disruption mutant, liveness (cold start, failover, and the
+  anti-vacuity "a cluster cut in half elects nobody"), the restart-durability test, and the test
+  that drives the real `Consensus` and starts asserting the moment F1/F2 land.
 
 **Next action**
-- Write the eight mutant tests, then the scenario tests (partitioned leader demotes itself, one-way
-  partition, pre-vote does not depose a healthy leader, liveness after healing).
+- Add those tests, clear every `-D dead_code` warning (CI denies it), run the 10k-seed sweep in
+  release, then the full suite.

@@ -812,7 +812,16 @@ impl<P: Peer> Sim<P> {
     /// Advance `ticks` nominal ticks. Scenario tests drive the sim with this between their own
     /// partitions and crashes.
     pub fn run_ticks(&mut self, ticks: u64) -> Result<(), Violation> {
-        let end = self.now + ticks * UNITS_PER_TICK;
+        self.run_units(ticks * UNITS_PER_TICK)
+    }
+
+    /// Advance by sub-tick units.
+    ///
+    /// A scripted scenario needs this rather than [`Sim::run_ticks`]: it has to observe a role
+    /// change and cut the network **before** the messages that change carries are delivered, and a
+    /// tick is far too coarse for that — the whole election would be over inside one.
+    pub fn run_units(&mut self, units: u64) -> Result<(), Violation> {
+        let end = self.now + units;
         while self.now < end {
             self.now += 1;
             self.churn()?;
