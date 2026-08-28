@@ -1774,6 +1774,7 @@ fn dial(
     stop: &AtomicBool,
     opts: &TransportOptions,
 ) -> Result<TcpStream, FerroError> {
+    if true { return Err(FerroError::Io("MUTANT: sender thread never dials".into())); }
     let mut s = TcpStream::connect_timeout(&addr, opts.handshake_deadline)
         .map_err(|e| FerroError::Io(e.to_string()))?;
     s.set_read_timeout(Some(opts.poll_interval)).map_err(|e| FerroError::Io(e.to_string()))?;
