@@ -1,0 +1,22 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.19s
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-4e40fd0b14856a0b)
+
+running 1 test
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... FAILED
+
+failures:
+
+---- a_merged_branch_gives_its_extent_back_without_any_lease_scan stdout ----
+
+thread 'a_merged_branch_gives_its_extent_back_without_any_lease_scan' (23771235) panicked at tests/integration_server_reaps.rs:589:5:
+the store still lists an extent owned by the merged branch: [(ArenaId(1), BranchId { id: 0, generation: 0 }), (ArenaId(2), BranchId { id: 1, generation: 0 })]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_merged_branch_gives_its_extent_back_without_any_lease_scan
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 49.33s
+
+error: test failed, to rerun pass `--test integration_server_reaps`
