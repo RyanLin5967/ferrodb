@@ -362,15 +362,39 @@ fn racing_the_parent_directory_away_between_the_open_and_the_stat() {
     let mut loaded = 0usize;
     let mut refused_dir = 0usize;
     let mut refused_uninspectable = 0usize;
+    let mut refused_hop = 0usize;
     let mut refused_open = 0usize;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
-    while std::time::Instant::now() < deadline {
+    // **Bounded by iterations first and the clock only as a backstop**, so a loaded machine makes
+    // this SLOWER rather than flaky: it keeps going until the window has been seen at least once
+    // AND enough iterations have run for the `loaded == 0` assertion to mean something.
+    const MIN_ITERS: usize = 50_000;
+    let cap = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut iters = 0usize;
+    while std::time::Instant::now() < cap
+        && loaded == 0
+        && (iters < MIN_ITERS || refused_uninspectable == 0)
+    {
+        iters += 1;
         match Key::load(&p) {
+            // Stop at the FIRST one. A single load of a key in a 0777 directory is the whole
+            // finding, and stopping here is what keeps this test fast against a defect: the
+            // continuation condition below never comes true when the branch has been deleted, so
+            // without this the mutant run would burn the entire 60s cap instead of ~200 iterations.
             Ok(_) => loaded += 1,
             Err(e) if e.to_string().contains("writable by group or other") => refused_dir += 1,
-            // The post-fix branch: the open SUCCEEDED and the directory stat then failed. This is
-            // the state the mutant table records as unreachable from a test.
-            Err(e) if e.to_string().contains("could not be inspected") => refused_uninspectable += 1,
+            // **The branch this test exists for**: the open SUCCEEDED and `check_directory`'s stat
+            // of the parent then failed. Matched on `check_directory`'s own wording, NOT on the
+            // shared phrase "could not be inspected" -- `directories_to_check` emits that too, for
+            // a failed `symlink_metadata` on a hop, and counting both together would make this
+            // report a number that is mostly the other branch.
+            Err(e)
+                if e.to_string().contains("the directory holding the consensus signing key")
+                    && e.to_string().contains("could not be inspected") =>
+            {
+                refused_uninspectable += 1
+            }
+            // The chain walk could not stat a hop. A different branch, counted separately.
+            Err(e) if e.to_string().contains("could not be inspected") => refused_hop += 1,
             Err(_) => refused_open += 1,
         }
     }
@@ -379,7 +403,8 @@ fn racing_the_parent_directory_away_between_the_open_and_the_stat() {
     let _ = std::fs::rename(&b, &a);
     chmod(&a, 0o700);
     println!(
-        "loaded={loaded} refused_mode={refused_dir} refused_uninspectable={refused_uninspectable} \
+        "iters={iters} loaded={loaded} refused_mode={refused_dir} \
+         refused_uninspectable={refused_uninspectable} refused_at_hop_walk={refused_hop} \
          refused_at_open={refused_open}"
     );
     assert_eq!(
@@ -390,7 +415,8 @@ fn racing_the_parent_directory_away_between_the_open_and_the_stat() {
     assert!(
         refused_uninspectable > 0,
         "the open-succeeds-then-stat-fails window never opened, so this run proves nothing about \
-         that branch; loaded={loaded} refused_mode={refused_dir} refused_at_open={refused_open}"
+         that branch; loaded={loaded} refused_mode={refused_dir} \
+         refused_at_hop_walk={refused_hop} refused_at_open={refused_open}"
     );
 }
 
@@ -782,7 +808,19 @@ fn the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between() {
 
     // Honest state: the chain lands on the operator's key.
     std::os::unix::fs::symlink(&good, open.join("k")).unwrap();
-    let honest = Key::load(&configured).expect("the honest chain must load");
+    // The middle hop sits in a 0777 directory. A walk that checks every hop refuses here; one that
+    // checks only the two endpoints does not. A refusal naming `open` is the correct outcome.
+    let honest = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the middle hop: {e}");
+            assert!(
+                e.to_string().contains("open") && e.to_string().contains("0777"),
+                "refused for the wrong reason: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
     assert_eq!(identify(&honest, &[("good", GOOD), ("other", OTHER)]), "good");
 
     // The attacker's whole move: repoint the middle name. `rename` over it, which 0777-non-sticky
@@ -941,8 +979,12 @@ fn the_table_of_keys_that_hold_nothing_anyone_chose() {
             Err(e) => println!("  {name:<24} ({} bytes) -> refused: {e}", bytes.len()),
         }
     }
-    println!("accepted: {accepted:?}");
-    assert!(accepted.is_empty(), "PROBE HIT: accepted {accepted:?}");
+    println!("still accepted, outside a zero-specific rule: {accepted:?}");
+    // The zero rule is what shipped, and it is deliberately "the generator produced nothing" and
+    // not an entropy rule. This asserts exactly that scope and inventories the rest.
+    for zero in ["32 zero bytes", "64 zero bytes"] {
+        assert!(!accepted.contains(&zero), "an all-zero key must be refused: {zero}");
+    }
 }
 
 /// A distinct axis from "holds nothing": a key with plenty of bytes and little entropy per byte.
@@ -959,4 +1001,215 @@ fn a_hex_encoded_key_is_bytes_not_entropy() {
     let distinct: std::collections::BTreeSet<u8> = hex.iter().copied().collect();
     println!("{} bytes, {} distinct byte values", k.len(), distinct.len());
     assert_eq!(k.len(), 64);
+}
+
+// =============================================================================================
+// I. Against the hop-by-hop chain walk
+// =============================================================================================
+
+/// One chain shape: how to build it, and the path a node would be configured with.
+struct Shape {
+    name: &'static str,
+    /// Directories created under the root, in creation order. Every one of them takes part in
+    /// resolving the configured path.
+    dirs: Vec<&'static str>,
+    build: fn(&Path) -> PathBuf,
+}
+
+/// Flip exactly ONE directory of a chain to 0777 at a time and ask whether the walk notices.
+///
+/// The rule the fix states about itself is "the name's directory matters because whoever can write
+/// there can repoint the link". So for every directory that holds a name the resolution passes
+/// through, 0777 must be refused. Anything that loads is a directory an attacker can write while
+/// the guard says the key is protected.
+fn sweep(shape: &Shape) -> Vec<String> {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+    for d in &shape.dirs {
+        std::fs::create_dir_all(root.path().join(d)).unwrap();
+    }
+    for d in &shape.dirs {
+        chmod(&root.path().join(d), 0o700);
+    }
+    let configured = (shape.build)(root.path());
+
+    // Baseline: every directory closed, so the chain must load.
+    let base = Key::load(&configured);
+    assert!(base.is_ok(), "[{}] baseline must load, got {:?}", shape.name, base.err().map(|e| e.to_string()));
+
+    let mut missed = Vec::new();
+    for d in &shape.dirs {
+        let p = root.path().join(d);
+        chmod(&p, 0o777);
+        let verdict = Key::load(&configured);
+        chmod(&p, 0o700);
+        match verdict {
+            Err(_) => println!("  [{}] {d:<18} 0777 -> refused", shape.name),
+            Ok(_) => {
+                println!("  [{}] {d:<18} 0777 -> LOADED", shape.name);
+                missed.push(format!("{}: {d}", shape.name));
+            }
+        }
+    }
+    missed
+}
+
+#[test]
+fn every_directory_holding_a_name_in_the_chain_is_checked() {
+    let shapes = vec![
+        Shape {
+            name: "plain file",
+            dirs: vec!["a"],
+            build: |r| {
+                let p = r.join("a/k");
+                std::fs::write(&p, RECOGNISABLE).unwrap();
+                chmod(&p, 0o600);
+                p
+            },
+        },
+        Shape {
+            name: "link, absolute",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(&real, &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "link, relative ..",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink("../b/real", &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "three hops",
+            dirs: vec!["a", "mid", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(&real, r.join("mid/m")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("mid/m"), &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            name: "leave and re-enter",
+            dirs: vec!["a", "mid"],
+            build: |r| {
+                let real = r.join("a/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(&real, r.join("mid/m")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("mid/m"), &k).unwrap();
+                k
+            },
+        },
+        Shape {
+            // The lever the fix names -- "whoever can write there can repoint the link" -- applied
+            // to a name that is a DIRECTORY component rather than the final one.
+            name: "dir-component link",
+            dirs: vec!["a", "b"],
+            build: |r| {
+                let real = r.join("b/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                // `a/dl` is a symlink to the directory `b`. An attacker who can write in `a`
+                // repoints `dl` and redirects the key, exactly as they would a final-component link.
+                std::os::unix::fs::symlink(r.join("b"), r.join("a/dl")).unwrap();
+                r.join("a/dl/real")
+            },
+        },
+        Shape {
+            name: "dir-component mid-chain",
+            dirs: vec!["a", "b", "c"],
+            build: |r| {
+                let real = r.join("c/real");
+                std::fs::write(&real, RECOGNISABLE).unwrap();
+                chmod(&real, 0o600);
+                std::os::unix::fs::symlink(r.join("c"), r.join("b/dl")).unwrap();
+                let k = r.join("a/k");
+                std::os::unix::fs::symlink(r.join("b/dl/real"), &k).unwrap();
+                k
+            },
+        },
+    ];
+
+    let mut missed = Vec::new();
+    for s in &shapes {
+        missed.extend(sweep(s));
+    }
+    println!("MISSED: {missed:#?}");
+    assert!(missed.is_empty(), "PROBE HIT: a 0777 directory holding a name in the chain was not caught: {missed:#?}");
+}
+
+/// **The walk follows the chain of the FINAL component and never the chain of a directory
+/// component.** `symlink_metadata(current)` asks whether `current` itself is a link; the kernel has
+/// already silently resolved every directory component to get there. So a name like `b/dl`, where
+/// `dl` is a symlink to a directory, is a name in the resolution that the walk never sees -- and
+/// the directory holding it, `b`, is checked by nobody.
+///
+/// `b` is an ancestor of NEITHER endpoint: not of the configured path `a/k`, and not of the file
+/// finally opened. It is the same class as the two-endpoint bypass, one level down.
+#[test]
+fn a_directory_component_symlink_redirects_the_key_with_every_checked_directory_closed() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+
+    const REAL: &[u8; 32] = b"THE-OPERATORS-REAL-CLUSTER-KEY!!";
+    const OLD: &[u8; 32] = b"A-ROTATED-KEY-THE-NODE-CAN-READ!";
+
+    for d in ["a", "b", "c", "backups"] {
+        std::fs::create_dir(root.path().join(d)).unwrap();
+    }
+    // The live key, and an old one the node can also read: both node-owned, 0600, both in 0700
+    // directories. The attacker owns neither and authors neither.
+    for (dir, bytes) in [("c", REAL), ("backups", OLD)] {
+        let p = root.path().join(dir).join("real");
+        std::fs::write(&p, bytes).unwrap();
+        chmod(&p, 0o600);
+    }
+    // `b/dl` is a directory symlink; `a/k` is the configured path and points through it.
+    std::os::unix::fs::symlink(root.path().join("c"), root.path().join("b/dl")).unwrap();
+    let configured = root.path().join("a/k");
+    std::os::unix::fs::symlink(root.path().join("b/dl/real"), &configured).unwrap();
+    for d in ["a", "c", "backups"] {
+        chmod(&root.path().join(d), 0o700);
+    }
+    // The one directory the attacker can write. Every OTHER directory stays 0700.
+    chmod(&root.path().join("b"), 0o777);
+
+    let honest = Key::load(&configured).expect("all checked directories are 0700, so it loads");
+    assert_eq!(identify(&honest, &[("real", REAL), ("old", OLD)]), "real");
+
+    // The attacker's entire move: repoint the DIRECTORY symlink. No key is authored, nothing is
+    // chowned, and the file finally read is one the node already had at 0600 in a 0700 directory.
+    let tmp = root.path().join("b/.t");
+    std::os::unix::fs::symlink(root.path().join("backups"), &tmp).unwrap();
+    std::fs::rename(&tmp, root.path().join("b/dl")).unwrap();
+
+    let after = Key::load(&configured);
+    println!("configured   = a/k -> b/dl/real   (b is 0777; a, c, backups are 0700)");
+    println!("canonical    = {:?}", std::fs::canonicalize(&configured));
+    match &after {
+        Ok(k) => println!("Key::load -> Ok, and it is the {} key", identify(k, &[("real", REAL), ("old", OLD)])),
+        Err(e) => println!("Key::load -> {e}"),
+    }
+    let err = after.expect_err(
+        "PROBE HIT: repointing a DIRECTORY-component symlink swapped the key while every \
+         directory the walk checked was 0700 -- the directory holding that name is never checked",
+    );
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
 }
