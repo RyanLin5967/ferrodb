@@ -118,6 +118,9 @@
 //!   be made without a dependency. A cluster running its nodes as root and keeping its key in
 //!   another user's home directory is outside what this can detect.
 //! * **The ancestry above the immediate parent.** Only the directory holding the key is inspected.
+//!   The parent's own mode is read by *name* rather than through a descriptor, because `std` has no
+//!   portable `fstat`-on-a-directory. The key file itself is not: it is opened once and judged
+//!   through that handle, so the mode approved and the bytes taken cannot be two different files.
 //!   A world-writable grandparent lets an attacker swap the whole directory. Checking every
 //!   ancestor was considered and not done: it refuses ordinary layouts for a threat that already
 //!   implies control of the filesystem.
@@ -150,6 +153,7 @@
 //!   which is the safe way for that mistake to fail and is why no fallback-to-unsigned path exists.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::FerroError;
@@ -312,15 +316,31 @@ impl Key {
 
     /// Load and validate.
     ///
-    /// Order matters: the file's protection is judged **before** its contents are read, so a key
-    /// this build would refuse is never brought into this process's memory.
+    /// Two orderings matter here and both are deliberate.
+    ///
+    /// **The file is opened ONCE and judged through that handle**, never by name twice. `stat` the
+    /// path, check the mode, then `read` the path is a race: between the two calls the name can be
+    /// repointed at a different file, and the mode that was approved would belong to bytes nobody
+    /// read. `File::metadata` is `fstat` on this descriptor, so the thing inspected and the thing
+    /// read are the same file by construction rather than by timing. The window is small and needs
+    /// write access to the directory to exploit — which `unix_protection` refuses anyway — so this
+    /// is the second lock on a door that already has one, and it costs nothing.
+    ///
+    /// **The protection is judged before the contents are read**, so a key this build would refuse
+    /// never reaches this process's memory.
     pub fn load_with(path: impl AsRef<Path>, check: PermissionCheck) -> Result<Key, FerroError> {
         let path = path.as_ref();
-        let meta = fs::metadata(path).map_err(|e| {
+        let mut file = fs::File::open(path).map_err(|e| {
             FerroError::Io(format!(
-                "the consensus signing key at {} could not be read: {e}. A node configured to sign \
-                 its traffic and unable to load its key refuses to start rather than falling back \
-                 to sending unsigned frames",
+                "the consensus signing key at {} could not be opened: {e}. A node configured to \
+                 sign its traffic and unable to load its key refuses to start rather than falling \
+                 back to sending unsigned frames",
+                path.display()
+            ))
+        })?;
+        let meta = file.metadata().map_err(|e| {
+            FerroError::Io(format!(
+                "the consensus signing key at {} was opened but could not be inspected: {e}",
                 path.display()
             ))
         })?;
@@ -334,7 +354,8 @@ impl Key {
         }
         check_protection(path, &meta, check)?;
 
-        let bytes = fs::read(path).map_err(|e| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| {
             FerroError::Io(format!("the consensus signing key at {} could not be read: {e}", path.display()))
         })?;
         if bytes.len() < MIN_KEY_BYTES {

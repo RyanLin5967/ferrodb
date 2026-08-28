@@ -384,14 +384,22 @@ fn a_missing_key_file_is_refused_rather_than_leaving_the_node_unsigned() {
 
 #[test]
 fn a_directory_named_where_a_key_was_expected_is_refused() {
-    // Not pedantry: `fs::read` of a directory fails on Unix but the failure is an errno, and on
-    // some platforms reading a special file succeeds and yields bytes nobody chose. Refused by
-    // shape, before anything is read.
+    // Not pedantry: reading a directory or a device would produce a key whose bytes nobody chose,
+    // so the shape is refused before anything is read.
+    //
+    // The two platforms refuse it at different points and the assertion says so rather than
+    // pretending one message: `File::open` on a directory SUCCEEDS on Unix and fails on Windows, so
+    // on Unix the refusal comes from the `is_file` check on the open handle and on Windows from the
+    // open itself. Both refuse; only Unix can name the reason.
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
     let err = load_for_rule_under_test(&sub).expect_err("a directory is not a key");
-    assert!(err.to_string().contains("not a regular file"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("sub"), "the error must name the path it refused: {text}");
+    if cfg!(unix) {
+        assert!(text.contains("not a regular file"), "{text}");
+    }
 }
 
 #[cfg(unix)]
