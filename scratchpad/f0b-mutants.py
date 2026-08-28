@@ -79,7 +79,7 @@ MUTANTS = [
     ),
     (
         "checkpoint writes its header before syncing the data it describes",
-        [(SRC, "        dst.sync_data().map_err(io)?;\n\n        // 3. The header.", "        // 3. The header.")],
+        [(SRC, "        dst.sync_data().map_err(io)?;\n\n        // 3. The header, and", "        // 3. The header, and")],
         "a_checkpoint_syncs_its_data_before_it_writes_the_header_that_makes_it_live",
     ),
     (
@@ -104,7 +104,7 @@ MUTANTS = [
     ),
     (
         "an unreadable header reinitializes over the entries",
-        [(SRC, "                if lens[0] > 0 || lens[1] > 0 {", "                if false {")],
+        [(SRC, "                if lens[0] > HEADER_SIZE as u64 || lens[1] > HEADER_SIZE as u64 {", "                if false {")],
         "a_live_header_that_cannot_be_read_is_refused_rather_than_reinitialized_over",
     ),
     (
@@ -163,6 +163,92 @@ MUTANTS = [
         "a range may return nothing when one entry blows the budget",
         [(SRC, "            if !out.is_empty() && (out.len() >= max_entries || bytes + f.len as usize > max_bytes) {", "            if out.len() >= max_entries || bytes + f.len as usize > max_bytes {")],
         "a_range_is_bounded_by_both_limits_and_still_returns_one_entry_when_it_must",
+    ),
+    (
+        "a checkpoint that fails at the header returns an ordinary error instead of poisoning",
+        [(SRC,
+          '                "a checkpoint at round {through} could not be made durable, so whether the \\\n'
+          '                 generation-{} header is live is no longer knowable from this handle: {e}",\n'
+          '                h.generation\n'
+          '            );\n'
+          '            self.poisoned = Some(why.clone());\n'
+          '            return Err(LogError::Poisoned(why));',
+          '                "unused {through} {e}", h.generation\n'
+          '            );\n'
+          '            let _ = why;\n'
+          '            return Err(e);')],
+        "a_checkpoint_that_cannot_be_made_durable_poisons_rather_than_returning_an_ordinary_error",
+    ),
+    (
+        "a failed fsync returns an ordinary error instead of poisoning",
+        [(SRC,
+          '                "an fsync through round {} failed, and a second fsync cannot be trusted to report \\\n'
+          '                 the same failure twice: {e}",\n'
+          '                self.last_round()\n'
+          '            );\n'
+          '            self.poisoned = Some(why.clone());\n'
+          '            return Err(LogError::Poisoned(why));',
+          '                "unused {}", self.last_round()\n'
+          '            );\n'
+          '            let _ = why;\n'
+          '            return Err(io(e));')],
+        "a_failed_fsync_poisons_rather_than_letting_the_next_one_report_success",
+    ),
+    (
+        "the superseded file is retired best-effort and unsynced",
+        [(SRC,
+          "        let retire = self.files[stale]\n            .set_len(0)\n            .and_then(|()| self.files[stale].sync_all());",
+          "        let retire: std::io::Result<()> = { let _ = self.files[stale].set_len(0); Ok(()) };")],
+        "a_superseded_file_is_retired_so_a_damaged_header_cannot_rewind_the_log",
+    ),
+    (
+        "the reinitialize refusal keys on any bytes rather than on room for a frame",
+        [(SRC,
+          "                if lens[0] > HEADER_SIZE as u64 || lens[1] > HEADER_SIZE as u64 {",
+          "                if lens[0] > 0 || lens[1] > 0 {")],
+        "a_torn_first_header_write_does_not_brick_a_log_that_has_nothing_in_it",
+    ),
+    (
+        "the MAX_FRAME allocation bound is removed from the scan",
+        [(SRC,
+          "        if total < MIN_FRAME || total > MAX_FRAME || offset + total as u64 > file_len {",
+          "        if total < MIN_FRAME || offset + total as u64 > file_len {")],
+        "the_scan_refuses_a_frame_longer_than_the_maximum_before_allocating_for_it",
+    ),
+    (
+        "the live file is chosen by the LESSER generation",
+        [(SRC,
+          "                if x.generation > y.generation { 0 } else { 1 }",
+          "                if x.generation < y.generation { 0 } else { 1 }")],
+        "the_live_file_is_the_one_at_the_greater_generation",
+    ),
+    (
+        "the header magic is not checked",
+        [(SRC,
+          "        if u32::from_be_bytes(bytes[0..4].try_into().unwrap()) != MAGIC {\n            return Ok(None);\n        }\n",
+          "")],
+        "a_header_with_the_wrong_magic_is_not_a_header",
+    ),
+    (
+        "a string longer than its length field is written anyway",
+        [(SRC,
+          "fn put_str(out: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), LogError> {\n    fits_u16(s.len(), what)?;",
+          "fn put_str(out: &mut Vec<u8>, s: &str, what: &'static str) -> Result<(), LogError> {\n    let _ = what;")],
+        "a_value_the_length_fields_cannot_express_is_refused_before_it_becomes_durable",
+    ),
+    (
+        "a column count wider than its length field is truncated",
+        [(SRC,
+          '            out.extend_from_slice(&fits_u16(columns.len(), "column count")?.to_be_bytes());',
+          "            out.extend_from_slice(&(columns.len() as u16).to_be_bytes());")],
+        "a_value_the_length_fields_cannot_express_is_refused_before_it_becomes_durable",
+    ),
+    (
+        "a device error reading log bytes is reported as corruption",
+        [(SRC,
+          "fn read_at(file: &dyn Storage, buf: &mut [u8], offset: u64) -> Result<(), LogError> {\n    pread_all(file, buf, offset).map_err(io)\n}",
+          "fn read_at(file: &dyn Storage, buf: &mut [u8], offset: u64) -> Result<(), LogError> {\n    pread_all(file, buf, offset).map_err(LogError::from)\n}")],
+        "a_device_error_reading_the_log_is_reported_as_io_and_not_as_corruption",
     ),
 ]
 

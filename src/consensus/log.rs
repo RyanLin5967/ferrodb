@@ -435,9 +435,12 @@ impl RoundLog {
                     )));
                 }
                 let h = Header { generation: 1, snapshot_round: 0, snapshot_term: 0 };
-                // Truncated first, so a torn header from an earlier attempt cannot leave trailing
-                // bytes that a later scan would walk into.
-                files[0].set_len(0).map_err(io)?;
+                // No truncate first, and that is provable rather than hopeful: this arm is only
+                // reached when both files are at most `HEADER_SIZE` bytes, and the write below is
+                // exactly `HEADER_SIZE` bytes at offset 0, so every byte of whatever a torn earlier
+                // attempt left is overwritten. A `set_len` here would be a line no test could ever
+                // make matter.
+                //
                 // Written and fsynced before a single entry may be appended. A header that is not
                 // durable when the entries above it are is a log that reopens as empty.
                 write_at(&*files[0], &h.encode(), 0)?;
