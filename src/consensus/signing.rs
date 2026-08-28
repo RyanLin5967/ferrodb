@@ -554,23 +554,75 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
     // file. The sticky bit is the exception rather than a special case: on a sticky directory only
     // the owner of a file may rename or remove it, which is exactly the property being checked for.
     // This is the rule OpenSSH's StrictModes applies, for the same reason.
-    // **`Path::parent` of a bare relative name is `Some("")`, and that means the CURRENT directory
-    // — not "there is no directory".** Filtering the empty parent out as "nothing to check" made
-    // the *spelling* of the path decide whether this check ran at all: `./cluster.key` was checked
-    // and `cluster.key` was not, for the same file in the same directory. Found by an adversarial
-    // pass, and it is exactly the shape this file warns about elsewhere — a guard that quietly
-    // declines to run and reports the same `Ok` as one that ran and passed.
     //
+    // **Both directories are checked: the one the NAME sits in, and the one the INODE sits in.**
+    //
+    // They are not the same when the path is a symlink, and checking only the first is a complete
+    // bypass of this rule — found by an adversarial pass, with a working substitution. `safe/k` is
+    // a link to `open/k`; `safe/` is 0700 and `open/` is 0777. The mode check is fine, because it
+    // reads the open descriptor and therefore the target's mode. The directory check was not: it
+    // read `safe/`, pronounced the key protected, and an attacker with write access to `open/`
+    // renamed their own key over the target. `Key::load` returned `Ok` and the node then verified
+    // frames the attacker had signed.
+    //
+    // So the rule needs both. The name's directory matters because whoever can write there can
+    // repoint the link; the inode's directory matters because whoever can write THERE can replace
+    // what the link points at. Either one being open is enough to lose the key.
+    for dir in directories_to_check(path)? {
+        check_directory(&dir)?;
+    }
+    Ok(())
+}
+
+/// Every directory whose contents could be swapped for the key this path names.
+///
+/// Deduplicated, because for an ordinary file the two are the same directory and reporting it twice
+/// would produce two identical refusals for one problem.
+#[cfg(unix)]
+fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // The directory the NAME sits in. `Path::parent` of a bare relative name is `Some("")`, which
+    // means the CURRENT directory and not "there is no directory" — filtering that out as
+    // nothing-to-check made the *spelling* of the path decide whether this rule ran at all.
     // `None` is the only case with genuinely nothing above it: a path that is a root.
-    let dir = match path.parent() {
-        None => return Ok(()),
-        Some(p) if p.as_os_str().is_empty() => Path::new("."),
-        Some(p) => p,
-    };
+    match path.parent() {
+        None => {}
+        Some(p) if p.as_os_str().is_empty() => out.push(PathBuf::from(".")),
+        Some(p) => out.push(p.to_path_buf()),
+    }
+
+    // The directory the INODE sits in, which is a different directory exactly when a symlink is
+    // involved. Refused rather than skipped if the path cannot be resolved: this whole function
+    // exists to answer "who could swap this file", and a build that cannot resolve the name cannot
+    // answer it.
+    let real = fs::canonicalize(path).map_err(|e| {
+        FerroError::Io(format!(
+            "the consensus signing key at {} could not be resolved to a real path: {e}. Refused \
+             rather than assumed safe: a symlink's own directory says nothing about who can replace \
+             the file it points at, so the target's directory has to be inspected too.",
+            path.display()
+        ))
+    })?;
+    if let Some(p) = real.parent() {
+        let p = p.to_path_buf();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// The mode rule for one directory holding a key.
+#[cfg(unix)]
+fn check_directory(dir: &Path) -> Result<(), FerroError> {
+    use std::os::unix::fs::PermissionsExt;
     // **Refused, not skipped, when the directory cannot be inspected.** This was `if let Ok(..)`,
     // which fell through to "allowed" whenever the `stat` failed — a guard that cannot read its own
-    // input must refuse, never pass. The file itself was opened successfully a moment ago, so a
-    // failure here is a race or a permission shape nobody intended, and either is a reason to stop.
+    // input must refuse, never pass. It is reachable: an adversarial pass renamed the parent
+    // directory back and forth in a second thread and got 46,895 successful loads of a key sitting
+    // in a directory this rule refuses. A transient failure — an unmount, a stale handle — reaches
+    // it too, and fell open the same way.
     let dmeta = fs::metadata(dir).map_err(|e| {
         FerroError::Io(format!(
             "the directory holding the consensus signing key, {}, could not be inspected: {e}. \

@@ -5,10 +5,13 @@ has a test named against it, and every one of those tests has been **seen to fai
 deliberate defect in the rule it names. A rule with no mutant is a rule nobody has shown matters;
 a test nobody has seen fail is not evidence.
 
-Method: apply the defect to the working tree, run only the named test(s), record what they printed,
-`git checkout --` the file, and assert the tree is clean before the next one. The driver is
-`/tmp/mutants.py`; its structured output is reproduced below verbatim. All eleven were killed, by
-fifteen test-kills in total, and the tree was clean at the end (`GIT STATUS: (clean)`).
+Method: assert the tree is clean and **committed**, apply the defect, run only the named test(s),
+record what they printed, `git checkout --` the file, and assert the tree is clean again. The
+drivers are `/tmp/mutants.py` and `/tmp/mutants3.py`; their output is reproduced below verbatim.
+
+Eleven chosen mutants, killed by fifteen test-kills. A twelfth was not chosen: an adversarial pass
+found it as a **live bug**, and it is in its own section below along with two further findings.
+Every run ended `GIT STATUS: (clean)`.
 
 Run on 2026-08-28, macOS (darwin 25.6.0), `rustc 1.97.1`, under CI's own flags
 `RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"`.
@@ -50,6 +53,89 @@ Why 1 MiB and not the 32 bytes a tag actually is: at 32 bytes a short-circuiting
 scan are both a handful of nanoseconds, so the test would pass against the very implementation it
 exists to reject. That is the vacuous-detector shape this project keeps meeting, and it was avoided
 by choosing a size at which the two are three orders of magnitude apart.
+
+## The two rules the adversarial pass added
+
+The eleven above were mutants I chose. An adversarial review in fresh contexts then found two
+things I had not, and both became rules with their own tests. They are listed separately because
+the distinction matters: the first eleven test rules I already believed; these two exist because
+somebody attacked the work.
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M12 | The empty parent is filtered out as "nothing to check" — the code as originally written | `the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked` | `two spellings of one path must reach one verdict; bare=None dotted=Some("io error: the directory holding the consensus signing key, ., has mode 0777 ...")` |
+
+**M12 was a live bug, not a hypothetical.** `Path::parent()` of a bare relative name is `Some("")`,
+which means the *current* directory and not "there is no directory". Filtering it out meant
+`Key::load("cluster.key")` skipped the directory-permission check entirely while
+`Key::load("./cluster.key")` performed it — the same file, in the same directory, with the spelling
+of the path deciding whether a security check ran at all. The reviewer demonstrated it by replacing
+the key in a `0777` directory and showing the loader accepted the attacker's key.
+
+**M13 — and a claim I made about it that was wrong.** The same review found that a failed `stat` of
+the directory fell through to `Ok(())`; a guard that cannot read its own input must refuse, and it
+now does.
+
+I first recorded that branch here as *unreachable from a test*, arguing that `File::open` resolves
+the path before the directory is stat'd, so anything that breaks the stat breaks the open. **That
+was wrong and a later adversarial pass refuted it by racing the condition**: renaming the parent
+directory back and forth in a second thread while loading a 0600 key from a 0777 directory produced
+
+```
+loaded=46895  refused_for_the_directory=105012  refused_otherwise=877831   (6s)
+```
+
+46,895 successful loads of a key the rule refuses — every one of them the check being skipped. The
+original claim is left standing above rather than edited away, because the reversal is the point:
+"I could not think of a way to fire it" is not the same statement as "it cannot be fired", and this
+file had recorded the first as the second. What is genuinely missing is a *deterministic* test, not
+reachability; the branch refuses now, and `a_key_whose_directory_is_gone_is_refused` says so in its
+own body.
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M14 | Only the NAME's directory is checked, never the resolved inode's — the symlink hole as shipped | `a_symlink_cannot_launder_a_key_out_of_a_world_writable_directory` | `the same inode, in the same 0777 directory, loaded because it was named through a link in a 0700 one — the directory rule was bypassed by spelling` |
+| M15 | Only the RESOLVED directory is checked, never the name's | `a_symlink_whose_own_directory_is_open_is_also_refused` | panicked at `a repointable link is a replaceable key` |
+
+**M14 was the review's best find and it was a total bypass, not a wrong verdict.** The mode check
+reads the open descriptor, so it sees the target's mode and was always right. The *directory* check
+read `path.parent()` — the symlink's parent — and never the directory the inode sits in. A link in
+a 0700 directory pointing at a key in a 0777 one therefore passed. The reviewer drove it to the end:
+with the real key loaded through the link, an attacker with write access to the target's directory
+renamed their own key over it, `Key::load` returned `Ok` with no complaint, and `verify_frame` then
+accepted frames the **attacker** had signed. Total compromise of this module's guarantee, reached
+without ever reading the operator's key.
+
+Both directories are checked now, and M15 exists because checking only the resolved one would be
+the mirror-image hole: whoever can write to the link's directory repoints the link. Note that
+M15 does **not** kill `the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked`
+(that test still passes under it, because canonicalisation happens to cover the bare-relative case
+too) — which is why the symlink test is the one named against it.
+
+**A third finding needed no mutant because it was an absence.** The review showed that
+`NodeOptions` had no way to express a key at all, so `examples/consensus_node.rs` built an unsigned
+node and a keyless peer set its term to 500 — the whole row was unreachable from the surface a
+product uses. `NodeOptions::signed_with` closes it, and
+`a_keyless_peer_cannot_raise_the_term_of_a_node_built_through_the_driver` carries both halves: the
+signed node's term does not move, and the identical bytes at an unsigned node do set it to 500.
+
+## A correction to this file's own method
+
+The first run of the M12/M13 harness was made against a tree with **uncommitted** work in it. The
+harness restores with `git checkout --`, which discarded the fix before it was committed — so a
+commit whose message described the fix contained only its tests. At the same time, review agents
+were installing their own mutants in this same worktree, and one of them reasonably reported the
+resulting failure as a live defect.
+
+Both are recorded here rather than tidied away, because the method is part of the evidence:
+
+* **Mutate only a committed tree.** The harness now asserts `git status --porcelain` is empty before
+  it starts, and M12's re-run above was made under that assertion and ended `GIT STATUS: (clean)`.
+* **One writer per worktree.** Mutation-running reviewers get their own tree from
+  `~/.claude/bin/wt new <branch>`; two agents mutating one checkout produced results neither could
+  attribute.
+
+Every number in this file was re-measured after that correction.
 
 ## What has no mutant, and why
 
