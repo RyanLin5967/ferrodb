@@ -27,7 +27,7 @@ use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::types::{BranchId, LeaseDeadline, ARENA_EXTENT_PAGES};
 use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
-use ferrodb::cluster::{self, ClusterScope, GrantError};
+use ferrodb::cluster::{self, Applied, ClusterScope, GrantError};
 use ferrodb::consensus::NodeId;
 use ferrodb::cow::{PageStore, PageType};
 use ferrodb::storage::disk_manager::DiskManager;
@@ -298,9 +298,21 @@ fn a_redelivered_grant_does_not_hand_out_the_same_extent_twice() {
 
     // A committed round may be delivered more than once — `WalBatch` is idempotent for exactly
     // this reason — so applying one twice must be a no-op, not a second range.
-    s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap();
+    assert_eq!(
+        s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap(),
+        Applied::Accepted { usable: ARENA_EXTENT_PAGES as u64 }
+    );
     let a1 = s.store.arena_for(BranchId::TRUNK).unwrap();
-    s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap();
+    // **Asserted on the outcome, not only on the consequence.** The mutation sweep showed that
+    // removing the duplicate check did NOT let a re-delivered grant hand out a second extent — the
+    // clamp to `max(accepted_through, issued)` already stops that — so a test that checked only
+    // "no second extent" was pinning a rule it could not detect. The two are defence in depth and
+    // this asserts the one the check itself owns.
+    assert_eq!(
+        s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap(),
+        Applied::Duplicate,
+        "a re-delivered grant was not recognised as already applied"
+    );
 
     let b = s.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX / 2)).unwrap();
     assert!(
@@ -426,6 +438,25 @@ fn a_lease_tick_never_moves_the_clusters_clock_backwards() {
     assert_eq!(cluster::apply_lease_tick(9_000).unwrap(), 9_000);
     assert_eq!(cluster::apply_lease_tick(1_000).unwrap(), 9_000, "the cluster clock rewound");
     assert_eq!(LeaseDeadline::try_now_millis().unwrap(), 9_000);
+}
+
+#[test]
+fn is_expired_now_refuses_rather_than_answering_false_on_a_member_with_no_tick() {
+    // Fallible on purpose. `false` would read as "still live" and silently stop reaping, which
+    // defeats exit criterion 8 with no symptom; this replaced an infallible `is_expired()` that
+    // read `SystemTime::now()` itself and had no callers anywhere in the repository.
+    let d = LeaseDeadline(1_000);
+    {
+        let _scope = ClusterScope::joined(N1);
+        assert!(matches!(d.is_expired_now(), Err(GrantError::NoClusterTime { .. })));
+        cluster::apply_lease_tick(999).unwrap();
+        assert!(!d.is_expired_now().unwrap(), "not expired one millisecond early");
+        cluster::apply_lease_tick(1_000).unwrap();
+        assert!(d.is_expired_now().unwrap(), "expired at its own deadline");
+    }
+    let _solo = ClusterScope::standalone();
+    // Standalone it answers from the local wall clock, which is far past 1970.
+    assert!(d.is_expired_now().unwrap());
 }
 
 #[test]
@@ -670,34 +701,36 @@ fn an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name() {
     // leak the leader cannot see and will not re-grant. It cannot happen because one grant carries
     // `page_count` ids against `page_count / extent_pages` extents. That ratio is load-bearing, so
     // it is pinned here rather than left in a comment.
+    // **The ratio only shows up under REUSE.** Claiming N extents needs N ids, so a grant cut to
+    // one id per extent still satisfies it — which is why the first version of this test detected
+    // nothing. Recycling is what consumes ids without consuming pages: the freed start page comes
+    // straight back off the recycle stack, and every re-claim needs a FRESH id.
     let s = store("grant_ratio");
     let _scope = ClusterScope::joined(N1);
-    s.store.apply_arena_grant(N1, 30_000, 4 * ARENA_EXTENT_PAGES).unwrap();
-    assert_eq!(s.store.grantable_extents(), 4);
 
-    // Claim every extent the grant allows; the id counter must never be what runs out.
-    let mut parent = BranchId::TRUNK;
+    // ONE extent's worth of pages, and therefore `ARENA_EXTENT_PAGES` ids.
+    s.store.apply_arena_grant(N1, 30_000, ARENA_EXTENT_PAGES).unwrap();
+    assert_eq!(s.store.grantable_extents(), 1);
+
     let mut ids = Vec::new();
-    for k in 0..4 {
-        let a = s.store.arena_for(parent).unwrap_or_else(|e| {
-            panic!("the arena-id counter ran out before the page counter at extent {k}: {e}")
+    for k in 0..8 {
+        let a = s.store.arena_for(BranchId::TRUNK).unwrap_or_else(|e| {
+            panic!("the arena-id counter ran out before the page counter on reuse {k}: {e}")
         });
+        assert_eq!(
+            s.store.extent_range(a).map(|r| r.0),
+            Some(30_000),
+            "reuse {k} took a fresh page range instead of recycling one"
+        );
         ids.push(a);
-        parent = s.catalog.fork(parent, LeaseDeadline(u64::MAX / 2)).unwrap().branch_id;
+        s.store.free_arena(a).unwrap();
     }
-    assert_eq!(ids.len(), 4);
+
     let mut sorted = ids.clone();
     sorted.sort();
     assert_eq!(ids, sorted, "arena ids were not issued in increasing order");
     sorted.dedup();
-    assert_eq!(sorted.len(), 4, "an arena id was issued twice");
-
-    // The page counter is the binding constraint, and it is what refuses.
-    let err = s.store.arena_for(parent).unwrap_err();
-    assert!(
-        format!("{err}").contains("extent-start"),
-        "the refusal came from the id counter, not the page counter: {err}"
-    );
+    assert_eq!(sorted.len(), 8, "an arena id was reused for a different extent claim");
 }
 
 #[test]
@@ -708,14 +741,102 @@ fn an_authority_change_is_noticed_by_the_counters_and_not_merely_survived() {
         let _solo = ClusterScope::standalone();
         s.store.arena_for(BranchId::TRUNK).unwrap();
     }
+    // The standalone self-grant took four extents (`SELF_GRANT_EXTENTS`) from the region base and
+    // issued one, so it left the watermark at 1280 and the accepted high-water at 2048.
+    let watermark = s.store.extent_watermark();
+    assert_eq!(watermark, ARENA_BASE + ARENA_EXTENT_PAGES, "fixture: the standalone era changed");
+
     let _scope = ClusterScope::joined(N1);
-    // A grant above the standalone watermark is accepted, which is the liveness half: the old
-    // era's high-water must not swallow it.
-    s.store.apply_arena_grant(N1, 50_000, 2 * ARENA_EXTENT_PAGES).unwrap();
-    assert_eq!(s.store.grantable_extents(), 2, "the new leader's grant was swallowed");
+    // **The grant must straddle the old high-water**, or nothing is being tested: a range above
+    // 2048 is accepted whether or not the authority change reset the high-water, and the first
+    // version of this test used 50_000 and therefore detected nothing. This one sits above the
+    // issued watermark and below the old high-water, so it is accepted ONLY if the reset happened.
+    let lo = ARENA_BASE + 2 * ARENA_EXTENT_PAGES; // 1536: above 1280, below 2048
+    assert!(lo > watermark, "fixture: the grant must be above the issued watermark");
+    s.store.apply_arena_grant(N1, lo, 2 * ARENA_EXTENT_PAGES).unwrap();
+    assert_eq!(
+        s.store.grantable_extents(),
+        2,
+        "the old authority's high-water swallowed the new leader's grant"
+    );
     let b = s.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX / 2)).unwrap();
     let a = s.store.arena_for(b.branch_id).unwrap();
-    assert_eq!(s.store.extent_range(a).map(|r| r.0), Some(50_000));
+    assert_eq!(s.store.extent_range(a).map(|r| r.0), Some(lo));
+}
+
+// =================================================================================================
+// FILLING an extent, as opposed to CLAIMING one. Found by an adversarial pass over this row's own
+// code: `reserve()` was guarded, but the two paths that put pages INSIDE an already-claimed extent
+// were not, so an extent claimed while standalone went on being filled after the process joined.
+// =================================================================================================
+
+#[test]
+fn an_extent_claimed_under_a_superseded_authority_is_not_filled_afterwards() {
+    let s = store("fill_revoked");
+    let arena;
+    let epoch;
+    {
+        let _solo = ClusterScope::standalone();
+        arena = s.store.arena_for(BranchId::TRUNK).unwrap();
+        epoch = s.catalog.next_epoch();
+        // It really is fillable while standalone, or the assertion below proves nothing.
+        s.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+    }
+
+    let _scope = ClusterScope::joined(N1);
+    // The fast path must not hand the stale arena back...
+    let err = s.store.arena_for(BranchId::TRUNK).unwrap_err();
+    assert!(
+        format!("{err}").contains("no leader-granted"),
+        "arena_for served an extent claimed under a superseded authority: {err}"
+    );
+    // ...and neither may a caller that still holds the id, which is why the stamp exists at all:
+    // clearing `current` alone would not stop this.
+    let err = s.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap_err();
+    assert!(
+        format!("{err}").contains("superseded authority"),
+        "a page was written into an extent the current leader knows nothing about: {err}"
+    );
+}
+
+#[test]
+fn a_recycled_page_inside_a_stale_extent_is_not_handed_out_after_a_join() {
+    // `alloc_in_arena` pops `state.recycled[arena]` BEFORE it looks at the extent, so a page freed
+    // back inside a stale extent is a second way in.
+    let s = store("fill_recycled");
+    let arena;
+    let epoch;
+    {
+        let _solo = ClusterScope::standalone();
+        arena = s.store.arena_for(BranchId::TRUNK).unwrap();
+        epoch = s.catalog.next_epoch();
+        let p = s.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+        s.store.free_page(p, epoch).unwrap();
+    }
+    let _scope = ClusterScope::joined(N1);
+    let err = s.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap_err();
+    assert!(
+        format!("{err}").contains("superseded authority"),
+        "a recycled page inside a stale extent was handed out: {err}"
+    );
+}
+
+#[test]
+fn a_granted_extent_is_filled_without_any_further_consensus() {
+    // The mirror image, and the reason the fast path must survive: pages inside an extent this
+    // authority granted are node-local, and making each one cost a round is exactly what would
+    // make agent isolation expensive. Only the CLAIM is a cluster decision.
+    let s = store("fill_granted");
+    let _scope = ClusterScope::joined(N1);
+    s.store.apply_arena_grant(N1, 40_000, ARENA_EXTENT_PAGES).unwrap();
+    let a = s.store.arena_for(BranchId::TRUNK).unwrap();
+    let epoch = s.catalog.next_epoch();
+    for _ in 0..64 {
+        s.store.alloc_in_arena(a, PageType::BTreeLeaf, epoch).unwrap();
+    }
+    // And the fast path keeps returning it, with no grant consumed.
+    assert_eq!(s.store.arena_for(BranchId::TRUNK).unwrap(), a);
+    assert_eq!(s.store.grantable_extents(), 0, "filling an extent consumed another grant");
 }
 
 // =================================================================================================
@@ -739,7 +860,10 @@ fn the_three_appliers_take_exactly_the_frozen_commands_shape() {
     for c in cmds {
         match c {
             Command::ArenaGrant { node, first_page, page_count } => {
-                s.store.apply_arena_grant(node, first_page, page_count).unwrap()
+                // The outcome is discarded here on purpose: this test is about the SHAPE of the
+                // frozen command matching the applier, not about idempotence, which
+                // `a_redelivered_grant_does_not_hand_out_the_same_extent_twice` owns.
+                let _ = s.store.apply_arena_grant(node, first_page, page_count).unwrap();
             }
             Command::TxnIdRange { node, lo, hi } => e.txn.apply_txn_id_grant(node, lo, hi).unwrap(),
             Command::LeaseTick { unix_millis } => {

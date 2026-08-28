@@ -27,7 +27,7 @@ MUTANTS = [
      """            Authority::Member(_node) => {
                 let lo = self.accepted_through.max(self.issued);
                 let hi = lo.saturating_add(self.chunk.max(n));
-                self.push_range(lo, hi, now_epoch);
+                self.push_range(lo, hi);
                 self.take_from_held(n).ok_or(GrantError::SpaceExhausted {
                     counter: self.counter,
                     issued_through: self.issued,
@@ -43,7 +43,7 @@ MUTANTS = [
      """            Authority::Member(_node) => {
                 let lo = self.accepted_through.max(self.issued);
                 let hi = lo.saturating_add(self.chunk.max(n));
-                self.push_range(lo, hi, now_epoch);
+                self.push_range(lo, hi);
                 self.take_from_held(n).ok_or(GrantError::SpaceExhausted {
                     counter: self.counter,
                     issued_through: self.issued,
@@ -101,15 +101,79 @@ MUTANTS = [
 
     ("M5", "space granted under a superseded authority is not issued from",
      "src/cluster/mod.rs",
-     "        self.held.retain(|h| h.epoch == now_epoch);",
-     "        let _ = now_epoch;",
-     "--lib", "cluster::tests::ranges_from_a_superseded_authority_are_not_issued_from"),
+     """        if self.epoch != now_epoch {
+            self.epoch = now_epoch;
+            self.held.clear();
+            self.accepted_through = self.issued;
+        }""",
+     """        if self.epoch != now_epoch {
+            self.epoch = now_epoch;
+            self.accepted_through = self.issued;
+        }""",
+     "--lib", "cluster::tests::ranges_from_a_superseded_authority"),
 
     ("M5b", "same rule, through a store that self-granted and then joined",
      "src/cluster/mod.rs",
-     "        self.held.retain(|h| h.epoch == now_epoch);",
-     "        let _ = now_epoch;",
+     """        if self.epoch != now_epoch {
+            self.epoch = now_epoch;
+            self.held.clear();
+            self.accepted_through = self.issued;
+        }""",
+     """        if self.epoch != now_epoch {
+            self.epoch = now_epoch;
+            self.accepted_through = self.issued;
+        }""",
      "--test integration_cluster_grants", "self_granted_while_standalone"),
+
+    ("M14", "an authority change resets the high-water, so the old membership cannot clamp the new leader's grants",
+     "src/cluster/mod.rs",
+     """            self.held.clear();
+            self.accepted_through = self.issued;""",
+     """            self.held.clear();""",
+     "--lib", "cluster::tests::an_authority_change_stops_the_old_high_water"),
+
+    ("M14b", "same rule, through a store that self-granted and then joined",
+     "src/cluster/mod.rs",
+     """            self.held.clear();
+            self.accepted_through = self.issued;""",
+     """            self.held.clear();""",
+     "--test integration_cluster_grants", "an_authority_change_is_noticed"),
+
+    ("M15", "the reset floor is the ISSUED watermark and never lower, or a value is issued twice",
+     "src/cluster/mod.rs",
+     """            self.held.clear();
+            self.accepted_through = self.issued;""",
+     """            self.held.clear();
+            self.accepted_through = 0;
+            self.issued = 0;""",
+     "--lib", "cluster::tests::an_authority_change_never_lowers_the_issued_watermark"),
+
+    ("M16", "the automatic checkpoint is withheld on a cluster member",
+     "src/wal/txn.rs",
+     "        if due && !crate::cluster::is_clustered() {",
+     "        if due {",
+     "--test integration_cluster_grants", "does_not_truncate_its_wal"),
+
+    ("M17", "withholding a checkpoint defers it rather than dropping it",
+     "src/wal/txn.rs",
+     """        let due = self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1
+            >= checkpoint_interval()
+            && self.att.lock().unwrap().is_empty();
+        if due && !crate::cluster::is_clustered() {""",
+     """        let due = self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1
+            >= checkpoint_interval()
+            && self.att.lock().unwrap().is_empty();
+        if due && crate::cluster::is_clustered() {
+            self.commits_since_checkpoint.store(0, Ordering::SeqCst);
+        }
+        if due && !crate::cluster::is_clustered() {""",
+     "--test integration_cluster_grants", "does_not_truncate_its_wal"),
+
+    ("M18", "an arena grant carries more ids than extents, so the page counter is what refuses",
+     "src/branch/arena.rs",
+     "        self.space.arena_ids.apply_grant(node, lo, hi)?;",
+     "        self.space.arena_ids.apply_grant(node, lo, lo + (hi - lo) / ARENA_EXTENT_PAGES as u64)?;",
+     "--test integration_cluster_grants", "an_arena_grant_always_carries_more_ids"),
 
     ("M6", "the recycle stack is epoch-stamped too, being issued space outside the grant book",
      "src/branch/arena.rs",
@@ -161,13 +225,13 @@ MUTANTS = [
     ("M10", "only the issued watermark reaches the durable image; held ranges never do",
      "src/branch/arena.rs",
      "        b.extend_from_slice(&(self.space.extent_starts.issued_through() as u32).to_be_bytes());",
-     "        b.extend_from_slice(&(self.space.extent_starts.granted_through_for_mutant() as u32).to_be_bytes());",
+     "        b.extend_from_slice(&((self.space.extent_starts.issued_through() + self.space.extent_starts.remaining()) as u32).to_be_bytes());",
      "--test integration_cluster_grants", "the_checkpoint_image_is_byte_identical"),
 
     ("M11", "a standalone node issues exactly what fetch_add issued",
      "src/cluster/mod.rs",
-     "                let lo = self.accepted_through.max(self.issued);\n                let hi = lo.saturating_add(self.chunk.max(n));\n                self.push_range(lo, hi, now_epoch);\n                self.take_from_held(n).ok_or(GrantError::SpaceExhausted {",
-     "                let lo = self.accepted_through.max(self.issued) + 1;\n                let hi = lo.saturating_add(self.chunk.max(n));\n                self.push_range(lo, hi, now_epoch);\n                self.take_from_held(n).ok_or(GrantError::SpaceExhausted {",
+     "                let lo = self.accepted_through.max(self.issued);\n                let hi = lo.saturating_add(self.chunk.max(n));\n                self.push_range(lo, hi);\n                self.take_from_held(n).ok_or(GrantError::SpaceExhausted {",
+     "                let lo = self.accepted_through.max(self.issued) + 1;\n                let hi = lo.saturating_add(self.chunk.max(n));\n                self.push_range(lo, hi);\n                self.take_from_held(n).ok_or(GrantError::SpaceExhausted {",
      "--test integration_cluster_grants", "no_cluster_configured"),
 
     ("M12", "a take never splices two granted ranges into one allocation",
@@ -178,8 +242,10 @@ MUTANTS = [
 
     ("M13", "the epoch-aware remaining() cannot disagree with the guard that refuses",
      "src/cluster/mod.rs",
-     "        self.held.iter().filter(|h| h.epoch == now_epoch).map(|h| h.hi - h.lo).sum()",
-     "        let _ = now_epoch;\n        self.held.iter().map(|h| h.hi - h.lo).sum()",
+     """    fn remaining_values(&mut self, now_epoch: AuthorityEpoch) -> u64 {
+        self.observe_epoch(now_epoch);""",
+     """    fn remaining_values(&mut self, now_epoch: AuthorityEpoch) -> u64 {
+        let _ = now_epoch;""",
      "--test integration_cluster_grants", "self_granted_while_standalone"),
 ]
 
@@ -192,18 +258,11 @@ impl Grants {
         let mut merged: Vec<Held> = Vec::new();
         for h in self.held.iter().copied() {
             match merged.last_mut() {
-                Some(p) if p.hi == h.lo && p.epoch == h.epoch => p.hi = h.hi,
+                Some(p) if p.hi == h.lo => p.hi = h.hi,
                 _ => merged.push(h),
             }
         }
         self.held = merged;
-    }
-}
-
-impl GrantedCounter {
-    #[allow(dead_code)]
-    pub fn granted_through_for_mutant(&self) -> u64 {
-        self.inner().accepted_through
     }
 }
 ''',
@@ -224,12 +283,56 @@ def restore(path):
     run(f"git checkout -- {path}")
 
 
+def one_check(log, mid, rule, path, needle, target, filt):
+    """Run one named test against the mutation already in the tree, and classify."""
+    cmd = f"timeout 900 cargo test {target} {filt} -- --test-threads=4"
+    r = run(cmd)
+    out = r.stdout + r.stderr
+    # A mutant that will not compile has still not been SHOWN to be caught by the test.
+    if "error[E" in out or "error: could not compile" in out:
+        verdict = "DID-NOT-COMPILE"
+    elif "test result: FAILED" in out or "error: test failed" in out:
+        verdict = "KILLED"
+    elif "0 passed" in out and "test result: ok" in out:
+        verdict = "COLLECTED-NOTHING"
+    elif "test result: ok" in out:
+        verdict = "SURVIVED"
+    else:
+        verdict = "INCONCLUSIVE"
+    ran = [l for l in out.splitlines() if l.startswith("test result:")]
+    fails = [l for l in out.splitlines() if "panicked at" in l or l.strip().startswith("assertion")]
+    log("")
+    log(f"[{mid}] {verdict}")
+    log(f"  rule    : {rule}")
+    log(f"  mutant  : {path} — {needle.strip().splitlines()[0][:88]}")
+    log(f"  command : {cmd}")
+    for l in ran:
+        log(f"  result  : {l}")
+    for l in fails[:3]:
+        log(f"  printed : {l.strip()[:160]}")
+    return (mid, verdict)
+
+
 def main():
     files = sorted({m[2] for m in MUTANTS})
     if not clean(files):
         print("REFUSING: mutated files are not committed and clean; restore would discard work.")
         print(run("git status --porcelain -- " + " ".join(files)).stdout)
         return 2
+
+    # Group by (file, needle, replacement): several ids share one mutation (a rule pinned by both a
+    # unit test and an integration test), and applying it once per group instead of once per id
+    # halves the rebuilds. Rebuilding is the entire cost of this sweep.
+    groups = []
+    for m in MUTANTS:
+        mid, rule, path, needle, repl, target, filt = m
+        key = (path, needle, repl)
+        for g in groups:
+            if g["key"] == key:
+                g["checks"].append((mid, rule, target, filt))
+                break
+        else:
+            groups.append({"key": key, "checks": [(mid, rule, target, filt)]})
 
     lines = []
     def log(s):
@@ -239,41 +342,26 @@ def main():
 
     log("F4 mutation evidence — every rule broken on purpose, then restored.")
     log("=" * 90)
+    log(f"{len(MUTANTS)} checks over {len(groups)} distinct mutations.")
     verdicts = []
-    for mid, rule, path, needle, repl, target, filt in MUTANTS:
+    for g in groups:
+        path, needle, repl = g["key"]
         src = (ROOT / path).read_text()
         if needle not in src:
-            log(f"[{mid}] SETUP FAILED — needle not found in {path}. Rule: {rule}")
-            verdicts.append((mid, "SETUP-FAILED"))
+            for mid, rule, _, _ in g["checks"]:
+                log(f"[{mid}] SETUP FAILED — needle not found in {path}. Rule: {rule}")
+                verdicts.append((mid, "SETUP-FAILED"))
             continue
         mutated = src.replace(needle, repl, 1) + HELPERS.get(path, "")
         (ROOT / path).write_text(mutated)
-        cmd = f"timeout 900 cargo test {target} {filt} -- --test-threads=4"
-        r = run(cmd)
-        restore(path)
-        out = (r.stdout + r.stderr)
-        # A mutant that will not compile has still not been SHOWN to be caught by the test.
-        if "error[E" in out or "error: could not compile" in out:
-            verdict = "DID-NOT-COMPILE"
-        elif "test result: FAILED" in out or "error: test failed" in out:
-            verdict = "KILLED"
-        elif "test result: ok" in out:
-            verdict = "SURVIVED"
-        else:
-            verdict = "INCONCLUSIVE"
-        # Which tests actually ran, and how the failure read.
-        ran = [l for l in out.splitlines() if l.startswith("test result:")]
-        fails = [l for l in out.splitlines() if "panicked at" in l or l.strip().startswith("assertion")]
-        log("")
-        log(f"[{mid}] {verdict}")
-        log(f"  rule    : {rule}")
-        log(f"  mutant  : {path} — {needle.strip().splitlines()[0][:88]}")
-        log(f"  command : {cmd}")
-        for l in ran:
-            log(f"  result  : {l}")
-        for l in fails[:3]:
-            log(f"  printed : {l.strip()[:160]}")
-        verdicts.append((mid, verdict))
+        try:
+            for mid, rule, target, filt in g["checks"]:
+                verdicts.append(one_check(log, mid, rule, path, needle, target, filt))
+        finally:
+            # Restore in a `finally`: run 1 was killed by its own timeout between mutate and
+            # restore and left a mutated file in the tree. Caught by `git status`, but only
+            # because someone looked.
+            restore(path)
 
     log("")
     log("=" * 90)
