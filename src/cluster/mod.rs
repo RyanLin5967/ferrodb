@@ -419,9 +419,14 @@ impl Grants {
         }
     }
 
-    /// How many values are held and not yet issued.
-    fn remaining_values(&self) -> u64 {
-        self.held.iter().map(|h| h.hi - h.lo).sum()
+    /// How many values are held and not yet issued **under `now_epoch`**.
+    ///
+    /// The epoch filter is not decoration. Without it this reports space that [`Grants::take`]
+    /// would refuse — a diagnostic that disagrees with the guard, which is the worst kind: a
+    /// leader loop reading it would see a node as well supplied and never grant it anything, and
+    /// the node would refuse every allocation for ever.
+    fn remaining_values(&self, now_epoch: AuthorityEpoch) -> u64 {
+        self.held.iter().filter(|h| h.epoch == now_epoch).map(|h| h.hi - h.lo).sum()
     }
 
     fn take_from_held(&mut self, n: u64) -> Option<u64> {
@@ -548,7 +553,8 @@ impl GrantedCounter {
     /// How many values this node may still issue without a new grant. Diagnostic only: a caller
     /// that branches on it is re-implementing the guard.
     pub fn remaining(&self) -> u64 {
-        self.inner().remaining_values()
+        let (_, ep) = authority_at();
+        self.inner().remaining_values(ep)
     }
 }
 

@@ -14,8 +14,14 @@
 - 3 one-line call-site fixes outside my files: `wal/recovery.rs`, `execution/executor.rs` (test),
   `replication/snapshot.rs` (test).
 
+- `tests/integration_cluster_grants.rs`: 26 tests, all green. Single-node preservation, the three
+  refusals, wrong-node/duplicate/standalone grant guards, two-node disjointness for pages and txn
+  ids, the replicated clock, authority-change revocation, restart, and the byte-identical image.
+- One real bug the tests caught: `GrantedCounter::remaining()` counted stale-epoch ranges the
+  guard would refuse. Fixed to filter by epoch.
+
 ## Doing now
-`tests/integration_cluster_grants.rs` — the process-wired tests, then the mutants.
+Mutation sweep: `scratchpad/f4_mutants.py` breaks each rule, runs its named test, restores.
 
 ## Next action
-Write `tests/integration_cluster_grants.rs`.
+Run `python3 scratchpad/f4_mutants.py`, then the full suite, then the summary.

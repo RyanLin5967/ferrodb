@@ -74,7 +74,7 @@ fn a_standalone_node_self_grants_through_the_same_consume_path() {
     // bypassed for standalone, this would read zero.
     let mut g = Grants::new("arena-id", 1, 4);
     assert_eq!(g.take(1, Authority::Standalone, 0).unwrap(), 1);
-    assert_eq!(g.remaining_values(), 3, "a self-grant of 4 with one issued leaves three");
+    assert_eq!(g.remaining_values(0), 3, "a self-grant of 4 with one issued leaves three");
 }
 
 // ---- the guards ---------------------------------------------------------------------------------
@@ -142,14 +142,15 @@ fn ranges_from_a_superseded_authority_are_not_issued_from() {
     // test, and the assertion below would pass for the wrong reason.
     let mut g = Grants::new("extent-page", 256, 1024);
     assert_eq!(g.take(256, Authority::Standalone, 0).unwrap(), 256);
-    assert_eq!(g.remaining_values(), 768, "fixture: nothing is held, so this proves nothing");
+    assert_eq!(g.remaining_values(0), 768, "fixture: nothing is held, so this proves nothing");
 
     // Epoch 1: joined a cluster. Whatever was held under epoch 0 is not ours.
     assert_eq!(
         g.take(1, Authority::Member(N1), 1).unwrap_err(),
         GrantError::Exhausted { counter: "extent-page", node: N1, need: 1 }
     );
-    assert_eq!(g.remaining_values(), 0, "stale ranges are dropped, not merely skipped");
+    assert_eq!(g.remaining_values(1), 0, "stale ranges are dropped, not merely skipped");
+    assert_eq!(g.remaining_values(0), 0, "the stale range was skipped rather than dropped");
 }
 
 #[test]
