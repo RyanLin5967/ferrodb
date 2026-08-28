@@ -452,6 +452,19 @@ pub fn encode_row(row: &[Value], fields: &[Field]) -> Result<Message, FerroError
 fn describe_stmt(stmt: &Stmt, catalog: &Catalog) -> Result<Option<Vec<Field>>, FerroError> {
     match stmt {
         Stmt::Select { from, columns, joins, .. } => {
+            // B9's system views, which are NOT in `Catalog::tables` by design — they are
+            // materialised from the agent layer on every read. `scope_for_table` below looks only
+            // there, so without this a `SELECT * FROM ferro_branches` was rejected at PARSE time as
+            // an unknown table and never reached the executor, where `system_views::intercept` was
+            // waiting for it as the very first check. The views worked from the CLI and were
+            // invisible over the wire.
+            //
+            // `describe_select` binds the same scope and the same projection `run_select` does, so
+            // what this announces and what the executor sends cannot drift.
+            if let Some(view) = crate::catalog::system_views::view_for(catalog, &from.name) {
+                let out = crate::catalog::system_views::describe_select(view, stmt, catalog)?;
+                return Ok(Some(fields_of(out)));
+            }
             if joins.is_empty() {
                 // Single table, which covers the plain read and the `AS OF BRANCH` read: the
                 // agent runtime builds exactly this scope for its own projection.

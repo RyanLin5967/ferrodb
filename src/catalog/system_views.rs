@@ -561,6 +561,43 @@ fn join_refusal(view: SystemView) -> FerroError {
 /// * a join — a view has no `TableEntry`, so the optimizer cannot lower a scan of it, and the join
 ///   operators are reached only through `lower`. Refusing names the limit; ignoring the join clause
 ///   would silently return the left side alone.
+/// The columns a `SELECT` on this view will produce, **without running it**.
+///
+/// pgwire's extended protocol lets a client `Describe` a statement before it `Execute`s it, so the
+/// field list has to be answerable at PARSE time — and before this existed, `describe_stmt` bound a
+/// view through `scope_for_table`, which looks in `Catalog::tables`, where a view is deliberately
+/// absent. The whole statement was rejected as `unknown table 'ferro_branches'` before the executor
+/// ever saw it, so the views were readable from the CLI and invisible over the wire.
+///
+/// It builds the scope exactly as `run_select` does and binds the same projection, so what
+/// `Describe` announces and what `Execute` sends agree **by construction** rather than by two
+/// copies of the same logic staying in step. That matters here more than usual: this server refuses
+/// outright if it described a statement one way and then produced rows another
+/// (`"described the statement as returning no rows and then produced some"`), so a drift between
+/// the two is not a cosmetic mismatch — it is an error the client sees.
+///
+/// A projection narrows it: `SELECT reason FROM ferro_quarantine` describes one column, not four.
+pub fn describe_select(
+    view: SystemView,
+    stmt: &Stmt,
+    catalog: &Catalog,
+) -> Result<Vec<BoundColumn>, FerroError> {
+    let Stmt::Select { from, columns, joins, .. } = stmt else {
+        return Err(FerroError::Bind(format!(
+            "{} is a system view and can only be read by SELECT",
+            view.name()
+        )));
+    };
+    if !joins.is_empty() {
+        return Err(join_refusal(view));
+    }
+    let qualifier = from.alias.clone().unwrap_or_else(|| view.name().to_string());
+    let mut scope = Scope::new();
+    scope.add_table(&qualifier, &view.schema())?;
+    let (_, output) = Binder::new(catalog).bind_projection(columns.clone(), &scope)?;
+    Ok(output)
+}
+
 pub fn run_select(
     view: SystemView,
     stmt: &Stmt,

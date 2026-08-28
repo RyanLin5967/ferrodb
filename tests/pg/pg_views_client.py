@@ -135,11 +135,25 @@ def main():
         i = at.index(name)
         return [r[i] for r in rows]
 
+    # `(name, oid)`, dropping the format code.
+    #
+    # `pg_client.py` used to yield `(name, oid)` and B12's extended-protocol work (`60c6820`) added
+    # the wire format as a third element, because a column announced as text and sent as binary is a
+    # silent mojibake bug it wanted assertable. This client was written against the two-element
+    # shape, so every comparison below failed on ARITY while every name and OID matched exactly.
+    #
+    # Normalised here rather than by widening the expectations, so what these assertions check is
+    # unchanged: the names and the type OIDs, in order. A client that wants to assert the format
+    # code should do it deliberately and separately — silently folding it into these lists would
+    # make an unrelated format change read as a schema change.
+    def name_oid(fields):
+        return [(f[0], f[1]) for f in (fields or [])]
+
     def fields_match(view, fields, where):
         want = EXPECTED_FIELDS[view]
         check(
-            fields == want,
-            f"{view} {where}: RowDescription is {fields}, expected {want}",
+            name_oid(fields) == want,
+            f"{view} {where}: RowDescription is {name_oid(fields)}, expected {want}",
         )
 
     # ---- conn1: seed, then an agent session whose premise will move -----------------------------
@@ -206,7 +220,7 @@ def main():
     # Projection and WHERE over a view: the field list must narrow to what was asked for.
     fields, rows, _, _ = q(a, "SELECT agent_id, staged_rows FROM ferro_run_activity WHERE staged_rows = 1;")
     check(
-        fields == [("agent_id", TEXT), ("staged_rows", INT8)],
+        name_oid(fields) == [("agent_id", TEXT), ("staged_rows", INT8)],
         f"a projected view did not narrow its RowDescription: {fields}",
     )
     check(rows == [["held", "1"]], f"{rows}")
@@ -216,7 +230,7 @@ def main():
     # at any conforming driver, so the OID has to come from the value.
     fields, rows, _, _ = q(a, "SELECT branch_id = 9999 FROM ferro_branches;")
     check(
-        fields == [("?column?", BOOL)],
+        name_oid(fields) == [("?column?", BOOL)],
         f"a computed column was announced as its placeholder type instead of the value's: {fields}",
     )
     check(rows == [["f"], ["f"]], f"{rows}")
@@ -261,7 +275,7 @@ def main():
     )
     check(len(fields) > 1, f"MERGE came back as a single column: {fields}")
     check(
-        ("applied_to_target", BOOL) in (fields or []),
+        ("applied_to_target", BOOL) in name_oid(fields),
         f"applied_to_target is not a bool column: {fields}",
     )
     check(col(fields, rows, "applied_to_target") == ["t"], f"conn2's merge did not publish: {rows}")
