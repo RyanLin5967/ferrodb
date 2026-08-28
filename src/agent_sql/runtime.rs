@@ -66,6 +66,7 @@ use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
+use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::tel::frame::TxnFrame;
@@ -312,6 +313,33 @@ pub struct RunActivity {
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {
     fn resolve_branch(&self, name: &str) -> Result<BranchId, FerroError>;
+}
+
+/// Everything a caller declares about the run behind a session — what provenance interns.
+///
+/// A struct rather than four more positional parameters on `begin_session_with_model`. Three of
+/// the four fields are optional and two of those are `Option<&str>`: as parameters, `run_id` and
+/// `prompt` would sit in one argument list with nothing in the type system between them, and a
+/// swapped pair would attribute every row of the run to a prompt while hashing the run id — a
+/// mistake with no symptom, because both values are strings and both are accepted.
+///
+/// [`Default`] gives the shape a caller who declares only an agent: no run, no model, no prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunIdentity<'a> {
+    /// Stable identity of the agent across runs. The one field that is required.
+    pub agent_id: &'a str,
+    /// This particular invocation. `None` is recorded as the literal `<unnamed>`.
+    pub run_id: Option<&'a str>,
+    /// `(name, version)`. `None` is recorded as `unspecified` in both halves, which reads as
+    /// "never declared" rather than attributing the writes to a model nobody named.
+    pub model: Option<(&'a str, &'a str)>,
+    /// The prompt behind the run, as text. It is hashed by `begin_session_as` and never stored:
+    /// `RunEntity::prompt_hash` is the digest, so a prompt carrying customer data does not become
+    /// a durable copy of it.
+    ///
+    /// `None` — no prompt declared — is the all-zero hash, deliberately **not**
+    /// `prompt_digest("")`. An empty prompt is a prompt.
+    pub prompt: Option<&'a str>,
 }
 
 pub struct AgentRuntime {
@@ -629,7 +657,7 @@ impl AgentRuntime {
         run_id: Option<&str>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
-        self.begin_session_with_model(agent_id, run_id, None, parent)
+        self.begin_session_as(RunIdentity { agent_id, run_id, ..RunIdentity::default() }, parent)
     }
 
     /// As [`AgentRuntime::begin_session`], but recording the model behind the run.
@@ -644,6 +672,21 @@ impl AgentRuntime {
         model: Option<(&str, &str)>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
+        self.begin_session_as(RunIdentity { agent_id, run_id, model, prompt: None }, parent)
+    }
+
+    /// The full form: fork a branch and intern the run under everything the caller declared
+    /// about it, the prompt included.
+    ///
+    /// This is the only one of the three with a body; the other two are the shapes that predate
+    /// [`RunIdentity`] and delegate here. One body is the point — a second copy of the interning
+    /// sequence is how the `[0u8; 32]` this row exists to remove survived being fixed once.
+    pub fn begin_session_as(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+    ) -> Result<AgentSession, FerroError> {
+        let RunIdentity { agent_id, run_id, model, prompt } = id;
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
@@ -657,9 +700,17 @@ impl AgentRuntime {
         let txn = TxnId(state.next_txn);
         let run = run_id.unwrap_or("<unnamed>").to_string();
         let (model_name, model_version) = model.unwrap_or(("unspecified", "unspecified"));
+        // **This is where the prompt stops being text.** Hashed once, here, and the `&str` is
+        // dropped at the end of the call: what the store, the WAL identity record, the change feed
+        // and `ferro_runs` all receive is 32 bytes. `None` — no `PROMPT` clause — is the all-zero
+        // hash, which is not `prompt_digest("")` and must never become it: "no prompt was declared"
+        // and "the prompt was empty" are different facts about a run.
+        let prompt_hash = prompt.map(prompt_digest).unwrap_or([0u8; 32]);
         // Intern first so the store assigns the id, then rebuild the entity carrying it. The
         // store returns the SAME id for a repeated (agent, run), which is what makes attribution
-        // run-level; it also refuses a re-intern whose actor tuple disagrees.
+        // run-level; it also refuses a re-intern whose actor tuple disagrees. `same_actor` counts
+        // `prompt_hash`, so re-beginning one run under a different prompt is refused here rather
+        // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
         let prov = self.prov_store.intern(&RunEntity::new(
             ProvId::NONE,
@@ -667,7 +718,7 @@ impl AgentRuntime {
             run.clone(),
             model_name,
             model_version,
-            [0u8; 32],
+            prompt_hash,
             started,
             parent,
         ))?;
@@ -677,7 +728,7 @@ impl AgentRuntime {
             run.clone(),
             model_name,
             model_version,
-            [0u8; 32],
+            prompt_hash,
             started,
             parent,
         );

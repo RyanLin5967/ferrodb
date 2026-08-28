@@ -218,17 +218,24 @@ fn every_view_is_populated_once_an_agent_has_run() {
     assert_eq!(column(&runs, "run_id"), vec!["r_7"]);
     assert_eq!(column(&runs, "model_name"), vec!["claude-opus-5"]);
     assert_eq!(column(&runs, "model_version"), vec!["2026-05"]);
-    // **Asserted as the all-zero hash, not merely as 64 characters wide.** A width assertion is what a
-    // constant passes, and this IS a constant: every `RunEntity` the SQL surface builds passes
-    // `[0u8; 32]`, because `BEGIN AGENT SESSION` has no syntax for a prompt. `RunEntity`'s own field
-    // doc calls it "hash of the prompt that produced the run", so the column is a documented gap
-    // rather than a value, and pinning the gap is what makes it visible: the day a prompt is captured,
-    // this fails and points at the column to re-check.
+    // **Asserted as the all-zero hash, not merely as 64 characters wide.** A width assertion is what
+    // a constant passes.
+    //
+    // Until E79b this WAS a constant — every `RunEntity` the SQL surface built passed `[0u8; 32]`,
+    // because `BEGIN AGENT SESSION` had no syntax for a prompt — and the assertion existed to pin
+    // the gap so that the day a prompt was captured it would fail and point here. It has now been
+    // captured: `BEGIN AGENT SESSION ... PROMPT '<text>'` exists and hashes through `prompt_digest`.
+    //
+    // The value is unchanged and the meaning is not. All-zero is no longer "nothing can be
+    // recorded", it is **"this statement declared no prompt"** — which the statement above does
+    // not, deliberately, because the omitted clause has to keep meaning something distinguishable
+    // from `PROMPT ''`. `ferro_runs_reports_the_digest_of_a_declared_prompt` is the other half, and
+    // neither one alone tells a working column from a column stuck on one answer.
     assert_eq!(
         column(&runs, "prompt_hash"),
         vec!["0".repeat(64)],
-        "prompt_hash is no longer the unset all-zero hash — a prompt is now being captured somewhere, \
-         so this assertion and the column's doc both need revisiting"
+        "a statement with no PROMPT clause must leave prompt_hash unset; a digest here means the \
+         omitted clause started hashing something nobody declared"
     );
     assert_eq!(column(&runs, "branch_name"), vec![format!("b_{}", branch.id)]);
 
@@ -840,6 +847,48 @@ fn the_readmes_system_view_examples_run_as_written() {
 ///
 /// So this asks for each column by name, one statement per column. It is the guard that catches the
 /// next collision when someone adds a column, rather than a reader finding it.
+/// **E79b: the populated half of `prompt_hash`.**
+///
+/// `every_view_is_populated_once_an_agent_has_run` pins the *unset* value, which a column stuck on
+/// one answer would also pass. This is the pair to it: a session that declares a prompt reports its
+/// digest, in the lowercase hex `hex32` renders, and two different prompts report two different
+/// digests — so the column carries information rather than a second constant.
+#[test]
+fn ferro_runs_reports_the_digest_of_a_declared_prompt() {
+    use ferrodb::provenance::sha256::{prompt_digest, to_hex};
+
+    let mut db = Db::new();
+    db.seed();
+
+    let first = "restock everything below reorder";
+    let second = "check the restock for overshoot";
+    let mut a = db.session();
+    db.ok(&format!("BEGIN AGENT SESSION AS 'restock' RUN 'r_1' PROMPT '{first}';"), &mut a);
+    let mut b = db.session();
+    db.ok(&format!("BEGIN AGENT SESSION AS 'audit' RUN 'r_2' PROMPT '{second}';"), &mut b);
+    // A third with no clause at all, so all three renderings are in one result set.
+    let mut c = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'plain' RUN 'r_3';", &mut c);
+
+    let runs = db.view("SELECT agent_id, prompt_hash FROM ferro_runs;");
+    let agents = column(&runs, "agent_id");
+    let hashes = column(&runs, "prompt_hash");
+    let of = |name: &str| -> String {
+        let i = agents.iter().position(|a| a == name).unwrap_or_else(|| {
+            panic!("no row for {name} in {agents:?}")
+        });
+        hashes[i].clone()
+    };
+
+    assert_eq!(of("restock"), to_hex(&prompt_digest(first)));
+    assert_eq!(of("audit"), to_hex(&prompt_digest(second)));
+    assert_ne!(of("restock"), of("audit"), "one digest for two prompts");
+    assert_eq!(of("plain"), "0".repeat(64), "a run with no PROMPT clause must stay unset");
+    // Rendered as hex, not as bytes or as a Debug array: 64 lowercase hex characters.
+    assert_eq!(of("restock").len(), 64);
+    assert!(of("restock").chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+}
+
 #[test]
 fn every_declared_column_is_selectable_by_name() {
     let mut db = Db::new();

@@ -410,7 +410,7 @@ pub fn run_agent_stmt(
     let mut ctx = ExecCtx { catalog, bp, txn };
 
     match bound {
-        BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, parent } => {
+        BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, prompt, parent } => {
             if session.agent.is_some() {
                 return Err(FerroError::Txn(
                     "an agent session is already open on this connection".into(),
@@ -422,7 +422,19 @@ pub fn run_agent_stmt(
                 ));
             }
             let model = model.as_ref().map(|(n, v)| (n.as_str(), v.as_str()));
-            let s = runtime.begin_session_with_model(&agent_id, run_id.as_deref(), model, parent)?;
+            // `prompt` reaches the runtime as text and goes no further: `begin_session_as` hashes
+            // it into `RunEntity::prompt_hash` and drops it. Nothing on this path — the session
+            // struct, the `SessionStarted` output, the branch record — carries the plaintext, so
+            // there is no route by which a prompt becomes a durable copy of what it contained.
+            let s = runtime.begin_session_as(
+                crate::agent_sql::runtime::RunIdentity {
+                    agent_id: &agent_id,
+                    run_id: run_id.as_deref(),
+                    model,
+                    prompt: prompt.as_deref(),
+                },
+                parent,
+            )?;
             session.agent = Some(s.clone());
             Ok(Outcome::Agent(AgentOutput::SessionStarted(s)))
         }
