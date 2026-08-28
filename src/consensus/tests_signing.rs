@@ -812,9 +812,26 @@ fn a_relative_link_target_resolves_against_the_links_own_directory() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_cycle_is_refused_rather_than_followed() {
-    // The walk is bounded, so a cycle is a refusal instead of a hang or an ELOOP from somewhere
-    // deeper. Named here because the bound is the thing that makes the walk safe to write at all.
+fn a_symlink_cycle_is_refused_by_the_shape_check_before_the_walk_begins() {
+    // **Renamed from "...refused rather than followed", which overclaimed.** A mutant that removed
+    // the walk's `MAX_HOPS` bound did NOT make this test fail, so the test was not evidence for the
+    // bound — it was passing for a different reason, which is the shape of test this project keeps
+    // warning about. Measured, not guessed: the refusal is
+    //
+    //     could not be inspected: Too many levels of symbolic links (os error 62)
+    //
+    // i.e. `fs::metadata` in the shape check hits `ELOOP` and refuses before the walk runs at all.
+    // The assertion below now pins that exact cause, so if the order ever changes this test says so
+    // instead of quietly continuing to pass.
+    //
+    // **The walk's own bound therefore has no killing test here, and the reason is worth stating
+    // rather than leaving as "unreachable".** A cycle is refused earlier; a *non*-cyclic chain
+    // longer than the bound cannot be built either, because every OS this targets caps symlink
+    // resolution around 32 — below `MAX_HOPS` — so `fs::metadata` refuses those too. The bound is
+    // belt-and-braces against a future edit that removes the shape check, and it becomes reachable
+    // the moment one does. (This module has already been wrong once about calling a branch
+    // untestable — see `a_key_whose_directory_is_gone_is_refused` — so: no test HERE reaches it,
+    // by this mechanism, today.)
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
     let b = dir.path().join("b");
@@ -822,9 +839,10 @@ fn a_symlink_cycle_is_refused_rather_than_followed() {
     std::os::unix::fs::symlink(&a, &b).unwrap();
     let err = Key::load(&a).expect_err("a symlink cycle must be refused");
     let text = err.to_string();
+    assert!(text.contains("could not be inspected"), "the shape check must be what refuses: {text}");
     assert!(
-        text.contains("cycle") || text.contains("could not be inspected"),
-        "the refusal must say what it met: {text}"
+        text.contains("symbolic links"),
+        "and it must carry the OS's own reason, so an operator sees ELOOP rather than a guess: {text}"
     );
 }
 
