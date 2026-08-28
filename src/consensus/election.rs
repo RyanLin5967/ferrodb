@@ -470,6 +470,23 @@ impl Consensus {
     /// whatever about whether it holds a single round of the log, so a node added to a running
     /// cluster would be told the configuration and campaign on its very next tick — holding
     /// nothing, with a term one above everybody's.
+    // TRANSITIONAL `dead_code` ALLOW — one of the set tracked by ledger row **F-cleanup**.
+    //
+    // These three are the seams between F1's rules and the evidence that drives them, and their
+    // callers are not built yet: `replicate.rs` must call `observe_quorum_watermark` and
+    // `observe_config_at`, and the command applier must call `apply_config`. CI builds with
+    // `-D dead_code`, so without this the branch cannot be green between one lane landing and the
+    // next.
+    //
+    // Scoped to these three methods and NOT to the impl block or the module, deliberately: a wider
+    // allow would also silence genuinely dead code added to this file later, which is the defect
+    // the gate exists to catch — the lint would read as "on" while protecting nothing.
+    //
+    // **Removal condition, exact:** delete each attribute once its named caller exists. If the
+    // build still passes with it gone, it was doing nothing; if it fails, that caller is missing
+    // and THAT is the bug — `replicate.rs` failing to call `observe_quorum_watermark` means no node
+    // added to a running cluster can ever campaign, which no test in this file can see.
+    #[allow(dead_code)]
     pub(crate) fn apply_config(&mut self, cfg: Config, out: &mut Vec<Action>) {
         self.cfg = cfg;
         self.behind = false;
@@ -498,6 +515,7 @@ impl Consensus {
     /// Without this a node with an old configuration stands on its own timeout, raises the term,
     /// and fences a healthy leader out of office — repeatedly, in a livelock where no node with an
     /// up-to-date configuration can hold the office and no node without one can win it.
+    #[allow(dead_code)]
     pub(crate) fn observe_config_at(&mut self, at: CfgAt) {
         if at > self.cfg.at() {
             self.behind = true;
@@ -517,6 +535,7 @@ impl Consensus {
     /// **And a cluster with an empty log reports a watermark of zero**, which every node matches —
     /// so joining an empty cluster clears the flag at once and does not leave a member that can
     /// never stand. That case is why the rule is a comparison and not merely "have some rounds".
+    #[allow(dead_code)]
     pub(crate) fn observe_quorum_watermark(&mut self, watermark: Round) {
         if self.unjoined && self.durable >= watermark {
             self.unjoined = false;

@@ -98,6 +98,41 @@ jobs:
         working-directory: cdc-consumer
         run: go mod download
 
+      # THE POSTGRES WIRE DRIVERS. `tests/integration_pgwire.rs` checks this server against two
+      # INDEPENDENT real clients, and it does so because a wire protocol verified with its own
+      # client agrees with itself about any shared misreading - the same argument the Go consumer
+      # and the duckdb CLI are here for.
+      #
+      # Those tests REFUSE when a driver is missing rather than skipping, which is correct and is
+      # why this step exists: before it, `cargo test` failed on all three runners with
+      # "ModuleNotFoundError: No module named 'asyncpg'". The tests were right and the workflow was
+      # incomplete - they were added after this file last changed, and nothing here had ever
+      # installed what they need.
+      #
+      # Two drivers, not one, and they are not interchangeable: asyncpg speaks the EXTENDED protocol
+      # with binary formats, pg8000 speaks it with text, and B12's field-type work is only pinned
+      # because both are checked. Dropping either would silently narrow the claim.
+      - name: Install the Postgres wire drivers (asyncpg, pg8000)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --user on the runners' system python. A venv would need every later step to activate it,
+          # and the tests shell out to a bare `python3`.
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user asyncpg pg8000
+          # ASSERT THE IMPORT, not the install. `pip install` reporting success and the module being
+          # importable are different facts: a --user install goes somewhere `python3` may not search,
+          # and the failure then arrives inside cargo test as the same ModuleNotFoundError this step
+          # was added to prevent. Name it here instead.
+          for m in asyncpg pg8000; do
+            python3 -c "import $m; print('$m', $m.__version__ if hasattr($m,'__version__') else 'ok')" || {
+              echo "$m installed but is not importable by the python3 the tests invoke." >&2
+              echo "python3 is $(command -v python3); sys.path follows:" >&2
+              python3 -c "import sys; print('\n'.join(sys.path))" >&2
+              exit 1
+            }
+          done
+
       # sqlite3 ships on the ubuntu and macos runners; Windows needs it installed.
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'
