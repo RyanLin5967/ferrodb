@@ -1442,3 +1442,708 @@ mod tests {
         assert!(rounds > 1, "the backlog came out in one batch, so bounding was never exercised");
     }
 }
+// ==== ATTACK MODULE (throwaway, b7-atk-cursor) ==================================================
+#[cfg(test)]
+mod atk {
+    use super::*;
+    use crate::catalog::column::{Column, DataType, Value};
+    use crate::catalog::schema::Schema;
+    use crate::storage::tuple::Tuple;
+    use crate::wal::log::{DdlOp, RecKind};
+    use crate::wal::txn::Snapshot as TxnSnapshot;
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Column { name: "id".into(), data_type: DataType::Integer, nullable: false },
+            Column { name: "qty".into(), data_type: DataType::Integer, nullable: true },
+        ])
+    }
+
+    fn tuple_bytes(id: i32, qty: i32) -> Vec<u8> {
+        Tuple::serialize(&[Value::Integer(id), Value::Integer(qty)], &schema(), 0).unwrap().data
+    }
+
+    fn wal(tag: &str) -> (tempfile::TempDir, WalManager) {
+        let d = tempfile::tempdir().unwrap();
+        let w = WalManager::new(d.path().join(format!("{tag}.wal"))).unwrap();
+        (d, w)
+    }
+
+    /// dir_root 9 == `audit_log`, the only table this decoder resolves. The publication decides
+    /// whether its rows may leave; the decoder is identical in every pump so it can never be the
+    /// explanation for a missing row.
+    fn dec() -> LogicalDecoder {
+        LogicalDecoder::for_table(9, "audit_log", schema(), 8)
+    }
+
+    /// Both tables, statically. No `CREATE TABLE` needs to be inside a decoded range for either
+    /// table to resolve, so `unresolved` can never be the reason a row goes missing.
+    fn two_table_dec() -> LogicalDecoder {
+        LogicalDecoder::for_table(7, "published", schema(), 1007)
+            .plus_table(9, "audit_log", schema(), 1009)
+    }
+
+    fn insert9(w: &WalManager, txn: u64, id: i32, qty: i32) -> u64 {
+        w.append(
+            txn,
+            0,
+            &RecKind::HeapInsert { dir_root: 9, page_id: 1, slot: 0, tuple: tuple_bytes(id, qty) },
+        )
+        .unwrap()
+    }
+
+    fn create_table(w: &WalManager, table: &str, dir_root: u32) -> u64 {
+        w.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::CreateTable,
+                table: table.into(),
+                dir_root,
+                time_travel_root: dir_root + 1000,
+                columns: vec![
+                    ("id".into(), DataType::Integer, false),
+                    ("qty".into(), DataType::Integer, true),
+                ],
+            },
+        )
+        .unwrap()
+    }
+
+    fn narrow() -> Publication {
+        Publication::named("analytics").publishing("published", ["id", "qty"])
+    }
+    fn wide() -> Publication {
+        Publication::named("analytics")
+            .publishing("published", ["id", "qty"])
+            .publishing("published_two", ["id", "qty"])
+            .publishing("audit_log", ["id", "qty"])
+    }
+
+    /// ATTACK 1 — a transaction whose RECORDS sit below a surviving commit and whose COMMIT lands
+    /// after the refused boundary. Truncation drops its event; the cursor is then computed from the
+    /// survivors alone and lands above the record. The row is not stalled, it is gone.
+    #[test]
+    fn atk1_interleaved_refused_transaction_is_stepped_over() {
+        let (_d, w) = wal("atk1");
+        let start = FeedStreamer::start_cursor(&w);
+
+        // R opens first and writes its row.
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        let r_record = insert9(&w, 2, 42, 4242);
+        // A publishable event commits in between: the CREATE TABLE for a published table.
+        let d_lsn = create_table(&w, "published", 7);
+        // R commits last, so its event sorts AFTER the publishable one and is the refused boundary.
+        let r_commit = w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let s = FeedStreamer::new(dec(), narrow());
+        let mut feed = Vec::new();
+        let p1 = s.pump(&w, start, 0, &mut feed).unwrap();
+        eprintln!(
+            "ATK1 records: R.insert={r_record} ddl={d_lsn} R.commit={r_commit}\nATK1 pump1 = {p1:?}"
+        );
+        assert!(p1.refused >= 1, "the refusal never happened, so the attack is vacuous: {p1:?}");
+
+        // THE INVARIANT: a refusal must not move the read cursor above any record it withheld.
+        assert!(
+            p1.cursor <= r_record,
+            "ATK1: the cursor is {} but the refused transaction's only row record is at {}. \
+             A replay from {} can never read it again.\n{p1:?}",
+            p1.cursor,
+            r_record,
+            p1.cursor
+        );
+
+        // And the end-to-end consequence, so the invariant is not merely aesthetic: widen the
+        // publication and resume exactly where the refusal left the consumer.
+        let widened = FeedStreamer::new(dec(), wide());
+        let mut rest = Vec::new();
+        let p2 = widened.pump(&w, p1.cursor, p1.emitted_through, &mut rest).unwrap();
+        let text = String::from_utf8(rest).unwrap();
+        eprintln!("ATK1 pump2 (widened) = {p2:?}\nATK1 feed after widening: {text:?}");
+        assert!(
+            text.contains("4242"),
+            "ATK1 LOST ROW: after amending the publication, the refused row never arrives. \
+             pump2={p2:?} feed={text:?}"
+        );
+    }
+
+    /// ATTACK 1b — the same shape, and the loss reported as a CLEAN pump: the second pump neither
+    /// emits nor refuses, so `is_clean()` is true and an operator has nothing to act on.
+    #[test]
+    fn atk1b_the_loss_is_reported_as_a_clean_pump() {
+        let (_d, w) = wal("atk1b");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        let r_record = insert9(&w, 2, 42, 4242);
+        create_table(&w, "published", 7);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let s = FeedStreamer::new(dec(), narrow());
+        let p1 = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        // Same publication, second pump: the contract says a refusal is a STALL, so pumping again
+        // must refuse again and move nothing.
+        let p2 = s.pump(&w, p1.cursor, p1.emitted_through, &mut Vec::new()).unwrap();
+        eprintln!("ATK1b r_record={r_record}\n  pump1={p1:?}\n  pump2={p2:?}");
+        assert_eq!(
+            (p2.refused, p2.is_clean()),
+            (p1.refused, false),
+            "ATK1b: the second pump with the SAME publication stopped refusing and called itself \
+             clean - the refused row is no longer in any range this consumer will read. \
+             pump1={p1:?} pump2={p2:?}"
+        );
+    }
+
+    /// ATTACK 2 — an OPEN transaction that opened after the refused commit's records. `open_from`
+    /// clamps the cursor and is meant to be the safety net; check both orders.
+    #[test]
+    fn atk2_open_transaction_plus_refusal_both_orders() {
+        // Order A: refusal first, open transaction after.
+        {
+            let (_d, w) = wal("atk2a");
+            let start = FeedStreamer::start_cursor(&w);
+            create_table(&w, "published", 7);
+            w.append(2, 0, &RecKind::Begin).unwrap();
+            let r_rec = insert9(&w, 2, 1, 11);
+            w.append(2, 0, &RecKind::Commit).unwrap();
+            w.append(3, 0, &RecKind::Begin).unwrap();
+            let open_rec = insert9(&w, 3, 2, 22); // never commits
+            w.flush().unwrap();
+
+            let s = FeedStreamer::new(dec(), narrow());
+            let p = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+            eprintln!("ATK2a r_rec={r_rec} open_rec={open_rec} pump={p:?}");
+            assert!(p.cursor <= r_rec, "ATK2a cursor {} > refused record {r_rec}: {p:?}", p.cursor);
+        }
+        // Order B: open transaction first, refusal after.
+        {
+            let (_d, w) = wal("atk2b");
+            let start = FeedStreamer::start_cursor(&w);
+            create_table(&w, "published", 7);
+            w.append(3, 0, &RecKind::Begin).unwrap();
+            let open_rec = insert9(&w, 3, 2, 22); // never commits
+            w.append(2, 0, &RecKind::Begin).unwrap();
+            let r_rec = insert9(&w, 2, 1, 11);
+            w.append(2, 0, &RecKind::Commit).unwrap();
+            w.flush().unwrap();
+
+            let s = FeedStreamer::new(dec(), narrow());
+            let p = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+            eprintln!("ATK2b open_rec={open_rec} r_rec={r_rec} pump={p:?}");
+            assert!(p.cursor <= r_rec, "ATK2b cursor {} > refused record {r_rec}: {p:?}", p.cursor);
+        }
+    }
+
+    /// ATTACK 3 — snapshot suppression plus a refusal. Suppression does not move
+    /// `emitted_through`, but the refusal truncation runs FIRST, so a suppressed-and-refused event
+    /// is the one case where "already delivered by the snapshot" meets "must come back".
+    #[test]
+    fn atk3_snapshot_boundary_plus_refusal() {
+        let (_d, w) = wal("atk3");
+        let start = FeedStreamer::start_cursor(&w);
+        create_table(&w, "published", 7);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        insert9(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        // The snapshot already contains audit_log txn 1, so nothing is owed for it.
+        let boundary = SnapshotBoundary::new(
+            std::collections::BTreeSet::from(["audit_log".to_string(), "published".to_string()]),
+            TxnSnapshot { high_water: 3, active: std::collections::HashSet::new() },
+            start,
+        );
+        let s = FeedStreamer::new(dec(), narrow()).resuming_after_snapshot(boundary);
+        let mut cursor = start;
+        let mut through = 0u64;
+        let mut rounds = 0;
+        loop {
+            let p = s.pump(&w, cursor, through, &mut Vec::new()).unwrap();
+            rounds += 1;
+            if rounds <= 3 || rounds % 50 == 0 {
+                eprintln!("ATK3 round {rounds}: {p:?}");
+            }
+            if p.cursor == cursor && p.emitted == 0 {
+                eprintln!("ATK3 fixed point after {rounds} rounds: {p:?}");
+                assert!(
+                    p.refused == 0,
+                    "ATK3 STALL: the feed is wedged for ever on an event the snapshot had already \
+                     delivered - suppression can never run, because truncation runs first: {p:?}"
+                );
+                break;
+            }
+            cursor = p.cursor;
+            through = p.emitted_through;
+            assert!(rounds < 200, "ATK3 did not reach a fixed point");
+        }
+    }
+
+    /// Pump until a fixed point, appending to `feed`. Returns (cursor, emitted_through, rounds,
+    /// last report).
+    fn drain(
+        s: &FeedStreamer,
+        w: &WalManager,
+        mut cursor: u64,
+        mut through: u64,
+        feed: &mut Vec<u8>,
+    ) -> (u64, u64, usize, Pumped) {
+        let mut rounds = 0;
+        loop {
+            let p = s.pump(w, cursor, through, feed).unwrap();
+            rounds += 1;
+            if p.cursor == cursor && p.emitted == 0 {
+                return (cursor, through, rounds, p);
+            }
+            cursor = p.cursor;
+            through = p.emitted_through;
+            assert!(rounds < 2000, "drain did not reach a fixed point: {p:?}");
+        }
+    }
+
+    /// The log ATTACK 4 and 8 both run against: two interleaved audit_log transactions and two
+    /// publishable DDLs, arranged so a refused commit's records sit below a published commit.
+    fn mixed_log(w: &WalManager) {
+        create_table(w, "published", 7);
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        insert9(w, 2, 1, 11);
+        w.append(3, 0, &RecKind::Begin).unwrap();
+        insert9(w, 3, 2, 22);
+        w.append(3, 0, &RecKind::Commit).unwrap();
+        create_table(w, "published_two", 11);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+    }
+
+    /// ATTACK 4 — `with_max_bytes` across the whole range, with NO publication in force. This is the
+    /// control for ATTACK 8: it says which batch sizes the pump loop is able to drain at all,
+    /// independently of any refusal.
+    #[test]
+    fn atk4_control_batch_sizes_that_drain_without_any_publication() {
+        let (_d, w) = wal("atk4");
+        let start = FeedStreamer::start_cursor(&w);
+        mixed_log(&w);
+        let frontier = w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut ok: Vec<u64> = Vec::new();
+        let mut stuck: Vec<u64> = Vec::new();
+        for max in 1..=(frontier - start + 8) {
+            let s = FeedStreamer::new(dec(), Publication::unrestricted()).with_max_bytes(max);
+            let mut feed = Vec::new();
+            let (_c, _t, _r, _p) = drain(&s, &w, start, 0, &mut feed);
+            let text = String::from_utf8(feed).unwrap();
+            let complete = ["\"qty\":11", "\"qty\":22", "published_two"]
+                .iter()
+                .all(|want| text.contains(want));
+            if complete { ok.push(max) } else {
+                if max == 200 {
+                    // One stuck size in full, so the wedge is quotable rather than summarised.
+                    let s2 = FeedStreamer::new(dec(), Publication::unrestricted()).with_max_bytes(max);
+                    let mut f2 = Vec::new();
+                    let (c2, t2, r2, p2) = drain(&s2, &w, start, 0, &mut f2);
+                    eprintln!(
+                        "ATK4 max_bytes=200 wedged after {r2} rounds at cursor={c2} through={t2}: \
+                         {p2:?} is_clean={} lag_bytes={}",
+                        p2.is_clean(),
+                        p2.lag_bytes()
+                    );
+                }
+                stuck.push(max)
+            }
+        }
+        eprintln!(
+            "ATK4 CONTROL (unrestricted): complete at max_bytes {:?}; INCOMPLETE at {:?}",
+            ok, stuck
+        );
+        assert!(
+            stuck.is_empty(),
+            "ATK4 CONTROL: with NO publication in force (so this is the parent commit's cursor \
+             arithmetic verbatim), these batch sizes never drain the log: {stuck:?}"
+        );
+    }
+
+    /// ATTACK 8 — the same sweep with a publication that refuses `audit_log` for a while and is then
+    /// widened. Every batch size that drains in the control must deliver every row here too.
+    #[test]
+    fn atk8_batch_sizes_with_a_refusal_then_widened() {
+        let (_d, w) = wal("atk8");
+        let start = FeedStreamer::start_cursor(&w);
+        mixed_log(&w);
+        let frontier = w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut lost: Vec<(u64, String)> = Vec::new();
+        for max in 1..=(frontier - start + 8) {
+            // Control first: can this batch size drain the log at all, with no policy?
+            let ctrl = FeedStreamer::new(dec(), Publication::unrestricted()).with_max_bytes(max);
+            let mut cf = Vec::new();
+            drain(&ctrl, &w, start, 0, &mut cf);
+            let ctext = String::from_utf8(cf).unwrap();
+            if !["\"qty\":11", "\"qty\":22"].iter().all(|x| ctext.contains(x)) {
+                continue; // batch size cannot drain at all; not a refusal question
+            }
+
+            // Narrow: stall on audit_log, drain to the fixed point.
+            let narrow_s = FeedStreamer::new(dec(), narrow()).with_max_bytes(max);
+            let mut feed = Vec::new();
+            let (cursor, through, _r, last) = drain(&narrow_s, &w, start, 0, &mut feed);
+            // Then widen and resume from exactly there.
+            let wide_s = FeedStreamer::new(dec(), wide()).with_max_bytes(max);
+            drain(&wide_s, &w, cursor, through, &mut feed);
+            let text = String::from_utf8(feed).unwrap();
+            for want in ["\"qty\":11", "\"qty\":22"] {
+                if !text.contains(want) {
+                    lost.push((max, format!("{want} lost; stall report {last:?}")));
+                }
+            }
+        }
+        eprintln!("ATK8 losses: {lost:#?}");
+        assert!(lost.is_empty(), "ATK8: rows lost at batch sizes {lost:#?}");
+    }
+
+    /// ATTACK 5 — `Subscription::pump` stalled on a refusal, then a checkpoint. The pin must keep
+    /// the records the replay needs.
+    #[test]
+    fn atk5_subscription_pin_survives_a_truncate_while_stalled() {
+        let (_d, w) = wal("atk5");
+        let w = std::sync::Arc::new(w);
+        w.append(2, 0, &RecKind::Begin).unwrap();
+        let r_rec = insert9(&w, 2, 42, 4242);
+        create_table(&w, "published", 7);
+        w.append(2, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let s = FeedStreamer::new(dec(), narrow());
+        let mut sub = Subscription::from_start(&w).unwrap();
+        let p = sub.pump(&s, &mut Vec::new()).unwrap();
+        eprintln!("ATK5 r_rec={r_rec} pump={p:?} cursor={} pin={:?}", sub.cursor(), w.min_pinned_lsn());
+        w.truncate(99).unwrap();
+        let base = w.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("ATK5 after truncate base={base} pin={:?}", w.min_pinned_lsn());
+        assert!(
+            base <= r_rec,
+            "ATK5: the checkpoint reclaimed to {base}, above the refused row's record at {r_rec}; \
+             the stall has become a permanent loss"
+        );
+        let widened = FeedStreamer::new(dec(), wide());
+        let mut buf = Vec::new();
+        let p2 = sub.pump(&widened, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("4242"), "ATK5: the row was not recoverable. {p2:?} {text:?}");
+    }
+
+    /// ATTACK 6 — two DIFFERENT tables inside ONE commit, one publishable and one not. The
+    /// truncation groups by `commit_lsn`, so it must hold the whole commit back.
+    #[test]
+    fn atk6_mixed_tables_in_one_commit_are_all_or_nothing() {
+        let (_d, w) = wal("atk6");
+        let start = FeedStreamer::start_cursor(&w);
+        // Learn both tables from the log so one transaction can touch both.
+        create_table(&w, "published", 7);
+        create_table(&w, "audit_log", 9);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert { dir_root: 7, page_id: 1, slot: 0, tuple: tuple_bytes(1, 111) },
+        )
+        .unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert { dir_root: 9, page_id: 1, slot: 0, tuple: tuple_bytes(2, 222) },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let s = FeedStreamer::new(LogicalDecoder::blank(), narrow());
+        let mut feed = Vec::new();
+        let p = s.pump(&w, start, 0, &mut feed).unwrap();
+        let text = String::from_utf8(feed).unwrap();
+        eprintln!("ATK6 pump={p:?}\nATK6 feed:\n{text}");
+        assert!(p.refused >= 2, "ATK6: the mixed commit was not held whole: {p:?}");
+        assert!(
+            !text.contains("\"qty\":111"),
+            "ATK6 HALF-COMMIT: the publishable sibling of a refused row was delivered while its \
+             commit is being replayed - the E74/E75 shape: {text}"
+        );
+    }
+
+    /// Debug helper: one batch size, printed in full.
+    #[test]
+    fn atk_dbg_one_batch_size() {
+        let max: u64 = std::env::var("ATK_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(440);
+        let (_d, w) = wal("atkdbg");
+        let start = FeedStreamer::start_cursor(&w);
+        mixed_log(&w);
+        eprintln!("DBG max={max} start={start} frontier={}", w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst));
+
+        let narrow_s = FeedStreamer::new(dec(), narrow()).with_max_bytes(max);
+        let mut feed = Vec::new();
+        let (mut cursor, mut through) = (start, 0u64);
+        for round in 1..=6 {
+            let p = narrow_s.pump(&w, cursor, through, &mut feed).unwrap();
+            eprintln!("DBG narrow round {round}: {p:?}");
+            if p.cursor == cursor && p.emitted == 0 { break; }
+            cursor = p.cursor; through = p.emitted_through;
+        }
+        eprintln!("DBG after narrow: cursor={cursor} through={through}");
+        let wide_s = FeedStreamer::new(dec(), wide()).with_max_bytes(max);
+        for round in 1..=6 {
+            let p = wide_s.pump(&w, cursor, through, &mut feed).unwrap();
+            eprintln!("DBG wide round {round}: {p:?}");
+            if p.cursor == cursor && p.emitted == 0 { break; }
+            cursor = p.cursor; through = p.emitted_through;
+        }
+        eprintln!("DBG feed:\n{}", String::from_utf8(feed).unwrap());
+    }
+
+    /// ATTACK 9 — a randomised differential. Build a log of interleaved transactions over one
+    /// published table (`published`, dir_root 7) and one that starts unpublished (`audit_log`,
+    /// dir_root 9), drain with the narrow publication to its fixed point, then widen the publication
+    /// and drain again from exactly the position the stall left behind. Every row the log contains
+    /// must appear in the union of the two feeds.
+    ///
+    /// The two feeds together are the whole contract: a refusal is a STALL, so nothing may be lost
+    /// by it, and amending the publication must deliver everything it held back.
+    #[test]
+    fn atk9_randomised_refusal_then_widen_loses_nothing() {
+        let mut seed = 0x5eed_1234_9abc_def0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut failures: Vec<String> = Vec::new();
+
+        for case in 0..300u32 {
+            let (_d, w) = wal(&format!("atk9_{case}"));
+            let start = FeedStreamer::start_cursor(&w);
+            // No DDL at all: both tables are statically known to `two_table_dec`, so nothing in
+            // this log except a row can be refused, and `unresolved` stays 0.
+
+            // Random interleaving: keep up to three transactions in flight, opening, writing and
+            // committing in a random order. `want` records every row that must reach a feed.
+            let mut open: Vec<u64> = Vec::new();
+            let mut want: Vec<i32> = Vec::new();
+            let mut txn_id = 10u64;
+            let steps = 6 + (next() % 10) as usize;
+            let mut value = 100i32;
+            for _ in 0..steps {
+                let roll = next() % 10;
+                if roll < 4 || open.is_empty() {
+                    if open.len() < 3 {
+                        txn_id += 1;
+                        w.append(txn_id, 0, &RecKind::Begin).unwrap();
+                        open.push(txn_id);
+                    }
+                }
+                let roll = next() % 10;
+                if !open.is_empty() && roll < 6 {
+                    let which = (next() % open.len() as u64) as usize;
+                    let t = open[which];
+                    let dir = if next() % 2 == 0 { 7 } else { 9 };
+                    value += 1;
+                    w.append(
+                        t,
+                        0,
+                        &RecKind::HeapInsert {
+                            dir_root: dir,
+                            page_id: 1,
+                            slot: 0,
+                            tuple: tuple_bytes(value, value),
+                        },
+                    )
+                    .unwrap();
+                    want.push(value);
+                } else if !open.is_empty() && next() % 10 < 7 {
+                    let which = (next() % open.len() as u64) as usize;
+                    let t = open.remove(which);
+                    w.append(t, 0, &RecKind::Commit).unwrap();
+                }
+            }
+            // Commit everything still open, so nothing is legitimately withheld at the end.
+            for t in open.drain(..) {
+                w.append(t, 0, &RecKind::Commit).unwrap();
+            }
+            w.flush().unwrap();
+            let frontier = w.flushed_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            if want.is_empty() {
+                continue;
+            }
+
+            // A batch size that can always cover the widest transaction, so this case is about the
+            // refusal and not about the bounded-batch arithmetic (see atk4_control).
+            let max = frontier - start + 16;
+
+            let narrow_s = FeedStreamer::new(two_table_dec(), narrow()).with_max_bytes(max);
+            let mut feed = Vec::new();
+            let (cursor, through, _r, stall) = drain(&narrow_s, &w, start, 0, &mut feed);
+            let wide_s = FeedStreamer::new(two_table_dec(), wide()).with_max_bytes(max);
+            drain(&wide_s, &w, cursor, through, &mut feed);
+            let text = String::from_utf8(feed).unwrap();
+
+            // ANTI-VACUITY: the same log, the same decoder, the wide publication from the start.
+            // If this loses a row the harness is wrong, not the pump.
+            let ctrl = FeedStreamer::new(two_table_dec(), wide()).with_max_bytes(max);
+            let mut cf = Vec::new();
+            drain(&ctrl, &w, start, 0, &mut cf);
+            let ctext = String::from_utf8(cf).unwrap();
+            let ctrl_missing: Vec<i32> = want
+                .iter()
+                .copied()
+                .filter(|v| !ctext.contains(&format!("\"qty\":{v}")))
+                .collect();
+            assert!(
+                ctrl_missing.is_empty(),
+                "ATK9 case {case} HARNESS BUG: the wide publication also lost {ctrl_missing:?}"
+            );
+
+            let missing: Vec<i32> = want
+                .iter()
+                .copied()
+                .filter(|v| !text.contains(&format!("\"qty\":{v}")))
+                .collect();
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "case {case}: rows {missing:?} of {want:?} never reached the feed. \
+                     stall={stall:?} resumed at cursor={cursor} through={through}"
+                ));
+            }
+        }
+        eprintln!("ATK9 failing cases: {}", failures.len());
+        for f in failures.iter().take(4) {
+            eprintln!("ATK9  {f}");
+        }
+        assert!(failures.is_empty(), "ATK9: {} of 300 random logs lost rows", failures.len());
+    }
+
+    /// ATTACK 7 — a batch of exactly one event, refused; and a refusal in the first position.
+    #[test]
+    fn atk7_single_event_batch_refused() {
+        let (_d, w) = wal("atk7");
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        let rec = insert9(&w, 1, 1, 10);
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let s = FeedStreamer::new(dec(), narrow());
+        let p = s.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        eprintln!("ATK7 rec={rec} pump={p:?}");
+        assert_eq!(p.cursor, start, "ATK7 a single refused event moved the cursor: {p:?}");
+        assert_eq!(p.refused, 1, "{p:?}");
+        let widened = FeedStreamer::new(dec(), wide());
+        let mut buf = Vec::new();
+        widened.pump(&w, p.cursor, p.emitted_through, &mut buf).unwrap();
+        assert!(String::from_utf8(buf).unwrap().contains("\"qty\":10"), "ATK7 lost the row");
+    }
+}
+
+
+#[cfg(test)]
+mod atk10 {
+    use super::*;
+    use crate::catalog::column::{Column, DataType, Value};
+    use crate::catalog::schema::Schema;
+    use crate::storage::tuple::Tuple;
+    use crate::wal::log::RecKind;
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Column { name: "id".into(), data_type: DataType::Integer, nullable: false },
+            Column { name: "qty".into(), data_type: DataType::Integer, nullable: true },
+        ])
+    }
+
+    /// ATTACK 10 — follow the advice the `NothingPublishable` refusal prints.
+    ///
+    /// It says: "Either publish a column of {table} or leave the table out of the publication
+    /// altogether." The second branch is not an escape from the stall - it is the other stall.
+    #[test]
+    fn atk10_the_refusals_own_advice_does_not_unwedge_the_feed() {
+        let d = tempfile::tempdir().unwrap();
+        let w = WalManager::new(d.path().join("atk10.wal")).unwrap();
+        let start = FeedStreamer::start_cursor(&w);
+        w.append(1, 0, &RecKind::Begin).unwrap();
+        w.append(
+            1,
+            0,
+            &RecKind::HeapInsert {
+                dir_root: 7,
+                page_id: 1,
+                slot: 0,
+                tuple: Tuple::serialize(&[Value::Integer(1), Value::Integer(10)], &schema(), 0)
+                    .unwrap()
+                    .data,
+            },
+        )
+        .unwrap();
+        w.append(1, 0, &RecKind::Commit).unwrap();
+        w.flush().unwrap();
+
+        let dec = || LogicalDecoder::for_table(7, "inventory", schema(), 8);
+
+        // The table IS published, but only a column the rows do not carry.
+        let a = FeedStreamer::new(
+            dec(),
+            Publication::named("analytics").publishing("inventory", ["archived_at"]),
+        );
+        let pa = a.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        eprintln!("ATK10 published-wrong-column: {pa:?}");
+        eprintln!("ATK10 message A: {}", pa.refusal.as_ref().unwrap());
+
+        // Now do exactly what that message says: leave the table out of the publication.
+        let b = FeedStreamer::new(
+            dec(),
+            Publication::named("analytics").publishing("somewhere_else", ["id"]),
+        );
+        let pb = b.pump(&w, start, 0, &mut Vec::new()).unwrap();
+        eprintln!("ATK10 table-left-out: {pb:?}");
+        eprintln!("ATK10 message B: {}", pb.refusal.as_ref().unwrap());
+
+        assert!(
+            pb.refused == 0 && pb.cursor > start,
+            "ATK10: the refusal tells an operator to 'leave the table out of the publication \
+             altogether'; doing so produces refused={} and leaves the cursor at {} (start {start}). \
+             The advice moves the feed from one permanent stall to another.",
+            pb.refused,
+            pb.cursor
+        );
+    }
+}
+
+#[cfg(test)]
+mod atk11 {
+    use super::*;
+    use crate::catalog::column::Value;
+    use crate::replication::snapshot::snapshot_table;
+
+    /// ATTACK 11 — the backfill path. Every snapshot READ event shares one `commit_lsn`
+    /// (`handoff.resume_lsn`), which is the granularity mismatch the stream truncation is built
+    /// around. `snapshot_table` has no truncation at all, so the question is whether a refusal on
+    /// row N leaves rows 1..N on the wire.
+    #[test]
+    fn atk11_a_refused_snapshot_writes_no_partial_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let w = std::sync::Arc::new(WalManager::new(d.path().join("atk11.wal")).unwrap());
+        let mut buf = Vec::new();
+        let pubn = Publication::named("analytics").publishing("elsewhere", ["id"]);
+        let r = snapshot_table("inventory", &w, &pubn, &mut buf, || {
+            Ok((
+                vec!["id".to_string(), "qty".to_string()],
+                vec![
+                    vec![Value::Integer(1), Value::Integer(10)],
+                    vec![Value::Integer(2), Value::Integer(20)],
+                    vec![Value::Integer(3), Value::Integer(30)],
+                ],
+            ))
+        });
+        eprintln!("ATK11 result = {:?}", r.as_ref().err().map(|e| e.to_string()));
+        eprintln!("ATK11 bytes written = {:?}", String::from_utf8_lossy(&buf));
+        assert!(r.is_err(), "ATK11: an unpublished table was backfilled");
+        assert!(buf.is_empty(), "ATK11 PARTIAL EGRESS: {:?}", String::from_utf8_lossy(&buf));
+    }
+}
