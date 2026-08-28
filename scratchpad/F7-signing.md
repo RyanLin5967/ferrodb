@@ -324,9 +324,31 @@ rather than in it. **A security refusal an operator cannot act on is one they wo
 The reviewer also confirmed the rule does not refuse the ordinary layouts: `0755` all the way down,
 a private tree, a group-readable-but-not-writable parent, and a sticky shared parent all still load.
 
+## Two mutants aimed at the socket tests, one of which found a vacuous test of mine
+
+A review agent I stopped had left an uncommitted mutant in its worktree — `dial` never connects —
+aimed at the question "would these refusal tests pass if the transport simply never talked?". It is
+the right question and the answer was partly no.
+
+| # | The defect | Effect |
+|---|---|---|
+| M24 | `dial` never connects (outbound is dead) | 3 tests fail. **`a_signed_peer_is_refused_by_a_node_with_no_key` PASSED** — it was vacuous |
+| M25 | `conn_loop` never delivers to the caller (inbound is dead) | 4 tests fail, including the rewritten one — the positive controls fire |
+
+**M24 found a real hole in my own test.** `a_signed_peer_is_refused_by_a_node_with_no_key` asserted
+`received() == 0` and `unauthenticated() == 0` on a pair of `Transport`s. Both of those hold when
+nothing ever connects, so two zeros were being read as a refusal when they are equally a dead
+network. Three sibling tests failed under the mutant, exactly as they should; this one did not.
+
+Rewritten to drive a raw socket with its own positive control: an **unsigned** frame over the same
+address must arrive first, proving the path is live, before a **signed** frame over that same path
+is required not to. It is correctly insensitive to M24 now (it never dials), and M25 — breaking the
+inbound path instead — makes its positive control fire, which is the evidence that the control is
+real rather than decorative.
+
 ## The final mutant tally
 
-Twenty-three fired. **Twenty killed** by the test named against each. **Two survived**, and both are
+Twenty-five fired. **Twenty-two killed** by the test named against each. **Two survived**, and both are
 recorded above rather than quietly re-aimed: M20 showed a cycle test was passing for the wrong
 reason (renamed, and it now pins the real cause), and M22 showed a line of code was redundant (the
 line was deleted). **One — M13 — has no deterministic test in this suite**: the reviewer demonstrated

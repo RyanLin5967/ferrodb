@@ -10,7 +10,8 @@
 //!
 //! That sentence is the whole contract and it is stated first because the second half is the part a
 //! reader would otherwise have to discover. Every frame carries an HMAC-SHA256 tag over its own
-//! bytes and nothing else — no counter, no nonce, no timestamp — so a passive attacker who records
+//! bytes and a fixed domain prefix — no counter, no nonce, no timestamp, nothing that varies
+//! between two sendings of the same message — so a passive attacker who records
 //! a frame can re-send it, unchanged, at any later moment, and it will verify. **Replay protection
 //! is a follow-on row and it is absent here.**
 //!
