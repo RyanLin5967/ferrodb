@@ -591,21 +591,28 @@ fn the_symlink_hole_lets_an_attacker_substitute_the_cluster_key() {
     let configured = safe.join("cluster.key");
     std::os::unix::fs::symlink(&real, &configured).unwrap();
 
-    let before = Key::load(&configured).expect("loads through the link");
-    let frame = sign_frame(&before, b"term=9 vote-for-me").unwrap();
+    // The guard must refuse here: the INODE's directory is 0777 even though the NAME's is 0700.
+    let before = match Key::load(&configured) {
+        Err(e) => {
+            println!("refused, and the message names the inode's directory: {e}");
+            assert!(
+                e.to_string().contains("open") && e.to_string().contains("0777"),
+                "refused for the wrong reason: {e}"
+            );
+            return;
+        }
+        Ok(k) => k,
+    };
 
-    // The attacker's move: same directory, same final name, a key of their choosing. `rename` is
-    // what the sticky-bit exception exists to prevent and what 0777-without-sticky permits.
+    // Only reached if the guard let it through. Carry the substitution out, so the report is the
+    // attack and not the absence of a check.
     //
-    // **Threat-model note, because this test writes the substitute as the SAME uid.** A
-    // different-uid attacker cannot get a file they authored past the next check: 0644 is refused
-    // by the `mode & 0o077` rule (pinned by `a_key_file_readable_by_group_or_other_is_refused`),
-    // and 0600 owned by them is unreadable by the node, so `File::open` fails. What this test
-    // therefore proves on its own is that the DIRECTORY GUARD DOES NOT RUN -- the substitution as
-    // written needs a same-uid attacker (a compromised sidecar, a shared service account, a CI
-    // job). The cross-uid version needs no ownership of anything and is
-    // `the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between`: point the name at a file
-    // the node can ALREADY read, and the mode check sees the target's own 0600 and passes.
+    // **Threat-model note, because this writes the substitute as the SAME uid.** A different-uid
+    // attacker cannot get a file they authored past the mode rule: 0644 is refused, and 0600 owned
+    // by them is unreadable by the node. What this proves on its own is that the DIRECTORY GUARD
+    // DID NOT RUN. The cross-uid version needs no ownership of anything and is
+    // `the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between`.
+    let frame = sign_frame(&before, b"term=9 vote-for-me").unwrap();
     let theirs = open.join(".theirs");
     std::fs::write(&theirs, b"ATTACKER-CHOSEN-CLUSTER-KEY!!!!!").unwrap();
     chmod(&theirs, 0o600);
@@ -613,12 +620,8 @@ fn the_symlink_hole_lets_an_attacker_substitute_the_cluster_key() {
 
     let after = Key::load(&configured).expect("still loads, still without a complaint");
     let forged = sign_frame(&after, b"term=9 vote-for-me").unwrap();
-
-    println!("frame signed before the swap == frame signed after: {}", forged == frame);
-    println!("verify_frame(after-key, forged) -> {:?}", verify_frame(&after, &forged).map(|b| b.len()));
     assert_ne!(forged, frame, "sanity: the two keys must differ");
-    assert!(
-        verify_frame(&after, &forged).is_err(),
+    panic!(
         "PROBE HIT: a node reached its key through a symlink, the key was replaced by anyone with \
          write access to the target's directory, and Key::load reported no problem either time"
     );
@@ -801,4 +804,159 @@ fn the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between() {
          the world-writable directory was an intermediate hop and neither check looked at it",
     );
     let _ = loaded;
+}
+
+// =============================================================================================
+// G. Which path shapes BLOCK rather than refuse
+// =============================================================================================
+
+/// `Key::load(path)`, or `None` if it had not returned within `ms`.
+fn load_bounded(path: &Path, ms: u64) -> Option<Result<usize, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(Key::load(&p).map(|k| k.len()).map_err(|e| e.to_string()));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(ms)).ok()
+}
+
+/// The full inventory: which named shapes return, and which block `File::open` before `is_file()`
+/// is ever consulted. A shape that blocks turns "refuses to start" into "never returns".
+#[test]
+fn the_inventory_of_shapes_that_block_instead_of_refusing() {
+    let root = tempfile::tempdir().unwrap();
+    let mut blocked = Vec::new();
+
+    // A FIFO, which is the one an unprivileged user can plant.
+    let fifo = root.path().join("fifo");
+    assert!(std::process::Command::new("mkfifo").arg("-m").arg("600").arg(&fifo).status().unwrap().success());
+
+    // A unix-domain socket.
+    let sock = root.path().join("sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    // A regular file and a directory, as controls that must return.
+    let reg = write_key(root.path(), "reg");
+    let dir = root.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+
+    let mut cases: Vec<(String, PathBuf)> = vec![
+        ("fifo".into(), fifo.clone()),
+        ("unix socket".into(), sock.clone()),
+        ("regular file".into(), reg),
+        ("directory".into(), dir),
+    ];
+    // Device nodes present on this machine.
+    for d in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/console"] {
+        if Path::new(d).exists() {
+            cases.push((d.to_string(), PathBuf::from(d)));
+        }
+    }
+
+    for (name, path) in &cases {
+        match load_bounded(path, 1200) {
+            Some(r) => println!("  {name:<14} returned: {r:?}"),
+            None => {
+                println!("  {name:<14} BLOCKED (no answer in 1200ms)");
+                blocked.push(name.clone());
+            }
+        }
+    }
+
+    // Let the FIFO thread finish so the binary can exit.
+    if blocked.iter().any(|b| b == "fifo") {
+        let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let _ = w.write_all(b"x");
+    }
+    assert!(blocked.is_empty(), "PROBE HIT: these shapes block instead of refusing: {blocked:?}");
+}
+
+// =============================================================================================
+// H. "The file exists but holds nothing anyone chose"
+// =============================================================================================
+
+/// An all-zero key is not merely weak — it is the CANONICAL one. RFC 2104 zero-pads a key shorter
+/// than the block, so a key of 1, 32 or 64 zero bytes, and a zero-length key, all pad to the same
+/// `k0` and therefore produce **byte-identical tags**. Every broken generator lands on the same
+/// key, so two unrelated clusters that both got a zero key can authenticate each other's frames.
+#[test]
+fn every_all_zero_key_is_the_same_key() {
+    let msg = b"a frame body";
+    let base = hmac_sha256(&[0u8; 32], msg);
+    for n in [0usize, 1, 16, 31, 32, 33, 63, 64] {
+        assert_eq!(
+            hmac_sha256(&vec![0u8; n], msg),
+            base,
+            "a {n}-byte zero key must be shown to collide with a 32-byte one"
+        );
+    }
+    // Above the block size RFC 2104 hashes the key first, so the collision stops there.
+    assert_ne!(hmac_sha256(&vec![0u8; 65], msg), base, "65 zero bytes is hashed first");
+
+    // And through the real type, not just the primitive.
+    let a = Key::from_bytes_for_test(vec![0u8; 32]).unwrap();
+    let b = Key::from_bytes_for_test(vec![0u8; 64]).unwrap();
+    assert_eq!(a.tag(msg), b.tag(msg), "two different zero key FILES sign identically");
+    assert!(b.verify(msg, &a.tag(msg)), "and each verifies the other's frames");
+}
+
+/// The shapes a file lands in when a generator wrote nothing, or wrote a placeholder. Recorded as
+/// a table of what `Key::load` does today; every one of them is >= 32 bytes and passes.
+#[test]
+fn the_table_of_keys_that_hold_nothing_anyone_chose() {
+    let root = tempfile::tempdir().unwrap();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // `truncate -s 32`, `dd if=/dev/zero`, a sparse file, a file extended past its end.
+        ("32 zero bytes", vec![0u8; 32]),
+        // A longer zero file: the same key as the line above, per the test.
+        ("64 zero bytes", vec![0u8; 64]),
+        // Erased flash, or a failed read that filled the buffer with ones.
+        ("32 0xFF bytes", vec![0xffu8; 32]),
+        // Any single repeated byte -- the general shape of "one value, repeated".
+        ("32 identical 0x41", vec![0x41u8; 32]),
+        // `echo >> key` in a loop, or a text editor that saved only newlines.
+        ("32 newlines", vec![b'\n'; 32]),
+        ("32 spaces", vec![b' '; 32]),
+        // A placeholder someone meant to replace.
+        ("placeholder text", b"changeme-changeme-changeme-change".to_vec()),
+        // `head -c 32 /dev/urandom > key` on a box where the tool printed an error into the file.
+        ("a shell error message", b"head: /dev/urandom: Permission denied\n".to_vec()),
+        // The operator's key committed as text and checked out with CRLF, or a here-doc.
+        ("32 bytes then a newline", {
+            let mut v = vec![0x41u8; 32];
+            v.push(b'\n');
+            v
+        }),
+    ];
+    let mut accepted = Vec::new();
+    for (name, bytes) in &cases {
+        let p = root.path().join(name.replace(' ', "_"));
+        std::fs::write(&p, bytes).unwrap();
+        chmod(&p, 0o600);
+        match Key::load(&p) {
+            Ok(k) => {
+                println!("  {name:<24} ({} bytes) -> ACCEPTED", k.len());
+                accepted.push(*name);
+            }
+            Err(e) => println!("  {name:<24} ({} bytes) -> refused: {e}", bytes.len()),
+        }
+    }
+    println!("accepted: {accepted:?}");
+    assert!(accepted.is_empty(), "PROBE HIT: accepted {accepted:?}");
+}
+
+/// A distinct axis from "holds nothing": a key with plenty of bytes and little entropy per byte.
+/// `openssl rand -hex 32 > key` is 64 bytes of hex TEXT -- it carries the full 256 bits, so this is
+/// not a defect, but it means a byte-count rule and an entropy rule are not the same rule.
+#[test]
+fn a_hex_encoded_key_is_bytes_not_entropy() {
+    let root = tempfile::tempdir().unwrap();
+    let hex = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let p = root.path().join("hex");
+    std::fs::write(&p, hex).unwrap();
+    chmod(&p, 0o600);
+    let k = Key::load(&p).expect("64 bytes of hex text is over the minimum");
+    let distinct: std::collections::BTreeSet<u8> = hex.iter().copied().collect();
+    println!("{} bytes, {} distinct byte values", k.len(), distinct.len());
+    assert_eq!(k.len(), 64);
 }
