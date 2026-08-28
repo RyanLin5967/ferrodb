@@ -857,6 +857,21 @@ fn a_second_snapshot_supersedes_the_one_in_flight() {
     assert_eq!(first.meta, second.meta, "the fixture's two metas differ, so it tests nothing");
     assert_ne!(first.header, second.header);
 
+    // **The restart is immediate**, and that is the assertion. A receiver keyed on the meta alone
+    // would take this chunk for a duplicate of the first payload's, splice the rest of the second
+    // onto it, and only discover the mixture at the very end — where the digest fault drops the
+    // whole transfer and it starts again. That converges too, eventually, which is exactly why
+    // "it converged" cannot be the assertion: it is the same answer at twice the cost, and a
+    // mutant of this rule survived a test that only checked convergence.
+    let out = f.step(Event::Recv(install_msg(N1, N2, 1, &second, 0)));
+    assert_eq!(received_through(&only_send(&out)), SNAPSHOT_CHUNK_BYTES as u64);
+    assert_eq!(
+        f.snapshot_incoming().map(|c| *c.header()),
+        Some(second.header),
+        "the receiver is still assembling the first payload, so the second is being spliced onto it"
+    );
+    assert_eq!(f.snapshot_incoming().map(|c| c.received()), Some(SNAPSHOT_CHUNK_BYTES as u64));
+
     deliver_all(&mut f, N1, 1, &second);
     assert_eq!(
         f.pending_install_round(),

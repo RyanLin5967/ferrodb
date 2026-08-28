@@ -98,8 +98,8 @@ M = [
      "a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not", "lib"),
 
     # ---- the install -----------------------------------------------------------------------------
-    ("M25", SNAP, "            cur.complete = true;\n        }\n\n        let n = cur.received;",
-     "            cur.complete = true;\n        }\n        if cur.complete {\n            self.progress.entry(self.self_id).or_default().receiving = Some(cur.clone());\n            let _ = self.finish_install(out);\n        }\n\n        let n = cur.received;",
+    ("M25", SNAP, "        let n = cur.received;\n        self.progress.entry(self.self_id).or_default().receiving = Some(cur);\n        self.ack_snapshot(from, n, out);\n    }\n\n    /// The install is durable",
+     "        let n = cur.received;\n        self.progress.entry(self.self_id).or_default().receiving = Some(cur);\n        let _ = self.finish_install(out);\n        self.ack_snapshot(from, n, out);\n    }\n\n    /// The install is durable",
      "nothing_moves_until_the_install_is_reported_durable", "lib"),
     ("M26", SNAP, "        self.durable = cur.meta.last_round;\n\n        // A snapshot is committed state",
      "        self.durable = cur.meta.last_round;\n        self.unjoined = false;\n\n        // A snapshot is committed state",
