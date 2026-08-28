@@ -299,8 +299,15 @@ durable metadata record, and **zero data pages read, written, or refcounted**.
 
 Because the child's root *is* the parent's root at fork time, ordinary B+tree descent already
 reaches parent data, so the read path never walks a parent chain. That is a hard rule, not an
-optimisation: BranchBench (arXiv 2604.17180) measured the "not found here, ask my parent" overlay
-pattern at up to **5400x read degradation** as branches accumulate.
+optimisation: BranchBench (arXiv:2604.17180) measured the "not found here, ask my parent" overlay
+pattern at up to **4000x read degradation** as branches deepen, across Neon, DoltgreSQL, Xata and
+Tiger Data.
+
+*Corrected 2026-08-28: this said **5400x** in the README, in `src/branch/mod.rs`, in
+`src/cow/btree.rs` and in `bench/branch_scaling.txt`. The paper's sentence is "up to **5-4000x**
+slower reads as branches deepen" — a range whose top is 4000x. 5400x was that string with the hyphen
+dropped, and it was never anyone's measurement. The figure is also **BranchBench's measurement of
+other systems**, never ferrodb's: `bench/branch_scaling.txt` says so and reproduces nothing of it.*
 
 Storage is a copy-on-write B+tree with shadow paging, fixed 4KB pages, and a self-describing page
 header carrying `birth_epoch`. Reclamation is ZFS-style birth-time algebra generalised from a linear

@@ -1,7 +1,8 @@
 //! D7 — how branch-create and read latency behave as branches accumulate.
 //!
-//! This is the claim the whole design rests on. DESIGN.md cites BranchBench (arXiv 2604.17180)
-//! measuring the *overlay* pattern at up to **5400x read degradation** as branches accumulate, and
+//! This is the claim the whole design rests on. The README's ferrobranch section cites BranchBench
+//! (arXiv:2604.17180)
+//! measuring the *overlay* pattern at up to **4000x read degradation** as branches deepen, and
 //! the substrate here is chosen specifically to avoid that: shadow paging with no content
 //! addressing, no refcounts, and ancestry held only in branch metadata, so a fork touches no data
 //! page and a read is an ordinary descent rather than a walk up a chain of parents.
@@ -11,10 +12,10 @@
 //! **Measures:** ferrodb, on this machine, right now. `std::time::Instant`, wall clock, one
 //! process, warm cache after a warmup pass.
 //!
-//! **Does NOT measure:** Dolt, or BranchBench, or anything else. The 5400x figure above is quoted
-//! from that paper about other systems' overlay pattern; nothing here reproduces it, and no number
-//! this program prints is a comparison against it. Saying "we are 5400x better" on the strength of
-//! this file would be inventing a measurement that was never taken. The honest claim available
+//! **Does NOT measure:** Dolt, or BranchBench, or anything else. The up-to-4000x figure above is
+//! quoted from that paper about other systems' overlay pattern; nothing here reproduces it, and no
+//! number this program prints is a comparison against it. Saying "we are 4000x better" on that
+//! basis would be inventing a measurement that was never taken. The honest claim available
 //! from this program is only about how ferrodb scales against *itself* as branch count rises.
 //!
 //! Run it with `cargo run --release --example branch_scaling_bench`. Debug numbers are meaningless
@@ -308,7 +309,9 @@ fn main() {
 
     println!(
         "\nThese are ferrodb's numbers against ITSELF at three branch counts, on this machine.\n\
-         BranchBench's 5400x figure is that paper's measurement of other systems' overlay pattern;\n\
+         BranchBench's up-to-4000x figure is that paper's measurement of other systems' overlay\n\
+         pattern (arXiv:2604.17180, \"up to 5-4000x slower reads as branches deepen\"; this said\n\
+         5400x until 2026-08-28, which was that range with the hyphen dropped);\n\
          nothing here reproduces it and none of the above is a comparison against it."
     );
 
