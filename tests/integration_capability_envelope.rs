@@ -1432,6 +1432,19 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
         [
             "workspaces", "names", "runs", "next_txn", "next_merge", "apply_seq", "applied",
             "merges", "quarantine_reasons", "escrow", "row_author", "versions", "captures",
+            // I21's, added by the merge at `c6dcb3a`. Declared here only after making the
+            // determination this assertion demands, and it is NOT a second funnel:
+            //
+            //   * its ONLY write site is inside `seal(branch, published)` — the merge-publication
+            //     path — so no statement reaches it; `stage_all` remains the single write funnel
+            //     the envelope governs.
+            //   * it holds transaction ids, not per-branch capability state, and it is append-only:
+            //     it records which writes BECAME READABLE, a fact about the past.
+            //   * its purpose is to make a DELETION safe rather than to admit a write — a
+            //     provenance capture may only be dropped when nobody published what it justified.
+            //
+            // A field that failed any of those three would be a governance hole, not a list entry.
+            "published_txns",
             "policy",
         ],
         "the fields of `AgentRuntime`'s `State` have changed. If a new one holds per-branch state \
@@ -1441,7 +1454,15 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     assert_eq!(
         field_names("struct Workspace {", "Workspace"),
         [
-            "name", "prov", "txn", "fork_seq", "fork_root", "rows", "base_rows", "tables", "frame",
+            "name", "prov", "txn", "fork_seq", "fork_root", "rows", "base_rows",
+            // I21's, added by the merge at `c6dcb3a`. Declared after making the determination, and
+            // it is NOT a write the envelope must govern: it is set ONCE at fork (the parent's
+            // chain plus the parent's own txn) and is read-only afterwards, it holds transaction
+            // ids rather than row or cell state, and no statement path fills it. Compare
+            // `schema_edits` below, which is flagged precisely because a write path DOES fill it
+            // outside `stage_all` — that is the difference between an entry here and a hole.
+            "inherited",
+            "tables", "frame",
             // B11's two, added by the merge at `398e361`. `stage_schema_edit` writes
             // `schema_edits` without passing through `stage_all`, which is the gap
             // `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap` drives.
