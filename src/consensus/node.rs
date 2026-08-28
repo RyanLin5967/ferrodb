@@ -191,6 +191,23 @@ pub struct Node<A: Applier> {
     /// F6. See the module header.
     snapshots: Option<Box<dyn super::snapshot::SnapshotStore>>,
     retain_rounds: Option<u64>,
+    /// Bytes of the incoming snapshot on this node's spool, and which payload they are of.
+    ///
+    /// **The driver's own account of what it wrote, never inferred from the state machine's.** The
+    /// state machine digests the bytes it saw; the driver installs the bytes it wrote; if the two
+    /// are allowed to disagree about which chunk went where, a payload that digests correctly can
+    /// still install from a spool that is a mixture of two transfers. So a chunk is written only
+    /// when the state machine's cursor and this pair agree on exactly where it belongs, and a chunk
+    /// the state machine accepted and the driver cannot place is refused **loudly** — it means the
+    /// two rules have drifted, which is the one failure neither side can detect on its own.
+    spooled: u64,
+    spooled_header: Option<super::snapshot::PayloadHeader>,
+    /// The round of an install this driver has already performed and is waiting to have confirmed.
+    ///
+    /// The confirmation is an `Event::Persisted` pushed to the back of the queue, so several
+    /// further events are drained before the state machine sees it — and without this the install
+    /// would be attempted again on each of them, against a spool the first one has already removed.
+    installed_round: Option<Round>,
     /// How many `InstallSnapshot` transfers this node has served and completed. Counted so a test
     /// can assert the path was **taken**, not merely that the cluster converged — a cluster that
     /// converged by ordinary replication passes any convergence check you write.
@@ -316,6 +333,9 @@ impl<A: Applier> Node<A> {
             transitions: Vec::new(),
             snapshots: opts.snapshots,
             retain_rounds: opts.retain_rounds,
+            spooled: 0,
+            spooled_header: None,
+            installed_round: None,
             snapshots_sent: 0,
             snapshots_installed: 0,
         };
@@ -410,36 +430,77 @@ impl<A: Applier> Node<A> {
                     self.sm.id()
                 )));
             }
-            // The receive cursor before and after the step is how the driver learns whether the
-            // state machine ACCEPTED a chunk. Reading the decision rather than re-deriving it is
-            // what keeps the spool and the cursor from ever disagreeing about which bytes are held:
-            // there is one rule, in `snapshot.rs`, and this reads its answer.
+            // The chunk is taken before the step, because the step consumes the event and the
+            // bytes are needed after the state machine has ruled on them.
             let chunk = snapshot_chunk_of(&ev);
-            let before = self.sm.snapshot_incoming().map_or(0, |c| c.received());
 
             for a in self.sm.step(ev) {
                 self.perform(a)?;
             }
 
             if let Some((offset, data)) = chunk {
-                let after = self.sm.snapshot_incoming().map_or(0, |c| c.received());
-                if after == before + data.len() as u64 && after > before {
-                    self.spool_chunk(offset, &data)?;
-                }
+                self.spool_accepted_chunk(offset, &data)?;
             }
+            // Inside the loop, because both are about the event just stepped: the spool write is
+            // the bytes it carried, and the install feeds a `Persisted` back into this same queue.
             self.install_pending_snapshot()?;
-            self.serve_snapshots()?;
-            self.checkpoint()?;
         }
+        // **Outside the loop**, because neither is about any one event and both are expensive.
+        // A checkpoint rewrites the log and fsyncs three times; a capture copies the page file.
+        // Running either once per event rather than once per drain multiplies that by the number
+        // of rounds in a batch — and a driver that spends longer in a drain than a leader's lease
+        // is a driver that loses the office while doing bookkeeping.
+        self.serve_snapshots()?;
+        self.checkpoint()?;
         Ok(())
     }
 
-    /// Write an accepted chunk to the spool, at the offset the state machine accepted it at.
+    /// Write a chunk the state machine accepted, at the offset it accepted it at.
     ///
+    /// The condition is an exact agreement between two independent accounts and never an inference
+    /// from one of them:
+    ///
+    /// * the state machine says it now holds `offset + data.len()` bytes of a payload whose header
+    ///   it names, and
+    /// * this driver says its spool holds exactly `offset` bytes of that same payload — or the
+    ///   chunk is at offset 0, which starts a payload and truncates whatever was there.
+    ///
+    /// Anything else is a disagreement about which bytes are where. It is refused by name rather
+    /// than skipped, because the failure it would otherwise become is a payload that digests
+    /// correctly on the state machine's account of the bytes and installs from a spool that is a
+    /// mixture of two transfers — and every page of that mixture passes its own checksum.
+    fn spool_accepted_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
+        let Some(cur) = self.sm.snapshot_incoming() else {
+            // Refused, or superseded. Nothing was accepted, so nothing is written.
+            return Ok(());
+        };
+        let header = *cur.header();
+        if cur.received() != offset + data.len() as u64 {
+            // The state machine did not accept this chunk here — an out-of-order chunk answered
+            // with a resume point, a duplicate, or a refusal. All of them leave the spool alone.
+            return Ok(());
+        }
+        let starting = offset == 0;
+        let continuing = self.spooled_header == Some(header) && self.spooled == offset;
+        if !starting && !continuing {
+            return Err(FerroError::Internal(format!(
+                "the state machine accepted a snapshot chunk at offset {offset} and this node's \
+                 spool holds {} bytes of {}. The two accounts of the transfer have drifted, and \
+                 installing from a spool the state machine did not digest is how a payload passes \
+                 its own checksum while being a mixture of two transfers.",
+                self.spooled,
+                if self.spooled_header.is_some() { "another payload" } else { "nothing" }
+            )));
+        }
+        self.spool_chunk(offset, data)?;
+        self.spooled = offset + data.len() as u64;
+        self.spooled_header = Some(header);
+        Ok(())
+    }
+
     /// Positioned rather than appended, and the file is truncated to the new length afterwards, so
     /// a transfer that restarts at offset 0 overwrites the old one instead of leaving its tail
-    /// behind — a longer stale payload under a shorter new one digests to nothing and is refused,
-    /// but only after the whole thing has been transferred again.
+    /// behind.
     fn spool_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
         let path = spool_path(&self.dir);
         let f = fs::OpenOptions::new()
@@ -464,7 +525,16 @@ impl<A: Applier> Node<A> {
     /// so that event must not be fed until the bytes are on this node's device. An install reported
     /// early is a node answering for a history it does not hold.
     fn install_pending_snapshot(&mut self) -> Result<(), FerroError> {
-        let Some(round) = self.sm.pending_install_round() else { return Ok(()) };
+        let Some(round) = self.sm.pending_install_round() else {
+            self.installed_round = None;
+            return Ok(());
+        };
+        if self.installed_round == Some(round) {
+            // Already installed and waiting for the `Persisted` this pushed, which is at the back
+            // of a queue with other events in front of it. Doing it again would open a spool the
+            // first install has already removed — which is exactly how this was found.
+            return Ok(());
+        }
         let meta = self
             .sm
             .snapshot_incoming()
@@ -496,6 +566,9 @@ impl<A: Applier> Node<A> {
         let _ = fs::remove_file(spool_path(&self.dir));
 
         self.applied = self.applied.max(round);
+        self.spooled = 0;
+        self.spooled_header = None;
+        self.installed_round = Some(round);
         self.snapshots_installed += 1;
         // The event that already means "everything through this round is on my disk". Reusing it
         // rather than inventing an event keeps the frozen contract intact.

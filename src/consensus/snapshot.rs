@@ -519,6 +519,11 @@ pub trait SnapshotStore: Send {
     /// A path and not a buffer: the payload arrived from a peer and was never held in memory, and
     /// reading it back in to install it would give that peer the memory footprint the streaming
     /// exists to deny them.
+    ///
+    /// Must leave nothing of the old state readable — files *and* whatever is cached in front of
+    /// them. An implementation that replaced only the files would leave this node answering from
+    /// an in-memory index of a database it no longer has, and the only sign of it would be a
+    /// restart much later that quietly changed the answers.
     fn install(&mut self, meta: &SnapshotMeta, path: &Path) -> Result<(), FerroError>;
 }
 
@@ -1119,6 +1124,15 @@ impl Consensus {
 /// [`crate::replication::backup::take`] for the page image and its LSN window,
 /// `ArenaPageStore::state_bytes` for the live arenas, and the branch catalog's own on-disk record
 /// stream for the branch metadata. Nothing here walks a page.
+///
+/// # One conservative residue, stated
+///
+/// `DiskManager::next_page_id` is an in-memory allocator cursor and an install does not lower it,
+/// so a node re-seeded from a *smaller* database keeps allocating above the old high-water mark
+/// until it restarts. That wastes page ids and cannot hand out a live page —
+/// `DiskManager::high_water` is defined as the max of the bitmap scan and this cursor precisely so
+/// it never regresses. Named because the safe direction of a stale allocator is not obvious from
+/// reading it.
 pub struct PageStoreSnapshots {
     pool: Arc<crate::buffer::buffer_pool::BufferPoolManager>,
     wal: Arc<crate::wal::log::WalManager>,
@@ -1258,11 +1272,25 @@ impl SnapshotStore for PageStoreSnapshots {
         )
         .map_err(|e| FerroError::Io(format!("write the install label: {e}")))?;
 
+        // **Invalidate before replacing, and never flush.** Every frame this pool holds describes
+        // a database that is about to stop existing, so writing one back would put a page of the
+        // old database into the middle of the new one — and `examples/repl_primary.rs` names the
+        // consequence exactly: "every such page still passes its checksum, so refusing here is the
+        // only detection point." `invalidate_all` refuses whole if any frame is pinned, because a
+        // live reader holding a frame index would otherwise be handed another database's bytes.
+        self.pool.invalidate_all()?;
+
         crate::replication::backup::restore(&dir, &self.paths.page_file)?;
         std::fs::write(&self.paths.arena_image, &arena)
             .map_err(|e| FerroError::Io(format!("write the arena image: {e}")))?;
         std::fs::write(&self.paths.branch_catalog, &branches)
             .map_err(|e| FerroError::Io(format!("write the branch catalog: {e}")))?;
+
+        // The live objects, not only the files. A node that replaced its durable state and went on
+        // serving the old in-memory index would answer for a database it no longer has, and the
+        // only sign of it would be a restart much later that "changed" the answers.
+        self.arenas.load_state(&arena)?;
+        self.branches.reload_from(&self.paths.branch_catalog, header.root_page_id)?;
 
         // Durable before returning. The state machine moves its floor on the strength of this call
         // having returned, so an install that is still in a page cache is an install that a power

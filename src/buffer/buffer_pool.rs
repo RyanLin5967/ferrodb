@@ -356,6 +356,40 @@ impl BufferPoolManager {
         Ok(())
     }
 
+    /// Drop every cached page **without writing any of them back**.
+    ///
+    /// For F6: a snapshot install replaces the page file underneath this pool, so every frame it
+    /// holds describes a database that no longer exists. Writing one back — which is what
+    /// [`BufferPoolManager::flush_all`] would do, and what the eviction path does on its own —
+    /// puts a page of the old database into the middle of the new one, and every such page still
+    /// passes its checksum. So this is the one operation that must *not* flush.
+    ///
+    /// **Refuses whole rather than in part** if any frame is pinned. A pinned frame has a live
+    /// reader holding an index into it; dropping the page underneath that reader would hand it
+    /// another database's bytes with no error anywhere. The caller's answer to a refusal is to
+    /// stop its readers, not to retry.
+    pub fn invalidate_all(&self) -> Result<(), FerroError> {
+        let mut pt = self.page_table.write().unwrap();
+        // Check every frame before touching any of them: a partial invalidation leaves the pool
+        // holding some pages of the old database and some of the new, which is worse than either.
+        for frame in &self.frames {
+            if frame.read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                return Err(FerroError::PagePinned);
+            }
+        }
+        let mut cache = self.arc_cache.lock().unwrap();
+        for (page_id, frame_i) in pt.drain() {
+            let mut frame = self.frames[frame_i].write().unwrap();
+            frame.page_id = None;
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+            drop(frame);
+            cache.remove(page_id)?;
+        }
+        Ok(())
+    }
+
     pub fn attach_wal(&self, wal: Arc<WalManager>) {
         let _ = self.wal.set(wal);
     }
