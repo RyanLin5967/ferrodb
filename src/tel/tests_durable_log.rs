@@ -367,6 +367,54 @@ fn a_contradicting_reappend_is_refused_and_never_reaches_the_file() {
     assert!(clean_len > 0);
 }
 
+/// **The two stores hold the identical frame, not merely an equal one.**
+///
+/// `Value`'s equality is numeric: `Integer(1) == Float(1.0)`, `Decimal("1.50") == Decimal("1.5")`.
+/// So `extends` accepts a re-append that *retypes* a value already stored, and the question is what
+/// each store then holds. The durable one writes only the new tail, so the disk keeps the bytes it
+/// first accepted. `MemEffectLog` used to answer that by replacing the whole frame — which left the
+/// live store holding the new variant and the file holding the old one, so a restart silently
+/// changed which variant a merge composed. Extending instead makes them agree by construction.
+///
+/// Breaking shape: exactly this — a growth whose prefix is numerically equal and differently typed.
+/// No producer sends it (`stage_all` only pushes), which is why it is built by hand rather than
+/// hoped for from a workload.
+#[test]
+fn retyping_a_stored_value_under_growth_cannot_split_the_two_stores() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let assign = |v: Value| Op::new(TBL, RowId(1), Some(QTY), OpKind::Assign(v));
+
+    let mut first = TxnFrame::new(TxnId(7), b(1), CommitHash::ZERO, 0, 1);
+    first.push_op(assign(Value::Integer(1)));
+    let mut retyped = TxnFrame::new(TxnId(7), b(1), CommitHash::ZERO, 0, 1);
+    retyped.push_op(assign(Value::Float(1.0)));
+    retyped.push_op(assign(Value::Decimal("2.50".into())));
+    // The premise: `extends` really does accept this, because the prefix compares equal.
+    assert_eq!(first.ops[0], retyped.ops[0], "the two prefixes are not numerically equal");
+    assert_ne!(format!("{:?}", first.ops[0]), format!("{:?}", retyped.ops[0]));
+
+    let live = {
+        let log = open_on(&fabric).unwrap();
+        log.append(&first).unwrap();
+        log.append(&retyped).unwrap();
+        exactly(&log.frame(b(1), TxnId(7)).unwrap())
+    };
+    let log = open_on(&fabric.restart()).unwrap();
+    assert_eq!(
+        exactly(&log.frame(b(1), TxnId(7)).unwrap()),
+        live,
+        "the reopened store holds a differently typed value from the live one, so a restart changed \
+         which variant a merge composes"
+    );
+    // And the value that survived is the one the disk first accepted, stated so the direction is
+    // pinned rather than left to whichever store happened to win.
+    match &log.frame(b(1), TxnId(7)).unwrap().ops[0].kind {
+        OpKind::Assign(Value::Integer(1)) => {}
+        other => panic!("the first-accepted variant did not survive: {other:?}"),
+    }
+    assert_eq!(log.frame(b(1), TxnId(7)).unwrap().ops.len(), 2);
+}
+
 /// The same `TxnId` on two branches is two frames, here as in memory. The key is `(branch, txn)`,
 /// and a file keyed on the id alone would merge two agents' work into one transaction.
 #[test]

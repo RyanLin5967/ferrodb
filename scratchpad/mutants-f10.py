@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""F10 mutant firing. Break one rule at a time; the named test MUST fail.
+
+A rule with no mutant is a rule nobody has shown matters. Every entry below names the rule, the
+exact edit that breaks it, and the test that has to notice. Run from the worktree root:
+
+    PATH="$HOME/.cargo/bin:$PATH" python3 scratchpad/mutants-f10.py
+
+Refuses if the tree is dirty, and restores every file it touched even on a crash.
+"""
+import subprocess, sys, os, shutil, tempfile
+
+LOG = "src/tel/log.rs"
+TESTS = "src/tel/tests_durable_log.rs"
+
+MUTANTS = [
+    # (name, file, find, replace, tests that must fail)
+    ("retry-writes-a-second-copy", LOG,
+     "            Some(Reappend::Retry) => return Ok(()),",
+     "            Some(Reappend::Retry) => encode_extend(frame, 0, 0, 0)?,",
+     ["a_retried_frame_does_not_double_its_add_across_a_restart"]),
+
+    ("growth-rewrites-the-whole-frame", LOG,
+     "            Some(Reappend::Grew { ops, guards, claims }) => {\n                encode_extend(frame, ops, guards, claims)?\n            }",
+     "            Some(Reappend::Grew { ops: _, guards: _, claims: _ }) => {\n                encode_extend(frame, 0, 0, 0)?\n            }",
+     ["a_growing_frame_replays_to_its_final_contents_and_not_to_the_sum_of_its_appends"]),
+
+    ("no-arithmetic-hole-check", LOG,
+     "                    if (prior_ops, prior_guards, prior_claims)\n                        != (frame.ops.len(), frame.guards.len(), frame.claims.len())",
+     "                    if false && (prior_ops, prior_guards, prior_claims)\n                        != (frame.ops.len(), frame.guards.len(), frame.claims.len())",
+     ["a_delta_whose_prior_counts_do_not_line_up_is_refused"]),
+
+    ("undeclared-extend-is-healed", LOG,
+     "                    let frame = built.get_mut(&(branch, txn)).ok_or_else(|| {",
+     "                    built.entry((branch, txn)).or_insert_with(|| { order.push((branch, txn)); TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1) });\n                    let frame = built.get_mut(&(branch, txn)).ok_or_else(|| {",
+     ["an_extend_for_a_frame_the_file_never_declared_is_refused"]),
+
+    ("second-open-overwrites", LOG,
+     "                    if built.contains_key(&(branch, txn)) {",
+     "                    if false && built.contains_key(&(branch, txn)) {",
+     ["a_second_open_for_one_key_is_refused"]),
+
+    ("trailing-bytes-ignored", LOG,
+     "    if at != body.len() {",
+     "    if false && at != body.len() {",
+     ["an_unknown_tag_and_a_record_with_trailing_bytes_are_both_refused"]),
+
+    ("torn-tail-not-healed", LOG,
+     "            file.set_len(good_end)\n                .map_err(|e| FerroError::Io(format!(\"{name}: truncate torn tail: {e}\")))?;",
+     "            let _ = good_end;",
+     ["a_partial_append_is_discarded_reported_and_then_written_over"]),
+
+    ("torn-tail-not-reported", LOG,
+     "        Ok((RecoveryReport { frames, extensions, discarded_tail_bytes }, good_end))",
+     "        Ok((RecoveryReport { frames, extensions, discarded_tail_bytes: 0 }, good_end))",
+     ["a_partial_append_is_discarded_reported_and_then_written_over"]),
+
+    ("header-crc-unchecked", LOG,
+     "        if crc32(&header[0..8]) != u32::from_be_bytes(header[8..12].try_into().unwrap()) {",
+     "        if false && crc32(&header[0..8]) != u32::from_be_bytes(header[8..12].try_into().unwrap()) {",
+     ["a_foreign_file_and_a_damaged_header_are_both_refused"]),
+
+    ("unguarded-string-length", LOG,
+     "    if s.len() > u16::MAX as usize {",
+     "    if false && s.len() > u16::MAX as usize {",
+     ["a_value_too_long_for_its_length_prefix_is_refused_rather_than_truncated"]),
+
+    ("no-guard-depth-cap-on-decode", LOG,
+     "fn take_guard_expr(body: &[u8], at: &mut usize, depth: u32) -> Result<GuardExpr, FerroError> {\n    if depth > MAX_GUARD_DEPTH {",
+     "fn take_guard_expr(body: &[u8], at: &mut usize, depth: u32) -> Result<GuardExpr, FerroError> {\n    if false && depth > MAX_GUARD_DEPTH {",
+     ["a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out"]),
+
+    ("no-guard-depth-cap-on-encode", LOG,
+     "    if depth > MAX_GUARD_DEPTH {\n        return Err(FerroError::Merge(format!(",
+     "    if false && depth > MAX_GUARD_DEPTH {\n        return Err(FerroError::Merge(format!(",
+     ["a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out"]),
+
+    ("index-accepts-before-the-record-lands", LOG,
+     "        Self::write_record(&*inner.file, &rec, at)?;\n        self.mem.append(frame)?;",
+     "        self.mem.append(frame)?;\n        Self::write_record(&*inner.file, &rec, at)?;",
+     ["a_failed_append_leaves_a_store_that_still_works_and_a_file_that_still_opens"]),
+
+    ("torn-first-header-bricks-the-log", LOG,
+     "        let (recovery, end) = if len <= HEADER_SIZE {",
+     "        let (recovery, end) = if len == 0 {",
+     ["a_crash_at_any_point_during_an_append_loses_nothing_already_acknowledged",
+      "a_foreign_file_and_a_damaged_header_are_both_refused"]),
+
+    ("frames_for-loses-its-ordering", LOG,
+     "        out.sort_by_key(|f| (f.seq, f.txn_id.0));",
+     "        out.reverse();",
+     ["frames_come_back_in_sequence_order_per_branch"]),
+
+    ("mem-replaces-instead-of-extending", LOG,
+     "                    let stored = &mut frames[i];\n                    stored.ops.extend_from_slice(&frame.ops[ops..]);\n                    stored.guards.extend_from_slice(&frame.guards[guards..]);\n                    stored.claims.extend_from_slice(&frame.claims[claims..]);",
+     "                    let _ = (ops, guards, claims);\n                    frames[i] = frame.clone();",
+     ["retyping_a_stored_value_under_growth_cannot_split_the_two_stores"]),
+]
+
+
+def run(cmd, timeout=900):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+
+
+def named_tests_fail(tests):
+    """Run each named test alone. Returns (all_failed, per_test_verdict)."""
+    verdicts = {}
+    for t in tests:
+        r = run(f'timeout 600 cargo test --lib tel::log::tests_durable_log::{t} -- --exact 2>&1'
+                f' || timeout 600 cargo test --lib tel::log::tests::{t} -- --exact 2>&1')
+        out = r.stdout + r.stderr
+        if "1 passed" in out and "0 failed" in out:
+            verdicts[t] = "PASSED (mutant survived)"
+        elif "0 passed" in out and "0 failed" in out and "filtered out" in out:
+            verdicts[t] = "COLLECTED NOTHING"
+        elif "error[E" in out or "could not compile" in out:
+            verdicts[t] = "BUILD ERROR"
+        else:
+            verdicts[t] = "failed (killed)"
+    return all(v.startswith("failed") for v in verdicts.values()), verdicts
+
+
+def main():
+    if run("git status --porcelain -- src/ tests/").stdout.strip():
+        print("REFUSING: src/ or tests/ is dirty; commit first so a restore is exact.")
+        return 2
+
+    baseline = run("timeout 900 cargo test --lib tel::log 2>&1")
+    b = baseline.stdout + baseline.stderr
+    if "test result: ok" not in b:
+        print("REFUSING: the baseline is not green.\n" + b[-3000:])
+        return 2
+    print("baseline: " + [l for l in b.splitlines() if "test result:" in l][-1])
+
+    rows = []
+    for name, path, find, repl, tests in MUTANTS:
+        src = open(path).read()
+        n = src.count(find)
+        if n != 1:
+            rows.append((name, f"NOT APPLIED: the anchor matches {n} times", {}))
+            print(f"[{name}] NOT APPLIED (anchor matches {n} times)")
+            continue
+        shutil.copy(path, path + ".orig")
+        try:
+            open(path, "w").write(src.replace(find, repl))
+            ok, verdicts = named_tests_fail(tests)
+            rows.append((name, "KILLED" if ok else "SURVIVED", verdicts))
+            print(f"[{name}] {'KILLED' if ok else 'SURVIVED'}  {verdicts}")
+        finally:
+            shutil.move(path + ".orig", path)
+
+    after = run("timeout 900 cargo test --lib tel::log 2>&1")
+    a = after.stdout + after.stderr
+    print("restored: " + [l for l in a.splitlines() if "test result:" in l][-1])
+    if run("git status --porcelain -- src/ tests/").stdout.strip():
+        print("WARNING: the tree is dirty after the run; a restore did not complete.")
+        return 2
+
+    print("\n=== summary ===")
+    survived = [r for r in rows if r[1] != "KILLED"]
+    for name, verdict, v in rows:
+        print(f"{verdict:>12}  {name}")
+        for t, res in v.items():
+            print(f"              {t}: {res}")
+    print(f"\n{len(rows) - len(survived)}/{len(rows)} killed")
+    return 1 if survived else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
