@@ -308,11 +308,14 @@ impl FeedStreamer {
         let mut events = decoded.events;
         let mut refused = 0usize;
         let mut refusal: Option<Refusal> = None;
-        if let Some(at) = events.iter().position(|e| self.publication.check(e).is_err()) {
-            let r = self
-                .publication
-                .check(&events[at])
-                .expect_err("the event that just refused now passes; the publication is not pure");
+        // One pass, and the refusal is carried out of it rather than recomputed: asking the
+        // publication twice about the same event would work only because `check` is pure, and a
+        // second call is exactly the kind of thing that stops being equivalent later.
+        let refused_at = events
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| self.publication.check(e).err().map(|r| (i, r)));
+        if let Some((at, r)) = refused_at {
             // Back up to the FIRST event of that commit. Truncating at `at` would write the
             // publishable siblings ahead of it and then compute the cursor over them - landing on
             // this commit's own `commit_end_lsn` and stepping over the refused row for good.
