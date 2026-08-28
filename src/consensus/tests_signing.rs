@@ -515,14 +515,19 @@ fn the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked() {
 
 #[cfg(unix)]
 #[test]
-fn a_directory_that_cannot_be_inspected_is_refused_rather_than_assumed_safe() {
-    // The other half of the same defect: the check was `if let Ok(dmeta) = fs::metadata(dir)`, so
-    // any failure to stat the directory fell through to "allowed". A guard that cannot read its own
-    // input must refuse.
+fn a_key_whose_directory_is_gone_is_refused() {
+    // What this proves: the disappearance of the key's directory produces a refusal and never an
+    // `Ok`. The refusal comes from the `File::open`, which is the first thing that fails.
     //
-    // The condition is made to happen rather than argued: the key is opened through a descriptor
-    // this process already holds, and its directory is then removed, so the open succeeds and the
-    // directory stat cannot.
+    // **Stated blind spot, because it shaped the code.** The other half of the same defect — the
+    // directory `stat` itself failing — was `if let Ok(dmeta) = fs::metadata(dir)`, which fell
+    // through to "allowed", and it is now a refusal. That branch has **no killing test and cannot
+    // have one here**: `File::open` has already resolved the path by the time the directory is
+    // stat'd, so every way to make the stat fail also makes the open fail, and the open reports
+    // first. The only remaining route is a genuine race — the directory removed between the two
+    // calls — which a test cannot schedule. So the change is a refuse-by-default posture rather
+    // than a detected rule, and it is recorded as such in `scratchpad/F7-signing.md` rather than
+    // counted as a mutant that was killed.
     let outer = tempfile::tempdir().unwrap();
     let inner = outer.path().join("gone");
     std::fs::create_dir(&inner).unwrap();
@@ -532,8 +537,7 @@ fn a_directory_that_cannot_be_inspected_is_refused_rather_than_assumed_safe() {
     std::fs::remove_file(&p).unwrap();
     std::fs::remove_dir(&inner).unwrap();
     let err = Key::load(&p).expect_err("a key whose directory is gone must be refused");
-    // The open fails first here, which is also a refusal; what must never happen is an `Ok`.
-    assert!(!err.to_string().is_empty());
+    assert!(err.to_string().contains("gone"), "the error must name the path: {err}");
 }
 
 #[test]
