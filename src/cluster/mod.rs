@@ -299,9 +299,13 @@ fn lease_source(auth: Authority, cluster_millis: Option<u64>) -> Result<LeaseSou
 }
 
 /// Fold an incoming tick into the cluster clock. **Monotone** — see [`apply_lease_tick`].
+///
+/// The `Some` arm takes the maximum rather than the incoming value, which is the whole content of
+/// the monotonicity guarantee: a re-delivered suffix of the log is normal, and letting an older
+/// tick win would move lease expiry backwards and un-expire a branch a peer has already reaped.
 fn fold_tick(prev: Option<u64>, incoming: u64) -> u64 {
     match prev {
-        Some(_p) => incoming,
+        Some(p) => p.max(incoming),
         None => incoming,
     }
 }
