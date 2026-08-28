@@ -11,8 +11,10 @@ use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, 
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::catalog::LogBranchCatalog;
-use crate::branch::BranchCatalog;
-use crate::cow::PageStore;
+use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseThread, RuntimeLock};
+use crate::branch::reaper::TwoTierReaper;
+use crate::branch::{BranchCatalog, Reaper};
+use crate::cow::{CowPageLinks, PageStore};
 use crate::storage::db_lock::DbLock;
 use crate::tel::MemEffectLog;
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
@@ -107,6 +109,16 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // catalog is a map that re-issues pages the catalog still points at.
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
+    // F11 - the reaper, built over the SAME branch catalog and page store as the runtime. That is
+    // the contract `with_reaper` states and cannot check, so it is satisfied here by construction.
+    //
+    // `CowPageLinks` is supplied because `TwoTierReaper::collapse` refuses without a page-layout
+    // walker rather than re-parent a branch onto ancestor-owned pages the interval rule would then
+    // be free to reclaim, and this is the tree these branches are on.
+    let reaper = Arc::new(
+        TwoTierReaper::new(branches.clone(), store.clone()).with_links(Arc::new(CowPageLinks)),
+    );
+
     // Provenance on disk, not in this process. Without this the runtime interns runs into a
     // `MemProvenanceStore`, so `who_wrote_row` and `ferro_row_authors` answer correctly for as long
     // as the CLI is open and answer nothing after a restart — the rows keep their author stamp, and
@@ -126,10 +138,35 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
                 store.clone() as Arc<dyn PageStore>,
             )?
         }
-        .with_durable_provenance(format!("{db_path}.provenance"))?,
+        .with_durable_provenance(format!("{db_path}.provenance"))?
+        // Retiring a branch now reclaims it. Without this, `seal` took its no-reaper path: a
+        // merged or abandoned branch was marked `Reaped` and its extents were never freed, so
+        // every `MERGE` and every `ABANDON` in this CLI leaked the branch's pages.
+        .with_reaper(reaper.clone() as Arc<dyn Reaper>),
     );
-    let mut session = Session::with_runtime(runtime);
+    let mut session = Session::with_runtime(runtime.clone());
+
+    // The catalog moves behind a mutex, and is locked for exactly one statement.
+    //
+    // Until F11 this REPL was single-threaded and owned its `Catalog` outright. The lease scan
+    // makes it two threads, and the scan must not run inside a `MERGE` - so it takes the same
+    // outermost per-statement lock, which is the rule `pgwire::serve` already documents for the
+    // server. One rule, in both places that run SQL, rather than a second lock ordering here.
+    let catalog = Arc::new(CatalogLock::new(catalog));
+
+    let interval = scan_interval_from_env()?;
+    let lease = LeaseThread::start(
+        reaper,
+        runtime,
+        catalog.clone() as Arc<dyn RuntimeLock>,
+        interval,
+    )?;
     println!("ferrodb: type .exit to quit");
+    println!(
+        "ferrodb: lease scan every {}ms; {} interrupted reap(s) finished on startup",
+        interval.as_millis(),
+        lease.resumed().len()
+    );
     let stdin = io::stdin();
     let mut buffer = String::new();
 
@@ -149,8 +186,14 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
         if let Some(pos) = buffer.rfind(';') {
             let complete = buffer[..=pos].to_string();
             buffer = buffer[pos + 1..].to_string();
-            execute_sql(&complete, &mut catalog, bp.clone(), txn.clone(), &mut session);
+            execute_sql(&complete, &catalog, bp.clone(), txn.clone(), &mut session);
         }
+    }
+    // Stop the scan before the checkpoints below. A scan that freed an extent after the free-space
+    // map was written would leave a durable map that still charges pages nothing owns.
+    let stats = lease.stop();
+    if stats.reaped > 0 || stats.refused > 0 || stats.failed > 0 {
+        println!("ferrodb: lease scan {stats:?}");
     }
     txn.checkpoint()?;
     // Persist where the arena starts and what it has allocated. Without this the next open finds
@@ -160,7 +203,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     Ok(())
 }
 
-fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {
+fn execute_sql(sql: &str, catalog: &CatalogLock, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) {
     let tokens = match Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens() {
         Ok(t) => t,
         Err(e) => { 
@@ -175,7 +218,11 @@ fn execute_sql(sql: &str, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn
         return;
     }
     for stmt in stmts {
-        match run(stmt, catalog, bp.clone(), txn.clone(), session) {
+        // Locked per statement and released before the next one, exactly as
+        // `pgwire::extended::Statement::execute` does: holding it across the whole batch would
+        // shut the lease scan out for as long as a client kept typing.
+        let mut guard = catalog.lock();
+        match run(stmt, &mut guard, bp.clone(), txn.clone(), session) {
             Ok(out) => print_outcome(&out),
             Err(e) => eprintln!("error: {}", e),
         }
