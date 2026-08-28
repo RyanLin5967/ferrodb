@@ -183,6 +183,11 @@ impl<const D: u32> RefNode<D> {
             out.push(Action::PersistHardState { term, voted_for: None });
         }
         self.role = Role::Follower;
+        if self.leader != leader {
+            // An acknowledgement owed to a leader this node no longer follows is a message to the
+            // wrong node in the wrong term. Dropped rather than sent and ignored.
+            self.ack_owed = false;
+        }
         self.leader = leader;
         self.votes.clear();
         self.since_heard = 0;
@@ -286,6 +291,7 @@ impl<const D: u32> RefNode<D> {
         self.role = Role::Leader;
         self.leader = Some(self.id);
         self.votes.clear();
+        self.ack_owed = false;
         self.since_heartbeat = 0;
         let next = self.last_round() + 1;
         self.progress = self
