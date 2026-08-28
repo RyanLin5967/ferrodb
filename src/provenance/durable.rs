@@ -9,14 +9,28 @@
 //! alive and not one moment longer. Attribution that evaporates on restart is not attribution; it
 //! is a cache of it.
 //!
-//! **This type is the replacement, and nothing constructs it yet.** `src/agent_sql/runtime.rs` is
-//! owned by another lane and was deliberately not touched, so all three of its constructors still
-//! build `Arc::new(MemProvenanceStore::new())` and `prov_store` has no setter. Read the paragraph
-//! above in the present tense for every path that goes through `AgentRuntime`: on those, restarting
-//! still loses attribution. What is done here is the store itself, proven durable and proven to be
-//! usable as the exact `Arc<dyn ProvenanceStore>` that field holds
-//! (`tests/integration_run_identity_feed.rs::the_durable_store_is_usable_as_the_trait_object_agent_runtime_holds`).
-//! Wiring it is one line in each of `runtime.rs:276`, `:332` and `:369`.
+//! **Status, corrected 2026-08-28.** This header used to say "nothing constructs it yet" and to
+//! give three line numbers to wire it at; both statements are stale and the line numbers have
+//! moved. What is true now:
+//!
+//! * `AgentRuntime::with_durable_provenance` exists (E79) and `src/cli/cli.rs` uses it, so the CLI
+//!   really does get a durable store.
+//! * The three plain constructors still default to `MemProvenanceStore`. That is deliberate — a
+//!   constructor that takes page stores is not given a database's name, so the layer that owns the
+//!   path applies it — and it means a runtime built any other way is still in-memory.
+//! * **The half that is still open, and it is the half criterion 9 is written against.**
+//!   `AgentRuntime::who_wrote_row` does not read this store at all: it reads `State::row_author`
+//!   and `State::runs`, two in-memory maps (`runtime.rs:764-768`), and so do `authors_of` and the
+//!   `ferro_row_authors` view. So the stamps below genuinely survive a restart while the *question*
+//!   "who wrote this row" still does not. Ledger row **E79c** closes that; until it does, do not
+//!   read this module's durability as criterion 9 holding end to end.
+//!
+//! There is a key-space mismatch behind that gap, and it is the real work in E79c rather than an
+//! oversight: `Stamp` is keyed by the **physical** `(page_id, slot_num)` because that is what the
+//! executor knows when it writes, while `row_author` is keyed by the **logical** `(table, row)`,
+//! which is what a caller asks about. `DESIGN.md` is explicit that `RowId` is the immutable
+//! surrogate and physical position is not identity, so the logical key is the one attribution
+//! should survive on.
 //!
 //! # Shape: an append-only log, replayed on open
 //!
