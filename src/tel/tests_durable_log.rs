@@ -10,10 +10,11 @@
 //! fabric cannot hide.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::storage::sim::{Durability, FaultPlan, SimFabric, WriteShape};
+use crate::storage::storage::Storage;
 use crate::tel::guard::GuardContext;
 use crate::tel::merge::{ColumnPolicyLookup, MergeOutcome, MergePolicy, Merger};
 use crate::tel::ThreeWayMerger;
@@ -945,6 +946,183 @@ fn a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out() {
     refuse(image, "operators deep");
 }
 
+/// **A growth whose tail carries GUARDS and CLAIMS, not only ops.**
+///
+/// This is the shape `stage_all` produces on the second WHERE-carrying statement of every agent
+/// task, and until this test existed every `FrameExtend` in the whole suite had an empty guards tail
+/// and an empty claims tail — so `put_tail(.., &frame.ops[ops..], &[], &[])` would have kept the
+/// suite green. `frame.rs` states the stakes itself: guards are not derivable from ops by anything,
+/// so a guard dropped on the way to the disk cannot be reconstructed. The production failure is
+/// quiet and expensive: the merge engine re-checks guards as preconditions, so a guard that never
+/// replayed is never re-evaluated, and a merge that should be a `Conflict` comes back `Clean`.
+#[test]
+fn a_growth_whose_tail_carries_guards_and_claims_replays_with_them() {
+    use crate::tel::guard::{CmpOp, GuardExpr};
+
+    let guard = |n: i64| {
+        Guard::holds(GuardExpr::cmp(
+            GuardExpr::col(TBL, RowId(1), QTY),
+            CmpOp::Ge,
+            GuardExpr::Literal(Value::Integer(n as i32)),
+        ))
+        .with_source(format!("qty >= {n}"))
+    };
+    let claim = |n: i64| EscrowClaim {
+        tbl: TBL,
+        row: RowId(1),
+        col: QTY,
+        amount: Delta::Int(-n),
+        floor: Some(Value::Integer(0)),
+        ceiling: None,
+    };
+
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let mut f = TxnFrame::new(TxnId(7), b(1), CommitHash::ZERO, 0, 1);
+    let live = {
+        let log = open_on(&fabric).unwrap();
+
+        // Statement one: an op, a guard and a claim.
+        f.push_op(Op::new(TBL, RowId(1), Some(QTY), OpKind::Add(Delta::Int(-5))));
+        f.push_guard(guard(5));
+        f.push_claim(claim(5));
+        log.append(&f).unwrap();
+
+        // Statement two: the frame grows in ALL THREE vectors at once.
+        f.push_op(Op::new(TBL, RowId(2), Some(QTY), OpKind::Add(Delta::Int(-3))));
+        f.push_guard(guard(3));
+        f.push_claim(claim(3));
+        log.append(&f).unwrap();
+
+        // Statement three grows guards only, so a tail that is empty in one vector and not another
+        // is exercised too — the counts are per-vector and a shared count would pass the first case.
+        f.push_guard(guard(1));
+        log.append(&f).unwrap();
+
+        let held = log.frame(b(1), TxnId(7)).unwrap();
+        assert_eq!((held.ops.len(), held.guards.len(), held.claims.len()), (2, 3, 2));
+        exactly(&held)
+    };
+
+    let log = open_on(&fabric.restart()).unwrap();
+    assert_eq!(log.recovery().extensions, 2, "the growth was not stored as two deltas");
+    let back = log.frame(b(1), TxnId(7)).unwrap();
+    assert_eq!(
+        (back.ops.len(), back.guards.len(), back.claims.len()),
+        (2, 3, 2),
+        "a guard or a claim was dropped on the way to the disk: {} ops / {} guards / {} claims",
+        back.ops.len(),
+        back.guards.len(),
+        back.claims.len()
+    );
+    assert_eq!(exactly(&back), live, "the grown frame did not survive byte for byte");
+    assert_eq!(exactly(&back), exactly(&f));
+    // The predicates themselves, which are what an agent is handed back on a violation.
+    let sources: Vec<String> = back.guards.iter().map(|g| g.violated_predicate()).collect();
+    assert_eq!(sources, vec!["qty >= 5", "qty >= 3", "qty >= 1"]);
+}
+
+/// **A frame carrying a NaN delta can still be retried and still grow.**
+///
+/// `Delta` derives `PartialEq`, so `Float(NAN) != Float(NAN)`; `Value` avoids that by comparing
+/// through `Ord`/`total_cmp`, but `OpKind::Add` and `EscrowClaim::amount` carry a `Delta` and bypass
+/// `Value`. Without [`delta_eq`] the byte-identical retry below is reported as *a contradiction* —
+/// "two transactions wearing one id" — and since `stage_all` re-appends the open frame once per
+/// statement, that task's frame could never grow again.
+///
+/// Reachability, stated rather than assumed: not from SQL, because the parser yields ±inf and never
+/// NaN. It is reachable through the public `EffectLog::append`, and through `Delta::compose`, which
+/// turns `inf + -inf` into NaN. That is why this is a test and not a comment.
+#[test]
+fn a_nan_delta_does_not_turn_a_retry_into_a_contradiction() {
+    // The premise: composing two ordinary deltas really does produce NaN.
+    assert!(matches!(
+        Delta::Float(f64::INFINITY).compose(&Delta::Float(f64::NEG_INFINITY)).unwrap(),
+        Delta::Float(x) if x.is_nan()
+    ));
+
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    let mut f = TxnFrame::new(TxnId(7), b(1), CommitHash::ZERO, 0, 1);
+    f.push_op(Op::new(TBL, RowId(1), Some(QTY), OpKind::Add(Delta::Float(f64::NAN))));
+    f.push_claim(EscrowClaim {
+        tbl: TBL,
+        row: RowId(1),
+        col: QTY,
+        amount: Delta::Float(f64::NAN),
+        floor: None,
+        ceiling: None,
+    });
+
+    let live = {
+        let log = open_on(&fabric).unwrap();
+        log.append(&f).unwrap();
+        // The retry. Under the derived `PartialEq` this is an Err.
+        log.append(&f).expect("a byte-identical retry of a NaN-carrying frame was refused");
+        assert_eq!(log.len(), 1, "the retry was stored as a second frame");
+        assert_eq!(log.frame(b(1), TxnId(7)).unwrap().ops.len(), 1, "the NaN Add was doubled");
+
+        // And it can still grow, which is the half that matters to a multi-statement task.
+        f.push_op(Op::new(TBL, RowId(2), Some(QTY), OpKind::Add(Delta::Int(-3))));
+        log.append(&f).expect("a NaN-carrying frame could not grow");
+        exactly(&log.frame(b(1), TxnId(7)).unwrap())
+    };
+
+    // `MemEffectLog` takes the same path, because `classify` is shared.
+    let mem = MemEffectLog::new();
+    mem.append(&f).unwrap();
+    mem.append(&f).expect("MemEffectLog refused a NaN-carrying retry");
+    assert_eq!(mem.len(), 1);
+
+    let log = open_on(&fabric.restart()).unwrap();
+    let back = log.frame(b(1), TxnId(7)).unwrap();
+    assert_eq!(exactly(&back), live, "the NaN did not survive byte for byte");
+    match back.ops[0].kind {
+        OpKind::Add(Delta::Float(x)) => assert!(x.is_nan(), "the NaN came back as {x}"),
+        ref other => panic!("the NaN op came back as {other:?}"),
+    }
+    // Anti-vacuity: a frame that genuinely contradicts is still refused, so the acceptance above is
+    // about NaN and not about the contradiction check having been switched off.
+    let mut rewritten = TxnFrame::new(TxnId(7), b(1), CommitHash::ZERO, 0, 1);
+    rewritten.push_op(Op::new(TBL, RowId(1), Some(QTY), OpKind::Add(Delta::Float(1.0))));
+    assert!(log.append(&rewritten).is_err(), "a rewritten prefix was accepted");
+}
+
+/// **A non-canonical boolean byte is refused.**
+///
+/// `take_u8(..) != 0` would give one value 255 encodings, which is the record-level defect the
+/// trailing-bytes check refuses: two byte sequences that decode identically mean two files can be
+/// byte-different and indistinguishable. Every other presence tag in this format already refuses
+/// anything but 0 and 1; the boolean was the odd one out.
+#[test]
+fn a_boolean_byte_that_is_neither_zero_nor_one_is_refused() {
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    {
+        let log = open_on(&fabric).unwrap();
+        let mut f = TxnFrame::new(TxnId(1), b(1), CommitHash::ZERO, 0, 1);
+        f.push_op(Op::new(TBL, RowId(1), Some(QTY), OpKind::Assign(Value::Boolean(true))));
+        log.append(&f).unwrap();
+    }
+    let mut image = fabric.durable_image();
+    // The only `true` byte in the file is the one the Assign wrote. Find the last 1 inside the
+    // record and set it to 2; re-CRC so the reader believes the bytes.
+    let offsets = record_offsets(&image);
+    {
+        let bytes = image.get_mut(TEL).unwrap();
+        let total =
+            u32::from_be_bytes(bytes[offsets[0]..offsets[0] + 4].try_into().unwrap()) as usize;
+        // ... | kind tag 2 (Assign) | value tag 3 (Boolean) | 0x01 | witness-absent 0 | 3 counts...
+        let at = bytes[offsets[0]..offsets[0] + total]
+            .windows(3)
+            .position(|w| w == [3u8, 1u8, 0u8])
+            .expect("the encoded boolean was not found")
+            + offsets[0]
+            + 1;
+        assert_eq!(bytes[at], 1);
+        bytes[at] = 2;
+    }
+    recrc(&mut image, offsets[0]);
+    refuse(image, "neither false");
+}
+
 // =================================================================================================
 // Aimed crashes
 // =================================================================================================
@@ -1118,6 +1296,173 @@ fn a_failed_append_leaves_a_store_that_still_works_and_a_file_that_still_opens()
     // Anti-vacuity: the reopened store is not latched off, so the refusal above was about the
     // fault and not about this store having stopped accepting anything.
     log.append(&decrement(2, 1, 1, 2, 3)).expect("a freshly opened store refused an append");
+}
+
+/// A [`Storage`] that fails exactly one read, at a chosen offset, and behaves normally otherwise.
+///
+/// Written here rather than added to `storage::sim` because the fabric declares reads unfaultable,
+/// and its stated reason — "a failed read leaves the durable image untouched, so it cannot produce
+/// the class of bug this harness hunts" — is precisely the assumption a scan that truncates on a
+/// read error breaks. Widening the fabric is the right fix for the tree and is not this row's file.
+struct FailOneRead {
+    bytes: Mutex<Vec<u8>>,
+    fail_at: u64,
+    reads_failed: Mutex<usize>,
+}
+
+impl FailOneRead {
+    fn new(bytes: Vec<u8>, fail_at: u64) -> Arc<Self> {
+        Arc::new(FailOneRead {
+            bytes: Mutex::new(bytes),
+            fail_at,
+            reads_failed: Mutex::new(0),
+        })
+    }
+}
+
+impl crate::storage::storage::Storage for FailOneRead {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        let mut b = self.bytes.lock().unwrap();
+        let end = offset as usize + buf.len();
+        if b.len() < end {
+            b.resize(end, 0);
+        }
+        b[offset as usize..end].copy_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if offset == self.fail_at {
+            *self.reads_failed.lock().unwrap() += 1;
+            return Err(std::io::Error::other("simulated media error: EIO"));
+        }
+        let b = self.bytes.lock().unwrap();
+        if offset as usize >= b.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(b.len() - offset as usize);
+        buf[..n].copy_from_slice(&b[offset as usize..offset as usize + n]);
+        Ok(n)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.bytes.lock().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.bytes.lock().unwrap().len() as u64)
+    }
+}
+
+/// **A read that fails mid-file refuses the open. It does NOT truncate away the records after it.**
+///
+/// Both bounds in the scan are proved against the length `Storage::len` reported, so neither record
+/// read can fail on end-of-data: the only way in is a real I/O error. An earlier version of this
+/// scan wrote `if pread_all(..).is_err() { break offset }`, which made an unreadable sector
+/// indistinguishable from a torn tail — so the heal `set_len`'d away every **undamaged** record
+/// after it, `open` returned `Ok`, and the store came back short of effects it had reported durable
+/// with the records themselves gone from the media. That is the worst outcome this module has: a
+/// merge computed from it is confidently wrong, and nothing anywhere can tell.
+///
+/// Breaking shape: exactly that — a bad sector under one record of an otherwise intact file.
+#[test]
+fn a_read_error_mid_file_refuses_the_open_and_destroys_nothing() {
+    // A clean file with three records: two frames and a growth.
+    let fabric = SimFabric::clean(Durability::SyncOnly);
+    {
+        let log = open_on(&fabric).unwrap();
+        log.append(&grown(7, 1, 0, &[(1, 5)])).unwrap();
+        log.append(&grown(7, 1, 0, &[(1, 5), (2, 3)])).unwrap();
+        log.append(&kitchen_sink(8, 1)).unwrap();
+    }
+    let image = fabric.durable_image();
+    let bytes = image.get(TEL).unwrap().clone();
+    let offsets = record_offsets(&image);
+    assert_eq!(offsets.len(), 3, "expected three records to have something to lose");
+
+    // Fail the read of the SECOND record's length prefix. Records one and three are untouched.
+    let media = FailOneRead::new(bytes.clone(), offsets[1] as u64);
+    let err = DurableEffectLog::with_storage(TEL, Arc::clone(&media) as Arc<dyn Storage>)
+        .expect_err("a read error was healed into a torn tail");
+    let text = format!("{err}");
+    assert!(text.contains("refuses to open"), "it failed, but not by this guard: {text}");
+    assert!(text.contains("EIO"), "the refusal did not carry the underlying error: {text}");
+    assert_eq!(*media.reads_failed.lock().unwrap(), 1, "the fault did not fire");
+
+    // **Nothing was destroyed.** Byte for byte, the file is what it was.
+    assert_eq!(
+        *media.bytes.lock().unwrap(),
+        bytes,
+        "the refused open truncated the file anyway, so the records after the bad sector are gone"
+    );
+
+    // And the healthy media still opens and still holds everything, which is what proves the
+    // refusal was about the read and not about the file.
+    let healthy = FailOneRead::new(bytes, u64::MAX);
+    let log = DurableEffectLog::with_storage(TEL, healthy as Arc<dyn Storage>).unwrap();
+    assert_eq!(log.recovery().frames, 2);
+    assert_eq!(log.recovery().extensions, 1);
+    assert_eq!(log.discarded_tail_bytes(), 0);
+    assert_eq!(log.frame(b(1), TxnId(7)).unwrap().ops.len(), 2);
+    assert_eq!(exactly(&log.frame(b(1), TxnId(8)).unwrap()), exactly(&kitchen_sink(8, 1)));
+}
+
+/// Appends from many threads at once land in the file, all of them, exactly once each.
+///
+/// The store hands out `&self` and every entry point is `Arc<dyn EffectLog>` shared across
+/// `pgwire`'s thread-per-connection model, so this is the shape production takes. The claim under
+/// test is the one the append path's comment makes: `end` and the index advance together under one
+/// lock, so no two threads can write at the same offset and no record can be lost between them.
+#[test]
+fn concurrent_appends_all_reach_the_file_exactly_once() {
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 25;
+
+    let fabric = SimFabric::clean(Durability::WriteThrough);
+    {
+        let log: Arc<dyn EffectLog> = Arc::new(open_on(&fabric).unwrap());
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let log = Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    // A distinct frame per (thread, i), then grown once, so both record kinds are
+                    // written concurrently rather than only the simple one.
+                    let txn = t * PER_THREAD + i + 1;
+                    log.append(&grown(txn, 1, i, &[(1, 5)])).unwrap();
+                    log.append(&grown(txn, 1, i, &[(1, 5), (2, 3)])).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("a thread panicked");
+        }
+    }
+
+    let log = open_on(&fabric.restart()).unwrap();
+    let total = (THREADS * PER_THREAD) as usize;
+    assert_eq!(log.recovery().frames, total, "a frame was lost or written twice");
+    assert_eq!(log.recovery().extensions, total, "a growth was lost or written twice");
+    assert_eq!(log.discarded_tail_bytes(), 0);
+    for t in 0..THREADS {
+        for i in 0..PER_THREAD {
+            let txn = t * PER_THREAD + i + 1;
+            let f = log
+                .frame(b(1), TxnId(txn))
+                .unwrap_or_else(|| panic!("txn{txn} is missing after the restart"));
+            assert_eq!(f.ops.len(), 2, "txn{txn} came back with {} ops", f.ops.len());
+            assert_eq!(exactly(&f), exactly(&grown(txn, 1, i, &[(1, 5), (2, 3)])));
+        }
+    }
 }
 
 // =================================================================================================

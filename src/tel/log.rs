@@ -75,12 +75,30 @@
 //! silently concatenated into a frame with the wrong ops — the same reason `consensus::log` stamps
 //! each frame with the round its position implies.
 //!
+//! **Stated gap: the directory entry is not fsynced.** The header and every record are, so a record
+//! whose append returned `Ok` is on the device. But on a filesystem that can lose a newly created
+//! file's directory entry across a power cut, the *first* append of a brand-new log can go with the
+//! entry, and the reopened database then reports no frames rather than refusing. The repo's only
+//! directory fsync is `storage::atomic_file::OsFileOps::sync_dir`, which is reachable from a
+//! temp-then-rename and not from an append, and whose own documentation records the Windows arm as a
+//! real gap — a directory handle there needs `FILE_FLAG_BACKUP_SEMANTICS`, which this crate has no
+//! dependency to ask for (see `872a7d9`, where a hand-rolled directory fsync was `ERROR_ACCESS_
+//! DENIED` on the Windows runner). `provenance::durable` and `wal::log` have the same gap. Named
+//! here rather than left for a reader to discover.
+//!
 //! # What a torn tail does, and what damage elsewhere does
 //!
 //! A torn tail is truncated back to the last good byte and the number of discarded bytes is
 //! **reported** through [`DurableEffectLog::discarded_tail_bytes`]. A store that silently swallowed
 //! a partial write would answer with a frame short of the ops it had been told about, and a merge
 //! computed from it would be confidently wrong.
+//!
+//! **The scan stops at the first record that fails, and everything after it is discarded too.**
+//! That is the WAL's behaviour and it is deliberate rather than a shortcut: the record that failed
+//! might have been a `FrameExtend`, and skipping it to keep what follows would replay a frame short
+//! of the ops it ran — the counter bug, arrived at by a repair. So a garbled record in the middle of
+//! the file costs the records after it, and the byte count is reported rather than swallowed so an
+//! operator knows how much went.
 //!
 //! Damage that is *not* at the tail is refused rather than healed, because every repair would mean
 //! inventing effects: a `FrameExtend` for a key the file never opened, a second `FrameOpen` for a
@@ -162,6 +180,66 @@ impl MemEffectLog {
     }
 }
 
+/// Whether two numeric deltas are the same delta, **with NaN equal to itself**.
+///
+/// `Delta` derives `PartialEq`, so `Delta::Float(NAN) != Delta::Float(NAN)` under IEEE rules.
+/// `Value` deliberately avoids that trap — its `PartialEq` goes through `Ord`, which uses
+/// `f64::total_cmp` — but `OpKind::Add` and `EscrowClaim::amount` carry a `Delta` and bypass `Value`
+/// entirely. Left alone, a frame holding a NaN delta reports its own **byte-identical retry** as a
+/// contradiction: `classify` finds `old != new`, `extends` finds the op is not a prefix of itself,
+/// and the caller is told two transactions are wearing one id. And because `stage_all` re-appends
+/// the open frame once per statement, that task's frame could then never grow again — every later
+/// statement of it would fail, permanently.
+///
+/// Not hypothetical: `Delta::compose` turns `inf + -inf` into NaN (`op.rs`), so a composed delta
+/// reaches this state without anyone writing `NAN`. It is unreachable from SQL today — the parser
+/// yields `±inf` but never NaN — which is exactly why it needs a test rather than a comment.
+fn delta_eq(a: &Delta, b: &Delta) -> bool {
+    match (a, b) {
+        (Delta::Float(x), Delta::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,
+        _ => a == b,
+    }
+}
+
+/// Two ops are the same effect on the same cell. `Op`'s derived `PartialEq` everywhere except the
+/// one field that carries a bare `f64`; see [`delta_eq`].
+fn op_eq(a: &Op, b: &Op) -> bool {
+    a.tbl == b.tbl
+        && a.row == b.row
+        && a.col == b.col
+        && a.witness == b.witness
+        && match (&a.kind, &b.kind) {
+            (OpKind::Add(x), OpKind::Add(y)) => delta_eq(x, y),
+            (x, y) => x == y,
+        }
+}
+
+/// Likewise for a reservation, whose `amount` is a `Delta`.
+fn claim_eq(a: &EscrowClaim, b: &EscrowClaim) -> bool {
+    a.tbl == b.tbl
+        && a.row == b.row
+        && a.col == b.col
+        && a.floor == b.floor
+        && a.ceiling == b.ceiling
+        && delta_eq(&a.amount, &b.amount)
+}
+
+/// Two frames are the same frame. `TxnFrame`'s derived `PartialEq` with [`op_eq`] and [`claim_eq`]
+/// in place of `==` on the two vectors that can hold a bare `f64`. Guards need no special case:
+/// every float inside one is a `Value`, whose comparison is already total.
+fn frame_eq(a: &TxnFrame, b: &TxnFrame) -> bool {
+    a.txn_id == b.txn_id
+        && a.branch == b.branch
+        && a.base == b.base
+        && a.seq == b.seq
+        && a.schema_ver == b.schema_ver
+        && a.guards == b.guards
+        && a.ops.len() == b.ops.len()
+        && a.ops.iter().zip(&b.ops).all(|(x, y)| op_eq(x, y))
+        && a.claims.len() == b.claims.len()
+        && a.claims.iter().zip(&b.claims).all(|(x, y)| claim_eq(x, y))
+}
+
 /// Whether `new` is the same open frame as `old`, grown.
 ///
 /// Everything identifying the transaction must match exactly, and every op, guard and claim
@@ -169,15 +247,15 @@ impl MemEffectLog {
 /// reorders, rewrites or drops what was logged is not the same transaction continuing — it is a
 /// different one reusing the id, and the caller needs to hear about it.
 fn extends(old: &TxnFrame, new: &TxnFrame) -> bool {
-    fn prefix<T: PartialEq>(old: &[T], new: &[T]) -> bool {
-        old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| a == b)
+    fn prefix<T, F: Fn(&T, &T) -> bool>(old: &[T], new: &[T], eq: F) -> bool {
+        old.len() <= new.len() && old.iter().zip(new).all(|(a, b)| eq(a, b))
     }
     old.base == new.base
         && old.seq == new.seq
         && old.schema_ver == new.schema_ver
-        && prefix(&old.ops, &new.ops)
-        && prefix(&old.guards, &new.guards)
-        && prefix(&old.claims, &new.claims)
+        && prefix(&old.ops, &new.ops, op_eq)
+        && prefix(&old.guards, &new.guards, |a, b| a == b)
+        && prefix(&old.claims, &new.claims, claim_eq)
 }
 
 /// What a second append under a key that is already present is. See the module header.
@@ -194,7 +272,7 @@ enum Reappend {
 
 /// The re-append decision, in one place, for both stores.
 fn classify(old: &TxnFrame, new: &TxnFrame) -> Result<Reappend, FerroError> {
-    if old == new {
+    if frame_eq(old, new) {
         // A retry delivering the identical frame. Storing it again would double every Add it
         // carries.
         return Ok(Reappend::Retry);
@@ -278,17 +356,39 @@ const HEADER_SIZE: u64 = 12;
 /// `total_len(4) | tag(1) | crc32(4)`: the smallest record that can exist.
 const MIN_RECORD: usize = 9;
 
-/// The largest record this log will write, or read from a disk.
+/// The largest record this store will **write**.
 ///
 /// **Reused rather than chosen.** It is [`crate::consensus::log::MAX_ENTRY_BYTES`], the consensus
 /// log's own limit, for the reason `DISTRIBUTED.md` §F9 gives: `BEGIN AGENT SESSION ... DURABLE` is
 /// the row that makes a session's TEL frames a replicated command, and a delta larger than one
 /// replication frame is a delta that could never be shipped. Two constants with one derivation
 /// would be two numbers to keep equal; this is the same number.
+const MAX_APPEND_BYTES: usize = crate::consensus::log::MAX_ENTRY_BYTES;
+
+/// The largest record this store will **read** from a disk — a constant of the *format*, and
+/// deliberately not the same number as [`MAX_APPEND_BYTES`].
 ///
-/// It is also the bound that makes a corrupt length field safe: a scan that trusted four bad bytes
-/// would be a denial of service triggered by a torn write.
-const MAX_RECORD: usize = crate::consensus::log::MAX_ENTRY_BYTES;
+/// One number serving both would be a trap rather than a simplification. `MAX_APPEND_BYTES` is
+/// derived from `replication::MAX_FRAME_BYTES`, which is a **transport tuning knob**; the scan
+/// treats an over-long length prefix as a torn tail and truncates there. So if the read bound
+/// tracked the transport, someone lowering that knob would silently truncate every effect log
+/// already on a disk that held a record above the new value — a tuning change destroying committed
+/// data, with the file reporting a healthy torn-tail heal. Fixing the read bound here decouples
+/// them: lowering the transport constant then refuses new large records, which is a refusal the
+/// caller sees, and reads every old one unchanged.
+///
+/// It is also the bound that makes a corrupt length field safe to allocate against — four bad bytes
+/// must not be a request for memory — and it is checked *with* `offset + total > len`, so the real
+/// ceiling is the file's own size.
+const MAX_RECORD: usize = 64 * 1024 * 1024;
+
+/// The write bound must fit inside the read bound, or this store could write a record it refuses to
+/// read back. Checked at compile time so a change to either number fails the build rather than a
+/// recovery.
+const _: () = assert!(
+    MAX_APPEND_BYTES <= MAX_RECORD,
+    "MAX_APPEND_BYTES exceeds the format's read bound; raise MAX_RECORD in the same commit"
+);
 
 /// How deeply a [`GuardExpr`] may nest, on the way in and on the way out.
 ///
@@ -448,7 +548,19 @@ fn take_value(body: &[u8], at: &mut usize) -> Result<Value, FerroError> {
         V_INTEGER => Value::Integer(take_u32(body, at)? as i32),
         V_VARCHAR => Value::Varchar(take_str(body, at)?),
         V_FLOAT => Value::Float(f64::from_be_bytes(take_array::<8>(body, at)?)),
-        V_BOOLEAN => Value::Boolean(take_u8(body, at)? != 0),
+        // Not `!= 0`. Accepting 2..=255 as `true` would give one value 255 encodings, which is the
+        // same defect the trailing-bytes check below refuses at the record level: two byte sequences
+        // that decode identically mean two files can be byte-different and indistinguishable.
+        V_BOOLEAN => match take_u8(body, at)? {
+            0 => Value::Boolean(false),
+            1 => Value::Boolean(true),
+            other => {
+                return Err(FerroError::Corruption(format!(
+                    "a boolean in a typed effect record carries byte {other}, which is neither false \
+                     (0) nor true (1)"
+                )))
+            }
+        },
         V_NULL => Value::Null,
         V_BIGINT => Value::BigInt(take_u64(body, at)? as i64),
         V_DECIMAL => Value::Decimal(take_str(body, at)?),
@@ -654,9 +766,14 @@ fn take_op(body: &[u8], at: &mut usize) -> Result<Op, FerroError> {
 
 // ---- Guard, GuardExpr -------------------------------------------------------------------------
 
-/// The smallest a `Guard` can be: a one-byte expr tag, a one-byte `Value::Null` expectation, and
-/// an absent `source_text`.
-const GUARD_MIN: usize = 3;
+/// The smallest a `Guard` can be, derived rather than eyeballed: the shortest expression is
+/// `Literal(Null)` at **two** bytes — its own tag plus the value's — then a one-byte `Value::Null`
+/// expectation and a one-byte absent `source_text`.
+///
+/// It was 3 here for one commit, from counting the expression as one byte. Too small only *weakens*
+/// the allocation bound rather than breaking it, which is exactly why it is worth correcting: a
+/// stated derivation that does not add up is a false claim in a comment the next reader will trust.
+const GUARD_MIN: usize = 4;
 
 fn put_guard(out: &mut Vec<u8>, g: &Guard) -> Result<(), FerroError> {
     put_guard_expr(out, &g.expr, 0, g)?;
@@ -744,10 +861,17 @@ fn put_guard_expr(
     owner: &Guard,
 ) -> Result<(), FerroError> {
     if depth > MAX_GUARD_DEPTH {
+        // `owner.source_text` and NOT `owner.violated_predicate()`. That accessor falls back to
+        // `expr.to_string()`, whose `Display` recurses over the WHOLE tree — so on the one input
+        // this guard exists to refuse, building the refusal message would overflow the stack the
+        // refusal is protecting. Reading the source text cannot recurse at all.
         return Err(FerroError::Merge(format!(
-            "the guard `{}` nests more than {MAX_GUARD_DEPTH} operators deep; refusing to write a \
-             record this store could not read back without overflowing its own stack",
-            owner.violated_predicate()
+            "a guard in this frame nests more than {MAX_GUARD_DEPTH} operators deep ({}); refusing to \
+             write a record this store could not read back without overflowing its own stack",
+            match &owner.source_text {
+                Some(t) => format!("its source reads `{t}`"),
+                None => "it was synthesised and carries no source text".to_string(),
+            }
         )));
     }
     match e {
@@ -843,7 +967,8 @@ fn take_guard_parts(
     depth: u32,
     what: &'static str,
 ) -> Result<Vec<GuardExpr>, FerroError> {
-    let n = take_u32_len(body, at, 1, what)?;
+    // 2, not 1: the shortest child is `Literal(Null)`, which is its tag plus the value's.
+    let n = take_u32_len(body, at, 2, what)?;
     let mut parts = Vec::with_capacity(n.min(64));
     for _ in 0..n {
         parts.push(take_guard_expr(body, at, depth + 1)?);
@@ -1019,10 +1144,10 @@ fn decode_record(body: &[u8], at_offset: u64, name: &str) -> Result<Record, Ferr
 /// `total_len(4) | body | crc32(4)`, the framing `wal::log` and `provenance::durable` both use.
 fn frame_record(body: &[u8]) -> Result<Vec<u8>, FerroError> {
     let total = 4 + body.len() + 4;
-    if total > MAX_RECORD {
+    if total > MAX_APPEND_BYTES {
         return Err(FerroError::Merge(format!(
-            "this frame's new effects encode to {total} bytes, over the {MAX_RECORD}-byte limit a \
-             record may occupy; refusing to store effects that could never be replicated"
+            "this frame's new effects encode to {total} bytes, over the {MAX_APPEND_BYTES}-byte limit \
+             a record may occupy; refusing to store effects that could never be replicated"
         )));
     }
     let mut rec = Vec::with_capacity(total);
@@ -1031,6 +1156,41 @@ fn frame_record(body: &[u8]) -> Result<Vec<u8>, FerroError> {
     let crc = crc32(&rec);
     rec.extend_from_slice(&crc.to_be_bytes());
     Ok(rec)
+}
+
+/// **A failed read is a fault, not the end of the file**, and keeping those two apart is the whole
+/// of this function.
+///
+/// Every call site has already proved its bytes are inside the length [`Storage::len`] reported, so
+/// none of them can fail on end-of-data. The only way in is a real I/O error: a bad sector, a device
+/// that went away mid-scan, a file another process truncated underneath us. An earlier version of
+/// the scan wrote `if pread_all(..).is_err() { break offset }`, which made that error indistinguish-
+/// able from a torn tail — so the heal would `set_len` away every **undamaged** record after the
+/// unreadable one and `open` would return `Ok`, leaving a store short of effects it had reported
+/// durable and the records themselves gone from the media. Refusing the open instead leaves every
+/// byte where it is, which is recoverable; healing is not.
+///
+/// `consensus::log::scan_frames` propagates for exactly this reason. `provenance::durable` swallows
+/// it (`durable.rs:221`, `:229`), and that is a defect there rather than a precedent to copy.
+///
+/// This is also the one fault class `storage::sim` cannot inject — it declares reads unfaultable
+/// because "a failed read leaves the durable image untouched", which was true of every reader in the
+/// tree until a reader started truncating on one. So the test for it hands the store a `Storage` of
+/// its own rather than a `SimFabric`.
+fn read_or_refuse(
+    file: &dyn Storage,
+    buf: &mut [u8],
+    offset: u64,
+    name: &str,
+) -> Result<(), FerroError> {
+    pread_all(file, buf, offset).map_err(|e| {
+        FerroError::Io(format!(
+            "{name}: reading {} byte(s) at offset {offset} failed: {e}. The scan cannot tell how much \
+             of this file is intact, so it refuses to open rather than truncating away what it could \
+             not read.",
+            buf.len()
+        ))
+    })
 }
 
 fn header_bytes() -> [u8; HEADER_SIZE as usize] {
@@ -1202,17 +1362,13 @@ impl DurableEffectLog {
                 break offset;
             }
             let mut len_buf = [0u8; 4];
-            if pread_all(file, &mut len_buf, offset).is_err() {
-                break offset;
-            }
+            read_or_refuse(file, &mut len_buf, offset, name)?;
             let total = u32::from_be_bytes(len_buf) as u64;
             if (total as usize) < MIN_RECORD || total as usize > MAX_RECORD || offset + total > len {
                 break offset;
             }
             let mut rec = vec![0u8; total as usize];
-            if pread_all(file, &mut rec, offset).is_err() {
-                break offset;
-            }
+            read_or_refuse(file, &mut rec, offset, name)?;
             let stored = u32::from_be_bytes(rec[total as usize - 4..].try_into().unwrap());
             if crc32(&rec[..total as usize - 4]) != stored {
                 break offset;

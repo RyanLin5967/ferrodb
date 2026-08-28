@@ -120,6 +120,15 @@ def named_tests_fail(tests):
     a survivor is worse than no harness, so the verdicts below are mutually exclusive and anything
     unrecognised is an explicit error rather than a default.
     """
+    # **Build first, untimed-ish, so the per-test timeout measures the TEST.** The first version
+    # put a 150s bound around `cargo test`, which under load 6 on this machine spent all of it in
+    # the rebuild the mutant had just invalidated — so mutant 1 reported "TIMED OUT with no verdict"
+    # and would have read as a survivor. A timeout that can expire in the build is not a verdict
+    # about the mutant.
+    b = run("timeout 900 cargo build --lib --tests 2>&1")
+    if "error[E" in (b.stdout + b.stderr) or "could not compile" in (b.stdout + b.stderr):
+        return False, {t: "BUILD ERROR" for t in tests}
+
     verdicts = {}
     for t in tests:
         # 150s and not 600. Two mutants kill by aborting the test binary, and macOS's ReportCrash
@@ -127,7 +136,7 @@ def named_tests_fail(tests):
         # buys nothing but wall clock. The abort message reaches the pipe immediately, before the
         # hold, so it is still in `out` when the timeout fires; a timeout that carries it is a kill,
         # and one that carries nothing is reported as a timeout rather than counted either way.
-        r = run(f"timeout 150 cargo test --lib {t} 2>&1")
+        r = run(f"timeout 200 cargo test --lib {t} 2>&1")
         out = r.stdout + r.stderr
         timed_out = r.returncode == 124
         if "error[E" in out or "could not compile" in out:

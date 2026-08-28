@@ -25,7 +25,7 @@ pub mod schema_merge;
 pub use capture::{capture_assignment, capture_guard, to_guard_expr, ColMap, RowSnapshot};
 pub use engine::{dedup_by_txn, ComposedState, Deduped, Side, ThreeWayMerger};
 pub use frame::{SchemaVer, TxnFrame};
-pub use log::MemEffectLog;
+pub use log::{DurableEffectLog, MemEffectLog, RecoveryReport};
 pub use guard::{ArithOp, CmpOp, Guard, GuardContext, GuardExpr};
 pub use ids::{ColId, Dot, RowId, TableId, TxnId};
 pub use merge::{
