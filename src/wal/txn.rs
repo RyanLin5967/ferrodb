@@ -1,6 +1,7 @@
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 use crate::catalog::column::DataType;
+use crate::cluster::GrantedCounter;
 use crate::provenance::RunEntity;
 use crate::{buffer::buffer_pool::BufferPoolManager, error::FerroError, storage::{heap_page::Page, tuple::{Tuple, VersionHeader}}, wal::{log::{DdlOp, RecKind, WalManager, WalPin}}};
 
@@ -30,10 +31,28 @@ fn checkpoint_interval() -> u64 {
 }
 
 
+/// How many transaction ids a standalone node takes for itself at a time.
+///
+/// Invisible to everything durable: only the *issued* watermark reaches the WAL header, so a
+/// self-grant of 256 that issues one leaves the header exactly where a `fetch_add` of one would.
+/// Above one so that single-node running exercises the partially-consumed-range path.
+const SELF_GRANT_TXN_IDS: u64 = 256;
+
 pub struct TxnManager {
     pub wal: Arc<WalManager>,
     pub bp: Arc<BufferPoolManager>,
-    pub next_txn_id: AtomicU64,
+    /// **F4: transaction ids are cluster state.**
+    ///
+    /// This was `pub next_txn_id: AtomicU64` and a `fetch_add`. Two nodes both issue txn 5, and
+    /// because the TEL's `stamp()` leads with `TxnId` to order writes across branches (ledger R8),
+    /// the duplicate does not merely repeat an integer — it silently corrupts **merge ordering**,
+    /// which is the one thing the merge engine cannot detect for itself.
+    ///
+    /// A standalone node grants itself and issues exactly what `fetch_add` issued, starting at the
+    /// WAL header's id; a cluster member issues only from an applied
+    /// [`crate::consensus::Command::TxnIdRange`] and **refuses** when it holds none. See
+    /// [`crate::cluster`].
+    pub txn_ids: GrantedCounter,
     pub att: Mutex<HashMap<u64, TxnEntry>>,
     pub commits_since_checkpoint: AtomicU64,
     /// Every table's DDL, retained so a checkpoint can re-establish it at the head of the new log.
@@ -176,12 +195,12 @@ pub struct ReadView {
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, next_txn_id: AtomicU64::new(start), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
         let mut att = self.att.lock().unwrap();
-        Self::begin_locked(&self.next_txn_id, &self.wal, &mut att)
+        Self::begin_locked(&self.txn_ids, &self.wal, &mut att)
     }
 
     /// The body of `begin`, with the active-transaction table already locked.
@@ -190,11 +209,17 @@ impl TxnManager {
     /// critical section that allocates the id and writes the `Begin` — see the comment there for
     /// why doing it in two steps would be a race rather than a tidiness question.
     fn begin_locked(
-        next_txn_id: &AtomicU64,
+        txn_ids: &GrantedCounter,
         wal: &WalManager,
         att: &mut HashMap<u64, TxnEntry>,
     ) -> Result<u64, FerroError> {
-        let txn_id = next_txn_id.fetch_add(1, Ordering::SeqCst);
+        // **Refuses; it does not fetch.** A cluster member holding no granted range fails here
+        // rather than asking a leader, because this runs with the active-transaction table locked
+        // — the lock every checkpoint and every snapshot handoff waits on — and a network
+        // round-trip inside it would stall the whole engine on a partition. Refusing early is also
+        // what keeps the failure clean: nothing has been inserted into `att` yet, so there is no
+        // half-open transaction to leak.
+        let txn_id = txn_ids.take(1)?;
         let lsn = wal.append(txn_id, 0, &RecKind::Begin)?;
         let snapshot = Snapshot { high_water: txn_id, active: att.keys().copied().collect() };
         att.insert(
@@ -235,7 +260,7 @@ impl TxnManager {
     pub fn begin_snapshot_read(&self) -> Result<SnapshotHandoff, FerroError> {
         let (txn_id, snapshot, resume_lsn) = {
             let mut att = self.att.lock().unwrap();
-            let txn_id = Self::begin_locked(&self.next_txn_id, &self.wal, &mut att)?;
+            let txn_id = Self::begin_locked(&self.txn_ids, &self.wal, &mut att)?;
             // Includes this reader's own `Begin`, which is the answer when nothing else is in
             // flight: there is then nothing below it that the snapshot does not already contain.
             let resume_lsn = att
@@ -764,7 +789,9 @@ impl TxnManager {
         self.wal.flush()?;
         self.bp.flush_all()?;
         self.bp.disk_manager.sync()?;
-        self.wal.truncate(self.next_txn_id.load(Ordering::SeqCst))?;
+        // The issued watermark is exactly what the old counter held, so the WAL header — 24 bytes
+        // with no spare room — keeps its meaning and its format.
+        self.wal.truncate(self.txn_ids.issued_through())?;
         self.commits_since_checkpoint.store(0, Ordering::SeqCst);
         // The truncation just discarded every DDL record. Put them back, or a log reader starting
         // at the new base has no way to know what any table is.
@@ -779,9 +806,47 @@ impl TxnManager {
         self.att.lock().unwrap().get(&txn_id).and_then(|e| e.snapshot.clone()).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
     }
 
+    /// Apply a committed [`crate::consensus::Command::TxnIdRange`].
+    ///
+    /// Refuses a range addressed to another node, and any range at all on a standalone node. A
+    /// re-delivered range is a no-op — a committed round may arrive twice, and re-offering ids this
+    /// node has already issued is how two transactions get the same id on ONE node.
+    pub fn apply_txn_id_grant(
+        &self,
+        node: crate::consensus::NodeId,
+        lo: u64,
+        hi: u64,
+    ) -> Result<(), FerroError> {
+        self.txn_ids.apply_grant(node, lo, hi)?;
+        Ok(())
+    }
+
+    /// Raise the id watermark to `at_least`, discarding any granted range below it.
+    ///
+    /// Recovery's half of the seed. `TxnManager::new` takes the WAL header's id, and the header is
+    /// only advanced at checkpoint, so between checkpoints it lags what was actually issued;
+    /// `wal::recovery::recover` scans the retained records and calls this with one past the
+    /// highest id it saw. Monotone, because both inputs are lower bounds on what was issued and a
+    /// counter that could be lowered would re-issue.
+    ///
+    /// It does **not** create a grant. A cluster member that recovers a log full of ids still
+    /// holds no range and still refuses to begin a transaction until the leader grants one — the
+    /// watermark says what was used, never what may be used.
+    pub fn raise_next_txn_id(&self, at_least: u64) {
+        self.txn_ids.raise_issued_through(at_least);
+    }
+
+    /// The id watermark: everything below it has been issued. Diagnostic and recovery-facing.
+    pub fn next_txn_id(&self) -> u64 {
+        self.txn_ids.issued_through()
+    }
+
     pub fn read_snapshot(&self) -> Snapshot {
         let att = self.att.lock().unwrap();
-        Snapshot { high_water: self.next_txn_id.load(Ordering::SeqCst), active: att.keys().copied().collect() }
+        // A read of the watermark, not a take: a snapshot's high water is "everything below this
+        // was issued", which the watermark answers without consuming anything and therefore
+        // without ever refusing. That is why `read_snapshot` stays infallible.
+        Snapshot { high_water: self.txn_ids.issued_through(), active: att.keys().copied().collect() }
     }
 }
 
@@ -1402,7 +1467,7 @@ use super::*;
 
         // The log's base moves to `next_lsn`, which is already past that `Begin`, so pinning the
         // resume point must fail.
-        wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
+        wal.truncate(txn.txn_ids.issued_through()).unwrap();
         assert!(
             wal.base_lsn.load(Ordering::SeqCst) > txn.att.lock().unwrap()[&open].begin_lsn,
             "the log was not truncated past the open transaction, so this test proves nothing"

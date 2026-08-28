@@ -19,3 +19,5 @@ pub mod pgwire;
 pub mod provenance;
 pub mod replication;
 pub mod consensus;
+/// F4: the node-local counters that must become cluster state, and the guards that refuse.
+pub mod cluster;

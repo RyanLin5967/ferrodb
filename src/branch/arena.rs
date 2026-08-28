@@ -30,7 +30,7 @@
 //! counts the arena's own pages and locks it out of its own region.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::branch::record::{reclaimable, ArenaExtent, BranchRecord, PendingFree};
@@ -39,6 +39,7 @@ use crate::branch::types::{
 };
 use crate::branch::catalog::LogBranchCatalog;
 use crate::branch::BranchCatalog;
+use crate::cluster::GrantedCounter;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::cow::page_header::{flags, stamp_checksum, verify_checksum, PageHeader, PageType};
 use crate::cow::{CowPage, PageHandle, PageStore, PAGE_HEADER_SIZE};
@@ -61,29 +62,107 @@ pub fn privacy_barrier(rec: &BranchRecord) -> Epoch {
     }
 }
 
+/// How many extents a standalone node takes for itself at a time.
+///
+/// Only the *issued* watermark is durable, so this is invisible to the checkpoint image and to
+/// every existing test: a self-grant of four extents that issues one leaves the image exactly
+/// where a `fetch_add` of one extent would have. It is above one purely so that single-node
+/// running exercises the partially-consumed-range path rather than only the empty-range one.
+const SELF_GRANT_EXTENTS: u64 = 4;
+
+/// How many arena ids a standalone node takes for itself at a time.
+const SELF_GRANT_ARENA_IDS: u64 = 64;
+
 /// Hands out contiguous extents and takes them back whole.
+///
+/// # F4: both counters here are cluster state
+///
+/// `next_extent_start` and `next_arena_id` were node-local `AtomicU32`s, and each is a silent
+/// corruption on a second node. Two nodes bumping the extent counter both allocate the extent at
+/// page 66 and hand the same physical page to different branches; `examples/repl_primary.rs` names
+/// what that costs — *"every such page still passes its checksum, so refusing here is the only
+/// detection point."* Two nodes bumping the arena counter both name a different extent `a7`, and
+/// `BranchRecord::arenas` then points two branches at one arena, which the reaper frees whole.
+///
+/// Both are now [`GrantedCounter`]s. A standalone node grants itself and issues exactly the values
+/// `fetch_add` issued; a cluster member issues only from what the leader granted it and
+/// **refuses** when it holds nothing. See [`crate::cluster`].
 struct ArenaSpaceManager {
     base_page: PageId,
     extent_pages: u32,
-    next_extent_start: AtomicU32,
+    /// Start pages of extents. Issues `extent_pages` at a time.
+    extent_starts: GrantedCounter,
     /// Extent start pages returned by `free_arena`, ready to be handed out again. Reuse is what
     /// makes the reserved page count return to baseline rather than merely stopping its growth.
+    ///
+    /// **Recycling needs no grant** — and that is a property, not an oversight. These pages were
+    /// already granted to this node and were never given back to the leader, so handing one out
+    /// again is this node issuing from its own space. What it *does* need is the epoch check
+    /// below: pages self-granted under a previous authority are not this node's to reuse.
     free_extent_starts: Mutex<Vec<PageId>>,
-    next_arena_id: AtomicU32,
+    /// Arena ids. Issues one at a time.
+    ///
+    /// In a cluster these come from the same [`crate::consensus::Command::ArenaGrant`] as the
+    /// pages — see [`ArenaPageStore::apply_arena_grant`] for why, and for what the frozen contract
+    /// does not carry.
+    arena_ids: GrantedCounter,
+    /// The authority epoch `free_extent_starts` was filled under.
+    ///
+    /// A store that recycled pages while standalone, in a process that then joined a cluster, is
+    /// sitting on space no leader knows it has. [`crate::cluster::GrantedCounter`] evicts stale
+    /// *grants* on its own; this is the same rule for the recycle stack, which is the one piece of
+    /// issued space that lives outside the counter.
+    recycle_epoch: AtomicU64,
 }
 
 impl ArenaSpaceManager {
+    /// Take one extent's worth of pages and one arena id, or refuse.
+    ///
+    /// Both takes can refuse and neither is retried against a local counter. The arena id is taken
+    /// **after** the pages so that a refusal on the id does not strand a page range: an unused
+    /// grant range is still this node's, but a page range consumed for an arena that was never
+    /// created would be a durable leak the leader cannot see.
     fn reserve(&self) -> Result<(ArenaId, PageId), FerroError> {
-        let start = match self.free_extent_starts.lock().unwrap().pop() {
+        let epoch = crate::cluster::epoch();
+        let start = match self.recycled_start(epoch) {
             Some(s) => s,
-            None => self.next_extent_start.fetch_add(self.extent_pages, Ordering::SeqCst),
+            None => {
+                let v = self.extent_starts.take(self.extent_pages as u64)?;
+                // Every value in this counter is a page id, and a `PageId` is a `u32`. A grant
+                // that pushed the watermark past that is a leader arithmetic error, and truncating
+                // it silently would alias page 0.
+                u32::try_from(v).map_err(|_| {
+                    BranchError::Arena(format!(
+                        "granted extent start {v} does not fit a page id; refusing to allocate"
+                    ))
+                })?
+            }
         };
-        let arena = ArenaId(self.next_arena_id.fetch_add(1, Ordering::SeqCst));
+        let id = self.arena_ids.take(1)?;
+        let arena = ArenaId(u32::try_from(id).map_err(|_| {
+            BranchError::Arena(format!("granted arena id {id} does not fit an ArenaId"))
+        })?);
         Ok((arena, start))
     }
 
+    /// Pop a recycled extent start, discarding the stack outright if it was filled under a
+    /// superseded authority.
+    fn recycled_start(&self, epoch: u64) -> Option<PageId> {
+        let mut free = self.free_extent_starts.lock().unwrap();
+        if self.recycle_epoch.swap(epoch, Ordering::SeqCst) != epoch {
+            free.clear();
+            return None;
+        }
+        free.pop()
+    }
+
     fn give_back(&self, start: PageId) {
-        self.free_extent_starts.lock().unwrap().push(start);
+        let epoch = crate::cluster::epoch();
+        let mut free = self.free_extent_starts.lock().unwrap();
+        if self.recycle_epoch.swap(epoch, Ordering::SeqCst) != epoch {
+            free.clear();
+        }
+        free.push(start);
     }
 }
 
@@ -199,9 +278,15 @@ impl ArenaPageStore {
             space: ArenaSpaceManager {
                 base_page,
                 extent_pages: ARENA_EXTENT_PAGES,
-                next_extent_start: AtomicU32::new(base_page),
+                extent_starts: GrantedCounter::new(
+                    "extent-start",
+                    base_page as u64,
+                    ARENA_EXTENT_PAGES as u64 * SELF_GRANT_EXTENTS,
+                ),
                 free_extent_starts: Mutex::new(Vec::new()),
-                next_arena_id: AtomicU32::new(1), // arena 0 is the shared/trunk arena
+                // Starts at 1: arena 0 is the shared/trunk arena and is never an extent.
+                arena_ids: GrantedCounter::new("arena-id", 1, SELF_GRANT_ARENA_IDS),
+                recycle_epoch: AtomicU64::new(crate::cluster::epoch()),
             },
             state: Mutex::new(StoreState {
                 extents: HashMap::new(),
@@ -217,6 +302,58 @@ impl ArenaPageStore {
 
     pub fn base_page(&self) -> PageId {
         self.space.base_page
+    }
+
+    /// Apply a committed [`crate::consensus::Command::ArenaGrant`].
+    ///
+    /// One entry grants **both** counters: pages `[first_page, first_page + page_count)` and arena
+    /// ids drawn from the same numbers.
+    ///
+    /// # Why arena ids ride the page grant
+    ///
+    /// The frozen contract has no `Command` variant for an arena-id range —
+    /// `ArenaGrant { node, first_page, page_count }` names pages only. Rather than leave the id
+    /// counter node-local (which is the same corruption one level up: two nodes naming a different
+    /// extent `a7`, and `BranchRecord::arenas` then pointing two branches at one arena), the ids
+    /// are drawn from the granted page numbers themselves.
+    ///
+    /// That is sound for exactly the reason the grant exists: page numbers are unique across the
+    /// cluster, so any function of them is too, and `[first_page, first_page + page_count)` gives
+    /// `page_count` ids per grant — 256 reuses per extent at the default extent size, so recycling
+    /// an extent does not need a fresh consensus round. `ArenaId` and `PageId` are distinct types,
+    /// so the shared numbering cannot be confused at a call site. Reported as a needed variant in
+    /// this row's summary rather than worked around silently.
+    ///
+    /// # Refusals
+    ///
+    /// Refuses a grant addressed to another node, and a grant reaching a standalone node. A
+    /// re-delivered grant is a no-op: a committed round may be delivered more than once, and
+    /// re-offering a range this node has already issued from hands one page to two branches.
+    pub fn apply_arena_grant(
+        &self,
+        node: crate::consensus::NodeId,
+        first_page: u32,
+        page_count: u32,
+    ) -> Result<(), FerroError> {
+        let lo = first_page as u64;
+        let hi = lo + page_count as u64;
+        self.space.extent_starts.apply_grant(node, lo, hi)?;
+        self.space.arena_ids.apply_grant(node, lo, hi)?;
+        Ok(())
+    }
+
+    /// How many extents this node may still claim without a new grant.
+    ///
+    /// Diagnostic, for an operator and for the leader loop that decides when to propose the next
+    /// grant. A caller that branches on it to decide whether to allocate is re-implementing the
+    /// guard in [`ArenaSpaceManager::reserve`], which already refuses.
+    pub fn grantable_extents(&self) -> u64 {
+        self.space.extent_starts.remaining() / self.space.extent_pages as u64
+    }
+
+    /// The extent-start watermark, i.e. what the checkpoint image carries. Diagnostic.
+    pub fn extent_watermark(&self) -> PageId {
+        self.space.extent_starts.issued_through() as PageId
     }
 
     /// Extent pages currently reserved by some branch.
@@ -426,8 +563,15 @@ impl ArenaPageStore {
         let mut b = Vec::new();
         b.push(Self::STATE_VERSION);
         b.extend_from_slice(&self.space.base_page.to_be_bytes());
-        b.extend_from_slice(&self.space.next_extent_start.load(Ordering::SeqCst).to_be_bytes());
-        b.extend_from_slice(&self.space.next_arena_id.load(Ordering::SeqCst).to_be_bytes());
+        // The two counters are written as they always were: **the issued watermark occupies the
+        // slot the old `AtomicU32` did, and is the same number.** Held-but-unissued grant ranges
+        // are deliberately NOT persisted — a grant is proved by the replicated log, which replays
+        // it, and a range recorded here would be a second, weaker record of the same fact that a
+        // restart could disagree with. Keeping the format byte-identical is also what lets
+        // `two_stores_in_the_same_state_checkpoint_byte_identical_images` still hold and every
+        // `<db>.arena` already on disk still open.
+        b.extend_from_slice(&(self.space.extent_starts.issued_through() as u32).to_be_bytes());
+        b.extend_from_slice(&(self.space.arena_ids.issued_through() as u32).to_be_bytes());
         b.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
         b.extend_from_slice(&self.reserved_pages.load(Ordering::SeqCst).to_be_bytes());
 
@@ -591,8 +735,15 @@ impl ArenaPageStore {
         current.clear();
         *self.state.lock().unwrap() = StoreState { extents, recycled, current, pending };
         *self.space.free_extent_starts.lock().unwrap() = free_starts;
-        self.space.next_extent_start.store(next_start, Ordering::SeqCst);
-        self.space.next_arena_id.store(next_arena, Ordering::SeqCst);
+        // Raised, never lowered, and every held range is trimmed to match: the image says this
+        // much was already issued, and a grant replayed afterwards must only re-offer its unissued
+        // suffix. See `GrantedCounter::raise_issued_through`.
+        self.space.extent_starts.raise_issued_through(next_start as u64);
+        self.space.arena_ids.raise_issued_through(next_arena as u64);
+        // The restored recycle stack is kept — those pages were granted to *this* node and were
+        // never returned to the leader — but it is re-stamped with the authority in force now, so
+        // a later `join` still invalidates it.
+        self.space.recycle_epoch.store(crate::cluster::epoch(), Ordering::SeqCst);
         self.live_pages.store(live, Ordering::SeqCst);
         self.reserved_pages.store(reserved, Ordering::SeqCst);
         Ok(())
