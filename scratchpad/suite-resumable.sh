@@ -48,7 +48,28 @@ if ! timeout 1800 cargo build --examples > "$LOGDIR/examples.log" 2>&1; then
 fi
 
 silent=0
-run_one "lib" "--lib" || silent=$((silent+1))
+
+# **Priority order, by blast radius rather than alphabet.** This branch changes exactly one
+# behaviour outside its own new files - `MemEffectLog::append` extends the stored frame instead of
+# replacing it - so the targets that call `EffectLog::append` or `frames_for` are the ones that can
+# possibly break, and they run first. `grep -rln 'MemEffectLog\|EffectLog' tests/` produced this
+# list; `--lib` carries every `src/tel` unit test. The rest still runs, in full, afterwards: the
+# order is about getting the answer early, not about running less.
+PRIORITY="lib agent_sql_surface integration_effect_log integration_durable_tel \
+integration_merge_agreement prop_merge_outcomes integration_simulate \
+integration_runtime_reattach integration_runtime_concurrency integration_branch_pages \
+integration_zero_copy_fork integration_trunk_tree_authority adv_f5_probe \
+guard_precondition_probe adv_f6_dropped_capture adv_f4_false_refusal"
+
+for t in $PRIORITY; do
+    if [ "$t" = lib ]; then
+        run_one lib "--lib" || silent=$((silent+1))
+    else
+        [ -f "tests/$t.rs" ] || { echo "REFUSING - no tests/$t.rs; the priority list names a target that does not exist"; exit 1; }
+        run_one "$t" "--test $t" || silent=$((silent+1))
+    fi
+done
+echo "--- priority set done (blast radius); now the rest ---"
 for f in tests/*.rs; do
     t=$(basename "$f" .rs)
     run_one "$t" "--test $t" || silent=$((silent+1))
