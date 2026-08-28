@@ -542,6 +542,91 @@ fn a_key_whose_directory_is_gone_is_refused() {
     assert!(err.to_string().contains("gone"), "the error must name the path: {err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_symlink_cannot_launder_a_key_out_of_a_world_writable_directory() {
+    // **The best finding of this row's adversarial review, reproduced.** The mode check reads the
+    // OPEN DESCRIPTOR, so it sees the target's mode and is correct. The directory check read
+    // `path.parent()` — the *symlink's* parent — and never the directory the inode actually sits
+    // in. So a link in a 0700 directory pointing at a key in a 0777 one passed, and the whole
+    // directory rule was bypassed by naming the key differently.
+    //
+    // Driven to the end, because "the verdict is wrong" understates it: the consequence is that an
+    // attacker who can write to the target's directory renames their own key over it, the node
+    // reloads happily, and then verifies frames the ATTACKER signed. That is total compromise of
+    // this module's guarantee, reached without ever reading the operator's key.
+    let root = tempfile::tempdir().unwrap();
+    let open = root.path().join("open");
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&safe).unwrap();
+
+    let real = write_key_file(&open, "k", b"THE-OPERATORS-REAL-CLUSTER-KEY!!");
+    let link = safe.join("k");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    chmod(&open, 0o777);
+    chmod(&safe, 0o700);
+
+    // The direct path is refused, and that half always worked.
+    let direct = Key::load(&real).expect_err("a key in a 0777 directory is refused by name");
+    assert!(direct.to_string().contains("writable by group or other"), "{direct}");
+
+    // The link must reach the SAME verdict. Before the fix it returned `Ok`.
+    let through_link = Key::load(&link);
+    assert!(
+        through_link.is_err(),
+        "the same inode, in the same 0777 directory, loaded because it was named through a link \
+         in a 0700 one — the directory rule was bypassed by spelling"
+    );
+
+    // The anti-vacuity half: with the target's directory closed, the link loads. Otherwise this
+    // test would pass against an implementation that simply refused every symlink.
+    chmod(&open, 0o700);
+    let ok = Key::load(&link).expect("a link to a key in a protected directory is fine");
+    assert_eq!(ok.len(), 32);
+
+    // And the attack the rule exists to stop, shown to be a real substitution rather than a
+    // theoretical one: with the directory open, an attacker's rename replaces the key under the
+    // operator's configured path.
+    chmod(&open, 0o777);
+    let theirs = open.join(".theirs");
+    std::fs::write(&theirs, b"ATTACKER-CHOSEN-CLUSTER-KEY!!!!!").unwrap();
+    chmod(&theirs, 0o600);
+    std::fs::rename(&theirs, &real).unwrap();
+    assert!(
+        Key::load(&link).is_err(),
+        "after an attacker renamed their own key over the target, loading through the configured \
+         path must still refuse — otherwise the node signs and verifies with the attacker's key"
+    );
+    chmod(&open, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_whose_own_directory_is_open_is_also_refused() {
+    // The other direction of the same rule, and the reason both directories are checked rather
+    // than just the resolved one: whoever can write to the LINK's directory can repoint the link
+    // at a key they chose, without ever touching the target's directory.
+    let root = tempfile::tempdir().unwrap();
+    let target_dir = root.path().join("target");
+    let link_dir = root.path().join("links");
+    std::fs::create_dir(&target_dir).unwrap();
+    std::fs::create_dir(&link_dir).unwrap();
+
+    let real = write_key_file(&target_dir, "k", &key_bytes(52));
+    let link = link_dir.join("k");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    chmod(&target_dir, 0o700);
+
+    chmod(&link_dir, 0o700);
+    Key::load(&link).expect("both directories closed: fine");
+
+    chmod(&link_dir, 0o777);
+    let err = Key::load(&link).expect_err("a repointable link is a replaceable key");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    chmod(&link_dir, 0o700);
+}
+
 #[test]
 fn the_platform_that_cannot_read_its_own_file_protection_refuses_rather_than_allowing() {
     // **Both arms of the Windows rule, run on every platform.** `accept_unverifiable` carries no
