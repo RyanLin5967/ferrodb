@@ -22,6 +22,10 @@
 //! in-memory pieces here without the SQL layer changing.
 
 pub mod changeset;
+/// F9 — agent isolation on a cluster: what reaches quorum, what stays node-local, and the
+/// ordering rule that decides whether a merge's gate verdict is still worth anything. Declared
+/// here because a module `mod.rs` does not name is not compiled at all.
+pub mod cluster;
 pub mod dispatch;
 pub mod escrow;
 pub mod gate;
