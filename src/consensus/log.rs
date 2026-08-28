@@ -1134,21 +1134,31 @@ fn read_config(bytes: &[u8], at: &mut usize) -> Result<Config, LogError> {
     Ok(Config::new(members, version, term).with_learners(learners))
 }
 
+/// A length-prefixed list of node ids.
+///
+/// **The claimed count never reaches an allocator.** `Vec::with_capacity(n)` on an `n` that came
+/// off a disk or a socket is a seventeen-gigabyte allocation triggered by four bad bytes, and a
+/// check placed *beside* such a call is a check somebody can delete without any test noticing —
+/// measured: a mutant that removed exactly that check survived the whole suite, because both
+/// versions still returned an error and no assertion can see how much memory was reserved on the
+/// way. So the bound is the **slice**: the bytes are proven present first, and the vector's
+/// capacity is then a function of a slice that exists rather than of a number a peer chose.
 fn read_ids(bytes: &[u8], at: &mut usize) -> Result<Vec<NodeId>, LogError> {
     let n = take_u32(bytes, at)? as usize;
-    // Four bytes each: a claimed count that cannot fit in what is left is corrupt, and checking it
-    // before reserving is what stops a bad length from being an allocation request.
-    if at.saturating_add(n.saturating_mul(4)) > bytes.len() {
-        return Err(LogError::Corrupt(format!(
-            "a node list claims {n} entries but only {} bytes remain",
+    let want = n.checked_mul(4).ok_or_else(|| {
+        LogError::Corrupt(format!("a node list claims {n} entries, which cannot be a byte count"))
+    })?;
+    let slice = bytes.get(*at..at.saturating_add(want)).ok_or_else(|| {
+        LogError::Corrupt(format!(
+            "a node list claims {n} entries ({want} bytes) but only {} bytes remain",
             bytes.len().saturating_sub(*at)
-        )));
-    }
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push(NodeId(take_u32(bytes, at)?));
-    }
-    Ok(out)
+        ))
+    })?;
+    *at += want;
+    Ok(slice
+        .chunks_exact(4)
+        .map(|c| NodeId(u32::from_be_bytes(c.try_into().unwrap())))
+        .collect())
 }
 
 fn take_bytes(bytes: &[u8], at: &mut usize, n: usize) -> Result<Vec<u8>, LogError> {

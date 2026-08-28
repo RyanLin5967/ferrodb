@@ -1,0 +1,74 @@
+KILLED           contiguity check removed from append
+                 -> assertion `left == right` failed: the log accepted round 2 as its first round, which is a hole nothing later can see | left: Ok(()) | right: Err(NonContiguous { expected: 1, got: 2 })
+KILLED           batch validated as it writes, not before
+                 -> assertion `left == right` failed: a refused batch moved the log's end | left: 4 | right: 3
+KILLED           term-goes-backwards check removed from append
+                 -> assertion `left == right` failed: a term went backwards along the log, which means a stale frame was accepted as a new one | left: Ok(()) | right: Err(TermWentBackwards { last: 5, got: 4 })
+KILLED           crc32 check removed from the recovery scan
+                 -> assertion `left == right` failed: the scan trusted a frame whose crc32 does not hold | left: 6 | right: 5
+KILLED           round-equals-position check removed from the scan
+                 -> assertion `left == right` failed: the scan walked past a frame claiming round 9 where round 3 belongs, so a hole in this log is not visible by arithmetic after all | left: 5 | right: 2
+KILLED           term-monotonic check removed from the scan
+                 -> assertion `left == right` failed: the scan accepted a frame whose term went backwards | left: 3 | right: 2
+KILLED           frame length bound removed from the scan
+                 -> thread 'consensus::log::tests_log::a_frame_length_that_runs_past_the_file_ends_the_scan_without_allocating_for_it' (15643958) panicked at src/consensus/tests_log.rs:236:34:
+KILLED           snapshot floor check removed from every read
+                 -> thread 'consensus::log::tests_log::a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor' (15649768) panicked at src/consensus/log.rs:790:24:
+KILLED           truncate_from skips the floor check
+                 -> thread 'consensus::log::tests_log::a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor' (15655565) panicked at src/consensus/log.rs:647:19:
+KILLED           checkpoint writes its header before syncing the data it describes
+                 -> thread 'consensus::log::tests_log::a_checkpoint_syncs_its_data_before_it_writes_the_header_that_makes_it_live' (15663493) panicked at src/consensus/tests_log.rs:571:5:
+KILLED           checkpoint rewrites the live file instead of the spare
+                 -> thread 'consensus::log::tests_log::a_crash_at_any_point_during_a_checkpoint_loses_nothing' (15684778) panicked at src/consensus/tests_log.rs:589:30:
+KILLED           checkpoint accepts a term that disagrees with the log
+                 -> assertion `left == right` failed | left: Ok(()) | right: Err(TermMismatch { round: 3, held: 4, claimed: 9 })
+KILLED           append advances the durable frontier without an fsync
+                 -> assertion `left == right` failed: an append moved the durable frontier without an fsync | left: 10 | right: 5
+KILLED           the zero terminator is not written after a batch
+                 -> assertion `left == right` failed: the scan walked past the terminator and resurrected rounds that had been truncated away | left: 2 | right: 3
+KILLED           an unreadable header reinitializes over the entries
+                 -> thread 'consensus::log::tests_log::a_live_header_that_cannot_be_read_is_refused_rather_than_reinitialized_over' (15708808) panicked at src/consensus/tests_log.rs:667:18:
+KILLED           two files at one generation are guessed between
+                 -> thread 'consensus::log::tests_log::two_files_claiming_one_generation_are_refused' (15721064) panicked at src/consensus/tests_log.rs:692:18:
+KILLED           a newer on-disk format version is accepted
+                 -> thread 'consensus::log::tests_log::a_log_written_at_a_newer_format_version_is_refused_rather_than_reinitialized' (15730660) panicked at src/consensus/tests_log.rs:712:18:
+KILLED           the entry size limit is removed
+                 -> thread 'consensus::log::tests_log::an_entry_too_large_for_the_transport_is_refused_at_append' (15737353) panicked at src/consensus/tests_log.rs:1000:18:
+KILLED           the command decoder accepts trailing bytes
+                 -> thread 'consensus::log::tests_log::the_command_decoder_refuses_trailing_bytes' (15742716) panicked at src/consensus/tests_log.rs:874:5:
+SURVIVED         a node list is allocated for before it is bounded
+KILLED           the Timestamp column tag drifts from the wal's
+                 -> assertion `left == right` failed: this module gives Timestamp tag 7 and the wal gives it 6 | left: 7 | right: 6
+KILLED           a frame is served without checking the position the index claims
+                 -> thread 'consensus::log::tests_log::a_frame_is_cross_checked_against_the_position_the_index_says_it_holds' (15811309) panicked at src/consensus/tests_log.rs:750:5:
+KILLED           a failed truncation is reported without poisoning the log
+                 -> thread 'consensus::log::tests_log::a_truncation_that_cannot_be_made_durable_poisons_the_log' (15861726) panicked at src/consensus/tests_log.rs:474:5:
+KILLED           a range may return nothing when one entry blows the budget
+                 -> assertion `left == right` failed | left: 0 | right: 1
+
+KILLED           contiguity check removed from append  [rounds_are_contiguous_from_one_and_an_append_that_would_leave_a_hole_is_refused]
+KILLED           batch validated as it writes, not before  [a_refused_batch_leaves_the_log_exactly_as_it_was]
+KILLED           term-goes-backwards check removed from append  [terms_never_decrease_along_the_log]
+KILLED           crc32 check removed from the recovery scan  [a_torn_tail_is_trimmed_and_everything_before_it_survives]
+KILLED           round-equals-position check removed from the scan  [a_frame_whose_round_does_not_match_its_position_ends_the_scan]
+KILLED           term-monotonic check removed from the scan  [a_frame_whose_term_goes_backwards_ends_the_scan]
+KILLED           frame length bound removed from the scan  [a_frame_length_that_runs_past_the_file_ends_the_scan_without_allocating_for_it]
+KILLED           snapshot floor check removed from every read  [a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor]
+KILLED           truncate_from skips the floor check  [a_read_below_the_snapshot_floor_refuses_with_compacted_and_names_the_floor]
+KILLED           checkpoint writes its header before syncing the data it describes  [a_checkpoint_syncs_its_data_before_it_writes_the_header_that_makes_it_live]
+KILLED           checkpoint rewrites the live file instead of the spare  [a_crash_at_any_point_during_a_checkpoint_loses_nothing]
+KILLED           checkpoint accepts a term that disagrees with the log  [a_checkpoint_whose_term_disagrees_with_the_log_is_refused]
+KILLED           append advances the durable frontier without an fsync  [writes_that_were_never_synced_do_not_survive_a_crash]
+KILLED           the zero terminator is not written after a batch  [a_zero_terminator_stops_the_scan_before_a_frame_left_over_from_an_earlier_life]
+KILLED           an unreadable header reinitializes over the entries  [a_live_header_that_cannot_be_read_is_refused_rather_than_reinitialized_over]
+KILLED           two files at one generation are guessed between  [two_files_claiming_one_generation_are_refused]
+KILLED           a newer on-disk format version is accepted  [a_log_written_at_a_newer_format_version_is_refused_rather_than_reinitialized]
+KILLED           the entry size limit is removed  [an_entry_too_large_for_the_transport_is_refused_at_append]
+KILLED           the command decoder accepts trailing bytes  [the_command_decoder_refuses_trailing_bytes]
+SURVIVED         a node list is allocated for before it is bounded  [a_node_list_claiming_more_entries_than_the_record_holds_is_refused_before_it_is_allocated_for]
+KILLED           the Timestamp column tag drifts from the wal's  [the_column_type_tags_agree_with_the_wals]
+KILLED           a frame is served without checking the position the index claims  [a_frame_is_cross_checked_against_the_position_the_index_says_it_holds]
+KILLED           a failed truncation is reported without poisoning the log  [a_truncation_that_cannot_be_made_durable_poisons_the_log]
+KILLED           a range may return nothing when one entry blows the budget  [a_range_is_bounded_by_both_limits_and_still_returns_one_entry_when_it_must]
+
+23/24 mutants killed

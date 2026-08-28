@@ -896,13 +896,37 @@ fn the_command_decoder_refuses_a_truncated_record_rather_than_panicking() {
 }
 
 #[test]
-fn a_node_list_claiming_more_entries_than_the_record_holds_is_refused_before_it_is_allocated_for() {
+fn a_node_list_claiming_more_entries_than_the_record_holds_is_refused_rather_than_allocated_for() {
+    // Stated blind spot, because it is what shaped the code: no assertion available here can see
+    // how much memory a decoder reserved on its way to an error. A mutant that deleted a
+    // `Vec::with_capacity` bound placed beside the loop SURVIVED this test for exactly that reason.
+    // The remedy was structural rather than a stronger assertion -- `read_ids` now proves the bytes
+    // are present and takes its capacity from that slice, so there is no separable check to delete.
+    // What this test can prove is the refusal, and that it is the *node list* that refused rather
+    // than some later field tripping over the same bad bytes.
     let mut buf = Vec::new();
     buf.push(7); // Membership
     buf.extend_from_slice(&1u64.to_be_bytes()); // version
     buf.extend_from_slice(&1u64.to_be_bytes()); // term
     buf.extend_from_slice(&u32::MAX.to_be_bytes()); // four billion members
-    assert!(matches!(decode_command(&buf), Err(LogError::Corrupt(_))));
+    match decode_command(&buf) {
+        Err(LogError::Corrupt(m)) => assert!(m.contains("node list"), "unexpected refusal: {m}"),
+        other => panic!("a node list claiming four billion entries decoded as {other:?}"),
+    }
+
+    // And a list one entry longer than the bytes behind it, which is the realistic shape of the
+    // same fault: a record that ends mid-field.
+    let mut short = Vec::new();
+    short.push(7);
+    short.extend_from_slice(&1u64.to_be_bytes());
+    short.extend_from_slice(&1u64.to_be_bytes());
+    short.extend_from_slice(&3u32.to_be_bytes());
+    short.extend_from_slice(&1u32.to_be_bytes());
+    short.extend_from_slice(&2u32.to_be_bytes());
+    match decode_command(&short) {
+        Err(LogError::Corrupt(m)) => assert!(m.contains("node list"), "unexpected refusal: {m}"),
+        other => panic!("a node list that runs past its record decoded as {other:?}"),
+    }
 }
 
 #[test]
