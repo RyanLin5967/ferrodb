@@ -1128,7 +1128,9 @@ fn the_log_opens_on_real_files_and_recovers_from_them() {
     assert_eq!(reopened.last_round(), 9);
     assert_eq!(reopened.entry(9).unwrap(), entry(6, 9));
     assert_eq!(reopened.entry(2).unwrap_err(), LogError::Compacted { asked: 2, floor: 4 });
-    assert!(base.with_extension("rounds.a").exists() || dir.path().join("cluster.rounds.a").exists());
+    // Both sides of the switch exist on the filesystem, named as the production path names them.
+    assert!(dir.path().join("cluster.rounds.a").exists(), "the first log file was not created");
+    assert!(dir.path().join("cluster.rounds.b").exists(), "the second log file was not created");
 }
 
 #[test]

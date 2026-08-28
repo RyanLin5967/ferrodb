@@ -9,6 +9,7 @@ test suite, not a success.
 Run from the worktree root:  python3 scratchpad/f0b-mutants.py
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -98,8 +99,21 @@ MUTANTS = [
         "writes_that_were_never_synced_do_not_survive_a_crash",
     ),
     (
+        # The rule has two halves and one mutant cannot see both: `append` must WRITE the terminator,
+        # and the scan must STOP at it. This mutant is the writing half. It was originally aimed at
+        # the scanning test and SURVIVED, because that test hand-builds its image and never calls
+        # `write_batch` for the bytes it asserts on.
         "the zero terminator is not written after a batch",
         [(SRC, "        buf.extend_from_slice(bytes);\n        buf.extend_from_slice(&[0u8; 4]);", "        buf.extend_from_slice(bytes);")],
+        "an_append_leaves_a_zero_terminator_on_the_disk",
+    ),
+    (
+        # The scanning half: a zero length is below MIN_FRAME, and that clause is the only thing
+        # that makes a terminator mean anything.
+        "the scan does not stop at a zero-length frame",
+        [(SRC,
+          "        if total < MIN_FRAME || total > MAX_FRAME || offset + total as u64 > file_len {",
+          "        if total > MAX_FRAME || offset + total as u64 > file_len {")],
         "a_zero_terminator_stops_the_scan_before_a_frame_left_over_from_an_earlier_life",
     ),
     (
@@ -253,6 +267,26 @@ MUTANTS = [
 ]
 
 
+LEDGER = Path("scratchpad/f0b-mutants.jsonl")
+
+
+def already_done():
+    if not LEDGER.exists():
+        return {}
+    out = {}
+    for line in LEDGER.read_text().splitlines():
+        if line.strip():
+            r = json.loads(line)
+            out[r["name"]] = r
+    return out
+
+
+def record(name, test, verdict, line):
+    with LEDGER.open("a") as f:
+        f.write(json.dumps({"name": name, "test": test, "verdict": verdict, "evidence": line}) + "\n")
+        f.flush()
+
+
 def run(test):
     p = subprocess.run(
         ["cargo", "test", "--lib", f"consensus::log::tests_log::{test}", "--", "--exact"],
@@ -265,14 +299,20 @@ def run(test):
 
 def main():
     originals = {f: f.read_text() for f in {SRC, TESTS}}
-    results = []
+    done = already_done()
+    results = [(r["name"], r["test"], r["verdict"], r["evidence"]) for r in done.values()]
+    if done:
+        print(f"resuming: {len(done)} mutants already recorded in {LEDGER}")
     try:
         for name, patches, test in MUTANTS:
+            if name in done:
+                continue
             for f, old, new in patches:
                 text = f.read_text()
                 if text.count(old) != 1:
                     print(f"!! mutant '{name}': anchor found {text.count(old)} times, skipping")
                     results.append((name, test, "ANCHOR-MISSING", ""))
+                    record(name, test, "ANCHOR-MISSING", "")
                     break
                 f.write_text(text.replace(old, new))
             else:
@@ -297,6 +337,7 @@ def main():
                     verdict = "SURVIVED"
                     line = ""
                 results.append((name, test, verdict, line))
+                record(name, test, verdict, line)
                 print(f"{verdict:16} {name}")
                 if line:
                     print(f"                 -> {line[:400]}")

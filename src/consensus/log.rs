@@ -472,6 +472,17 @@ impl RoundLog {
         // Trim whatever the scan refused to trust, exactly as `WalManager::with_storage` does. The
         // frames are already unreachable — the scan stops at them — so this reclaims space and
         // keeps the file's length equal to the log's length, which every later append relies on.
+        //
+        // **This deletes intact frames above a hole, and that is the right answer rather than a
+        // regrettable one.** The scan cannot tell a torn tail from damage in the middle of a log
+        // that was fully durable, so this same line can discard rounds that were acknowledged. A
+        // Raft log is contiguous: a node holding rounds 51..=100 above a damaged round 50 cannot
+        // serve any of them, cannot fill the hole locally, and cannot be believed about its own
+        // `last_round` — so keeping them buys nothing and costs the guarantee that the index and the
+        // file agree. The rounds are not lost to the *cluster*: they were committed only if a quorum
+        // held them, and the leader re-sends the suffix to a follower that comes back short, which
+        // is the ordinary path this log is built for. Refusing to open instead would take a node
+        // down over damage its peers can repair in one `Append`.
         if scan.end_offset < lens[live] {
             files[live].set_len(scan.end_offset).map_err(io)?;
             files[live].sync_all().map_err(io)?;
@@ -712,7 +723,9 @@ impl RoundLog {
 
         let file = Arc::clone(&self.files[self.live]);
         if let Err(e) = file.set_len(new_end).and_then(|()| file.sync_all()) {
-            return Err(LogError::Io(format!("{e}")));
+            let why = format!("a truncation to round {} could not be made durable: {e}", from - 1);
+            self.poisoned = Some(why.clone());
+            return Err(LogError::Poisoned(why));
         }
         Ok(())
     }
