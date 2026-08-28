@@ -341,11 +341,15 @@ impl Statement {
                         let n = rows.len();
                         RunResult { rows, tag: Some(format!("SELECT {n}")) }
                     }
-                    Outcome::Agent(a) => RunResult {
-                        // Debug rather than Display on purpose: the structured form names the
-                        // branch and the run, which is what a client of an agent session needs.
-                        rows: vec![vec![Value::Varchar(format!("{a:?}"))]],
-                        tag: Some("SELECT 1".into()),
+                    // Typed columns, from the same `to_rows` whose shape `describe_stmt`
+                    // announced. This was `format!("{a:?}")` — a Debug literal in a single text
+                    // column, carrying a comment defending it as deliberate. It was deliberate, and
+                    // it was the only option while the field list had to be known before the
+                    // statement ran; it is not any more.
+                    Outcome::Agent(a) => {
+                        let t = a.to_rows();
+                        let n = t.rows.len();
+                        RunResult { rows: t.rows, tag: Some(format!("SELECT {n}")) }
                     },
                     Outcome::Ok => RunResult { rows: Vec::new(), tag: Some(verb.to_string()) },
                 })
@@ -477,11 +481,22 @@ fn describe_stmt(stmt: &Stmt, catalog: &Catalog) -> Result<Option<Vec<Field>>, F
             }
         }
         Stmt::Explain(_) => Ok(Some(vec![Field::text("QUERY PLAN", oid::TEXT)])),
+        // The agent statements. This announced ONE `text` column called `agent`, and the executor
+        // duly sent one column holding `format!("{a:?}")` — a Rust Debug literal on the wire, which
+        // a client can only re-parse by hand. B9 built `to_rows` to fix exactly that and could not
+        // reach here, because B12 computes fields at PARSE time and B9's shape looked unknowable
+        // until the statement ran.
+        //
+        // It is knowable: a statement kind determines its `AgentOutput` variant, and a variant's
+        // columns depend only on the variant. `columns_for_stmt` reads the SAME per-variant lists
+        // `to_rows` builds from, so what is announced here and what the executor sends cannot drift
+        // — which this server checks, refusing a described/produced contradiction outright.
         Stmt::BeginAgentSession { .. }
         | Stmt::Diff { .. }
         | Stmt::Merge { .. }
         | Stmt::Abandon { .. }
-        | Stmt::RevertMerge { .. } => Ok(Some(vec![Field::text("agent", oid::TEXT)])),
+        | Stmt::RevertMerge { .. } => Ok(crate::agent_sql::dispatch::columns_for_stmt(stmt)
+            .map(fields_of)),
         _ => Ok(None),
     }
 }

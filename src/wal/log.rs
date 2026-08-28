@@ -5,7 +5,6 @@ use crate::{
     catalog::column::DataType,
     error::FerroError,
     provenance::{ProvId, RunEntity},
-    storage::disk_manager::{pread, pwrite},
     storage::storage::Storage,
 };
 

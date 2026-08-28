@@ -91,6 +91,96 @@ fn text(v: impl Into<String>) -> Value {
     Value::Varchar(v.into())
 }
 
+/// The column list each [`AgentOutput`] variant produces, as data.
+///
+/// **Why these are functions and not literals inside `to_rows`.** pgwire's extended protocol lets a
+/// client `Describe` a statement before it `Execute`s it, so the field list has to be answerable at
+/// PARSE time — and this server refuses outright if it described a statement one way and then
+/// produced rows another. `to_rows` and `columns_for_stmt` therefore MUST agree, and the only way to
+/// guarantee that is for both to read the same list rather than two copies that stay in step by
+/// discipline. The same reasoning produced `system_views::describe_select`.
+fn session_started_columns() -> Vec<BoundColumn> {
+    let q = "session";
+    vec![
+        col(q, "branch_id", DataType::BigInt, false),
+        col(q, "generation", DataType::Integer, false),
+        col(q, "branch_name", DataType::Varchar(32), false),
+        col(q, "agent_id", DataType::Varchar(64), false),
+        col(q, "run_id", DataType::Varchar(64), false),
+        col(q, "prov_id", DataType::Integer, false),
+        col(q, "txn_id", DataType::BigInt, false),
+    ]
+}
+
+fn diff_columns() -> Vec<BoundColumn> {
+    let q = "diff";
+    vec![
+        col(q, "from_branch", DataType::Varchar(32), false),
+        col(q, "into_branch", DataType::Varchar(32), false),
+        col(q, "table_name", DataType::Varchar(64), false),
+        col(q, "row_id", DataType::Decimal, false),
+        col(q, "change", DataType::Varchar(8), false),
+        col(q, "outcome", DataType::Varchar(32), false),
+        col(q, "ops", DataType::Integer, false),
+        col(q, "op_kinds", DataType::Varchar(128), true),
+        col(q, "guards", DataType::Integer, false),
+        col(q, "guard_predicates", DataType::Varchar(512), true),
+    ]
+}
+
+fn merge_columns() -> Vec<BoundColumn> {
+    let q = "merge";
+    vec![
+        col(q, "merge_id", DataType::Varchar(16), false),
+        col(q, "from_branch", DataType::Varchar(32), false),
+        col(q, "into_branch", DataType::Varchar(32), false),
+        col(q, "outcome", DataType::Varchar(24), false),
+        col(q, "applied_to_target", DataType::Boolean, false),
+        col(q, "blind_writes", DataType::Integer, false),
+        // NULL on the summary-only row: a merge with no per-row outcomes still has a
+        // verdict, and the verdict is what the columns above carry.
+        col(q, "table_name", DataType::Varchar(64), true),
+        col(q, "row_id", DataType::Decimal, true),
+        col(q, "row_outcome", DataType::Varchar(24), true),
+        col(q, "violated_predicate", DataType::Varchar(512), true),
+    ]
+}
+
+fn abandoned_columns() -> Vec<BoundColumn> {
+    vec![col("abandon", "branch", DataType::Varchar(32), false)]
+}
+
+fn revert_columns() -> Vec<BoundColumn> {
+    let q = "revert";
+    vec![
+        col(q, "target_txn", DataType::BigInt, false),
+        col(q, "mode", DataType::Varchar(8), false),
+        // The load-bearing column. `Halt` with dependents changed NOTHING, and a
+        // client that could not tell that apart from a completed revert would report
+        // work as undone that is still there.
+        col(q, "blocked", DataType::Boolean, false),
+        col(q, "blocked_by", DataType::Varchar(256), true),
+        col(q, "cascaded", DataType::Varchar(256), true),
+    ]
+}
+
+/// The columns the result of `stmt` will have, **without running it**.
+///
+/// The shape looks unknowable at parse time and is not: a statement kind determines its
+/// [`AgentOutput`] variant — `Stmt::Merge` always yields `AgentOutput::Merge` — and a variant's
+/// columns depend only on the variant, never on the data. `None` for anything else, including DML
+/// inside an agent session, whose `Affected` shape this does not claim to know.
+pub fn columns_for_stmt(stmt: &Stmt) -> Option<Vec<BoundColumn>> {
+    match stmt {
+        Stmt::BeginAgentSession { .. } => Some(session_started_columns()),
+        Stmt::Diff { .. } => Some(diff_columns()),
+        Stmt::Merge { .. } => Some(merge_columns()),
+        Stmt::Abandon { .. } => Some(abandoned_columns()),
+        Stmt::RevertMerge { .. } => Some(revert_columns()),
+        _ => None,
+    }
+}
+
 impl AgentOutput {
     /// The typed form of an agent statement's result: named, declared columns and rows.
     ///
@@ -117,17 +207,8 @@ impl AgentOutput {
     pub fn to_rows(&self) -> NamedRows {
         match self {
             AgentOutput::SessionStarted(s) => {
-                let q = "session";
                 NamedRows::new(
-                    vec![
-                        col(q, "branch_id", DataType::BigInt, false),
-                        col(q, "generation", DataType::Integer, false),
-                        col(q, "branch_name", DataType::Varchar(32), false),
-                        col(q, "agent_id", DataType::Varchar(64), false),
-                        col(q, "run_id", DataType::Varchar(64), false),
-                        col(q, "prov_id", DataType::Integer, false),
-                        col(q, "txn_id", DataType::BigInt, false),
-                    ],
+                    session_started_columns(),
                     vec![vec![
                         Value::BigInt(s.branch.id as i64),
                         Value::Integer(s.branch.generation as i32),
@@ -140,19 +221,7 @@ impl AgentOutput {
                 )
             }
             AgentOutput::Diff(d) => {
-                let q = "diff";
-                let columns = vec![
-                    col(q, "from_branch", DataType::Varchar(32), false),
-                    col(q, "into_branch", DataType::Varchar(32), false),
-                    col(q, "table_name", DataType::Varchar(64), false),
-                    col(q, "row_id", DataType::Decimal, false),
-                    col(q, "change", DataType::Varchar(8), false),
-                    col(q, "outcome", DataType::Varchar(32), false),
-                    col(q, "ops", DataType::Integer, false),
-                    col(q, "op_kinds", DataType::Varchar(128), true),
-                    col(q, "guards", DataType::Integer, false),
-                    col(q, "guard_predicates", DataType::Varchar(512), true),
-                ];
+                let columns = diff_columns();
                 let rows = d
                     .rows
                     .iter()
@@ -177,21 +246,7 @@ impl AgentOutput {
                 NamedRows::new(columns, rows)
             }
             AgentOutput::Merge(m) => {
-                let q = "merge";
-                let columns = vec![
-                    col(q, "merge_id", DataType::Varchar(16), false),
-                    col(q, "from_branch", DataType::Varchar(32), false),
-                    col(q, "into_branch", DataType::Varchar(32), false),
-                    col(q, "outcome", DataType::Varchar(24), false),
-                    col(q, "applied_to_target", DataType::Boolean, false),
-                    col(q, "blind_writes", DataType::Integer, false),
-                    // NULL on the summary-only row: a merge with no per-row outcomes still has a
-                    // verdict, and the verdict is what the columns above carry.
-                    col(q, "table_name", DataType::Varchar(64), true),
-                    col(q, "row_id", DataType::Decimal, true),
-                    col(q, "row_outcome", DataType::Varchar(24), true),
-                    col(q, "violated_predicate", DataType::Varchar(512), true),
-                ];
+                let columns = merge_columns();
                 let head = |extra: Vec<Value>| {
                     let mut v = vec![
                         text(m.merge_id.clone()),
@@ -223,11 +278,10 @@ impl AgentOutput {
                 NamedRows::new(columns, rows)
             }
             AgentOutput::Abandoned { branch } => NamedRows::new(
-                vec![col("abandon", "branch", DataType::Varchar(32), false)],
+                abandoned_columns(),
                 vec![vec![text(branch.clone())]],
             ),
             AgentOutput::Revert(p) => {
-                let q = "revert";
                 let ids = |v: &[crate::tel::ids::TxnId]| {
                     if v.is_empty() {
                         Value::Null
@@ -236,16 +290,7 @@ impl AgentOutput {
                     }
                 };
                 NamedRows::new(
-                    vec![
-                        col(q, "target_txn", DataType::BigInt, false),
-                        col(q, "mode", DataType::Varchar(8), false),
-                        // The load-bearing column. `Halt` with dependents changed NOTHING, and a
-                        // client that could not tell that apart from a completed revert would report
-                        // work as undone that is still there.
-                        col(q, "blocked", DataType::Boolean, false),
-                        col(q, "blocked_by", DataType::Varchar(256), true),
-                        col(q, "cascaded", DataType::Varchar(256), true),
-                    ],
+                    revert_columns(),
                     vec![vec![
                         Value::BigInt(p.target.0 as i64),
                         text(match p.mode {

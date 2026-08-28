@@ -344,7 +344,29 @@ fn run_simple(
         // Text format throughout: the simple query protocol has no way to ask for anything else.
         let fields = stmt.describe_rows();
         let mut result = stmt.execute(conn, ctx, &[])?;
-        if let Some(fields) = fields {
+        if let Some(mut fields) = fields {
+            // **A computed column's type comes from the value, and only the simple protocol may do
+            // this.** `bind_projection` types `SELECT branch_id = 9999` with the binder's `Integer`
+            // placeholder while the value is a BOOLEAN, so `fields_of` refuses to announce the
+            // placeholder and says `text` instead — a promise it can always keep, because every
+            // value has a text form.
+            //
+            // Here it can do better. The simple query protocol has no `Describe`, so this
+            // `RowDescription` is built AFTER the statement ran and a real value is in hand. The
+            // extended path cannot: it must answer `Describe` before any row exists, so `text`
+            // remains the honest answer there and this deliberately does not touch it.
+            //
+            // Only the placeholder is upgraded. A column whose declared type the binder actually
+            // worked out keeps it, so this cannot silently re-type a real column from one row.
+            if let Some(first) = result.rows.first() {
+                for (i, f) in fields.iter_mut().enumerate() {
+                    if f.name == "?column?" && f.type_oid == types::oid::TEXT {
+                        if let Some(v) = first.get(i) {
+                            f.type_oid = types::oid_of(v);
+                        }
+                    }
+                }
+            }
             out.push(Message::RowDescription(fields.clone()));
             for row in result.rows.drain(..) {
                 out.push(extended::encode_row(&row, &fields)?);
