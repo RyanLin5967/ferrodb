@@ -854,6 +854,13 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
     );
     assert!(t.heals > 0, "the network never healed, so nothing could make progress: {t:?}");
     assert!(
+        t.forgotten_votes > 0,
+        "no crash ever destroyed a vote that had been written and not yet fsynced. That is the \
+         stated breaking shape of 'at most one leader per term' -- a node votes, crashes, forgets, \
+         and votes again -- so without it the headline sweep asserts a property over runs in which \
+         the only way to break it never happened: {t:?}"
+    );
+    assert!(
         t.unsent_at_crash > 0,
         "no crash ever destroyed a message that was still waiting behind an fsync, so the ordering \
          the contract requires of a caller was never actually enforced: {t:?}"
@@ -1699,23 +1706,50 @@ fn the_real_consensus_state_machine_runs_under_this_simulator_the_moment_f1_and_
 /// forgotten a vote it had never durably cast and completed a second. Delivering that message is
 /// modelling a disk that reports a write it did not keep, and no consensus protocol survives one.
 ///
-/// The seed is pinned rather than described: it is the only thing that proves the repair holds.
+/// The scenario is **scripted rather than pinned to that seed**, and the reason is worth stating: a
+/// seed is a reproducer for one fault model, and the fault model has since changed — twice — so the
+/// seed stopped producing the scenario while still passing. The script sets up the condition by
+/// observation instead, so it cannot drift.
 #[test]
 fn a_send_still_waiting_on_its_fsync_does_not_survive_the_crash() {
-    let r = Sim::<Correct>::replay(1_592_682_576, chaos_cfg()).unwrap_or_else(|v| {
-        panic!(
-            "the seed that exposed the unsound crash model is failing again. If the rule below \
-             still holds, this is a real protocol defect; if it does not, the simulator has gone \
-             back to letting a crashed node speak.\n{v}"
-        )
-    });
-    assert_eq!(
-        r.unsent_at_crash, 1,
-        "seed 1592682576 is supposed to crash a node with exactly one message queued behind an \
-         unfinished fsync; it destroyed {} instead, so this is no longer the scenario it pins: {r:?}",
-        r.unsent_at_crash
-    );
+    let mut sim = Sim::<Correct>::new(11, scripted());
+    let l = wait_for_leader(&mut sim, 80).unwrap().expect("fixture: nobody was elected");
+    // Depose the leader so the cluster casts votes; a granted vote is a `PersistHardState`
+    // immediately followed by a `Send`, which is exactly the window this rule is about.
+    sim.isolate(l);
 
+    let mut victim = None;
+    for _ in 0..(200 * UNITS_PER_TICK) {
+        // Reaching into the private wire on purpose: the question is whether a message that has
+        // NOT been released can survive, and "released" is not observable from outside.
+        let now = sim.now();
+        if let Some(w) = sim.wire.values().find(|w| w.released > now && w.msg.from != l) {
+            victim = Some(w.msg.from);
+            break;
+        }
+        sim.run_units(1).expect("no violation while merely waiting for the window");
+    }
+    let victim = victim.expect(
+        "fixture: no node ever had a message queued behind an unfinished fsync, so this rule was \
+         never in a position to be broken",
+    );
+    let queued = sim.wire.values().filter(|w| w.msg.from == victim && w.released > sim.now()).count();
+    sim.crash(victim);
+    assert_eq!(
+        sim.report().unsent_at_crash,
+        queued as u64,
+        "{victim} crashed with {queued} message(s) still behind an unfinished fsync and the \
+         simulator kept {} of them on the wire. A message that has not been released has not left \
+         the machine, and delivering it models a disk that reports a write it did not keep.",
+        queued as u64 - sim.report().unsent_at_crash
+    );
+    assert!(
+        !sim.wire.values().any(|w| w.msg.from == victim && w.released > sim.now()),
+        "a crashed node still has unreleased messages on the wire"
+    );
+    sim.run_ticks(120).expect("the cluster must recover without a violation");
+
+    // And the model reaches this state on its own often enough for the sweeps to be testing it.
     let s = sweep::<Correct>(SEED_SAFETY, 400, &chaos_cfg());
     expect_quiet(&s, "the crash model");
     assert!(

@@ -465,6 +465,13 @@ pub struct Report {
     /// not left the machine. See [`Sim::crash`] — a simulator that delivered these reports two
     /// leaders in one term against a protocol that did nothing wrong.
     pub unsent_at_crash: u64,
+    /// Crashes that destroyed a `(term, voted_for)` that had been written and not yet fsynced.
+    ///
+    /// This is the **stated breaking shape of the headline detector**: `mod.rs` says a node that
+    /// votes, crashes and forgets the vote can vote twice in one term. If this is zero, that
+    /// scenario never happened and "at most one leader per term" was asserted over runs in which
+    /// the only way to break it was never reached — so it is asserted on, not merely reported.
+    pub forgotten_votes: u64,
     /// Transitions into [`Role::Leader`].
     pub elections: u64,
     pub proposals: u64,
@@ -497,6 +504,7 @@ impl Report {
         self.heals += other.heals;
         self.discarded_entries += other.discarded_entries;
         self.unsent_at_crash += other.unsent_at_crash;
+        self.forgotten_votes += other.forgotten_votes;
         self.elections += other.elections;
         self.proposals += other.proposals;
         self.refusals += other.refusals;
@@ -531,6 +539,11 @@ pub struct Sweep {
 struct Flush {
     at: u64,
     /// Log length this flush makes durable.
+    ///
+    /// Clamped by any truncation that happens before it lands: an fsync covers the **bytes that
+    /// were there when it was issued**, and a log that has since been truncated and re-grown holds
+    /// different entries at those positions. Crediting the new ones is the same lying fsync this
+    /// file has now been caught modelling three times — see [`Sim::crash`] for the first.
     len: usize,
     hard: Option<HardState>,
 }
@@ -628,8 +641,7 @@ impl Store {
                 if let Some(v) = self.would_drop_committed(idx, committed) {
                     return Err(v);
                 }
-                self.log.truncate(idx);
-                self.durable_len = self.durable_len.min(idx);
+                self.truncate_to(idx);
             }
             self.log.push(e.clone());
         }
@@ -648,9 +660,26 @@ impl Store {
         if let Some(v) = self.would_drop_committed(idx, committed) {
             return Err(v);
         }
-        self.log.truncate(idx);
-        self.durable_len = self.durable_len.min(idx);
+        self.truncate_to(idx);
         Ok(())
+    }
+
+    /// Drop the log above `len`, lower the durable watermark to match, **and clamp every fsync
+    /// still in flight**.
+    ///
+    /// The last clause is the one that is easy to leave out and impossible to notice: a `Flush`
+    /// records a length, and a length means nothing once the entries at those positions have been
+    /// replaced. Without the clamp, an fsync issued for ten old entries lands after a truncation to
+    /// five and declares five *new* entries durable that no fsync ever covered — the follower then
+    /// acknowledges them, and `check_send`'s "an append was acknowledged before it was durable"
+    /// compares against the same inflated watermark and cannot see it. Found by review, measured at
+    /// 151 such events in 4 000 chaos seeds.
+    fn truncate_to(&mut self, len: usize) {
+        self.log.truncate(len);
+        self.durable_len = self.durable_len.min(len);
+        for f in &mut self.flushes {
+            f.len = f.len.min(len);
+        }
     }
 
     /// Schedule an fsync, returning the unit at which it lands.
@@ -990,6 +1019,10 @@ impl<P: Peer> Sim<P> {
         self.report.unsent_at_crash += (before - self.wire.len()) as u64;
         let lost = self.nodes[i].store.log.len() - self.nodes[i].store.durable_len;
         self.report.discarded_entries += lost as u64;
+        let st = &self.nodes[i].store;
+        if st.hard_pending.as_ref().is_some_and(|h| *h != st.hard) {
+            self.report.forgotten_votes += 1;
+        }
         self.nodes[i].store.crash();
         self.nodes[i].applied = 0;
         self.nodes[i].overlap = 0;
@@ -1066,6 +1099,15 @@ impl<P: Peer> Sim<P> {
 
     // -- the fault process ---------------------------------------------------------------------
 
+    /// The fault process.
+    ///
+    /// Counting is done from the **outcome** rather than from the action taken: a cut that blocks
+    /// nothing — because it drew the whole cluster, or because those links were already down —
+    /// must not be reported as a partition. `one_way_partitions` is the counter
+    /// `the_fault_model_injects_every_fault_it_claims_to` uses as evidence that the asymmetric case
+    /// `DISTRIBUTED.md` §F8 singles out was reached at all, so an inflated one is worse than none.
+    /// It was inflated: the subset draw below could select every node, which cuts nobody off from
+    /// anybody, and the old code counted it anyway.
     fn churn(&mut self) -> Result<(), Violation> {
         let every = self.cfg.faults.churn_every;
         if every == 0 || self.now % every != 0 {
@@ -1078,50 +1120,46 @@ impl<P: Peer> Sim<P> {
         let pick = (self.rng.next_u64() % total as u64) as u32;
         let kind = self.cfg.faults.churn.pick(pick);
         let n = self.cfg.nodes;
+        let before = self.blocked.clone();
         match kind {
             ChurnKind::Quiet => {}
             ChurnKind::Isolate => {
                 let k = self.pick_node();
                 self.isolate(k);
-                self.report.partitions += 1;
                 self.log_line(format!("NET isolate {k}"));
             }
             ChurnKind::IsolateIn => {
                 let k = self.pick_node();
                 self.isolate_inbound(k);
-                self.report.partitions += 1;
-                self.report.one_way_partitions += 1;
                 self.log_line(format!("NET isolate-inbound {k} (one-way)"));
             }
             ChurnKind::IsolateOut => {
                 let k = self.pick_node();
                 self.isolate_outbound(k);
-                self.report.partitions += 1;
-                self.report.one_way_partitions += 1;
                 self.log_line(format!("NET isolate-outbound {k} (one-way)"));
             }
             ChurnKind::Cut | ChurnKind::CutOneWay => {
-                // A non-empty proper subset, so the cut always separates somebody from somebody.
-                let mask = 1 + self.rng.next_u64() % ((1u64 << n) - 1);
-                let side: Vec<NodeId> =
-                    (0..n).filter(|k| mask & (1 << k) != 0).map(|k| NodeId(k + 1)).collect();
-                if kind == ChurnKind::Cut {
-                    self.cut(&side);
-                    self.log_line(format!("NET cut {side:?}"));
-                } else {
-                    self.cut_one_way(&side);
-                    self.log_line(format!("NET cut-one-way {side:?} -> rest"));
-                    self.report.one_way_partitions += 1;
+                // A non-empty **proper** subset: `1 ..= 2^n - 2` excludes both the empty set and the
+                // whole cluster, so the cut always separates somebody from somebody. `2^n - 1` was
+                // reachable before and cut nothing at all, one draw in 31 at five nodes.
+                if n >= 2 {
+                    let mask = 1 + self.rng.next_u64() % ((1u64 << n) - 2);
+                    let side: Vec<NodeId> =
+                        (0..n).filter(|k| mask & (1 << k) != 0).map(|k| NodeId(k + 1)).collect();
+                    if kind == ChurnKind::Cut {
+                        self.cut(&side);
+                        self.log_line(format!("NET cut {side:?}"));
+                    } else {
+                        self.cut_one_way(&side);
+                        self.log_line(format!("NET cut-one-way {side:?} -> rest"));
+                    }
                 }
-                self.report.partitions += 1;
             }
             ChurnKind::Link => {
                 let a = self.pick_node();
                 let b = self.pick_node();
                 if a != b {
                     self.block(a, b);
-                    self.report.partitions += 1;
-                    self.report.one_way_partitions += 1;
                     self.log_line(format!("NET block {a}->{b}"));
                 }
             }
@@ -1143,6 +1181,18 @@ impl<P: Peer> Sim<P> {
                     let k = down[(self.rng.next_u64() % down.len() as u64) as usize];
                     self.restart(k);
                 }
+            }
+        }
+        // Counted from what actually changed, not from what was attempted.
+        let added: Vec<(u32, u32)> =
+            self.blocked.difference(&before).copied().collect();
+        if !added.is_empty() {
+            self.report.partitions += 1;
+            // Asymmetric only if one of the links this event added has an open reverse. A one-way
+            // *action* over links that were already cut both ways produces a symmetric network, and
+            // calling that a one-way partition is how the evidence stops being evidence.
+            if added.iter().any(|(a, b)| !self.blocked.contains(&(*b, *a))) {
+                self.report.one_way_partitions += 1;
             }
         }
         Ok(())
