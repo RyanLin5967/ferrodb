@@ -361,24 +361,36 @@ fn racing_the_parent_directory_away_between_the_open_and_the_stat() {
 
     let mut loaded = 0usize;
     let mut refused_dir = 0usize;
-    let mut other = 0usize;
+    let mut refused_uninspectable = 0usize;
+    let mut refused_open = 0usize;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
     while std::time::Instant::now() < deadline {
         match Key::load(&p) {
             Ok(_) => loaded += 1,
             Err(e) if e.to_string().contains("writable by group or other") => refused_dir += 1,
-            Err(_) => other += 1,
+            // The post-fix branch: the open SUCCEEDED and the directory stat then failed. This is
+            // the state the mutant table records as unreachable from a test.
+            Err(e) if e.to_string().contains("could not be inspected") => refused_uninspectable += 1,
+            Err(_) => refused_open += 1,
         }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     flip.join().unwrap();
     let _ = std::fs::rename(&b, &a);
     chmod(&a, 0o700);
-    println!("loaded={loaded} refused_for_the_directory={refused_dir} refused_otherwise={other}");
+    println!(
+        "loaded={loaded} refused_mode={refused_dir} refused_uninspectable={refused_uninspectable} \
+         refused_at_open={refused_open}"
+    );
     assert_eq!(
         loaded, 0,
-        "PROBE HIT: a key in a 0777 directory loaded {loaded} time(s) because fs::metadata on the \
-         parent failed and the check fell through to Ok(())"
+        "a key in a 0777 directory loaded {loaded} time(s): fs::metadata on the parent failed and \
+         the check fell through to Ok(())"
+    );
+    assert!(
+        refused_uninspectable > 0,
+        "the open-succeeds-then-stat-fails window never opened, so this run proves nothing about \
+         that branch; loaded={loaded} refused_mode={refused_dir} refused_at_open={refused_open}"
     );
 }
 
