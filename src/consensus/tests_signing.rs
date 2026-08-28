@@ -758,9 +758,80 @@ fn no_hop_of_the_symlink_chain_escapes_the_directory_rule() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_cycle_is_refused_rather_than_followed() {
-    // The walk is bounded, so a cycle is a refusal instead of a hang or an ELOOP from somewhere
-    // deeper. Named here because the bound is the thing that makes the walk safe to write at all.
+fn a_symlinked_directory_component_is_judged_by_what_it_points_at() {
+    // A DIRECTORY in the path being a symlink, rather than the key itself. `check_directory` uses
+    // `fs::metadata`, which follows, so it judges the directory the component resolves to and not
+    // the link. Asserted rather than assumed: "metadata follows symlinks" is exactly the kind of
+    // thing that is true until somebody reaches for `symlink_metadata` for consistency with the
+    // walk above, where NOT following is the point.
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let via = root.path().join("via");
+    std::os::unix::fs::symlink(&real, &via).unwrap();
+    write_key_file(&real, "k", &key_bytes(54));
+    let through = via.join("k");
+
+    chmod(&real, 0o700);
+    Key::load(&through).expect("a link to a closed directory is fine");
+
+    chmod(&real, 0o777);
+    let err = Key::load(&through).expect_err("the directory it POINTS AT is 0777");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    chmod(&real, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_link_target_resolves_against_the_links_own_directory() {
+    // A relative target must resolve against the directory the LINK sits in, never the process's
+    // current directory — otherwise the walk inspects a directory that has nothing to do with the
+    // chain, and reports a verdict about the wrong filesystem location entirely. `..` in the target
+    // is included because that is how a real relative link reaches a sibling tree.
+    let root = tempfile::tempdir().unwrap();
+    let links = root.path().join("links");
+    let store = root.path().join("store");
+    std::fs::create_dir(&links).unwrap();
+    std::fs::create_dir(&store).unwrap();
+    write_key_file(&store, "k", &key_bytes(55));
+
+    let entry = links.join("k");
+    std::os::unix::fs::symlink("../store/k", &entry).unwrap();
+    chmod(&links, 0o700);
+
+    chmod(&store, 0o700);
+    Key::load(&entry).expect("a relative link into a closed directory is fine");
+
+    // Only the directory the RELATIVE target lands in changes.
+    chmod(&store, 0o777);
+    let err = Key::load(&entry).expect_err("the directory the relative target lands in is 0777");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    assert!(err.to_string().contains("store"), "the error must name where the target lands: {err}");
+    chmod(&store, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_cycle_is_refused_by_the_shape_check_before_the_walk_begins() {
+    // **Renamed from "...refused rather than followed", which overclaimed.** A mutant that removed
+    // the walk's `MAX_HOPS` bound did NOT make this test fail, so the test was not evidence for the
+    // bound — it was passing for a different reason, which is the shape of test this project keeps
+    // warning about. Measured, not guessed: the refusal is
+    //
+    //     could not be inspected: Too many levels of symbolic links (os error 62)
+    //
+    // i.e. `fs::metadata` in the shape check hits `ELOOP` and refuses before the walk runs at all.
+    // The assertion below now pins that exact cause, so if the order ever changes this test says so
+    // instead of quietly continuing to pass.
+    //
+    // **The walk's own bound therefore has no killing test here, and the reason is worth stating
+    // rather than leaving as "unreachable".** A cycle is refused earlier; a *non*-cyclic chain
+    // longer than the bound cannot be built either, because every OS this targets caps symlink
+    // resolution around 32 — below `MAX_HOPS` — so `fs::metadata` refuses those too. The bound is
+    // belt-and-braces against a future edit that removes the shape check, and it becomes reachable
+    // the moment one does. (This module has already been wrong once about calling a branch
+    // untestable — see `a_key_whose_directory_is_gone_is_refused` — so: no test HERE reaches it,
+    // by this mechanism, today.)
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a");
     let b = dir.path().join("b");
@@ -768,9 +839,10 @@ fn a_symlink_cycle_is_refused_rather_than_followed() {
     std::os::unix::fs::symlink(&a, &b).unwrap();
     let err = Key::load(&a).expect_err("a symlink cycle must be refused");
     let text = err.to_string();
+    assert!(text.contains("could not be inspected"), "the shape check must be what refuses: {text}");
     assert!(
-        text.contains("cycle") || text.contains("could not be inspected"),
-        "the refusal must say what it met: {text}"
+        text.contains("symbolic links"),
+        "and it must carry the OS's own reason, so an operator sees ELOOP rather than a guess: {text}"
     );
 }
 
