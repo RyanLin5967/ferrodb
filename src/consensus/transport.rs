@@ -918,7 +918,6 @@ struct Counters {
 
 /// One peer's queue and its current connection.
 struct Outbox {
-    peer: NodeId,
     addr: SocketAddr,
     state: Mutex<OutboxState>,
     woken: Condvar,
@@ -976,9 +975,32 @@ pub struct Transport {
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    /// Clones of every live inbound socket, so shutdown can unblock their readers at once instead
-    /// of waiting a `poll_interval` for each.
-    inbound_conns: Arc<Mutex<Vec<TcpStream>>>,
+    /// Every **live** inbound socket, so shutdown can unblock their readers at once instead of
+    /// waiting a `poll_interval` for each.
+    ///
+    /// Keyed, and each connection removes its own entry on the way out. A plain `Vec` pushed onto
+    /// and never drained leaks a file descriptor per connection: `try_clone` dups the descriptor,
+    /// and a clone left behind after its thread has returned keeps that descriptor allocated for
+    /// the life of the process. Since a reconnect is how this transport recovers from any write
+    /// failure, that is the ordinary path and not a pathological one — a long-lived node would
+    /// reach `EMFILE` and start refusing connections for reasons nothing in the cluster explains.
+    inbound_conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+}
+
+/// Removes a connection from the live registry however its thread leaves — including the early
+/// return on a refused handshake.
+///
+/// A `Drop` guard rather than a call at the end of `conn_loop`, because "every exit path also
+/// deregisters" is exactly the invariant a later edit breaks by adding one more `return`.
+struct ConnRegistration {
+    id: u64,
+    conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+}
+
+impl Drop for ConnRegistration {
+    fn drop(&mut self) {
+        self.conns.lock().unwrap().remove(&self.id);
+    }
 }
 
 impl Transport {
@@ -1017,6 +1039,23 @@ impl Transport {
                  for ever"
             )));
         }
+        for (name, d) in [
+            ("poll_interval", opts.poll_interval),
+            ("reconnect_delay", opts.reconnect_delay),
+            ("handshake_deadline", opts.handshake_deadline),
+        ] {
+            // std documents a zero duration as an error for both `set_read_timeout` and
+            // `connect_timeout`, so a zero here does not mean "no wait" — it means every socket
+            // call fails with `invalid input`, and the node reports itself unable to reach anyone
+            // for a reason that names nothing about the cluster. Refused where the value is set.
+            if d.is_zero() {
+                return Err(FerroError::Internal(format!(
+                    "`{name}` is zero; std refuses a zero socket or connect timeout, so every \
+                     connection this node made or accepted would fail at a call reporting \
+                     `invalid input` rather than anything about the peer"
+                )));
+            }
+        }
         if opts.queue_depth == 0 {
             return Err(FerroError::Internal(
                 "a queue depth of 0 would drop every message on the way out, which is a \
@@ -1032,14 +1071,16 @@ impl Transport {
 
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
-        let inbound_conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let inbound_conns: Arc<Mutex<BTreeMap<u64, TcpStream>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        // Lives only in the accept thread, which is the only place a connection id is minted.
+        let next_conn_id = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel::<Message>();
         let mut threads = Vec::new();
 
         let mut outboxes = BTreeMap::new();
         for (peer, addr) in peers {
             let ob = Arc::new(Outbox {
-                peer,
                 addr,
                 state: Mutex::new(OutboxState {
                     queue: VecDeque::new(),
@@ -1069,12 +1110,13 @@ impl Transport {
         let stop_c = Arc::clone(&stop);
         let counters_c = Arc::clone(&counters);
         let conns_c = Arc::clone(&inbound_conns);
+        let ids_c = next_conn_id;
         let opts_c = opts.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("consensus-accept-{self_id}"))
                 .spawn(move || {
-                    accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, opts_c)
+                    accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c)
                 })
                 .map_err(|e| FerroError::Io(e.to_string()))?,
         );
@@ -1166,6 +1208,22 @@ impl Transport {
     pub fn misrouted(&self) -> u64 {
         self.counters.misrouted.load(Ordering::SeqCst)
     }
+    /// Whether [`Transport::shutdown`] has run.
+    ///
+    /// `recv_timeout` returning `None` means "nothing arrived in that window" while the transport
+    /// is live and "nothing ever will" after it is stopped, and a caller looping on it needs to
+    /// tell those apart — a quiet cluster and a closed transport are not the same fact.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// How many inbound connections are currently registered. The meter that makes the descriptor
+    /// leak visible: it must fall back to zero as peers disconnect, not climb with every connection
+    /// this node has ever accepted.
+    pub fn live_inbound_conns(&self) -> usize {
+        self.inbound_conns.lock().unwrap().len()
+    }
+
     /// Connections closed at the handshake — a wrong magic, or a peer speaking another version.
     pub fn refused_handshakes(&self) -> u64 {
         self.counters.refused_handshakes.load(Ordering::SeqCst)
@@ -1182,6 +1240,14 @@ impl Transport {
     /// `write_all` does not notice a flag, and joining it would hang until the peer happened to
     /// send something. `shutdown(Both)` makes both calls return at once, and the `poll_interval`
     /// read timeout is the backstop for anything that slips between the flag and the shutdown.
+    ///
+    /// **One bound this cannot beat, stated rather than left to be found:** a sender thread already
+    /// inside `TcpStream::connect_timeout` against a black-holed peer — one that neither accepts
+    /// nor refuses — has no socket to shut down yet, so it is not interruptible and this call waits
+    /// up to one `handshake_deadline` for it. That is bounded and it is the reason
+    /// `handshake_deadline` is a knob rather than a constant. It is not shortened here, because the
+    /// alternative is failing a legitimately slow connect, and a slow shutdown is the cheaper
+    /// failure.
     pub fn shutdown(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
             // Already shut down. Still join below, so a second call is a barrier rather than a
@@ -1196,7 +1262,7 @@ impl Transport {
             }
             ob.woken.notify_all();
         }
-        for s in self.inbound_conns.lock().unwrap().drain(..) {
+        for (_, s) in std::mem::take(&mut *self.inbound_conns.lock().unwrap()) {
             let _ = s.shutdown(Shutdown::Both);
         }
         let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.threads.lock().unwrap());
@@ -1311,7 +1377,6 @@ fn sender_loop(
     }
     drop(st);
     drop(conn);
-    let _ = ob.peer;
 }
 
 /// Dial a peer and complete the handshake as the **connecting** side: write ours, then read theirs.
@@ -1356,7 +1421,8 @@ fn accept_loop(
     tx: mpsc::Sender<Message>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    conns: Arc<Mutex<Vec<TcpStream>>>,
+    conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+    ids: Arc<AtomicU64>,
     opts: TransportOptions,
 ) {
     let mut conn_threads: Vec<JoinHandle<()>> = Vec::new();
@@ -1377,10 +1443,11 @@ fn accept_loop(
                 let counters_c = Arc::clone(&counters);
                 let conns_c = Arc::clone(&conns);
                 let opts_c = opts.clone();
+                let id = ids.fetch_add(1, Ordering::SeqCst);
                 match std::thread::Builder::new()
                     .name(format!("consensus-in-{self_id}"))
                     .spawn(move || {
-                        conn_loop(stream, self_id, tx_c, stop_c, counters_c, conns_c, opts_c)
+                        conn_loop(stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c)
                     }) {
                     Ok(h) => conn_threads.push(h),
                     Err(_) => continue,
@@ -1404,18 +1471,20 @@ fn accept_loop(
 
 fn conn_loop(
     mut stream: TcpStream,
+    id: u64,
     self_id: NodeId,
     tx: mpsc::Sender<Message>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
-    conns: Arc<Mutex<Vec<TcpStream>>>,
+    conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     opts: TransportOptions,
 ) {
     // Registered before the handshake, so a peer that connects and then goes silent is still
-    // reachable by `shutdown` rather than pinned until its deadline.
-    let registered = stream.try_clone().ok();
-    if let Some(c) = registered {
-        conns.lock().unwrap().push(c);
+    // reachable by `shutdown` rather than pinned until its deadline. The guard deregisters on every
+    // exit path, including the early return below.
+    let _registration = ConnRegistration { id, conns: Arc::clone(&conns) };
+    if let Ok(c) = stream.try_clone() {
+        conns.lock().unwrap().insert(id, c);
     }
 
     let verdict = recv_handshake(&mut stream, &stop, opts.handshake_deadline);

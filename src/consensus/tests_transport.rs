@@ -1055,21 +1055,33 @@ fn a_frame_with_an_unknown_tag_closes_the_connection_rather_than_being_skipped()
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     s.read_exact(&mut theirs).unwrap();
 
-    // A perfectly valid *replication* frame, on a consensus port — then a perfectly valid
-    // *consensus* frame behind it. The second one is the detector: if the reader had skipped the
-    // unroutable frame and carried on, this would arrive and be delivered. It must not, because the
-    // connection is closed at the first frame it cannot route.
-    s.write_all(&crate::replication::Message::UpToDate { durable_lsn: 9 }.encode()).unwrap();
-    s.write_all(
-        &encode(&Message {
-            from: NodeId(1),
-            to: NodeId(2),
-            term: 1,
-            body: Body::PreVoteResp { granted: true },
-        })
-        .unwrap(),
-    )
+    // **A frame under replication's tag whose body IS a valid consensus message.**
+    //
+    // The first version of this test sent a replication `UpToDate`, and the mutant that removes the
+    // tag check SURVIVED it: an `UpToDate` body is eight bytes, too short to decode as a consensus
+    // message, so `decode` refused it and the connection closed anyway — for the wrong reason. The
+    // test was measuring the decoder, not the tag check.
+    //
+    // The case the tag check actually guards is this one: bytes that decode perfectly well. A
+    // replication `Records` frame carries `start_lsn` and then arbitrary WAL bytes, so its body can
+    // be anything at all — and without the tag check those bytes are handed to the state machine
+    // off a stream this node has no business reading as consensus.
+    let smuggled = encode(&Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::PreVoteResp { granted: true },
+    })
     .unwrap();
+    let body = &smuggled[5..];
+    let mut disguised = vec![b'R'];
+    disguised.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    disguised.extend_from_slice(body);
+    s.write_all(&disguised).unwrap();
+
+    // ...and a genuine consensus frame behind it, which must also not arrive: the connection is
+    // closed at the first frame it cannot route, not merely at frames it cannot parse.
+    s.write_all(&smuggled).unwrap();
     s.flush().unwrap();
 
     let mut rest = Vec::new();
@@ -1081,8 +1093,9 @@ fn a_frame_with_an_unknown_tag_closes_the_connection_rather_than_being_skipped()
     assert_eq!(
         b.received(),
         0,
-        "a consensus frame behind an unroutable one was delivered, so the reader skipped rather \
-         than closed and its idea of where frames begin is no longer trustworthy"
+        "a message arrived under a tag this listener does not route. Either the disguised frame was \
+         decoded as consensus, or the reader skipped it and carried on to the frame behind it; \
+         both mean this node acts on bytes it cannot claim to be reading correctly"
     );
     assert!(b.try_recv().is_none());
     drop(a);
@@ -1129,4 +1142,151 @@ fn a_catalog_command_with_bytes_after_its_ddl_record_is_refused() {
         format!("{e}").contains("did not re-encode"),
         "eight smuggled bytes rode inside a Catalog command: {e}"
     );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Why the frame reader is resumable at all
+// ---------------------------------------------------------------------------------------------
+
+/// Delivers `before` bytes one at a time and then times out for ever — a frame that straddles a
+/// socket read timeout.
+struct Halting {
+    data: Vec<u8>,
+    at: usize,
+    before: usize,
+}
+
+impl Read for Halting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at >= self.before {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"));
+        }
+        if self.at >= self.data.len() || buf.is_empty() {
+            return Ok(0);
+        }
+        buf[0] = self.data[self.at];
+        self.at += 1;
+        Ok(1)
+    }
+}
+
+#[test]
+fn read_exact_loses_what_it_consumed_which_is_why_the_frame_reader_is_resumable() {
+    // ANTI-VACUITY for `FrameReader`. Every other test here shows the resumable reader working;
+    // this one shows the obvious alternative failing, so the extra machinery is evidenced rather
+    // than asserted.
+    //
+    // `TcpStream` does not override `read_exact`, so it gets `default_read_exact`, which loops on
+    // `read` and returns on the first non-`Interrupted` error — discarding both the bytes it has
+    // already moved into the caller's buffer and any record of how many there were. A socket read
+    // timeout is exactly such an error, and the read timeout is not optional here: it is how a
+    // connection thread notices a shutdown.
+    let data: Vec<u8> = (0u8..10).collect();
+
+    let mut r = Halting { data: data.clone(), at: 0, before: 4 };
+    let mut buf = [0u8; 10];
+    let err = r.read_exact(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(r.at, 4, "the reader should have taken four bytes off the stream before timing out");
+    // And that is the whole problem: four bytes are gone from the stream, `read_exact` returned no
+    // count, and its contract says `buf`'s contents are unspecified — so a caller has no way to
+    // find out. Retrying re-reads from byte 4, and every frame after this one is parsed from the
+    // wrong offset.
+
+    // The same reader, the same four bytes, through `FrameReader`: still held.
+    let mut r2 = Halting { data, at: 0, before: 4 };
+    let mut fr = FrameReader::new();
+    for _ in 0..8 {
+        match fr.poll(&mut r2) {
+            Ok(Poll::Pending) => continue,
+            other => panic!("expected the reader to be waiting, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        fr.header_got, 4,
+        "the resumable reader lost the same bytes `read_exact` loses, so it is not resumable"
+    );
+    assert_eq!(r2.at, 4, "no extra bytes were taken from the stream");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resource lifetime
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_inbound_connection_frees_its_descriptor_when_it_closes() {
+    // `try_clone` DUPS the descriptor, so a registry that is pushed onto and never drained holds
+    // one open per connection this node has ever accepted — for the life of the process. A
+    // reconnect is this transport's ordinary recovery from a write failure, so a long-lived node
+    // would reach EMFILE and start refusing peers for a reason nothing in the cluster explains.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), fast()).unwrap();
+
+    const ROUNDS: usize = 40;
+    for i in 0..ROUNDS {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut hs = Vec::new();
+        crate::replication::write_handshake(&mut hs).unwrap();
+        s.write_all(&hs).unwrap();
+        s.flush().unwrap();
+        let mut theirs = [0u8; 6];
+        s.read_exact(&mut theirs).unwrap_or_else(|e| panic!("handshake {i}: {e}"));
+        drop(s);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.live_inbound_conns() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        t.live_inbound_conns(),
+        0,
+        "{ROUNDS} connections were opened and closed, and the registry still holds {}; each one is \
+         a leaked file descriptor",
+        t.live_inbound_conns()
+    );
+}
+
+#[test]
+fn a_zero_timeout_is_refused_at_bind_rather_than_failing_every_socket_call() {
+    // std treats a zero duration as an error for both `set_read_timeout` and `connect_timeout`, so
+    // a zero here does not mean "do not wait" — it means every socket call fails with `invalid
+    // input` and the node reports itself unable to reach anyone, for a reason that names nothing
+    // about the cluster.
+    for (name, mutate) in [
+        ("poll_interval", 0usize),
+        ("reconnect_delay", 1),
+        ("handshake_deadline", 2),
+    ] {
+        let mut opts = fast();
+        match mutate {
+            0 => opts.poll_interval = Duration::ZERO,
+            1 => opts.reconnect_delay = Duration::ZERO,
+            _ => opts.handshake_deadline = Duration::ZERO,
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let e = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap_err();
+        assert!(
+            format!("{e}").contains(name) && format!("{e}").contains("is zero"),
+            "a zero {name} was accepted: {e}"
+        );
+    }
+}
+
+#[test]
+fn a_stopped_transport_is_distinguishable_from_a_quiet_one() {
+    // `recv_timeout` returning `None` means "nothing arrived in that window" while the transport is
+    // live and "nothing ever will" after it is stopped. A driver looping on it has to tell those
+    // apart, or a shut-down transport reads exactly like a healthy cluster with nothing to say.
+    let (a, b) = pair(fast());
+    assert!(!a.is_stopped());
+    assert!(a.recv_timeout(Duration::from_millis(20)).is_none(), "a quiet transport had traffic");
+    assert!(!a.is_stopped(), "a quiet window is not a stopped transport");
+    a.shutdown();
+    assert!(a.is_stopped());
+    assert!(a.recv_timeout(Duration::from_millis(20)).is_none());
+    drop(b);
 }
