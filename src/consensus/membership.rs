@@ -367,14 +367,26 @@ impl Consensus {
         if !self.acked.contains_key(&self.self_id) {
             return false;
         }
+        self.cfg.has_quorum(self.config_holders())
+    }
+
+    /// How many **voters** of the configuration in force are known to hold it durably.
+    ///
+    /// One implementation, read by the predicate above and by the refusal that reports the number,
+    /// because two counts of one fact drift and the drift would show up as a refusal whose message
+    /// contradicts the predicate that produced it.
+    ///
+    /// Counted over `cfg.members()` only: a learner is replicated to and never counted, and a node
+    /// in no configuration is not counted either. Compared on the whole `(version, term)` pair, so
+    /// an acknowledgement of some other term's configuration of the same version cannot make up the
+    /// number.
+    fn config_holders(&self) -> usize {
         let want = self.cfg.at();
-        let holders = self
-            .cfg
+        self.cfg
             .members()
             .iter()
             .filter(|n| self.acked.get(n).is_some_and(|a| *a >= want))
-            .count();
-        self.cfg.has_quorum(holders)
+            .count()
     }
 
     /// Whether a change is begun and not finished: the configuration in force is not yet known to be
@@ -625,12 +637,7 @@ impl Consensus {
         }
 
         let want = self.cfg.at();
-        let holders = self
-            .cfg
-            .members()
-            .iter()
-            .filter(|n| self.acked.get(n).is_some_and(|a| *a >= want))
-            .count();
+        let holders = self.config_holders();
         if !self.cfg.has_quorum(holders) {
             return Err(FerroError::Constraint(format!(
                 "refused a membership change while the configuration in force (version {}, term \
