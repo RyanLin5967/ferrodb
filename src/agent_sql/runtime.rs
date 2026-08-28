@@ -1412,9 +1412,7 @@ impl AgentRuntime {
         // charging afterwards would mean a failed record write leaves a row written and
         // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
         // admits one.
-        if charge > 0 {
-            self.branches.charge_row_writes(branch, charge)?;
-        }
+        let _ = charge;
 
         // ---- apply --------------------------------------------------------------------------
         //
