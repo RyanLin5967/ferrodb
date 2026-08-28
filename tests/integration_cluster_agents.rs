@@ -597,6 +597,9 @@ struct Scripted {
     inject: Mutex<Vec<Command>>,
     sticky: Mutex<bool>,
     leader: Mutex<Option<NodeId>>,
+    /// When set, the next `pump` deposes this node and applies nothing — a leader that loses
+    /// office while a caller is waiting on a round.
+    depose_on_pump: Mutex<bool>,
 }
 
 impl Scripted {
@@ -609,6 +612,7 @@ impl Scripted {
             inject: Mutex::new(Vec::new()),
             sticky: Mutex::new(false),
             leader: Mutex::new(Some(node)),
+            depose_on_pump: Mutex::new(false),
         })
     }
 
@@ -625,6 +629,12 @@ impl Scripted {
 
     fn step_down(&self) {
         *lock(&self.leader) = Some(NodeId(99));
+    }
+
+    /// Lose office on the next turn of the driver, and stop making progress — which is what a
+    /// deposed leader looks like to something waiting on a round.
+    fn depose_on_next_pump(&self) {
+        *lock(&self.depose_on_pump) = true;
     }
 
     /// Apply everything proposed. Stands for the time an agent spends working after its fork.
@@ -668,6 +678,10 @@ impl Replicated for Scripted {
     }
 
     fn pump(&self) -> Result<(), FerroError> {
+        if *lock(&self.depose_on_pump) {
+            *lock(&self.leader) = Some(NodeId(99));
+            return Ok(());
+        }
         let mut applied = lock(&self.applied);
         let next = {
             let log = lock(&self.log);
@@ -854,6 +868,41 @@ fn a_fork_on_a_node_that_does_not_lead_is_refused_and_creates_nothing() {
     assert!(matches!(e, FerroError::NotLeader { .. }), "a follower accepted a fork: {e}");
     assert!(repl.log_commands().is_empty(), "a refused fork still reached the log");
     assert_eq!(agents.cost().proposals, 0);
+    // **And it created nothing.** A branch record minted on a node that cannot commit is garbage
+    // the cluster never agreed on: it burns an id and an epoch, and it pins whatever arenas it is
+    // charged until something reaps it. The leadership check therefore comes *before* the local
+    // fork, not after it.
+    let records = _db.runtime.branches().all_branches().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "a refused fork left {} branch records behind, not just the trunk: {:?}",
+        records.len(),
+        records.iter().map(|r| (r.branch_id, r.state)).collect::<Vec<_>>()
+    );
+}
+
+/// A merge that loses its leader **while waiting on a round** must refuse, rather than block a
+/// client until the pump budget runs out. The check is inside the wait loop and not only at its
+/// entry, because losing office during the wait is the case that actually happens.
+#[test]
+fn a_merge_that_loses_the_leadership_while_waiting_refuses_rather_than_blocking() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let agents = agents.with_pump_budget(1_000);
+    // Deliberately not settled: the fork is proposed and not yet applied, so the merge must wait.
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+    repl.depose_on_next_pump();
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+    assert!(
+        matches!(e, FerroError::NotLeader { .. }),
+        "a leader deposed mid-wait blocked until its budget ran out instead of refusing: {e}"
+    );
+    assert_eq!(db.main_qty(1), Some(100), "a deposed leader published a merge");
 }
 
 /// A merge that loses its leader mid-flight must refuse and publish nothing, rather than block a

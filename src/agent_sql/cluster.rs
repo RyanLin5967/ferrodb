@@ -1062,6 +1062,10 @@ impl ClusterAgents {
         ctx: &mut ExecCtx,
         branch: BranchId,
     ) -> Result<ClusterMergeReport, FerroError> {
+        // Defence in depth, and honestly labelled as such: `propose` below refuses on a follower
+        // too, so removing this line changes no outcome and no mutant kills it. What it buys is
+        // that a node that cannot commit does not run a full `evaluate_merge` — two scans of every
+        // touched table — to reach a verdict it can never act on.
         self.require_leader()?;
         let cid = ClusterBranchId::of(self.node, branch)?;
         if cid == ClusterBranchId::TRUNK {
