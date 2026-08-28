@@ -113,3 +113,18 @@ or a kill would prove nothing.
   - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
 - **mutant** `a_branch_whose_owner_died_is_named_as_lost_work_and_its_merged_sibling_is_not` — M28 the orphan list is not filtered by the node that died
   - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+
+## Later run: M24, M25, M26
+
+- **clean** `the_trunk_is_the_same_branch_on_every_node_and_has_no_owner` — M24 the trunk is packed like any other branch instead of being id 0 everywhere
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **clean** `node_zero_cannot_own_a_branch` — M25 node 0 may own a branch
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **clean** `a_merge_that_applied_moves_the_base_for_the_merge_behind_it` — M26 a merge that applied does not move the base
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `the_trunk_is_the_same_branch_on_every_node_and_has_no_owner` — M24 the trunk is packed like any other branch instead of being id 0 everywhere
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `node_zero_cannot_own_a_branch` — M25 node 0 may own a branch
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `a_merge_that_applied_moves_the_base_for_the_merge_behind_it` — M26 a merge that applied does not move the base
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
