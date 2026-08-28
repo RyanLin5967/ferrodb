@@ -611,7 +611,14 @@ fn a_chunk_at_the_wrong_offset_is_answered_with_the_resume_point_and_never_buffe
     let mut l = Consensus::new(N1, cfg3(), 1);
     seed(&mut l, &[(1, wal(1)), (1, wal(2))]);
     promote(&mut l, 1);
-    let snap = payload_of(&point_of(&l), 512, 3);
+    // Four chunks, so the skipped one is in the MIDDLE. A mutant of this rule survived a fixture
+    // whose out-of-order chunk was the last one: the `done`-at-the-wrong-length check refused it
+    // instead, and the test could not tell which guard had done the refusing.
+    let snap = payload_of(&point_of(&l), 1024, 3);
+    assert!(
+        snap.meta.total_bytes > 3 * SNAPSHOT_CHUNK_BYTES as u64,
+        "the fixture is too small for a chunk to be skipped without being the last one"
+    );
 
     let mut f = Consensus::new(N2, cfg3(), 3);
     follower_of(&mut f, 1, N1);
@@ -620,8 +627,13 @@ fn a_chunk_at_the_wrong_offset_is_answered_with_the_resume_point_and_never_buffe
     let held = received_through(&only_send(&out));
     assert_eq!(held, SNAPSHOT_CHUNK_BYTES as u64);
 
-    // A chunk from further along than this node has reached.
+    // Chunk 2, while this node holds only chunk 0 — a hole, and not the final chunk, so nothing
+    // about the transfer's declared length can refuse it. Only the offset can.
     let ahead = install_msg(N1, N2, 1, &snap, held + SNAPSHOT_CHUNK_BYTES as u64);
+    assert!(
+        matches!(&ahead.body, Body::InstallSnapshot { done, .. } if !done),
+        "the skipped-over chunk is the last one, so this fixture cannot isolate the offset rule"
+    );
     let out = f.step(Event::Recv(ahead));
     assert_eq!(
         received_through(&only_send(&out)),
@@ -646,14 +658,62 @@ fn a_chunk_that_would_run_past_the_declared_length_is_refused() {
     let mut f = Consensus::new(N2, cfg3(), 3);
     follower_of(&mut f, 1, N1);
 
+    // **Not final.** A mutant of this rule survived a fixture whose over-long chunk was also the
+    // last one: the `done`-at-the-wrong-length check refused it, and the test could not tell which
+    // guard had done the refusing. With `done: false`, the length rule is the only one that can.
     let mut over = install_msg(N1, N2, 1, &snap, 0);
     if let Body::InstallSnapshot { data, done, .. } = &mut over.body {
         data.extend_from_slice(&[0u8; 32]);
-        *done = true;
+        *done = false;
     }
     let out = f.step(Event::Recv(over));
     assert_eq!(received_through(&only_send(&out)), 0, "a chunk longer than the payload was taken");
-    assert!(f.pending_install_round().is_none(), "an over-long payload was offered for install");
+    assert!(
+        f.snapshot_incoming().is_none(),
+        "a chunk that runs past the declared length was accepted into the cursor"
+    );
+}
+
+/// A transfer that says it is **done** at the wrong length is refused.
+///
+/// Its own test, because the guard above can otherwise stand in for this one and neither is then
+/// tested. The two are different claims: one is a chunk that is too long, this is a sender and a
+/// receiver that disagree about how much a whole snapshot is — and there is no reading of that
+/// which installs safely.
+#[test]
+fn a_transfer_that_claims_to_be_done_at_the_wrong_length_is_refused() {
+    let mut l = Consensus::new(N1, cfg3(), 1);
+    seed(&mut l, &[(1, wal(1))]);
+    promote(&mut l, 1);
+    let snap = payload_of(&point_of(&l), 512, 3);
+
+    let mut f = Consensus::new(N2, cfg3(), 3);
+    follower_of(&mut f, 1, N1);
+
+    // The first chunk of a multi-chunk payload, flagged `done`.
+    let mut early = install_msg(N1, N2, 1, &snap, 0);
+    let len = match &mut early.body {
+        Body::InstallSnapshot { data, done, .. } => {
+            *done = true;
+            data.len() as u64
+        }
+        other => panic!("expected an InstallSnapshot, got {other:?}"),
+    };
+    assert!(len < snap.meta.total_bytes, "the fixture fits in one chunk, so it cannot end early");
+
+    let out = f.step(Event::Recv(early));
+    assert_eq!(
+        received_through(&only_send(&out)),
+        0,
+        "a transfer that ended {len} bytes into a {} byte payload was accepted",
+        snap.meta.total_bytes
+    );
+    assert!(f.pending_install_round().is_none(), "a short payload was offered for install");
+
+    // Anti-vacuity: the same first chunk WITHOUT the flag is accepted, so the refusal is about the
+    // claim of completeness and not about the chunk.
+    let out = f.step(Event::Recv(install_msg(N1, N2, 1, &snap, 0)));
+    assert_eq!(received_through(&only_send(&out)), len);
 }
 
 /// A payload whose body does not digest to what its header claims is refused **before the driver is
@@ -750,6 +810,15 @@ fn a_snapshot_of_a_round_this_node_already_holds_is_not_installed() {
 
     let out = f.step(Event::Recv(install_msg(N1, N2, 1, &snap, 0)));
     assert_eq!(received_through(&only_send(&out)), snap.meta.total_bytes);
+    // **The assertion has to be that nothing was accepted for install**, not that nothing has
+    // moved: nothing moves until `Persisted` either way, so a mutant of this rule survived a test
+    // that only checked the floor and the tail.
+    assert!(
+        f.pending_install_round().is_none(),
+        "a snapshot of state this node already holds was accepted for install; the driver would \
+         now replace this node's whole database with an older image of it"
+    );
+    assert!(f.snapshot_incoming().is_none(), "a cursor was armed for a transfer with nothing to do");
     assert_eq!(f.snapshot_round, 0, "a snapshot of state this node already had was installed");
     assert_eq!(f.last_round, 3, "the log was discarded for a snapshot that added nothing");
 }
@@ -972,8 +1041,18 @@ fn an_install_discards_the_whole_log_and_the_floor_moves_with_it() {
     assert_eq!(f.last_round, 6);
 
     deliver_all(&mut f, N1, 5, &snap);
-    f.step(Event::Persisted { term: 5, round: snap.meta.last_round });
+    let out = f.step(Event::Persisted { term: 5, round: snap.meta.last_round });
 
+    // **The applied cursor, judged by what it makes the driver do.** `advance_apply` runs after
+    // the install and will happily raise `applied` from 0 to 5 on its own, so asserting the field
+    // alone cannot see an install that left it behind — a mutant proved exactly that. What it
+    // cannot cover for is the action: an `Apply { through: 5 }` on a node whose cursor is 0 sends
+    // the driver walking rounds 1..5, and rounds 1..5 no longer exist anywhere on this node.
+    assert!(
+        !out.iter().any(|a| matches!(a, Action::Apply { .. })),
+        "the install asked the storage engine to apply rounds the snapshot replaced, which no \
+         longer exist on this node: {out:#?}"
+    );
     assert_eq!(f.snapshot_round, 5);
     assert_eq!(f.last_round, 5, "a stale suffix survived an install");
     assert_eq!(f.term_at(5), Some(5));

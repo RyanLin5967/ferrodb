@@ -262,3 +262,104 @@ fn a_proposal_to_a_follower_is_refused_rather_than_dropped() {
     );
     n.shutdown();
 }
+
+use crate::consensus::snapshot as snap6;
+use crate::consensus::{Body, Message};
+
+// ---------------------------------------------------------------- F6: the driver's own account
+
+/// A `Snapshot` big enough to need more than one chunk, so a second chunk has somewhere to go
+/// wrong. Two pages of arena and branch bytes are enough to make the payloads distinguishable.
+fn multi_chunk_snapshot(round: Round, term: Term) -> snap6::Snapshot {
+    use crate::replication::backup::BackupLabel;
+    let pages = 512u32;
+    snap6::Snapshot::build(
+        &snap6::SnapshotPoint {
+            last_round: round,
+            last_term: term,
+            config: Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+            base_digest: 0,
+        },
+        1,
+        1,
+        BackupLabel { start_lsn: 1, end_lsn: 2, page_count: pages },
+        &[7u8; 8],
+        &[7u8; 4],
+        vec![7u8; pages as usize * crate::storage::disk_manager::PAGE_SIZE],
+    )
+    .expect("a well-formed payload was refused")
+}
+
+fn chunk_msg(snap: &snap6::Snapshot, offset: u64) -> Message {
+    let bytes = snap.payload();
+    let from = offset as usize;
+    let to = (from + snap6::SNAPSHOT_CHUNK_BYTES).min(bytes.len());
+    Message {
+        from: NodeId(2),
+        to: NodeId(1),
+        term: 1,
+        body: Body::InstallSnapshot {
+            meta: snap.meta.clone(),
+            offset,
+            data: bytes[from..to].to_vec(),
+            done: to == bytes.len(),
+        },
+    }
+}
+
+/// **FORCED FIRE.** A chunk the state machine accepted and the driver cannot place is refused by
+/// name, rather than written wherever the offset says.
+///
+/// This guard cannot fire in a healthy run, which is exactly why it needs to be made to. What it
+/// prevents is invisible without it: the state machine digests the bytes it *saw* and the driver
+/// installs the bytes it *wrote*, so a spool assembled from two different transfers passes the
+/// payload's own digest — the state machine folded the same mixture — and every page of the
+/// database it installs passes its own checksum. There is no later point at which that is
+/// detectable.
+#[test]
+fn a_chunk_the_driver_cannot_place_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+
+    let snap = multi_chunk_snapshot(4, 1);
+    assert!(
+        snap.meta.total_bytes > snap6::SNAPSHOT_CHUNK_BYTES as u64,
+        "the fixture fits in one chunk, so there is no second chunk to misplace"
+    );
+
+    // Chunk 0 arrives and is accepted by both accounts.
+    n.pending.push_back(Event::Recv(chunk_msg(&snap, 0)));
+    n.drain().expect("the first chunk was refused");
+    assert_eq!(n.spooled, snap6::SNAPSHOT_CHUNK_BYTES as u64);
+    assert!(spool_path(&n.dir).exists(), "the accepted chunk was not spooled");
+
+    // The two accounts drift. In the wild this is a bug in one of the two rules; here it is made
+    // to happen, because a guard that has never fired is not a guard.
+    n.spooled = 12_345;
+
+    n.pending.push_back(Event::Recv(chunk_msg(&snap, snap6::SNAPSHOT_CHUNK_BYTES as u64)));
+    let err = n.drain().expect_err(
+        "the driver wrote a chunk it could not place. The spool is now a mixture of two accounts \
+         of one transfer, and it will still pass the payload's digest.",
+    );
+    assert!(
+        format!("{err}").contains("have drifted"),
+        "refused, but not for the reason this guard exists: {err}"
+    );
+
+    // Anti-vacuity: with the accounts agreeing, the same chunk is accepted. Without this the test
+    // above would pass just as well against a driver that refused every chunk.
+    n.spooled = snap6::SNAPSHOT_CHUNK_BYTES as u64;
+    n.pending.push_back(Event::Recv(chunk_msg(&snap, snap6::SNAPSHOT_CHUNK_BYTES as u64)));
+    n.drain().expect("a chunk both accounts agree on was refused");
+    assert_eq!(n.spooled, 2 * snap6::SNAPSHOT_CHUNK_BYTES as u64);
+
+    n.shutdown();
+}

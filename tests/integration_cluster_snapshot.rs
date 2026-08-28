@@ -112,9 +112,11 @@ fn engine_at(dir: &Path, tag: &str, fresh: bool) -> (Engine, Box<PageStoreSnapsh
 
 /// Write `n` pages whose bytes are a function of `(mark, page)`, so two engines' files are equal
 /// only if the bytes actually crossed.
-fn seed_pages(e: &Engine, n: usize, mark: u8) {
+fn seed_pages(e: &Engine, n: usize, mark: u8) -> Vec<u32> {
+    let mut ids = Vec::new();
     for i in 0..n {
         let id = e.pool.new_page().unwrap();
+        ids.push(id);
         let frame_i = e.pool.fetch_page(id).unwrap();
         {
             let mut f = e.pool.frames[frame_i].write().unwrap();
@@ -125,6 +127,19 @@ fn seed_pages(e: &Engine, n: usize, mark: u8) {
         e.pool.unpin_page(id, true);
     }
     e.pool.flush_all().unwrap();
+    ids
+}
+
+/// A page as the pool serves it — not as the file holds it.
+///
+/// The distinction is the whole of one rule: an install replaces the page file, and a pool that
+/// went on serving its cached frames would answer for a database this node no longer has, with
+/// nothing on disk to show for it.
+fn page_through_pool(e: &Engine, id: u32) -> [u8; PAGE_SIZE] {
+    let frame_i = e.pool.fetch_page(id).unwrap();
+    let data = e.pool.frames[frame_i].read().unwrap().data;
+    e.pool.unpin_page(id, false);
+    data
 }
 
 /// Three nodes, three listeners bound before anything is told about anything.
@@ -489,7 +504,7 @@ fn a_captured_payload_installs_back_to_the_same_pages() {
 
     let dst = tempfile::tempdir().unwrap();
     let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
-    seed_pages(&to_engine, 2, 0xF0);
+    let dst_ids = seed_pages(&to_engine, 2, 0xF0);
     assert_ne!(
         std::fs::read(&from_engine.page_file).unwrap(),
         std::fs::read(&to_engine.page_file).unwrap(),
@@ -521,4 +536,16 @@ fn a_captured_payload_installs_back_to_the_same_pages() {
     let common = a.len().min(b.len());
     assert!(common >= 5 * PAGE_SIZE, "the restored image is shorter than the pages it carried");
     assert_eq!(a[..common], b[..common], "a captured payload did not install back to the same bytes");
+
+    // **And the pool, not only the file.** A mutant that removed the cache invalidation survived a
+    // version of this test that compared files alone: the files were right and the process went on
+    // serving pages of the database it had just replaced. Read a page the destination had cached
+    // before the install, and require it to be the source's.
+    let id = dst_ids[0];
+    assert_eq!(
+        page_through_pool(&to_engine, id).to_vec(),
+        page_through_pool(&from_engine, id).to_vec(),
+        "after installing a snapshot this node's buffer pool still serves page {id} of the \
+         database the install replaced, and the file on disk says otherwise"
+    );
 }

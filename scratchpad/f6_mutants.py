@@ -83,9 +83,9 @@ M = [
     ("M23", SNAP, "                Some(c) if c.header == header && c.received > 0 => {",
      "                Some(c) if c.meta == meta && c.received > 0 => {",
      "a_second_snapshot_supersedes_the_one_in_flight", "lib"),
-    ("M24", SNAP, "        if cur.received != meta.total_bytes {\n                // \"Done\" at the wrong length.",
-     "        if false {\n                // \"Done\" at the wrong length.",
-     "a_chunk_that_would_run_past_the_declared_length_is_refused", "lib"),
+    ("M24", SNAP, "            if cur.received != meta.total_bytes {",
+     "            if false {",
+     "a_transfer_that_claims_to_be_done_at_the_wrong_length_is_refused", "lib"),
 
     # ---- the install -----------------------------------------------------------------------------
     ("M25", SNAP, "            cur.complete = true;\n        }\n\n        let n = cur.received;",
@@ -130,8 +130,7 @@ M = [
      "integration_cluster_snapshot"),
     ("M37", NODE, "        if !starting && !continuing {",
      "        if false {",
-     "a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges",
-     "integration_cluster_snapshot"),
+     "consensus::node::tests_node::a_chunk_the_driver_cannot_place_is_refused_by_name", "lib"),
     ("M38", NODE, "            applied: floor,", "            applied: 0,",
      "a_node_restarted_above_a_snapshot_floor_comes_back_on_it",
      "integration_cluster_snapshot"),
@@ -174,8 +173,9 @@ def main():
         path.write_text(src.replace(old, new, 1))
         try:
             if target == "lib":
-                cmd = ["cargo", "test", "--lib", f"consensus::snapshot::tests_snapshot::{test}",
-                       "--", "--exact"]
+                path = test if test.startswith("consensus::") else \
+                    f"consensus::snapshot::tests_snapshot::{test}"
+                cmd = ["cargo", "test", "--lib", path, "--", "--exact"]
             else:
                 cmd = ["cargo", "test", "--test", target, test, "--", "--exact"]
             r = run(cmd)

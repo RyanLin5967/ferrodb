@@ -67,11 +67,22 @@
 //!
 //! A guard whose blind spots are undocumented is one whose silence means nothing.
 //!
-//! * **Snapshots.** [`Store`] requires rounds contiguous from 1 and refuses a write that leaves a
-//!   hole, so a node whose log begins above `snapshot_round` is outside the model. `Body::Append`
-//!   and `Body::InstallSnapshot` are routed to the state machine either way, but nothing here
-//!   checks a snapshot install. F6 extends this file; until then the properties are asserted for
-//!   clusters whose logs still begin at round 1.
+//! * **Snapshots — and F6 landed WITHOUT extending this file, which is a decision rather than an
+//!   omission.** [`Store`] requires rounds contiguous from 1 and refuses a write that leaves a
+//!   hole, so a node whose log begins above `snapshot_round` is outside the model; `entry_at`,
+//!   `durable_round`, `persist` and `would_drop_committed` all read a round as an index into one
+//!   `Vec`, and every one of them feeds the two safety properties this file sweeps over 100 000
+//!   seeds. Teaching the model a floor is a change to all four.
+//!
+//!   `Body::Append` and `Body::InstallSnapshot` are still routed to the state machine, so a
+//!   snapshot message in a run is delivered and answered — but no run here ever produces one,
+//!   because nothing in the model checkpoints. **So the properties below are asserted for clusters
+//!   whose logs still begin at round 1, and that is the whole of the coverage claim.** F6's
+//!   protocol is proven deterministically instead, in `consensus/tests_snapshot.rs` (34 rules, each
+//!   fired by a mutant) and against three real drivers, sockets and page files in
+//!   `tests/integration_cluster_snapshot.rs`. Extending `Store` with a floor remains open, and
+//!   whoever takes it should read this paragraph first rather than the sentence that used to be
+//!   here, which said F6 would.
 //! * **Membership changes.** The configuration is fixed for the life of a run. A
 //!   `Command::Membership` in the log is carried like any other command and changes nothing about
 //!   who the simulator counts. F5 extends this file.
