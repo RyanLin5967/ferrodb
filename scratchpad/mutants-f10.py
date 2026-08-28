@@ -79,8 +79,8 @@ MUTANTS = [
      ["a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out"]),
 
     ("no-guard-depth-cap-on-encode", LOG,
-     "    if depth > MAX_GUARD_DEPTH {\n        return Err(FerroError::Merge(format!(",
-     "    if false && depth > MAX_GUARD_DEPTH {\n        return Err(FerroError::Merge(format!(",
+     "    if depth > MAX_GUARD_DEPTH {\n        // `owner.source_text` and NOT",
+     "    if false && depth > MAX_GUARD_DEPTH {\n        // `owner.source_text` and NOT",
      ["a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out"]),
 
     ("index-accepts-before-the-record-lands", LOG,
@@ -161,9 +161,16 @@ def named_tests_fail(tests):
     # the rebuild the mutant had just invalidated — so mutant 1 reported "TIMED OUT with no verdict"
     # and would have read as a survivor. A timeout that can expire in the build is not a verdict
     # about the mutant.
-    b = run("timeout 900 cargo build --lib --tests 2>&1")
-    if "error[E" in (b.stdout + b.stderr) or "could not compile" in (b.stdout + b.stderr):
-        return False, {t: "BUILD ERROR" for t in tests}
+    # **Build only the target under test.** `cargo build --lib --tests` relinks all ~75 integration
+    # binaries after every mutation — measured at over ten minutes each on this machine at load 5 —
+    # and every mutant here needs exactly one of them. `--no-run` is what makes it a build.
+    targets = {
+        "--test integration_durable_tel" if t.startswith("itest:") else "--lib" for t in tests
+    }
+    for tgt in targets:
+        b = run(f"timeout 900 cargo test {tgt} --no-run 2>&1")
+        if "error[E" in (b.stdout + b.stderr) or "could not compile" in (b.stdout + b.stderr):
+            return False, {t: "BUILD ERROR" for t in tests}
 
     verdicts = {}
     for t in tests:
@@ -204,6 +211,7 @@ def named_tests_fail(tests):
 
 
 def main():
+    only = set(sys.argv[1:])
     if run("git status --porcelain -- src/ tests/").stdout.strip():
         print("REFUSING: src/ or tests/ is dirty; commit first so a restore is exact.")
         return 2
@@ -217,6 +225,8 @@ def main():
 
     rows = []
     for name, path, find, repl, tests in MUTANTS:
+        if only and name not in only:
+            continue
         src = open(path).read()
         n = src.count(find)
         if n != 1:
