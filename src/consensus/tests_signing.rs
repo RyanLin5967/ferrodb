@@ -707,6 +707,75 @@ fn a_symlink_cannot_launder_a_key_out_of_a_world_writable_directory() {
 
 #[cfg(unix)]
 #[test]
+fn no_hop_of_the_symlink_chain_escapes_the_directory_rule() {
+    // **This broke my first fix, deterministically, and an adversarial pass found it.** Checking
+    // the path as given and the canonicalised path checks the two ENDPOINTS of resolution and no
+    // hop in between — and `canonicalize` collapses the chain, so the middle is invisible to it:
+    //
+    //     safe/cluster.key   parent 0700   <- the path as given: checked
+    //       -> open/k        parent 0777   <- checked by NOBODY
+    //         -> known       parent 0700   <- the canonicalised path: checked
+    //
+    // What makes it worse than a wrong verdict is that **the attacker never authors a key file**.
+    // They rename a symlink over the middle name, pointing it at a file the node can already read,
+    // and the mode check passes because it inspects that file's own 0600. Nothing about ownership
+    // or mode can catch that; only the directory rule can, and it was not running on `open/`.
+    let root = tempfile::tempdir().unwrap();
+    let safe = root.path().join("safe");
+    let open = root.path().join("open");
+    let other = root.path().join("other");
+    for d in [&safe, &open, &other] {
+        std::fs::create_dir(d).unwrap();
+    }
+
+    // `known` is any file the node can already read: node-owned, 0600, in a private directory.
+    let known = write_key_file(&other, "known", &key_bytes(53));
+    let middle = open.join("k");
+    std::os::unix::fs::symlink(&known, &middle).unwrap();
+    let entry = safe.join("cluster.key");
+    std::os::unix::fs::symlink(&middle, &entry).unwrap();
+
+    chmod(&safe, 0o700);
+    chmod(&other, 0o700);
+
+    chmod(&open, 0o700);
+    let ok = Key::load(&entry).expect("every hop closed: the chain loads");
+    assert_eq!(ok.tag(b"probe"), a_key(53).tag(b"probe"), "and it is the key at the end of it");
+
+    // The only change is the MIDDLE hop's directory. Both endpoints are still 0700.
+    chmod(&open, 0o777);
+    let err = Key::load(&entry).expect_err(
+        "the middle hop sits in a 0777 directory: an attacker who can write there repoints it at \
+         any file this node can read, without ever authoring a key",
+    );
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    assert!(
+        err.to_string().contains("open"),
+        "the error must name the directory that is open, not one of the safe endpoints: {err}"
+    );
+    chmod(&open, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_cycle_is_refused_rather_than_followed() {
+    // The walk is bounded, so a cycle is a refusal instead of a hang or an ELOOP from somewhere
+    // deeper. Named here because the bound is the thing that makes the walk safe to write at all.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let err = Key::load(&a).expect_err("a symlink cycle must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("cycle") || text.contains("could not be inspected"),
+        "the refusal must say what it met: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_symlink_whose_own_directory_is_open_is_also_refused() {
     // The other direction of the same rule, and the reason both directories are checked rather
     // than just the resolved one: whoever can write to the LINK's directory can repoint the link

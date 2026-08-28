@@ -638,41 +638,82 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
 
 /// Every directory whose contents could be swapped for the key this path names.
 ///
-/// Deduplicated, because for an ordinary file the two are the same directory and reporting it twice
-/// would produce two identical refusals for one problem.
+/// **A walk of the resolution chain, hop by hop — not the two endpoints.** Checking only the
+/// endpoints was a fix that looked right and was broken deterministically by an adversarial pass:
+///
+/// ```text
+/// safe/cluster.key   parent 0700   <- the path as given: checked
+///   -> open/k        parent 0777   <- an intermediate name: checked by NOBODY
+///     -> known       parent 0700   <- the canonicalised path: checked
+/// ```
+///
+/// `canonicalize` collapses the whole chain, so its parent is the *final* target's directory and
+/// every hop between the two ends is invisible to it. An attacker who can write to `open/` renames
+/// a symlink over that middle name, pointing it at any file the node can already read — a rotated
+/// key, a fixture, a log — and the mode check passes, because it inspects that file's own `0600`.
+/// **The attacker never authors a key file at all**, so nothing about ownership or mode catches
+/// them: the lever is redirection, not authorship, and only the directory rule can stop it.
+///
+/// So every name in the chain has its directory checked, because every one of them is a name
+/// somebody with write access to its directory could repoint.
+///
+/// **This part is necessarily by NAME, and that is a real asymmetry worth stating.** The *mode*
+/// check is `fstat` on the descriptor the key is read from and cannot be raced. This cannot be:
+/// `std` offers no way to ask "which directory holds the inode behind this descriptor", so the
+/// chain is walked as strings. What that costs is a race — the chain could change between this walk
+/// and the open — and what it buys is the only defence against the redirection above. The race
+/// needs write access to a directory in the chain, which is exactly what this refuses.
 #[cfg(unix)]
 fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
+    /// Bounded so a symlink cycle is refused rather than looped on. `std` would report `ELOOP`
+    /// eventually; this reports it as what it is, before spending the syscalls.
+    const MAX_HOPS: usize = 40;
+
     let mut out: Vec<PathBuf> = Vec::new();
-
-    // The directory the NAME sits in. `Path::parent` of a bare relative name is `Some("")`, which
-    // means the CURRENT directory and not "there is no directory" — filtering that out as
-    // nothing-to-check made the *spelling* of the path decide whether this rule ran at all.
-    // `None` is the only case with genuinely nothing above it: a path that is a root.
-    match path.parent() {
-        None => {}
-        Some(p) if p.as_os_str().is_empty() => out.push(PathBuf::from(".")),
-        Some(p) => out.push(p.to_path_buf()),
-    }
-
-    // The directory the INODE sits in, which is a different directory exactly when a symlink is
-    // involved. Refused rather than skipped if the path cannot be resolved: this whole function
-    // exists to answer "who could swap this file", and a build that cannot resolve the name cannot
-    // answer it.
-    let real = fs::canonicalize(path).map_err(|e| {
-        FerroError::Io(format!(
-            "the consensus signing key at {} could not be resolved to a real path: {e}. Refused \
-             rather than assumed safe: a symlink's own directory says nothing about who can replace \
-             the file it points at, so the target's directory has to be inspected too.",
-            path.display()
-        ))
-    })?;
-    if let Some(p) = real.parent() {
-        let p = p.to_path_buf();
-        if !out.contains(&p) {
-            out.push(p);
+    let mut current = path.to_path_buf();
+    for hop in 0..MAX_HOPS {
+        // `Path::parent` of a bare relative name is `Some("")`, which means the CURRENT directory
+        // and NOT "there is no directory". Treating the empty parent as nothing-to-check made the
+        // *spelling* of the path decide whether this rule ran at all.
+        let dir = match current.parent() {
+            // A root. It has no parent to inspect, and it is not a file either, so the shape check
+            // has already refused it.
+            None => break,
+            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
+            Some(p) => p.to_path_buf(),
+        };
+        if !out.contains(&dir) {
+            out.push(dir.clone());
         }
+
+        // `symlink_metadata` does NOT follow, which is the point: this asks what `current` itself
+        // is, so a link is seen as a link rather than as the file at the end of it.
+        let link_meta = fs::symlink_metadata(&current).map_err(|e| {
+            FerroError::Io(format!(
+                "hop {hop} of the consensus signing key's path, {}, could not be inspected: {e}. \
+                 Refused rather than assumed safe: an unwalkable chain is one whose directories \
+                 cannot be shown to be closed.",
+                current.display()
+            ))
+        })?;
+        if !link_meta.file_type().is_symlink() {
+            return Ok(out);
+        }
+        let target = fs::read_link(&current).map_err(|e| {
+            FerroError::Io(format!(
+                "the symlink at {} could not be read: {e}",
+                current.display()
+            ))
+        })?;
+        // A relative target resolves against the directory the LINK sits in, not the process's cwd.
+        current = if target.is_absolute() { target } else { dir.join(target) };
     }
-    Ok(out)
+    Err(FerroError::Io(format!(
+        "the consensus signing key at {} is behind more than {MAX_HOPS} symlinks, or behind a \
+         cycle of them. Refused rather than followed: a chain nobody can walk is a chain whose \
+         directories nobody can show are closed.",
+        path.display()
+    )))
 }
 
 /// The mode rule for one directory holding a key.
