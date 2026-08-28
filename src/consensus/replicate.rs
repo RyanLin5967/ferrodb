@@ -366,10 +366,18 @@ fn fold_command(h: u64, c: &Command) -> u64 {
 /// about the pair and not about the payload: two nodes holding the same command at the same round
 /// under *different terms* are not the same log.
 fn fold_entry(prev: u64, e: &Entry) -> u64 {
-    let h = fold_command(fold_u64(fold_u64(prev, e.term), e.round), &e.command);
-    // Zero is reserved by `Body::AppendResp` for "not claiming anything", so a real digest must
-    // never be it. Substituted rather than asserted: a 1-in-2^64 collision that silently disarmed
-    // the detector would be indistinguishable from a refusal.
+    never_zero(fold_command(fold_u64(fold_u64(prev, e.term), e.round), &e.command))
+}
+
+/// Zero is reserved by [`Body::AppendResp`] for "not claiming anything", so a real digest must
+/// never be it.
+///
+/// Substituted rather than asserted: a 1-in-2^64 collision that silently disarmed the detector
+/// would be indistinguishable from a refusal, and a panic on it would take a node down for an
+/// arithmetic coincidence. A separate function because a branch folded into `fold_entry` can only
+/// be tested by finding a preimage of zero, which is the whole difficulty — here it is testable
+/// directly.
+fn never_zero(h: u64) -> u64 {
     if h == 0 { FNV_OFFSET } else { h }
 }
 
@@ -697,25 +705,29 @@ impl Consensus {
     /// inherited rounds from an earlier term and replicated them to a majority. Substituting
     /// `self.last_term` passes every ordinary test and commits an inherited round the moment the
     /// leader appends anything of its own — see the figure-8 tests.
-    fn advance_commit(&mut self, out: &mut Vec<Action>) {
+    ///
+    /// Returns whether the watermark moved, which also says whether every peer has just been sent
+    /// an `Append` carrying it.
+    fn advance_commit(&mut self, out: &mut Vec<Action>) -> bool {
         if self.role != Role::Leader {
-            return;
+            return false;
         }
         let q = self.quorum_matched();
         if q <= self.commit {
-            return;
+            return false;
         }
         if self.term_at(q) != Some(self.hard.term) {
             // An inherited round on a majority is *not* committed. It becomes committed — with
             // every round below it — as a side effect of the first round of this leader's own term
             // reaching a majority, because `commit` is a watermark and not a set.
-            return;
+            return false;
         }
         self.commit = q;
         self.advance_apply(out);
         // The followers cannot apply what they do not know is committed, and `commit` only travels
         // on an `Append`.
         self.bcast_append(out);
+        true
     }
 
     /// Hand the storage engine everything that is both committed and durable **here**.
@@ -1025,6 +1037,7 @@ impl Consensus {
         }
 
         let p = self.progress.entry(from).or_default();
+        let before = p.matched;
         // Monotonic, for the reason `AckTracker::record` gives: a durability promise that can be
         // withdrawn after the fact is not a promise. Sound because an acknowledgement claims only
         // the prefix established with THIS leader (see `acknowledgement`) and `matched` is reset
@@ -1037,8 +1050,19 @@ impl Consensus {
         // answer must not undo a back-up the leader has already made.
         p.next = p.next.max(p.matched + 1);
         p.needs_snapshot = false;
+        let advanced = p.matched > before;
 
-        self.advance_commit(out);
+        // **Keep sending while the peer is still behind.** One `Append` carries at most
+        // `MAX_ENTRIES_PER_APPEND`, so a peer that is a thousand rounds behind needs many; waiting
+        // for the next heartbeat between each turns a repair that should take milliseconds into
+        // one heartbeat interval per batch. `advance_commit` has already sent every peer an
+        // `Append` if the watermark moved, so this fires only when it did not.
+        //
+        // Gated on this acknowledgement having actually moved `matched`: re-sending on an ack that
+        // told the leader nothing new would answer a duplicate with a duplicate, for ever.
+        if !self.advance_commit(out) && advanced && self.progress[&from].matched < self.last_round {
+            self.send_append_to(from, out);
+        }
     }
 
     /// The caller made rounds durable. This is where an ack is emitted — never on receipt.

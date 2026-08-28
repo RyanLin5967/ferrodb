@@ -697,8 +697,14 @@ fn a_follower_refuses_to_truncate_a_committed_round() {
     let bad = Entry { term: 9, round: 2, command: wal(0x99) };
     let out = f.step(Event::Recv(append_msg(N1, N2, 9, 1, 1, vec![bad], 0)));
     assert!(truncations(&out).is_empty(), "a COMMITTED round was truncated");
-    let (ok, ..) = resp_of(&only_send(&out));
+    let (ok, matched, hint, _) = resp_of(&only_send(&out));
     assert!(!ok, "an append that would unmake a committed round was accepted");
+    assert_eq!(matched, 0);
+    assert_eq!(
+        hint, 3,
+        "the refusal must still move the leader, to the first round genuinely in question. A hint \
+         of 0 carries no information, so the leader would re-send the identical append for ever"
+    );
     assert_eq!(f.term_at(2), Some(2), "the committed entry was replaced");
 }
 
@@ -1217,4 +1223,315 @@ fn a_steady_heartbeat_does_not_announce_a_role_change_on_every_beat() {
         "a caller that starts and stops serving on RoleChanged would thrash once per heartbeat"
     );
     assert_eq!(f.since_heard, 0, "a heartbeat did not reset the election clock");
+}
+
+
+// -------------------------------------------------------------------------------------------
+// What an acknowledgement is allowed to claim. Every test below pins a defect an independent
+// adversarial review found in the first version of this file, each of which was reachable from
+// an ordinary leader change with no injected fault.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn a_follower_that_refused_an_append_does_not_acknowledge_it_afterwards() {
+    // The defect this pins, and it was a real one: `Event::Persisted` emitted an acknowledgement
+    // claiming the node's WHOLE durable log, with no regard for whether the append that log came
+    // from was this leader's -- or was even accepted. A node that was a leader a moment ago holds
+    // a durable tail its successor has never seen, and claiming it makes that successor count a
+    // phantom replica, commit a round only it holds, and hand it to the storage engine.
+    let mut a = Consensus::new(N1, cfg3(), 101);
+    seed(&mut a, &[(1, wal(1)), (1, wal(2))]);
+    a.commit = 2;
+    a.applied = 2;
+    promote_bare(&mut a, 3);
+    let mut sink = Vec::new();
+    a.append_own_entry(Command::NoOp, &mut sink); // round 3, term 3
+    a.step(Event::Persisted { term: 3, round: 3 });
+
+    // B led term 2 and appended rounds 3 and 4 of its own; the fsync is still in flight.
+    let mut b = Consensus::new(N2, cfg3(), 102);
+    seed(&mut b, &[(1, wal(1)), (1, wal(2)), (2, Command::NoOp), (2, wal(4))]);
+    b.commit = 2;
+    b.applied = 2;
+    b.durable = 2;
+    b.role = Role::Follower;
+    b.leader = None;
+
+    // A's heartbeat is refused: B holds round 3 at term 2, not term 3.
+    let refusal = b.step(Event::Recv(append_msg(N1, N2, 3, 3, 3, vec![], 2)));
+    assert!(!resp_of(&only_send(&refusal)).0, "the setup is wrong: B did not refuse");
+    assert_eq!(b.last_round, 4, "B still holds its own tail; nothing was truncated");
+
+    // Now B's term-2 fsync completes.
+    let ack = b.step(Event::Persisted { term: 2, round: 4 });
+    assert_eq!(b.durable, 4, "the rounds really are durable on B");
+    let (ok, matched, _, digest) = resp_of(&only_send(&ack));
+    assert!(ok);
+    assert_eq!(
+        matched, 0,
+        "B acknowledged its own unreplicated tail to a leader that never sent it. Nothing has been \
+         established with this leader, so the only truthful claim is zero"
+    );
+    assert_eq!(digest, 0, "a claim of nothing carries no digest");
+
+    a.step(Event::Recv(resp_msg(N2, N1, 3, ok, matched, 0, digest)));
+    assert_eq!(a.progress[&N2].matched, 0);
+    assert_eq!(
+        a.commit_round(),
+        2,
+        "round 3 lives on this leader alone and was reported committed on a phantom replica"
+    );
+}
+
+#[test]
+fn an_acknowledgement_claims_only_the_prefix_the_append_established() {
+    // Raft's `matchIndex` is `prevLogIndex + len(entries)` -- what the append PROVED -- and not the
+    // follower's log length. They differ exactly when the follower holds a tail from some other
+    // leader.
+    let mut f = Consensus::new(N2, cfg3(), 103);
+    seed(&mut f, &[(1, wal(1)), (1, wal(2)), (1, wal(3))]);
+    follower_of(&mut f, 1, N1);
+    assert_eq!(f.durable, 3, "the follower really does hold three durable rounds");
+
+    let out = f.step(Event::Recv(append_msg(N1, N2, 1, 1, 1, vec![], 0)));
+    let (_, matched, ..) = resp_of(&only_send(&out));
+    assert_eq!(
+        matched, 1,
+        "the append established agreement through round 1 and no further. Claiming 3 tells the \
+         leader that rounds it has never sent are replicated"
+    );
+}
+
+#[test]
+fn an_acknowledgement_claims_durability_and_not_log_length() {
+    // The other half of rule 4, which no test pinned before: an entry appended but not yet fsynced
+    // is exactly the entry a power loss removes after it was counted into a quorum.
+    let mut f = Consensus::new(N2, cfg3(), 104);
+    follower_of(&mut f, 1, N1);
+    let e: Vec<Entry> =
+        (1..=3u64).map(|r| Entry { term: 1, round: r, command: wal(r as u8) }).collect();
+    f.step(Event::Recv(append_msg(N1, N2, 1, 0, 0, e, 0)));
+    assert_eq!(f.last_round, 3, "all three are in the log");
+
+    f.step(Event::Persisted { term: 1, round: 2 });
+    let out = f.step(Event::Recv(append_msg(N1, N2, 1, 3, 1, vec![], 0)));
+    let (_, matched, ..) = resp_of(&only_send(&out));
+    assert_eq!(
+        matched, 2,
+        "the append established agreement through round 3, but only rounds 1 and 2 are on the \
+         disk. An acknowledgement is the smaller of the two"
+    );
+}
+
+#[test]
+fn a_leader_ignores_an_acknowledgement_of_a_round_it_does_not_hold() {
+    // A peer cannot have matched a round this leader does not hold, and such an ack is the one
+    // place the divergence detector CANNOT fire -- `digest_at` has nothing to compare.
+    let mut c = Consensus::new(N1, cfg3(), 105);
+    seed(&mut c, &[(1, wal(1)), (1, wal(2))]);
+    promote_bare(&mut c, 1);
+    c.step(Event::Persisted { term: 1, round: 2 });
+
+    let out = c.step(Event::Recv(resp_msg(N2, N1, 1, true, 9, 0, 0x1234)));
+    assert!(out.is_empty(), "the leader acted on a claim about rounds it does not have");
+    assert_eq!(c.progress[&N2].matched, 0, "a round beyond this leader's own tail was counted");
+    assert_eq!(c.commit_round(), 0);
+}
+
+#[test]
+fn a_success_answer_never_pulls_next_backwards() {
+    let mut c = Consensus::new(N1, cfg3(), 106);
+    seed(&mut c, &[(1, wal(1)), (1, wal(2)), (1, wal(3))]);
+    promote_bare(&mut c, 1);
+    assert_eq!(c.progress[&N2].next, 4);
+
+    c.step(Event::Recv(resp_msg(N2, N1, 1, true, 0, 0, 0)));
+    assert_eq!(
+        c.progress[&N2].next, 4,
+        "a zero-matched success answer rewound the send cursor, so the leader re-sends a log the \
+         peer may already hold"
+    );
+}
+
+#[test]
+fn a_follower_does_not_commit_a_suffix_this_leader_never_sent() {
+    // `commit = min(leaderCommit, last NEW round)`, not `min(leaderCommit, own tail)`. The follower
+    // below holds a round 3 from a leader of term 2 that this leader has never seen; taking the
+    // watermark against its own tail applies that stale entry as though a quorum had agreed to it.
+    let mut f = Consensus::new(N2, cfg3(), 107);
+    seed(&mut f, &[(1, wal(1)), (1, wal(2)), (2, wal(0x33))]);
+    follower_of(&mut f, 5, N1);
+
+    let out = f.step(Event::Recv(append_msg(N1, N2, 5, 2, 1, vec![], 3)));
+    assert_eq!(
+        f.commit_round(),
+        2,
+        "the append established agreement through round 2. Round 3 is this follower's own stale \
+         suffix and no quorum ever agreed to it"
+    );
+    assert_eq!(applies(&out), vec![2], "a round no quorum committed was handed to the engine");
+}
+
+#[test]
+fn a_persisted_from_before_a_truncation_does_not_make_the_replacement_durable() {
+    // A round number does not name an entry. After a truncate-and-refill a DIFFERENT entry sits at
+    // that round, and the fsync now completing made the old one durable -- so taking it would ack,
+    // and let a leader commit, bytes that are not on this node's disk.
+    let mut f = Consensus::new(N2, cfg3(), 108);
+    seed(&mut f, &[(2, wal(1))]);
+    follower_of(&mut f, 2, N1);
+
+    // n1's round 2 is appended; its fsync is in flight.
+    f.step(Event::Recv(append_msg(N1, N2, 2, 1, 2, vec![Entry { term: 2, round: 2, command: wal(0xAA) }], 0)));
+    assert_eq!(f.durable, 1);
+
+    // n3 wins term 3 and replaces round 2 before that fsync lands.
+    let out = f.step(Event::Recv(append_msg(N3, N2, 3, 1, 2, vec![Entry { term: 3, round: 2, command: wal(0xBB) }], 0)));
+    assert_eq!(truncations(&out), vec![2]);
+    assert_eq!(f.term_at(2), Some(3), "the log now holds n3's entry at round 2");
+
+    // The stale report finally arrives. It is honest about n1's round 2 -- and n1's round 2 is gone.
+    let stale = f.step(Event::Persisted { term: 2, round: 2 });
+    assert_eq!(
+        f.durable, 1,
+        "a report from before the truncation was taken as durability for what replaced it"
+    );
+    assert_eq!(resp_of(&only_send(&stale)).1, 1, "and it must not be acknowledged either");
+
+    // The refill's own report is trusted.
+    let fresh = f.step(Event::Persisted { term: 3, round: 2 });
+    assert_eq!(f.durable, 2);
+    assert_eq!(resp_of(&only_send(&fresh)).1, 2);
+}
+
+#[test]
+fn a_replayed_refusal_does_not_demand_a_snapshot_from_a_healthy_peer() {
+    // F8 injects duplication deliberately. A refusal this leader has already acted on arrives a
+    // second time carrying the same hint; answering it with a snapshot demand silences a healthy
+    // peer permanently, because `send_append_to` then refuses to send it anything and only a
+    // successful acknowledgement -- which can no longer arrive -- clears the flag.
+    let mut c = Consensus::new(N1, cfg3(), 109);
+    seed(&mut c, &[(1, wal(1)), (1, wal(2)), (1, wal(3)), (1, wal(4)), (1, wal(5))]);
+    promote_bare(&mut c, 1);
+    assert_eq!(c.progress[&N2].next, 6);
+
+    let first = c.step(Event::Recv(resp_msg(N2, N1, 1, false, 0, 3, 0)));
+    assert_eq!(c.progress[&N2].next, 3);
+    assert_eq!(sends(&first).len(), 1, "the leader must back up and re-send once");
+
+    let replay = c.step(Event::Recv(resp_msg(N2, N1, 1, false, 0, 3, 0)));
+    assert!(replay.is_empty(), "a replayed refusal was acted on a second time");
+    assert!(
+        !c.progress[&N2].needs_snapshot,
+        "a healthy peer was marked as needing state transfer because a refusal arrived twice"
+    );
+    assert_eq!(c.progress[&N2].next, 3);
+}
+
+#[test]
+fn a_malformed_entry_list_is_refused_rather_than_aborting_the_process() {
+    // F7's own header says it proves the sender holds the key and NOT that the message is new, so a
+    // replayed or spliced frame reaches this code. An unchecked hole used to reach the log's
+    // contiguity assertion, so one message could abort any node in the cluster -- and the panic
+    // text blamed the local log.
+    let cases: Vec<(&str, Vec<Entry>)> = vec![
+        ("a batch that starts above prev_round + 1", vec![Entry { term: 1, round: 5, command: Command::NoOp }]),
+        (
+            "a hole inside the batch",
+            vec![
+                Entry { term: 1, round: 1, command: Command::NoOp },
+                Entry { term: 1, round: 3, command: Command::NoOp },
+            ],
+        ),
+        ("an entry claiming a term above the envelope", vec![Entry { term: 9, round: 1, command: Command::NoOp }]),
+    ];
+    for (what, entries) in cases {
+        let mut f = Consensus::new(N2, cfg3(), 110);
+        follower_of(&mut f, 1, N1);
+        let out = f.step(Event::Recv(append_msg(N1, N2, 1, 0, 0, entries, 0)));
+        let (ok, matched, hint, digest) = resp_of(&only_send(&out));
+        assert!(!ok, "{what} was accepted");
+        assert_eq!((matched, hint, digest), (0, 0, 0), "{what}: a malformed message is no evidence");
+        assert_eq!(f.last_round, 0, "{what} reached the log");
+        assert!(persisted_entries(&out).is_empty(), "{what} was handed to the disk");
+    }
+}
+
+#[test]
+fn a_divergence_deeper_than_one_batch_converges_without_a_livelock() {
+    // The fork is 200 rounds below the leader's tail and the batch cap is 64, so the repair takes
+    // several round trips. The first version of this file oscillated here for ever: the follower
+    // acknowledged its whole durable log, which put `next` straight back above the fork.
+    let mut leader = Consensus::new(N1, cfg3(), 111);
+    let mut log: Vec<(Term, Command)> = (0..100u8).map(|i| (1u64, wal(i))).collect();
+    log.extend((0..200u8).map(|i| (3u64, wal(i))));
+    seed(&mut leader, &log);
+    promote_bare(&mut leader, 3);
+
+    let mut f = Consensus::new(N2, cfg3(), 112);
+    let f_log: Vec<(Term, Command)> = (0..200u8).map(|i| (1u64, wal(i))).collect();
+    seed(&mut f, &f_log);
+    follower_of(&mut f, 1, N1);
+
+    assert_eq!((leader.last_round, f.last_round), (300, 200));
+    let msgs = catch_up(&mut leader, &mut f, 60);
+
+    assert_eq!(f.last_round, 300, "the follower did not converge in {msgs} messages");
+    assert_eq!(f.digest_at(300), leader.digest_at(300), "the logs converged to different bytes");
+    assert!(!leader.progress[&N2].needs_snapshot, "a repairable peer was sent to F6");
+    assert_eq!(leader.progress[&N2].matched, 300);
+    assert!(msgs < 60, "{msgs} messages for a 200-round repair at 64 entries a batch");
+}
+
+#[test]
+fn a_membership_entry_in_the_log_tells_this_node_its_configuration_is_stale() {
+    // The second seam into `election.rs`. Observing a newer configuration is not applying it --
+    // applying happens when the round commits, which is F5's row -- but a node that has SEEN one
+    // knows it is stale and must not campaign, or it fences a healthy leader out of office.
+    let mut f = Consensus::new(N2, cfg3(), 113);
+    follower_of(&mut f, 1, N1);
+    assert!(!f.behind);
+
+    let newer = Config::new([N1, N2, N3, N4], 2, 1);
+    let e = vec![Entry { term: 1, round: 1, command: Command::Membership { config: newer } }];
+    f.step(Event::Recv(append_msg(N1, N2, 1, 0, 0, e, 0)));
+    assert!(
+        f.behind,
+        "this node replicated a configuration newer than its own and still believed it could \
+         count a majority"
+    );
+    assert_eq!(f.config().version, 1, "observing a configuration must not apply it");
+}
+
+// -------------------------------------------------------------------------------------------
+// The digest, continued.
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn the_digest_is_chained_so_a_change_at_an_early_round_moves_every_later_one() {
+    // The whole point of a ROLLING digest: divergence at round 1 must still be visible at round
+    // 300, because that is the only round the leader and follower are comparing.
+    let mut a = Consensus::new(N1, cfg3(), 114);
+    let mut b = Consensus::new(N2, cfg3(), 115);
+    seed(&mut a, &[(1, wal(0xAA)), (1, wal(2)), (1, wal(3))]);
+    seed(&mut b, &[(1, wal(0xBB)), (1, wal(2)), (1, wal(3))]);
+
+    assert_ne!(a.digest_at(1), b.digest_at(1), "round 1 differs and must digest differently");
+    assert_ne!(
+        a.digest_at(3),
+        b.digest_at(3),
+        "rounds 2 and 3 are identical on both nodes, so an unchained digest agrees at round 3 and \
+         the detector never fires for a divergence that began two rounds earlier"
+    );
+}
+
+#[test]
+fn the_reserved_no_claim_value_is_never_produced_by_a_real_digest() {
+    // Zero means "not claiming anything" everywhere in `AppendResp`, so a fold that happened to
+    // land on zero would silently disarm the detector. Tested on the substitution directly,
+    // because finding an entry whose fold is zero is the difficulty itself.
+    assert_ne!(never_zero(0), 0, "the reserved value survived the substitution");
+    assert_eq!(never_zero(FNV_OFFSET), FNV_OFFSET, "a real digest was rewritten");
+    assert_eq!(never_zero(1), 1);
+    assert_eq!(never_zero(u64::MAX), u64::MAX);
 }
