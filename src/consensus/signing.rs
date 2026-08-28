@@ -129,10 +129,13 @@
 //!   anyway, unless this process is root — and `std` exposes no `geteuid`, so the comparison cannot
 //!   be made without a dependency. A cluster running its nodes as root and keeping its key in
 //!   another user's home directory is outside what this can detect.
-//! * **The ancestry above the immediate parent.** Only the directory holding the key is inspected.
-//!   The parent's own mode is read by *name* rather than through a descriptor, because `std` has no
-//!   portable `fstat`-on-a-directory. The key file itself is not: it is opened once and judged
-//!   through that handle, so the mode approved and the bytes taken cannot be two different files.
+//!
+//! The ancestry above the immediate parent **used** to be an unchecked dimension and is no longer:
+//! every component of the resolution is walked and every directory in it is inspected, because an
+//! adversarial pass showed that a symlink one level up redirects the key just as well as one at the
+//! end. What remains true is that the walk is by *name* — `std` cannot say which directory holds
+//! the inode behind a descriptor — while the *mode* check is `fstat` on the descriptor and cannot
+//! be raced.
 //!   A world-writable grandparent lets an attacker swap the whole directory. Checking every
 //!   ancestor was considered and not done: it refuses ordinary layouts for a threat that already
 //!   implies control of the filesystem.
@@ -636,84 +639,139 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
     Ok(())
 }
 
+/// One step of a path, owned so it can outlive the `Path` it came from.
+#[cfg(unix)]
+enum Step {
+    Root,
+    Here,
+    Up,
+    Name(std::ffi::OsString),
+}
+
+#[cfg(unix)]
+fn steps_of(p: &Path) -> Vec<Step> {
+    use std::path::Component;
+    p.components()
+        .map(|c| match c {
+            Component::RootDir => Step::Root,
+            Component::CurDir => Step::Here,
+            Component::ParentDir => Step::Up,
+            Component::Normal(n) => Step::Name(n.to_os_string()),
+            // Unreachable under `cfg(unix)`; a drive prefix is a Windows concept.
+            Component::Prefix(_) => Step::Here,
+        })
+        .collect()
+}
+
 /// Every directory whose contents could be swapped for the key this path names.
 ///
-/// **A walk of the resolution chain, hop by hop — not the two endpoints.** Checking only the
-/// endpoints was a fix that looked right and was broken deterministically by an adversarial pass:
+/// **A walk of every COMPONENT of the resolution, not of the final names in it.** This rule has
+/// been wrong twice, in the same direction both times, and the second correction is why it is now
+/// shaped like this rather than like a shortcut:
 ///
-/// ```text
-/// safe/cluster.key   parent 0700   <- the path as given: checked
-///   -> open/k        parent 0777   <- an intermediate name: checked by NOBODY
-///     -> known       parent 0700   <- the canonicalised path: checked
-/// ```
+/// 1. It first checked the path as given and the *canonicalised* path. `canonicalize` collapses the
+///    chain, so those are its two endpoints and every hop between them is invisible. An adversarial
+///    pass renamed a symlink over a middle name — `safe/k -> open/k -> known`, with `open` at 0777
+///    and both ends at 0700 — and pointed it at a file the node could already read.
+/// 2. It then walked the chain hop by hop, which closed that. The same pass broke it again with a
+///    symlink among the **directory** components: `symlink_metadata(name)` asks whether that final
+///    name is a link, and the kernel has already silently resolved every directory above it. With
+///    `a/k -> b/dl/real` and `b/dl -> c`, the directory `b` holds a link nobody looked at.
 ///
-/// `canonicalize` collapses the whole chain, so its parent is the *final* target's directory and
-/// every hop between the two ends is invisible to it. An attacker who can write to `open/` renames
-/// a symlink over that middle name, pointing it at any file the node can already read — a rotated
-/// key, a fixture, a log — and the mode check passes, because it inspects that file's own `0600`.
-/// **The attacker never authors a key file at all**, so nothing about ownership or mode catches
-/// them: the lever is redirection, not authorship, and only the directory rule can stop it.
+/// Both are the same mistake at different depths, and the fix that is not a third instance of it is
+/// to resolve the path the way the kernel does — one component at a time, from the root — and check
+/// the directory each component sits in. **The attacker never authors a key file** in any of these:
+/// they repoint a name they may write at a file the node can already read, so the mode rule passes
+/// on that file's own `0600`. Only the directory rule can stop redirection, and it can only stop it
+/// where it actually looks.
 ///
-/// So every name in the chain has its directory checked, because every one of them is a name
-/// somebody with write access to its directory could repoint.
+/// **This checks the whole ancestry, and that is a deliberate change from an earlier stated limit.**
+/// A group- or world-writable directory anywhere above the key — not merely its immediate parent —
+/// is now a refusal, because an attacker who can write to `/usr/local` can replace `/usr/local/etc`
+/// and redirect everything below it. It is the rule OpenSSH's `StrictModes` applies, for this
+/// reason. The cost is real and accepted: a key under a group-writable prefix is refused rather than
+/// warned about, and the error names the directory and the `chmod`.
 ///
-/// **This part is necessarily by NAME, and that is a real asymmetry worth stating.** The *mode*
-/// check is `fstat` on the descriptor the key is read from and cannot be raced. This cannot be:
-/// `std` offers no way to ask "which directory holds the inode behind this descriptor", so the
-/// chain is walked as strings. What that costs is a race — the chain could change between this walk
-/// and the open — and what it buys is the only defence against the redirection above. The race
-/// needs write access to a directory in the chain, which is exactly what this refuses.
+/// **What remains by NAME, and it is an asymmetry worth stating.** The *mode* check is `fstat` on
+/// the descriptor the key is read from and cannot be raced. This cannot be: `std` offers no way to
+/// ask which directory holds the inode behind a descriptor, so the walk is strings. Winning that
+/// race needs write access to a directory in the chain — which is exactly what this refuses.
 #[cfg(unix)]
 fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
-    /// Bounded so a symlink cycle is refused rather than looped on. `std` would report `ELOOP`
-    /// eventually; this reports it as what it is, before spending the syscalls.
+    use std::collections::VecDeque;
+
+    /// Bounded so a symlink cycle is refused rather than looped on.
     const MAX_HOPS: usize = 40;
 
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut current = path.to_path_buf();
-    for hop in 0..MAX_HOPS {
-        // `Path::parent` of a bare relative name is `Some("")`, which means the CURRENT directory
-        // and NOT "there is no directory". Treating the empty parent as nothing-to-check made the
-        // *spelling* of the path decide whether this rule ran at all.
-        let dir = match current.parent() {
-            // A root. It has no parent to inspect, and it is not a file either, so the shape check
-            // has already refused it.
-            None => break,
-            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
-            Some(p) => p.to_path_buf(),
-        };
-        if !out.contains(&dir) {
-            out.push(dir.clone());
-        }
+    let mut checked: Vec<PathBuf> = Vec::new();
+    // The prefix resolved so far. Empty means "relative to the process's current directory".
+    let mut resolved = PathBuf::new();
+    let mut queue: VecDeque<Step> = steps_of(path).into();
+    let mut hops = 0usize;
 
-        // `symlink_metadata` does NOT follow, which is the point: this asks what `current` itself
-        // is, so a link is seen as a link rather than as the file at the end of it.
-        let link_meta = fs::symlink_metadata(&current).map_err(|e| {
-            FerroError::Io(format!(
-                "hop {hop} of the consensus signing key's path, {}, could not be inspected: {e}. \
-                 Refused rather than assumed safe: an unwalkable chain is one whose directories \
-                 cannot be shown to be closed.",
-                current.display()
-            ))
-        })?;
-        if !link_meta.file_type().is_symlink() {
-            return Ok(out);
+    while let Some(step) = queue.pop_front() {
+        match step {
+            Step::Root => resolved = PathBuf::from("/"),
+            Step::Here => {
+                if resolved.as_os_str().is_empty() {
+                    resolved = PathBuf::from(".");
+                }
+            }
+            // Kept literally rather than popped. Popping is only correct for a path with no
+            // leading `..` and no `..` immediately after a symlink, and getting that wrong would
+            // silently inspect a directory that has nothing to do with the chain. `..` in a string
+            // is resolved by the kernel when the string is stat'd, which is the behaviour wanted;
+            // the directory it denotes is one this walk has already checked on the way down.
+            Step::Up => resolved.push(".."),
+            Step::Name(name) => {
+                let dir = if resolved.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    resolved.clone()
+                };
+                if !checked.contains(&dir) {
+                    checked.push(dir.clone());
+                }
+                let here = dir.join(&name);
+                // Does NOT follow, which is the point: this asks what `here` itself is, so a link
+                // is seen as a link rather than as the file at the end of it.
+                let link_meta = fs::symlink_metadata(&here).map_err(|e| {
+                    FerroError::Io(format!(
+                        "{} — a component of the consensus signing key's path — could not be \
+                         inspected: {e}. Refused rather than assumed safe: a path that cannot be \
+                         walked is one whose directories cannot be shown to be closed.",
+                        here.display()
+                    ))
+                })?;
+                if link_meta.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > MAX_HOPS {
+                        return Err(FerroError::Io(format!(
+                            "the consensus signing key at {} is behind more than {MAX_HOPS} \
+                             symlinks, or behind a cycle of them. Refused rather than followed: a \
+                             chain nobody can walk is a chain whose directories nobody can show \
+                             are closed.",
+                            path.display()
+                        )));
+                    }
+                    let target = fs::read_link(&here).map_err(|e| {
+                        FerroError::Io(format!("the symlink at {} could not be read: {e}", here.display()))
+                    })?;
+                    // An absolute target restarts the walk at the root; a relative one continues
+                    // from the directory the LINK sits in, never from the process's cwd.
+                    if target.is_absolute() {
+                        resolved = PathBuf::new();
+                    }
+                    for step in steps_of(&target).into_iter().rev() {
+                        queue.push_front(step);
+                    }
+                } else {
+                    resolved = here;
+                }
+            }
         }
-        let target = fs::read_link(&current).map_err(|e| {
-            FerroError::Io(format!(
-                "the symlink at {} could not be read: {e}",
-                current.display()
-            ))
-        })?;
-        // A relative target resolves against the directory the LINK sits in, not the process's cwd.
-        current = if target.is_absolute() { target } else { dir.join(target) };
     }
-    Err(FerroError::Io(format!(
-        "the consensus signing key at {} is behind more than {MAX_HOPS} symlinks, or behind a \
-         cycle of them. Refused rather than followed: a chain nobody can walk is a chain whose \
-         directories nobody can show are closed.",
-        path.display()
-    )))
+    Ok(checked)
 }
 
 /// The mode rule for one directory holding a key.
