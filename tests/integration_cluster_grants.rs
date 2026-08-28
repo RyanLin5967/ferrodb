@@ -589,6 +589,136 @@ fn the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote() {
 }
 
 // =================================================================================================
+// THE FOURTH DECISION — found by sweeping `fetch_add` across src/, not by the brief.
+//
+// `consensus::Command::Checkpoint` exists and its own doc names the hole: "`TxnManager` checkpoints
+// on a node-local counter and calls `wal.truncate`; two nodes doing that at different moments have
+// different WAL byte streams from then on." That counter is in a file this row owns.
+// =================================================================================================
+
+/// Enough commits to cross `checkpoint_interval()` (256 by default). Driven for real rather than by
+/// forcing the interval down: `FERRODB_CHECKPOINT_INTERVAL` is read once per process through a
+/// `OnceLock`, and `std::env::set_var` is `unsafe` on edition 2024, so a test that tried to shrink
+/// it would either be ignored or poison every sibling in this binary.
+fn commit_until_checkpoint_is_due(txn: &TxnManager) {
+    for _ in 0..300 {
+        let t = txn.begin().expect("a standalone/granted node must be able to begin");
+        txn.commit(t).expect("commit");
+    }
+}
+
+#[test]
+fn a_standalone_node_still_checkpoints_on_its_own_commit_counter() {
+    let _scope = ClusterScope::standalone();
+    let e = engine("ckpt_solo");
+    let base_before = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    commit_until_checkpoint_is_due(&e.txn);
+    let base_after = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        base_after > base_before,
+        "single-node auto-checkpointing stopped working: base_lsn {base_before} -> {base_after}"
+    );
+    assert!(!e.txn.checkpoint_due(), "the counter was not reset by the checkpoint it fired");
+}
+
+#[test]
+fn a_cluster_member_does_not_truncate_its_wal_on_its_own_commit_counter() {
+    let e = engine("ckpt_member");
+    let _scope = ClusterScope::joined(N1);
+    e.txn.apply_txn_id_grant(N1, 1, 1_000).unwrap();
+
+    let base_before = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    commit_until_checkpoint_is_due(&e.txn);
+    let base_after = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        base_after, base_before,
+        "a cluster member truncated its WAL on a node-local counter; two nodes doing that at \
+         different moments have different byte streams from then on"
+    );
+    // Deferred, not dropped: the counter is over the threshold and says so, which is how a leader
+    // loop knows to propose `Command::Checkpoint`.
+    assert!(e.txn.checkpoint_due(), "the withheld checkpoint was forgotten rather than deferred");
+}
+
+#[test]
+fn a_replicated_checkpoint_command_is_what_truncates_on_a_member() {
+    let e = engine("ckpt_applied");
+    let _scope = ClusterScope::joined(N1);
+    e.txn.apply_txn_id_grant(N1, 1, 1_000).unwrap();
+    commit_until_checkpoint_is_due(&e.txn);
+    let base_before = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(e.txn.checkpoint_due());
+
+    e.txn.apply_checkpoint().unwrap();
+
+    let base_after = e.txn.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        base_after > base_before,
+        "applying Command::Checkpoint did not truncate: base_lsn {base_before} -> {base_after}"
+    );
+    assert!(!e.txn.checkpoint_due(), "the applied checkpoint did not reset the counter");
+}
+
+// =================================================================================================
+// THE INVARIANT THAT MAKES reserve()'s ORDER SAFE
+// =================================================================================================
+
+#[test]
+fn an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name() {
+    // `reserve()` consumes the extent pages first and the arena id second, so a refusal on the id
+    // would strand a page range — pages consumed for an arena that was never created are a durable
+    // leak the leader cannot see and will not re-grant. It cannot happen because one grant carries
+    // `page_count` ids against `page_count / extent_pages` extents. That ratio is load-bearing, so
+    // it is pinned here rather than left in a comment.
+    let s = store("grant_ratio");
+    let _scope = ClusterScope::joined(N1);
+    s.store.apply_arena_grant(N1, 30_000, 4 * ARENA_EXTENT_PAGES).unwrap();
+    assert_eq!(s.store.grantable_extents(), 4);
+
+    // Claim every extent the grant allows; the id counter must never be what runs out.
+    let mut parent = BranchId::TRUNK;
+    let mut ids = Vec::new();
+    for k in 0..4 {
+        let a = s.store.arena_for(parent).unwrap_or_else(|e| {
+            panic!("the arena-id counter ran out before the page counter at extent {k}: {e}")
+        });
+        ids.push(a);
+        parent = s.catalog.fork(parent, LeaseDeadline(u64::MAX / 2)).unwrap().branch_id;
+    }
+    assert_eq!(ids.len(), 4);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "arena ids were not issued in increasing order");
+    sorted.dedup();
+    assert_eq!(sorted.len(), 4, "an arena id was issued twice");
+
+    // The page counter is the binding constraint, and it is what refuses.
+    let err = s.store.arena_for(parent).unwrap_err();
+    assert!(
+        format!("{err}").contains("extent-start"),
+        "the refusal came from the id counter, not the page counter: {err}"
+    );
+}
+
+#[test]
+fn an_authority_change_is_noticed_by_the_counters_and_not_merely_survived() {
+    // The epoch is observed, so a leader loop and the guard cannot disagree about what a node holds.
+    let s = store("epoch_observed");
+    {
+        let _solo = ClusterScope::standalone();
+        s.store.arena_for(BranchId::TRUNK).unwrap();
+    }
+    let _scope = ClusterScope::joined(N1);
+    // A grant above the standalone watermark is accepted, which is the liveness half: the old
+    // era's high-water must not swallow it.
+    s.store.apply_arena_grant(N1, 50_000, 2 * ARENA_EXTENT_PAGES).unwrap();
+    assert_eq!(s.store.grantable_extents(), 2, "the new leader's grant was swallowed");
+    let b = s.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX / 2)).unwrap();
+    let a = s.store.arena_for(b.branch_id).unwrap();
+    assert_eq!(s.store.extent_range(a).map(|r| r.0), Some(50_000));
+}
+
+// =================================================================================================
 // THE SEAM — the appliers are what a consensus Apply action calls.
 // =================================================================================================
 

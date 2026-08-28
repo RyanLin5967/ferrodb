@@ -20,8 +20,23 @@
 - One real bug the tests caught: `GrantedCounter::remaining()` counted stale-epoch ranges the
   guard would refuse. Fixed to filter by epoch.
 
+- Two defects found by re-reading my own code, both fixed and pinned:
+  (a) `accepted_through` was not reset on an authority change, so the old membership's high-water
+      kept clamping the new leader's grants -> a node could refuse space it legitimately held.
+      Reset floor is `issued`, never lower, because that is the record of what was handed out.
+  (b) `reserve()`'s comment stated the stranding direction backwards. Fixed, and the invariant that
+      makes the order safe (one grant carries `page_count` ids vs `page_count/extent_pages`
+      extents) is now pinned by a test instead of assumed.
+- FOURTH node-local decision found by sweeping `fetch_add` across src/, not named in the brief:
+  `txn.rs` `commits_since_checkpoint` fires `wal.truncate` on a node-local counter, which is exactly
+  the hole `Command::Checkpoint`'s own doc names. Guarded (automatic trigger withheld on a member,
+  deferred not dropped) with `apply_checkpoint()` as the replicated entry point.
+- 25 rule tests + 31 integration tests green.
+- Mutation run 1 stopped early (fleet CPU starvation, ~2.5 min/mutant); 5/5 verdicts KILLED, banked
+  in scratchpad/f4-mutants-partial-run1.txt. The kill DID leave a mutated file, caught and restored.
+
 ## Doing now
-Mutation sweep: `scratchpad/f4_mutants.py` breaks each rule, runs its named test, restores.
+Re-running the mutation sweep against final code, grouped by mutation to halve the rebuilds.
 
 ## Next action
-Run `python3 scratchpad/f4_mutants.py`, then the full suite, then the summary.
+Run the grouped sweep, then tools/verify-suite.sh, then read the adversary, then the summary.

@@ -154,13 +154,81 @@ fn ranges_from_a_superseded_authority_are_not_issued_from() {
 }
 
 #[test]
+fn an_authority_change_stops_the_old_high_water_clamping_the_new_leaders_grants() {
+    // The liveness half of the epoch rule, and a real defect for a while. `accepted_through` is the
+    // highest `hi` ever accepted; carried across a leave/join it kept clamping the NEW leader's
+    // grants against the OLD membership's high-water, so the node refused a range it legitimately
+    // held and then never allocated again. Safety was never at risk — it only ever refuses — but a
+    // guard that deadlocks liveness is still wrong.
+    let mut g = member("extent-page", 0);
+    g.apply_grant(N1, 10_000, 20_000, Authority::Member(N1), 1).unwrap();
+    assert_eq!(g.take(1, Authority::Member(N1), 1).unwrap(), 10_000);
+    assert_eq!(g.accepted_through, 20_000, "fixture: nothing was accepted, so this proves nothing");
+    assert_eq!(g.issued, 10_001);
+
+    // Epoch 2: a different membership. A new leader that knows nothing of the old era grants a
+    // range ABOVE what this node has issued but BELOW the old high-water. That is the whole
+    // defect: the old `accepted_through` of 20_000 used to swallow this as a duplicate, and the
+    // node then refused every allocation for ever while holding a grant it had been given.
+    assert_eq!(
+        g.apply_grant(N1, 12_000, 13_000, Authority::Member(N1), 2).unwrap(),
+        Applied::Accepted { usable: 1_000 },
+        "the old authority's high-water swallowed the new leader's grant"
+    );
+    assert_eq!(g.take(1, Authority::Member(N1), 2).unwrap(), 12_000);
+
+    // And the floor still holds: a grant wholly below the issued watermark is still a duplicate,
+    // whatever the authority. Those values are in this node's own durable data.
+    assert_eq!(
+        g.apply_grant(N1, 5_000, 6_000, Authority::Member(N1), 3).unwrap(),
+        Applied::Duplicate,
+        "a range below the issued watermark was accepted and will re-issue"
+    );
+}
+
+#[test]
+fn an_authority_change_never_lowers_the_issued_watermark() {
+    // The safety half of the same rule: `issued` is the floor and is never lowered, because it is
+    // the record of which values were already handed out.
+    let mut g = member("txn-id", 0);
+    g.apply_grant(N1, 100, 200, Authority::Member(N1), 1).unwrap();
+    assert_eq!(g.take(1, Authority::Member(N1), 1).unwrap(), 100);
+    assert_eq!(g.issued, 101);
+    // A new authority, then a grant reaching back below the watermark.
+    g.apply_grant(N1, 50, 300, Authority::Member(N1), 2).unwrap();
+    assert_eq!(g.issued, 101, "the watermark was lowered and will re-issue an id");
+    assert_eq!(
+        g.take(1, Authority::Member(N1), 2).unwrap(),
+        101,
+        "a value at or below the watermark was issued a second time"
+    );
+}
+
+#[test]
 fn a_grant_from_a_previous_epoch_is_not_issued_from_after_leaving() {
     let mut g = member("txn-id", 1);
     g.apply_grant(N1, 100, 200, Authority::Member(N1), 1).unwrap();
     assert_eq!(g.take(1, Authority::Member(N1), 1).unwrap(), 100);
-    // Left the cluster: epoch 2, standalone. The leader's range is no longer ours to issue.
+    assert_eq!(g.remaining_values(1), 99, "fixture: nothing is held, so this proves nothing");
+
+    // Left the cluster: epoch 2, standalone. The leader's *range* is gone — the held vector is
+    // cleared — so what comes back is a fresh self-grant, not the tail of somebody else's grant.
     let v = g.take(1, Authority::Standalone, 2).unwrap();
-    assert!(v >= 200, "a standalone self-grant must start above everything already accepted, got {v}");
+    assert!(
+        v >= g.issued - 1,
+        "a self-grant re-issued a value at or below the watermark, got {v}"
+    );
+    assert_eq!(v, 101, "the self-grant did not resume at the issued watermark");
+
+    // The watermark is the floor and the ONLY floor. It is not `accepted_through`: after an
+    // authority change that field describes a membership this node has left, and keeping it as the
+    // floor is what used to make the node refuse space it legitimately held. Safety is carried by
+    // `issued`, which is the record of what was actually handed out — and 100 is never seen again.
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(100u64);
+    for _ in 0..50 {
+        assert!(seen.insert(g.take(1, Authority::Standalone, 2).unwrap()), "a value repeated");
+    }
 }
 
 // ---- two nodes, which is the whole point --------------------------------------------------------

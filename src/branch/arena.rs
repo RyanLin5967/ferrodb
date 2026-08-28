@@ -118,10 +118,20 @@ struct ArenaSpaceManager {
 impl ArenaSpaceManager {
     /// Take one extent's worth of pages and one arena id, or refuse.
     ///
-    /// Both takes can refuse and neither is retried against a local counter. The arena id is taken
-    /// **after** the pages so that a refusal on the id does not strand a page range: an unused
-    /// grant range is still this node's, but a page range consumed for an arena that was never
-    /// created would be a durable leak the leader cannot see.
+    /// Both takes can refuse and neither is retried against a local counter.
+    ///
+    /// # The order, and the invariant that makes it safe
+    ///
+    /// The pages are consumed first and the id second, so in principle a refusal on the *id* would
+    /// strand a page range: an unused arena id costs one number, but pages consumed for an arena
+    /// that was never created are a durable leak the leader cannot see and will not re-grant.
+    ///
+    /// That cannot happen, and the reason is an invariant worth stating rather than relying on.
+    /// [`ArenaPageStore::apply_arena_grant`] grants `page_count` arena ids alongside `page_count`
+    /// pages, while one reserve consumes `extent_pages` pages against a single id — so ids
+    /// outnumber the extents they can name by `extent_pages` to one, and the page counter is always
+    /// the binding constraint. Pinned by
+    /// `an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name`.
     fn reserve(&self) -> Result<(ArenaId, PageId), FerroError> {
         let epoch = crate::cluster::epoch();
         let start = match self.recycled_start(epoch) {

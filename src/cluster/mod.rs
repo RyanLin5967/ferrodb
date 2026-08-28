@@ -338,13 +338,14 @@ fn local_wall_millis() -> u64 {
 // ---- the granted counter -----------------------------------------------------------------------
 
 /// A half-open range of values this node may issue.
+///
+/// Carries no epoch: the epoch lives once on [`Grants`], because every range in `held` was granted
+/// under the same authority — a change of authority clears the whole vector. Stamping each range
+/// separately was two places to get one fact right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held {
     lo: u64,
     hi: u64,
-    /// The authority epoch this range was granted under. A range from a stale epoch is not this
-    /// node's to issue from — see the module header.
-    epoch: AuthorityEpoch,
 }
 
 /// What [`Grants::apply_grant`] did with an entry.
@@ -376,17 +377,42 @@ struct Grants {
     issued: u64,
     /// How much a standalone node takes for itself when it runs dry.
     chunk: u64,
+    /// The authority epoch every range in `held` was granted under, and that `accepted_through`
+    /// describes. See [`Grants::observe_epoch`].
+    epoch: AuthorityEpoch,
 }
 
 impl Grants {
     fn new(counter: &'static str, start: u64, chunk: u64) -> Self {
         assert!(chunk > 0, "a self-grant chunk of 0 would never satisfy a take");
-        Grants { counter, held: Vec::new(), accepted_through: start, issued: start, chunk }
+        Grants { counter, held: Vec::new(), accepted_through: start, issued: start, chunk, epoch: 0 }
     }
 
-    /// Drop ranges granted under a superseded authority. See the module header.
-    fn evict_stale(&mut self, now_epoch: AuthorityEpoch) {
-        self.held.retain(|h| h.epoch == now_epoch);
+    /// Notice an authority change, and forget everything that belonged to the old one.
+    ///
+    /// Two things are dropped, for two different reasons.
+    ///
+    /// **`held`**, because a range granted under a superseded authority is not this node's to issue
+    /// from: a store that self-granted pages `[256, 512)` while standalone, in a process that then
+    /// joins a cluster, is sitting on space no leader knows it has and will hand to somebody else.
+    ///
+    /// **`accepted_through` down to `issued`**, which is the subtler half and was a defect for a
+    /// while. That field is the highest `hi` ever accepted, and it does two jobs — recognising a
+    /// re-delivered grant, and clamping a grant that reaches below what this node already issued.
+    /// Both are statements *about the authority that issued those ranges*. Carried across a
+    /// `leave()`/`join()` it keeps clamping the NEW leader's grants against the old membership's
+    /// high-water, so the node refuses a range it legitimately holds and then never allocates
+    /// again. Safety was never at risk — it only ever refuses — but a guard that deadlocks
+    /// liveness is still a guard that is wrong.
+    ///
+    /// `issued` is the floor and is never lowered: safety here is "never issue a value twice", and
+    /// `issued` is the record of which values those are.
+    fn observe_epoch(&mut self, now_epoch: AuthorityEpoch) {
+        if self.epoch != now_epoch {
+            self.epoch = now_epoch;
+            self.held.clear();
+            self.accepted_through = self.issued;
+        }
     }
 
     /// Take `n` consecutive values, returning the first.
@@ -395,7 +421,7 @@ impl Grants {
     /// dropped**: `n` is 1 for ids and a whole extent for pages, so a narrow range can still answer
     /// a later id take, and dropping it would leak space no leader will grant again.
     fn take(&mut self, n: u64, auth: Authority, now_epoch: AuthorityEpoch) -> Result<u64, GrantError> {
-        self.evict_stale(now_epoch);
+        self.observe_epoch(now_epoch);
         if let Some(v) = self.take_from_held(n) {
             return Ok(v);
         }
@@ -406,7 +432,7 @@ impl Grants {
             Authority::Standalone => {
                 let lo = self.accepted_through.max(self.issued);
                 let hi = lo.saturating_add(self.chunk.max(n));
-                self.push_range(lo, hi, now_epoch);
+                self.push_range(lo, hi);
                 self.take_from_held(n).ok_or(GrantError::SpaceExhausted {
                     counter: self.counter,
                     issued_through: self.issued,
@@ -421,12 +447,14 @@ impl Grants {
 
     /// How many values are held and not yet issued **under `now_epoch`**.
     ///
-    /// The epoch filter is not decoration. Without it this reports space that [`Grants::take`]
-    /// would refuse — a diagnostic that disagrees with the guard, which is the worst kind: a
-    /// leader loop reading it would see a node as well supplied and never grant it anything, and
-    /// the node would refuse every allocation for ever.
-    fn remaining_values(&self, now_epoch: AuthorityEpoch) -> u64 {
-        self.held.iter().filter(|h| h.epoch == now_epoch).map(|h| h.hi - h.lo).sum()
+    /// Takes the epoch and applies it rather than reading `held` raw. Without that this reports
+    /// space [`Grants::take`] would refuse — a diagnostic that disagrees with the guard, which is
+    /// the worst kind: a leader loop reading it would see a node as well supplied and never grant
+    /// it anything, and the node would refuse every allocation for ever. Caught by
+    /// `space_a_node_self_granted_while_standalone_is_revoked_when_it_joins`.
+    fn remaining_values(&mut self, now_epoch: AuthorityEpoch) -> u64 {
+        self.observe_epoch(now_epoch);
+        self.held.iter().map(|h| h.hi - h.lo).sum()
     }
 
     fn take_from_held(&mut self, n: u64) -> Option<u64> {
@@ -441,9 +469,9 @@ impl Grants {
         Some(v)
     }
 
-    fn push_range(&mut self, lo: u64, hi: u64, epoch: AuthorityEpoch) {
+    fn push_range(&mut self, lo: u64, hi: u64) {
         if hi > lo {
-            self.held.push(Held { lo, hi, epoch });
+            self.held.push(Held { lo, hi });
             self.held.sort_unstable_by_key(|h| h.lo);
         }
         self.accepted_through = self.accepted_through.max(hi);
@@ -474,7 +502,7 @@ impl Grants {
         if hi <= lo {
             return Err(GrantError::EmptyRange { counter: self.counter, lo, hi });
         }
-        self.evict_stale(now_epoch);
+        self.observe_epoch(now_epoch);
 
         // Already applied in full. A committed round may be re-delivered, and re-adding a range
         // already issued from is how one page reaches two branches on a single node.
@@ -488,7 +516,7 @@ impl Grants {
         // the suffix. Refusing here would refuse every recovery of a partly-consumed grant.
         let lo = lo.max(self.accepted_through).max(self.issued);
         let usable = hi.saturating_sub(lo);
-        self.push_range(lo, hi, now_epoch);
+        self.push_range(lo, hi);
         Ok(Applied::Accepted { usable })
     }
 }
@@ -555,6 +583,12 @@ impl GrantedCounter {
     pub fn remaining(&self) -> u64 {
         let (_, ep) = authority_at();
         self.inner().remaining_values(ep)
+    }
+
+    /// The authority epoch this counter last acted under. Diagnostic, and how a test observes that
+    /// an authority change was noticed at all rather than merely not mattering yet.
+    pub fn observed_epoch(&self) -> AuthorityEpoch {
+        self.inner().epoch
     }
 }
 
