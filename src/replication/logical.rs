@@ -311,6 +311,22 @@ impl LogicalDecoder {
         LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
     }
 
+    /// ATTACK-ONLY (b7-atk-cursor worktree): add a second statically-known table, so a test can
+    /// decode two tables from any range without depending on a `CREATE TABLE` being inside it.
+    #[cfg(test)]
+    pub(crate) fn plus_table(
+        mut self,
+        dir_root: u32,
+        name: &str,
+        schema: Schema,
+        time_travel_root: u32,
+    ) -> Self {
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        self.tables.insert(dir_root, (name.to_string(), schema, Arc::new(columns)));
+        self.time_travel.insert(time_travel_root);
+        self
+    }
+
     /// A decoder that knows nothing at all.
     ///
     /// Useful on its own, because the log now carries `CREATE TABLE`: a blank decoder walking a
