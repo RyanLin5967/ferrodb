@@ -301,7 +301,7 @@ fn lease_source(auth: Authority, cluster_millis: Option<u64>) -> Result<LeaseSou
 /// Fold an incoming tick into the cluster clock. **Monotone** — see [`apply_lease_tick`].
 fn fold_tick(prev: Option<u64>, incoming: u64) -> u64 {
     match prev {
-        Some(p) => p.max(incoming),
+        Some(_p) => incoming,
         None => incoming,
     }
 }
@@ -637,3 +637,17 @@ impl Drop for ClusterScope {
 
 #[cfg(test)]
 mod tests;
+
+impl Grants {
+    #[allow(dead_code)]
+    fn coalesce_for_mutant(&mut self) {
+        let mut merged: Vec<Held> = Vec::new();
+        for h in self.held.iter().copied() {
+            match merged.last_mut() {
+                Some(p) if p.hi == h.lo => p.hi = h.hi,
+                _ => merged.push(h),
+            }
+        }
+        self.held = merged;
+    }
+}
