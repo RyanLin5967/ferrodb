@@ -171,8 +171,8 @@ MUTANTS = [
 
     ("M18", "an arena grant carries more ids than extents, so the page counter is what refuses",
      "src/branch/arena.rs",
-     "        self.space.arena_ids.apply_grant(node, lo, hi)?;",
-     "        self.space.arena_ids.apply_grant(node, lo, lo + (hi - lo) / ARENA_EXTENT_PAGES as u64)?;",
+     "        let ids = self.space.arena_ids.apply_grant(node, lo, hi)?;",
+     "        let ids = self.space.arena_ids.apply_grant(node, lo, lo + (hi - lo) / ARENA_EXTENT_PAGES as u64)?;",
      "--test integration_cluster_grants", "an_arena_grant_always_carries_more_ids"),
 
     ("M6", "the recycle stack is epoch-stamped too, being issued space outside the grant book",
@@ -239,6 +239,33 @@ MUTANTS = [
      "        let idx = self.held.iter().position(|h| h.hi - h.lo >= n)?;",
      "        self.coalesce_for_mutant();\n        let idx = self.held.iter().position(|h| h.hi - h.lo >= n)?;",
      "--lib", "cluster::tests::a_take_never_straddles_two_granted_ranges"),
+
+    ("M19", "arena_for does not serve an extent claimed under a superseded authority",
+     "src/branch/arena.rs",
+     "                if st.claim_epoch.get(&arena) == Some(&epoch) {",
+     "                if true {",
+     "--test integration_cluster_grants", "an_extent_claimed_under_a_superseded_authority"),
+
+    ("M20", "alloc_in_arena refuses an extent claimed under a superseded authority",
+     "src/branch/arena.rs",
+     "            if st.claim_epoch.get(&arena) != Some(&epoch) {",
+     "            if false {",
+     "--test integration_cluster_grants", "superseded_authority"),
+
+    ("M21", "an authority change also drops the per-arena recycled pages",
+     "src/branch/arena.rs",
+     """            st.current.clear();
+            st.claim_epoch.clear();
+            st.recycled.clear();""",
+     """            st.current.clear();
+            st.claim_epoch.clear();""",
+     "--test integration_cluster_grants", "a_recycled_page_inside_a_stale_extent"),
+
+    ("M22", "the fill fast path SURVIVES for a granted extent - the guard must not refuse everything",
+     "src/branch/arena.rs",
+     "        let epoch = self.revoke_stale_authority();\n        {\n            let st = self.state.lock().unwrap();\n            if let Some(&arena) = st.current.get(&branch) {",
+     "        let epoch = self.revoke_stale_authority();\n        let _ = epoch;\n        if false {\n            let st = self.state.lock().unwrap();\n            if let Some(&arena) = st.current.get(&branch) {",
+     "--test integration_cluster_grants", "a_granted_extent_is_filled_without_any_further_consensus"),
 
     ("M13", "the epoch-aware remaining() cannot disagree with the guard that refuses",
      "src/cluster/mod.rs",
