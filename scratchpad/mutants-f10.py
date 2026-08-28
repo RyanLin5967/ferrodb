@@ -19,6 +19,7 @@ import subprocess, sys, os, shutil, tempfile
 
 LOG = "src/tel/log.rs"
 TESTS = "src/tel/tests_durable_log.rs"
+ITEST = "tests/integration_durable_tel.rs"
 
 MUTANTS = [
     # (name, file, find, replace, tests that must fail)
@@ -98,10 +99,45 @@ MUTANTS = [
      "        out.reverse();",
      ["frames_come_back_in_sequence_order_per_branch"]),
 
+    # --- the rules the adversarial pass added ----------------------------------------------------
+    ("read-error-swallowed-as-end-of-file", LOG,
+     "            read_or_refuse(file, &mut rec, offset, name)?;",
+     "            if pread_all(file, &mut rec, offset).is_err() { break offset; }",
+     ["a_read_error_mid_file_refuses_the_open_and_destroys_nothing"]),
+
+    ("extend-drops-guards-and-claims", LOG,
+     "    put_tail(&mut body, &frame.ops[ops..], &frame.guards[guards..], &frame.claims[claims..])?;",
+     "    let _ = (guards, claims);\n    put_tail(&mut body, &frame.ops[ops..], &[], &[])?;",
+     ["a_growth_whose_tail_carries_guards_and_claims_replays_with_them"]),
+
+    ("nan-delta-breaks-a-retry", LOG,
+     "        (Delta::Float(x), Delta::Float(y)) => x.total_cmp(y) == std::cmp::Ordering::Equal,\n        _ => a == b,",
+     "        _ => a == b,",
+     ["a_nan_delta_does_not_turn_a_retry_into_a_contradiction"]),
+
+    ("non-canonical-boolean-accepted", LOG,
+     "            1 => Value::Boolean(true),",
+     "            1 | 2 => Value::Boolean(true),",
+     ["a_boolean_byte_that_is_neither_zero_nor_one_is_refused"]),
+
+    ("depth-refusal-walks-the-tree-it-refuses", LOG,
+     '                None => "it was synthesised and carries no source text".to_string(),',
+     '                None => owner.violated_predicate(),',
+     ["a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out"]),
+
     ("mem-replaces-instead-of-extending", LOG,
      "                    let stored = &mut frames[i];\n                    stored.ops.extend_from_slice(&frame.ops[ops..]);\n                    stored.guards.extend_from_slice(&frame.guards[guards..]);\n                    stored.claims.extend_from_slice(&frame.claims[claims..]);",
      "                    let _ = (ops, guards, claims);\n                    frames[i] = frame.clone();",
      ["retyping_a_stored_value_under_growth_cannot_split_the_two_stores"]),
+
+    # The integration test's own anti-vacuity. If the "durable" arm is quietly in-memory, every
+    # restart assertion in tests/integration_durable_tel.rs must fail — which is what stops that
+    # file from passing because a runtime happens to hold its frames in the same process.
+    ("the-durable-arm-is-secretly-in-memory", ITEST,
+     '        DurableEffectLog::default_for_database(db.to_str().unwrap()).unwrap()\n    } else {',
+     '        Arc::new(MemEffectLog::new())\n    } else {',
+     ["itest:an_agent_tasks_frames_and_its_merge_survive_a_process_restart",
+      "itest:wide_typed_values_survive_the_restart_with_their_bytes_intact"]),
 ]
 
 
@@ -136,7 +172,10 @@ def named_tests_fail(tests):
         # buys nothing but wall clock. The abort message reaches the pipe immediately, before the
         # hold, so it is still in `out` when the timeout fires; a timeout that carries it is a kill,
         # and one that carries nothing is reported as a timeout rather than counted either way.
-        r = run(f"timeout 200 cargo test --lib {t} 2>&1")
+        # An `itest:` prefix names a test in the integration target rather than the lib.
+        target = "--test integration_durable_tel" if t.startswith("itest:") else "--lib"
+        name = t[len("itest:"):] if t.startswith("itest:") else t
+        r = run(f"timeout 200 cargo test {target} {name} 2>&1")
         out = r.stdout + r.stderr
         timed_out = r.returncode == 124
         if "error[E" in out or "could not compile" in out:
