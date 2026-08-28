@@ -997,6 +997,14 @@ impl AgentRuntime {
         table: &str,
         action: &AlterAction,
     ) -> Result<(), FerroError> {
+        // CLOSURE EXPERIMENT (not for commit): govern ALTER by the envelope.
+        if let Some(envelope) = self.branches.envelope_of(branch)? {
+            if envelope.table(table_id(table).0).is_none() {
+                return Err(FerroError::Branch(format!(
+                    "the branch may not write table `{table}`"
+                )));
+            }
+        }
         let entry = catalog.require_table(table)?;
         let shared = entry.schema.clone();
         let row_count = catalog.stats.get(table).map(|s| s.row_count).unwrap_or(0);
