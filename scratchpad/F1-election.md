@@ -244,6 +244,17 @@ that is deliberate rather than an omission: during a membership change a voter's
 the leader's, and filtering there deadlocks the change. The disruption case is handled by the wall
 (`leader_is_live`) and by `may_campaign` on the asking side.
 
+## Measured against the committed tree, not the working directory
+
+```
+$ git archive HEAD | tar -x -C <fresh dir> && cd <fresh dir> && cargo test --lib consensus::
+running 45 tests
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 810 filtered out; finished in 0.02s
+EXIT=0
+```
+`git status --short -- src/ tests/ examples/` is empty, so nothing untracked is sitting on the import
+path — the usual way a deletion or a new module passes locally and fails for whoever receives it.
+
 ## Measured, not asserted
 
 * The leader demotes on tick **8** of silence (`lease`), with `election_base` **10** and every drawn
