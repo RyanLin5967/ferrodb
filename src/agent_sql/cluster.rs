@@ -86,7 +86,7 @@ use std::time::Duration;
 use crate::agent_sql::runtime::{AgentRuntime, ExecCtx, RunIdentity, DEFAULT_LEASE_MILLIS};
 use crate::agent_sql::session::AgentSession;
 use crate::agent_sql::MergeReport;
-use crate::branch::types::BranchId;
+use crate::branch::types::{BranchId, BranchState};
 use crate::consensus::node::{Applier, Node};
 use crate::consensus::{BranchOp, Command, Entry, NodeId, Round};
 use crate::error::FerroError;
@@ -1068,6 +1068,24 @@ impl ClusterAgents {
             return Err(FerroError::Merge(
                 "the trunk is the merge target, not a branch that can be merged".to_string(),
             ));
+        }
+
+        // **A held branch is held, on a cluster exactly as on one node.** `evaluate_merge` scores a
+        // branch without asking whether it may be merged at all, so a coordinator built out of
+        // evaluate-then-publish walks straight through quarantine — and a hold a merge can walk
+        // through is advisory, which is not a hold. Caught by
+        // `a_merge_the_gate_declines_costs_no_consensus_at_all`, which published a quarantined
+        // branch before this guard existed.
+        //
+        // The refusal itself is `AgentRuntime::merge`'s, reason and all: there is one copy of that
+        // wording and this is not a second.
+        if self.runtime.branches().get(branch)?.state == BranchState::Quarantined {
+            return match self.runtime.merge(ctx, branch) {
+                Err(e) => Err(e),
+                Ok(_) => Err(FerroError::Internal(format!(
+                    "{branch} is quarantined and AgentRuntime::merge published it anyway"
+                ))),
+            };
         }
 
         // A merge names a branch the cluster agreed exists. Ordinarily this has been true for as

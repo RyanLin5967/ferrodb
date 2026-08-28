@@ -501,3 +501,695 @@ fn a_branch_whose_owner_died_is_named_as_lost_work_and_its_merged_sibling_is_not
     assert!(!in_flight.rows_are_on(N1), "n1 believes it holds rows that only n2 ever had");
     assert_eq!(l.live_owned_by(N1), vec![mine], "n1's own branch was swept up as an orphan");
 }
+
+// =================================================================================================
+// A real runtime against a scripted log
+// =================================================================================================
+
+/// A single-node database with the whole agent surface on it.
+struct Db {
+    catalog: Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    runtime: Arc<AgentRuntime>,
+    _dir: tempfile::TempDir,
+}
+
+impl Db {
+    fn new() -> Db {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("f9.db"))
+            .unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Catalog::create(bp.clone()).unwrap();
+        let wal = Arc::new(WalManager::new(dir.path().join("f9.wal")).unwrap());
+        let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+        bp.attach_wal(wal);
+        Db { catalog, bp, txn, runtime: Arc::new(AgentRuntime::new()), _dir: dir }
+    }
+
+    fn session(&self) -> Session {
+        Session::with_runtime(self.runtime.clone())
+    }
+
+    fn exec(&mut self, sql: &str, s: &mut Session) -> Result<Outcome, FerroError> {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens()?;
+        let mut parser = Parser::new(tokens);
+        let mut stmts = parser.parse();
+        if !parser.errors.is_empty() {
+            return Err(FerroError::SqlParseError(
+                parser.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+            ));
+        }
+        assert_eq!(stmts.len(), 1, "expected one statement: {sql}");
+        run(stmts.remove(0), &mut self.catalog, self.bp.clone(), self.txn.clone(), s)
+    }
+
+    fn ok(&mut self, sql: &str, s: &mut Session) -> Outcome {
+        self.exec(sql, s).unwrap_or_else(|e| panic!("{sql} failed: {e}"))
+    }
+
+    fn seed(&mut self) {
+        let mut s = self.session();
+        self.ok("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut s);
+        self.ok("INSERT INTO inventory VALUES (1, 100);", &mut s);
+    }
+
+    fn main_qty(&mut self, id: i32) -> Option<i32> {
+        let mut s = self.session();
+        let sql = format!("SELECT qty FROM inventory WHERE id = {id};");
+        match self.ok(&sql, &mut s) {
+            Outcome::Rows(rows) => rows.first().and_then(|r| match r.first() {
+                Some(Value::Integer(i)) => Some(*i),
+                _ => None,
+            }),
+            _ => panic!("expected rows from: {sql}"),
+        }
+    }
+
+    /// Run a statement inside an agent session, exactly as a connection that said
+    /// `BEGIN AGENT SESSION` would: the write goes into the branch's private buffer and nothing
+    /// touches the shared tables.
+    fn on_branch(&mut self, cs: &ClusterSession, sql: &str) {
+        let mut s = self.session();
+        s.agent = Some(cs.session.clone());
+        self.ok(sql, &mut s);
+    }
+}
+
+/// **A log this test writes.**
+///
+/// Everything proposed is immediately committed, and `pump` hands one entry at a time to the
+/// ledger — so the interleaving that matters can be placed exactly rather than waited for.
+/// `inject` is the whole point: it puts a base-moving round between a gate's read and its merge's
+/// commit, on purpose, every run.
+struct Scripted {
+    node: NodeId,
+    ledger: Arc<Mutex<BranchLedger>>,
+    log: Mutex<Vec<Entry>>,
+    applied: Mutex<usize>,
+    /// Commands appended immediately *before* the next proposal. Drained unless `sticky`.
+    inject: Mutex<Vec<Command>>,
+    sticky: Mutex<bool>,
+    leader: Mutex<Option<NodeId>>,
+}
+
+impl Scripted {
+    fn new(node: NodeId, ledger: Arc<Mutex<BranchLedger>>) -> Arc<Scripted> {
+        Arc::new(Scripted {
+            node,
+            ledger,
+            log: Mutex::new(Vec::new()),
+            applied: Mutex::new(0),
+            inject: Mutex::new(Vec::new()),
+            sticky: Mutex::new(false),
+            leader: Mutex::new(Some(node)),
+        })
+    }
+
+    /// Land `c` immediately before whatever is proposed next — the race, scripted.
+    fn inject_before_next_proposal(&self, c: Command) {
+        lock(&self.inject).push(c);
+    }
+
+    /// Keep injecting before *every* proposal: a base under sustained write load.
+    fn inject_before_every_proposal(&self, c: Command) {
+        lock(&self.inject).push(c);
+        *lock(&self.sticky) = true;
+    }
+
+    fn step_down(&self) {
+        *lock(&self.leader) = Some(NodeId(99));
+    }
+
+    /// Apply everything proposed. Stands for the time an agent spends working after its fork.
+    fn settle(&self) {
+        loop {
+            let (a, n) = (*lock(&self.applied), lock(&self.log).len());
+            if a >= n {
+                return;
+            }
+            self.pump().unwrap();
+        }
+    }
+
+    fn log_commands(&self) -> Vec<Command> {
+        lock(&self.log).iter().map(|e| e.command.clone()).collect()
+    }
+}
+
+impl Replicated for Scripted {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        if *lock(&self.leader) != Some(self.node) {
+            return Err(FerroError::NotLeader { leader: None });
+        }
+        let injected: Vec<Command> = if *lock(&self.sticky) {
+            lock(&self.inject).clone()
+        } else {
+            lock(&self.inject).drain(..).collect()
+        };
+        let mut log = lock(&self.log);
+        for i in injected {
+            let r = log.len() as u64 + 1;
+            log.push(entry(r, i));
+        }
+        let r = log.len() as u64 + 1;
+        log.push(entry(r, c));
+        Ok(r)
+    }
+
+    fn committed_head(&self) -> Round {
+        lock(&self.log).len() as u64
+    }
+
+    fn pump(&self) -> Result<(), FerroError> {
+        let mut applied = lock(&self.applied);
+        let next = {
+            let log = lock(&self.log);
+            if *applied >= log.len() {
+                return Ok(());
+            }
+            log[*applied].clone()
+        };
+        lock(&self.ledger).apply(&next);
+        *applied += 1;
+        Ok(())
+    }
+
+    fn leader(&self) -> Option<NodeId> {
+        *lock(&self.leader)
+    }
+}
+
+/// A seeded database, a scripted log, and a coordinator over both.
+fn scripted_cluster() -> (Db, Arc<Scripted>, ClusterAgents) {
+    let mut db = Db::new();
+    db.seed();
+    let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+    let repl = Scripted::new(N1, ledger.clone());
+    let agents = ClusterAgents::new(N1, db.runtime.clone(), repl.clone(), ledger);
+    (db, repl, agents)
+}
+
+fn agent(name: &'static str) -> RunIdentity<'static> {
+    RunIdentity { agent_id: name, run_id: Some("r_1"), ..RunIdentity::default() }
+}
+
+/// **The headline.** A write commits between the gate's read and the merge's own round, so the
+/// verdict the merge carries is about a database that no longer exists. It is re-evaluated — not
+/// applied, and not silently dropped either.
+#[test]
+fn a_merge_racing_a_committed_change_to_its_base_is_re_evaluated_rather_than_silently_applied() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+
+    // The race, placed rather than waited for: this lands at the round after the base the gate is
+    // about to read, and before the merge command's own round.
+    repl.inject_before_next_proposal(wal(7));
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = agents.merge(&mut ctx, cs.branch()).expect("the merge must land on its retry");
+
+    assert_eq!(
+        report.reevaluations, 1,
+        "a write committed after the gate read its base did not force a re-evaluation: the merge \
+         was applied on a verdict about a database that had already moved"
+    );
+    assert!(report.report.applied_to_target, "the re-evaluated merge never published");
+    assert_eq!(db.main_qty(1), Some(42), "the branch's write did not reach main after re-evaluation");
+    assert_eq!(agents.cost().reevaluations, 1);
+
+    // At the log level: the first merge command really was refused, and a second one really was
+    // proposed. Without both halves this passes for a merge that was never raced at all.
+    let l = lock(agents.ledger());
+    assert!(
+        matches!(l.verdict_at(3), Some(MergeVerdict::ReEvaluate { moved_at: 2, .. })),
+        "round 3 should be the merge whose base round 2 invalidated, and is {:?}",
+        l.verdict_at(3)
+    );
+    assert!(
+        matches!(l.verdict_at(4), Some(MergeVerdict::Applied { base_round: 3, .. })),
+        "round 4 should be the re-proposed merge, scored against round 3: {:?}",
+        l.verdict_at(4)
+    );
+    assert_eq!(
+        repl.log_commands().len(),
+        4,
+        "expected fork, the racing write, the refused merge and the re-proposed merge"
+    );
+}
+
+/// A base that keeps moving cannot be merged against, and the honest answer is to say so with the
+/// round that moved — not to spin for ever. Optimistic concurrency starves under sustained
+/// conflict; `DESIGN.md` §4 chose optimistic, so this is the chosen semantics being stated.
+#[test]
+fn a_merge_whose_base_never_stops_moving_is_refused_with_the_round_that_moved() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let agents = agents.with_max_reevaluations(2);
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+    repl.inject_before_every_proposal(wal(7));
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+    let msg = format!("{e}");
+    assert!(msg.contains("re-evaluated 3 times"), "the refusal did not say how often: {msg}");
+    assert!(msg.contains("most recently at round"), "the refusal did not name the round: {msg}");
+    assert_eq!(db.main_qty(1), Some(100), "a starved merge published anyway");
+    assert_eq!(
+        db.runtime.branches().get(cs.branch()).unwrap().state,
+        ferrodb::branch::types::BranchState::Live,
+        "a starved merge destroyed the branch, so the agent cannot retry"
+    );
+}
+
+/// **The performance claim, counted.** A fork and a hundred writes block on nothing; the merge is
+/// the one thing that pays.
+#[test]
+fn a_fork_and_a_hundred_writes_cost_no_quorum_round_trip_and_the_merge_costs_one() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+
+    assert_eq!(
+        agents.cost().quorum_waits,
+        0,
+        "the fork blocked on a quorum; an agent that must wait for consensus to start is the cost \
+         this design exists to avoid"
+    );
+    assert_eq!(agents.cost().proposals, 1, "the fork's metadata did not reach the log");
+
+    repl.settle();
+    for i in 0..100 {
+        db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
+    }
+    assert_eq!(
+        agents.cost(),
+        ferrodb::agent_sql::cluster::ConsensusCost { proposals: 1, quorum_waits: 0, reevaluations: 0 },
+        "a hundred speculative writes reached the log; only the accepted result may"
+    );
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = agents.merge(&mut ctx, cs.branch()).unwrap();
+    assert!(report.report.applied_to_target);
+    assert_eq!(
+        agents.cost(),
+        ferrodb::agent_sql::cluster::ConsensusCost { proposals: 2, quorum_waits: 1, reevaluations: 0 },
+        "the merge did not cost exactly one proposal and one round trip"
+    );
+    assert_eq!(db.main_qty(1), Some(1));
+
+    // And the log carries the two branch commands and nothing else: a hundred agent writes left no
+    // trace in it at all.
+    let cmds = repl.log_commands();
+    assert_eq!(cmds.len(), 2, "the log carries {} commands, not 2: {cmds:?}", cmds.len());
+    assert!(cmds.iter().all(|c| matches!(c, Command::Branch { .. })));
+}
+
+/// A merge the gate declines is a node-local decision. Proposing it would spend a quorum round
+/// trip to agree on something that was never going to be published.
+#[test]
+fn a_merge_the_gate_declines_costs_no_consensus_at_all() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("suspect"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+    db.runtime.quarantine(cs.branch(), "held for this test").unwrap();
+
+    let before = agents.cost();
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+    assert!(format!("{e}").contains("quarantined"), "{e}");
+    assert_eq!(
+        agents.cost().proposals,
+        before.proposals,
+        "a merge that could never publish still spent a consensus round"
+    );
+    assert_eq!(lock(agents.ledger()).get(cs.cluster_id).unwrap().state, ReplicatedState::Live);
+}
+
+/// Exit criterion 10's anti-vacuity half, at this layer: a write to a node that does not lead is
+/// **refused**, never silently served. A branch created on a follower would take writes no quorum
+/// will ever see.
+#[test]
+fn a_fork_on_a_node_that_does_not_lead_is_refused_and_creates_nothing() {
+    let (_db, repl, agents) = scripted_cluster();
+    repl.step_down();
+    let e = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap_err();
+    assert!(matches!(e, FerroError::NotLeader { .. }), "a follower accepted a fork: {e}");
+    assert!(repl.log_commands().is_empty(), "a refused fork still reached the log");
+    assert_eq!(agents.cost().proposals, 0);
+}
+
+/// A merge that loses its leader mid-flight must refuse and publish nothing, rather than block a
+/// client until a budget runs out.
+#[test]
+fn a_merge_that_loses_the_leadership_mid_flight_refuses_and_publishes_nothing() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    db.on_branch(&cs, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+    repl.step_down();
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, cs.branch()).unwrap_err();
+    assert!(matches!(e, FerroError::NotLeader { .. }), "a deposed leader completed a merge: {e}");
+    assert_eq!(db.main_qty(1), Some(100), "a deposed leader published a merge");
+}
+
+// =================================================================================================
+// Three real nodes, three real sockets, three real round logs
+// =================================================================================================
+
+/// Three `Node`s in one process, each with its own listener, directory and round log.
+///
+/// One process rather than three, deliberately: `tests/integration_consensus_failover.rs` already
+/// owns the three-process, `kill -9` proof of the *driver*. What is on trial here is what an agent
+/// costs, and that is a question about counts on the coordinator, which needs the coordinator and
+/// the cluster in one address space to be asked at all. The consensus underneath is entirely real —
+/// real elections, real appends over TCP, real fsyncs.
+struct Fleet {
+    reps: Vec<Arc<NodeReplicator>>,
+    ledgers: Vec<Arc<Mutex<BranchLedger>>>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+impl Fleet {
+    fn start(n: u32) -> Arc<Fleet> {
+        let listeners: Vec<TcpListener> =
+            (0..n).map(|_| TcpListener::bind("127.0.0.1:0").expect("an ephemeral port")).collect();
+        let addrs: BTreeMap<NodeId, SocketAddr> = listeners
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (NodeId(i as u32 + 1), l.local_addr().unwrap()))
+            .collect();
+        let cfg = Config::new((1..=n).map(NodeId), 1, 0);
+
+        let mut reps = Vec::new();
+        let mut ledgers = Vec::new();
+        let mut dirs = Vec::new();
+        for (i, l) in listeners.into_iter().enumerate() {
+            let id = NodeId(i as u32 + 1);
+            let dir = tempfile::tempdir().unwrap();
+            // The transport refuses a peer map containing this node's own id.
+            let peers: BTreeMap<NodeId, SocketAddr> =
+                addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
+            let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+            // Distinct seeds: two nodes drawing the same election timeout split every vote.
+            let opts = NodeOptions::new(dir.path(), peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9))
+                .tick_of(Duration::from_millis(20));
+            let node =
+                Node::start(id, cfg.clone(), l, opts, BranchApplier::new(ledger.clone())).unwrap();
+            reps.push(Arc::new(NodeReplicator::new(node, Duration::from_millis(1))));
+            ledgers.push(ledger);
+            dirs.push(dir);
+        }
+        Arc::new(Fleet { reps, ledgers, _dirs: dirs })
+    }
+
+    /// One turn of every node's driver loop.
+    ///
+    /// In a real server this is a thread of its own and nothing an agent does drives it. Here it
+    /// is called explicitly so the whole test stays deterministic — but it must be called *while*
+    /// an agent works, not only around it: a leader whose driver is starved of ticks for longer
+    /// than an election timeout is deposed by its own peers, which is correct behaviour and has
+    /// nothing to do with what is on trial.
+    fn pump_all(&self) {
+        for r in &self.reps {
+            r.pump().expect("a node's driver failed");
+        }
+    }
+
+    /// Drive until one node holds office, **every** node agrees it does, it has committed its own
+    /// term-establishing round, and that has held for `STABLE` consecutive turns. Returns its
+    /// index.
+    ///
+    /// All four clauses earn their place. "One node believes it leads" is true for a few turns of
+    /// every election that is about to be lost, and a test that forks against such a node fails
+    /// with `NotLeader` from a cluster behaving perfectly — which is a flake that looks exactly
+    /// like the bug this file is about.
+    fn elect(&self) -> usize {
+        const STABLE: usize = 50;
+        let mut who: Option<usize> = None;
+        let mut held_for = 0usize;
+        for _ in 0..100_000 {
+            self.pump_all();
+            let claiming: Vec<usize> = (0..self.reps.len())
+                .filter(|i| self.reps[*i].leader() == Some(NodeId(*i as u32 + 1)))
+                .collect();
+            let settled = claiming.len() == 1 && {
+                let l = NodeId(claiming[0] as u32 + 1);
+                self.reps.iter().all(|r| r.leader() == Some(l))
+                    && self.reps[claiming[0]].committed_head() >= 1
+            };
+            if settled {
+                if who == Some(claiming[0]) {
+                    held_for += 1;
+                } else {
+                    who = Some(claiming[0]);
+                    held_for = 1;
+                }
+                if held_for >= STABLE {
+                    return claiming[0];
+                }
+            } else {
+                who = None;
+                held_for = 0;
+            }
+        }
+        panic!("no stable leader after 100000 turns of a three-node cluster");
+    }
+
+    /// Drive until every node has applied through `round`.
+    fn settle_to(&self, round: Round) {
+        for _ in 0..20_000 {
+            if self.ledgers.iter().all(|l| lock(l).last_applied() >= round) {
+                return;
+            }
+            self.pump_all();
+        }
+        panic!(
+            "round {round} did not reach every node; applied = {:?}",
+            self.ledgers.iter().map(|l| lock(l).last_applied()).collect::<Vec<_>>()
+        );
+    }
+
+    fn shutdown(&self) {
+        for r in &self.reps {
+            r.shutdown();
+        }
+    }
+}
+
+/// What a coordinator on node `me` sees.
+///
+/// `propose`, `committed_head` and `leader` go to that node's own [`NodeReplicator`] — the real
+/// seam. `pump` drives every node, because in one process nobody else is polling the followers'
+/// sockets and a leader alone commits nothing.
+struct FleetSeam {
+    me: usize,
+    fleet: Arc<Fleet>,
+}
+
+impl Replicated for FleetSeam {
+    fn propose(&self, c: Command) -> Result<Round, FerroError> {
+        self.fleet.reps[self.me].propose(c)
+    }
+    fn committed_head(&self) -> Round {
+        self.fleet.reps[self.me].committed_head()
+    }
+    fn pump(&self) -> Result<(), FerroError> {
+        for r in &self.fleet.reps {
+            r.pump()?;
+        }
+        Ok(())
+    }
+    fn leader(&self) -> Option<NodeId> {
+        self.fleet.reps[self.me].leader()
+    }
+}
+
+/// **The claim, against a real cluster.** A fork and its agent's writes block on nothing; the
+/// merge is the one thing that reaches a quorum, and every node ends up agreeing it did.
+#[test]
+fn on_three_real_nodes_only_the_merge_reaches_a_quorum() {
+    // The database is built *before* the cluster is asked who leads: creating files and running
+    // DDL takes long enough to starve a driver nobody is turning, and a leader deposed by its own
+    // peers because the test was busy is not a finding.
+    let mut db = Db::new();
+    db.seed();
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let me = NodeId(leader as u32 + 1);
+    let agents = ClusterAgents::new(
+        me,
+        db.runtime.clone(),
+        Arc::new(FleetSeam { me: leader, fleet: fleet.clone() }),
+        fleet.ledgers[leader].clone(),
+    );
+
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    assert_eq!(
+        agents.cost().quorum_waits,
+        0,
+        "the fork blocked on a quorum against a real cluster"
+    );
+
+    // The agent works. Nothing here touches consensus at all — the cluster's driver turns beside
+    // it, exactly as a server's own thread would, and neither one waits for the other.
+    for i in 0..25 {
+        db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
+        fleet.pump_all();
+    }
+    assert_eq!(agents.cost().quorum_waits, 0, "an agent's writes blocked on a quorum");
+    assert_eq!(agents.cost().proposals, 1, "an agent's writes reached the replicated log");
+
+    // Time passes and the fork's metadata commits, as it would while the agent was working.
+    fleet.settle_to(cs.fork_round);
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = agents.merge(&mut ctx, cs.branch()).expect("the merge must commit");
+    drop(ctx);
+
+    assert!(report.report.applied_to_target, "the merge did not publish");
+    assert_eq!(db.main_qty(1), Some(76));
+    assert_eq!(
+        agents.cost().quorum_waits,
+        1,
+        "the merge cost {} round trips, not one",
+        agents.cost().quorum_waits
+    );
+    assert_eq!(agents.cost().proposals, 2, "fork and merge, and nothing else, reach the log");
+
+    let merge_round = report.merge_round.expect("the merge was linearized by a round");
+    fleet.settle_to(merge_round);
+
+    // **Every node agrees, and none of them holds a row of it.** The branch is n1's; its rows were
+    // never replicated, and what reached the other two is the decision.
+    for (i, l) in fleet.ledgers.iter().enumerate() {
+        let l = lock(l);
+        assert_eq!(
+            l.get(cs.cluster_id).map(|b| b.state),
+            Some(ReplicatedState::Merged { at: merge_round }),
+            "node {} does not agree that {} merged at round {merge_round}",
+            i + 1,
+            cs.cluster_id
+        );
+        assert!(
+            matches!(l.verdict_at(merge_round), Some(MergeVerdict::Applied { .. })),
+            "node {} computed a different verdict for round {merge_round}: {:?}",
+            i + 1,
+            l.verdict_at(merge_round)
+        );
+        assert!(l.rejections().is_empty(), "node {} rejected an op: {:?}", i + 1, l.rejections());
+    }
+    fleet.shutdown();
+}
+
+/// A follower must refuse, never silently serve. Exit criterion 10's anti-vacuity half against a
+/// real cluster: the refusal names where to reconnect.
+#[test]
+fn on_a_real_cluster_a_fork_on_a_follower_is_refused_and_names_the_leader() {
+    let db = Db::new();
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let follower = (leader + 1) % 3;
+    let mut book = BTreeMap::new();
+    book.insert(NodeId(leader as u32 + 1), "127.0.0.1:65001".to_string());
+    let agents = ClusterAgents::new(
+        NodeId(follower as u32 + 1),
+        db.runtime.clone(),
+        Arc::new(FleetSeam { me: follower, fleet: fleet.clone() }),
+        fleet.ledgers[follower].clone(),
+    )
+    .with_client_addresses(book);
+
+    let e = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap_err();
+    match &e {
+        FerroError::NotLeader { leader: Some(a) } => {
+            assert_eq!(a, "127.0.0.1:65001", "the refusal sent the client to the wrong place")
+        }
+        other => panic!("a follower accepted an agent session: {other}"),
+    }
+    assert!(format!("{e}").contains("reconnect there"));
+    assert_eq!(agents.cost().proposals, 0, "a refused fork still reached the log");
+    fleet.shutdown();
+}
+
+/// **The whole of the performance argument, at the log.** A hundred agent writes across three
+/// branches leave nothing in the replicated log but their forks and their merges.
+#[test]
+fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log() {
+    let mut db = Db::new();
+    db.seed();
+    {
+        let mut s = db.session();
+        db.ok("INSERT INTO inventory VALUES (2, 100);", &mut s);
+        db.ok("INSERT INTO inventory VALUES (3, 100);", &mut s);
+    }
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let me = NodeId(leader as u32 + 1);
+    let agents = ClusterAgents::new(
+        me,
+        db.runtime.clone(),
+        Arc::new(FleetSeam { me: leader, fleet: fleet.clone() }),
+        fleet.ledgers[leader].clone(),
+    );
+
+    let mut merged = Vec::new();
+    for row in 1..=3 {
+        let cs = agents.fork(agent("fanout"), BranchId::TRUNK).unwrap();
+        fleet.settle_to(cs.fork_round);
+        for i in 0..100 {
+            db.on_branch(
+                &cs,
+                &format!("UPDATE inventory SET qty = {} WHERE id = {row};", 100 - i),
+            );
+            fleet.pump_all();
+        }
+        let bp = db.bp.clone();
+        let txn = db.txn.clone();
+        let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+        let r = agents.merge(&mut ctx, cs.branch()).unwrap_or_else(|e| panic!("branch {row}: {e}"));
+        drop(ctx);
+        assert!(r.report.applied_to_target, "branch {row} did not publish");
+        merged.push(r.merge_round.unwrap());
+    }
+
+    assert_eq!(
+        agents.cost().proposals,
+        6,
+        "300 agent writes and 3 merges cost {} proposals; the design says one per fork and one per \
+         accepted result",
+        agents.cost().proposals
+    );
+    assert_eq!(agents.cost().quorum_waits, 3, "one round trip per merge, and no others");
+    for row in 1..=3 {
+        assert_eq!(db.main_qty(row), Some(1), "row {row} did not get its merged value");
+    }
+    fleet.settle_to(*merged.iter().max().unwrap());
+    fleet.shutdown();
+}
