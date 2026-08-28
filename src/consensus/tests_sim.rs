@@ -822,6 +822,17 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
     assert!(s.violation.is_none(), "unexpected violation:\n{}", s.violation.as_ref().unwrap());
     assert!(t.dropped_loss > 0, "no message was ever dropped: {t:?}");
     assert!(t.duplicated > 0, "no message was ever duplicated: {t:?}");
+    assert!(
+        t.duplicates_delivered > 0,
+        "every duplicate was dropped before it arrived, so nothing was ever asked to be idempotent: \
+         {t:?}"
+    );
+    assert!(
+        t.reordered > 0,
+        "no message ever arrived after a later-sent one on the same link. Reorder is emergent here \
+         rather than injected — it comes from drawing each latency independently — which is exactly \
+         why it is asserted rather than assumed: {t:?}"
+    );
     assert!(t.dropped_partition > 0, "no message was ever cut off by a partition: {t:?}");
     assert!(
         t.one_way_partitions > 0,
