@@ -375,6 +375,46 @@ impl PayloadHeader {
     }
 }
 
+/// Whether a transfer that says it is **done** actually is: the right length, and the right bytes.
+///
+/// A named function rather than two branches inside the receive path, and the reason is a mutant.
+/// Inline, the length check is unreachable independently of the digest check — a short transfer
+/// fails both, and a long one has already been refused by the per-chunk bound — so removing it
+/// changed nothing any behavioural test could see. A rule no test can distinguish is a rule nobody
+/// has shown matters. Asked directly, each half is answerable on its own.
+///
+/// **The length check stays in front of the digest even though the digest would catch the same
+/// case.** It is certain where a digest is probabilistic, it is a comparison of two integers rather
+/// than a fold over a gigabyte, and it names what is actually wrong: the sender and this node
+/// disagree about how much a whole snapshot is, which is a different fault from bytes that changed
+/// in flight.
+fn completion_verdict(
+    received: u64,
+    total: u64,
+    body_digest: u64,
+    claimed: u64,
+) -> Result<(), CompletionFault> {
+    if received != total {
+        // The sender and this node disagree about how much a whole snapshot is. The bytes accepted
+        // so far are not in question — only the claim that they are all of them.
+        return Err(CompletionFault::Length);
+    }
+    if body_digest != claimed {
+        // Every byte arrived and they are not the bytes the sender digested. Which byte is wrong is
+        // exactly what a digest cannot say, so no prefix of this transfer is worth keeping.
+        return Err(CompletionFault::Digest);
+    }
+    Ok(())
+}
+
+/// Why a completed transfer was refused. **Two variants because the two are recovered differently**,
+/// not for the sake of a taxonomy: one keeps the bytes already accepted and one cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionFault {
+    Length,
+    Digest,
+}
+
 /// FNV-1a over `bytes`, from the standard offset basis.
 ///
 /// The same function `replicate.rs` chains its log digests with, reused rather than copied: one
@@ -1014,19 +1054,37 @@ impl Consensus {
         cur.received += data.len() as u64;
 
         if done {
-            if cur.received != meta.total_bytes {
-                // "Done" at the wrong length. The sender and this node disagree about how much a
-                // whole snapshot is, and there is no reading of that which installs safely.
-                self.refuse_snapshot(from, out);
-                return;
+            // **The two halves of the completion rule are answered differently, because they are
+            // recoverable differently.**
+            //
+            // A `done` at the wrong LENGTH says nothing about the bytes: only the claim of
+            // completeness is wrong, and the megabytes already accepted are still good. Keeping the
+            // cursor and answering with what is held lets the sender carry on from there — and
+            // means one truncated or forged frame cannot cost a gigabyte of progress.
+            //
+            // A DIGEST mismatch at the right length is the opposite: some byte in the payload is
+            // wrong and nothing here can say which, so there is no prefix worth keeping. The cursor
+            // goes and the answer is zero, which is where the sender restarts from — the only
+            // offset at which a payload can be validated at all.
+            match completion_verdict(
+                cur.received,
+                meta.total_bytes,
+                cur.body_digest,
+                cur.header.body_digest,
+            ) {
+                Ok(()) => cur.complete = true,
+                Err(CompletionFault::Length) => {
+                    let n = cur.received;
+                    self.progress.entry(self.self_id).or_default().receiving = Some(cur);
+                    self.ack_snapshot(from, n, out);
+                    return;
+                }
+                Err(CompletionFault::Digest) => {
+                    self.progress.entry(self.self_id).or_default().receiving = None;
+                    self.ack_snapshot(from, 0, out);
+                    return;
+                }
             }
-            if cur.body_digest != cur.header.body_digest {
-                // Every byte arrived and they are not the bytes the sender digested. Refused before
-                // the driver is told there is anything to install.
-                self.refuse_snapshot(from, out);
-                return;
-            }
-            cur.complete = true;
         }
 
         let n = cur.received;

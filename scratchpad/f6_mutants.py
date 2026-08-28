@@ -83,9 +83,19 @@ M = [
     ("M23", SNAP, "                Some(c) if c.header == header && c.received > 0 => {",
      "                Some(c) if c.meta == meta && c.received > 0 => {",
      "a_second_snapshot_supersedes_the_one_in_flight", "lib"),
-    ("M24", SNAP, "            if cur.received != meta.total_bytes {",
-     "            if false {",
-     "a_transfer_that_claims_to_be_done_at_the_wrong_length_is_refused", "lib"),
+    # The length half of the completion rule is unreachable independently of the digest half
+    # through the receive path — a short transfer fails both — so it is asked directly. That is
+    # what M24 fires against; M40/M41 fire against the two RECOVERIES, which the receive path can
+    # tell apart.
+    ("M24", SNAP, "    if received != total {\n        // The sender and this node disagree",
+     "    if false {\n        // The sender and this node disagree",
+     "a_completed_transfer_is_judged_on_its_length_and_then_on_its_bytes", "lib"),
+    ("M40", SNAP, "                Err(CompletionFault::Digest) => {\n                    self.progress.entry(self.self_id).or_default().receiving = None;\n                    self.ack_snapshot(from, 0, out);",
+     "                Err(CompletionFault::Digest) => {\n                    let n = cur.received;\n                    self.progress.entry(self.self_id).or_default().receiving = Some(cur);\n                    self.ack_snapshot(from, n, out);",
+     "a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not", "lib"),
+    ("M41", SNAP, "                Err(CompletionFault::Length) => {\n                    let n = cur.received;\n                    self.progress.entry(self.self_id).or_default().receiving = Some(cur);\n                    self.ack_snapshot(from, n, out);",
+     "                Err(CompletionFault::Length) => {\n                    self.progress.entry(self.self_id).or_default().receiving = None;\n                    self.ack_snapshot(from, 0, out);",
+     "a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not", "lib"),
 
     # ---- the install -----------------------------------------------------------------------------
     ("M25", SNAP, "            cur.complete = true;\n        }\n\n        let n = cur.received;",

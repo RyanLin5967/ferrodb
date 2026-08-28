@@ -702,18 +702,21 @@ fn a_transfer_that_claims_to_be_done_at_the_wrong_length_is_refused() {
     assert!(len < snap.meta.total_bytes, "the fixture fits in one chunk, so it cannot end early");
 
     let out = f.step(Event::Recv(early));
-    assert_eq!(
-        received_through(&only_send(&out)),
-        0,
-        "a transfer that ended {len} bytes into a {} byte payload was accepted",
+    assert!(
+        f.pending_install_round().is_none(),
+        "a transfer that ended {len} bytes into a {} byte payload was offered for install",
         snap.meta.total_bytes
     );
-    assert!(f.pending_install_round().is_none(), "a short payload was offered for install");
+    // The chunk itself was fine, so it is kept and reported — see
+    // `a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not` for why the two
+    // completion faults are answered differently.
+    assert_eq!(received_through(&only_send(&out)), len);
 
-    // Anti-vacuity: the same first chunk WITHOUT the flag is accepted, so the refusal is about the
-    // claim of completeness and not about the chunk.
+    // Anti-vacuity: the SAME first chunk without the flag leaves the node in the same place, so the
+    // refusal above is about the claim of completeness and not about the chunk.
     let out = f.step(Event::Recv(install_msg(N1, N2, 1, &snap, 0)));
     assert_eq!(received_through(&only_send(&out)), len);
+    assert!(f.pending_install_round().is_none());
 }
 
 /// A payload whose body does not digest to what its header claims is refused **before the driver is
@@ -736,6 +739,10 @@ fn a_payload_whose_body_digest_does_not_match_is_refused_before_the_driver_is_to
     let out = f.step(Event::Recv(damaged));
     assert_eq!(received_through(&only_send(&out)), 0, "a damaged payload was accepted whole");
     assert!(f.pending_install_round().is_none(), "a damaged payload was offered for install");
+    assert!(
+        f.snapshot_incoming().is_none(),
+        "a transfer whose bytes do not digest kept a prefix that cannot be trusted"
+    );
 
     // Anti-vacuity: the same payload undamaged completes.
     let out = f.step(Event::Recv(install_msg(N1, N2, 1, &snap, 0)));
@@ -1159,5 +1166,95 @@ fn a_restart_above_a_snapshot_floor_comes_back_at_the_floor_and_not_at_zero() {
         c.digest_at(12),
         Some(0xDEAD_BEEF),
         "the floor's digest was not restored, so every round above it will disagree with the leader"
+    );
+}
+
+/// **The completion rule, asked directly.**
+///
+/// Its two halves are unreachable independently through the receive path — a short transfer fails
+/// both — so a mutant that removed the length check survived every behavioural test in this file.
+/// A rule no test can distinguish is a rule nobody has shown matters, so the rule is a function and
+/// this test asks it.
+#[test]
+fn a_completed_transfer_is_judged_on_its_length_and_then_on_its_bytes() {
+    // The length, with a digest that matches — the case the receive path cannot construct, because
+    // a short payload's digest never matches, and the reason the check was untestable inline.
+    assert_eq!(
+        super::completion_verdict(500, 1000, 0xABCD, 0xABCD),
+        Err(super::CompletionFault::Length),
+        "a transfer that ended at 500 bytes of 1000 was accepted"
+    );
+
+    // The bytes, at the right length. A DIFFERENT verdict, because the two are recovered
+    // differently: a wrong length keeps the bytes already accepted and a wrong digest cannot.
+    assert_eq!(
+        super::completion_verdict(1000, 1000, 0xABCD, 0x1234),
+        Err(super::CompletionFault::Digest),
+        "a payload that digests differently from its own header was accepted"
+    );
+
+    // Anti-vacuity: right length, right bytes, accepted. Without this the two refusals above would
+    // pass just as well against a function that refused everything.
+    super::completion_verdict(1000, 1000, 0xABCD, 0xABCD).expect("a complete transfer was refused");
+}
+
+/// A `done` at the wrong **length** does not destroy the transfer; a wrong **digest** does.
+///
+/// The two are recovered differently and the difference is the whole reason they are separate
+/// verdicts. A short `done` says nothing about the bytes — one frame, truncated in transit or
+/// forged — and throwing away the megabytes already accepted for it is a denial of service anyone
+/// who can reach the port could perform. A digest mismatch says some byte is wrong and cannot say
+/// which, so no prefix of that transfer is worth keeping.
+#[test]
+fn a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not() {
+    let mut l = Consensus::new(N1, cfg3(), 1);
+    seed(&mut l, &[(1, wal(1))]);
+    promote(&mut l, 1);
+    let snap = payload_of(&point_of(&l), 512, 3);
+
+    let mut f = Consensus::new(N2, cfg3(), 3);
+    follower_of(&mut f, 1, N1);
+
+    let mut early = install_msg(N1, N2, 1, &snap, 0);
+    if let Body::InstallSnapshot { done, .. } = &mut early.body {
+        *done = true;
+    }
+    let out = f.step(Event::Recv(early));
+    let held = received_through(&only_send(&out));
+    assert_eq!(
+        held,
+        SNAPSHOT_CHUNK_BYTES as u64,
+        "a refused completion threw away the chunk it arrived with"
+    );
+    assert_eq!(
+        f.snapshot_incoming().map(|c| c.received()),
+        Some(SNAPSHOT_CHUNK_BYTES as u64),
+        "a refused completion destroyed the transfer, so one bad frame costs a whole re-transfer"
+    );
+
+    // And the transfer still finishes from where it was, which is what makes the survival useful
+    // rather than merely tidy.
+    deliver_all(&mut f, N1, 1, &snap);
+    assert_eq!(f.pending_install_round(), Some(snap.meta.last_round));
+
+    // The other half: a full-length transfer whose bytes are wrong drops the cursor and answers
+    // zero, because there is no prefix of it worth resuming from.
+    let mut g = Consensus::new(N3, cfg3(), 5);
+    follower_of(&mut g, 1, N1);
+    let mut offset = 0u64;
+    while offset + SNAPSHOT_CHUNK_BYTES as u64 <= snap.meta.total_bytes {
+        let out = g.step(Event::Recv(install_msg(N1, N3, 1, &snap, offset)));
+        offset = received_through(&only_send(&out));
+    }
+    let mut last = install_msg(N1, N3, 1, &snap, offset);
+    if let Body::InstallSnapshot { data, .. } = &mut last.body {
+        let n = data.len();
+        data[n - 1] ^= 0xFF;
+    }
+    let out = g.step(Event::Recv(last));
+    assert_eq!(received_through(&only_send(&out)), 0, "a payload with a wrong byte was resumable");
+    assert!(
+        g.snapshot_incoming().is_none(),
+        "a transfer whose bytes do not digest kept a prefix that cannot be trusted"
     );
 }
