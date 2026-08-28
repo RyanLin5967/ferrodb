@@ -65,14 +65,38 @@ def main():
     seen_b = rows_of(b, "SELECT qty FROM inv WHERE id = 1;")
     check(seen_b == [["20"]], f"B does not see A's unmerged write: {seen_b}")
 
-    # A's branch does not outlive A's socket: a session that ends without merging abandons its
-    # branch, which is the whole point of the lease design — an agent that crashes must not leave
-    # its work pinned forever. Asserted rather than assumed, because the first version of this
-    # script expected `b1` to still resolve and was simply wrong about the design.
-    _f, _r, _t, errors = b.query("SELECT qty FROM inv AS OF BRANCH b1;")
+    # **A's branch DOES outlive A's socket, and that is the load-bearing fact of this script.**
+    #
+    # This check used to read `AS OF BRANCH b1` and assert "unknown branch", with a comment saying a
+    # session that ends without merging abandons its branch. Both halves were wrong. The branch is
+    # not abandoned — `Session` has no `Drop`, nothing on the disconnect path calls `abandon`, and the
+    # runtime is shared by every connection on purpose — and the check passed only because the branch
+    # is named `b_1`, with the underscore, so `b1` is a name that never existed. It would have passed
+    # against a server that abandoned branches and against one that did not, which makes it no
+    # instrument at all. Measured against a running server on 2026-08-17: `AS OF BRANCH b_1` from a
+    # second connection returns A's uncommitted 15, while `b1` and `b_99` both answer "unknown
+    # branch".
+    #
+    # **What actually happens to that branch in THIS server: nothing.** Saying so rather than pointing
+    # at the lease, because this comment replaced one unverified claim and must not install another.
+    # `TwoTierReaper` is constructed in `examples/agent_isolation_demo.rs` and two integration tests
+    # and NOWHERE else — not in `examples/pgserver.rs`, not in the CLI (grepped 2026-08-18). So a
+    # client that disconnects without merging leaks its branch for the life of the process. The lease
+    # reaper is the design's answer to exactly that (exit criterion 8, non-cooperative expiry) and it
+    # exists and is tested; it is simply not wired into the server under test here.
+    _f, rows, _t, errors = b.query("SELECT qty FROM inv AS OF BRANCH b_1;")
+    check(
+        rows == [["15"]] and not errors,
+        f"A's branch did not outlive the socket that opened it, so no other connection can inspect "
+        f"an agent's work in progress: {rows} {errors}",
+    )
+
+    # The negative half, on a name that genuinely does not exist. Without it the check above would be
+    # satisfied by a server that resolved every branch name to something.
+    _f, _r, _t, errors = b.query("SELECT qty FROM inv AS OF BRANCH b_99;")
     check(
         any("unknown branch" in e.get("M", "") for e in errors),
-        f"A's branch outlived the socket that opened it, so an abandoned agent pins storage: {errors}",
+        f"a branch name that was never minted resolved to something: {errors}",
     )
 
     # **The check a per-connection runtime fails.** Branch ids come from the shared catalog, so B's

@@ -105,7 +105,8 @@ fn main() {
         .expect("storage-backed runtime")
     });
 
-    let mut ctx = ServerContext { catalog, bp, txn, runtime };
-    serve(listener, &mut ctx).unwrap();
+    // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
+    let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime));
+    serve(listener, ctx).unwrap();
     store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
 }

@@ -8,6 +8,7 @@ pub mod insert;
 pub mod index_handle;
 pub mod projection;
 pub mod sec_index_scan;
+pub mod fulltext_search;
 pub mod nested_loop_join;
 pub mod hash_join;
 pub mod session;

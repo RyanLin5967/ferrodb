@@ -336,9 +336,23 @@ fn the_destination_ddl_comes_from_the_create_table_event() {
     // carries many rows. Keyed on commit_lsn alone, the first row of a commit advanced the cursor to
     // that commit and every sibling was then discarded as a re-delivery - measured on a 3-row commit:
     // one row landed and the run exited 0. This assertion is pinning the wider key, not tolerating it.
+    //
+    // The seven `_prov_id`..`_retracted` columns joined them for the same kind of reason: the sink
+    // lands the agent run that wrote each row, which is what makes `cdc-consumer retract -engine
+    // duckdb -model-version v` answerable at the DESTINATION — with no source database and no
+    // untruncated log. `_retracted` is written only by `retract`, never by the feed, and is kept
+    // separate from `_deleted` so an operator can tell a row the SOURCE deleted from one this
+    // consumer withdrew. Their DuckDB types are asserted here rather than only their names, because
+    // this is the half of the claim SQLite cannot test: `_prov_id|BIGINT` and `_retracted|BOOLEAN`
+    // are only true if the sink declared them, and SQLite's storage classes would hide a wrong guess.
+    //
+    // The names must match the SQLite sink's, since `retract` addresses them by name;
+    // `cdc-consumer`'s `TestBothSinksLandTheSameWriterColumnNames` is what pins that.
     assert_eq!(
         schema,
-        "id|BIGINT\nitem|VARCHAR\nqty|BIGINT\n_commit_lsn|BIGINT\n_lsn|BIGINT\n_deleted|BOOLEAN",
+        "id|BIGINT\nitem|VARCHAR\nqty|BIGINT\n_commit_lsn|BIGINT\n_lsn|BIGINT\n_deleted|BOOLEAN\n\
+         _prov_id|BIGINT\n_agent|VARCHAR\n_run|VARCHAR\n_model|VARCHAR\n_model_version|VARCHAR\n\
+         _prompt_sha256|VARCHAR\n_retracted|BOOLEAN",
         "the destination DDL does not match the CREATE_TABLE event"
     );
 

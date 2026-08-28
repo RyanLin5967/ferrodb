@@ -26,6 +26,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -96,7 +97,7 @@ fn main() {
     // --- pinned: the consumer holds a claim on the log it has not read yet.
     let mut d = open(&dir, "pinned");
     sql(&mut d, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
-    let streamer = FeedStreamer::new(LogicalDecoder::new(&d.catalog));
+    let streamer = FeedStreamer::new(LogicalDecoder::new(&d.catalog), Publication::unrestricted());
     let mut sub = Subscription::from_start(&d.wal).expect("subscribe");
     let mut pinned_events = 0usize;
     let mut pinned_inserts = 0usize;
@@ -136,7 +137,7 @@ fn main() {
     // --- unpinned: a bare cursor, which is what every consumer looked like before E16.
     let mut d2 = open(&dir, "unpinned");
     sql(&mut d2, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);");
-    let streamer2 = FeedStreamer::new(LogicalDecoder::new(&d2.catalog));
+    let streamer2 = FeedStreamer::new(LogicalDecoder::new(&d2.catalog), Publication::unrestricted());
     let mut cursor = FeedStreamer::start_cursor(&d2.wal);
     // The unpinned consumer tracks delivery progress separately from its read position, exactly
     // as the pinned one does inside its Subscription.

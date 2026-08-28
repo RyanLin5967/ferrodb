@@ -23,22 +23,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::catalog::alter::{conform_row, resulting_schema};
+use crate::execution::executor::alteration_of;
+use crate::parser::parser::AlterAction;
 use crate::agent_sql::changeset::{
     ChangeOutcome, ChangeSet, MergeReport, RowChange, RowChangeKind, RowMergeOutcome,
 };
 use crate::branch::catalog::LogBranchCatalog;
 use crate::tel::MemEffectLog;
+use crate::tel::schema_merge::{merge_schema, SchemaEdit};
+use crate::agent_sql::changeset::SchemaMergeReport;
 use crate::agent_sql::merge_engine::{
     apply_op, check_guards, compose_ops, invert, resolve_cell, CellMerge, CellResolution,
     CellState, PolicyTable,
 };
 use crate::agent_sql::escrow::EscrowLedger;
-use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::gate::{AssertionResult, GateOutcome};
+use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
-use crate::binder::binder::{Binder, Scope};
+use crate::binder::binder::{Binder, BoundExpr, Scope};
+use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::cow::PageStore;
-use crate::branch::BranchCatalog;
+use crate::branch::{BranchCatalog, Reaper};
 
 /// Root page the trunk branch starts at. The CoW store publishes a real root over this on the
 /// first write; until then it is only an identity for the trunk record.
@@ -52,8 +60,9 @@ use crate::execution::executor::evaluate;
 use crate::parser::parser::{Expr, Stmt, TableRef};
 use crate::parser::scanner::TokenType;
 use crate::planner::plan::{plan, Plan};
-use crate::provenance::readset::{AccessShape, PredicateSummary, VersionRef};
-use crate::provenance::revert::{DependencyGraphBuilder, RevertMode, RevertPlan};
+use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
+use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
+use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
@@ -90,7 +99,11 @@ pub fn table_id(name: &str) -> TableId {
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv64_update(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+/// FNV-1a, resumable, so a fingerprint can be folded over many pieces without concatenating them.
+fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -143,9 +156,38 @@ struct Workspace {
     rows: BTreeMap<(u32, u64), RowState>,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
+    /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
+    ///
+    /// A fork takes a snapshot of the parent's `rows`/`schema_edits` rather than a link, so a
+    /// child's `MERGE` publishes writes its ANCESTORS staged. Those ancestors' captures are the
+    /// read premises for rows that are now in the shared tables, and F6's discriminator
+    /// (`published`, meaning "did *this* branch's own seal come from a merge") cannot see that:
+    /// the ancestor's own seal is an ABANDON or a reap. Without this list, dropping its capture
+    /// silently deletes the premise of a published row -- measured as
+    /// `REVERT MERGE m1` reporting `blocked_by = []` and then removing the row the published row
+    /// was derived from.
+    inherited: Vec<TxnId>,
     tables: BTreeMap<u32, String>,
     frame: TxnFrame,
-    reads: Vec<crate::provenance::readset::ReadSet>,
+    // B11's fields, WITHOUT its `reads`: B4 deleted `Workspace::reads` as a second copy of a
+    // read-set the runtime already keeps in `State::captures`, and re-adding it here would restore
+    // the duplication B4 removed. The one consumer below reads it from `captures` instead.
+    /// Column-level schema changes this branch has made but not published — B11.
+    ///
+    /// Pending rather than applied, because a schema is the most visible write there is: applying
+    /// one immediately would make every other connection see the column the moment one agent
+    /// typed the statement, and abandoning the branch would not take it away. Published at
+    /// `MERGE`, after [`crate::tel::schema_merge::merge_schema`] has decided they compose with
+    /// whatever the target's shape has become.
+    schema_edits: Vec<(String, SchemaEdit)>,
+    /// Each touched table's shape **at first touch** — the fork point, in exactly the sense
+    /// `base_rows` is the fork-point row image.
+    ///
+    /// Needed by two things at merge: the three-way schema merge, and conforming this branch's
+    /// rows to a target whose shape a sibling agent has widened since. Without it a branch that
+    /// forked before a concurrent `ADD COLUMN` publishes rows one value short and the failure
+    /// surfaces from inside `Tuple::serialize`.
+    base_shapes: BTreeMap<String, Schema>,
 }
 
 impl Workspace {
@@ -213,8 +255,56 @@ struct State {
     /// is the question being asked.
     row_author: BTreeMap<(u32, u64), ProvId>,
     versions: BTreeMap<(u32, u64), VersionRef>,
-    dep: DependencyGraphBuilder,
+    /// What each agent task retained: the reads its access shapes demanded — every scan carrying
+    /// the snapshot it read at — and every version it published, with the values it published.
+    ///
+    /// **The runtime's only retention point, and that is the fix.** This used to be a bare
+    /// `DependencyGraphBuilder` here plus a second copy of the read-sets on each `Workspace`, fed
+    /// with exact versions only. `record_predicate_read` and `record_write_value` — the two calls
+    /// that turn a SCAN into a causal edge — were reachable from `provenance::capture` and from
+    /// nowhere else, and the runtime never referenced that module. So `REVERT ... CASCADE`
+    /// under-reported precisely where agents read: the query surface has no `LIMIT` and no
+    /// `ORDER BY`, which makes an agent's natural read a full scan, and a full scan retained a
+    /// region that nothing downstream ever looked at.
+    ///
+    /// Keyed by txn, and never dropped by `seal`: the dependency graph has to outlive the workspace
+    /// for the same reason `row_author` does — a merge retires the branch at the moment its rows
+    /// become visible to everyone else, which is the moment they can start being read.
+    captures: BTreeMap<u64, TxnCapture>,
+    /// Txns whose staged writes reached the shared tables -- by their own `MERGE`, or by a
+    /// DESCENDANT's merge publishing writes the descendant inherited at fork time.
+    ///
+    /// A capture may only be dropped for a task that published nothing (F6). "Published" is a
+    /// property of the WRITES, not of which branch happened to call `MERGE`, so it is recorded
+    /// here when the publish happens rather than re-derived at seal time from a flag that cannot
+    /// answer for an ancestor.
+    published_txns: BTreeSet<u64>,
     policy: PolicyTable,
+}
+
+/// What one live agent task has written and read, as counts. See [`AgentRuntime::run_activity`]
+/// for what each field does and does not include.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunActivity {
+    pub branch: BranchId,
+    /// The name this branch answers to in SQL (`b_3`).
+    pub branch_name: String,
+    /// `None` only if the interned run went missing, which would be a bug rather than a state.
+    pub run: Option<RunEntity>,
+    /// Typed ops in this task's own frame. Not inherited at fork.
+    pub ops_captured: u64,
+    /// Guards in this task's own frame. Not inherited at fork.
+    pub guards_captured: u64,
+    /// Rows in the workspace map. **Inherited at fork** from an open parent session.
+    pub staged_rows: u64,
+    /// Distinct `(table, row)` pairs read as exact versions.
+    pub rows_read_exact: u64,
+    /// Range / full-scan reads, which retain a predicate summary rather than versions.
+    pub scan_reads: u64,
+    /// Rows those scans reported observing. Diagnostic; never feeds a decision.
+    pub scan_rows_observed: u64,
+    /// Rows staged without ever being read — DESIGN.md section 4's cheap metric.
+    pub blind_writes: u64,
 }
 
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
@@ -240,6 +330,9 @@ pub struct AgentRuntime {
     /// Where captured frames go. One frame per agent task, re-appended as the task grows, so a
     /// merge engine on the other side of this trait sees exactly what the SQL layer captured.
     log: Arc<dyn EffectLog>,
+    /// The reaper that reclaims a branch's pages the moment the branch is retired, if one is
+    /// attached. See [`AgentRuntime::with_reaper`].
+    reaper: Option<Arc<dyn Reaper>>,
     state: Mutex<State>,
 }
 
@@ -275,6 +368,7 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: None,
+            reaper: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -331,6 +425,7 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(rows),
+            reaper: None,
             state: Mutex::new(State::default()),
         })
     }
@@ -368,11 +463,50 @@ impl AgentRuntime {
             log,
             prov_store: Arc::new(MemProvenanceStore::new()),
             storage: Some(PagedRows::new(store)),
+            reaper: None,
             state: Mutex::new(State::default()),
         })
     }
 
+    /// Attach the reaper that reclaims a branch's pages when the branch is retired.
+    ///
+    /// **Why a retired branch needs a reaper at all.** `seal` marks a merged or abandoned branch
+    /// reaped in the catalog, which makes its id a hard error and unpins its parent's pages — but
+    /// nothing frees the extents the branch itself allocated. Its shadow pages are garbage the
+    /// instant its work is published (the rows are in the shared tables now) and they stay charged
+    /// to the store until something takes them back. Without a reaper attached that is a lease
+    /// scan away; with one it is immediate, which is what lets a simulation's page count return to
+    /// its baseline rather than to its baseline plus the winners.
+    ///
+    /// **The reaper must be built over the same catalog and page store as this runtime.** A reaper
+    /// over a different catalog would reap a record this runtime never wrote. That is the caller's
+    /// contract because the `Reaper` trait carries no way to check it.
+    pub fn with_reaper(mut self, reaper: Arc<dyn Reaper>) -> Self {
+        self.reaper = Some(reaper);
+        self
+    }
+
     /// The provenance store: interned runs, and the author of each version the executor wrote.
+    /// Swap in a provenance store that **outlives the process**.
+    ///
+    /// Every constructor builds a `MemProvenanceStore`, which is right for a test and wrong for a
+    /// database: the run behind each row lives only in this process, so `who_wrote_row` and
+    /// `ferro_row_authors` answer correctly all session and then answer nothing at all after a
+    /// restart. B5 built `DurableProvenanceStore` for exactly this and could not wire it, because
+    /// it opens a PATH and the constructors take page stores — a database file's name is not
+    /// something `with_storage` is given.
+    ///
+    /// So it is a builder rather than a constructor parameter: the caller that owns the database
+    /// path applies it, and the three constructors keep their signatures and their many call sites.
+    /// A runtime built without it still works — it is simply in-memory, which is what a test wants.
+    pub fn with_durable_provenance(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, FerroError> {
+        self.prov_store = Arc::new(crate::provenance::DurableProvenanceStore::open(path)?);
+        Ok(self)
+    }
+
     pub fn provenance(&self) -> &Arc<dyn ProvenanceStore> {
         &self.prov_store
     }
@@ -388,6 +522,18 @@ impl AgentRuntime {
                 "this runtime has no page store; build it with AgentRuntime::with_storage".into(),
             )
         })
+    }
+
+    /// Pages the store currently holds, when this runtime is page-backed.
+    ///
+    /// `None` — no page store — is deliberately not `Some(0)`. Exit criteria 1 and 8 are both
+    /// stated as page counts, and a measurement of a store that does not exist reading as zero is
+    /// how "the fork copied nothing" becomes a fact about the instrument instead of the database.
+    pub fn live_page_count(&self) -> Result<Option<u32>, FerroError> {
+        match &self.storage {
+            Some(rows) => Ok(Some(rows.tree().store().live_page_count()?)),
+            None => Ok(None),
+        }
     }
 
     /// The page a branch's rows currently hang off.
@@ -533,7 +679,13 @@ impl AgentRuntime {
             started,
             parent,
         );
-        state.runs.insert(prov.0, entity);
+        // `or_insert`, not `insert`. Attribution is run-level: `MemProvenanceStore::intern` returns
+        // the EXISTING `ProvId` when `same_actor` holds, and `same_actor` deliberately excludes
+        // `started_at` because that is when a particular session began, not part of who the actor is.
+        // Overwriting therefore stamped every branch of one run with the LAST session's start time, so
+        // `ferro_runs` reported a run starting after a branch it had already forked. First start wins,
+        // which is the only one that is a fact about the run.
+        state.runs.entry(prov.0).or_insert(entity);
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
@@ -547,6 +699,22 @@ impl AgentRuntime {
             Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
             None => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
         };
+        let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
+            None => (Vec::new(), BTreeMap::new()),
+        };
+        // Which ancestors' staged writes did that snapshot just hand us? Only recorded when the
+        // parent actually had staged state to hand over: a parent that staged nothing has no
+        // published write for a descendant to protect, and naming it here would re-open exactly
+        // the leak F6 closed -- a ghost task's scan blocking every revert forever.
+        let inherited: Vec<TxnId> = match state.workspaces.get(&parent.id) {
+            Some(p) if !p.rows.is_empty() || !p.schema_edits.is_empty() => {
+                let mut v = p.inherited.clone();
+                v.push(p.txn);
+                v
+            }
+            _ => Vec::new(),
+        };
         state.workspaces.insert(
             branch.id,
             Workspace {
@@ -558,10 +726,16 @@ impl AgentRuntime {
                 rows,
                 base_rows,
                 tables,
+                inherited,
                 frame: TxnFrame::new(txn, branch, CommitHash::ZERO, 0, 1),
-                reads: Vec::new(),
+                // A child forked from a live agent task inherits its parent's pending schema
+                // edits for the same reason it inherits its rows: the child's visible state IS
+                // the parent's state at fork time.
+                schema_edits: parent_schema_edits,
+                base_shapes: parent_base_shapes,
             },
         );
+        state.captures.insert(txn.0, TxnCapture::new(txn, prov, branch));
         Ok(AgentSession {
             branch,
             branch_name: name,
@@ -605,6 +779,146 @@ impl AgentRuntime {
             .collect()
     }
 
+    /// Per-run counters for the observability views, one row per **live** agent task.
+    ///
+    /// **Counts only; this adds no bookkeeping.** Every number here is the length of something the
+    /// workspace already holds — the captured frame, the staged row map, the retained read-set — so
+    /// this is a read-only projection of state the runtime maintains for merge, not a new ledger
+    /// kept for reporting. Nothing here is durable: a workspace exists only between
+    /// `BEGIN AGENT SESSION` and `MERGE` / `ABANDON` (`seal` drops it), so this answers about work
+    /// in flight and says nothing about work already published. `authors_of` is the question to ask
+    /// about published rows.
+    ///
+    /// The counters are deliberately separate rather than summed into one "writes" and one "reads",
+    /// because they are not interchangeable and adding them would invent a number:
+    ///
+    /// * `ops_captured` / `guards_captured` come from this task's own `TxnFrame`, which is **not**
+    ///   copied at fork, so they count only what this run did.
+    /// * `staged_rows` is the workspace's row map, which **is** copied at fork from an open parent
+    ///   session (`begin_session_with_model`). For a branch forked from another live agent task it
+    ///   therefore includes rows inherited at fork time, not only rows this run wrote. Named
+    ///   `staged_rows` and not `rows_written` for exactly that reason. **`blind_writes` is derived
+    ///   from the same map and inherits the same caveat**: for a branch forked from an open session
+    ///   it counts inherited rows the child never read, which is true of the map and is not a
+    ///   statement about what the child did.
+    /// * `rows_read_exact` counts DISTINCT `(table, row)` pairs across the exact-version read-sets;
+    ///   a point read repeated is one premise, not two.
+    /// * `scan_reads` / `scan_rows_observed` are the range and full-scan reads, kept apart from the
+    ///   exact ones because a scan retains a predicate summary rather than versions — DESIGN.md
+    ///   section 2's "chosen by ACCESS SHAPE, never by size". `rows_observed` is that summary's own
+    ///   diagnostic count.
+    pub fn run_activity(&self) -> Vec<RunActivity> {
+        use crate::provenance::readset::ReadSet;
+        let state = self.state.lock().unwrap();
+        let mut out = Vec::with_capacity(state.workspaces.len());
+        for (id, ws) in state.workspaces.iter() {
+            // The generation lives in `names`, not in the workspace: `workspaces` is keyed by the id
+            // SLOT alone. Falling back to generation 0 would name a *different* branch after an id
+            // slot is recycled, so the name map is the authority and its absence is reported as
+            // generation 0 only when there is no name at all — which `seal` makes impossible while a
+            // workspace is present.
+            let branch = state
+                .names
+                .get(&ws.name)
+                .copied()
+                .unwrap_or_else(|| BranchId::new(*id, 0));
+            // A `BTreeSet`, not a sorted `Vec`. `Vec::insert` memmoves the tail, so building the
+            // distinct set was O(n^2) in the size of a branch's read-set — and it ran while holding
+            // the one Mutex every write path also takes, so reading `ferro_run_activity` against a
+            // branch with a large read-set stalled every other connection. This is documented as
+            // "counts only"; it should not be able to block a writer.
+            let mut exact: BTreeSet<(u32, u64)> = BTreeSet::new();
+            let mut scan_reads = 0u64;
+            let mut scan_rows_observed = 0u64;
+            // B4 deleted `Workspace::reads` as a second copy of the read-set the runtime already
+            // keeps in `State::captures`, and B9 was written before that deletion. Derived here the
+            // way every other consumer derives it (see the same expression at `:905` and `:2079`),
+            // so this view still reads the one read-set rather than reviving the duplicate.
+            let reads = state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default();
+            for rs in &reads {
+                match rs {
+                    ReadSet::ExactVersions(versions) => {
+                        for v in versions {
+                            exact.insert((v.tbl.0, v.row.0));
+                        }
+                    }
+                    ReadSet::Predicate(p) => {
+                        scan_reads += 1;
+                        scan_rows_observed += p.rows_observed;
+                    }
+                }
+            }
+            out.push(RunActivity {
+                branch,
+                branch_name: ws.name.clone(),
+                run: state.runs.get(&ws.prov.0).cloned(),
+                ops_captured: ws.frame.ops.len() as u64,
+                guards_captured: ws.frame.guards.len() as u64,
+                staged_rows: ws.rows.len() as u64,
+                rows_read_exact: exact.len() as u64,
+                scan_reads,
+                scan_rows_observed,
+                blind_writes: blind_writes_of(&ws.rows, &reads).len() as u64,
+            });
+        }
+        out.sort_by_key(|a| (a.branch.id, a.branch.generation));
+        out
+    }
+
+    /// Forget every per-row record this runtime holds for `table`. Called when a table is dropped.
+    ///
+    /// # Why a drop has to reach in here at all
+    ///
+    /// `row_author` and `versions` are keyed by `table_id(name)` — an FNV hash of the table's
+    /// **name**, chosen because the catalog mints no table ids and a name hash is stable across
+    /// processes where an assignment counter would not be. The cost of that choice is that a table
+    /// dropped and recreated under the same name is, to these maps, the same table: the new one
+    /// inherits the old one's authorship and version stamps.
+    ///
+    /// Before B9 that was invisible, because `authors_of` and `who_wrote_row` had no SQL surface.
+    /// `ferro_row_authors` gives them one, and it then reported rows of the *previous* table —
+    /// attributed to an agent that never touched the new one, for row ids the new table does not
+    /// contain. `Catalog::drop_table` already purges `stats` for the same reason (E69 fixed exactly
+    /// that omission); this is the same omission one layer over.
+    ///
+    /// # `versions` is deliberately NOT purged, and the first version of this function purged it
+    ///
+    /// It looked symmetrical: `versions` is keyed the same way, so a stale stamp under a recycled name
+    /// could report a moved premise for a row the branch never read. Purging it **disarmed B1's
+    /// read-premise gate**, and the test
+    /// `integration_system_views::dropping_a_table_does_not_silence_the_read_premise_gate` exists
+    /// because of it.
+    ///
+    /// `versions` is what the gate compares against at merge admission, and the comparison reads an
+    /// **absent** entry as "the premise holds" (`merge`, the `_ => {}` arm). Erasing the entries
+    /// therefore erases the evidence: a branch whose premise had already been replaced merged `Clean`
+    /// instead of being held. Measured, with a control proving the gate fires in the same fixture
+    /// without the drop. It is the same absence-reads-as-unchanged confusion the comment beside that
+    /// arm records having already been fixed once, arriving from the opposite direction.
+    ///
+    /// The two directions are not symmetrical in cost, which is what decides this. A stale stamp
+    /// over-approximates staleness and routes to **quarantine** — a hold that stays queryable and can
+    /// be released. A missing stamp under-approximates it and **publishes** a merge computed from
+    /// state that no longer exists. One is recoverable and the other is not, so absence is the error
+    /// worth avoiding. And nothing in this module needed `versions` purged in the first place: no
+    /// view exposes it, so purging it bought nothing and cost a safety check.
+    ///
+    /// **What this deliberately does NOT purge**, stated rather than left to be discovered:
+    /// `versions` as above, plus the escrow ledger, the dependency graph and the applied-op log. None
+    /// of the latter three is exposed by the observability views, and each is keyed by something other
+    /// than the table alone — undoing them on a drop is a separate decision about `REVERT`'s reach,
+    /// not a presentation fix.
+    ///
+    /// Note that authorship deliberately survives an ordinary `DELETE` of the row. That is an audit
+    /// record answering "which agent wrote this", which is criterion 9, and it outliving the row is
+    /// the point; a dropped *table* is different, because the name can come back attached to
+    /// different data.
+    pub fn forget_table(&self, table: &str) {
+        let tbl = table_id(table).0;
+        let mut state = self.state.lock().unwrap();
+        state.row_author.retain(|(t, _), _| *t != tbl);
+    }
+
     // ---- reads -----------------------------------------------------------------------------
 
     /// Rows this branch wrote without ever reading. See [`blind_writes_of`].
@@ -613,7 +927,8 @@ impl AgentRuntime {
         let ws = state.workspaces.get(&branch.id).ok_or_else(|| {
             FerroError::Branch(format!("no agent session on branch {branch}"))
         })?;
-        Ok(blind_writes_of(&ws.rows, &ws.reads))
+        let reads = state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default();
+        Ok(blind_writes_of(&ws.rows, &reads))
     }
 
     /// The branch's changeset, derived from the PAGES rather than from the workspace map.
@@ -738,7 +1053,15 @@ impl AgentRuntime {
         // Record the read-set against the *reading* session, if there is one.
         if let Some(reader_branch) = reader {
             let shape = access_shape(where_clause.as_ref(), &schema);
-            self.record_read(reader_branch, table_id(&from.name), shape, &matched, where_clause.as_ref());
+            self.record_read(
+                reader_branch,
+                table_id(&from.name),
+                shape,
+                &matched,
+                where_clause.as_ref(),
+                bound_where.as_ref(),
+                ReadPurpose::Inspection,
+            )?;
         }
 
         let mut out = Vec::with_capacity(matched.len());
@@ -752,6 +1075,15 @@ impl AgentRuntime {
         Ok(out)
     }
 
+    /// Retain one access against the reading task's capture.
+    ///
+    /// `shape` alone decides the form (exact versions for a point or index lookup, a predicate for a
+    /// range or scan); `TxnCapture::on_read` performs that routing, so there is no second copy of it
+    /// here. What this function owns is the three things only the runtime knows: which versions the
+    /// rows it returned are at, **what snapshot the read saw**, and whether the read was an
+    /// inspection or a write statement addressing its own rows ([`ReadPurpose`]).
+    ///
+    /// Refuses when the reading session is gone, rather than retaining nothing and reporting success.
     fn record_read(
         &self,
         reader: BranchId,
@@ -759,11 +1091,36 @@ impl AgentRuntime {
         shape: AccessShape,
         matched: &[(RowId, Vec<Value>)],
         where_clause: Option<&Expr>,
-    ) {
+        bound_where: Option<&BoundExpr>,
+        purpose: ReadPurpose,
+    ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
-        let txn = match state.workspaces.get(&reader.id) {
-            Some(ws) => ws.txn,
-            None => return,
+        // **A read whose session is gone REFUSES; it does not report success while retaining
+        // nothing.**
+        //
+        // This was the reachable half of a pair of sequential guards, and the one that got hardened
+        // was the unreachable half: `entry().or_insert_with` below covers a missing *capture*, which
+        // there is no site to produce, while this arm covers a missing *workspace*, which any
+        // connection can produce on demand. Workspace-absent is exactly branch-sealed — `seal`
+        // removes it — and `ABANDON BRANCH b_2` from a second connection seals a live session's
+        // branch by name.
+        //
+        // Measured before this: connection 1 opened a session, connection 2 abandoned its branch,
+        // and connection 1's `SELECT ... WHERE qty >= 20 AND qty < 50` returned `Ok` with two rows
+        // while its retention went on the floor; `REVERT MERGE m_1` then came back unblocked. The
+        // rest of that session's surface already refuses — its next write fails with `no agent
+        // session on branch` and its `MERGE` fails with `has been reaped` — so the read reporting
+        // success was the one operation still lying about it.
+        let (txn, prov) = match state.workspaces.get(&reader.id) {
+            Some(ws) => (ws.txn, ws.prov),
+            None => {
+                return Err(FerroError::Branch(format!(
+                    "no agent session on branch {reader}: this read cannot be retained, and a read \
+                     that reports success while retaining nothing is indistinguishable from one \
+                     that had nothing to retain. The branch was sealed — merged, abandoned or \
+                     reaped — while this session still held it."
+                )))
+            }
         };
         // `begin_ts: 0` means "no published version existed when this row was read", and that is a
         // real observation rather than a null: `state.versions` is written only when a merge
@@ -784,25 +1141,79 @@ impl AgentRuntime {
                 })
             })
             .collect();
-        let summary = PredicateSummary {
-            tbl,
-            col: None,
-            lo: crate::provenance::readset::Bound::Unbounded,
-            hi: crate::provenance::readset::Bound::Unbounded,
-            residual: where_clause.map(|w| w.to_sql()),
-            rows_observed: matched.len() as u64,
+        // **The snapshot this read saw, on the runtime's own version clock.** `record_applied`
+        // stamps every published version with `apply_seq`, so everything published so far is
+        // `<= apply_seq` and the next version that can exist is `apply_seq + 1`. That is a HIGH
+        // WATER MARK, and `DependencyGraphBuilder::build` compares strictly against it
+        // (`begin_ts < observed_at`), the same rule `ReadView::is_commited_for_me` applies.
+        //
+        // The `+ 1` is load-bearing and is the anti-vacuity half of criterion 10. With `apply_seq`
+        // itself, a scan would come out depending on the write that landed AT that seq — a write it
+        // could not have seen — and every scan would then be a dependent of the merge immediately
+        // preceding it, which is the same under-reporting failure with the sign flipped.
+        let observed_at = state.apply_seq + 1;
+        let summary = predicate_summary(tbl, where_clause, bound_where, matched.len() as u64);
+        // `or_insert_with`, never `if let Some`. A read that finds no capture and retains nothing
+        // silently is indistinguishable from a read that had nothing to retain, and that is the
+        // precise failure this lane exists to remove — the previous shape lost a scan's region with
+        // no error anywhere. There is one workspace-creation site and it opens a capture, so this
+        // arm should be unreachable; it is written this way so that a second site cannot make
+        // retention optional by forgetting.
+        let capture = state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, prov, reader));
+        match purpose {
+            ReadPurpose::Inspection => capture.on_read(shape, versions, Some(summary), observed_at),
+            ReadPurpose::RowTargeting => capture.on_write_targeting_read(summary, observed_at),
+        }
+        Ok(())
+    }
+
+    /// Retain the scan a WRITE statement's own `WHERE` clause performed.
+    ///
+    /// **`UPDATE ... WHERE` and `DELETE ... WHERE` are scans, by this module's own definition.** Both
+    /// call [`AgentRuntime::visible_rows`], which returns *every* row, and then evaluate the bound
+    /// clause against each one. None of that used to be retained anywhere, and `record_read` had
+    /// exactly one caller — `select` — so the read-modify-write shape this lane exists to protect
+    /// found ZERO dependents unless the agent happened to spell the scan as a `SELECT` first.
+    ///
+    /// Measured before this: `INSERT (7, 30); MERGE` then
+    /// `UPDATE inventory SET qty = qty + 1 WHERE qty >= 20 AND qty < 50; MERGE` then
+    /// `REVERT MERGE m_1` gave `blocked_by = []`, the halt-mode revert proceeded, and row 7 —
+    /// carrying the second task's qty 31 — was deleted with no name in any tree. The identical
+    /// workload with one extra `SELECT` over the same range gave `blocked_by = [TxnId(2)]`, so the
+    /// difference was purely whether the scan had been spelled as a `SELECT`.
+    ///
+    /// The shape passed is [`AccessShape::FullScan`] because that is the physical access. Exact
+    /// versions are deliberately NOT retained here even for a key-shaped clause: the merge engine
+    /// already validates the cells a branch wrote against the target's current image with a witness
+    /// per cell, and adding a second staleness mechanism on top of it would promote a resolvable
+    /// cell merge into a hard `Retry`. What varies is the [`ReadPurpose`].
+    fn record_write_scan(
+        &self,
+        branch: BranchId,
+        tbl: TableId,
+        schema: &Schema,
+        matched: &[(RowId, Vec<Value>)],
+        where_clause: Option<&Expr>,
+        bound_where: Option<&BoundExpr>,
+    ) -> Result<(), FerroError> {
+        let purpose = match access_shape(where_clause, schema) {
+            // `WHERE <pk> = <literal>`: the statement named the row, it did not look at anything.
+            AccessShape::Point | AccessShape::IndexLookup => ReadPurpose::RowTargeting,
+            // Anything else compared a value to decide which rows matched. That is looking.
+            AccessShape::Range | AccessShape::FullScan => ReadPurpose::Inspection,
         };
-        let mut builder = crate::provenance::readset::ReadSetBuilder::new();
-        builder.observe(shape, versions.clone(), Some(summary));
-        let sets = builder.finish();
-        for v in &versions {
-            if shape.form() == crate::provenance::readset::ReadSetForm::ExactVersions {
-                state.dep.record_read(txn, *v);
-            }
-        }
-        if let Some(ws) = state.workspaces.get_mut(&reader.id) {
-            ws.reads.extend(sets);
-        }
+        self.record_read(
+            branch,
+            tbl,
+            AccessShape::FullScan,
+            matched,
+            where_clause,
+            bound_where,
+            purpose,
+        )
     }
 
     // ---- writes on a branch ----------------------------------------------------------------
@@ -818,6 +1229,19 @@ impl AgentRuntime {
         branch: BranchId,
         stmt: Stmt,
     ) -> Result<usize, FerroError> {
+        // The shape at first touch, for the same reason `base_rows` records the image at first
+        // touch: it is the fork point, and a merge that has to reconcile a shape needs one.
+        if let Some(name) = match &stmt {
+            Stmt::Update { table, .. } | Stmt::Insert { table, .. } | Stmt::Delete { table, .. } => {
+                Some(table.clone())
+            }
+            _ => None,
+        } {
+            if let Some(entry) = ctx.catalog.get_table(&name) {
+                let shape = entry.schema.clone();
+                self.note_base_shape(branch, &name, shape);
+            }
+        }
         match stmt {
             Stmt::Update { table, assignments, where_clause } => {
                 self.branch_update(ctx, branch, &table, assignments, where_clause)
@@ -826,10 +1250,102 @@ impl AgentRuntime {
             Stmt::Delete { table, where_clause } => {
                 self.branch_delete(ctx, branch, &table, where_clause)
             }
+            // `ALTER TABLE` does NOT come through here: it is staged by `stage_schema_edit`
+            // before this point, because a schema change is not a row write and must not be
+            // mixed into the effect log's cell algebra, whose `ColId` is the very ordinal an
+            // alteration moves.
             _ => Err(FerroError::Bind(
                 "only INSERT / UPDATE / DELETE run inside an agent session".into(),
             )),
         }
+    }
+
+    /// Record a table's shape at this branch's first touch of it. First-touch-wins, exactly as
+    /// `base_rows` is populated: a later call cannot move the fork point.
+    fn note_base_shape(&self, branch: BranchId, table: &str, shape: Schema) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(ws) = state.workspaces.get_mut(&branch.id) {
+            ws.base_shapes.entry(table.to_string()).or_insert(shape);
+        }
+    }
+
+    /// The shape this branch is working against: its fork point plus its own pending edits.
+    ///
+    /// This is what a *second* `ALTER` in one session is validated against, so `ADD COLUMN note`
+    /// twice in a row is refused when the agent types it rather than at merge.
+    fn branch_shape(&self, branch: BranchId, table: &str, shared: &Schema) -> Schema {
+        let state = self.state.lock().unwrap();
+        let Some(ws) = state.workspaces.get(&branch.id) else { return shared.clone() };
+        let mut shape = ws.base_shapes.get(table).cloned().unwrap_or_else(|| shared.clone());
+        for (t, edit) in &ws.schema_edits {
+            if t == table {
+                let _ = edit.apply(&mut shape);
+            }
+        }
+        shape
+    }
+
+    /// Record an `ALTER TABLE` on a branch — B11.
+    ///
+    /// Validated **now**, against the branch's own projected shape, with the same rules
+    /// [`Catalog::alter_table`] applies (`catalog::alter::resulting_schema`). An agent that types
+    /// an `ADD COLUMN ... NOT NULL` is told so immediately rather than at merge, after everything
+    /// that depended on it.
+    pub fn stage_schema_edit(
+        &self,
+        catalog: &Catalog,
+        branch: BranchId,
+        table: &str,
+        action: &AlterAction,
+    ) -> Result<(), FerroError> {
+        let entry = catalog.require_table(table)?;
+        let shared = entry.schema.clone();
+        let row_count = catalog.stats.get(table).map(|s| s.row_count).unwrap_or(0);
+        self.note_base_shape(branch, table, shared.clone());
+
+        let before = self.branch_shape(branch, table, &shared);
+        // Refuses here or nowhere: this is the same function the shared-catalog path calls.
+        resulting_schema(table, &before, action, row_count)?;
+
+        let edit = match action {
+            AlterAction::AddColumn(col) => SchemaEdit::AddColumn(col.clone()),
+            AlterAction::RenameColumn { from, to } => {
+                SchemaEdit::RenameColumn { from: from.clone(), to: to.clone() }
+            }
+            AlterAction::RetypeColumn { column, to } => {
+                // The type the branch OBSERVED. It is the whole of the precondition the merge
+                // re-checks — DESIGN's rule that a guard must name what was seen, not the
+                // invariant — and the parser has no reason to know it.
+                let from = before
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == column)
+                    .map(|c| c.data_type.clone())
+                    .ok_or_else(|| {
+                        FerroError::Bind(format!("no column '{column}' to retype in '{table}'"))
+                    })?;
+                SchemaEdit::RetypeColumn { column: column.clone(), from, to: to.clone() }
+            }
+        };
+
+        let mut state = self.state.lock().unwrap();
+        let ws = state
+            .workspaces
+            .get_mut(&branch.id)
+            .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
+        ws.schema_edits.push((table.to_string(), edit));
+        Ok(())
+    }
+
+    /// The schema changes a branch is carrying, for `DIFF` and for tests.
+    pub fn pending_schema_edits(&self, branch: BranchId) -> Vec<(String, SchemaEdit)> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .get(&branch.id)
+            .map(|ws| ws.schema_edits.clone())
+            .unwrap_or_default()
     }
 
     fn branch_update(
@@ -888,12 +1404,15 @@ impl AgentRuntime {
 
         let rows = self.visible_rows(ctx, Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
+        // The rows this statement's own scan returned. See `record_write_scan`.
+        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
                     continue;
                 }
             }
+            matched.push((rid, row.clone()));
             let mut new_row = row.clone();
             let mut ops: Vec<Op> = Vec::new();
             for (idx, expr, bound) in &resolved {
@@ -919,6 +1438,17 @@ impl AgentRuntime {
                 guard,
             });
         }
+        // Retained BEFORE the write is staged, deliberately: the scan happened whether or not
+        // `stage_all` admits the write, and dropping retention when a statement is refused is the
+        // same silent loss in a different place.
+        self.record_write_scan(
+            branch,
+            tbl,
+            &schema,
+            &matched,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let touched = staged.len();
         self.stage_all(branch, tbl, table, staged)?;
         Ok(touched)
@@ -994,12 +1524,15 @@ impl AgentRuntime {
         };
         let rows = self.visible_rows(ctx, Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
+        // The rows this statement's own scan returned. See `record_write_scan`.
+        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
         for (rid, row) in rows {
             if let Some(p) = &bound_where {
                 if !matches!(evaluate(p, &row)?, Value::Boolean(true)) {
                     continue;
                 }
             }
+            matched.push((rid, row.clone()));
             let guard = match &where_clause {
                 Some(w) => Some(guard_from_expr(w, tbl, rid, &schema)?),
                 None => None,
@@ -1013,6 +1546,15 @@ impl AgentRuntime {
                 guard,
             });
         }
+        // Same reason as on the UPDATE path: retained before the refusal point.
+        self.record_write_scan(
+            branch,
+            tbl,
+            &schema,
+            &matched,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let n = staged.len();
         self.stage_all(branch, tbl, table, staged)?;
         Ok(n)
@@ -1035,6 +1577,50 @@ impl AgentRuntime {
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
         self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
+    }
+
+    // ---- the capability envelope ------------------------------------------------------------
+
+    /// Narrow what `branch` is permitted to write, durably.
+    ///
+    /// **Narrow, not set.** A branch already carrying an envelope cannot be granted authority it
+    /// did not have — [`BranchRecord::restrict`] refuses any widening — because an envelope a
+    /// governed party can widen is a suggestion. A branch with no envelope is ungoverned, so the
+    /// first call installs freely; every child forked afterwards inherits it.
+    ///
+    /// Installing one on [`BranchId::TRUNK`] is how agent sessions become governed, since
+    /// `BEGIN AGENT SESSION` forks out of trunk by default.
+    ///
+    /// **Sessions already open keep the envelope they forked with.** A capability is what its
+    /// holder was handed at creation; changing it underneath a running holder is *revocation*, and
+    /// revocation is a design decision this does not make — it has to say what happens to a
+    /// statement in flight, and whether a branch may be narrowed below what it has already
+    /// written. The lever that does exist for a live agent is
+    /// [`AgentRuntime::quarantine`]: the branch stays readable and its `MERGE` is refused, so
+    /// nothing it wrote can reach the shared tables.
+    /// `installing_an_envelope_does_not_reach_a_session_that_is_already_open` pins both halves.
+    ///
+    /// **Cost.** Every governed statement that writes a row appends a full `BranchRecord` to the
+    /// catalog log and fsyncs it. On the page-backed path `set_root` already does that once per
+    /// row written, so this adds a fraction; on a map-backed runtime with a durable catalog it is
+    /// the only fsync on the path. Nothing compacts `branches.log`, and `LogBranchCatalog::open`
+    /// replays all of it, so a long-lived governed database pays for this at open time too. The
+    /// alternative — charging in memory and flushing on a bound — trades exactly the property the
+    /// field exists for, so it is a decision to make deliberately rather than a tuning knob.
+    pub fn restrict_branch(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        let mut record = self.branches.get(branch)?;
+        record.restrict(envelope)?;
+        self.branches.put(&record)
+    }
+
+    /// What `branch` is currently permitted to write, read from its durable record. `None` means
+    /// no envelope was ever installed, which is ungoverned.
+    pub fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
+        Ok(self.branches.get(branch)?.envelope)
     }
 
     /// Stage every row of ONE statement, or none of them.
@@ -1072,6 +1658,47 @@ impl AgentRuntime {
         // straight past the bound and landed the counter at -100 against a floor of 0. A float decrement
         // slipped through the same gap. Comparing before against after catches every op that lowers the
         // value, including ones not yet invented.
+
+        // The session has to exist before the branch record is consulted, so that writing to a
+        // sealed branch still reports "no agent session" rather than "reaped". Same refusal, same
+        // place in the order, just hoisted ahead of the record read.
+        if !self.state.lock().unwrap().workspaces.contains_key(&branch.id) {
+            return Err(FerroError::Branch(format!("no agent session on branch {}", branch)));
+        }
+
+        // **The capability envelope, read from the branch's own DURABLE record.**
+        //
+        // This is the one policy in this runtime that does not live in `Mutex<State>`. Merge
+        // policy, escrow claims and quarantine reasons all do, which means a restart silently
+        // un-governs every running agent — the envelope is in the record precisely so a reopen
+        // finds it still in force.
+        //
+        // It is evaluated on the same before/after images the escrow check below uses, and for
+        // the same reason, spelled out on `CapabilityEnvelope`: an allowlist keyed on the shape of
+        // the op is walked around by any other shape with the same effect. An INSERT is the live
+        // example — its `Op` carries `col: None`, so a column check reading the ops would see it
+        // write no column while it writes every one of them.
+        let charge = match self.branches.envelope_of(branch)? {
+            None => 0,
+            Some(envelope) => {
+                let images: Vec<RowImage> = items
+                    .iter()
+                    .map(|i| RowImage {
+                        row: i.row.0,
+                        before: i.before.as_deref(),
+                        after: match &i.after {
+                            RowState::Present(v) => Some(v.as_slice()),
+                            RowState::Deleted => None,
+                        },
+                    })
+                    .collect();
+                // The whole statement, before a single row is recorded — the same batch rule the
+                // escrow check follows just below, and for the same reason. Nothing is charged
+                // here: `admit` only answers how much this statement would cost.
+                envelope.admit(tbl.0, table, &images)?
+            }
+        };
+
         let mut spends: Vec<((TableId, RowId, ColId), i64)> = Vec::new();
         {
             let state = self.state.lock().unwrap();
@@ -1096,6 +1723,24 @@ impl AgentRuntime {
             // The whole statement, before a single unit is charged. This is the line that makes the
             // refusal atomic.
             state.escrow.check_all(branch, &spends)?;
+        }
+
+        // **Every refusal has now been decided, so the budget can be charged.**
+        //
+        // The order is load-bearing and was wrong once: charging before `check_all` meant an
+        // escrow-refused statement permanently spent envelope budget on rows it never wrote, and
+        // since the escrow error tells the client to claim more and retry, an ordinary retry loop
+        // burned the whole envelope budget on statements that wrote nothing.
+        //
+        // `charge_row_writes` is atomic against every other mutation of the record and re-checks
+        // the budget under the catalog's own lock, so it is the charge — not `admit` above — that
+        // decides. The window it leaves is an I/O failure further down (appending the frame,
+        // mirroring to pages) with the budget already spent. That direction is deliberate:
+        // charging afterwards would mean a failed record write leaves a row written and
+        // unbudgeted, which is fail-open. Over-charging refuses a later write; under-charging
+        // admits one.
+        if charge > 0 {
+            self.branches.charge_row_writes(branch, charge)?;
         }
 
         // ---- apply --------------------------------------------------------------------------
@@ -1294,13 +1939,26 @@ impl AgentRuntime {
         if rec.state == BranchState::Quarantined {
             return Ok(());
         }
-        rec.state = BranchState::Quarantined;
-        self.branches.put(&rec)?;
+        // **The reason is recorded BEFORE the state is published, and the order is the whole point.**
+        //
+        // These are two stores with two locks: the reason lives in this runtime's in-memory state, the
+        // state flag in the durable branch record. `put` makes `Quarantined` visible to every reader
+        // on every connection — the runtime is shared by all of them (`pgwire::ServerContext`) — so
+        // publishing first left a window in which `ferro_quarantine` showed a held branch with a NULL
+        // reason. `system_views` tells the reader that a NULL there means the reason did not survive a
+        // restart, which would have been a false statement about a live process.
+        //
+        // Reversed, the only window left is a branch whose reason is recorded and whose state is still
+        // `Live` — invisible to the view, because it selects on state, so a reader sees either nothing
+        // or a hold with its reason. `release_from_quarantine` already has the safe order for the same
+        // reason: it clears the state first and the reason after.
         self.state
             .lock()
             .unwrap()
             .quarantine_reasons
             .insert(branch.id, reason.to_string());
+        rec.state = BranchState::Quarantined;
+        self.branches.put(&rec)?;
         Ok(())
     }
 
@@ -1334,6 +1992,19 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Three-way merge of a branch into its parent, published if the gate admits it. Exit
+    /// criteria 5, 6 and 7.
+    ///
+    /// **This function is policy; the mechanism is [`AgentRuntime::evaluate_merge`].** Scoring a
+    /// merge — composing the ops, re-checking the guards, running the verification gate — touches
+    /// nothing at all, and lives there. What is left here is the two decisions only a production
+    /// merge makes: hold a branch the gate declined, and leave a conflicting branch alive so the
+    /// agent can retry against the predicate it was handed.
+    ///
+    /// A caller that wants the verdict without the consequences (`SIMULATE` scoring K candidate
+    /// branches against one base) calls `evaluate_merge` directly and never reaches this function
+    /// for the candidates it does not admit. That is the whole point of the split: the score of
+    /// candidate 2 must not have been computed against a base candidate 1 already moved.
     pub fn merge(&self, ctx: &mut ExecCtx, branch: BranchId) -> Result<MergeReport, FerroError> {
         // A held branch is held. Letting a merge through would make quarantine advisory, and an
         // advisory hold is not a hold.
@@ -1343,6 +2014,77 @@ impl AgentRuntime {
                 self.quarantine_reason(branch).unwrap_or_else(|| "no reason recorded".into())
             )));
         }
+
+        // No assertions: a production merge is scored by the gate's own checks. `SIMULATE` adds
+        // declared invariants to this same list rather than scoring anywhere else.
+        let eval = self.evaluate_merge(ctx, branch, &[])?;
+        let merge_id = self.next_merge_id();
+
+        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
+        //
+        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
+        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
+        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
+        // retrying blindly would recompute against a base that may move again.
+        //
+        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
+        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
+        // the safe response to not knowing is to hold, not to throw away.
+        if !eval.gate.is_pass() {
+            let reason = eval.gate_reason();
+            self.quarantine(branch, &reason)?;
+            return Ok(eval.into_report(merge_id, false));
+        }
+
+        if eval.outcome.is_conflict() {
+            // Nothing is published and the branch stays alive: the agent has the violated
+            // predicate and can retry.
+            return Ok(eval.into_report(merge_id, false));
+        }
+
+        self.publish_evaluation_as(ctx, eval, merge_id)
+    }
+
+    /// The next merge id. One per `MERGE` statement and one per admitted candidate, whatever the
+    /// outcome, so an id names an admission attempt rather than only a success.
+    fn next_merge_id(&self) -> String {
+        let mut state = self.state.lock().unwrap();
+        state.next_merge += 1;
+        format!("m_{}", state.next_merge)
+    }
+
+    /// **Score a merge without performing it.**
+    ///
+    /// Everything a merge decides — three-way composition against the target, the guard re-check,
+    /// the blind-write metric, the read-premise check, any declared assertions, and the
+    /// verification gate's verdict over all of them — computed against the target as it stands
+    /// now, publishing nothing and mutating no shared state.
+    ///
+    /// # Why this is a separate function
+    ///
+    /// `SIMULATE` forks K sibling branches off one base and scores every one of them. If scoring
+    /// were merging, candidate 1 would land on the target before candidate 2 was scored, and every
+    /// score after the first would be a score against a different database. The evaluations are
+    /// therefore all computed against one base, and admission is a second pass that re-evaluates.
+    ///
+    /// # The staleness the split creates, and the guard on it
+    ///
+    /// An evaluation is an **optimistic read**: DESIGN.md section 4 says the gate "must run as an
+    /// optimistic transaction — it reads the base snapshot to reach a verdict, so if base moves
+    /// before merge the verdict is stale. Textbook TOCTOU." Splitting evaluate from publish opens
+    /// exactly that window, so the evaluation carries a fingerprint of every row it read and
+    /// [`AgentRuntime::publish_evaluation`] refuses to publish against a base that no longer
+    /// matches it. The window is closed by refusing, not by hoping it is short.
+    ///
+    /// `assertions` are declared invariants, checked against the state this merge would leave
+    /// behind — see [`crate::agent_sql::gate::AssertionResult`] for why that is not what a guard
+    /// does. A production `MERGE` passes none and is scored by the gate's own checks alone.
+    pub fn evaluate_merge(
+        &self,
+        ctx: &mut ExecCtx,
+        branch: BranchId,
+        assertions: &[Assertion],
+    ) -> Result<MergeEvaluation, FerroError> {
         let target = self.branches.get(branch)?.parent_id.unwrap_or(BranchId::TRUNK);
         let snapshot = {
             let state = self.state.lock().unwrap();
@@ -1358,28 +2100,150 @@ impl AgentRuntime {
                 tables: ws.tables.clone(),
                 ops: ws.frame.ops.clone(),
                 guards: ws.frame.guards.clone(),
-                reads: ws.reads.clone(),
+                // B4's read-set, from `captures` rather than a per-workspace copy.
+                reads: state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default(),
+                schema_edits: ws.schema_edits.clone(),
+                base_shapes: ws.base_shapes.clone(),
             }
         };
 
-        // Current shared state for every table this branch touched.
-        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
-        let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
-        for (t, name) in &snapshot.tables {
+        // ---- schema, before rows -----------------------------------------------------------
+        //
+        // B11. The shape a merge publishes rows into is the merged shape, so the schema has to
+        // compose before anything decides what a row means. A schema conflict is reported exactly
+        // as a cell conflict is — same `ConflictReport`, same violated predicate — and publishes
+        // nothing, because a merge that applied half a shape is worse than one that applied none.
+        //
+        // Every table the branch touched is considered, not only the ones it altered: a branch
+        // that forked before a sibling's `ADD COLUMN` has rows one value short of the target, and
+        // that is a schema question about a branch with no schema edits of its own.
+        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
+        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
+        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
+        for (_, name) in &snapshot.tables {
+            altered_tables.insert(name.clone());
+        }
+        for (name, _) in &snapshot.schema_edits {
+            altered_tables.insert(name.clone());
+        }
+        let mut merged_shapes: BTreeMap<String, Schema> = BTreeMap::new();
+        for name in &altered_tables {
             let entry = ctx
                 .catalog
                 .get_table(name)
                 .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
+            let target_now = entry.schema.clone();
+            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
+            let ours: Vec<SchemaEdit> = snapshot
+                .schema_edits
+                .iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, e)| e.clone())
+                .collect();
+            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
+            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
+            merged_shapes.insert(name.clone(), merged.shape.clone());
+            schema_reports.push(SchemaMergeReport {
+                table: name.clone(),
+                outcome: merged.outcome,
+                to_apply: merged.to_apply,
+                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
+            });
+        }
+
+        // Current shared state for every table this branch touched.
+        // **B11's schema merge, evaluated here and applied in `publish_evaluation`.**
+        //
+        // B6 split `merge` into a half that decides and a half that applies, so B11's schema
+        // work splits the same way: conflict detection is a question about state and belongs
+        // with every other admission check, while the DDL that changes the shape must not run
+        // until a decision has been taken. Left whole in either half it would be wrong - in
+        // `evaluate` it would alter tables during a dry run, in `publish` its conflicts would
+        // arrive after the gate had already passed the merge.
+        //
+        // `merged_shapes` from B11's version is dropped: it was written and never read.
+        let mut schema_reports: Vec<SchemaMergeReport> = Vec::new();
+        let mut schema_conflicts: Vec<ConflictReport> = Vec::new();
+        let mut altered_tables: BTreeSet<String> = BTreeSet::new();
+        for (_, name) in &snapshot.tables {
+            altered_tables.insert(name.clone());
+        }
+        for (name, _) in &snapshot.schema_edits {
+            altered_tables.insert(name.clone());
+        }
+        for name in &altered_tables {
+            let entry = ctx
+                .catalog
+                .get_table(name)
+                .ok_or_else(|| FerroError::Bind(format!("unknown table: {}", name)))?;
+            let target_now = entry.schema.clone();
+            let base = snapshot.base_shapes.get(name).cloned().unwrap_or_else(|| target_now.clone());
+            let ours: Vec<SchemaEdit> = snapshot
+                .schema_edits
+                .iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, e)| e.clone())
+                .collect();
+            let merged = merge_schema(name, table_id(name), &base, &target_now, &ours)?;
+            schema_conflicts.extend(merged.outcome.conflicts().iter().cloned());
+            schema_reports.push(SchemaMergeReport {
+                table: name.clone(),
+                outcome: merged.outcome,
+                to_apply: merged.to_apply,
+                shape: merged.shape.columns.iter().map(|c| c.name.clone()).collect(),
+            });
+        }
+
+        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
+        let mut table_names: BTreeMap<u32, String> = snapshot.tables.clone();
+        // ...and for every table an assertion ranges over, which need not be one this branch
+        // wrote to. An assertion over a table the candidate never touched is still a claim about
+        // the state the merge would leave behind, and it is read here so the fingerprint below
+        // covers it: the evaluation depended on those rows, so a change to them invalidates it.
+        for a in assertions {
+            table_names.entry(table_id(&a.table).0).or_insert_with(|| a.table.clone());
+        }
+        for (t, name) in &table_names {
+            let Some(entry) = ctx.catalog.get_table(name) else {
+                // An unknown table is not an empty one. A table this branch wrote to must exist;
+                // a table only an assertion names is reported by the assertion itself as
+                // unevaluable, which the gate hard-rejects.
+                if snapshot.tables.contains_key(t) {
+                    return Err(FerroError::Bind(format!("unknown table: {}", name)));
+                }
+                continue;
+            };
             schemas.insert(*t, entry.schema.clone());
             for row in scan_table(name, ctx)? {
                 current.insert((*t, row_id_of(&row).0), row);
             }
         }
 
+        // Every row this branch READ by exact version. The gate's read-premise verdict is computed
+        // from `state.versions` for exactly these rows, and `tables_read` cannot cover them: a read
+        // does not put its table into the workspace's table map (only `stage_all` does), and a
+        // `TableId` is a one-way hash of the name, so there is no table to re-scan. They are
+        // fingerprinted directly instead.
+        //
+        // Without this, an evaluation of a branch that READ `oncall` and WROTE `roster` carried a
+        // `Pass` from the read-premise check and a fingerprint over `roster` alone — so a
+        // concurrent publication to `oncall` left the fingerprint matching and the stale verdict
+        // publishable. That is the hospital case the check exists for, arriving through the door
+        // the split opened.
+        let premise_rows = premise_rows_of(&snapshot.reads);
+        // The base this evaluation is about, as one number. See `publish_evaluation`.
+        let base_fingerprint =
+            fnv64_update(fingerprint_rows(&current)?, &self.fingerprint_premises(&premise_rows).to_be_bytes());
+
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
         // The state guards are re-checked against; see the comment where it is filled in.
         let mut admit_state = CellState::new();
+        // The image this merge would LEAVE for each row it touches — `None` where it would remove
+        // the row. Distinct from `admit_state` on purpose: guards are preconditions and read the
+        // image before the ops land, assertions are claims about the result and read this one.
+        let mut produced: BTreeMap<(u32, u64), Option<Vec<Value>>> = BTreeMap::new();
         let policy_snapshot = { self.state.lock().unwrap().policy.clone() };
 
         for ((t, r), after) in &snapshot.rows {
@@ -1389,6 +2253,33 @@ impl AgentRuntime {
             let schema = schemas.get(t).cloned().unwrap_or_else(|| Schema::new(Vec::new()));
             let before = snapshot.base_rows.get(&(*t, *r)).cloned().flatten();
             let now = current.get(&(*t, *r)).cloned();
+
+            // **B11 — read this branch's images in the shape the target has NOW, before anything
+            // compares them.**
+            //
+            // A branch's rows were written against its fork-point shape. If a sibling agent merged
+            // an `ADD COLUMN` or a widening retype since, those images are the wrong width or the
+            // wrong type for the table they are about to be compared against and published into.
+            // Conforming here rather than at publication is deliberate: the cell loop below walks
+            // `0..v.len().min(b.len())`, so two images of different widths would have their extra
+            // columns silently dropped from the merge — no conflict, no report, `Clean`.
+            let (before, after) = match (snapshot.base_shapes.get(&table), schemas.get(t)) {
+                (Some(base_shape), Some(target_shape)) if base_shape != target_shape => {
+                    let b = match &before {
+                        Some(v) => Some(conform_row(v, base_shape, target_shape)?),
+                        None => None,
+                    };
+                    let a = match after {
+                        RowState::Present(v) => {
+                            RowState::Present(conform_row(v, base_shape, target_shape)?)
+                        }
+                        RowState::Deleted => RowState::Deleted,
+                    };
+                    (b, a)
+                }
+                _ => (before, after.clone()),
+            };
+            let after = &after;
             let mut applied_ops: Vec<Op> = Vec::new();
             let mut discarded = Vec::new();
             let mut conflicts: Vec<ConflictReport> = Vec::new();
@@ -1428,6 +2319,7 @@ impl AgentRuntime {
                             table: table.clone(),
                             row: v.clone(),
                         });
+                        produced.insert((*t, *r), Some(v.clone()));
                     }
                 }
                 // delete
@@ -1448,6 +2340,9 @@ impl AgentRuntime {
                             table: table.clone(),
                             key: b[0].clone(),
                         });
+                        // `None` is the row being GONE, which is not the same as the row being
+                        // unchanged: an assertion must be scored over the table without it.
+                        produced.insert((*t, *r), None);
                     }
                     None => {
                         // already gone on the target: nothing to publish
@@ -1506,6 +2401,12 @@ impl AgentRuntime {
                             row: new_row.clone(),
                             before: now.clone().unwrap_or_else(|| b.clone()),
                         });
+                        // The COMPOSED image, not the branch's own after-image: a cell the target
+                        // also moved resolves to `target + ours`, and that is what an assertion has
+                        // to be scored against. Scoring the branch's after-image would test a state
+                        // no merge produces — and it is exactly the composed one that goes negative
+                        // when a third candidate lands on a pair that already composed.
+                        produced.insert((*t, *r), Some(new_row.clone()));
                     }
                 }
                 (None, RowState::Deleted) => {}
@@ -1543,6 +2444,10 @@ impl AgentRuntime {
         // Guards are re-checked **after** composition, against the state the merge would produce.
         let guard_conflicts = check_guards(&snapshot.guards, &admit_state);
         for c in guard_conflicts {
+            // A row whose guard failed publishes nothing, so it must not appear in the image the
+            // assertions are scored against either — scoring a candidate against a row it was
+            // refused permission to write is scoring a state that will never exist.
+            produced.remove(&(c.tbl.0, c.row.0));
             match row_outcomes.iter_mut().find(|r| r.tbl == c.tbl && r.row == c.row) {
                 Some(r) => {
                     r.conflicts.push(c);
@@ -1567,6 +2472,12 @@ impl AgentRuntime {
         // a heuristic is quarantine "which does not exist yet". Quarantine has existed end to end
         // since `integration_quarantine.rs`; the comment outlived it. So the gate now runs here, and
         // its outcome is honoured.
+        //
+        // **This is the only place a `VerificationGate` is built on the merge path**, and that is
+        // what makes "a simulated candidate is scored by the same gate a production merge uses" a
+        // property of the code rather than a claim about it: `SIMULATE` reaches this line through
+        // `evaluate_merge` exactly as `MERGE` does, and the only difference between them is the
+        // list of declared assertions handed in.
         let blind = blind_writes_of(&snapshot.rows, &snapshot.reads);
 
         // The premise check: every version this branch READ, against the version the base holds now.
@@ -1590,8 +2501,39 @@ impl AgentRuntime {
                                 Some(now) if now.begin_ts != v.begin_ts => {
                                     moved.push((v.tbl, v.row, v.begin_ts, now.begin_ts));
                                 }
-                                // Still unpublished, or the same version: the premise holds.
-                                _ => {}
+                                // Same version: the premise genuinely holds.
+                                Some(_) => {}
+                                // ABSENT. This used to share an arm with the line above under the
+                                // comment "still unpublished, or the same version: the premise
+                                // holds", which conflates two different facts. A fresh-context
+                                // reader of this code (B9) called that fail-open.
+                                //
+                                // MEASURED, because the conclusion changes what this arm is for: it
+                                // is UNREACHABLE today, and the claim that it closed a live hole was
+                                // wrong. `versions` is written only by `record_applied` and NOTHING
+                                // in the crate removes from it (`grep versions.remove|retain|clear`
+                                // -> no hits, checked across all ten feature branches). And a read
+                                // of a row no merge has published is retained as `begin_ts == 0`,
+                                // not as a real timestamp - pinned by
+                                // `integration_read_premise::a_read_of_an_unpublished_row_is_recorded_as_version_zero`.
+                                // So an absent entry always means "unpublished at read time", and
+                                // the zero case below is the one that actually runs.
+                                //
+                                // The arm is kept, split out, as defence for the day something DOES
+                                // remove from `versions` - a `DROP TABLE` purge being the obvious
+                                // candidate, and B9's own `forget_table` already purges `row_author`
+                                // while leaving `versions` alone. On that day an absent entry against
+                                // a real version would mean "a premise I verified and have since
+                                // lost", and the honest answer is to stop claiming exactness rather
+                                // than to report that it holds.
+                                //
+                                // Deliberately NOT pushed onto `moved`: escalating an unseen row to
+                                // a violation would quarantine branches over rows this gate simply
+                                // cannot see, which is how wiring `BlindWriteCheck` into admission
+                                // took the suite from 871 to 590.
+                                None if v.begin_ts != 0 => approximate = true,
+                                // Read a row nobody had published, and nobody has since. Holds.
+                                None => {}
                             }
                         }
                     }
@@ -1604,7 +2546,11 @@ impl AgentRuntime {
             (moved, approximate)
         };
 
-        // **Only the premise check gates the merge, and the blind-write metric deliberately does not.**
+        // Declared invariants, scored against the image this merge would leave behind.
+        let assertion_results = evaluate_assertions(assertions, &schemas, &current, &produced);
+
+        // **Only the premise check and the declared assertions gate the merge; the blind-write
+        // metric deliberately does not.**
         //
         // `BlindWriteCheck` is `Heuristic`, and its own documentation says why: "a blind write is
         // genuinely suspicious and genuinely not proof of anything — the agent may have had every right
@@ -1614,67 +2560,223 @@ impl AgentRuntime {
         // starts blocking merges has been promoted without anyone deciding to promote it.
         //
         // So it stays where it was, reported on `MergeReport::blind_writes`, and the gate carries the
-        // check that is actually decidable.
-        let gate = crate::agent_sql::gate::VerificationGate::new()
-            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)))
-            .run();
+        // checks that are actually decidable.
+        let mut gate = crate::agent_sql::gate::VerificationGate::new()
+            .with(Box::new(crate::agent_sql::gate::ReadPremiseCheck::new(moved, approximate)));
+        for r in &assertion_results {
+            // One check per assertion, not one check for all of them: the gate runs every check in
+            // a tier even after one has fired, so a caller with three broken assertions learns all
+            // three in one round trip.
+            gate = gate.with(Box::new(crate::agent_sql::gate::AssertionCheck::new(r.clone())));
+        }
+        let gate = gate.run();
 
-        let outcome = MergeReport::aggregate(&row_outcomes);
-        let merge_id = {
-            let mut state = self.state.lock().unwrap();
-            state.next_merge += 1;
-            format!("m_{}", state.next_merge)
+        let outcome = MergeReport::aggregate(&row_outcomes, &schema_reports);
+
+        Ok(MergeEvaluation {
+            from: branch,
+            into: target,
+            outcome,
+            rows: row_outcomes,
+            blind_writes: blind,
+            gate,
+            assertions: assertion_results,
+            produced,
+            base_fingerprint,
+            tables_read: table_names,
+            premise_rows,
+            snapshot,
+            pre_images: pending_writes
+                .iter()
+                .filter_map(|w| w.row_key())
+                .filter_map(|k| current.get(&k).map(|row| (k, row.clone())))
+                .collect(),
+            schema: schema_reports,
+            pending: pending_writes,
+        })
+    }
+
+    /// Publish an evaluation the gate admitted, under a fresh merge id.
+    pub fn publish_evaluation(
+        &self,
+        ctx: &mut ExecCtx,
+        eval: MergeEvaluation,
+    ) -> Result<MergeReport, FerroError> {
+        let merge_id = self.next_merge_id();
+        self.publish_evaluation_as(ctx, eval, merge_id)
+    }
+
+    /// The publishing half of the split, with the two refusals that make the split safe.
+    ///
+    /// **1. An evaluation the gate did not admit cannot be published.** Otherwise the split would
+    /// have moved the decision from the gate to whoever remembered to look at its verdict.
+    ///
+    /// **2. An evaluation whose base has moved cannot be published.** This is the TOCTOU window
+    /// that splitting evaluate from publish creates, and DESIGN.md section 4 names it: the gate is
+    /// an optimistic read, so a verdict computed against a base that has since changed is a
+    /// verdict about a database that no longer exists. The fingerprint covers every row of every
+    /// table the evaluation read — the tables the branch wrote to and the tables its assertions
+    /// ranged over — so any change to them refuses here rather than publishing a stale merge.
+    ///
+    /// The refusal is the point. `SIMULATE` never trips it, because it re-evaluates each candidate
+    /// against the base as it stands at that candidate's turn; a caller that holds an evaluation
+    /// across another merge gets an error instead of a silently wrong publication.
+    ///
+    /// **Two costs this imposes on every ordinary `MERGE`, stated rather than discovered:**
+    ///
+    /// * The touched tables are scanned twice — once to evaluate, once to fingerprint here. On a
+    ///   large table that doubles the merge's scan. The alternative is publishing against a base
+    ///   that may have moved, and there is no cheaper sufficient signal: a row count cannot see an
+    ///   update, and the version map only moves when a merge publishes.
+    /// * `MERGE` can now return an `Err` where it previously always returned a `MergeReport`. It
+    ///   happens only when another connection changed the base between this merge's own evaluate
+    ///   and publish, and the answer is to run `MERGE` again. The pre-split code had the same race
+    ///   and resolved it by publishing the stale merge, which is the failure this replaces.
+    fn publish_evaluation_as(
+        &self,
+        ctx: &mut ExecCtx,
+        eval: MergeEvaluation,
+        merge_id: String,
+    ) -> Result<MergeReport, FerroError> {
+        if !eval.gate.is_pass() {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {}: the verification gate returned {} — {}",
+                eval.from,
+                eval.gate.name(),
+                eval.gate_reason()
+            )));
+        }
+        if eval.outcome.is_conflict() {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {}: the merge conflicts — {}",
+                eval.from,
+                eval.violated_predicates().join("; ")
+            )));
+        }
+
+        let now = fnv64_update(
+            self.fingerprint_tables(ctx, &eval.tables_read)?,
+            &self.fingerprint_premises(&eval.premise_rows).to_be_bytes(),
+        );
+        if now != eval.base_fingerprint {
+            return Err(FerroError::Merge(format!(
+                "refusing to publish {} against a base that moved after it was scored: this \
+                 evaluation was computed against fingerprint {:x} and the base is now {:x}. \
+                 Re-evaluate; publishing would apply a merge decided against a state that no \
+                 longer exists.",
+                eval.from, eval.base_fingerprint, now
+            )));
+        }
+
+        let MergeEvaluation {
+            from, into, outcome, rows, blind_writes, snapshot, pending, pre_images,
+            schema: schema_reports, ..
+        } = eval;
+
+        // **The images each row moves BETWEEN, which is what a retained predicate is tested
+        // against.** A scan kept a region, not versions, so the only way to ask "did what this merge
+        // published fall inside the region you scanned" is against values — and both ends are
+        // needed, not just the new one:
+        //
+        // - `post` is what a scan running after this merge SAW. A write into the scanned range is
+        //   the phantom case.
+        // - `pre` is what such a scan no longer saw. A write that moved a value OUT of the range, or
+        //   deleted the row entirely, is a dependency too: the scan observed an ABSENCE that this
+        //   merge caused, and reverting the merge puts the row back inside the range. Phantom
+        //   coverage is exactly about the rows that were not there, so leaving `pre` out would drop
+        //   half of it.
+        //
+        // `pre` comes from `current`, the target's image at merge time, rather than from the
+        // branch's fork-point `base_rows`: what matters is what the row held immediately before this
+        // merge published, which is not the same thing once a concurrent branch has merged.
+        // `pre` is carried on the evaluation rather than recomputed here: `current` is
+        // evaluate-time state, and B6's `base_fingerprint` refuses to publish onto a base that
+        // moved since, so the evaluate-time image IS "what the target held immediately before this
+        // merge published". Recomputing it here would re-scan for a value the guard already pinned.
+        let images = PublishedImages {
+            pre: pre_images,
+            post: pending.iter().filter_map(|w| w.published_image()).collect(),
         };
 
-        // The gate decides BEFORE publication, and its outcome is honoured rather than reported.
+        // **Reserve the version sequence BEFORE the rows become visible.**
         //
-        // A stale premise is routed to quarantine rather than rejection, deliberately: the branch's
-        // work is not wrong, it was computed against state that has since moved, and quarantine keeps
-        // it queryable so an operator or the agent can look at it. Rejecting would destroy it and
-        // retrying blindly would recompute against a base that may move again.
+        // `record_applied` runs after `commit`, and it used to be where `apply_seq` advanced. That
+        // left a window in which the published rows were readable while the clock still said they
+        // did not exist: a scan landing there would take `observed_at = apply_seq + 1`, land at or
+        // below the versions it had just read, and the temporal rule in
+        // `DependencyGraphBuilder::build` would drop a real edge — a silently missing dependent,
+        // which is the failure mode this whole lane is about.
         //
-        // `HardReject` also quarantines rather than discarding, for the same reason the gate orders
-        // `NotEvaluable` last: not knowing whether a merge is safe is worse than knowing it is not, and
-        // the safe response to not knowing is to hold, not to throw away.
-        if !gate.is_pass() {
-            let detail: Vec<String> = gate
-                .findings()
-                .iter()
-                .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
-                .collect();
-            let reason = format!("{} at merge admission — {}", gate.name(), detail.join("; "));
-            self.quarantine(branch, &reason)?;
-            return Ok(MergeReport {
-                merge_id,
-                from: branch,
-                into: target,
-                outcome,
-                rows: row_outcomes,
-                blind_writes: blind,
-                applied_to_target: false,
-            });
-        }
-
-        if outcome.is_conflict() {
-            // Nothing is published and the branch stays alive: the agent has the violated
-            // predicate and can retry.
-            return Ok(MergeReport {
-                merge_id,
-                from: branch,
-                into: target,
-                outcome,
-                rows: row_outcomes,
-                blind_writes: blind,
-                applied_to_target: false,
-            });
-        }
+        // Reserving first inverts the error: in that window the clock is ahead of visibility, so a
+        // scan that could NOT see the rows may still be named a dependent. Over-reporting is
+        // recoverable — the operator sees a name in the halt tree and dismisses it — and
+        // under-reporting cascades a revert through work that depended on the write.
+        //
+        // Not reachable through today's server, which serves one connection at a time
+        // (`pgwire::serve`), so this closes a hole rather than fixing an observed failure. The
+        // numbering is unchanged: the same ops, in the same order, get the same sequence values.
+        //
+        // **And the reservation is checked for freshness against an INDEPENDENT record before the
+        // publish transaction opens.** The invariant that matters is the one the assertion in
+        // `record_applied` describes and cannot test: no two versions ever share a `begin_ts`. That
+        // assertion compares the reservation to a re-count of the same `rows` list the stamping loop
+        // walks, so both sides are the same sum and no input can falsify it. `State::applied` can:
+        // it is appended to once per stamped version, never pruned, and written by nobody but the
+        // stamping loop, so it answers "has this number been handed out" without consulting the
+        // arithmetic that produced the number. Refused here rather than asserted after `commit`,
+        // because here the rows are not yet visible and a refusal is still a clean one.
+        let reserved: std::ops::Range<u64> = {
+            let mut state = self.state.lock().unwrap();
+            let base = state.apply_seq;
+            fresh_reservation(highest_applied_seq(&state.applied), base)
+                .map_err(FerroError::Merge)?;
+            state.apply_seq += rows.iter().map(|r| r.applied.len() as u64).sum::<u64>();
+            base..state.apply_seq
+        };
 
         // Publish every row in ONE transaction. Row-at-a-time commits would leave a merge that
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
+        //
+        // Rows go in under the shape the catalog has NOW — every image was conformed to it above,
+        // where the cell merge could still see both shapes — and the branch's own schema edits are
+        // executed afterwards. Two reasons, and the order is not interchangeable:
+        //
+        // - `ALTER` is refused inside a transaction, so the edits cannot run inside the publish
+        //   transaction at all;
+        // - the alter's own heap rewrite widens every row in the table, which includes the ones
+        //   just published — so publishing narrow and altering after is not a compromise, it is
+        //   the same single pass over the heap that the alter was always going to make.
         let publish_txn = ctx.txn.begin()?;
+        // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
+        //
+        // The loop below already stamps each version's author through `apply_in`, which is what
+        // `who_wrote_row` and `ferro_row_authors` read — but that is in-memory state beside the
+        // heap, and a *reader of the log* has no access to it. `bind_run` appends a
+        // `RecKind::RunIdentity` chained to this transaction, which is the only thing the logical
+        // decoder can turn into a `writer` on a change event. Nothing called it, so every event on
+        // the feed carried `"writer":null` no matter which agent produced it — the attribution B5
+        // built was real and stopped at the process boundary.
+        //
+        // Skipped when the branch has no run: `ProvId::NONE` is the slot that MEANS unattributed,
+        // and `bind_run` refuses it rather than writing an identity record that claims a writer and
+        // names none. A plain SQL write has no run and must keep its honest null.
+        if !snapshot.prov.is_none() {
+            match self.provenance().lookup(snapshot.prov) {
+                Ok(run) => {
+                    if let Err(e) = ctx.txn.bind_run(publish_txn, run) {
+                        ctx.txn.abort(publish_txn)?;
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    ctx.txn.abort(publish_txn)?;
+                    return Err(e);
+                }
+            }
+        }
         let mut published = 0usize;
-        for w in pending_writes {
+        for w in pending {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
             let author = Some((Arc::clone(self.provenance()), snapshot.prov));
@@ -1685,18 +2787,98 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
-        self.record_applied(branch, snapshot.txn, &row_outcomes, &snapshot, &merge_id);
-        self.seal(branch, true)?;
+
+        // The schema, last, and outside the publish transaction because DDL is refused inside one.
+        // Executed through exactly the path a non-agent `ALTER TABLE` takes — `Catalog::alter_table`
+        // then a checkpoint then `log_ddl` — so a column an agent added reaches the change feed as
+        // the same in-band, in-log-order event as one a human added, and the retained declaration
+        // is updated the same way. A second producer of schema events would be a second chance to
+        // disagree with the consumer.
+        for report in &schema_reports {
+            for edit in &report.to_apply {
+                let action = edit.as_action();
+                let (dir_root, tt_root, alteration) = {
+                    let entry = ctx.catalog.require_table(&report.table)?;
+                    (
+                        entry.first_directory_page_id,
+                        entry.time_travel_root,
+                        alteration_of(&action, &entry.schema)?,
+                    )
+                };
+                let prov = Arc::clone(self.provenance());
+                let shape =
+                    ctx.catalog.alter_table(&report.table, &action, &ctx.txn, Some(&prov))?;
+                // Flushed rather than checkpointed, for the reason spelled out in the executor's
+                // `AlterTable` arm: truncating the log here would delete the change history of the
+                // very table this merge just published rows into.
+                ctx.bp.flush_all()?;
+                ctx.bp.disk_manager.sync()?;
+                ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
+                    op: crate::wal::log::DdlOp::AlterColumn(alteration),
+                    table: report.table.clone(),
+                    dir_root,
+                    time_travel_root: tt_root,
+                    columns: shape,
+                })?;
+            }
+        }
+
+        self.record_applied(
+            from,
+            snapshot.txn,
+            &rows,
+            &snapshot,
+            &merge_id,
+            &images,
+            reserved,
+        );
+        self.seal(from, true)?;
 
         Ok(MergeReport {
-            blind_writes: blind,
+            blind_writes,
             merge_id,
-            from: branch,
-            into: target,
+            from,
+            into,
             outcome,
-            rows: row_outcomes,
+            rows,
+            schema: schema_reports,
             applied_to_target: true,
         })
+    }
+
+    /// Fingerprint of every row of `tables`, as the shared tables hold them right now.
+    fn fingerprint_tables(
+        &self,
+        ctx: &mut ExecCtx,
+        tables: &BTreeMap<u32, String>,
+    ) -> Result<u64, FerroError> {
+        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        for (t, name) in tables {
+            if ctx.catalog.get_table(name).is_none() {
+                continue;
+            }
+            for row in scan_table(name, ctx)? {
+                current.insert((*t, row_id_of(&row).0), row);
+            }
+        }
+        fingerprint_rows(&current)
+    }
+
+    /// Fingerprint of the published version of every row an evaluation READ.
+    ///
+    /// `state.versions` is the map the read-premise check compares against, so folding it in is
+    /// what makes that check's verdict part of what the staleness guard protects. It also catches
+    /// a republication of byte-identical rows, which moves a version without moving any row image.
+    fn fingerprint_premises(&self, rows: &[(TableId, RowId)]) -> u64 {
+        let state = self.state.lock().unwrap();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (t, r) in rows {
+            h = fnv64_update(h, &t.0.to_be_bytes());
+            h = fnv64_update(h, &r.0.to_be_bytes());
+            let v = state.versions.get(&(t.0, r.0)).map(|v| v.begin_ts).unwrap_or(0);
+            h = fnv64_update(h, &v.to_be_bytes());
+        }
+        h
     }
 
     /// The composed effect the target absorbed on this cell since we forked, if any.
@@ -1739,12 +2921,19 @@ impl AgentRuntime {
         rows: &[RowMergeOutcome],
         snapshot: &WorkspaceSnapshot,
         merge_id: &str,
+        images: &PublishedImages,
+        reserved: std::ops::Range<u64>,
     ) {
         let mut state = self.state.lock().unwrap();
+        let mut written: Vec<WriteRecord> = Vec::new();
+        let mut next_seq = reserved.start;
         for r in rows {
             for op in &r.applied {
-                state.apply_seq += 1;
-                let seq = state.apply_seq;
+                // The sequence `merge` reserved before publishing, consumed in the same order it
+                // was counted. `state.apply_seq` is not touched here: it already stands at the end
+                // of this reservation.
+                next_seq += 1;
+                let seq = next_seq;
                 let before = snapshot
                     .ops
                     .iter()
@@ -1774,10 +2963,74 @@ impl AgentRuntime {
                     begin_ts: seq,
                 };
                 state.versions.insert((op.tbl.0, op.row.0), v);
-                state.dep.record_write(txn, v);
+                // **The valued writes a scan's retained region is checked against.** One per COLUMN
+                // of each image, because `PredicateSummary::covers` matches a write only against the
+                // column its predicate names: a summary over `qty` cannot see a write recorded
+                // against `id`, so recording only the op's own cell would leave every scan over
+                // every other column blind. A write with no image left to name (a delete of a row
+                // whose before-image we never held) still records the version itself, so the exact
+                // read-after-write edge survives; it simply cannot answer a region query.
+                let key = (op.tbl.0, op.row.0);
+                let mut seen: Vec<(u32, Value)> = Vec::new();
+                for img in [images.post.get(&key), images.pre.get(&key)].into_iter().flatten() {
+                    for (idx, val) in img.iter().enumerate() {
+                        let cell = (idx as u32, val.clone());
+                        if seen.contains(&cell) {
+                            continue;
+                        }
+                        seen.push(cell);
+                        written.push(WriteRecord::new(
+                            v,
+                            Some(ColId(idx as u32)),
+                            Some(val.clone()),
+                        ));
+                    }
+                }
+                if seen.is_empty() {
+                    written.push(WriteRecord::new(v, op.col, None));
+                }
                 // Authorship of the published row, kept past `seal` (exit criterion 9).
                 state.row_author.insert((op.tbl.0, op.row.0), snapshot.prov);
             }
+        }
+        // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
+        // `State` the loop is mutating, and holding a mutable borrow of it across `apply_seq += 1`
+        // does not borrow-check.
+        // **What this assertion is, stated honestly, because it was oversold.** Both sides are the
+        // same sum over the same `&[RowMergeOutcome]`: `reserved.end - reserved.start` is
+        // `rows.iter().map(|r| r.applied.len()).sum()` from the one call site, and
+        // `next_seq - reserved.start` counts iterations of the loop above over that same list, which
+        // nothing mutates in between and which has no interior mutability. So **no input can
+        // falsify it** — it is a structural invariant written as a runtime check, and it earns its
+        // place only as a tripwire on a future edit that changes one of the two expressions without
+        // the other. It is also a `debug_assert`, so it is absent from release builds.
+        //
+        // ITS BLIND SPOTS, both measured:
+        //  * it is silent when a merge stamps N versions and publishes fewer rows — the reservation
+        //    counts OPS while the publish loop iterates ROWS, and a two-column UPDATE reserves two
+        //    slots for one published row, so the two quantities are genuinely different and this
+        //    comparison is not between them;
+        //  * it never runs at all when the publish fails, because `record_applied` is not reached.
+        //
+        // The property its old comment claimed — that no two versions share a `begin_ts` — is
+        // guarded by `fresh_reservation` in `publish_evaluation_as`, against `State::applied`
+        // rather than against a re-count of this loop's own list, and it refuses before publishing
+        // rather than asserting afterwards.
+        debug_assert_eq!(
+            next_seq, reserved.end,
+            "merge reserved versions {:?} but record_applied consumed {} of them",
+            reserved,
+            next_seq - reserved.start
+        );
+        // `or_insert_with` for the same reason as on the read path: a publish whose valued writes
+        // go nowhere leaves cascade unable to see this merge at all, and it would look identical to
+        // a merge that published nothing.
+        let capture = state
+            .captures
+            .entry(txn.0)
+            .or_insert_with(|| TxnCapture::new(txn, snapshot.prov, branch));
+        for w in written {
+            capture.on_write(w);
         }
         state.merges.insert(
             merge_id.to_string(),
@@ -1786,6 +3039,59 @@ impl AgentRuntime {
     }
 
     // ---- ABANDON ---------------------------------------------------------------------------
+
+    /// Forget the in-memory state of every branch this runtime holds that the catalog no longer
+    /// does, returning how many were dropped.
+    ///
+    /// **The gap this closes.** `seal` is what removes a workspace, its `b_N` name and its escrow
+    /// claim, and `seal` is reached only from a merge or an `ABANDON`. A branch reclaimed by the
+    /// lease reaper is reclaimed *without client cooperation* — that is the whole point of the
+    /// lease — so nothing here is told, and its workspace stays in the map for the life of the
+    /// process. Its pages are gone; its bookkeeping is not. A server running simulations, where
+    /// most branches end this way by design, would grow without bound.
+    ///
+    /// Escrow is released rather than settled: a branch the reaper took never published anything,
+    /// so its claim goes back to the pool exactly as an abandoned branch's does.
+    ///
+    /// Safe to call at any time. A branch that is still live is left completely alone.
+    pub fn forget_reaped_branches(&self) -> usize {
+        // Two phases on purpose: the catalog is asked about each branch with the state lock NOT
+        // held, because the catalog takes its own lock and the two are taken in the other order
+        // elsewhere.
+        let candidates: Vec<(u64, String, BranchId)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .workspaces
+                .keys()
+                .filter_map(|id| {
+                    let name = format!("b_{id}");
+                    let bid = *state.names.get(&name)?;
+                    // The name now points at a different slot: this workspace's own branch is
+                    // unreachable through it, so leave it rather than guess.
+                    (bid.id == *id).then_some((*id, name, bid))
+                })
+                .collect()
+        };
+        let gone: Vec<(u64, String, BranchId)> = candidates
+            .into_iter()
+            .filter(|(_, _, bid)| self.branches.get(*bid).is_err())
+            .collect();
+        let mut state = self.state.lock().unwrap();
+        for (id, name, bid) in &gone {
+            // Reaped without client cooperation, so nothing this branch buffered was published
+            // BY IT: the same reasoning as the ABANDON arm of `seal`, and reached by a different
+            // door. A descendant may still have published what this branch staged, so the same
+            // helper decides -- the reaper is the door the fixture reaches this through with no
+            // client cooperation at all.
+            if let Some(ws) = state.workspaces.remove(id) {
+                forget_captures_unless_published(&mut state, &ws);
+            }
+            state.names.remove(name);
+            state.escrow.release(*bid);
+            state.quarantine_reasons.remove(id);
+        }
+        gone.len()
+    }
 
     /// Drop a branch and everything buffered on it.
     ///
@@ -1816,10 +3122,76 @@ impl AgentRuntime {
             } else {
                 state.escrow.release(branch);
             }
+            // Record WHOSE writes just became readable, before the workspace goes. A merge
+            // publishes this branch's staged rows and every ancestor's row it inherited at fork
+            // time, so all of those captures are now the premises of published rows and none of
+            // them may be dropped by a later abandon or reap.
+            if published {
+                if let Some(ws) = state.workspaces.get(&branch.id) {
+                    let mut newly: Vec<u64> = ws.inherited.iter().map(|t| t.0).collect();
+                    newly.push(ws.txn.0);
+                    for t in newly {
+                        state.published_txns.insert(t);
+                    }
+                }
+            }
             if let Some(ws) = state.workspaces.remove(&branch.id) {
                 state.names.remove(&ws.name);
+                // **A task that published nothing is not a dependent of anything.**
+                //
+                // Captures outlive the workspace on purpose, and that is right for a MERGE: it
+                // retires the branch at the moment its rows become readable, so the graph has to
+                // survive `seal` for the same reason `row_author` does. An ABANDON is the opposite
+                // case. The buffered writes never landed, so there is nothing downstream to
+                // protect — and keeping the capture made every scan the task ever ran block
+                // reverts FOREVER.
+                //
+                // Measured before this: a ghost task scans `WHERE qty >= 20 AND qty < 50`, runs
+                // `ABANDON`, and `REVERT MERGE m_1` reports `blocked_by = [TxnId(2)]`
+                // permanently. `undo_txn` then finds no applied ops for it, so `CASCADE`
+                // "reverts" a task that published nothing — which means the only way past the
+                // name is the dangerous mode, training the operator away from the default that
+                // exists to protect them. Over-reporting is the safe direction for a REGION; a
+                // name with nothing behind it is not a region error, it is a dead entry.
+                //
+                // **But "published" here means THIS branch's seal came from a merge, and that is
+                // not the same question as whether its staged writes reached the shared tables.**
+                // A fork copies the parent's staged rows, so a child's `MERGE` publishes writes
+                // its ancestors staged; the ancestor then seals through ABANDON or the reaper with
+                // `published = false`, and dropping its capture deletes the read premise of a row
+                // that is live in the shared tables right now. Measured before this:
+                // `REVERT MERGE m1` reported `blocked_by = []` and went on to remove row 7, the
+                // row that published row 9 was derived from. So the decision is delegated.
+                if !published {
+                    forget_captures_unless_published(&mut state, &ws);
+                }
             }
         }
+        // With a reaper attached, retiring a branch means reclaiming it: the reaper does
+        // everything below AND frees the extents this branch allocated, which nothing else will.
+        // It is the same call the lease scan makes, so a branch that is merged and a branch that
+        // was walked away from end in exactly the same state.
+        if let Some(reaper) = &self.reaper {
+            reaper.reap(branch)?;
+            // `with_reaper` cannot check that the reaper was built over this runtime's catalog —
+            // the `Reaper` trait exposes no catalog to compare. What it CAN do is check the
+            // result: after a successful reap, this runtime's own catalog must no longer hold the
+            // branch as live. If it does, the reaper reaped a record nobody here wrote, and the
+            // branch is now retired in name only with its pages still charged. Loud beats silent.
+            if let Ok(rec) = self.branches.get(branch) {
+                if rec.state != BranchState::Reaped {
+                    return Err(FerroError::Branch(format!(
+                        "the attached reaper reported success for {branch}, but this runtime's \
+                         catalog still holds it as {:?}. The reaper is built over a different \
+                         branch catalog than this runtime, so nothing it reaps belongs to these \
+                         branches and their pages are still charged.",
+                        rec.state
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
         // Reap through the `BranchCatalog` trait only, so this works against the durable engine
         // as written: mark the record reaped (which bumps the generation, making the old id a
         // hard error) and drop our fork epoch from the parent's live-children array so the
@@ -1856,7 +3228,7 @@ impl AgentRuntime {
                 .merges
                 .get(merge_id)
                 .ok_or_else(|| FerroError::Merge(format!("unknown merge {}", merge_id)))?;
-            (rec.txns.clone(), rec.branch, state.dep.build())
+            (rec.txns.clone(), rec.branch, dependency_graph_of(&state.captures))
         };
         let target = *targets
             .first()
@@ -1957,6 +3329,295 @@ impl BranchResolver for AgentRuntime {
     }
 }
 
+/// **Everything a merge decided, against a base it did not touch.**
+///
+/// Produced by [`AgentRuntime::evaluate_merge`] and consumed by
+/// [`AgentRuntime::publish_evaluation`]. Between those two calls the target is untouched, which is
+/// what lets K candidate branches be scored against one identical base.
+///
+/// It is deliberately not `Clone`: an evaluation names a specific base state, and two copies of
+/// one evaluation invite publishing it twice.
+pub struct MergeEvaluation {
+    pub from: BranchId,
+    pub into: BranchId,
+    /// The aggregate outcome this merge would report: `Clean`, `Commuting`, `Conflict` or
+    /// `ResolvedWithLoss`.
+    pub outcome: MergeOutcome,
+    pub rows: Vec<RowMergeOutcome>,
+    /// Rows the branch changed without ever reading. Reported, never decisive — see the gate.
+    pub blind_writes: Vec<(TableId, RowId)>,
+    /// The verdict of the one verification gate on the merge path.
+    pub gate: GateOutcome,
+    /// One result per declared assertion, in declaration order. Empty for a production `MERGE`,
+    /// which declares none.
+    pub assertions: Vec<AssertionResult>,
+    /// The image this merge would leave for each row it touches; `None` where it would remove the
+    /// row. Rows that conflict are absent, because a conflicting merge publishes nothing.
+    produced: BTreeMap<(u32, u64), Option<Vec<Value>>>,
+    /// Fingerprint of every row this evaluation read, so publishing can refuse a base that moved.
+    base_fingerprint: u64,
+    /// The tables that fingerprint covers.
+    tables_read: BTreeMap<u32, String>,
+    /// The rows this branch read by exact version, whose published versions the fingerprint also
+    /// covers. A read-set is not a table the fingerprint can re-scan, so it is folded in directly.
+    premise_rows: Vec<(TableId, RowId)>,
+    snapshot: WorkspaceSnapshot,
+    pending: Vec<PendingWrite>,
+    /// What the target held for each row this merge will touch, as of evaluation. Publishing needs
+    /// both ends of every move to derive predicate-derived dependency edges: `post` is what a later
+    /// scan sees, `pre` is what it no longer sees, and an absence a merge caused is a dependency
+    /// too. Captured here because `current` is evaluate-time state and `base_fingerprint` refuses a
+    /// base that moved, which is what makes the evaluate-time image still correct at publish.
+    pre_images: BTreeMap<(u32, u64), Vec<Value>>,
+    /// One result per table whose shape this merge decided - B11's three-way schema merge, evaluated
+    /// alongside every other admission check and applied by `publish_evaluation`.
+    schema: Vec<SchemaMergeReport>,
+}
+
+impl MergeEvaluation {
+    /// Would this merge be admitted? The gate passed **and** nothing conflicted.
+    ///
+    /// Both halves are load-bearing and neither implies the other: a conflicting merge can pass a
+    /// gate that has nothing to say about it, and a clean merge can be stopped by the gate.
+    pub fn is_admissible(&self) -> bool {
+        self.gate.is_pass() && !self.outcome.is_conflict()
+    }
+
+    /// Assertions that held, over assertions declared. `None` when none were declared — a merge
+    /// nothing asserted about has no score, which is not the same as a perfect one.
+    pub fn score(&self) -> Option<f64> {
+        if self.assertions.is_empty() {
+            return None;
+        }
+        let held = self.assertions.iter().filter(|a| a.holds()).count();
+        Some(held as f64 / self.assertions.len() as f64)
+    }
+
+    /// Every declared assertion that did not hold, by the predicate as it was written.
+    pub fn failed_assertions(&self) -> Vec<String> {
+        crate::agent_sql::gate::failed_assertions(&self.assertions)
+    }
+
+    /// The gate's verdict as the sentence a quarantine reason is written from.
+    pub fn gate_reason(&self) -> String {
+        let detail: Vec<String> = self
+            .gate
+            .findings()
+            .iter()
+            .map(|f| format!("[{:?} {}] {}: {}", f.tier, f.status, f.check, f.detail))
+            .collect();
+        format!("{} at merge admission — {}", self.gate.name(), detail.join("; "))
+    }
+
+    /// Every violated predicate this merge would report, verbatim.
+    pub fn violated_predicates(&self) -> Vec<String> {
+        self.rows.iter().flat_map(|r| r.violated_predicates()).collect()
+    }
+
+    /// The image this merge would leave for one row: `Some(None)` means it would delete the row,
+    /// `None` means this merge does not touch it.
+    pub fn produced_row(&self, tbl: TableId, row: RowId) -> Option<Option<&Vec<Value>>> {
+        self.produced.get(&(tbl.0, row.0)).map(|v| v.as_ref())
+    }
+
+    /// The base state this evaluation was computed against, as one number.
+    pub fn base_fingerprint(&self) -> u64 {
+        self.base_fingerprint
+    }
+
+    /// Turn an evaluation that will NOT be published into the report for it.
+    fn into_report(self, merge_id: String, applied_to_target: bool) -> MergeReport {
+        MergeReport {
+            merge_id,
+            from: self.from,
+            into: self.into,
+            outcome: self.outcome,
+            rows: self.rows,
+            blind_writes: self.blind_writes,
+            // An unpublished evaluation still reports what the schema merge DECIDED. A refused merge
+            // whose schema half conflicted has to be able to say so, or the caller sees a row-level
+            // report and no reason.
+            schema: self.schema,
+            applied_to_target,
+        }
+    }
+}
+
+/// The row a compiled assertion predicate refers to. Every row's cells are presented under this
+/// id in turn; the real row id is carried alongside, by the loop that does the presenting.
+const ASSERTION_PROBE_ROW: RowId = RowId(0);
+
+/// Score declared assertions against the state a merge would leave behind.
+///
+/// The row set is the asserted table **as the merge would leave it**: the shared table now,
+/// overlaid with the images this merge would produce, minus the rows it would delete. Scoring only
+/// the rows the candidate touched was the first shape and it is weaker in a way that matters — a
+/// candidate that changes nothing would then satisfy every assertion by touching nothing.
+///
+/// Each row is checked through [`Guard::check`], which is what `check_guards` calls for the
+/// production merge's own guards, so an assertion and a guard cannot disagree about what a
+/// predicate means.
+///
+/// The predicate is compiled **once**, against a fixed probe row, and each row's cells are then
+/// presented under that same probe id — a `GuardExpr` bakes the row it refers to, and compiling one
+/// per row cost a full parse-and-bind for every row of the table on every candidate, twice per
+/// simulation. The row a violation names comes from the loop, not from the guard.
+fn evaluate_assertions(
+    assertions: &[Assertion],
+    schemas: &BTreeMap<u32, Schema>,
+    current: &BTreeMap<(u32, u64), Vec<Value>>,
+    produced: &BTreeMap<(u32, u64), Option<Vec<Value>>>,
+) -> Vec<AssertionResult> {
+    let mut out = Vec::with_capacity(assertions.len());
+    for a in assertions {
+        let tbl = table_id(&a.table);
+        let source = a.source();
+        let mut result = AssertionResult {
+            source: source.clone(),
+            table: a.table.clone(),
+            tbl,
+            rows_checked: 0,
+            violations: Vec::new(),
+            unevaluable: Vec::new(),
+        };
+        let Some(schema) = schemas.get(&tbl.0) else {
+            // Not "no rows, therefore true": a predicate over a table this database does not have
+            // could not be evaluated, and the gate hard-rejects that rather than passing it.
+            result.unevaluable.push((RowId(0), format!("unknown table: {}", a.table)));
+            out.push(result);
+            continue;
+        };
+
+        // Borrowed, not cloned: the row images live in `current` and `produced` for the whole call.
+        let mut rows: BTreeMap<u64, &Vec<Value>> = current
+            .iter()
+            .filter(|((t, _), _)| *t == tbl.0)
+            .map(|((_, r), row)| (*r, row))
+            .collect();
+        for ((t, r), image) in produced {
+            if *t != tbl.0 {
+                continue;
+            }
+            match image {
+                Some(row) => {
+                    rows.insert(*r, row);
+                }
+                None => {
+                    rows.remove(r);
+                }
+            }
+        }
+
+        let guard = match guard_from_expr(&a.predicate, tbl, ASSERTION_PROBE_ROW, schema) {
+            Ok(g) => g,
+            Err(e) => {
+                result.unevaluable.push((RowId(0), e.to_string()));
+                out.push(result);
+                continue;
+            }
+        };
+        result.rows_checked = rows.len();
+        for (rid, row) in rows {
+            let row_id = RowId(rid);
+            let mut state = CellState::new();
+            for (idx, v) in row.iter().enumerate() {
+                state.set(tbl, ASSERTION_PROBE_ROW, ColId(idx as u32), v.clone());
+            }
+            match guard.check(&state) {
+                Ok(true) => {}
+                Ok(false) => result.violations.push((row_id, cells_text(&guard, schema, row))),
+                // An error is NOT a violation: the predicate could not be decided on this row, and
+                // the gate hard-rejects that rather than treating it as a failure the caller can
+                // retry against.
+                Err(e) => result.unevaluable.push((row_id, e.to_string())),
+            }
+        }
+        out.push(result);
+    }
+    out
+}
+
+/// The cells a predicate referred to, rendered for the caller who has to act on the violation.
+///
+/// `qty >= 0` failing is not actionable on its own; `qty >= 0 (qty = -4)` is.
+fn cells_text(guard: &Guard, schema: &Schema, row: &[Value]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (_, _, col) in guard.expr.referenced_cells() {
+        let idx = col.0 as usize;
+        let name = schema.columns.get(idx).map(|c| c.name.clone()).unwrap_or_else(|| format!("col{idx}"));
+        if parts.iter().any(|p| p.starts_with(&format!("{name} = "))) {
+            continue;
+        }
+        match row.get(idx) {
+            Some(v) => parts.push(format!("{name} = {}", cell_text(v))),
+            None => parts.push(format!("{name} = <absent>")),
+        }
+    }
+    parts.join(", ")
+}
+
+/// One cell as text. Deliberately not a float rendering of a decimal: the digits are the value.
+///
+/// **This is the fourth copy of this match in the tree** — `cli::display_value`,
+/// `optimizer::format_value` and `tel::guard::write_value` are the others, each private to its
+/// module, and the Decimal comment has already been copy-pasted between them. The right fix is one
+/// `impl Display for Value` in `catalog::column` and four deletions; it is not done here because
+/// three of those four files belong to other work in flight, and a fifth copy is cheaper to delete
+/// later than a merge conflict is to resolve now.
+fn cell_text(v: &Value) -> String {
+    match v {
+        Value::Boolean(b) => b.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Varchar(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::Decimal(d) => d.clone(),
+        Value::Timestamp(ms) => ms.to_string(),
+        Value::Null => "NULL".to_string(),
+    }
+}
+
+/// Every row an evaluation read by exact version, sorted and de-duplicated so the fingerprint over
+/// them is stable. A scan-shaped read retains a predicate summary rather than versions, and the
+/// read-premise check already downgrades itself to a heuristic for those; there is nothing here to
+/// name.
+fn premise_rows_of(reads: &[crate::provenance::readset::ReadSet]) -> Vec<(TableId, RowId)> {
+    let mut out: Vec<(TableId, RowId)> = Vec::new();
+    for rs in reads {
+        if let crate::provenance::readset::ReadSet::ExactVersions(versions) = rs {
+            out.extend(versions.iter().map(|v| (v.tbl, v.row)));
+        }
+    }
+    out.sort_by_key(|(t, r)| (t.0, r.0));
+    out.dedup();
+    out
+}
+
+/// A fingerprint over every row handed in, for detecting that a base moved under an evaluation.
+///
+/// Row *content* and not a counter: an update that leaves the row count alone is exactly the kind
+/// of movement a stale evaluation must not be published against. The bytes come from `encode_row`,
+/// which is the same encoding the branch trees store, so two values that differ only in variant
+/// (`Integer(5)` against `Float(5.0)`) do not collide.
+///
+/// **Its precision floor is `row_id_of`'s, and that is inherited rather than chosen.** The map
+/// handed in is keyed by row identity derived from the first column, so two rows whose first
+/// column collides — two `NULL`s, both `RowId(0)` — collapse into one entry, and a change to the
+/// shadowed row moves nothing here. The merge itself is keyed the same way and has the same blind
+/// spot; `row_id_of` is documented as the stand-in for a surrogate minted at insert, and the day
+/// it becomes one this becomes exact with no change here.
+fn fingerprint_rows(rows: &BTreeMap<(u32, u64), Vec<Value>>) -> Result<u64, FerroError> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for ((t, r), row) in rows {
+        h = fnv64_update(h, &t.to_be_bytes());
+        h = fnv64_update(h, &r.to_be_bytes());
+        let bytes = encode_row(row)?;
+        h = fnv64_update(h, &(bytes.len() as u64).to_be_bytes());
+        h = fnv64_update(h, &bytes);
+    }
+    Ok(h)
+}
+
 struct WorkspaceSnapshot {
     txn: TxnId,
     /// The run behind this task, carried into the merge so authorship outlives the workspace.
@@ -1968,6 +3629,8 @@ struct WorkspaceSnapshot {
     ops: Vec<Op>,
     guards: Vec<Guard>,
     reads: Vec<crate::provenance::readset::ReadSet>,
+    schema_edits: Vec<(String, SchemaEdit)>,
+    base_shapes: BTreeMap<String, Schema>,
 }
 
 /// A cell's value as an integer, for escrow accounting. `None` for anything not numeric.
@@ -2041,6 +3704,220 @@ fn blind_writes_of(
         .collect()
 }
 
+/// The highest version sequence any merge has already handed out, read from the record of what was
+/// applied rather than from the counter that produced it.
+///
+/// `State::applied` is the independent record: appended to once per stamped version, never pruned,
+/// and written by nobody but `record_applied`'s stamping loop. Asking it means the freshness check
+/// does not consult `apply_seq`, which is the arithmetic under suspicion — the check this replaced
+/// compared the reservation to a re-count of the SAME list the stamping loop walks, so no input
+/// could falsify it.
+///
+/// `max` rather than `last`, deliberately: if the invariant being checked is already broken, the
+/// final element is not necessarily the largest. One pass per merge, the same order of cost
+/// `undo_txn` already pays per revert over the same vector.
+fn highest_applied_seq(applied: &[AppliedOp]) -> Option<u64> {
+    applied.iter().map(|a| a.seq).max()
+}
+
+/// Refuse a reservation that would re-issue a version sequence already handed out.
+///
+/// `record_applied` stamps `base + 1 ..= base + n`, so freshness is exactly `base >= highest`.
+///
+/// Two versions sharing a `begin_ts` mis-answer every visibility comparison downstream, including
+/// `DependencyGraphBuilder::build`'s `begin_ts < observed_at` — which is the rule that decides
+/// whether a scan depended on a write, and therefore the whole of exit criterion 10. A reservation
+/// that STARTS above the high water mark is fine and is not refused: a range leaked by a failed
+/// publication only ever shifts later versions upward, which over-reports rather than corrupts.
+fn fresh_reservation(highest: Option<u64>, base: u64) -> Result<(), String> {
+    match highest {
+        Some(h) if base < h => Err(format!(
+            "refusing to publish: this merge would stamp version sequences from {} while {} has \
+             already been handed out. Two versions sharing a begin_ts mis-answer every visibility \
+             comparison downstream, including the one that decides whether a scan depended on a \
+             write.",
+            base + 1,
+            h
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Why a read was taken, which is what decides whether it counts as an INSPECTION.
+///
+/// **Causality and inspection are different questions, and this is the one place they part.** Both
+/// purposes retain the region for the causal graph, because both really did decide what got written.
+/// Only `Inspection` reaches the read-set builder, and therefore only `Inspection` moves
+/// `blind_writes` and `ReadPremiseCheck`.
+///
+/// `UPDATE ... WHERE id = 7` is the case that forces the distinction. It causally depends on row 7 —
+/// a revert of whatever published that row has a dependent to name — and it inspected no *value*: it
+/// addressed the row. Counting it as an inspection would stop every `UPDATE ... WHERE <pk> = <lit>`
+/// from being a blind write, which is the entire shape DESIGN.md section 4's metric exists to catch,
+/// and would downgrade `ReadPremiseCheck` to `Heuristic` for a branch that named exact versions and
+/// nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPurpose {
+    /// A `SELECT`, or a write whose `WHERE` clause compared a VALUE: the task looked.
+    Inspection,
+    /// A write statement's `WHERE` clause that only addressed rows by key: the task did not look.
+    RowTargeting,
+}
+
+/// The images a merge moved its published rows between. See where it is built in `merge`.
+#[derive(Debug, Default)]
+struct PublishedImages {
+    /// What the target held immediately before this merge published.
+    pre: BTreeMap<(u32, u64), Vec<Value>>,
+    /// What it holds after. Absent for a delete.
+    post: BTreeMap<(u32, u64), Vec<Value>>,
+}
+
+/// The dependency graph over everything every task retained — exact and predicate-derived alike.
+///
+/// **One derivation, and it lives in `ProvenanceLog::dependency_graph`.** That function is the only
+/// code in the tree that composes read-after-write edges over exact versions with the edges derived
+/// by re-evaluating `PredicateSummary::covers` against published values; the runtime deliberately
+/// does not keep a second copy of it, which is the reconciliation this lane exists to make.
+/// Drop the captures of a workspace that is going away WITHOUT having published anything -- and of
+/// any ancestor whose protection lapsed at the same moment.
+///
+/// F6's rule is right: a task that published nothing is not a dependent of anything, and keeping its
+/// capture made every scan it ever ran block reverts forever. What F6 got wrong is WHO published.
+/// `seal`'s `published` flag answers "did this branch's own seal come from a merge", while the
+/// question a capture's lifetime turns on is "did the writes this capture is the premise for reach
+/// the shared tables". Those differ whenever a fork is involved, because a fork snapshots the
+/// parent's staged rows: the child's `MERGE` publishes them and the parent then seals through
+/// ABANDON or the reaper with `published = false`.
+///
+/// So a capture survives while any of these holds:
+///
+/// - its own writes were published (`published_txns`, recorded by `seal` at the publish);
+/// - a descendant already published writes it staged (also `published_txns`, because `seal` records
+///   the whole inherited chain, not just the merging branch);
+/// - a LIVE workspace still carries its staged writes and could publish them yet.
+///
+/// Ancestors are considered deepest-first: an ancestor's protection can only lapse once the
+/// descendant that was holding it is gone, and the caller has already removed `ws` from the map.
+fn forget_captures_unless_published(state: &mut State, ws: &Workspace) {
+    let mut candidates: Vec<TxnId> = ws.inherited.clone();
+    candidates.push(ws.txn);
+    for txn in candidates.into_iter().rev() {
+        if capture_is_protected(state, txn) {
+            continue;
+        }
+        state.captures.remove(&txn.0);
+    }
+}
+
+/// Is anything still relying on `txn`'s capture -- a publish that happened, or one that still could?
+fn capture_is_protected(state: &State, txn: TxnId) -> bool {
+    state.published_txns.contains(&txn.0)
+        || state
+            .workspaces
+            .values()
+            .any(|w| w.txn == txn || w.inherited.contains(&txn))
+}
+
+fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
+    let mut log = ProvenanceLog::new();
+    for c in captures.values() {
+        log.record(c.clone().finish());
+    }
+    log.dependency_graph()
+}
+
+/// The region a range or full scan looked at, retained so that a write landing inside it later is a
+/// phantom the read depended on.
+///
+/// **The bounds are narrowed only when the clause proves a narrowing**, and that asymmetry is the
+/// whole safety argument. A conjunction of literal comparisons over one column gives a real
+/// interval; anything else — an `OR`, a `!=`, a column compared to a column, no `WHERE` at all —
+/// keeps the region unbounded over the table. A region WIDER than the truth names a dependent that
+/// may not be one, which an operator sees in the halt tree and can dismiss; a region NARROWER than
+/// the truth silently cascades a revert through work that did depend on it. Only one of those two
+/// errors is recoverable, so only one of them is allowed.
+///
+/// The `residual` keeps the clause verbatim either way, so a re-check is always possible.
+fn predicate_summary(
+    tbl: TableId,
+    where_clause: Option<&Expr>,
+    bound: Option<&BoundExpr>,
+    rows_observed: u64,
+) -> PredicateSummary {
+    let (col, lo, hi) = match bound.and_then(column_range) {
+        Some((c, lo, hi)) => (Some(ColId(c as u32)), lo, hi),
+        None => (None, Bound::Unbounded, Bound::Unbounded),
+    };
+    PredicateSummary { tbl, col, lo, hi, residual: where_clause.map(|w| w.to_sql()), rows_observed }
+}
+
+/// `(column, lo, hi)` for a clause that bounds ONE column with literals; `None` otherwise.
+///
+/// Derived from the BOUND expression rather than the parsed one: the binder has already resolved the
+/// column to its index, coerced the literal to the column's type and refused a cross-category
+/// comparison, so the values compared here are the values the executor compared. Re-deriving that
+/// from `Expr` would be a second, weaker copy of the binder's type rules.
+fn column_range(e: &BoundExpr) -> Option<(usize, Bound, Bound)> {
+    match e {
+        BoundExpr::BinaryOp { left, operator: TokenType::And, right } => {
+            match (column_range(left), column_range(right)) {
+                // Both conjuncts bound the same column: the region is their intersection.
+                (Some((lc, llo, lhi)), Some((rc, rlo, rhi))) if lc == rc => {
+                    Some((lc, llo.tighter_lo(rlo), lhi.tighter_hi(rhi)))
+                }
+                // Two different columns, or one side unusable: keep one side and DROP the other
+                // conjunct. Dropping a conjunct widens the region, which is the safe direction; a
+                // summary has one column and cannot express both.
+                (Some(l), _) => Some(l),
+                (None, r) => r,
+            }
+        }
+        // An `OR` is a union, and a union of two intervals is not an interval. Reporting either arm
+        // would understate the region, so the whole clause falls back to unbounded.
+        BoundExpr::BinaryOp { left, operator, right } => comparison_range(left, *operator, right),
+        _ => None,
+    }
+}
+
+fn comparison_range(
+    left: &BoundExpr,
+    operator: TokenType,
+    right: &BoundExpr,
+) -> Option<(usize, Bound, Bound)> {
+    let (col, v, op) = match (left, right) {
+        (BoundExpr::Column(c), BoundExpr::Literal(v)) => (*c, v.clone(), operator),
+        // `20 <= qty` is `qty >= 20`. Mirroring rather than refusing matters because refusing here
+        // is not neutral: it widens the region to the whole table for a clause that was perfectly
+        // precise, just written the other way round.
+        (BoundExpr::Literal(v), BoundExpr::Column(c)) => (*c, v.clone(), mirror(operator)?),
+        _ => return None,
+    };
+    let (lo, hi) = match op {
+        TokenType::Equal => (Bound::Included(v.clone()), Bound::Included(v)),
+        TokenType::Less => (Bound::Unbounded, Bound::Excluded(v)),
+        TokenType::LessEqual => (Bound::Unbounded, Bound::Included(v)),
+        TokenType::Greater => (Bound::Excluded(v), Bound::Unbounded),
+        TokenType::GreaterEqual => (Bound::Included(v), Bound::Unbounded),
+        // `!=` is the complement of a point: two intervals, and a single one could only over- or
+        // under-state it. Under-stating is not allowed, so it stays unbounded.
+        _ => return None,
+    };
+    Some((col, lo, hi))
+}
+
+/// The same comparison with its operands swapped.
+fn mirror(operator: TokenType) -> Option<TokenType> {
+    Some(match operator {
+        TokenType::Equal => TokenType::Equal,
+        TokenType::Less => TokenType::Greater,
+        TokenType::LessEqual => TokenType::GreaterEqual,
+        TokenType::Greater => TokenType::Less,
+        TokenType::GreaterEqual => TokenType::LessEqual,
+        _ => return None,
+    })
+}
+
 /// Who to attribute the versions a write produces to. `None` leaves them `ProvId::NONE`.
 type Author = Option<(Arc<dyn ProvenanceStore>, ProvId)>;
 
@@ -2053,6 +3930,31 @@ enum PendingWrite {
 }
 
 impl PendingWrite {
+    /// `(table, row)` this write lands on, or `None` for a write with no row image to key by.
+    fn row_key(&self) -> Option<(u32, u64)> {
+        match self {
+            PendingWrite::Insert { table, row } | PendingWrite::Update { table, row, .. } => {
+                Some((table_id(table).0, row_id_of(row).0))
+            }
+            // A delete names the key rather than the row, and `row_id_of` takes the primary key as
+            // the first column of a row — which is exactly what `key` is.
+            PendingWrite::Delete { table, key } => {
+                Some((table_id(table).0, row_id_of(std::slice::from_ref(key)).0))
+            }
+        }
+    }
+
+    /// The image this write leaves behind, for the rows that still have one. `None` for a delete:
+    /// what a scan can depend on there is the row's absence, which is answered from the `pre` image.
+    fn published_image(&self) -> Option<((u32, u64), Vec<Value>)> {
+        match self {
+            PendingWrite::Insert { row, .. } | PendingWrite::Update { row, .. } => {
+                self.row_key().map(|k| (k, row.clone()))
+            }
+            PendingWrite::Delete { .. } => None,
+        }
+    }
+
     /// Publish inside an already-open transaction.
     fn apply_in(self, ctx: &mut ExecCtx, txn_id: u64, author: Author) -> Result<usize, FerroError> {
         let stmt = self.into_stmt(ctx)?;
@@ -2333,6 +4235,20 @@ fn guard_expr(
     })
 }
 
+/// Strip any nesting of parentheses. `((x))` is `x`, and an access shape must not depend on how many
+/// of them the writer typed.
+fn ungroup(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Grouping(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+fn ungrouped(e: Option<&Expr>) -> Option<&Expr> {
+    e.map(ungroup)
+}
+
 /// Classify a read by its **shape**, which is the only admissible input to the read-set form.
 /// Size is deliberately not consulted: coarsening scattered point reads into one interval covers
 /// most of the table by `k = 3`.
@@ -2341,10 +4257,27 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
         Some(c) => c.name.clone(),
         None => return AccessShape::FullScan,
     };
-    match where_clause {
+    // **Both operand orders.** `7 = id` is `id = 7`, and classifying only one of them is not a
+    // neutral omission: the two spellings then get different answers out of every consumer of the
+    // shape. Measured before this was mirrored — `UPDATE inventory SET qty = 99 WHERE id = 7`
+    // reported row 7 as a blind write and `... WHERE 7 = id` reported nothing, because the second
+    // fell through to `FullScan` and so counted as an inspection. Identical semantics, opposite
+    // outcome, decided by syntax, which is the same defect shape as the point-lookup absence case.
+    //
+    // `comparison_range` already mirrors, with the same reasoning written out at `mirror`. This is
+    // that rule applied at the one other place operand order is read, rather than a second copy of
+    // it: equality is its own mirror, so there is nothing to translate here beyond accepting the
+    // swap.
+    // **Parentheses are not an access shape either.** `guard_expr` already unwraps `Expr::Grouping`
+    // before it looks at anything; this is the same unwrap at the same depth, for the same reason.
+    // Measured before it: `WHERE (id = 7)` and `WHERE ((7 = id))` were both classified as scans
+    // while `WHERE id = 7` was a lookup. Recursive rather than one level, because `((x))` is two.
+    match ungrouped(where_clause) {
         Some(Expr::BinaryOp { left, operator: TokenType::Equal, right }) => {
-            let points_at_pk = matches!(&**left, Expr::ColumnRef { column, .. } if *column == pk)
-                && matches!(&**right, Expr::Literal { .. });
+            let names_pk = |e: &Expr| matches!(ungroup(e), Expr::ColumnRef { column, .. } if *column == pk);
+            let is_literal = |e: &Expr| matches!(ungroup(e), Expr::Literal { .. });
+            let points_at_pk = (names_pk(left) && is_literal(right))
+                || (is_literal(left) && names_pk(right));
             if points_at_pk {
                 AccessShape::IndexLookup
             } else {
@@ -2352,5 +4285,62 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
             }
         }
         _ => AccessShape::FullScan,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied_at(seq: u64) -> AppliedOp {
+        AppliedOp {
+            seq,
+            txn: TxnId(1),
+            table: "inventory".into(),
+            tbl: TableId(1),
+            row: RowId(1),
+            col: None,
+            kind: OpKind::RowDelete,
+            before: None,
+            before_row: None,
+        }
+    }
+
+    /// **The guard has to be able to REFUSE**, which the `debug_assert` it stands behind cannot:
+    /// both of that assertion's sides are the same sum over the same list, so no input falsifies it.
+    /// This one is answerable from the record of what was applied, and here is an input it refuses.
+    #[test]
+    fn a_reservation_that_would_re_issue_a_version_sequence_is_refused() {
+        let applied = vec![applied_at(1), applied_at(3), applied_at(2)];
+        // `max`, not `last` — a broken invariant is exactly when the order stops holding.
+        assert_eq!(highest_applied_seq(&applied), Some(3));
+
+        // `record_applied` stamps `base + 1 ..= base + n`, so a base of 2 re-issues 3.
+        let err = fresh_reservation(Some(3), 2).expect_err("re-issuing version 3 was allowed");
+        assert!(err.contains("already been handed out"), "{err}");
+        assert!(err.contains("begin_ts"), "the refusal does not say what breaks: {err}");
+        assert!(err.contains('3'), "the refusal does not name the sequence: {err}");
+
+        // And the shape the reservation arithmetic actually produces when it goes wrong: a merge
+        // that reserved for one row and stamped three leaves `apply_seq` two behind, so the NEXT
+        // merge's base is below the high water mark.
+        assert!(fresh_reservation(Some(3), 1).is_err(), "a base two behind was allowed");
+        assert!(fresh_reservation(Some(1), 0).is_err(), "a base one behind was allowed");
+    }
+
+    /// Anti-vacuity: a guard that refused every merge would satisfy the test above completely.
+    #[test]
+    fn the_ordinary_reservation_and_a_leaked_range_are_both_allowed() {
+        assert!(highest_applied_seq(&[]).is_none(), "a database where nothing has been applied");
+        assert!(fresh_reservation(None, 0).is_ok(), "the first merge of a fresh database");
+        assert!(
+            fresh_reservation(Some(3), 3).is_ok(),
+            "the ordinary case: the next fresh sequence is 4"
+        );
+        assert!(
+            fresh_reservation(Some(3), 9).is_ok(),
+            "a range leaked by a failed publication only shifts later versions upward, which \
+             over-reports rather than corrupts, so it must not be refused"
+        );
     }
 }

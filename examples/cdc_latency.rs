@@ -30,6 +30,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -90,7 +91,7 @@ fn main() {
         std::process::exit(4);
     }
 
-    let streamer = FeedStreamer::new(LogicalDecoder::new(&catalog));
+    let streamer = FeedStreamer::new(LogicalDecoder::new(&catalog), Publication::unrestricted());
     // A Subscription rather than a bare cursor, so the automatic checkpoint every 256 commits
     // cannot truncate the log out from under this consumer. Without it a run of 1000 samples dies
     // around commit 256 — which is how this was found, and why the earlier 200-sample run was

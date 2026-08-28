@@ -255,7 +255,20 @@ impl Check for ReadPremiseCheck {
         Tier::Invariants
     }
     fn status(&self) -> CheckStatus {
-        // Exact when every read named its versions; approximate the moment one of them was a scan.
+        // WHAT `SoundAndCrisp` MEANS HERE, stated because it is narrower than it looks. The
+        // comparison feeding `moved` consults `AgentRuntime`'s `versions` map, which is written only
+        // by `record_applied` - so it holds merge-published rows and nothing else.
+        //
+        // That is not a soundness hole, though it was first written up as one. A read of a row no
+        // merge published is retained as `begin_ts == 0`, and the comparison handles that case
+        // explicitly: a zero premise against a present entry means someone published it in between,
+        // which is a moved premise and is detected. The case that would be unverifiable - an absent
+        // entry against a real version - cannot arise while nothing removes from `versions`, and
+        // nothing does. `runtime.rs` keeps it as its own arm, downgrading to `Heuristic` rather than
+        // reporting that the premise holds, against the day a `DROP TABLE` purge changes that.
+        //
+        // Exact when every read named versions this gate can see; approximate the moment one of them
+        // was a scan, or named a version the gate has no record of.
         if self.approximate {
             CheckStatus::Heuristic
         } else {
@@ -316,6 +329,151 @@ impl Check for BlindWriteCheck {
             self.blind.len(),
             rows.join(", ")
         ))
+    }
+}
+
+/// **A declarative assertion, re-evaluated against the state a merge would produce.**
+///
+/// This is what `Tier::Invariants` was named for and what nothing had yet put in it: "declared
+/// invariants re-checked against the state the merge would produce".
+///
+/// # Why this is not a guard, and why the difference is the whole point
+///
+/// A `Guard` is a **precondition**: the `WHERE qty >= 5` that made a write legal, re-evaluated
+/// against the state the ops are about to be applied *to*. DESIGN.md section 3 is explicit that a
+/// precondition cannot see a post-op violation — start at 20, two agents each take 12 under
+/// `WHERE qty >= 0`, the second merge tests `8 >= 0`, that passes, and main ends at −4. "An
+/// invariant written as an invariant is not enforced by this mechanism at all."
+///
+/// An assertion is the other half: it is evaluated against the image the merge would leave behind,
+/// so `qty >= 0` over a merged value of −4 fires. Guards keep their meaning (they are what the
+/// agent's write claimed), and assertions are what a caller declares about the *result*.
+///
+/// # Epistemic status, which is not fixed
+///
+/// `SoundAndCrisp` when every row it named could be evaluated: the answer is exact and the caller
+/// gets the predicate back to retry against. `NotEvaluable` — which the gate hard-rejects — in two
+/// cases, and the second one is the one that matters:
+///
+/// * a row where the predicate could not be evaluated at all (the column is gone, the cell is
+///   absent), because not knowing is not the same as passing; and
+/// * **an assertion that examined ZERO rows.** A predicate that ran over nothing did not hold, it
+///   simply never ran, and reporting that as a pass is how a simulation admits every candidate on
+///   the strength of an empty table. This is the vacuity trap in the form the type system can
+///   refuse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssertionResult {
+    /// The predicate as it was written, verbatim, for handing back on violation.
+    pub source: String,
+    /// The table the predicate ranges over.
+    pub table: String,
+    pub tbl: TableId,
+    /// How many rows the predicate was actually evaluated over. Zero is a failure, not a pass.
+    pub rows_checked: usize,
+    /// `(row, the cells the predicate referred to)` for every row where it is false.
+    pub violations: Vec<(RowId, String)>,
+    /// `(row, why)` for every row where it could not be evaluated at all.
+    pub unevaluable: Vec<(RowId, String)>,
+}
+
+impl AssertionResult {
+    /// True only when the predicate ran over at least one row and held on every one of them.
+    pub fn holds(&self) -> bool {
+        self.rows_checked > 0 && self.violations.is_empty() && self.unevaluable.is_empty()
+    }
+
+    /// The epistemic status of this result. See the type's documentation for why zero rows is
+    /// `NotEvaluable` rather than a pass.
+    pub fn status(&self) -> CheckStatus {
+        if self.rows_checked == 0 || !self.unevaluable.is_empty() {
+            CheckStatus::NotEvaluable
+        } else {
+            CheckStatus::SoundAndCrisp
+        }
+    }
+}
+
+/// Every assertion in `results` that did not hold, by the predicate as it was written.
+///
+/// One function rather than one per caller: `MergeEvaluation` and `Verdict` both answer this
+/// question about the same slice, and two copies of a filter drift the moment `holds` changes.
+pub fn failed_assertions(results: &[AssertionResult]) -> Vec<String> {
+    results.iter().filter(|a| !a.holds()).map(|a| a.source.clone()).collect()
+}
+
+/// One [`AssertionResult`] presented to the gate as a check.
+///
+/// One check per assertion rather than one check for all of them, because the gate runs every
+/// check within a tier even after one has fired: a caller with three broken assertions learns all
+/// three in one round trip instead of one per retry.
+pub struct AssertionCheck {
+    result: AssertionResult,
+}
+
+impl AssertionCheck {
+    pub fn new(result: AssertionResult) -> Self {
+        AssertionCheck { result }
+    }
+
+    pub fn result(&self) -> &AssertionResult {
+        &self.result
+    }
+}
+
+impl Check for AssertionCheck {
+    fn name(&self) -> String {
+        format!("assert on {}", self.result.table)
+    }
+    fn tier(&self) -> Tier {
+        Tier::Invariants
+    }
+    fn status(&self) -> CheckStatus {
+        self.result.status()
+    }
+    fn evaluate(&self) -> Option<String> {
+        if self.result.holds() {
+            return None;
+        }
+        if self.result.rows_checked == 0 {
+            return Some(format!(
+                "`{}` examined 0 row(s) of {}: an assertion that never ran is not an assertion \
+                 that held",
+                self.result.source, self.result.table
+            ));
+        }
+        let mut parts = Vec::new();
+        if !self.result.violations.is_empty() {
+            let rows: Vec<String> = self
+                .result
+                .violations
+                .iter()
+                .map(|(r, img)| format!("r{} ({})", r.0, img))
+                .collect();
+            parts.push(format!(
+                "`{}` is false for {} of {} row(s) of {}: {}",
+                self.result.source,
+                self.result.violations.len(),
+                self.result.rows_checked,
+                self.result.table,
+                rows.join(", ")
+            ));
+        }
+        if !self.result.unevaluable.is_empty() {
+            let rows: Vec<String> = self
+                .result
+                .unevaluable
+                .iter()
+                .map(|(r, why)| format!("r{} ({})", r.0, why))
+                .collect();
+            parts.push(format!(
+                "`{}` could not be evaluated on {} row(s) of {}: {}",
+                self.result.source,
+                self.result.unevaluable.len(),
+                self.result.table,
+                rows.join(", ")
+            ));
+        }
+        Some(parts.join("; "))
     }
 }
 
@@ -500,6 +658,108 @@ mod tests {
         assert_eq!(f.status, CheckStatus::Heuristic);
         assert!(f.detail.contains("t1:r7"), "the finding must name the rows: {f:?}");
         assert!(f.detail.contains("t1:r9"), "the finding must name every row: {f:?}");
+    }
+
+    fn assertion(rows_checked: usize, violations: Vec<(RowId, &str)>) -> AssertionResult {
+        AssertionResult {
+            source: "qty >= 0".into(),
+            table: "inventory".into(),
+            tbl: TableId(1),
+            rows_checked,
+            violations: violations.into_iter().map(|(r, s)| (r, s.to_string())).collect(),
+            unevaluable: Vec::new(),
+        }
+    }
+
+    /// The declarative assertion, both halves.
+    ///
+    /// **Breaking shape:** an assertion that is false in the merged state — `qty >= 0` over a
+    /// composed value of −4, which is exactly the bounded-counter case DESIGN.md section 3 says a
+    /// *guard* cannot catch, because a precondition sees the pre-op image. If `evaluate` reported
+    /// `None` for a violated assertion the merge would be admitted and the invariant broken with a
+    /// `Clean` verdict.
+    #[test]
+    fn an_assertion_fires_when_it_is_false_and_stays_quiet_when_it_holds() {
+        // The half that must stay quiet: three rows examined, none violated.
+        let held = AssertionCheck::new(assertion(3, Vec::new()));
+        assert_eq!(held.status(), CheckStatus::SoundAndCrisp);
+        assert_eq!(held.evaluate(), None, "an assertion that holds must not fire");
+        assert_eq!(VerificationGate::new().with(Box::new(held)).run(), GateOutcome::Pass);
+
+        // The half that must fire, with the predicate handed back.
+        let broken = AssertionCheck::new(assertion(3, vec![(RowId(1), "qty = -4")]));
+        let out = VerificationGate::new().with(Box::new(broken)).run();
+        assert!(
+            matches!(out, GateOutcome::Retry(_)),
+            "a sound assertion must demand a retry, got {}",
+            out.name()
+        );
+        let f = &out.findings()[0];
+        assert_eq!(f.tier, Tier::Invariants);
+        assert!(f.detail.contains("qty >= 0"), "the predicate was not handed back: {f:?}");
+        assert!(f.detail.contains("qty = -4"), "the failing image was not named: {f:?}");
+        assert!(f.detail.contains("r1"), "the failing row was not named: {f:?}");
+    }
+
+    /// **Breaking shape:** a simulation whose assertion names a table the candidates never wrote a
+    /// row to — or an empty table. Every predicate then holds over the empty set, every candidate
+    /// scores perfectly, and the gate admits work nothing checked. Zero rows examined is a fact
+    /// about the scope of the check, so it is reported as "could not be evaluated" and hard-rejects.
+    #[test]
+    fn an_assertion_that_examined_no_rows_is_a_hard_reject_not_a_pass() {
+        let empty = AssertionCheck::new(assertion(0, Vec::new()));
+        assert_eq!(empty.status(), CheckStatus::NotEvaluable);
+        let detail = empty.evaluate().expect("an assertion over zero rows must fire");
+        assert!(detail.contains("0 row"), "the finding must say it ran over nothing: {detail}");
+
+        let out = VerificationGate::new().with(Box::new(empty)).run();
+        assert!(
+            matches!(out, GateOutcome::HardReject(_)),
+            "an assertion that never ran was reported as {}",
+            out.name()
+        );
+    }
+
+    /// **Breaking shape:** one row of the asserted table whose cell the merge removed, alongside a
+    /// hundred rows where the predicate held. Counting only violations would call that a pass; not
+    /// knowing whether a merge is safe is worse than knowing it is not, so it hard-rejects.
+    #[test]
+    fn a_row_that_could_not_be_evaluated_outranks_every_row_that_held() {
+        let mut r = assertion(100, Vec::new());
+        r.unevaluable.push((RowId(7), "no such cell tbl1.qty[row7]".into()));
+        let check = AssertionCheck::new(r);
+        assert_eq!(check.status(), CheckStatus::NotEvaluable);
+        let out = VerificationGate::new().with(Box::new(check)).run();
+        assert!(
+            matches!(out, GateOutcome::HardReject(_)),
+            "an unevaluable row produced {}",
+            out.name()
+        );
+        assert!(out.findings()[0].detail.contains("could not be evaluated"));
+    }
+
+    /// Rule 2 applied to assertions: N broken assertions must cost ONE round trip, not N.
+    ///
+    /// **Breaking shape:** a caller declaring three assertions, two of which the candidate breaks.
+    /// One check holding all three would report a single finding and the caller would fix one,
+    /// re-run the whole simulation, and learn the next.
+    #[test]
+    fn every_broken_assertion_reaches_the_caller_in_one_round_trip() {
+        let mut a = assertion(2, vec![(RowId(1), "qty = -1")]);
+        a.source = "qty >= 0".into();
+        let mut b = assertion(2, vec![(RowId(2), "price = 0")]);
+        b.source = "price > 0".into();
+        let held = assertion(2, Vec::new());
+
+        let out = VerificationGate::new()
+            .with(Box::new(AssertionCheck::new(a)))
+            .with(Box::new(AssertionCheck::new(b)))
+            .with(Box::new(AssertionCheck::new(held)))
+            .run();
+
+        assert_eq!(out.findings().len(), 2, "the caller would learn one violation per retry");
+        let all = out.findings().iter().map(|f| f.detail.clone()).collect::<Vec<_>>().join(" | ");
+        assert!(all.contains("qty >= 0") && all.contains("price > 0"), "got {all}");
     }
 
     /// A sound check hands back what it violated — that is the difference between a retry the

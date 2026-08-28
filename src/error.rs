@@ -1,7 +1,12 @@
 use std::fmt::{ Display, Formatter, Result };
 use std::error;
 //add more types
-#[derive(Debug)]
+//
+// `Clone` and `PartialEq` are derived (F0): every variant is a unit or a `String`, so both are free,
+// and consensus actions carry a refusal reason that tests compare structurally. An error type that
+// cannot be compared forces tests to match on rendered text, which then pins the wording of a
+// message rather than the fact of it.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FerroError {
     // `Parse(String)` was here and is deliberately gone — E71.
     //
@@ -62,6 +67,23 @@ pub enum FerroError {
     /// Deliberately loud in `Display`. Every other error here describes something a caller did; this one
     /// describes damage, and it must not read like a syntax complaint.
     Corruption(String),
+    /// A publication refused to let something out of the database, or its declaration is not usable
+    /// — see `replication::publication`.
+    ///
+    /// Its own variant rather than `Constraint`, for the reason E71 gave for splitting `Parse`: a
+    /// constraint is about whether data is *valid*, and this is about whether data may *leave*. They
+    /// have different audiences — one is answered by fixing a row, the other by an operator deciding
+    /// what a consumer is allowed to see — and a log reader filtering by class must be able to tell
+    /// an egress refusal from a bad insert.
+    Publication(String),
+
+    /// This node is not the leader, so it refused rather than serving a write or a stale read.
+    ///
+    /// `leader` is an **address** and not a `NodeId`, because the only useful thing a refused
+    /// client can do with it is reconnect, and a node number is not something it can dial. `None`
+    /// means this node does not currently know who leads — which is a real and common state during
+    /// an election, and is deliberately distinguishable from "the leader is elsewhere".
+    NotLeader { leader: Option<String> },
 }
 
 impl Display for FerroError {
@@ -70,6 +92,7 @@ impl Display for FerroError {
             FerroError::Eval(e) => write!(f, "evaluation error: {}", e),
             FerroError::Internal(e) => write!(f, "internal error (this is a bug in ferrodb): {}", e),
             FerroError::Corruption(e) => write!(f, "DATA CORRUPTION: {}", e),
+            FerroError::Publication(e) => write!(f, "publication refused: {}", e),
             FerroError::Io(e) => write!(f, "io error: {}", e),
             FerroError::NotEnoughSpace => write!(f, "not enough space in page"),
             FerroError::SlotDeleted => write!(f, "the slot is delted"),
@@ -88,6 +111,21 @@ impl Display for FerroError {
             FerroError::Merge(s) => write!(f, "merge error: {}", s),
             FerroError::CellAbsent(s) => write!(f, "cell absent: {}", s),
             FerroError::Provenance(s) => write!(f, "provenance error: {}", s),
+            // Two distinct messages, because the two states call for different actions and a
+            // single message covering both would be advice that is wrong half the time. Knowing
+            // the leader means reconnect *there*; not knowing it means an election is in progress
+            // and the only correct action is to retry *here* shortly.
+            FerroError::NotLeader { leader: Some(addr) } => write!(
+                f,
+                "not the leader: this node does not accept writes. The leader is at {addr}; \
+                 reconnect there. Reads served here could be stale, so they are refused too."
+            ),
+            FerroError::NotLeader { leader: None } => write!(
+                f,
+                "not the leader, and this node does not currently know who is - an election is in \
+                 progress or this node is partitioned from the cluster. Retry shortly; do not treat \
+                 this as the leader being down."
+            ),
         }
     }
 }

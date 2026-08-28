@@ -193,7 +193,23 @@ fn start_primary_mode(
 }
 
 /// Restore a backup and follow the primary to its frontier. Returns the replica's stdout.
-fn catch_up(primary: &Primary, rdb: &Path) -> String {
+///
+/// # Why this asks after the PRIMARY when the REPLICA is the thing that failed
+///
+/// Seen twice, in two separate full-suite runs on a machine running the whole agent fleet, and not
+/// reproduced in 12 standalone runs across two trees: the replica restores its backup, dials, and
+/// dies with `connect to primary: ConnectionRefused`. That message is equally consistent with a
+/// primary that exited before it was dialled, one that never bound, and a port that went elsewhere —
+/// and the first is live here, because in `sync` mode `repl_primary` exits as soon as its
+/// synchronous wait resolves (`examples/repl_primary.rs`, "the wait IS the point") rather than
+/// serving on.
+///
+/// The obvious guess, that the sync deadline expires before the replica arrives, was TESTED AND
+/// FALSIFIED: squeezing `FERRODB_SYNC_TIMEOUT_SECS` from 30 to 1 leaves the test passing in 3.9s.
+/// So the cause is still open, and rather than widen a budget on a mechanism nobody has confirmed,
+/// this records the one fact the next occurrence needs and the last two did not have — whether the
+/// primary was still alive at the moment the replica could not reach it.
+fn catch_up(primary: &mut Primary, rdb: &Path) -> String {
     let out = Command::new(example_bin("repl_replica"))
         .arg(rdb)
         .arg(&primary.addr)
@@ -202,11 +218,19 @@ fn catch_up(primary: &Primary, rdb: &Path) -> String {
         .output()
         .expect("spawn restored replica");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(
-        out.status.success(),
-        "a replica restored from a base backup failed:\nstdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if !out.status.success() {
+        let primary_status = primary.child.try_wait().expect("query the primary");
+        let primary_stderr = std::fs::read_to_string(&primary.stderr_path).unwrap_or_default();
+        panic!(
+            "a replica restored from a base backup failed:\nstdout: {stdout}\nstderr: {}\n\
+             --- and the primary it was dialling ({}) ---\n\
+             status at this moment: {primary_status:?} (None = still running, so the address was \
+             live and this is not the primary having exited)\n\
+             --- primary stderr ---\n{primary_stderr}",
+            String::from_utf8_lossy(&out.stderr),
+            primary.addr,
+        );
+    }
     stdout
 }
 
@@ -236,7 +260,7 @@ const ROWS: u32 = 2000;
 fn a_replica_restored_from_a_base_backup_converges_past_a_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let pdb = dir.path().join("primary.db");
-    let primary = start_primary(&pdb, ROWS, false);
+    let mut primary = start_primary(&pdb, ROWS, false);
 
     // (1) Anti-vacuity. If the primary has NOT truncated, this test is a duplicate of E4's and
     // proves nothing about base backups, so it must fail rather than pass quietly.
@@ -271,7 +295,7 @@ fn a_replica_restored_from_a_base_backup_converges_past_a_checkpoint() {
 
     // (3) With one, it converges.
     let rdb = dir.path().join("replica.db");
-    let stdout = catch_up(&primary, &rdb);
+    let stdout = catch_up(&mut primary, &rdb);
     assert!(stdout.contains("RESTORED "), "the replica did not restore a backup: {stdout}");
 
     let applied: u64 = stdout
@@ -329,7 +353,7 @@ fn a_replica_restored_from_a_base_backup_converges_past_a_checkpoint() {
 fn a_backup_taken_while_the_primary_is_writing_still_converges() {
     let dir = tempfile::tempdir().unwrap();
     let pdb = dir.path().join("primary.db");
-    let primary = start_primary(&pdb, ROWS, true);
+    let mut primary = start_primary(&pdb, ROWS, true);
 
     // Anti-vacuity: if nothing was written during the copy this is just the quiescent test again.
     assert!(
@@ -341,7 +365,7 @@ fn a_backup_taken_while_the_primary_is_writing_still_converges() {
     );
 
     let rdb = dir.path().join("replica.db");
-    let stdout = catch_up(&primary, &rdb);
+    let stdout = catch_up(&mut primary, &rdb);
     let applied: u64 = stdout
         .lines()
         .find(|l| l.starts_with("APPLIED "))
@@ -582,7 +606,7 @@ fn synchronous_commit_waits_for_a_replica_and_says_so_when_there_is_none() {
     let durable = primary.durable_lsn;
 
     let rdb = dir.path().join("replica.db");
-    let replica_out = catch_up(&primary, &rdb);
+    let replica_out = catch_up(&mut primary, &rdb);
     assert!(replica_out.contains("APPLIED "), "the replica never caught up: {replica_out}");
 
     let verdict = primary

@@ -36,6 +36,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::LogicalDecoder;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -438,7 +439,7 @@ fn every_row_of_a_multi_row_commit_reaches_the_destination() {
         .expect("decode");
 
     let mut buf: Vec<u8> = Vec::new();
-    write_feed(&out.events, &mut buf).expect("write feed");
+    write_feed(&out.events, &Publication::unrestricted(), &mut buf).expect("write feed");
     let text = String::from_utf8(buf).unwrap();
 
     // The premise: three row events really do share one commit_lsn. If ferrodb ever stopped batching

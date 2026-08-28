@@ -37,6 +37,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::snapshot::{snapshot_table, snapshot_table_exact, SnapshotBoundaryBuilder};
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
@@ -179,7 +180,7 @@ fn snapshot_and_stream_deliver_every_row_exactly_once() {
     }
 
     let mut snap_out: Vec<u8> = Vec::new();
-    let snap = snapshot_table_exact("inventory", &txn, &mut snap_out, |reader| {
+    let snap = snapshot_table_exact("inventory", &txn, &Publication::unrestricted(), &mut snap_out, |reader| {
         // **Committed during the scan**, before the read runs. Under a snapshot pinned when the
         // reader opened, these are invisible to it and belong to the stream.
         for i in 14..=15 {
@@ -219,7 +220,7 @@ fn snapshot_and_stream_deliver_every_row_exactly_once() {
     );
 
     let streamer =
-        FeedStreamer::new(LogicalDecoder::new(catalog)).resuming_after_snapshot(snap.boundary.clone());
+        FeedStreamer::new(LogicalDecoder::new(catalog), Publication::unrestricted()).resuming_after_snapshot(snap.boundary.clone());
     let (stream_feed, suppressed) = drain(&streamer, &d.wal, snap.resume_lsn());
 
     assert!(
@@ -287,7 +288,7 @@ fn the_at_least_once_handoff_both_duplicates_and_drops_in_this_scenario() {
     }
 
     let mut snap_out: Vec<u8> = Vec::new();
-    let snap = snapshot_table("inventory", &d.wal, &mut snap_out, || {
+    let snap = snapshot_table("inventory", &d.wal, &Publication::unrestricted(), &mut snap_out, || {
         for i in 14..=15 {
             exec(&format!("INSERT INTO inventory VALUES ({i}, {});", i * 10), catalog, &bp, &txn, &mut app);
         }
@@ -306,7 +307,7 @@ fn the_at_least_once_handoff_both_duplicates_and_drops_in_this_scenario() {
     d.wal.flush().unwrap();
 
     let snapshot_feed = String::from_utf8(snap_out).unwrap();
-    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog));
+    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog), Publication::unrestricted());
     let (stream_feed, suppressed) = drain(&streamer, &d.wal, snap.lsn);
     assert_eq!(suppressed, 0, "a streamer with no snapshot boundary suppressed something");
 
@@ -417,7 +418,7 @@ fn one_reader_snapshots_two_tables_against_a_single_boundary() {
         "the boundary does not describe the tables this reader delivered"
     );
     let streamer =
-        FeedStreamer::new(LogicalDecoder::new(catalog)).resuming_after_snapshot(boundary);
+        FeedStreamer::new(LogicalDecoder::new(catalog), Publication::unrestricted()).resuming_after_snapshot(boundary);
     let (stream_feed, suppressed) = drain(&streamer, &d.wal, resume_lsn);
     drop(handoff_pin);
     assert!(suppressed > 0, "the single boundary suppressed nothing, so it was never exercised");
@@ -475,7 +476,7 @@ fn a_one_table_boundary_does_not_suppress_another_tables_rows() {
     exec("INSERT INTO b VALUES (5, 50);", catalog, &bp, &txn, &mut app);
 
     let mut snap_out: Vec<u8> = Vec::new();
-    let snap = snapshot_table_exact("a", &txn, &mut snap_out, |reader| {
+    let snap = snapshot_table_exact("a", &txn, &Publication::unrestricted(), &mut snap_out, |reader| {
         app.current = Some(reader);
         let rows = match exec("SELECT * FROM a;", catalog, &bp, &txn, &mut app) {
             Outcome::Rows(r) => r,
@@ -494,7 +495,7 @@ fn a_one_table_boundary_does_not_suppress_another_tables_rows() {
 
     // A stream whose decoder carries both tables — the ordinary case, since the decoder is built
     // from the catalog.
-    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog))
+    let streamer = FeedStreamer::new(LogicalDecoder::new(catalog), Publication::unrestricted())
         .resuming_after_snapshot(snap.boundary.clone());
     let (stream_feed, _suppressed) = drain(&streamer, &d.wal, snap.resume_lsn());
 

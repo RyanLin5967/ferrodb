@@ -28,6 +28,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::{Column, DataType, Value};
 use ferrodb::catalog::schema::Schema;
 use ferrodb::replication::logical::LogicalDecoder;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::snapshot::SnapshotBoundaryBuilder;
 use ferrodb::replication::stream::{FeedStreamer, Subscription};
 use ferrodb::storage::disk_manager::DiskManager;
@@ -204,7 +205,10 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
     boundary.delivered_elsewhere("t");
     let (boundary, handoff_pin) = boundary.finish();
 
-    let streamer = FeedStreamer::new(LogicalDecoder::for_table(dir_root, "t", schema(), u32::MAX))
+    let streamer = FeedStreamer::new(
+        LogicalDecoder::for_table(dir_root, "t", schema(), u32::MAX),
+        Publication::unrestricted(),
+    )
         .resuming_after_snapshot(boundary);
     let mut sub = Subscription::following(&wal, &streamer).expect("subscribe at the handoff");
     // The subscription holds its own claim from here, so the handoff's can go. Released explicitly

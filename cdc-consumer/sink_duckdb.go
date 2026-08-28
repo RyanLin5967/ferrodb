@@ -60,12 +60,44 @@ type DuckSink struct {
 	// Columns known per table, learned from CREATE_TABLE events, from the destination catalog, or
 	// inferred from the first row — in that order of preference.
 	columns map[string][]string
+	// The key column's CURRENT name per table, read from the destination catalog. See `keyFor`.
+	keys map[string]string
 }
 
 // bookkeeping names the columns this sink adds to every destination table. They are prefixed so
 // they cannot collide with a source column unless the source deliberately chose a leading
 // underscore, and they are listed here so the catalog reader can tell them from real ones.
-var bookkeeping = map[string]bool{"_commit_lsn": true, "_lsn": true, "_deleted": true}
+var bookkeeping = map[string]bool{"_commit_lsn": true, "_lsn": true, "_deleted": true,
+	// Attribution. Listed here so `catalogSchema` does not report them as columns of the source
+	// table — a missing entry here surfaces as `checkSchemaAgrees` refusing every CREATE_TABLE
+	// after the first, which reads as a schema conflict rather than as a missing name in a map.
+	"_prov_id": true, "_agent": true, "_run": true, "_model": true, "_model_version": true,
+	"_prompt_sha256": true, "_retracted": true}
+
+// duckWriterColumns mirrors `writerColumns` in sink.go with DuckDB's types.
+//
+// Two lists rather than one because the types genuinely differ — DuckDB has a real BOOLEAN and
+// SQLite does not — and `retract`/`scan` read the columns by name through engine-agnostic SQL, so the
+// names are what has to agree. `TestBothSinksLandTheSameWriterColumnNames` pins that they do; without
+// it, a column added to one sink and not the other shows up as a retraction that silently matches
+// nothing against half the destinations.
+// `decl` is used by CREATE TABLE; `bare` and `fill` by the ALTER path, because **DuckDB refuses
+// `ALTER TABLE … ADD COLUMN` with any constraint** — measured, not assumed: it answers `Parser
+// Error: Adding columns with constraints not yet supported`. So an upgraded table gets the bare type
+// and the existing rows are backfilled to what the DEFAULT would have given them, which makes the
+// DATA equivalent. The constraint itself is not retrofitted, and that difference between a fresh
+// table and an upgraded one is stated here rather than discovered later.
+var duckWriterColumns = []struct{ name, decl, bare, fill string }{
+	{"_prov_id", "BIGINT NOT NULL DEFAULT 0", "BIGINT", "0"},
+	{"_agent", "VARCHAR", "VARCHAR", ""},
+	{"_run", "VARCHAR", "VARCHAR", ""},
+	{"_model", "VARCHAR", "VARCHAR", ""},
+	{"_model_version", "VARCHAR", "VARCHAR", ""},
+	{"_prompt_sha256", "VARCHAR", "VARCHAR", ""},
+	// Set by `retract`, never by the feed. Separate from `_deleted` so an operator can tell a row the
+	// SOURCE deleted from one this consumer withdrew.
+	{"_retracted", "BOOLEAN NOT NULL DEFAULT false", "BOOLEAN", "false"},
+}
 
 func openDuckSink(path, key string) (*DuckSink, error) {
 	if key == "" {
@@ -96,7 +128,7 @@ func openDuckSink(path, key string) (*DuckSink, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DuckSink{db: db, key: key, columns: map[string][]string{}}, nil
+	return &DuckSink{db: db, key: key, columns: map[string][]string{}, keys: map[string]string{}}, nil
 }
 
 // duckTypes is the closed set of types this sink will ever put into DDL.
@@ -208,7 +240,10 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		names = append(names, name)
 		types = append(types, typ)
 		def := quoteIdent(name) + " " + typ
-		if name == s.key {
+		// `keyFor`, not the flag — I20. For a table that does not exist yet this IS the flag; for
+		// one whose key column the source has renamed it is the name the destination actually
+		// carries the PRIMARY KEY on.
+		if name == s.keyFor(table) {
 			def += " PRIMARY KEY"
 			sawKey = true
 		}
@@ -218,14 +253,20 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		// Refuse rather than warn. A table without the key column has no conflict target, so every
 		// upsert against it would be a plain INSERT — the ordering guard would be absent, not
 		// degraded, and the destination would corrupt silently on the first replay.
-		return fmt.Errorf("table %s has no key column %q; the ordering guard needs one", table, s.key)
+		return fmt.Errorf("table %s has no key column %q; the ordering guard needs one", table, s.keyFor(table))
 	}
 	defs = append(defs, `"_commit_lsn" BIGINT NOT NULL`, `"_lsn" BIGINT NOT NULL DEFAULT 0`,
 		`"_deleted" BOOLEAN NOT NULL DEFAULT false`)
+	for _, w := range duckWriterColumns {
+		defs = append(defs, quoteIdent(w.name)+" "+w.decl)
+	}
 
 	stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", quoteIdent(table), strings.Join(defs, ", "))
 	if _, err := s.db.Exec(stmt); err != nil {
 		return fmt.Errorf("create %s: %w", table, err)
+	}
+	if err := s.ensureDuckWriterColumns(table); err != nil {
+		return err
 	}
 	// The table may already have existed with a different shape — an older run's inference, say. Ask
 	// the catalog what is actually there rather than assuming the DDL just issued is what took.
@@ -246,11 +287,64 @@ func (s *DuckSink) ensureDuckTable(table string, cols []map[string]any) error {
 		s.columns[table] = names
 		return nil
 	}
+	// **A destination that is BEHIND the declared shape is caught up, not refused — B11.**
+	//
+	// This case did not exist before column-level DDL, because a table's shape never changed once
+	// created. It does now, and it is reachable without anybody doing anything wrong: a consumer
+	// that applied `CREATE_TABLE(id, qty)`, died before the `ADD_COLUMN`, and resumed after the
+	// source truncated its log is handed the re-emitted declaration `CREATE_TABLE(id, qty, note)`.
+	// `CREATE TABLE IF NOT EXISTS` is a no-op on the table that is already there, and without this
+	// the count check below refuses — permanently, because the ALTER that would have fixed it was
+	// truncated away. A stuck consumer with no way forward is a worse answer than a wrong one.
+	//
+	// **Only a strict PREFIX is caught up**, and that restriction is the whole safety argument: the
+	// destination's columns must be the declared ones, same names and same types, in order, with
+	// the declaration merely longer. Nothing is renamed, nothing is retyped, and the columns added
+	// are ones the destination has never had. A rename still surfaces as a name mismatch at an
+	// ordinal and a retype as a type mismatch, and both are still refused — a shape diff cannot
+	// tell a rename from a drop-plus-add, and guessing there loses the column's data.
+	if grown, err := s.catchUpToDeclaredShape(table, names, types, actualCols, actualTypes); err != nil {
+		return err
+	} else if grown {
+		actualCols, actualTypes, err = s.catalogSchema(table)
+		if err != nil {
+			return err
+		}
+	}
 	if err := s.checkSchemaAgrees(table, names, types, actualCols, actualTypes); err != nil {
 		return err
 	}
 	s.columns[table] = actualCols
 	return nil
+}
+
+// catchUpToDeclaredShape adds columns a declaration has and the destination does not, and reports
+// whether it added any.
+//
+// Refuses to do anything unless the destination is a strict PREFIX of the declaration — every
+// column it already has must be the declared one at that ordinal, by name and by type. Anything
+// else is left for `checkSchemaAgrees` to refuse. See the caller for why this case exists at all.
+func (s *DuckSink) catchUpToDeclaredShape(table string, want, wantTypes, got, gotTypes []string) (bool, error) {
+	if len(got) >= len(want) {
+		return false, nil
+	}
+	for i := range got {
+		if got[i] != want[i] || !strings.EqualFold(gotTypes[i], wantTypes[i]) {
+			return false, nil
+		}
+	}
+	for i := len(got); i < len(want); i++ {
+		if !duckTypes[wantTypes[i]] {
+			return false, fmt.Errorf("column %s.%s: type %q is not one this sink will emit",
+				table, want[i], wantTypes[i])
+		}
+		stmt := "ALTER TABLE " + quoteIdent(table) + " ADD COLUMN " + quoteIdent(want[i]) + " " +
+			wantTypes[i]
+		if _, err := s.db.Exec(stmt); err != nil {
+			return false, fmt.Errorf("catch %s up to the declared shape (%s): %w", table, want[i], err)
+		}
+	}
+	return true, nil
 }
 
 // checkSchemaAgrees refuses when the destination table is not the table the event describes.
@@ -284,6 +378,55 @@ func (s *DuckSink) checkSchemaAgrees(table string, want, wantTypes, got, gotType
 	return nil
 }
 
+// ensureDuckWriterColumns upgrades a destination written before attribution existed.
+//
+// The decision comes from the CATALOG, not from parsing an error string: `IF NOT EXISTS` on ADD
+// COLUMN is not portable and matching on a driver's duplicate-column wording is exactly the kind of
+// guard that stops working when the driver is upgraded. Refusing to open an older destination is not
+// an option either — that would strand the backups the checkpoint design exists to make resumable.
+func (s *DuckSink) ensureDuckWriterColumns(table string) error {
+	present := map[string]bool{}
+	rows, err := s.db.Query(
+		`SELECT column_name FROM duckdb_columns() WHERE table_name = ? AND schema_name = 'main'`, table)
+	if err != nil {
+		return fmt.Errorf("read catalog for %s: %w", table, err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		present[n] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, w := range duckWriterColumns {
+		if present[w.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s",
+			quoteIdent(table), quoteIdent(w.name), w.bare)
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s to %s: %w", w.name, table, err)
+		}
+		if w.fill == "" {
+			continue
+		}
+		// Backfill what the DEFAULT would have given the rows that were already there. Without it,
+		// `_retracted` is NULL on every pre-existing row — and NULL is neither retracted nor not, so
+		// a reader scanning it into a bool fails and a `WHERE _retracted` silently excludes them.
+		fill := fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IS NULL",
+			quoteIdent(table), quoteIdent(w.name), w.fill, quoteIdent(w.name))
+		if _, err := s.db.Exec(fill); err != nil {
+			return fmt.Errorf("backfill %s in %s: %w", w.name, table, err)
+		}
+	}
+	return nil
+}
+
 // catalogSchema reads a destination table's data columns and their types, excluding this sink's
 // bookkeeping ones. An empty result means the table does not exist; that is not an error here, it is
 // the question being asked.
@@ -312,6 +455,42 @@ func (s *DuckSink) catalogSchema(table string) (names, types []string, err error
 }
 
 // catalogColumns is catalogSchema when only the names are wanted.
+// keyFor is the name the key column carries in `table` RIGHT NOW — I20, review finding 10.
+//
+// See `Sink.keyFor` for the whole argument; this is the DuckDB half of it. `duckdb_constraints()`
+// is the catalog that answers what `ON CONFLICT` will accept, and it follows the rename — measured,
+// not assumed: after `ALTER TABLE inv RENAME "id" TO "sku"` it reports `PRIMARY KEY [sku]`, and an
+// upsert on `sku` succeeds. Pinning `s.key` to the `-key` flag instead produced
+// `INSERT event for inv has no key column "id"` on every row, on every restart, for ever.
+func (s *DuckSink) keyFor(table string) string {
+	if n, ok := s.keys[table]; ok {
+		return n
+	}
+	rows, err := s.db.Query(
+		`SELECT constraint_column_names FROM duckdb_constraints()
+		  WHERE table_name = ? AND schema_name = 'main' AND constraint_type = 'PRIMARY KEY'`, table)
+	if err != nil {
+		return s.key
+	}
+	defer rows.Close()
+	for rows.Next() {
+		// The driver hands the column-name list back as a slice; this source's primary key is
+		// always the single column at ordinal 0 (`catalog.rs`: "first column = primary key"), so
+		// there is no composite case to get wrong.
+		var names []any
+		if err := rows.Scan(&names); err != nil || len(names) == 0 {
+			return s.key
+		}
+		n := fmt.Sprint(names[0])
+		s.keys[table] = n
+		return n
+	}
+	return s.key
+}
+
+// forgetKey drops a cached key name, wherever the destination's shape moves underneath it.
+func (s *DuckSink) forgetKey(table string) { delete(s.keys, table) }
+
 func (s *DuckSink) catalogColumns(table string) ([]string, error) {
 	names, _, err := s.catalogSchema(table)
 	return names, err
@@ -345,6 +524,129 @@ func (s *DuckSink) ensureDuckFromRow(table string, row map[string]any) error {
 	return s.ensureDuckTable(table, cols)
 }
 
+// applyDuckSchemaChange evolves the destination for a column-level change — B11.
+//
+// **This is where `checkSchemaAgrees` had to be taught rather than worked around.** That check
+// refuses to write through a destination whose columns disagree with the source's declared shape,
+// positionally, by name and by type — which is right, and which means a source table that gained,
+// renamed or retyped a column would abort the entire sink run on the very next re-emitted
+// CREATE_TABLE. Evolving here is what makes the two agree again: the destination is brought to the
+// shape the source now has, so the next declaration matches instead of being refused.
+//
+// Each statement is the narrowest one that reaches the declared shape while keeping every row.
+// Dropping and recreating would produce a correct-looking schema over an empty table, which is
+// self-consistent and wrong — the worst thing a pipeline can be.
+func (s *DuckSink) applyDuckSchemaChange(e *Event) error {
+	list, _ := e.After["columns"].([]any)
+	cols := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		if m, ok := c.(map[string]any); ok {
+			cols = append(cols, map[string]any{
+				"name": fmt.Sprint(m["name"]),
+				"type": duckType(fmt.Sprint(m["type"])),
+			})
+		}
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("%s for %s carries no shape", e.Op, e.Table)
+	}
+	// Never seen this table: the event's shape is the whole truth. This is the resume case, where a
+	// consumer's first event for a table is the ALTER rather than the CREATE.
+	actual, err := s.catalogColumns(e.Table)
+	if err != nil {
+		return err
+	}
+	if len(actual) == 0 {
+		return s.ensureDuckTable(e.Table, cols)
+	}
+
+	typeOf := func(name string) string {
+		for _, c := range cols {
+			if c["name"] == name {
+				return fmt.Sprint(c["type"])
+			}
+		}
+		return ""
+	}
+	has := func(name string) bool {
+		for _, c := range actual {
+			if c == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch e.Op {
+	case "ADD_COLUMN":
+		name, _ := alterField(e, "column")
+		typ := typeOf(name)
+		if name == "" || typ == "" {
+			return fmt.Errorf("ADD_COLUMN for %s names no column present in its shape", e.Table)
+		}
+		// `duckTypes` is the allowlist that keeps a type string out of DDL unless this sink vouches
+		// for it. It applies to a column arriving by ALTER exactly as it does to one arriving by
+		// CREATE — a hostile type is no less hostile for coming second.
+		if !duckTypes[typ] {
+			return fmt.Errorf("column %s.%s: type %q is not one this sink will emit", e.Table, name, typ)
+		}
+		if has(name) {
+			// Re-delivered, or the destination was built from the evolved declaration. Nothing to do.
+			break
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " ADD COLUMN " + quoteIdent(name) + " " + typ
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s.%s: %w", e.Table, name, err)
+		}
+	case "RENAME_COLUMN":
+		from, _ := alterField(e, "from")
+		to, _ := alterField(e, "to")
+		if from == "" || to == "" {
+			return fmt.Errorf("RENAME_COLUMN for %s names no columns", e.Table)
+		}
+		if !has(from) && has(to) {
+			break // already renamed
+		}
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " RENAME " + quoteIdent(from) + " TO " +
+			quoteIdent(to)
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("rename %s.%s: %w", e.Table, from, err)
+		}
+	case "ALTER_COLUMN_TYPE":
+		name, _ := alterField(e, "column")
+		typ := typeOf(name)
+		if name == "" || typ == "" {
+			return fmt.Errorf("ALTER_COLUMN_TYPE for %s names no column present in its shape", e.Table)
+		}
+		if !duckTypes[typ] {
+			return fmt.Errorf("column %s.%s: type %q is not one this sink will emit", e.Table, name, typ)
+		}
+		// `duckType` collapses several feed types onto one DuckDB type — INTEGER and BIGINT both
+		// become BIGINT — so a source retype can be a no-op here. Issued anyway rather than
+		// predicted: DuckDB accepts a cast to the type a column already has, and skipping it would
+		// need a comparison against the catalog's spelling of the type, which is a second place for
+		// the mapping to be wrong.
+		stmt := "ALTER TABLE " + quoteIdent(e.Table) + " ALTER COLUMN " + quoteIdent(name) +
+			" TYPE " + typ
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("retype %s.%s: %w", e.Table, name, err)
+		}
+	}
+
+	// Re-read from the catalog rather than trusting the statement to have produced what was asked
+	// for. `s.columns` drives every subsequent upsert, and one built from the request rather than
+	// from the destination names a column that may not exist.
+	//
+	// I20: the cached key name goes with it — a RENAME_COLUMN may have just moved it.
+	s.forgetKey(e.Table)
+	after, err := s.catalogColumns(e.Table)
+	if err != nil {
+		return err
+	}
+	s.columns[e.Table] = after
+	return nil
+}
+
 // apply writes one event, ignoring it if the destination already holds a newer one.
 func (s *DuckSink) apply(e *Event) error {
 	switch e.Op {
@@ -361,11 +663,15 @@ func (s *DuckSink) apply(e *Event) error {
 		}
 		return s.ensureDuckTable(e.Table, cols)
 
+	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		return s.applyDuckSchemaChange(e)
+
 	case "DROP_TABLE":
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + quoteIdent(e.Table)); err != nil {
 			return err
 		}
 		delete(s.columns, e.Table)
+		s.forgetKey(e.Table)
 		return nil
 	}
 
@@ -381,10 +687,11 @@ func (s *DuckSink) apply(e *Event) error {
 	if err := s.ensureDuckFromRow(e.Table, row); err != nil {
 		return err
 	}
-	if _, ok := row[s.key]; !ok {
+	key := s.keyFor(e.Table)
+	if _, ok := row[key]; !ok {
 		// Without the key there is no conflict target, so the row would land as a fresh insert every
 		// time it was re-delivered. Say so rather than duplicating it.
-		return fmt.Errorf("%s event for %s has no key column %q", e.Op, e.Table, s.key)
+		return fmt.Errorf("%s event for %s has no key column %q", e.Op, e.Table, key)
 	}
 
 	cols := s.columns[e.Table]
@@ -400,11 +707,26 @@ func (s *DuckSink) apply(e *Event) error {
 	placeholders = append(placeholders, "?", "?", "?")
 	values = append(values, int64(e.CommitLSN), int64(e.LSN), deleted)
 
+	// The writer, landed with the row — the same contract sink.go documents. A change no run
+	// produced lands NULLs and prov_id 0, the unattributed slot, which `=` never matches.
+	var provID int64
+	var agent, run, model, modelVersion, promptSHA any
+	if e.Writer != nil {
+		provID = int64(e.Writer.ProvID)
+		agent, run = e.Writer.Agent, e.Writer.Run
+		model, modelVersion = e.Writer.Model, e.Writer.ModelVersion
+		promptSHA = e.Writer.PromptSHA256
+	}
+	names = append(names, `"_prov_id"`, `"_agent"`, `"_run"`, `"_model"`, `"_model_version"`,
+		`"_prompt_sha256"`, `"_retracted"`)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?")
+	values = append(values, provID, agent, run, model, modelVersion, promptSHA, false)
+
 	// The ordering guard lives HERE, in the statement, not in Go control flow above it. Every write
 	// path that goes through this function inherits it, and there is no path that does not.
 	sets := make([]string, 0, len(cols)+2)
 	for _, c := range cols {
-		if c == s.key {
+		if c == key {
 			// Left out because it is a no-op by construction: the row matched on this column, so it
 			// already holds this value. (DuckDB 1.4.1 accepts the assignment — measured, not
 			// assumed — so this is about the statement saying what it means, not about being
@@ -416,6 +738,9 @@ func (s *DuckSink) apply(e *Event) error {
 	}
 	sets = append(sets, `"_commit_lsn"=excluded."_commit_lsn"`, `"_lsn"=excluded."_lsn"`,
 		`"_deleted"=excluded."_deleted"`)
+	for _, w := range duckWriterColumns {
+		sets = append(sets, fmt.Sprintf("%s=excluded.%s", quoteIdent(w.name), quoteIdent(w.name)))
+	}
 
 	stmt := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
@@ -425,7 +750,7 @@ func (s *DuckSink) apply(e *Event) error {
 		quoteIdent(e.Table),
 		strings.Join(names, ", "),
 		strings.Join(placeholders, ", "),
-		quoteIdent(s.key),
+		quoteIdent(key),
 		strings.Join(sets, ", "),
 		quoteIdent(e.Table),
 		quoteIdent(e.Table),

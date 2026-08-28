@@ -20,7 +20,7 @@
 //!
 //! # Scope
 //!
-//! Escrow is charged from the agent capture path (`AgentRuntime::stage`), so it governs
+//! Escrow is charged from the agent capture path (`AgentRuntime::stage_all`), so it governs
 //! **agent-session writes**. A plain `UPDATE` outside a session goes straight through the executor
 //! and is never charged. That is a real boundary, not an oversight to be discovered later:
 //! `escrow_governs_agent_writes_only_and_a_direct_write_is_not_charged` asserts it. Closing it
@@ -31,6 +31,29 @@
 //! What escrow does NOT depend on is the shape of the write. It is charged from the change to the
 //! cell, so `Assign`, `Add` and float deltas are all covered; keying off `Add` was a real hole and
 //! let `SET qty = -100` through.
+//!
+//! # Escrow and the capability envelope are two bounds, and the difference is durability
+//!
+//! Both are enforced at `AgentRuntime::stage_all` and both read the after-image, so it is worth
+//! saying plainly which one answers what:
+//!
+//! - **This ledger is in memory.** It lives in the runtime's `Mutex<State>`, so a restart forgets
+//!   every pool, every claim and every unit spent. That is not a bug in it — a claim is a
+//!   *partition of slack between concurrently live branches*, and the branches themselves do not
+//!   survive a restart either — but it does mean nothing here can answer "what is this branch
+//!   still allowed to do" to a process that has just started.
+//! - **`CapabilityEnvelope::floor` is in the branch's durable record.** It is an absolute lower
+//!   bound on the value a branch may leave in a cell, it survives a reopen, and it needs no claim
+//!   to be opened first. It is coarser: it bounds the VALUE, not each branch's share of the
+//!   headroom, so it cannot stop two agents from both spending the last unit — that is what escrow
+//!   is for.
+//!
+//! The envelope also closes one gap this module documents and leaves open:
+//! `deleting_the_row_is_not_governed_by_escrow_and_this_is_a_known_gap` shows a `DELETE` removing
+//! a bounded cell without spending against the claim. A floor treats a removed row as having no
+//! value, which is below every floor, so a floored column cannot be deleted around. Escrow's gap
+//! is unchanged — the two mechanisms are additive, and a cell that has a claim but no floor still
+//! has that hole.
 
 use std::collections::BTreeMap;
 

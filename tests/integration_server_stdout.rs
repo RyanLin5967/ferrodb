@@ -114,12 +114,35 @@ fn survives_a_closed_stdout(name: &str, args: &[String]) {
     // Before its first write. This is the whole point — racing it would test the scheduler.
     drop(child.stdout.take().expect("piped stdout"));
 
-    // **Poll to a generous deadline instead of sleeping a fixed 1.5s.** The first version of this
-    // slept 1500ms and then asked once, and it PASSED for `pgserver` even with the panicking
-    // `println!` restored — pgserver takes a lock, opens the file, recovers and opens the catalog
-    // before it prints, so 1.5s expired before it reached the write and the test saw a healthy
-    // process that had not yet had the chance to die. A detector that reports "nothing bad
-    // happened" because it looked too early is worse than no detector.
+    // **Phase 1 — wait until the server has actually started, before starting any clock on it.**
+    //
+    // Every one of these creates its database file before it prints, so the working directory going
+    // non-empty is the readiness signal. Measured on an idle-ish machine that takes about 10ms
+    // (median over 15 spawns each of the three servers, max 594ms at load 89) — but this test has
+    // been seen failing `created nothing in its working directory` on a machine running the whole
+    // agent fleet, and a spawn that has not finished is not a server that died. Sixty seconds is a
+    // liveness bound, not an assertion: the loop leaves the instant the file appears, so a healthy
+    // run costs the same 10ms it always did.
+    let start_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < start_by {
+        if std::fs::read_dir(dir.path()).unwrap().count() > 0 {
+            break;
+        }
+        // Died before creating anything. Stop waiting and let the judgement below report it — the
+        // anti-vacuity branch names the status and the stderr, which is what tells the two apart.
+        if child.try_wait().expect("query the child").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // **Phase 2 — the death watch, timed from the moment the server started rather than from the
+    // moment we called `spawn`.** The first version of this slept 1500ms and then asked once, and it
+    // PASSED for `pgserver` even with the panicking `println!` restored — pgserver takes a lock,
+    // opens the file, recovers and opens the catalog before it prints, so 1.5s expired before it
+    // reached the write and the test saw a healthy process that had not yet had the chance to die.
+    // A detector that reports "nothing bad happened" because it looked too early is worse than no
+    // detector, and starting this clock at `spawn` reintroduced exactly that on a loaded machine.
     //
     // Measured: a vulnerable server dies within about a second of reaching its first write, so ten
     // is ample rather than arbitrary.
@@ -136,11 +159,27 @@ fn survives_a_closed_stdout(name: &str, args: &[String]) {
     // Anti-vacuity: the server must have done real work before being judged. Every one of these
     // creates its database file before it prints, so a missing file means the process never got
     // near the write and this test proved nothing about it.
-    assert!(
-        std::fs::read_dir(dir.path()).unwrap().count() > 0,
-        "{name} created nothing in its working directory, so it never reached the point where a \
-         closed stdout could matter and this test is vacuous"
-    );
+    //
+    // When it DOES fire it has to say why, which cost a day the first time it did not: "created
+    // nothing" alone is equally consistent with a server that never started, one that refused the
+    // database, and one that died on the way. So the child's status and its stderr are read first
+    // and carried into the message.
+    if std::fs::read_dir(dir.path()).unwrap().count() == 0 {
+        let st = child.try_wait().expect("query the child");
+        if st.is_none() {
+            let _ = child.kill();
+        }
+        let mut why = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut why);
+        }
+        let _ = child.wait();
+        panic!(
+            "{name} created nothing in its working directory, so it never reached the point where \
+             a closed stdout could matter and this test is vacuous.\nchild status: {st:?}\n\
+             --- its stderr ---\n{why}"
+        );
+    }
     let mut err = String::new();
     if let Some(mut e) = child.stderr.take() {
         // The child may still be running and holding the pipe open, so this must not block
@@ -233,7 +272,15 @@ fn every_user_path_binary_refuses_a_database_that_is_already_open() {
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // **Sixty seconds, and it is patience rather than an assertion.** This was ten, and ten was
+        // measured on a quiet machine: seen from a machine running the whole agent fleet, this test
+        // failed with `repl_replica did not refuse a database that is already held - it was still
+        // running after 10s`, which is the message for the one thing that must never happen, printed
+        // because a binary had not yet reached its lock check. Widening cannot hide the defect it
+        // guards: a binary that wrongly OPENS the database serves for ever, so it is still running
+        // at sixty seconds and at any other number. The loop leaves the instant the process exits,
+        // so a correct refusal costs what it always did.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut status = None;
         while std::time::Instant::now() < deadline {
             status = child.try_wait().expect("query the child");
@@ -258,7 +305,7 @@ fn every_user_path_binary_refuses_a_database_that_is_already_open() {
         assert!(
             !still_running,
             "{name} did not refuse a database that is already held - it was still running after \
-             10s, which for a server means it opened it and started serving:\n{text}"
+             60s, which for a server means it opened it and started serving:\n{text}"
         );
         assert!(
             !status.unwrap().success(),
@@ -272,4 +319,113 @@ fn every_user_path_binary_refuses_a_database_that_is_already_open() {
              database is held, not because of an unrelated error:\n{text}"
         );
     }
+}
+
+/// **E46 — no test harness picks a port for a server it has not started yet (I16).**
+///
+/// `integration_cdc_go_consumer::the_server_survives_a_consumer_that_stops_reading_its_stdout`
+/// opened its own listener on `127.0.0.1:0`, read the port off it, dropped it, and handed the bare
+/// number to a server it spawned afterwards. Across that gap the port belongs to nobody — and the
+/// gap is a process spawn plus the whole of that server's startup, not microseconds — so anything
+/// else on the machine may take it. Six independent lanes hit `the server never accepted a
+/// connection` on that one test while the fleet was running ten worktrees at once.
+///
+/// What rules out the alternative explanation: bind time was measured at 30ms median and 838ms max
+/// over 50 spawns at load 91, **with zero failures to bind**. The server was not starved; the port
+/// was taken. And a retry around the connect does not fix it — it relabels a stolen port as a slow
+/// start, which is the same flake with its evidence deleted.
+///
+/// The fix everywhere in this repo is the same: the server binds `:0` itself and reports the
+/// address it got — on stdout for the harnesses that read it, and to `FERRODB_LISTEN_FILE` for the
+/// one that closes stdout on purpose. This pins it, because the idiom is two lines to retype and
+/// its failure is rare, remote, and blamed on machine load every single time.
+///
+/// # Why a whole-name ban rather than a pattern match
+///
+/// Matching the exact shape that failed would be a denylist: spread over three statements, or with
+/// the listener dropped by hand, the same mistake walks straight past. So this bans the type from
+/// test sources outright and carries an allowlist of files that are permitted to name it, which is
+/// empty. A test that genuinely needs its own socket — proving an "address already in use" path,
+/// say — adds itself here with a reason, and that edit is the review.
+///
+/// The walk is recursive. `tests/` already has a subdirectory, and `tests/common/mod.rs` is where
+/// Rust conventionally puts shared harness code — a helper that bound its own listener there would
+/// be used by every integration test, and a one-level scan would report clean while the top-level
+/// file count still cleared the anti-vacuity floor.
+///
+/// Its remaining blind spot, stated rather than discovered later: a harness that reaches a raw
+/// socket through some other type, or shells out to something that does, is invisible to this.
+#[test]
+fn no_test_picks_a_port_for_a_server_it_has_not_started_yet() {
+    // Assembled from pieces so this file does not match itself, and never spelled whole anywhere
+    // above either — the doc comment says "listener", not the type name.
+    let needle = concat!("Tcp", "Listener");
+
+    // Files permitted to bind a socket of their own, each with the reason. Empty: after I16 no test
+    // in this repo needs one, because every example server reports the address it bound.
+    const ALLOWED: &[(&str, &str)] = &[];
+
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    let mut todo = vec![std::path::PathBuf::from("tests")];
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .flatten()
+        {
+        let path = entry.path();
+        if path.is_dir() {
+            todo.push(path);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        scanned += 1;
+        // Relative to `tests/`, so a helper in a subdirectory is named the way an allowlist entry
+        // would have to spell it.
+        let name = path.strip_prefix("tests").unwrap_or(&path).to_string_lossy().into_owned();
+        if ALLOWED.iter().any(|(f, _)| *f == name) {
+            continue;
+        }
+        // Whole-line comments are dropped first, so a test may still EXPLAIN the defect it used
+        // to have — the one that had it carries a long comment naming the type. A line whose first
+        // non-space characters are `//` is unambiguously a comment, which is why the rule is that
+        // and not "strip from `//` to end of line": the latter also eats the middle of a string
+        // literal. Not handled, and stated rather than left to be found: a trailing comment after
+        // code on the same line (over-strict, it fires and the fix is to move the comment), a
+        // block comment, and a raw string containing a line that begins with `//`.
+        let src = std::fs::read_to_string(&path).expect("read a test source");
+        let code = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if code.contains(needle) {
+            offenders.push(name);
+        }
+        }
+    }
+
+    // A scan that read nothing is not a pass. This directory holds dozens of test binaries; if it
+    // comes back empty the working directory is not the package root, and a clean verdict from
+    // there is a fact about the scan rather than about the repo.
+    assert!(
+        scanned >= 10,
+        "only {scanned} test sources were scanned, so this guard was pointed at the wrong directory \
+         rather than finding the repo clean"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these test sources bind a listener of their own: {}.\nThat is the discover-then-drop port \
+         race of I16 — the port is unowned between the harness dropping it and the server's own \
+         bind, and on a loaded machine something takes it. Let the server bind `:0` and report the \
+         address it got, and read it off the `LISTENING` line on stdout.\nOnly if the harness \
+         closes the server's stdout on purpose does it need the other channel, `FERRODB_LISTEN_FILE` \
+         — and TODAY ONLY `cdc_server` implements that. `pgserver` and `repl_primary` ignore the \
+         variable entirely, so setting it on one of those buys silence and a spent timeout, not an \
+         address; teach that server to publish first.\nIf a test really does need its own socket, \
+         add it to ALLOWED above with the reason.",
+        offenders.join(", ")
+    );
 }

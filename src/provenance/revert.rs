@@ -200,7 +200,15 @@ impl DependencyGraphBuilder {
         col: Option<ColId>,
         value: Option<Value>,
     ) {
-        self.record_write(txn, v);
+        // One version carries SEVERAL valued writes: a scan's predicate may be over any column, and
+        // `PredicateSummary::covers` only matches a write recorded against the column the predicate
+        // names, so the caller records the row's image column by column. The plain write is recorded
+        // once per version regardless — recording it per column multiplied every exact
+        // read-after-write edge by the width of the row, which surfaced as `row1@10,row1@10,...` in
+        // the halt tree and as a `dependents_of` list that only looked right because it de-dupes.
+        if !self.writes.contains(&(txn, v)) {
+            self.record_write(txn, v);
+        }
         if let Some(value) = value {
             self.valued_writes.push(ValuedWrite { txn, version: v, col, value });
         }

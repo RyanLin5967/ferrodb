@@ -14,8 +14,10 @@
 //! row-inflation figure for an unstated ~40-byte row, and was measured nowhere.
 
 pub mod capture;
+pub mod durable;
 pub mod readset;
 pub mod revert;
+pub mod sha256;
 pub mod store;
 
 pub use capture::{
@@ -29,6 +31,8 @@ pub use readset::{
 pub use revert::{
     DependencyEdge, DependencyGraph, DependencyGraphBuilder, RevertMode, RevertPlan,
 };
+pub use durable::DurableProvenanceStore;
+pub use sha256::{prompt_digest, sha256 as sha256_of, to_hex, Sha256};
 pub use store::{MemProvenanceStore, PageProvDict, MAX_PAGE_DICT_ENTRIES, PROV_SLOT_BYTES};
 
 use std::fmt::{Display, Formatter};

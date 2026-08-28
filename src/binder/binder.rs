@@ -1,4 +1,4 @@
-use crate::{agent_sql::runtime::BranchResolver, branch::types::BranchId, catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{BranchRef, Expr, JoinClause, Stmt, TableRef}, scanner::TokenType}, planner::logical_plan::LogicalPlan, provenance::revert::RevertMode};
+use crate::{agent_sql::runtime::BranchResolver, agent_sql::simulate::{AdmitPolicy, Assertion, Candidate, SimulationPlan}, branch::types::BranchId, catalog::{catalog::Catalog, column::{DataType, Value}, schema::Schema}, error::FerroError, parser::{parser::{AdmitSpec, BranchRef, Expr, JoinClause, Stmt, TableRef}, scanner::TokenType}, planner::logical_plan::LogicalPlan, provenance::revert::RevertMode};
 
 /// An agent-session statement with every name resolved.
 ///
@@ -32,6 +32,11 @@ pub enum BoundAgentStmt {
     SelectAsOf {
         branch: BranchId,
         stmt: Stmt,
+    },
+    /// `SIMULATE ...` — K candidate branches forked off `base`, scored, the winners admitted.
+    Simulate {
+        base: BranchId,
+        plan: SimulationPlan,
     },
 }
 
@@ -187,7 +192,13 @@ impl<'a> Binder<'a> {
             | Stmt::Delete { .. }
             | Stmt::Update { .. }
             | Stmt::CreateIndex { .. }
+            | Stmt::CreateFullTextIndex { .. }
+            // B8's `SEARCH` belongs in this group rather than with SELECT: it is its own access
+            // path with its own bound, executed directly, so there is no logical plan to build and
+            // nothing for the optimizer to choose between.
+            | Stmt::Search { .. }
             | Stmt::DropTable { .. }
+            | Stmt::AlterTable { .. }
             | Stmt::CreateTable { .. } => Err(FerroError::Bind(
                 "DML and DDL are applied directly by the executor and have no logical plan; \
                  Binder::bind takes SELECT".into(),
@@ -210,7 +221,8 @@ impl<'a> Binder<'a> {
             | Stmt::Diff { .. }
             | Stmt::Merge { .. }
             | Stmt::Abandon { .. }
-            | Stmt::RevertMerge { .. } => Err(FerroError::Bind(
+            | Stmt::RevertMerge { .. }
+            | Stmt::Simulate { .. } => Err(FerroError::Bind(
                 "agent-session statements are bound by Binder::bind_agent, not into a plan".into(),
             )),
         }
@@ -248,27 +260,7 @@ impl<'a> Binder<'a> {
                         return Err(FerroError::Bind("run id must not be empty".into()));
                     }
                 }
-                // `name/version`; a bare name leaves the version half unspecified rather than
-                // inventing one. An empty MODEL is refused outright — an attribution that reads
-                // as blank is worse than one that says it was never declared.
-                let model = match model {
-                    Some(m) if m.trim().is_empty() => {
-                        return Err(FerroError::Bind("model must not be empty".into()))
-                    }
-                    Some(m) => Some(match m.split_once('/') {
-                        Some((n, v)) if !n.trim().is_empty() && !v.trim().is_empty() => {
-                            (n.to_string(), v.to_string())
-                        }
-                        Some(_) => {
-                            return Err(FerroError::Bind(format!(
-                                "model '{}' must be 'name/version' with both halves present",
-                                m
-                            )))
-                        }
-                        None => (m.clone(), "unspecified".to_string()),
-                    }),
-                    None => None,
-                };
+                let model = Binder::bind_model(model)?;
                 Ok(BoundAgentStmt::BeginAgentSession {
                     agent_id: agent.clone(),
                     run_id: run.clone(),
@@ -307,11 +299,101 @@ impl<'a> Binder<'a> {
                 self.bind_select(plain, Vec::new(), columns.clone(), where_clause.clone())?;
                 Ok(BoundAgentStmt::SelectAsOf { branch, stmt: stmt.clone() })
             }
+            Stmt::Simulate { agent, run, model, candidates, assertions, admit } => {
+                if agent.trim().is_empty() {
+                    return Err(FerroError::Bind("agent id must not be empty".into()));
+                }
+                if let Some(r) = run {
+                    if r.trim().is_empty() {
+                        return Err(FerroError::Bind("run id must not be empty".into()));
+                    }
+                }
+                // **Refused inside an open agent session, deliberately.** A candidate is published
+                // by merging it, and a merge applies its rows to the shared tables whatever branch
+                // it names as its parent. Forking the candidates off an open session's branch would
+                // therefore publish them past that session rather than into it, which is not what
+                // anyone writing this would mean. Trunk is the only base with honest semantics
+                // today, so the other case refuses instead of doing something surprising.
+                if current.is_some() {
+                    return Err(FerroError::Bind(
+                        "SIMULATE cannot run inside an agent session: its candidates fork off the \
+                         trunk, and merging one publishes to the shared tables rather than into \
+                         the enclosing session's branch. MERGE or ABANDON this session first."
+                            .into(),
+                    ));
+                }
+                let mut plan = SimulationPlan::new(agent.clone());
+                plan.run_id = run.clone();
+                plan.model = Binder::bind_model(model)?;
+                plan.admit = match admit {
+                    AdmitSpec::All => AdmitPolicy::All,
+                    AdmitSpec::AtMost(n) => AdmitPolicy::AtMost(*n),
+                };
+                for (name, body) in candidates {
+                    for stmt in body {
+                        // The runtime refuses anything else too, but it does so one candidate into
+                        // a simulation that has already forked K branches. Refusing here costs
+                        // nothing and names the candidate.
+                        if !matches!(
+                            stmt,
+                            Stmt::Select { .. }
+                                | Stmt::Insert { .. }
+                                | Stmt::Update { .. }
+                                | Stmt::Delete { .. }
+                        ) {
+                            return Err(FerroError::Bind(format!(
+                                "candidate '{}' contains a statement that cannot run on a branch: \
+                                 only SELECT / INSERT / UPDATE / DELETE do",
+                                name
+                            )));
+                        }
+                    }
+                    plan.candidates.push(Candidate { name: name.clone(), body: body.clone() });
+                }
+                for (table, predicate) in assertions {
+                    // Bind the predicate against the asserted table now, so an unknown column is a
+                    // bind error rather than an unevaluable assertion discovered at admission.
+                    let entry = self.catalog.get_table(table).ok_or_else(|| {
+                        FerroError::Bind(format!("unknown table in ASSERT ON: {}", table))
+                    })?;
+                    let mut scope = Scope::new();
+                    scope.add_table(table, &entry.schema)?;
+                    self.bind_expr(predicate.clone(), &scope)?;
+                    plan.assertions.push(Assertion::new(table.clone(), predicate.clone()));
+                }
+                Ok(BoundAgentStmt::Simulate { base: BranchId::TRUNK, plan })
+            }
             other => Err(FerroError::Bind(format!(
                 "not an agent-session statement: {:?}",
                 other
             ))),
         }
+    }
+
+    /// `MODEL 'name/version'`, split into its halves.
+    ///
+    /// A bare name leaves the version half unspecified rather than inventing one. An empty MODEL is
+    /// refused outright — an attribution that reads as blank is worse than one that says it was
+    /// never declared. Shared by `BEGIN AGENT SESSION` and `SIMULATE` so the two cannot drift.
+    fn bind_model(model: &Option<String>) -> Result<Option<(String, String)>, FerroError> {
+        Ok(match model {
+            Some(m) if m.trim().is_empty() => {
+                return Err(FerroError::Bind("model must not be empty".into()))
+            }
+            Some(m) => Some(match m.split_once('/') {
+                Some((n, v)) if !n.trim().is_empty() && !v.trim().is_empty() => {
+                    (n.to_string(), v.to_string())
+                }
+                Some(_) => {
+                    return Err(FerroError::Bind(format!(
+                        "model '{}' must be 'name/version' with both halves present",
+                        m
+                    )))
+                }
+                None => (m.clone(), "unspecified".to_string()),
+            }),
+            None => None,
+        })
     }
 
     // SELECT: build scope from FROM/JOIN -> filter -> projection
@@ -836,6 +918,8 @@ mod tests {
             "UPDATE users SET name = 'b' WHERE id = 1;",
             "CREATE TABLE t (id INTEGER NOT NULL);",
             "CREATE INDEX ix ON users(id);",
+            "CREATE FULLTEXT INDEX fx ON users(name);",
+            "SEARCH users (name) FOR 'a';",
             "BEGIN;",
             "COMMIT;",
             "ROLLBACK;",

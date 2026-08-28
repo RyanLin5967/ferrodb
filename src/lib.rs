@@ -18,3 +18,4 @@ pub mod tel;
 pub mod pgwire;
 pub mod provenance;
 pub mod replication;
+pub mod consensus;

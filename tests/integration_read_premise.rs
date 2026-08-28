@@ -150,6 +150,14 @@ fn a_branch_that_read_a_row_another_branch_then_changed_is_held() {
         reason.contains("read-premise") && reason.contains("changed in the base"),
         "the reason does not name what actually happened: {reason}"
     );
+    // The anti-vacuity half of the honesty check below: B read exactly one row, and that row IS in
+    // the runtime's versions map by the time B merges, so the gate really did verify every premise
+    // and is entitled to say so. If this ever reads `heuristic`, the downgrade added for
+    // unverifiable premises has become unconditional and the status stops discriminating.
+    assert!(
+        reason.contains("sound"),
+        "every premise here was verifiable, so the gate should claim exactness: {reason}"
+    );
 
     // Quarantine, not rejection: the branch is held, and the record still reports itself readable.
     // That is the property that separates the two — a rejected branch's work is gone, a held branch's
@@ -201,4 +209,55 @@ fn two_branches_reading_different_rows_both_merge() {
         "B was quarantined with no stale read: {:?}",
         db.runtime.quarantine_reason(b_branch)
     );
+}
+
+/// **A read of a row no merge published is recorded as version 0 — the fact the gate's soundness
+/// claim rests on.**
+///
+/// `AgentRuntime`'s `versions` map is written only by `record_applied`, so it holds merge-published
+/// rows and nothing else. That raises the question a fresh-context reader of B1's code asked: what
+/// happens to a read whose row has no entry there? The answer is that it cannot be a read of a real
+/// published version, because such a read is recorded with `begin_ts == 0` — which is what this pins,
+/// through the gate's own reason string ("read version 0, base now 1").
+///
+/// So `None` in that comparison means "unpublished at read time", never "a version I verified and
+/// have since lost". Absence and unchanged are still separated into their own match arms in
+/// `runtime.rs`, but that arm is unreachable today and is documented there as defence for the day
+/// something starts REMOVING from `versions` — a `DROP TABLE` purge is the obvious candidate, and
+/// B9's `forget_table` already does exactly that for `row_author` while leaving `versions` alone.
+///
+/// This is the same treatment E70 gave `handle_underflow`: measure that the case cannot fire, say why
+/// in the place a reader will look, and test the fact that makes it unreachable rather than mocking up
+/// the state.
+#[test]
+fn a_read_of_an_unpublished_row_is_recorded_as_version_zero() {
+    let mut db = Db::new();
+    db.seed();
+
+    // Row 1 is inserted by ordinary SQL, so it is in the heap and NOT in the versions map.
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'a' RUN 'r_a';", &mut a);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
+
+    let mut b = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'b' RUN 'r_b';", &mut b);
+    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut b);
+    let b_branch = b.agent.as_ref().unwrap().branch;
+
+    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
+    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut b);
+
+    db.ok("MERGE;", &mut a);
+    db.ok("MERGE;", &mut b);
+
+    let reason = db.runtime.quarantine_reason(b_branch).unwrap_or_default();
+    assert!(
+        reason.contains("read version 0"),
+        "B read row 1 before any merge published it, so the retained premise must be version 0. If \
+         this now names a non-zero version, reads of unpublished rows have started carrying real \
+         timestamps and the unreachable arm in runtime.rs has become reachable: {reason}"
+    );
+    // And the gate is entitled to call that sound: a zero premise plus a present entry is a
+    // comparison it fully performed.
+    assert!(reason.contains("sound"), "the gate should claim exactness here: {reason}");
 }

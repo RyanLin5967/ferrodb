@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::buffer::buffer_pool::BufferPoolManager;
-use crate::catalog::catalog_page::{CatalogPage, IndexInfo, TableEntry};
+use crate::catalog::catalog_page::{CatalogPage, FullTextIndexInfo, IndexInfo, TableEntry};
 use crate::catalog::stats::{ColumnStats, TableStats};
 use crate::error::FerroError;
 use crate::storage::heap_file_manager::HeapFileManager;
 use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
-use crate::catalog::column::Value;
+use crate::catalog::column::{DataType, Value};
+use crate::storage::index_fulltext::{indexed_text, post_tokens};
 use std::sync::atomic::Ordering;
 use crate::catalog::schema::Schema;
 
@@ -45,6 +46,23 @@ impl Catalog {
                 "table '{name}' already exists; DROP TABLE {name} first, or choose another name"
             )));
         }
+        // B9: a table may not take a system view's name. Checked here — in `catalog`, because
+        // `Catalog::tables` is where every path that creates a table converges, and the parser is
+        // not; a guard in the parser is walked around by any caller that builds a `CreateTable`
+        // without going through SQL text.
+        //
+        // The state being made unrepresentable: `executor::run` recognises a view name before any
+        // other route, so a table called `ferro_quarantine` would accept writes and answer every
+        // read from the view. Rows in, nothing out, no error anywhere.
+        //
+        // **Ordered AFTER the already-exists check, and that order is a correctness fix.** On a
+        // database written before these views existed, a table CAN already hold one of these names
+        // (`Catalog::load` rebuilds `tables` from the catalog pages and never comes through here).
+        // Refusing such a `CREATE TABLE` with the view message told the reader that every SELECT
+        // would answer from the view and the table's rows were unreachable — and for that database
+        // both halves are false, because `system_views::view_for` yields to the real table. The
+        // honest answer there is the one above: the table already exists.
+        crate::catalog::system_views::reject_view_name_collision(&name)?;
         let hfm = HeapFileManager::new(self.buffer_pool.clone())?;
         let primary = BPlusTreeManager::<Value, RecordId>::create(self.buffer_pool.clone())?;
         let tt_heap = HeapFileManager::new(self.buffer_pool.clone())?;
@@ -54,7 +72,8 @@ impl Catalog {
             schema,
             primary_index_root: primary.root_page_id.load(Ordering::Relaxed),
             time_travel_root: tt_heap.first_directory_page_id, 
-            indexes: Vec::new()
+            indexes: Vec::new(),
+            fulltext_indexes: Vec::new()
         };
         self.tables.insert(name, entry);
         self.persist()?;
@@ -129,6 +148,66 @@ impl Catalog {
         Ok(())
     }
 
+    /// B8 — create a full-text index on one `VARCHAR` column and backfill it from the heap.
+    ///
+    /// Same shape as `create_index` above, and deliberately so: the tree is the same type, the
+    /// backfill is the same scan, and the only differences are the three that matter.
+    ///
+    /// 1. **The column must be `VARCHAR`.** Refused, not coerced. Tokenizing an `Integer` would
+    ///    mean picking a rendering for it, and every choice there is a silent one — so the
+    ///    maintenance paths are allowed to assume `Varchar | Null` and report anything else as a
+    ///    bug in this refusal (`index_fulltext::indexed_text`).
+    /// 2. **The backfill de-duplicates.** `create_index`'s does not, and gets away with it because
+    ///    the main heap holds one live version per primary key. That is not enough here: `DELETE`
+    ///    stamps `end_ts` and leaves the slot, so `DELETE FROM t WHERE id = 4` followed by
+    ///    `INSERT INTO t VALUES (4, ...)` leaves **two** slots with pk 4 in the same heap. Building
+    ///    an index over that emits every token they share twice, `insert_entry` appends rather than
+    ///    overwrites, and the search then returns that row twice. `post_tokens` probes first.
+    /// 3. **It lands in `fulltext_indexes`**, not `indexes` — see `FullTextIndexInfo`.
+    pub fn create_fulltext_index(&mut self, table: &str, column: &str) -> Result<(), FerroError> {
+        let (schema, first_dir_page_id, col_index) = {
+            let entry = self.tables.get(table).ok_or_else(|| self.unknown_table(table))?;
+
+            if entry.fulltext_indexes.iter().any(|ind| ind.column_name == column) {
+                return Err(FerroError::IndexAlreadyExists);
+            }
+            let col_index = entry.schema.columns.iter()
+                .position(|c| c.name == column)
+                .ok_or_else(|| FerroError::Bind(format!(
+                    "cannot index '{table}.{column}': no such column. '{table}' has: {}",
+                    entry.schema.columns.iter()
+                        .map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                )))?;
+            if !matches!(entry.schema.columns[col_index].data_type, DataType::Varchar(_)) {
+                return Err(FerroError::Bind(format!(
+                    "cannot build a full-text index on '{table}.{column}': it is {:?}, and only \
+                     VARCHAR columns have text to tokenize",
+                    entry.schema.columns[col_index].data_type
+                )));
+            }
+
+            (entry.schema.clone(), entry.first_directory_page_id, col_index)
+        };
+        let ft_tree = BPlusTreeManager::<(Value, Value), ()>::create(self.buffer_pool.clone())?;
+        let new_root_id = ft_tree.root_page_id.load(Ordering::Relaxed);
+
+        let hfm = HeapFileManager::open(first_dir_page_id, self.buffer_pool.clone());
+        for item in hfm.scan() {
+            let (_, tuple) = item?;
+            let values = tuple.deserialize(&schema)?;
+            let primary_key = values[0].clone();   // first column = primary key
+            if let Some(text) = indexed_text(&values[col_index])? {
+                post_tokens(&ft_tree, text, &primary_key)?;
+            }
+        }
+
+        let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
+        entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
+
+        self.persist()?;
+        Ok(())
+    }
+
     /// Remove a table and give back every page it allocated.
     ///
     /// **E69 found three gaps in this, all of them because nothing had ever called it.** It has existed
@@ -152,7 +231,12 @@ impl Catalog {
                 entry.first_directory_page_id,
                 entry.time_travel_root,
                 entry.primary_index_root,
-                entry.indexes.iter().map(|i| i.root_page_id).collect::<Vec<_>>(),
+                // B8: the full-text roots go in the SAME list because the trees are the same type,
+                // and leaving them out would leak one tree per full-text index on every DROP TABLE
+                // — the E69 gap, re-opened by a second index list.
+                entry.indexes.iter().map(|i| i.root_page_id)
+                    .chain(entry.fulltext_indexes.iter().map(|i| i.root_page_id))
+                    .collect::<Vec<_>>(),
             )
         };
         HeapFileManager::open(heap_dir, self.buffer_pool.clone()).free_all()?;
@@ -182,9 +266,28 @@ impl Catalog {
         Ok(())
     }
 
+    /// B8 — the `update_index_root` of the full-text list. Separate because the two lists are
+    /// separate: resolving a full-text column name inside `indexes` would either miss (and leave a
+    /// split tree's new root unrecorded, losing every posting added since) or hit a same-named
+    /// B-tree index and overwrite ITS root with a token tree's.
+    pub fn update_fulltext_root(&mut self, table: &str, column: &str, new_root: u32) -> Result<(), FerroError> {
+        let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
+        entry.fulltext_indexes.iter_mut().find(|ind| ind.column_name == column).ok_or(FerroError::KeyNotFound)?.root_page_id = new_root;
+        self.persist()?;
+        Ok(())
+    }
+
     pub fn persist(&self) -> Result<(), FerroError> {
         let mut curr_page_id = self.first_catalog_page_id;
-        let mut iter = self.tables.values().peekable();
+        // **By name, not by `HashMap` order.** Which table lands on which catalog page, and therefore
+        // which bytes are written where, used to depend on a per-process hash seed: `persist()` on the
+        // same two tables produced a different on-disk layout on every run. Nothing can rely on the
+        // old order because the old order was random, so sorting is safe; what it buys is a catalog
+        // whose image is a function of its contents, which is what makes a crash during `persist`
+        // reproducible at all.
+        let mut sorted: Vec<&TableEntry> = self.tables.values().collect();
+        sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let mut iter = sorted.into_iter().peekable();
 
         loop {
             let frame_i = self.buffer_pool.fetch_page(curr_page_id)?;
@@ -210,6 +313,19 @@ impl Catalog {
             if has_more {
                 if page.next_catalog_page == 0 {
                     let new_id = self.buffer_pool.new_page()?;
+                    // Stamp it as an empty catalog page before linking it. `new_page` hands back a
+                    // zero-filled page, and the next turn of this loop deserializes whatever is at
+                    // `next_catalog_page` — so an unstamped page arrives at `CatalogPage::deserialize`
+                    // with format byte 0. That used to parse as an accidentally-empty page because
+                    // byte 0 was never read; now that the byte is the format stamp (B8), the choice
+                    // is between initialising the page here and teaching the format allowlist to
+                    // accept all-zeroes, which would let a genuinely corrupt page through.
+                    let frame_i = self.buffer_pool.fetch_page(new_id)?;
+                    {
+                        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+                        frame.data = CatalogPage::new(new_id).serialize()?;
+                    }
+                    self.buffer_pool.unpin_page(new_id, true);
                     page.next_catalog_page = new_id;
                 }
             } else {
@@ -343,7 +459,7 @@ mod tests {
         let mut catalog = setup_catalog();
         assert_eq!(catalog.first_catalog_page_id, 1);
         
-        catalog.tables.insert("test_table".to_string(), TableEntry { name: "test_table".to_string(), first_directory_page_id: 2, primary_index_root: 3, schema: create_test_schema(), indexes: vec![] , time_travel_root: 1});
+        catalog.tables.insert("test_table".to_string(), TableEntry { name: "test_table".to_string(), first_directory_page_id: 2, primary_index_root: 3, schema: create_test_schema(), indexes: vec![], fulltext_indexes: vec![], time_travel_root: 1});
         catalog.persist().unwrap();
         let opened_catalog = Catalog::open(catalog.buffer_pool, catalog.first_catalog_page_id).unwrap();
         assert_eq!(opened_catalog.tables.len(), 1);
@@ -482,7 +598,7 @@ mod tests {
         for i in 0..200 {
             catalog.tables.insert(
                 format!("table_{}", i),
-                TableEntry { name: format!("table_{}", i), first_directory_page_id: i, primary_index_root: i + 1, schema: create_test_schema(), indexes: vec![], time_travel_root: 1 }
+                TableEntry { name: format!("table_{}", i), first_directory_page_id: i, primary_index_root: i + 1, schema: create_test_schema(), indexes: vec![], fulltext_indexes: vec![], time_travel_root: 1 }
             );
         }
         catalog.persist().unwrap();

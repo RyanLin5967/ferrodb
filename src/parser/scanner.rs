@@ -11,9 +11,24 @@ pub enum TokenType {
     And, Not, False, Null, Or, True, 
     Create, Table, Insert, Into, Values, Select, From, Where, Update, Set, Delete, Index, On, As, Join, Outer, Analyze, Explain, Drop,
     Begin, Commit, Rollback,
+    // B11: the only new *reserved* word column-level DDL needs. `ADD`, `COLUMN`, `RENAME`, `TO`
+    // and `TYPE` are matched by lexeme in the parser instead — the same idiom `parse_select`
+    // already uses for `INNER`/`LEFT`/`RIGHT`/`FULL` — so none of them stops being a usable
+    // column name. `ALTER` has to be a token because it is what selects the statement.
+    Alter,
+
+    // B8 — full-text retrieval: `CREATE FULLTEXT INDEX ... ` and `SEARCH t (col) FOR '...' TOP k`
+    Fulltext, Search, For, Top,
 
     // agent-isolation surface (DESIGN.md section 5)
     Agent, Session, Run, Model, Diff, Merge, Abandon, Of, Branch, Revert, Cascade,
+    // SIMULATE: K candidate branches off one base, scored, the winners admitted.
+    //
+    // `ALL` is deliberately NOT reserved here even though `ADMIT ALL` reads like it should be.
+    // `all` is a plausible column name and reserving a word costs every user of it forever, so
+    // the parser matches it as an identifier in the one position it can appear. The four below
+    // are rare enough as identifiers to be worth the reservation.
+    Simulate, Candidate, Assert, Admit,
 
     TypeInt, TypeVarchar, TypeFloat, TypeBoolean, TypeNull,
     // wide numeric and temporal types
@@ -186,6 +201,9 @@ impl Scanner {
             // E69: `DROP` is a real keyword now. It was an ordinary identifier, which is why
             // `DROP TABLE t` reported "expected a statement" - the parser never saw a DROP at all.
             "DROP" => TokenType::Drop,
+            // B11: was an ordinary identifier, and `unsupported_keyword` refused it in statement
+            // position. It is a real keyword now that `ALTER TABLE` is implemented.
+            "ALTER" => TokenType::Alter,
             "TABLE" => TokenType::Table,
             "AND" => TokenType::And,
             "OR" => TokenType::Or,
@@ -226,6 +244,17 @@ impl Scanner {
             "BRANCH" => TokenType::Branch,
             "REVERT" => TokenType::Revert,
             "CASCADE" => TokenType::Cascade,
+            "SIMULATE" => TokenType::Simulate,
+            "CANDIDATE" => TokenType::Candidate,
+            "ASSERT" => TokenType::Assert,
+            "ADMIT" => TokenType::Admit,
+            // B8. `TOP` is a keyword only because `MATCH`-style retrieval needs a bound and this
+            // SQL surface has no LIMIT; `parser::unsupported_keyword` still refuses LIMIT itself,
+            // because a general LIMIT is a different feature from a retrieval operator's own bound.
+            "FULLTEXT" => TokenType::Fulltext,
+            "SEARCH" => TokenType::Search,
+            "FOR" => TokenType::For,
+            "TOP" => TokenType::Top,
             _ => TokenType::Identifier
         };
         self.add_token(token_type);
@@ -293,6 +322,31 @@ mod tests {
         assert_eq!(toks, vec![Select, Star, From, Identifier, As, Of, Branch, Identifier, Semicolon, Eof]);
         let toks = scan("REVERT MERGE m_44 CASCADE;");
         assert_eq!(toks, vec![Revert, Merge, Identifier, Cascade, Semicolon, Eof]);
+    }
+
+    /// B8. Breaking shape: `FULLTEXT`/`SEARCH`/`FOR`/`TOP` left as `Identifier`. The parser would
+    /// then read `SEARCH docs (body) FOR 'x';` as a statement starting with a bare name and answer
+    /// "expected a statement" — the same failure E69 hit with `DROP`, where the keyword was missing
+    /// from this table and the parser never saw the statement at all.
+    #[test]
+    fn test_fulltext_keywords() {
+        use TokenType::*;
+        let toks = scan("CREATE FULLTEXT INDEX ix ON docs (body);");
+        assert_eq!(toks, vec![
+            Create, Fulltext, Index, Identifier, On, Identifier, LeftParen, Identifier,
+            RightParen, Semicolon, Eof
+        ]);
+        let toks = scan("SEARCH docs (body) FOR 'wireless charger' TOP 5;");
+        assert_eq!(toks, vec![
+            Search, Identifier, LeftParen, Identifier, RightParen, For, String, Top, Number,
+            Semicolon, Eof
+        ]);
+        // case-insensitive, like every other keyword here
+        let toks = scan("search docs (body) for 'x' top 2;");
+        assert_eq!(toks, vec![
+            Search, Identifier, LeftParen, Identifier, RightParen, For, String, Top, Number,
+            Semicolon, Eof
+        ]);
     }
 
     #[test]

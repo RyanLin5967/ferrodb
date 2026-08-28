@@ -98,6 +98,72 @@ jobs:
         working-directory: cdc-consumer
         run: go mod download
 
+      # THE POSTGRES WIRE DRIVERS. `tests/integration_pgwire.rs` checks this server against two
+      # INDEPENDENT real clients, and it does so because a wire protocol verified with its own
+      # client agrees with itself about any shared misreading - the same argument the Go consumer
+      # and the duckdb CLI are here for.
+      #
+      # Those tests REFUSE when a driver is missing rather than skipping, which is correct and is
+      # why this step exists: before it, `cargo test` failed on all three runners with
+      # "ModuleNotFoundError: No module named 'asyncpg'". The tests were right and the workflow was
+      # incomplete - they were added after this file last changed, and nothing here had ever
+      # installed what they need.
+      #
+      # Two drivers, not one, and they are not interchangeable: asyncpg speaks the EXTENDED protocol
+      # with binary formats, pg8000 speaks it with text, and B12's field-type work is only pinned
+      # because both are checked. Dropping either would silently narrow the claim.
+      - name: Install the Postgres wire drivers (asyncpg, pg8000)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A VENV, not `pip install --user`. The first version of this step used --user and failed
+          # on the macOS runner with `error: externally-managed-environment` (PEP 668): that image's
+          # python3 is managed by Homebrew and refuses to have packages installed into it.
+          #
+          # The obvious escape is --break-system-packages. Not used: it works by switching off a
+          # safety mechanism, and the name is accurate about what it does. A venv gets the same
+          # result by not fighting the system installer at all, and behaves identically on all three
+          # runners rather than needing a per-platform branch.
+          #
+          # The venv's bin directory goes on GITHUB_PATH because the tests shell out to a BARE
+          # `python3` (`Command::new("python3")` in tests/integration_pgwire.rs), so what matters is
+          # which python3 later steps resolve — not which interpreter ran pip here.
+          python3 -m venv "$RUNNER_TEMP/pgdrivers"
+          # Windows venvs put executables in Scripts/, every other platform in bin/.
+          if [ -d "$RUNNER_TEMP/pgdrivers/Scripts" ]; then
+            VBIN="$RUNNER_TEMP/pgdrivers/Scripts"
+          else
+            VBIN="$RUNNER_TEMP/pgdrivers/bin"
+          fi
+          "$VBIN/python" -m pip install --upgrade pip
+          "$VBIN/python" -m pip install asyncpg pg8000
+          # A Windows venv creates python.exe but not always python3.exe, and the tests ask for
+          # `python3` by name. Provide it rather than discover the gap as a "program not found" three
+          # steps later.
+          if [ ! -e "$VBIN/python3" ] && [ ! -e "$VBIN/python3.exe" ]; then
+            cp "$VBIN/python.exe" "$VBIN/python3.exe" 2>/dev/null \
+              || ln -s "$VBIN/python" "$VBIN/python3" 2>/dev/null \
+              || { echo "cannot provide a python3 in $VBIN" >&2; exit 1; }
+          fi
+          echo "$VBIN" >> "$GITHUB_PATH"
+
+      # Separate step, so the assertion runs against the PATH the TESTS will see. GITHUB_PATH only
+      # takes effect for SUBSEQUENT steps, so asserting inside the step above would check the old
+      # PATH and pass while the tests still failed - which is the exact shape of check this file
+      # keeps warning about.
+      - name: Verify the wire drivers are importable by the python3 the tests invoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "python3 is $(command -v python3)"
+          for m in asyncpg pg8000; do
+            python3 -c "import $m; print('$m ok')" || {
+              echo "$m is not importable by the python3 on PATH." >&2
+              python3 -c "import sys; print('\n'.join(sys.path))" >&2
+              exit 1
+            }
+          done
+
       # sqlite3 ships on the ubuntu and macos runners; Windows needs it installed.
       - name: Install sqlite3 (Windows)
         if: runner.os == 'Windows'

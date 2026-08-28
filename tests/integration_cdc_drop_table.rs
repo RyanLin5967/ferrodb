@@ -6,7 +6,9 @@
 //! deserialises, drives the retained-record logic in `wal::txn`, and `replication::logical` turns it
 //! into a `DROP_TABLE` event. The Go consumer validates it, the SQLite sink runs
 //! `DROP TABLE IF EXISTS`, the DuckDB sink has its own branch, and the README states that
-//! "`CREATE_TABLE` and `DROP_TABLE` are" carried while `ALTER TABLE` is not.
+//! "`CREATE_TABLE` and `DROP_TABLE` are" carried while `ALTER TABLE` is not. (B11 has since made
+//! `ALTER TABLE` carried too, in three column-level ops; the sentence quoted here is the one that
+//! was false at the time, and it is left as quoted because it is what this file is about.)
 //!
 //! **Nothing could ever write one.** `DdlOp::CreateTable` was the only op any code path logged, because
 //! `DROP TABLE` was not in the SQL surface at all — E67 measured it as
@@ -35,6 +37,7 @@ use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
 use ferrodb::replication::jsonl::write_feed;
+use ferrodb::replication::publication::Publication;
 use ferrodb::replication::logical::{ChangeOp, LogicalDecoder, SchemaChange};
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
@@ -289,7 +292,7 @@ fn feed_file(dir: &Path) -> PathBuf {
     let out = d.decode();
     let path = dir.join("feed.jsonl");
     let mut buf: Vec<u8> = Vec::new();
-    let n = write_feed(&out.events, &mut buf).expect("write feed");
+    let n = write_feed(&out.events, &Publication::unrestricted(), &mut buf).expect("write feed");
     assert!(n > 0, "the feed is empty; everything downstream would be vacuous");
     assert!(
         String::from_utf8_lossy(&buf).contains("\"op\":\"DROP_TABLE\""),

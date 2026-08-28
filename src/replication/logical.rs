@@ -65,14 +65,15 @@
 //!   needs a base backup, exactly as a replica does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::{Column, DataType, Value};
 use crate::catalog::schema::Schema;
 use crate::error::FerroError;
+use crate::provenance::RunEntity;
 use crate::storage::tuple::Tuple;
-use crate::wal::log::{DdlOp, RecKind, WalManager};
+use crate::wal::log::{ColumnAlteration, DdlOp, RecKind, WalManager};
 
 /// What happened to one row.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,12 +105,27 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
+    /// Whether this event is a **write some run performed** — the events that are supposed to name
+    /// a writer.
+    ///
+    /// `Insert`/`Update`/`Delete` are. `Read` is a snapshot observation: the row existed before the
+    /// feed began and the snapshot reader has no idea who wrote it, so counting one as unattributed
+    /// would make every backfill look like an attribution failure. `Schema` is a declaration about a
+    /// table, not a change to a row. The distinction is what keeps the unattributed count meaning
+    /// "a row shipped with no author" rather than "something in the feed lacks a writer field".
+    pub fn is_write(&self) -> bool {
+        matches!(self, ChangeOp::Insert { .. } | ChangeOp::Update { .. } | ChangeOp::Delete { .. })
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             ChangeOp::Read { .. } => "READ",
             ChangeOp::Schema { change, .. } => match change {
                 SchemaChange::CreateTable => "CREATE_TABLE",
                 SchemaChange::DropTable => "DROP_TABLE",
+                SchemaChange::AddColumn { .. } => "ADD_COLUMN",
+                SchemaChange::RenameColumn { .. } => "RENAME_COLUMN",
+                SchemaChange::RetypeColumn { .. } => "ALTER_COLUMN_TYPE",
             },
             ChangeOp::Insert { .. } => "INSERT",
             ChangeOp::Update { .. } => "UPDATE",
@@ -119,10 +135,46 @@ impl ChangeOp {
 }
 
 /// Which schema change a `Schema` event describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # Why the three column-level ones are separate ops rather than one `ALTER_TABLE` — B11
+///
+/// Every `Schema` event carries the table's full shape after the change, so a consumer *could*
+/// reconcile positionally from `columns` alone and never look at which change it was. It must not,
+/// and this is the reason the alteration is named rather than left to be inferred: from the shape
+/// alone, `RENAME COLUMN qty TO quantity` is indistinguishable from dropping `qty` and adding
+/// `quantity`. A sink that reconciles by diffing shapes applies the second reading and the
+/// column's data is gone. The change has to say which it was.
+///
+/// Given that it must be named, it is named in `op` rather than buried in the payload, because
+/// `op` is what the format tells a consumer to branch on and what the independent validator keys
+/// its rules off: an `ADD_COLUMN` must name a column that IS in the new shape, a `RENAME_COLUMN`
+/// must name one that is not and one that is, and those are different checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChange {
     CreateTable,
     DropTable,
+    /// A column appended at the end of the table. Its type and nullability are in the event's
+    /// `columns`, which is the full new shape.
+    AddColumn { column: String },
+    /// A column renamed. `to` is in the new shape; `from` is not, which is the whole point.
+    RenameColumn { from: String, to: String },
+    /// A column's type changed. Both spellings are given, in the feed's own type vocabulary
+    /// ([`sql_type_of`]), so a consumer can decide whether its destination needs a conversion
+    /// without having to remember what the column used to be.
+    RetypeColumn { column: String, from: String, to: String },
+}
+
+impl SchemaChange {
+    /// True for the two whole-table changes, false for the column-level ones.
+    ///
+    /// The distinction a consumer needs is not "is this about shape" — all five are — but
+    /// **"is this a declaration or is it news"**. `CREATE_TABLE` is re-emitted at every checkpoint
+    /// and must be idempotent at the consumer; `DROP_TABLE` likewise disappears from the retained
+    /// set. The column-level three are delivered exactly once, in log order, at the position the
+    /// DDL occupied, and a consumer that re-applies one has renamed a column twice.
+    pub fn is_declaration(&self) -> bool {
+        matches!(self, SchemaChange::CreateTable | SchemaChange::DropTable)
+    }
 }
 
 /// One column, as the feed describes it to a consumer that must recreate the table.
@@ -165,15 +217,12 @@ pub struct ColumnSpec {
 /// one definition a test can enumerate, and so that adding a `DataType` variant fails to compile
 /// here instead of silently acquiring a spelling somewhere downstream.
 pub fn sql_type_of(ty: &DataType) -> String {
-    match ty {
-        DataType::Integer => "INTEGER".to_string(),
-        DataType::Float => "FLOAT".to_string(),
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Varchar(n) => format!("VARCHAR({n})"),
-        DataType::BigInt => "BIGINT".to_string(),
-        DataType::Decimal => "DECIMAL".to_string(),
-        DataType::Timestamp => "TIMESTAMP".to_string(),
-    }
+    // Delegated to `Display for DataType` rather than matched a second time here. B11 needed the
+    // same spellings in `tel::schema_merge` (a schema conflict hands the agent back a predicate
+    // reading `typeof(inventory.qty) = INTEGER`) and in `catalog::alter`'s refusals, and three
+    // matches over `DataType` is three chances for the feed and the error message to disagree
+    // about what a type is called. `sql_type_contract_is_exhaustive` still pins the mapping.
+    ty.to_string()
 }
 
 /// One row-level change, attributed to the transaction that committed it.
@@ -207,6 +256,22 @@ pub struct ChangeEvent {
     /// the names are per-table, not per-row, and a busy table produces a great many rows.
     pub columns: Arc<Vec<String>>,
     pub op: ChangeOp,
+    /// **Who wrote this change.**
+    ///
+    /// Attribution used to stop at the database boundary: the provenance store could say which run
+    /// wrote a version, and the moment that change left as a feed event the answer was gone. A
+    /// consumer holding a million rows from a model that has since been found to hallucinate prices
+    /// had no way to ask which of them came from it — the very question provenance exists to
+    /// answer, unanswerable one layer downstream.
+    ///
+    /// `None` is a real and legitimate value, not a placeholder: a transaction written by no agent
+    /// run has no writer to name. It is deliberately not defaulted to something plausible, and
+    /// commits that produce `None` for a row change are **counted** in
+    /// [`Decoded::unattributed_commits`] rather than assumed absent.
+    ///
+    /// `Arc` because a writer is per *run* and a run writes a great many rows — the same reason
+    /// `columns` is shared.
+    pub writer: Option<Arc<RunEntity>>,
 }
 
 /// The result of a decode, including what could **not** be decoded.
@@ -238,6 +303,22 @@ pub struct Decoded {
     /// Transactions still open when the scan ended. Their changes are **withheld, not lost** — a
     /// later decode covering their commit will emit them.
     pub open: BTreeSet<u64>,
+    /// Every run this range declared, by `prov_id`.
+    ///
+    /// Populated from the identity records in the log itself, so a decoder walking an archived log
+    /// can name its writers with no provenance store to consult — the same self-describing property
+    /// `schema_changes` gives for tables.
+    pub runs: BTreeMap<u32, RunEntity>,
+    /// Transactions whose row changes were emitted with **no writer**.
+    ///
+    /// Never assumed to be empty. A feed that ships rows attributed to nobody is not a feed with
+    /// nothing to report, and the difference is invisible from the events alone — every one of them
+    /// simply has `writer: null`. Counted for the same reason [`Decoded::undecodable`] is counted
+    /// rather than dropped: a caller that ignores this has chosen to, and has not been misled.
+    pub unattributed_commits: BTreeSet<u64>,
+    /// How many row changes those commits carried. The commits say how many actors are missing;
+    /// this says how much data shipped without one.
+    pub unattributed_events: usize,
     /// The earliest record belonging to any still-open transaction.
     ///
     /// A caller advancing a cursor MUST NOT go past this, or those records are stepped over and the
@@ -249,8 +330,17 @@ pub struct Decoded {
 
 impl Decoded {
     /// True when something was seen that did not become an event, for any reason.
+    ///
+    /// Deliberately says nothing about attribution: a database nobody runs agents against has no
+    /// writers to name, and folding that into "complete" would report every ordinary transaction as
+    /// a defect. Ask [`Decoded::fully_attributed`] for that question, which is a different one.
     pub fn is_complete(&self) -> bool {
         self.unresolved.is_empty() && self.undecodable.is_empty() && self.open.is_empty()
+    }
+
+    /// True when every row change emitted named the run that wrote it.
+    pub fn fully_attributed(&self) -> bool {
+        self.unattributed_commits.is_empty()
     }
 }
 
@@ -263,12 +353,83 @@ enum RowResult {
     Undecodable,
 }
 
+/// The DDL one log has taught this decoder, and which log that was.
+#[derive(Default)]
+struct Learned {
+    /// The log these LSNs refer to. `None` until the first decode.
+    log: Option<std::path::PathBuf>,
+    shapes: Vec<ShapeAt>,
+    /// **`shapes` is known-COMPLETE for `[base_lsn, covered_through)`.**
+    ///
+    /// Without this, the seed was a property of *the decoder's traversal* rather than of the log,
+    /// and that is a correctness bug, not an optimisation detail. `decode` seeds a range by
+    /// replaying the shapes it has walked past that sit below `from_lsn` — so a decoder asked only
+    /// for `[split, end)` had never walked an `ALTER` below `split`, never learned the column, and
+    /// dropped it from every row; while a decoder that happened to walk `[base, split)` first
+    /// emitted it. **Same log, same range, two different feeds**, and every cleanliness counter on
+    /// the wrong one read clean (`undecodable = 0`, `unresolved = 0`), so nothing downstream could
+    /// detect it. Two threads pumping one `Arc<FeedStreamer>` — a shape this module's own docs name
+    /// as supported — reached the same defect by call order instead of by argument, losing the
+    /// column in **40 of 40** trials.
+    ///
+    /// So the history stays a *cache*, but a cache with a coverage watermark: `decode` fills any
+    /// gap below `from_lsn` by scanning the log for DDL before it seeds, which makes the seed a
+    /// pure function of `(log, from_lsn)`. A cold decoder scans the prefix once and then agrees
+    /// with the warm one; a sequential pump loop has no gap to fill and scans nothing extra, so the
+    /// performance reason the history exists is preserved.
+    ///
+    /// Two invariants this must keep, both of which reopen a fixed defect if dropped: it is reset
+    /// to 0 whenever the log changes (an LSN means nothing across files — the A9 defect), and it is
+    /// clamped UP to `base_lsn` on truncation, because records below the floor are gone and can
+    /// never be scanned again.
+    covered_through: u64,
+}
+
+/// One shape a DDL record put into force, and where in the log it did so.
+///
+/// See [`LogicalDecoder::history`] for what this is for. `entry` is `None` for a `DROP TABLE`:
+/// from that LSN onwards the `dir_root` resolves to nothing again.
+#[derive(Clone)]
+struct ShapeAt {
+    lsn: u64,
+    dir_root: u32,
+    entry: Option<(String, Schema, Arc<Vec<String>>)>,
+    time_travel_root: Option<u32>,
+}
+
 /// Reads a WAL range and produces committed row-level changes.
 pub struct LogicalDecoder {
-    /// `dir_root` -> (table name, schema, column names).
+    /// `dir_root` -> (table name, schema, column names). The mapping the decoder was BUILT with —
+    /// a catalog snapshot, one hand-written table, or nothing. Never mutated; see `history`.
     tables: HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
     /// Time-travel heap roots. Records against these are MVCC's own bookkeeping.
     time_travel: BTreeSet<u32>,
+    /// **Every DDL this decoder has ever walked past, kept so a later call can seed from it — I20.**
+    ///
+    /// `decode` used to clone `tables`, evolve the clone as it walked, and drop it on return. That
+    /// is correct for one call spanning a whole log and wrong for every caller that walks the log in
+    /// pieces, which is what a server does: `FeedStreamer::pump` calls `decode` once per pump, so an
+    /// `ADD COLUMN` learned in pump *N* was forgotten by pump *N+1*, which re-seeded from the
+    /// constructor's snapshot. `Tuple::deserialize` against the narrower schema then ignored the
+    /// trailing bytes, so the added column's value was dropped from **every row for the remaining
+    /// life of the process** — silently, with `undecodable = 0` and no error. B11's own exit
+    /// criterion "a column added mid-stream reaches the destination" held only because its test
+    /// decodes the whole log in one call.
+    ///
+    /// Remembering the evolved map instead of the history would fix the pump and break a re-decode:
+    /// a range is legitimately walked more than once (at-least-once redelivery, and `pump`'s cursor
+    /// clamps BACK below the previous batch's end whenever a transaction is still open), and rows
+    /// that sit *below* an `ALTER` must still decode against the shape that was in force where they
+    /// sit. So what is kept is the DDL *with its LSN*, and a decode of `[from, to)` seeds itself by
+    /// replaying only the entries strictly below `from`. Decoding the same range twice therefore
+    /// produces the same answer both times, and decoding the next range forward carries the shape.
+    ///
+    /// **An LSN only means something within ONE log**, so the history is bound to the first log
+    /// this decoder walks and discarded if it is handed a different one. Nothing stops a caller
+    /// passing two `WalManager`s to one decoder — `decode` takes the log as an argument — and
+    /// without this a `DROP TABLE` in log A at an LSN below log B's range removed the table from
+    /// log B's feed. Found by an adversarial pass, not by reasoning about it.
+    history: Mutex<Learned>,
 }
 
 impl LogicalDecoder {
@@ -289,7 +450,7 @@ impl LogicalDecoder {
             );
             time_travel.insert(entry.time_travel_root);
         }
-        LogicalDecoder { tables, time_travel }
+        LogicalDecoder { tables, time_travel, history: Mutex::new(Learned::default()) }
     }
 
     /// Build a decoder for a single table, without a catalog.
@@ -308,7 +469,11 @@ impl LogicalDecoder {
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let mut tables = HashMap::new();
         tables.insert(dir_root, (name.to_string(), schema, Arc::new(columns)));
-        LogicalDecoder { tables, time_travel: BTreeSet::from([time_travel_root]) }
+        LogicalDecoder {
+            tables,
+            time_travel: BTreeSet::from([time_travel_root]),
+            history: Mutex::new(Learned::default()),
+        }
     }
 
     /// A decoder that knows nothing at all.
@@ -318,7 +483,11 @@ impl LogicalDecoder {
     /// That is the difference between a feed that needs a catalog handed to it out of band and one
     /// that is self-describing.
     pub fn blank() -> Self {
-        LogicalDecoder { tables: HashMap::new(), time_travel: BTreeSet::new() }
+        LogicalDecoder {
+            tables: HashMap::new(),
+            time_travel: BTreeSet::new(),
+            history: Mutex::new(Learned::default()),
+        }
     }
 
     /// Number of tables this decoder can resolve. A decoder that knows no tables would report every
@@ -352,6 +521,220 @@ impl LogicalDecoder {
         }
     }
 
+    /// Put one remembered DDL back into a mapping being seeded. The inverse of what the walk below
+    /// does when it meets the record itself, so the two cannot disagree about what a record means.
+    fn apply_shape(
+        tables: &mut HashMap<u32, (String, Schema, Arc<Vec<String>>)>,
+        time_travel: &mut BTreeSet<u32>,
+        shape: &ShapeAt,
+    ) {
+        match &shape.entry {
+            Some(entry) => {
+                tables.insert(shape.dir_root, entry.clone());
+            }
+            None => {
+                tables.remove(&shape.dir_root);
+            }
+        }
+        if let Some(root) = shape.time_travel_root {
+            time_travel.insert(root);
+        }
+    }
+
+    /// What one `Ddl` record does to the mapping, as a value, derived from the RECORD ALONE.
+    ///
+    /// This is the same shape the main walk remembers, and it must stay that way: it is what makes
+    /// a prefix scan and a full walk agree. It can be built without the evolving map because every
+    /// `Ddl` record carries the table's **full shape after the change** — `CreateTable` and
+    /// `AlterColumn` both re-establish the entry outright, and `DropTable` removes it — so nothing
+    /// here depends on what came before.
+    fn shape_of_ddl(
+        lsn: u64,
+        op: &DdlOp,
+        table: &str,
+        dir_root: u32,
+        time_travel_root: u32,
+        columns: &[(String, DataType, bool)],
+    ) -> Result<ShapeAt, FerroError> {
+        // Refused for the same reason the main walk refuses it, and deliberately not softened to a
+        // skip: if a malformed record made the prefix scan give up quietly, a cold decode would
+        // succeed where the warm one errors, which is the very warm/cold divergence this scan
+        // exists to remove.
+        if let DdlOp::AlterColumn(alt) = op {
+            let subject = alt.column();
+            if !columns.iter().any(|(n, _, _)| n == subject) {
+                return Err(FerroError::Wal(format!(
+                    "ddl record alters column '{subject}' of '{table}' but the shape it carries has \
+                     no such column: {:?}",
+                    columns.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+                )));
+            }
+        }
+        let entry = match op {
+            DdlOp::DropTable => None,
+            _ => {
+                let schema = Schema::new(
+                    columns
+                        .iter()
+                        .map(|(name, ty, nullable)| Column {
+                            name: name.clone(),
+                            data_type: ty.clone(),
+                            nullable: *nullable,
+                        })
+                        .collect(),
+                );
+                let names: Vec<String> = columns.iter().map(|(n, _, _)| n.clone()).collect();
+                Some((table.to_string(), schema, Arc::new(names)))
+            }
+        };
+        Ok(ShapeAt {
+            lsn,
+            dir_root,
+            entry,
+            time_travel_root: match op {
+                DdlOp::DropTable => None,
+                _ => Some(time_travel_root),
+            },
+        })
+    }
+
+    /// Read `[from, to)` and push every DDL in it into `shapes`, ignoring everything else.
+    ///
+    /// This is the gap fill behind `Learned::covered_through`. It reads records rather than rows:
+    /// no tuple is deserialized, nothing is staged, and no event is produced, so the cost is one
+    /// pass over the record headers of a range the caller was going to skip anyway.
+    fn scan_ddl(
+        wal: &WalManager,
+        from: u64,
+        to: u64,
+        shapes: &mut Vec<ShapeAt>,
+    ) -> Result<(), FerroError> {
+        let mut lsn = from;
+        while lsn < to {
+            let (rec, next) = wal.read_record(lsn)?;
+            if let RecKind::Ddl { op, table, dir_root, time_travel_root, columns } = &rec.kind {
+                shapes.push(Self::shape_of_ddl(
+                    lsn,
+                    op,
+                    table,
+                    *dir_root,
+                    *time_travel_root,
+                    columns,
+                )?);
+            }
+            // Same guard the main walk carries: a record that does not advance would spin here
+            // forever, and a hang is harder to diagnose than an error.
+            if next <= lsn {
+                return Err(FerroError::Wal(format!(
+                    "log walk did not advance at lsn {lsn}; refusing to loop forever"
+                )));
+            }
+            lsn = next;
+        }
+        Ok(())
+    }
+
+    /// Fold newly-seen DDL into the remembered history.
+    ///
+    /// Merged rather than assigned, and keyed on `(lsn, dir_root)`: two threads may pump
+    /// concurrently through one `Arc<FeedStreamer>`, and a range walked twice — or a prefix scanned
+    /// after the walk that learned it — must not double-record. Both the walk's merge-back and the
+    /// `covered_through` gap fill go through here, so the two cannot drift apart.
+    fn merge_shapes(shapes: &mut Vec<ShapeAt>, incoming: Vec<ShapeAt>) {
+        if incoming.is_empty() {
+            return;
+        }
+        for shape in incoming {
+            match shapes.iter().position(|s| s.lsn == shape.lsn && s.dir_root == shape.dir_root) {
+                Some(at) => shapes[at] = shape,
+                None => shapes.push(shape),
+            }
+        }
+        // `apply_shape` is order-sensitive: two shapes for one `dir_root` must land newest-last.
+        shapes.sort_by_key(|s| s.lsn);
+        Self::collapse_repeats(shapes);
+    }
+
+    /// Drop a remembered DDL that says nothing its predecessor did not.
+    ///
+    /// **Without this the history grows for the life of the process.** `forget_truncated` prunes
+    /// against the log's base, and a live subscription pins the base, so under a held pin nothing
+    /// was ever dropped — measured by an adversarial pass at 603 entries and still climbing. The
+    /// bulk of them are not real schema changes at all: `replay_schema` re-appends a `CreateTable`
+    /// for every table after every truncation, so a long-running database mints one entry per table
+    /// per checkpoint, all carrying the identical shape.
+    ///
+    /// Collapsing is safe precisely because they ARE identical: an entry only ever decides which
+    /// shape a range starting above its LSN is seeded with, so where two consecutive entries for one
+    /// `dir_root` name the same shape, every range gets the same answer from either. The EARLIER is
+    /// the one kept — dropping it would move the shape's start LSN forward and change the answer for
+    /// ranges in between.
+    fn collapse_repeats(shapes: &mut Vec<ShapeAt>) {
+        let mut newest: HashMap<u32, usize> = HashMap::new();
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, s) in shapes.iter().enumerate() {
+            if let Some(&prev) = newest.get(&s.dir_root) {
+                let p: &ShapeAt = &shapes[prev];
+                let same = match (&p.entry, &s.entry) {
+                    (None, None) => true,
+                    (Some((pn, ps, _)), Some((sn, ss, _))) => pn == sn && ps == ss,
+                    _ => false,
+                };
+                if same && p.time_travel_root == s.time_travel_root {
+                    drop.push(i);
+                    continue;
+                }
+            }
+            newest.insert(s.dir_root, i);
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut i = 0usize;
+        shapes.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
+    /// How many DDL records this decoder is remembering. Read-only, for tests that need to show the
+    /// history is bounded rather than infer it from the absence of a symptom.
+    pub fn history_len(&self) -> usize {
+        self.history.lock().unwrap().shapes.len()
+    }
+
+    /// Drop remembered DDL that no range can ever ask about again.
+    ///
+    /// Without this the history grows for the life of the process. `base_lsn` is the floor of the
+    /// retained log and `pump` refuses a cursor below it, so nothing can ever be decoded from lower
+    /// than there — but the newest record per table AT OR BELOW the floor is still needed, because a
+    /// range starting exactly at the floor is seeded by everything strictly below it. Only records a
+    /// later one for the same `dir_root` has already superseded are dropped.
+    fn forget_truncated(history: &mut Vec<ShapeAt>, base_lsn: u64) {
+        let mut superseded: Vec<usize> = Vec::new();
+        for (i, s) in history.iter().enumerate() {
+            if s.lsn >= base_lsn {
+                continue;
+            }
+            if history
+                .iter()
+                .any(|later| later.dir_root == s.dir_root && later.lsn > s.lsn && later.lsn <= base_lsn)
+            {
+                superseded.push(i);
+            }
+        }
+        if superseded.is_empty() {
+            return;
+        }
+        let mut i = 0usize;
+        history.retain(|_| {
+            let keep = !superseded.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
     /// Decode `[from_lsn, to_lsn)`.
     ///
     /// Walks once, buffering per transaction and releasing on commit.
@@ -368,11 +751,68 @@ impl LogicalDecoder {
         // was in force where they sit rather than against whatever the catalog looks like now.
         // Without this, decoding any history that contains a `CREATE TABLE` requires a catalog from
         // the future, and a `DROP TABLE` makes the past undecodable entirely.
+        //
+        // I20: the starting point is the constructor's map plus every DDL this decoder has already
+        // walked past that sits BELOW `from_lsn`. See `LogicalDecoder::history` — that is what
+        // carries an `ALTER` across a pump boundary without corrupting a re-decode of an earlier
+        // range. `learned` collects this call's DDL and is merged back in on the way out.
         let mut tables = self.tables.clone();
         let mut time_travel = self.time_travel.clone();
+        {
+            let mut history = self.history.lock().unwrap();
+            // One decoder, one log. See the field's doc: LSNs from a different file name different
+            // records, and applying them would delete or re-shape tables at random.
+            match &history.log {
+                Some(seen) if seen != &wal.path => {
+                    history.shapes.clear();
+                    // The watermark describes the log it was measured against, so it cannot outlive
+                    // it. Leaving it set here would claim coverage of a prefix of the NEW log that
+                    // nothing has read, which is A9 re-opened through the watermark instead of
+                    // through the shapes.
+                    history.covered_through = 0;
+                    history.log = Some(wal.path.clone());
+                }
+                None => history.log = Some(wal.path.clone()),
+                _ => {}
+            }
+            let base_lsn = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            Self::forget_truncated(&mut history.shapes, base_lsn);
+            // Clamped UP, not down. Everything below the floor has been truncated away and can
+            // never be scanned again, so the prefix `[base_lsn, ...)` is as complete as it will
+            // ever get; without this the fill below would try to read records that are gone.
+            history.covered_through = history.covered_through.max(base_lsn);
+
+            // **The gap fill — this is what makes the seed a property of the LOG, not of what this
+            // decoder happens to have walked.** See `Learned::covered_through`. A sequential pump
+            // has already covered everything below its cursor, so this is a no-op for it; a decoder
+            // handed an upper range cold scans the prefix once and then agrees with the warm one.
+            //
+            // It happens under the same lock the merge-back takes, so a concurrent pump cannot
+            // observe a half-filled history and seed from it — that is the 40/40 column loss.
+            if history.covered_through < from_lsn {
+                let gap_from = history.covered_through;
+                let mut found = Vec::new();
+                Self::scan_ddl(wal, gap_from, from_lsn, &mut found)?;
+                // Through the shared merge: a decoder that walked an UPPER range first already holds
+                // shapes inside the gap, and appending blindly would duplicate them.
+                let mut shapes = std::mem::take(&mut history.shapes);
+                Self::merge_shapes(&mut shapes, found);
+                history.shapes = shapes;
+                history.covered_through = from_lsn;
+            }
+
+            for shape in history.shapes.iter().filter(|s| s.lsn < from_lsn) {
+                Self::apply_shape(&mut tables, &mut time_travel, shape);
+            }
+        }
+        let mut learned: Vec<ShapeAt> = Vec::new();
 
         // txn_id -> changes staged so far, in the order they were written.
         let mut staged: HashMap<u64, Vec<(u64, String, Arc<Vec<String>>, ChangeOp)>> = HashMap::new();
+        // Runs the walk has learned, and which transaction each one is bound to. Both are built
+        // from the log, not handed in: see `RecKind::RunIdentity`.
+        let mut runs: HashMap<u32, Arc<RunEntity>> = HashMap::new();
+        let mut bound: HashMap<u64, Arc<RunEntity>> = HashMap::new();
 
         let mut lsn = from_lsn;
         while lsn < to_lsn {
@@ -447,7 +887,23 @@ impl LogicalDecoder {
                 RecKind::Commit => {
                     // Release, stamped with this commit's LSN. Ordering by commit is what gives a
                     // consumer the sequence the database itself made visible.
+                    //
+                    // The writer is resolved HERE, at the commit, because this is the only point
+                    // where the decoder holds both the identity and the complete set of changes it
+                    // produced. It is `take`n rather than read: one identity record binds one
+                    // transaction, and leaving it behind would attribute a later transaction with
+                    // the same id — after a restart, transaction ids restart from the log header —
+                    // to a run that did not write it.
+                    let writer = bound.remove(&txn);
                     if let Some(changes) = staged.remove(&txn) {
+                        if writer.is_none() && !changes.is_empty() {
+                            // **Never assumed to be zero.** Rows shipping with no author is a fact
+                            // about this feed, and it is invisible in the events themselves — they
+                            // simply carry `writer: null`. Counted exactly as an undecodable record
+                            // is counted rather than being passed off as a clean run.
+                            out.unattributed_commits.insert(txn);
+                            out.unattributed_events += changes.len();
+                        }
                         for (change_lsn, table, columns, op) in changes {
                             out.events.push(ChangeEvent {
                                 txn_id: txn,
@@ -457,13 +913,58 @@ impl LogicalDecoder {
                                 table,
                                 columns,
                                 op,
+                                writer: writer.clone(),
                             });
                         }
                     }
                 }
+                RecKind::RunIdentity { run } => {
+                    // Learned as the walk proceeds, exactly as DDL is: a decoder must be able to
+                    // answer from the log alone, including one reading an archive whose database is
+                    // long gone.
+                    let key = run.prov_id.0;
+                    match runs.get(&key) {
+                        // `same_actor`, NOT `==`. Derived equality compares `started_at`, which is
+                        // when a session began and deliberately not part of who the actor is —
+                        // `MemProvenanceStore::intern` hands two sessions of one run the same
+                        // `ProvId` for exactly that reason, so their identity records differ in that
+                        // one field and in no other. A full-equality test refused them as "two
+                        // different actors" and, because this arm returns `Err`, made the entire log
+                        // range permanently undecodable: `FeedStreamer::pump` propagates it and the
+                        // consumer can never get past those bytes. `RunEntity::same_actor`'s own doc
+                        // records this same mistake being made once before.
+                        Some(known) if !known.same_actor(run) => {
+                            // The same slot naming two different actors means the log disagrees
+                            // with itself. Picking one would attribute rows to an actor the
+                            // database never recorded, which is worse than refusing.
+                            return Err(FerroError::Wal(format!(
+                                "the log declares provenance slot {key} twice with different \
+                                 actors: {} and {}. Refusing to guess which wrote what.",
+                                known.describe(),
+                                run.describe()
+                            )));
+                        }
+                        _ => {}
+                    }
+                    let shared = runs
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(run.clone()))
+                        .clone();
+                    // First wins, matching `MemProvenanceStore`: a re-declaration of the same
+                    // actor with a later `started_at` must not rewrite what the slot means.
+                    out.runs.entry(key).or_insert_with(|| run.clone());
+                    // Transaction 0 never commits: a record carrying it is a DECLARATION replayed
+                    // after a checkpoint, not a binding. Binding it would attach a run to a
+                    // transaction id that every DDL record also uses.
+                    if txn != 0 {
+                        bound.insert(txn, shared);
+                    }
+                }
                 RecKind::Abort => {
-                    // Rolled back: the rows never existed, so nothing is emitted.
+                    // Rolled back: the rows never existed, so nothing is emitted — and the identity
+                    // bound to this transaction described work that did not happen.
                     staged.remove(&txn);
+                    bound.remove(&txn);
                     out.aborted.insert(txn);
                 }
                 RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
@@ -476,33 +977,95 @@ impl LogicalDecoder {
                         })
                         .collect();
 
+                    // Both `CreateTable` and `AlterColumn` carry the table's FULL shape after the
+                    // change, so both re-establish the decoder's mapping the same way. That is
+                    // what lets records on either side of an ALTER decode against the shape that
+                    // was actually in force where they sit: the tuple bytes below an
+                    // `ADD COLUMN` were written with one fewer column and would not deserialize
+                    // against the new schema at all.
+                    let adopt_shape = |tables: &mut HashMap<u32, (String, Schema, Arc<Vec<String>>)>| {
+                        let schema = Schema::new(
+                            columns
+                                .iter()
+                                .map(|(name, ty, nullable)| Column {
+                                    name: name.clone(),
+                                    data_type: ty.clone(),
+                                    nullable: *nullable,
+                                })
+                                .collect(),
+                        );
+                        let names: Vec<String> =
+                            columns.iter().map(|(n, _, _)| n.clone()).collect();
+                        tables.insert(*dir_root, (table.clone(), schema, Arc::new(names)));
+                    };
+
+                    // I20: what this record does to the mapping, remembered with its LSN so the
+                    // NEXT call to `decode` starts where this one ended. Built here rather than by
+                    // diffing the map afterwards, so a record that changes nothing is still
+                    // recorded at its own LSN.
+                    let remember = |tables: &HashMap<u32, (String, Schema, Arc<Vec<String>>)>| ShapeAt {
+                        lsn,
+                        dir_root: *dir_root,
+                        entry: tables.get(dir_root).cloned(),
+                        time_travel_root: match op {
+                            DdlOp::DropTable => None,
+                            _ => Some(*time_travel_root),
+                        },
+                    };
+
                     let change = match op {
                         DdlOp::CreateTable => {
-                            let schema = Schema::new(
-                                columns
-                                    .iter()
-                                    .map(|(name, ty, nullable)| Column {
-                                        name: name.clone(),
-                                        data_type: ty.clone(),
-                                        nullable: *nullable,
-                                    })
-                                    .collect(),
-                            );
-                            let names: Vec<String> =
-                                columns.iter().map(|(n, _, _)| n.clone()).collect();
-                            tables.insert(
-                                *dir_root,
-                                (table.clone(), schema, Arc::new(names)),
-                            );
+                            adopt_shape(&mut tables);
                             time_travel.insert(*time_travel_root);
+                            learned.push(remember(&tables));
                             SchemaChange::CreateTable
                         }
                         DdlOp::DropTable => {
                             tables.remove(dir_root);
+                            learned.push(remember(&tables));
                             SchemaChange::DropTable
                         }
+                        DdlOp::AlterColumn(alt) => {
+                            // The alteration names a column; the new shape must contain it. A
+                            // record where it does not is malformed, and guessing which column was
+                            // meant would produce a feed that is confidently incorrect — the exact
+                            // failure this module's header is about. Refuse instead.
+                            let subject = alt.column();
+                            let new_type = columns
+                                .iter()
+                                .find(|(n, _, _)| n == subject)
+                                .map(|(_, ty, _)| sql_type_of(ty))
+                                .ok_or_else(|| {
+                                    FerroError::Wal(format!(
+                                        "ddl record alters column '{subject}' of '{table}' but the \
+                                         shape it carries has no such column: {:?}",
+                                        columns.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+                                    ))
+                                })?;
+                            adopt_shape(&mut tables);
+                            time_travel.insert(*time_travel_root);
+                            learned.push(remember(&tables));
+                            match alt {
+                                ColumnAlteration::Add { column } => {
+                                    SchemaChange::AddColumn { column: column.clone() }
+                                }
+                                ColumnAlteration::Rename { from, to } => {
+                                    SchemaChange::RenameColumn {
+                                        from: from.clone(),
+                                        to: to.clone(),
+                                    }
+                                }
+                                ColumnAlteration::Retype { column, from } => {
+                                    SchemaChange::RetypeColumn {
+                                        column: column.clone(),
+                                        from: sql_type_of(from),
+                                        to: new_type,
+                                    }
+                                }
+                            }
+                        }
                     };
-                    out.schema_changes.push((lsn, table.clone(), change));
+                    out.schema_changes.push((lsn, table.clone(), change.clone()));
 
                     // Emitted immediately rather than staged: DDL is refused inside a transaction
                     // (`executor.rs`, "DDL not allowed in txn"), so there is no commit to wait for
@@ -517,6 +1080,9 @@ impl LogicalDecoder {
                             columns.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
                         ),
                         op: ChangeOp::Schema { change, columns: specs },
+                        // A schema declaration is not a run's write. `is_write` is what keeps it
+                        // out of the unattributed count as well.
+                        writer: None,
                     });
                 }
                 // `Clr` records are undo work, and undo only happens on the way to an `Abort`,
@@ -531,6 +1097,20 @@ impl LogicalDecoder {
                 )));
             }
             lsn = next;
+        }
+
+        // I20: publish what this walk learned, so the next range starts from it. Merged rather than
+        // assigned — two threads may pump concurrently through one `Arc<FeedStreamer>`, and a range
+        // walked twice must not double-record.
+        {
+            let mut history = self.history.lock().unwrap();
+            let mut shapes = std::mem::take(&mut history.shapes);
+            Self::merge_shapes(&mut shapes, learned);
+            history.shapes = shapes;
+            // The walk reached `to_lsn`, so the history is now complete up to there — and this must
+            // happen even when the range held NO DDL, or a pump over a quiet stretch would leave a
+            // gap behind it and re-scan the same records on every later call.
+            history.covered_through = history.covered_through.max(to_lsn);
         }
 
         // Whatever is still staged belongs to transactions this range did not see commit. Withheld,
@@ -617,7 +1197,7 @@ mod tests {
             ),
         );
         // dir_root 8 is the table's time-travel heap: MVCC's own archive of superseded versions.
-        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]) }
+        LogicalDecoder { tables, time_travel: BTreeSet::from([8u32]), history: Mutex::new(Learned::default()) }
     }
 
     fn tuple_bytes(id: i32, qty: Option<i32>) -> Vec<u8> {
@@ -660,6 +1240,133 @@ mod tests {
         let base = w.base_lsn.load(Ordering::SeqCst);
         let end = w.next_lsn.load(Ordering::SeqCst);
         d.decode(w, base, end).unwrap()
+    }
+
+    fn a_run(prov: u32, agent: &str) -> RunEntity {
+        RunEntity::new(
+            crate::provenance::ProvId(prov),
+            agent,
+            "run-1",
+            "claude-opus",
+            "2026-05",
+            [0xab; 32],
+            1_700_000_000_000,
+            crate::branch::types::BranchId::new(1, 0),
+        )
+    }
+
+    /// **One provenance slot, two actors, is a log that disagrees with itself.**
+    ///
+    /// The slot is the reference every stamped version carries, so two meanings for it make every
+    /// attribution downstream ambiguous. Guessing which one wrote a given row would produce
+    /// confident wrong attribution — worse than refusing, because nothing downstream can tell.
+    ///
+    /// Breaking shape: two identity records with the same `prov_id` and different actor tuples in
+    /// one decode range. A log where each slot appears once — which is every well-formed log —
+    /// passes with or without the check.
+    #[test]
+    fn one_provenance_slot_naming_two_actors_is_refused() {
+        use std::sync::atomic::Ordering;
+        let (_d, w) = wal("conflicting-runs");
+
+        // Anti-vacuity first: the SAME declaration twice is exactly what a checkpoint replay
+        // produces, and must be accepted.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "a repeated declaration became two runs");
+
+        // Now the same slot with a different actor.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "auditor-agent") }).unwrap();
+        w.flush().unwrap();
+        let err = decoder()
+            .decode(&w, w.base_lsn.load(Ordering::SeqCst), w.next_lsn.load(Ordering::SeqCst))
+            .expect_err("a slot naming two actors was accepted");
+        assert!(
+            format!("{err}").contains("different"),
+            "it failed, but not by this guard: {err}"
+        );
+    }
+
+    /// **Two sessions of one run differ in `started_at` and are the same actor.**
+    ///
+    /// `MemProvenanceStore::intern` hands both sessions the same `ProvId` because `same_actor`
+    /// deliberately excludes `started_at` — its doc records that including it made the same input
+    /// refused or accepted depending on whether the clock had ticked. So a log legitimately holds two
+    /// identity records for one slot differing in exactly that field.
+    ///
+    /// The conflict check compared with derived `==`, which does compare `started_at`, and this arm
+    /// returns `Err` — so a perfectly ordinary second session made `decode` fail, `pump` propagate,
+    /// and the whole log range permanently undecodable. A feed that cannot get past a byte offset is
+    /// worse than one that loses a row.
+    ///
+    /// **Breaking shape:** any agent that opens a second session, with the clock advancing between
+    /// them. A workload where each run commits exactly once never produces it, and neither does one
+    /// fast enough to land both sessions inside a single clock tick — which is how the same mistake
+    /// passed on macOS and failed on an Ubuntu runner the first time it was made.
+    #[test]
+    fn a_second_session_of_one_run_is_not_a_conflicting_actor() {
+        let (_d, w) = wal("second-session");
+        let first = a_run(1, "restock-agent");
+        let mut later = a_run(1, "restock-agent");
+        later.started_at = first.started_at + 5_000;
+        assert_ne!(first, later, "the two entities must differ, or this test proves nothing");
+
+        w.append(0, 0, &RecKind::RunIdentity { run: first.clone() }).unwrap();
+        w.append(7, 0, &RecKind::Begin).unwrap();
+        insert(&w, 7, 7, 70);
+        w.append(7, 0, &RecKind::RunIdentity { run: later }).unwrap();
+        w.append(7, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "one run became two: {:?}", out.runs);
+        assert_eq!(
+            out.runs[&1].started_at, first.started_at,
+            "the later session rewrote what the slot means; the first declaration must win"
+        );
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
+    }
+
+    /// A declaration (transaction 0) names a run without binding one, and a binding attributes the
+    /// transaction it rides with. Told apart by `txn_id` alone.
+    ///
+    /// Breaking shape: a declaration followed by an unrelated transaction's commit. If declarations
+    /// bound, that commit would be attributed to whichever run was declared last — and after a
+    /// checkpoint, every table's declarations are replayed at the head of the log, so the first
+    /// commit after any checkpoint would be attributed to a run that did not write it.
+    #[test]
+    fn a_declaration_names_a_run_without_attributing_anybodys_commit() {
+        let (_d, w) = wal("declaration-only");
+        // Declared, not bound.
+        w.append(0, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w, 5, 7, 70);
+        w.append(5, 0, &RecKind::Commit).unwrap();
+
+        let out = decode_all(&decoder(), &w);
+        assert_eq!(out.runs.len(), 1, "the declaration was not learned");
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].writer.is_none(),
+            "a declaration attributed a commit it had nothing to do with: {:?}",
+            rows[0].writer
+        );
+        assert_eq!(out.unattributed_commits.iter().copied().collect::<Vec<_>>(), vec![5]);
+
+        // Anti-vacuity: the same record carrying that transaction's id DOES attribute it.
+        let (_d2, w2) = wal("declaration-bound");
+        w2.append(5, 0, &RecKind::Begin).unwrap();
+        insert(&w2, 5, 7, 70);
+        w2.append(5, 0, &RecKind::RunIdentity { run: a_run(1, "restock-agent") }).unwrap();
+        w2.append(5, 0, &RecKind::Commit).unwrap();
+        let out = decode_all(&decoder(), &w2);
+        let rows: Vec<_> = out.events.iter().filter(|e| e.op.is_write()).collect();
+        assert_eq!(rows[0].writer.as_ref().unwrap().agent_id, "restock-agent");
+        assert!(out.fully_attributed());
     }
 
     #[test]
@@ -910,7 +1617,11 @@ mod tests {
     #[test]
     fn a_decoder_with_no_tables_reports_everything_as_unresolved() {
         let (_d, w) = wal("empty");
-        let d = LogicalDecoder { tables: HashMap::new(), time_travel: BTreeSet::new() };
+        let d = LogicalDecoder {
+            tables: HashMap::new(),
+            time_travel: BTreeSet::new(),
+            history: Mutex::new(Learned::default()),
+        };
         assert_eq!(d.known_tables(), 0);
 
         w.append(1, 0, &RecKind::Begin).unwrap();
@@ -920,5 +1631,78 @@ mod tests {
         let out = decode_all(&d, &w);
         assert!(out.events.is_empty());
         assert_eq!(out.unresolved.get(&7), Some(&1), "the record vanished without being counted");
+    }
+
+    /// **A DDL record whose alteration names a column its own shape does not contain is refused.**
+    ///
+    /// The record's two halves are the full shape and the change that produced it, and they must
+    /// agree. A decoder that guessed which column was meant — or shrugged and emitted the change
+    /// with an empty type — would put a confidently incorrect event into the feed, which is the
+    /// failure this module's header is entirely about. The independent Go validator refuses the
+    /// same disagreement from the other side; this is the producer refusing to emit it at all.
+    ///
+    /// Breaking shape: a record written by a build whose alteration and shape were computed from
+    /// different snapshots of the catalog.
+    #[test]
+    fn a_ddl_record_whose_alteration_is_not_in_its_shape_is_refused() {
+        use crate::wal::log::{ColumnAlteration, DdlOp, RecKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalManager::new(dir.path().join("t.wal")).unwrap();
+        let shape = vec![
+            ("id".to_string(), DataType::Integer, false),
+            ("qty".to_string(), DataType::Integer, true),
+        ];
+        wal.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                // The alteration says `note` was added; the shape it carries has no `note`.
+                op: DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+                table: "inv".into(),
+                dir_root: 7,
+                time_travel_root: 8,
+                columns: shape.clone(),
+            },
+        )
+        .unwrap();
+        wal.flush().unwrap();
+
+        let base = wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let next = wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        let err = LogicalDecoder::blank()
+            .decode(&wal, base, next)
+            .expect_err("a record whose halves disagree was decoded into an event");
+        let text = format!("{err}");
+        assert!(text.contains("note"), "the refusal does not name the column: {text}");
+        assert!(text.contains("no such column"), "refused, but not by this guard: {text}");
+
+        // **Anti-vacuity**: the same record with a shape that DOES contain the column decodes, so
+        // the refusal above is about the disagreement and not about alterations in general.
+        let wal2 = WalManager::new(dir.path().join("ok.wal")).unwrap();
+        let mut wider = shape;
+        wider.push(("note".to_string(), DataType::Varchar(20), true));
+        wal2.append(
+            0,
+            0,
+            &RecKind::Ddl {
+                op: DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+                table: "inv".into(),
+                dir_root: 7,
+                time_travel_root: 8,
+                columns: wider,
+            },
+        )
+        .unwrap();
+        wal2.flush().unwrap();
+        let out = LogicalDecoder::blank()
+            .decode(
+                &wal2,
+                wal2.base_lsn.load(std::sync::atomic::Ordering::SeqCst),
+                wal2.next_lsn.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("a well-formed alteration record was refused");
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].op.name(), "ADD_COLUMN");
     }
 }

@@ -41,6 +41,10 @@ pub mod logical;
 /// process can read is not a CDC source; this is the representation that leaves the process.
 pub mod jsonl;
 
+/// What the feed is **allowed** to emit — see [`publication`]. Every other guard here is about not
+/// losing a row; this one is about not shipping one, which is the failure no re-read can undo.
+pub mod publication;
+
 /// Initial snapshot and the handoff to the stream — see [`snapshot`]. Without it a consumer learns
 /// only what changes after it connects, and never what was already there.
 pub mod snapshot;
@@ -401,6 +405,119 @@ mod tests {
     }
 }
 
+/// Where a replica is, and whether it may go on — persisted next to the replica's database.
+///
+/// **B6: the divergence latch on `ReplicaApplier` lives in memory, and the process exits on
+/// divergence.** The operator restarts it, and by then one more DDL statement on the primary has
+/// checkpointed and truncated the log past the record that caused the halt — so the only position
+/// the primary will still serve is its new base. Restarted there, the replica reports
+/// `diverged=None` and `applied_lsn == durable_lsn`, i.e. CAUGHT UP, over pages that do not match
+/// the primary's. The halt bought nothing.
+///
+/// It bought nothing because it was not durable. A latch that dies with the process only defends
+/// against the failure that does not restart. This is the same "refuse rather than warn" shape the
+/// rest of the project uses: a replica that cannot prove continuity must say so, and it must go on
+/// saying so after a restart.
+///
+/// The file is the one `repl_replica` already kept for its position, and the format stays
+/// backwards compatible: a bare number is a position with no divergence, which is exactly what
+/// every state file written before this held. A second line records the divergence and its reason,
+/// so an operator reading the file by hand sees why, not just that.
+pub struct ReplicaState {
+    path: std::path::PathBuf,
+}
+
+/// What a replica's state file says: where it got to, and why it stopped if it did.
+#[derive(Debug, Clone)]
+pub struct ReplicaPosition {
+    pub applied_lsn: u64,
+    /// `Some(reason)` if this replica recorded a divergence. It must not be resumed.
+    pub diverged: Option<String>,
+}
+
+impl ReplicaState {
+    /// The state file belonging to the replica database at `db_path`.
+    pub fn at(db_path: &std::path::Path) -> Self {
+        let mut p = db_path.as_os_str().to_os_string();
+        p.push(".replstate");
+        ReplicaState { path: std::path::PathBuf::from(p) }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// What the file says, or `None` if there is no file — a replica that has never run.
+    ///
+    /// An unparseable file reads as `None` rather than an error, which is what the previous
+    /// inline version did and is the safe direction here: the caller then treats the replica as
+    /// fresh and re-seeds, instead of resuming from a number it could not read.
+    pub fn read(&self) -> Option<ReplicaPosition> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        let mut lines = text.lines();
+        let applied_lsn = lines.next()?.trim().parse::<u64>().ok()?;
+        let diverged = lines
+            .next()
+            .and_then(|l| l.strip_prefix("DIVERGED "))
+            .map(|why| why.trim().to_string());
+        Some(ReplicaPosition { applied_lsn, diverged })
+    }
+
+    /// The position to resume from, or an error naming the divergence that forbids resuming.
+    ///
+    /// **This is the guard.** Reading the position and checking the latch are ONE operation
+    /// precisely so a caller cannot do the first and forget the second — which is how the
+    /// in-memory latch was lost across a restart in the first place.
+    pub fn resume(&self) -> Result<Option<u64>, FerroError> {
+        match self.read() {
+            None => Ok(None),
+            Some(pos) => match pos.diverged {
+                None => Ok(Some(pos.applied_lsn)),
+                Some(why) => Err(FerroError::Wal(format!(
+                    "this replica recorded a DIVERGENCE at lsn {} and must not be resumed: {why}\n\
+                     Applying further frames onto these pages would report the replica caught up \
+                     over data that does not match the primary. Re-seed from a base backup, or \
+                     delete {} to declare deliberately that this database is being abandoned.",
+                    pos.applied_lsn,
+                    self.path.display()
+                ))),
+            },
+        }
+    }
+
+    fn write(&self, pos: &ReplicaPosition) -> Result<(), FerroError> {
+        use std::io::Write as _;
+        let tmp = self.path.with_extension("replstate.tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| FerroError::Wal(format!("create {}: {e}", tmp.display())))?;
+        match &pos.diverged {
+            None => write!(f, "{}", pos.applied_lsn),
+            Some(why) => write!(f, "{}\nDIVERGED {}", pos.applied_lsn, why.replace('\n', " ")),
+        }
+        .map_err(|e| FerroError::Wal(format!("write {}: {e}", tmp.display())))?;
+        f.sync_all()
+            .map_err(|e| FerroError::Wal(format!("fsync {}: {e}", tmp.display())))?;
+        // Renamed so a reader never sees a half-written file.
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| FerroError::Wal(format!("rename to {}: {e}", self.path.display())))?;
+        Ok(())
+    }
+
+    /// Record progress. Call only AFTER the pages it describes are durable, never before.
+    ///
+    /// Refuses to clear a recorded divergence: a diverged replica that kept applying would
+    /// otherwise overwrite the very evidence that says it must not.
+    pub fn record_applied(&self, lsn: u64) -> Result<(), FerroError> {
+        let diverged = self.read().and_then(|p| p.diverged);
+        self.write(&ReplicaPosition { applied_lsn: lsn, diverged })
+    }
+
+    /// Record that this replica stopped, and why. Survives the process; `resume` refuses after it.
+    pub fn record_divergence(&self, lsn: u64, why: &str) -> Result<(), FerroError> {
+        self.write(&ReplicaPosition { applied_lsn: lsn, diverged: Some(why.to_string()) })
+    }
+}
+
 /// Applies a primary's shipped WAL frames on a replica.
 ///
 /// Redo goes through `wal::recovery::apply_redo`, the same code recovery uses, rather than a
@@ -410,6 +527,13 @@ mod tests {
 pub struct ReplicaApplier {
     bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
     applied_lsn: std::sync::atomic::AtomicU64,
+    /// Why this replica stopped, once it has — I20, review finding 11.
+    ///
+    /// Latched, and deliberately not clearable: a reconnect re-sends the batch from
+    /// `applied_lsn`, so without a latch the replica would meet the same record, refuse it, and be
+    /// restarted into the same refusal for ever — or worse, be restarted by an operator who reads
+    /// "it caught up again" as the problem going away.
+    diverged: std::sync::Mutex<Option<String>>,
 }
 
 impl ReplicaApplier {
@@ -418,7 +542,19 @@ impl ReplicaApplier {
         bp: std::sync::Arc<crate::buffer::buffer_pool::BufferPoolManager>,
         start_lsn: u64,
     ) -> Self {
-        ReplicaApplier { bp, applied_lsn: std::sync::atomic::AtomicU64::new(start_lsn) }
+        ReplicaApplier {
+            bp,
+            applied_lsn: std::sync::atomic::AtomicU64::new(start_lsn),
+            diverged: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// `Some(reason)` once this replica has refused something it cannot apply.
+    ///
+    /// Fatal, not transient. `applied_lsn` stays true — everything below it really is applied —
+    /// and it will never advance again. The only way forward is a fresh base backup.
+    pub fn diverged(&self) -> Option<String> {
+        self.diverged.lock().unwrap().clone()
     }
 
     /// How far this replica has applied. This is what it sends in `Hello`.
@@ -436,6 +572,34 @@ impl ReplicaApplier {
     /// justify, which is worse than refusing to advance at all.
     pub fn apply(&self, start_lsn: u64, bytes: &[u8]) -> Result<u64, FerroError> {
         use crate::wal::log::{crc32, LogRecord};
+
+        // **A batch that begins ABOVE where this replica has applied is a GAP, and a gap is not
+        // catching up — B6.** Nothing here used to check: `apply` validated each frame's own LSN
+        // against the walk and then `fetch_max`'d the result, so a batch starting past
+        // `applied_lsn` was accepted whole and the replica reported `applied_lsn == durable_lsn`
+        // over pages that never saw the missing range.
+        //
+        // That is reachable without anyone doing anything wrong. A primary that checkpoints
+        // truncates its log, and `read_from` then answers a request for a truncated position with
+        // the oldest records it still has — so a replica that fell behind, or halted and was
+        // restarted, asks for `applied_lsn` and is handed a batch that starts later. The records in
+        // between are gone from the primary and were never applied here.
+        //
+        // Latched rather than returned bare, because it is not transient: the missing records do
+        // not come back, and a reconnect would ask the same question and get the same answer. The
+        // remedy is a fresh base backup, which is what the message says.
+        //
+        // A batch starting BELOW `applied_lsn` is fine and deliberately still allowed — that is the
+        // overlap a reconnect re-sends, and redo is idempotent by page LSN, so it is skipped rather
+        // than applied twice.
+        let at = self.applied_lsn();
+        if start_lsn > at {
+            let why = format!(
+                "replica DIVERGED: the next batch begins at lsn {start_lsn} but this replica has                  only applied through {at}, so the records in [{at}, {start_lsn}) were never                  applied and are no longer on the primary to fetch. This is a GAP, not a catch-up;                  applying it would leave every page below it silently stale while `applied_lsn`                  reported the replica current. Re-seed from a base backup taken at or after                  {start_lsn}."
+            );
+            *self.diverged.lock().unwrap() = Some(why.clone());
+            return Err(FerroError::Wal(why));
+        }
 
         // Validate the whole batch before touching a page.
         let mut checked: Vec<(u64, LogRecord)> = Vec::new();
@@ -476,6 +640,59 @@ impl ReplicaApplier {
 
             at += total;
             lsn += total as u64;
+        }
+
+        // **An ALTER cannot be replayed here, so the replica stops rather than diverging — I20,
+        // review finding 11.**
+        //
+        // `Catalog::alter_table` rewrites every tuple of the table in place through a
+        // `HeapFileManager::open`, which sets `txn: None` (`storage/heap_file_manager.rs`), so
+        // every write path in it is gated off and **not one WAL record describes the rewrite**.
+        // The `Ddl` record logged afterwards is the only trace, and the redo loop below drops it
+        // into `_ => {}`.
+        //
+        // The consequence, before this guard: the replica never rewrites its heap, and the
+        // post-ALTER `HeapInsert` frames then deliver new-shape tuples into pages still holding
+        // old-shape ones. One page, two incompatible layouts, nothing in the bytes to tell them
+        // apart — while `applied_lsn == durable_lsn` reported the replica caught up. Measured on
+        // the primary/replica pair: raw tuple sizes `[38, 38, 43]` against `[36, 36, 43]`.
+        //
+        // This is a HALT, not a repair. Physical replication across a column change needs the
+        // rewrite to be logged, which is a change to `alter.rs` and not to this file. What the
+        // halt buys is that a diverged replica says so instead of answering queries from pages it
+        // has silently misread. Checked before anything is materialised or applied, so the
+        // batch's all-or-nothing property is preserved.
+        if let Some(why) = self.diverged.lock().unwrap().clone() {
+            return Err(FerroError::Wal(why));
+        }
+        for (rec_lsn, rec) in &checked {
+            // Scoped to `AlterColumn`. `CreateTable` and `DropTable` records are in every shipped
+            // stream already — the log re-declares every table at each checkpoint — and neither
+            // touches a heap page, so halting on those would stop every replica that exists.
+            // A `Clr` is unwrapped as well. Nothing in this codebase can produce a `Clr` wrapping a
+            // `Ddl` — DDL is refused inside a transaction and a `Clr` is only written while rolling
+            // one back — so this arm is unreachable today. It is here because the cost of being
+            // wrong about that is a silently diverged replica, and the cost of the arm is one line:
+            // a guard over what may be applied should be an allowlist, not a list of the shapes
+            // somebody happened to think of.
+            let kind = match &rec.kind {
+                crate::wal::log::RecKind::Clr { redo, .. } => redo.as_ref(),
+                other => other,
+            };
+            let crate::wal::log::RecKind::Ddl {
+                op: crate::wal::log::DdlOp::AlterColumn(alteration),
+                table,
+                ..
+            } = kind
+            else {
+                continue;
+            };
+            let why = format!(
+                "replica DIVERGED at lsn {rec_lsn}: the stream carries ALTER TABLE on '{table}'                  ({alteration:?}). The primary rewrote every tuple of that table in place through a                  heap manager with no transaction attached, so no WAL record describes the rewrite                  and there is nothing here to redo. This replica's pages still hold the pre-ALTER                  tuple layout while every frame after this one carries the post-ALTER layout, and                  nothing in the bytes distinguishes them. Stopped at applied_lsn {}; re-seed from a                  base backup taken after the ALTER.",
+                self.applied_lsn()
+            );
+            *self.diverged.lock().unwrap() = Some(why.clone());
+            return Err(FerroError::Wal(why));
         }
 
         // A replica's file does not yet contain the pages the primary is describing, so redo

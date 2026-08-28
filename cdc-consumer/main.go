@@ -10,11 +10,17 @@
 //
 // Subcommands:
 //
-//	validate <feed.jsonl>            check a feed file's format, exit non-zero on any violation
-//	precision <feed.jsonl>           report the JSON type of every column, and which numbers a
-//	                                 default float64 decode would silently corrupt
+//	validate <feed.jsonl> [-publication f]
+//	                                 check a feed file's format, exit non-zero on any violation; with
+//	                                 -publication, also refuse anything the policy does not publish
+//	precision <feed.jsonl> [-publication f]
+//	                                 report the JSON type of every column, and which numbers a
+//	                                 default float64 decode would silently corrupt; refuses a column
+//	                                 the publication does not publish rather than printing it
 //	follow <addr> [-key id]          stream a live feed, materialise it, print the resulting table
 //	sink <feed.jsonl> -db f [-engine] land the feed with idempotent, order-guarded upserts
+//	retract <db> -table t -model-version v [-engine]  withdraw everything one model version wrote
+//	scan <db> -table t [-key id] [-engine]           print every row's writer and retraction flag
 //	duckdb-sql <file> <sql>          run one statement against a DuckDB destination, separate process
 //
 // `sink` speaks to two destinations, chosen with `-engine`: `sqlite` (the default, and what the
@@ -52,8 +58,86 @@ type Event struct {
 	LSN          uint64         `json:"lsn"`
 	CommitLSN    uint64         `json:"commit_lsn"`
 	CommitEndLSN uint64         `json:"commit_end_lsn"`
+	Writer       *Writer        `json:"writer"`
 	Before       map[string]any `json:"before"`
 	After        map[string]any `json:"after"`
+}
+
+// Writer is the agent run that produced a change.
+//
+// Nil for a change no agent run produced, for the snapshot READ rows that existed before the feed
+// began, and for schema declarations. Nil is a legitimate value and not an error — but a consumer
+// that cannot count how often it happens cannot tell "this database has no agents" from "this feed
+// lost its attribution", so `validate` reports the number.
+//
+// `PromptSHA256` is a digest and never the prompt. That is enforced rather than trusted: see
+// `writerKeys`.
+type Writer struct {
+	ProvID       uint64 `json:"prov_id"`
+	Agent        string `json:"agent"`
+	Run          string `json:"run"`
+	Model        string `json:"model"`
+	ModelVersion string `json:"model_version"`
+	PromptSHA256 string `json:"prompt_sha256"`
+	StartedAt    string `json:"started_at"`
+	Branch       string `json:"branch"`
+}
+
+// writerKeys is an ALLOWLIST of the keys a writer object may carry, and it is an allowlist on
+// purpose.
+//
+// `prompt_hash` exists precisely so that a prompt containing customer data does not become a
+// durable copy of it in every consumer's destination table. A denylist of forbidden key names only
+// catches the spellings somebody already thought of — `prompt`, `prompt_text`, `instructions`,
+// `system_prompt` — and a producer that adds a ninth field for any reason would land it in the sink
+// unnoticed. A closed set cannot be talked around.
+var writerKeys = map[string]bool{
+	"prov_id": true, "agent": true, "run": true, "model": true, "model_version": true,
+	"prompt_sha256": true, "started_at": true, "branch": true,
+}
+
+// isHex64 reports whether s is exactly 64 lowercase-or-uppercase hex digits: a SHA-256 digest.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// checkWriter enforces the writer contract against the RAW object, not the decoded struct.
+//
+// The struct is the wrong instrument for this: `encoding/json` silently drops keys it has no field
+// for, so a producer leaking the prompt text would decode cleanly into a Writer that looks perfect.
+func checkWriter(raw map[string]json.RawMessage, w *Writer, n int) error {
+	for k := range raw {
+		if !writerKeys[k] {
+			return fmt.Errorf("line %d: the writer object carries an unknown key %q. The writer "+
+				"contract is a closed set, and `prompt_hash` exists so a prompt never becomes a "+
+				"durable copy of itself downstream", n, k)
+		}
+	}
+	if w.ProvID == 0 {
+		return fmt.Errorf("line %d: the writer names prov_id 0, which is the slot meaning "+
+			"'unattributed'; an event claiming a writer must name one", n)
+	}
+	for name, v := range map[string]string{
+		"agent": w.Agent, "run": w.Run, "model": w.Model, "model_version": w.ModelVersion,
+	} {
+		if v == "" {
+			return fmt.Errorf("line %d: the writer has an empty %s", n, name)
+		}
+	}
+	if !isHex64(w.PromptSHA256) {
+		return fmt.Errorf("line %d: prompt_sha256 %q is not 64 hex digits; a prompt digest that is "+
+			"not a digest is either missing or is the prompt itself", n, w.PromptSHA256)
+	}
+	return nil
 }
 
 var validOps = map[string]bool{
@@ -64,10 +148,34 @@ var validOps = map[string]bool{
 	// nuisance — a consumer that silently ignored ops it did not recognise would drop schema
 	// changes and never say so.
 	"CREATE_TABLE": true, "DROP_TABLE": true,
+	// B11's column-level three. Same lesson, applied on purpose this time rather than discovered:
+	// the producer and this program were changed together, because a consumer that has not been
+	// taught an op refuses the whole feed and one that silently ignores it drops schema changes.
+	"ADD_COLUMN": true, "RENAME_COLUMN": true, "ALTER_COLUMN_TYPE": true,
 }
 
 // isSchema reports whether an op describes the table's shape rather than a row.
-func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
+func isSchema(op string) bool {
+	switch op {
+	case "CREATE_TABLE", "DROP_TABLE", "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		return true
+	}
+	return false
+}
+
+// isDeclaration reports the schema ops that are **re-emitted** rather than delivered once.
+//
+// This is the distinction that matters to a consumer, and it is NOT the same as isSchema. A
+// CREATE_TABLE is a declaration — "this table has this shape" — re-sent at every checkpoint of the
+// source, because a checkpoint truncates the log and has to re-establish the schema at the new
+// base. A DROP_TABLE likewise leaves the source's retained set. The column-level three are
+// **news**: each is delivered exactly once, at the position the DDL occupied, and a consumer that
+// applies one twice has renamed a column that no longer has the old name.
+//
+// The source draws the same line in the same place (`SchemaChange::is_declaration`), and the
+// mechanism behind it is that an ALTER updates the source's retained CREATE_TABLE declaration
+// rather than being retained itself.
+func isDeclaration(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE" }
 
 // bypassesCursor reports ops whose idempotence CANNOT come from the resume cursor.
 //
@@ -86,7 +194,47 @@ func isSchema(op string) bool { return op == "CREATE_TABLE" || op == "DROP_TABLE
 // so a replay is a no-op; and a snapshot row arriving AFTER a newer stream event for the same key has a
 // lower commit_lsn and is rejected — which is the cutover's whole hazard, since the snapshot boundary
 // is taken before the scan.
-func bypassesCursor(op string) bool { return isSchema(op) || op == "READ" }
+// B11: `isDeclaration`, not `isSchema`. A column-level change is an ordinary positioned log
+// record delivered once, so the cursor is exactly the right idempotence mechanism for it — and
+// exempting it would be worse than useless: a re-run of the same feed would re-apply the rename.
+func bypassesCursor(op string) bool { return isDeclaration(op) || op == "READ" }
+
+// schemaColumns validates the `after.columns` payload every shape-carrying event has, and returns
+// it as name -> declared type.
+//
+// One function, two callers: `CREATE_TABLE` and B11's column-level three all carry the table's full
+// shape under the same key with the same rules, and validating it twice is two chances to check
+// different things. The map it returns is what lets the column-level cases cross-check the
+// alteration against the shape it claims to have produced.
+func schemaColumns(e *Event, n int) (map[string]string, error) {
+	// Its payload is the table's shape, keyed under `columns` so it can never be mistaken for a row
+	// of data.
+	if e.After == nil {
+		return nil, fmt.Errorf("line %d: %s has no schema payload", n, e.Op)
+	}
+	cols, ok := e.After["columns"]
+	if !ok {
+		return nil, fmt.Errorf("line %d: %s payload has no columns", n, e.Op)
+	}
+	list, ok := cols.([]any)
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("line %d: %s columns is not a non-empty list", n, e.Op)
+	}
+	out := make(map[string]string, len(list))
+	for _, c := range list {
+		m, ok := c.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("line %d: a column is not an object", n)
+		}
+		for _, want := range []string{"name", "type", "nullable"} {
+			if _, ok := m[want]; !ok {
+				return nil, fmt.Errorf("line %d: a column has no %q", n, want)
+			}
+		}
+		out[fmt.Sprint(m["name"])] = fmt.Sprint(m["type"])
+	}
+	return out, nil
+}
 
 // checkEnvelope enforces the invariants the feed documents, independently of the producer.
 func checkEnvelope(e *Event, raw string, n int) error {
@@ -102,33 +250,101 @@ func checkEnvelope(e *Event, raw string, n int) error {
 		if e.Before != nil {
 			return fmt.Errorf("line %d: CREATE_TABLE carries a before image", n)
 		}
-		// Its payload is the table's shape, keyed under `columns` so it can never be mistaken for
-		// a row of data.
-		if e.After == nil {
-			return fmt.Errorf("line %d: CREATE_TABLE has no schema payload", n)
-		}
-		cols, ok := e.After["columns"]
-		if !ok {
-			return fmt.Errorf("line %d: CREATE_TABLE payload has no columns", n)
-		}
-		list, ok := cols.([]any)
-		if !ok || len(list) == 0 {
-			return fmt.Errorf("line %d: CREATE_TABLE columns is not a non-empty list", n)
-		}
-		for _, c := range list {
-			m, ok := c.(map[string]any)
-			if !ok {
-				return fmt.Errorf("line %d: a column is not an object", n)
-			}
-			for _, want := range []string{"name", "type", "nullable"} {
-				if _, ok := m[want]; !ok {
-					return fmt.Errorf("line %d: a column has no %q", n, want)
-				}
-			}
+		if _, err := schemaColumns(e, n); err != nil {
+			return err
 		}
 	case "DROP_TABLE":
 		if e.After != nil {
 			return fmt.Errorf("line %d: DROP_TABLE carries an after image", n)
+		}
+	case "ADD_COLUMN", "RENAME_COLUMN", "ALTER_COLUMN_TYPE":
+		// A column-level change carries BOTH halves and each is checked here, independently of the
+		// producer, because either half alone is unusable:
+		//
+		//   - `columns` is the table's full shape afterwards, which is what the sinks reconcile
+		//     their destination against, positionally, exactly as they do for a CREATE_TABLE;
+		//   - `alter` says which change produced that shape, which the shape cannot say. A rename
+		//     and a drop-plus-add leave identical column lists, and only one of them keeps the
+		//     column's data.
+		//
+		// The cross-checks below are the point of an independent implementation: they verify the
+		// two halves agree with each other, which a producer validated by its own idea of the
+		// format cannot do for itself.
+		if e.Before != nil {
+			return fmt.Errorf("line %d: %s carries a before image", n, e.Op)
+		}
+		cols, err := schemaColumns(e, n)
+		if err != nil {
+			return err
+		}
+		alter, ok := e.After["alter"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("line %d: %s has no alter payload; the new shape alone cannot say "+
+				"which change produced it", n, e.Op)
+		}
+		named := func(k string) (string, error) {
+			v, ok := alter[k].(string)
+			if !ok || v == "" {
+				return "", fmt.Errorf("line %d: %s alter payload has no %q", n, e.Op, k)
+			}
+			return v, nil
+		}
+		switch e.Op {
+		case "ADD_COLUMN":
+			c, err := named("column")
+			if err != nil {
+				return err
+			}
+			if _, ok := cols[c]; !ok {
+				return fmt.Errorf("line %d: ADD_COLUMN adds %q but the new shape does not contain "+
+					"it", n, c)
+			}
+		case "RENAME_COLUMN":
+			from, err := named("from")
+			if err != nil {
+				return err
+			}
+			to, err := named("to")
+			if err != nil {
+				return err
+			}
+			if from == to {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames %q to itself", n, from)
+			}
+			if _, ok := cols[to]; !ok {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames to %q but the new shape does not "+
+					"contain it", n, to)
+			}
+			if _, ok := cols[from]; ok {
+				return fmt.Errorf("line %d: RENAME_COLUMN renames away from %q but the new shape "+
+					"still contains it", n, from)
+			}
+		case "ALTER_COLUMN_TYPE":
+			c, err := named("column")
+			if err != nil {
+				return err
+			}
+			was, err := named("from")
+			if err != nil {
+				return err
+			}
+			now, err := named("to")
+			if err != nil {
+				return err
+			}
+			if was == now {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE changes %q from %s to the same type",
+					n, c, was)
+			}
+			t, ok := cols[c]
+			if !ok {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE retypes %q but the new shape does "+
+					"not contain it", n, c)
+			}
+			if t != now {
+				return fmt.Errorf("line %d: ALTER_COLUMN_TYPE says %q became %s but the new shape "+
+					"declares it %s", n, c, now, t)
+			}
 		}
 	case "READ", "INSERT":
 		if e.Before != nil {
@@ -178,6 +394,34 @@ func decodeLine(line string, n int) (*Event, error) {
 	if err := checkEnvelope(&e, line, n); err != nil {
 		return nil, err
 	}
+	// **The publication, re-checked here rather than trusted from the producer.** In decodeLine
+	// because every mode that reads events goes through it, so a subcommand added later cannot be
+	// written without the check. See publication.go for what each direction catches, and for the
+	// blind spot: with no -publication flag, activePublication is nil and nothing is enforced.
+	// The structural rules first: they read the raw bytes, and two of the three things they catch are
+	// invisible once `encoding/json` has collapsed the line into a struct.
+	if err := activePublication.policeRawLine(line, n); err != nil {
+		return nil, err
+	}
+	if err := activePublication.check(&e, n); err != nil {
+		return nil, err
+	}
+	if err := activePublication.checkShape(&e, n); err != nil {
+		return nil, err
+	}
+	if e.Writer != nil {
+		// Re-read the writer as raw keys. The struct above cannot answer "what else was in there",
+		// and that is exactly the question the prompt-leak guard has to ask.
+		var probe struct {
+			Writer map[string]json.RawMessage `json:"writer"`
+		}
+		if err := json.Unmarshal([]byte(line), &probe); err != nil {
+			return nil, fmt.Errorf("line %d: re-reading the writer object: %w", n, err)
+		}
+		if err := checkWriter(probe.Writer, e.Writer, n); err != nil {
+			return nil, err
+		}
+	}
 	return &e, nil
 }
 
@@ -209,12 +453,56 @@ func (t *Table) apply(e *Event) error {
 		// Schema evolution: adopt the declared shape. A real sink would issue CREATE/ALTER against
 		// its destination here; the point is that it learns the shape IN BAND and in log order,
 		// rather than being told out of band and having to guess which rows it applies to.
-		t.columns = t.columns[:0]
-		if list, ok := e.After["columns"].([]any); ok {
-			for _, c := range list {
-				if m, ok := c.(map[string]any); ok {
-					t.columns = append(t.columns, fmt.Sprint(m["name"]))
-				}
+		t.adoptColumns(e)
+		return nil
+	case "ADD_COLUMN":
+		// The rows already held keep the values they were delivered with; the new column is absent
+		// from them, which is exactly right — it did not exist when they were written, and the
+		// source did not re-image them.
+		t.adoptColumns(e)
+		return nil
+	case "RENAME_COLUMN":
+		// The rows already held are keyed by the OLD name. Renaming the shape and leaving them
+		// alone would make every one of them look like a row missing the new column and carrying a
+		// stray one, and `diff` against the source — which reports the new name — would show every
+		// row as different. This is the case that makes the alteration's `from` load-bearing: the
+		// shape alone cannot say which key to move.
+		from, _ := alterField(e, "from")
+		to, _ := alterField(e, "to")
+		t.adoptColumns(e)
+		if from == "" || to == "" {
+			return nil
+		}
+		if t.key == from {
+			t.key = to
+		}
+		for _, row := range t.rows {
+			if v, ok := row[from]; ok {
+				row[to] = v
+				delete(row, from)
+			}
+		}
+		return nil
+	case "ALTER_COLUMN_TYPE":
+		// The rows already held carry the column in its OLD encoding. The feed encodes BIGINT,
+		// DECIMAL and TIMESTAMP as JSON **strings** and INTEGER as a JSON number (see the producer's
+		// `jsonl` module: a double cannot hold an i64 exactly, so the digits ship as text), and the
+		// source does not re-image existing rows for a retype — the values did not change, only the
+		// column's declared type did.
+		//
+		// So the fold has to re-encode what it is already holding, or a table materialised across a
+		// retype has two encodings for one column and `diff` reports every older row as different.
+		// Every retype the source performs widens toward a string-encoded type, which makes this a
+		// single rule rather than a conversion table.
+		to, _ := alterField(e, "to")
+		col, _ := alterField(e, "column")
+		t.adoptColumns(e)
+		if col == "" || !stringEncoded(to) {
+			return nil
+		}
+		for _, row := range t.rows {
+			if v, ok := row[col]; ok {
+				row[col] = asFeedString(v)
 			}
 		}
 		return nil
@@ -236,6 +524,62 @@ func (t *Table) apply(e *Event) error {
 		delete(t.rows, k)
 	}
 	return nil
+}
+
+// adoptColumns replaces the table's column list with the shape the event declares.
+func (t *Table) adoptColumns(e *Event) {
+	t.columns = t.columns[:0]
+	if list, ok := e.After["columns"].([]any); ok {
+		for _, c := range list {
+			if m, ok := c.(map[string]any); ok {
+				t.columns = append(t.columns, fmt.Sprint(m["name"]))
+			}
+		}
+	}
+}
+
+// alterField reads one string out of a schema event's `alter` payload. `checkEnvelope` has already
+// established that the required fields are present and non-empty for the op, so an empty return
+// here means the caller asked for a field this op does not have.
+func alterField(e *Event, key string) (string, bool) {
+	alter, ok := e.After["alter"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	v, ok := alter[key].(string)
+	return v, ok
+}
+
+// stringEncoded reports the feed types whose values ship as JSON strings rather than numbers.
+//
+// Mirrors the producer's rule in `replication::jsonl`, and the reason is the same: an i64 past 2^53
+// and an unbounded decimal are both corrupted by a default float64 decode, so their digits travel
+// as text. INTEGER is i32 and is deliberately NOT in this set — three orders of magnitude inside
+// what a double holds exactly, and turning it into a string would break every consumer reading that
+// column today.
+func stringEncoded(feedType string) bool {
+	switch feedType {
+	case "BIGINT", "DECIMAL", "TIMESTAMP":
+		return true
+	}
+	return false
+}
+
+// asFeedString renders a decoded JSON value the way the feed would render it as a string.
+//
+// `json.Number` keeps the digits verbatim, which is what makes this exact: the value is re-encoded
+// rather than round-tripped through a float.
+func asFeedString(v any) any {
+	switch n := v.(type) {
+	case nil:
+		return nil
+	case json.Number:
+		return n.String()
+	case string:
+		return n
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // dump prints the table as sorted JSON so a caller can compare it byte for byte.
@@ -361,6 +705,10 @@ func precision(path string) error {
 			return fmt.Errorf("line %d is not valid JSON: %w", i+1, err)
 		}
 
+		// The table this line belongs to, for the publication check below. Absent or non-string means
+		// the line is not an event envelope at all, and the check refuses an unknown table anyway.
+		table, _ := loose["table"].(string)
+
 		for _, side := range []string{"after", "before"} {
 			looseRow, ok := loose[side].(map[string]any)
 			if !ok {
@@ -373,6 +721,15 @@ func precision(path string) error {
 			}
 			sort.Strings(cols)
 			for _, col := range cols {
+				// **This subcommand does not go through decodeLine**, so it does not get the
+				// publication check from the envelope path - and it is the one mode that prints a
+				// column NAME and its VALUE to stdout. An adversarial review found it: with the guard
+				// wired only into decodeLine, `precision leaky.jsonl -publication p.txt` printed
+				// `FIELD 3 ssn string 000-11-2222` and exited 0. Refused here, per field, before
+				// anything is printed for it.
+				if err := activePublication.refuseUnpublished(table, col, "the type report for", i+1); err != nil {
+					return err
+				}
 				switch v := looseRow[col].(type) {
 				case string:
 					strings_++
@@ -411,6 +768,7 @@ func validate(path string) error {
 	}
 	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
 	var last uint64
+	attributed, unattributed := 0, 0
 	for i, line := range lines {
 		e, err := decodeLine(line, i+1)
 		if err != nil {
@@ -420,9 +778,29 @@ func validate(path string) error {
 			return fmt.Errorf("line %d: commit_lsn went backwards", i+1)
 		}
 		last = e.CommitLSN
+		// Row WRITES only. A snapshot READ describes a row that existed before the feed began and a
+		// schema event describes a table, so counting either would drown the number that matters.
+		if isRowWrite(e.Op) {
+			if e.Writer != nil {
+				attributed++
+			} else {
+				unattributed++
+			}
+		}
 	}
+	// `OK <n>` stays the first line and stays exactly parseable: it is read by
+	// `tests/integration_cdc_feed.rs`. The attribution census is a second line, because a feed that
+	// ships rows attributed to nobody looks identical, line by line, to one written by no agent —
+	// every record simply carries `"writer":null`, and only a count tells them apart.
 	fmt.Printf("OK %d\n", len(lines))
+	fmt.Printf("WRITERS attributed=%d unattributed=%d\n", attributed, unattributed)
 	return nil
+}
+
+// isRowWrite reports whether an op is a change some run performed, as opposed to a snapshot
+// observation or a declaration about a table's shape.
+func isRowWrite(op string) bool {
+	return op == "INSERT" || op == "UPDATE" || op == "DELETE"
 }
 
 func follow(addr, key string, cursor uint64, limit int) error {
@@ -718,26 +1096,70 @@ func diffAgainstSource(feedPath, sourcePath, key string) error {
 	return nil
 }
 
+// publicationFlagHelp is one wording for the flag, so four subcommands cannot describe it four ways.
+const publicationFlagHelp = "publication declaration file; the feed is refused if it carries any " +
+	"column this does not publish, or omits one it does"
+
+// refuseTrailingArgs exits non-zero when a positional argument follows the flags.
+//
+// Go's flag package stops at the first non-flag argument and reports no error, so
+// `validate feed.jsonl junk -publication p.txt` parsed to publication="" - the policy was never read,
+// nothing was enforced, and the run printed OK and exited 0. That is the exact failure the design
+// claims to prevent by making the flag the only way to switch the check on: here the flag WAS on the
+// command line and not in force. Found by an adversarial review of this file.
+//
+// Refusing leftovers rather than warning about them, because the run that would be warned about is a
+// run whose guard is off.
+func refuseTrailingArgs(fs *flag.FlagSet, usage string) {
+	if fs.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q after the flags; a positional argument here "+
+			"stops flag parsing, so -publication would be silently ignored and the feed checked "+
+			"against no policy at all\nusage: cdc-consumer %s\n", fs.Arg(0), usage)
+		os.Exit(2)
+	}
+}
+
+// mustUsePublication installs the policy or exits. Not a warning: a run asked to enforce a policy and
+// unable to read it must not land the feed anyway, because the columns it would land are exactly the
+// ones somebody was trying to hold back.
+func mustUsePublication(path string) {
+	if err := usePublication(path); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> | follow <addr> [flags] | "+
+		fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> [-publication f] | follow <addr> [flags] | "+
 			"sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] | "+
+			"retract <db> -table <t> -model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb] | "+
+			"scan <db> -table <t> [-key col] [-engine sqlite|duckdb] | "+
 			"diff <feed.jsonl> <source.json> [-key col] | duckdb-sql <file.duckdb> <sql>")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "validate":
-		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl>")
+		fs := flag.NewFlagSet("validate", flag.ExitOnError)
+		pub := fs.String("publication", "", publicationFlagHelp)
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer validate <feed.jsonl> [-publication <file>]")
 			os.Exit(2)
 		}
-		if err := validate(os.Args[2]); err != nil {
+		feed := os.Args[2]
+		if err := fs.Parse(os.Args[3:]); err != nil {
+			os.Exit(2)
+		}
+		refuseTrailingArgs(fs, "validate <feed.jsonl> [-publication <file>]")
+		mustUsePublication(*pub)
+		if err := validate(feed); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "diff":
 		fs := flag.NewFlagSet("diff", flag.ExitOnError)
 		key := fs.String("key", "id", "primary key column shared by the feed and the source dump")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer diff <feed.jsonl> <source.json> [-key col]")
 			os.Exit(2)
@@ -745,16 +1167,26 @@ func main() {
 		if err := fs.Parse(os.Args[4:]); err != nil {
 			os.Exit(2)
 		}
+		refuseTrailingArgs(fs, "diff <feed.jsonl> <source.json> [-key col] [-publication <file>]")
+		mustUsePublication(*pub)
 		if err := diffAgainstSource(os.Args[2], os.Args[3], *key); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "precision":
-		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: cdc-consumer precision <feed.jsonl>")
+		fs := flag.NewFlagSet("precision", flag.ExitOnError)
+		pub := fs.String("publication", "", publicationFlagHelp)
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer precision <feed.jsonl> [-publication <file>]")
 			os.Exit(2)
 		}
-		if err := precision(os.Args[2]); err != nil {
+		feed := os.Args[2]
+		if err := fs.Parse(os.Args[3:]); err != nil {
+			os.Exit(2)
+		}
+		refuseTrailingArgs(fs, "precision <feed.jsonl> [-publication <file>]")
+		mustUsePublication(*pub)
+		if err := precision(feed); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -763,12 +1195,15 @@ func main() {
 		dbPath := fs.String("db", "cdc.sqlite", "destination database file")
 		key := fs.String("key", "id", "primary key column")
 		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer sink <feed.jsonl> -db <file> [-engine sqlite|duckdb]")
 			os.Exit(2)
 		}
 		feed := os.Args[2]
 		_ = fs.Parse(os.Args[3:])
+		refuseTrailingArgs(fs, "sink <feed.jsonl> -db <file> [-engine sqlite|duckdb] [-publication <file>]")
+		mustUsePublication(*pub)
 		if err := runSink(feed, *dbPath, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -793,13 +1228,57 @@ func main() {
 		key := fs.String("key", "id", "column to key the materialised table by")
 		cursor := fs.Uint64("cursor", 0, "resume from this cursor; 0 means the start of the log")
 		limit := fs.Int("limit", 0, "stop after this many events; 0 means until the server closes")
+		pub := fs.String("publication", "", publicationFlagHelp)
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: cdc-consumer follow <addr> [flags]")
 			os.Exit(2)
 		}
 		addr := os.Args[2]
 		_ = fs.Parse(os.Args[3:])
+		refuseTrailingArgs(fs, "follow <addr> [-key col] [-cursor n] [-limit n] [-publication <file>]")
+		mustUsePublication(*pub)
 		if err := follow(addr, *key, *cursor, *limit); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "retract":
+		fs := flag.NewFlagSet("retract", flag.ExitOnError)
+		table := fs.String("table", "", "destination table to retract from")
+		version := fs.String("model-version", "", "the model_version whose rows to withdraw")
+		mode := fs.String("mode", string(quarantine), "quarantine (mark only) or delete (mark and tombstone)")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cdc-consumer retract <db> -table <t> "+
+				"-model-version <v> [-mode quarantine|delete] [-engine sqlite|duckdb]")
+			os.Exit(2)
+		}
+		dbPath := os.Args[2]
+		_ = fs.Parse(os.Args[3:])
+		if *table == "" {
+			fmt.Fprintln(os.Stderr, "retract needs -table")
+			os.Exit(2)
+		}
+		if err := runRetract(dbPath, *table, *version, retractMode(*mode), *engine); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "scan":
+		fs := flag.NewFlagSet("scan", flag.ExitOnError)
+		table := fs.String("table", "", "destination table to scan")
+		key := fs.String("key", "id", "primary key column")
+		engine := fs.String("engine", "sqlite", "destination engine: sqlite or duckdb")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr,
+				"usage: cdc-consumer scan <db> -table <t> [-key id] [-engine sqlite|duckdb]")
+			os.Exit(2)
+		}
+		dbPath := os.Args[2]
+		_ = fs.Parse(os.Args[3:])
+		if *table == "" {
+			fmt.Fprintln(os.Stderr, "scan needs -table")
+			os.Exit(2)
+		}
+		if err := runScan(dbPath, *table, *key, *engine); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

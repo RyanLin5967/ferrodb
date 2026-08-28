@@ -1,19 +1,21 @@
 use crate::catalog::column::DataType;
-use crate::wal::log::DdlOp;
+use crate::wal::log::{ColumnAlteration, DdlOp};
 use crate::wal::txn::DdlRecord;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_stmt, run_in_session, AgentOutput};
+use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_alter, run_agent_stmt, run_in_session, AgentOutput};
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::catalog::system_views::{self, NamedRows};
 use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
-use crate::execution::index_handle::IndexHandle;
+use crate::execution::fulltext_search::FullTextSearch;
+use crate::execution::index_handle::{FullTextHandle, IndexHandle};
 use crate::execution::session::Session;
-use crate::parser::parser::{Stmt};
+use crate::parser::parser::{AlterAction, Stmt};
 use crate::planner::plan::{Plan, explain, plan};
 use crate::storage::index::BPlusTreeManager;
 use crate::wal::txn::{ReadView, TxnManager};
@@ -43,10 +45,29 @@ pub enum Outcome {
     Explain(String),
     /// The structured result of an agent-session statement.
     Agent(AgentOutput),
+    /// Rows that carry their own column names and declared types.
+    ///
+    /// A separate variant from `Rows` rather than a widening of it, deliberately. `Rows` is what
+    /// every heap-backed `SELECT` returns and it has thirty-odd consumers across the suite; giving
+    /// it a schema would rewrite all of them for no gain, because a heap-backed row's names are
+    /// already recoverable from the catalog. What could not be recovered from anywhere was the
+    /// schema of a result with **no table behind it** — a system view — and that is what this
+    /// carries (B9).
+    Table(NamedRows),
     Ok,
 }
 
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    // B9 — read-only system views over the agent layer, checked BEFORE every other route.
+    //
+    // The order is not a preference. A view name is not in `Catalog::tables`, so every other route
+    // rejects it as an unknown table: the binder at `bind_scan`, the planner at `require_table`, and
+    // `runtime.select` inside an agent session. Checking here also means a view is readable from
+    // inside an agent session, which matters — an agent asking what the branch engine thinks of its
+    // own branch is the main reason these exist.
+    if let Some(answer) = system_views::intercept(&stmt, catalog, session.runtime.as_ref()) {
+        return answer.map(Outcome::Table);
+    }
     // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
     if is_agent_stmt(&stmt) {
         return run_agent_stmt(stmt, catalog, bp, txn, session);
@@ -88,6 +109,46 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             txn.checkpoint()?;
             return Ok(Outcome::Ok)
         }
+        // B8. Same three steps as CREATE INDEX above, for the same reasons: DDL inside a
+        // transaction is refused, and the checkpoint is what makes the new index durable — the
+        // catalog is written outside the WAL, so without it the tree exists and the record of
+        // where it is does not.
+        Stmt::CreateFullTextIndex { table, column_name, .. } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
+            catalog.create_fulltext_index(&table, &column_name)?;
+            txn.checkpoint()?;
+            return Ok(Outcome::Ok)
+        }
+        // B8 — ranked retrieval. A read, so it takes the same `ReadView` a SELECT does: inside a
+        // transaction it sees that transaction's snapshot, outside one it sees the latest committed
+        // state. That is what makes a deleted row disappear from a search for a word it contained.
+        Stmt::Search { table, column_name, query, top_k } => {
+            // Refused rather than answered, because the answer would be wrong in a way the caller
+            // could not see. An agent session's writes live on its branch and are invisible to the
+            // shared tables until MERGE, and the full-text index is a shared-table structure — so a
+            // search inside a session would silently ignore everything the session had written.
+            // `run_in_session` above handles Select/Insert/Update/Delete; teaching it retrieval
+            // means changing the branch runtime, which is not this feature's business.
+            if session.agent.is_some() {
+                return Err(FerroError::Bind(
+                    "SEARCH is not available inside an agent session: the full-text index covers the \
+                     shared tables, so it cannot see rows this branch has written and has not merged"
+                        .into(),
+                ));
+            }
+            let view = Arc::new(match session.current {
+                Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id },
+                None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+            });
+            let mut op = FullTextSearch::open(catalog, &table, &column_name, &query, top_k, bp.clone(), view)?;
+            let mut rows = Vec::new();
+            while let Some(row) = op.next() {
+                rows.push(row?.1);
+            }
+            return Ok(Outcome::Rows(rows))
+        }
         Stmt::CreateTable { table, columns } => {
             if session.current.is_some() {
                 return Err(FerroError::Txn("DDL not allowed in txn".into()))
@@ -97,8 +158,12 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 .iter()
                 .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
                 .collect();
-            catalog.create_table(table, Schema{columns})?;
-            txn.checkpoint()?;
+            // A8 — the catalog mutation and the checkpoint go through ONE barrier, because a
+            // refusal must not be able to half-happen. `checkpoint` refuses while any transaction
+            // is attached, and doing it the other way round (mutate, then ask) meant a refused
+            // `CREATE TABLE` had already created the table, with no `Ddl` record and no retained
+            // shape, so no consumer would ever learn of it. See `TxnManager::ddl_checkpointed`.
+            txn.ddl_checkpointed(|| catalog.create_table(table, Schema{columns}))?;
 
             // Logged AFTER the checkpoint, and that ordering is not stylistic: `checkpoint`
             // truncates the WAL, so a DDL record written before it would be discarded by the very
@@ -145,14 +210,94 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 let entry = catalog.require_table(&table)?;
                 (entry.first_directory_page_id, entry.time_travel_root)
             };
-            catalog.drop_table(&table)?;
-            txn.checkpoint()?;
+            // Through the same barrier as `CreateTable`, for the same reason and with the same
+            // consequence reversed: a refused DROP that had already dropped the table left it gone
+            // from the catalog with no `DROP_TABLE` record logged, so a consumer would keep the
+            // table in its own schema forever and simply never hear of it again.
+            txn.ddl_checkpointed(|| catalog.drop_table(&table))?;
+            // B9: the agent layer keys row authorship and version stamps by a hash of the table
+            // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
+            // would attribute the new table's rows to an agent that never touched it. See
+            // `AgentRuntime::forget_table`.
+            //
+            // AFTER the barrier's `?`, deliberately: a refused DROP must not forget a table that is
+            // still there. B9's own `txn.checkpoint()?` is dropped rather than kept — the wrapper
+            // above already checkpoints (`ddl_checkpointed` -> `checkpoint_locked`), and a second
+            // one would take a lock the first still holds.
+            session.runtime.forget_table(&table);
             txn.log_ddl(DdlRecord {
                 op: DdlOp::DropTable,
                 table: table.clone(),
                 dir_root,
                 time_travel_root: tt_root,
                 columns: Vec::new(),
+            })?;
+            return Ok(Outcome::Ok)
+        }
+        // B11 — the column-level half of DDL. Same shape as `CreateTable` and `DropTable` above,
+        // for the same reasons: refused inside a transaction, the catalog changed first, then a
+        // checkpoint, then the record logged AFTER it through `log_ddl` so the next checkpoint does
+        // not truncate it away.
+        //
+        // The one thing that is *not* the same: the record's `columns` is the shape the alteration
+        // PRODUCED, taken from `alter_table`'s return value rather than re-read from the catalog.
+        // Two reads of a mutable catalog are two chances to log a shape that is not the one that
+        // was applied, and `log_ddl` turns this record into the table's retained declaration — the
+        // thing a consumer is re-told after every truncation. Logging the wrong shape there is a
+        // lie that outlives the statement.
+        Stmt::AlterTable { table, action } => {
+            if session.current.is_some() {
+                return Err(FerroError::Txn("DDL not allowed in txn".into()))
+            }
+            if session.agent.is_some() {
+                return run_agent_alter(table, action, catalog, txn, session);
+            }
+            let (dir_root, tt_root, alteration) = {
+                let entry = catalog.require_table(&table)?;
+                (
+                    entry.first_directory_page_id,
+                    entry.time_travel_root,
+                    // Read BEFORE the change: a rename's old name and a retype's old type are the
+                    // half of the alteration that the resulting shape does not record, and after
+                    // the catalog is updated there is nowhere left to read them from.
+                    alteration_of(&action, &entry.schema)?,
+                )
+            };
+            let prov = session.runtime.provenance().clone();
+            let shape = catalog.alter_table(&table, &action, &txn, Some(&prov))?;
+
+            // **Flushed, NOT checkpointed — and this is the one place `ALTER` deliberately differs
+            // from `CREATE TABLE` and `DROP TABLE` above.**
+            //
+            // What those two need from `checkpoint` is durability: the catalog is written outside
+            // the WAL, so its pages have to reach the disk under their own steam. `flush_all` plus
+            // `sync` is that, exactly. What `checkpoint` *also* does is **truncate the log**, and
+            // for a whole-table DDL that costs nothing — a table being created has no history and
+            // one being dropped has no future. For a column-level change it would throw away every
+            // row change the altered table has ever emitted, at the precise moment the feature
+            // exists to keep them coherent: "a column added mid-stream" would mean "a column added,
+            // and every row before it deleted from the feed". A consumer that was behind would
+            // rebuild the table from the alter onwards and never learn what it had missed.
+            //
+            // Nothing is lost by not truncating. The record survives a *later* checkpoint through
+            // `log_ddl`'s retention, which turns it into the table's updated declaration; that is
+            // the same mechanism a `CREATE TABLE` relies on and it does not need the truncation to
+            // work.
+            //
+            // What this does NOT give is crash atomicity, and neither does any other DDL here: the
+            // catalog page and the rewritten heap pages are flushed together but not as one unit,
+            // so a crash midway can leave the two disagreeing. That is a property of the catalog
+            // living outside the WAL — recovery does not replay DDL — and this statement inherits
+            // it rather than introducing it.
+            bp.flush_all()?;
+            bp.disk_manager.sync()?;
+
+            txn.log_ddl(DdlRecord {
+                op: DdlOp::AlterColumn(alteration),
+                table: table.clone(),
+                dir_root,
+                time_travel_root: tt_root,
+                columns: shape,
             })?;
             return Ok(Outcome::Ok)
         }
@@ -231,6 +376,34 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
     }
 }
 
+/// The WAL-record half of an [`AlterAction`]: what the resulting shape cannot say.
+///
+/// Called with the schema as it stands **before** the change. A rename's old name and a retype's
+/// old type exist only here; everything else about the alteration is recoverable from the new
+/// shape the record also carries.
+pub fn alteration_of(action: &AlterAction, before: &Schema) -> Result<ColumnAlteration, FerroError> {
+    Ok(match action {
+        AlterAction::AddColumn(col) => ColumnAlteration::Add { column: col.name.clone() },
+        AlterAction::RenameColumn { from, to } => {
+            ColumnAlteration::Rename { from: from.clone(), to: to.clone() }
+        }
+        AlterAction::RetypeColumn { column, .. } => {
+            let from = before
+                .columns
+                .iter()
+                .find(|c| &c.name == column)
+                .map(|c| c.data_type.clone())
+                .ok_or_else(|| {
+                    FerroError::Bind(format!(
+                        "no column '{column}' to retype; the table has: {}",
+                        before.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+            ColumnAlteration::Retype { column: column.clone(), from }
+        }
+    })
+}
+
 pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value, RecordId>, secondaries: &[IndexHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
     let cur_primary = primary.root_page_id.load(Ordering::Relaxed);
     let stored_primary = catalog.get_table(table).ok_or(FerroError::KeyNotFound)?.primary_index_root;
@@ -243,6 +416,27 @@ pub fn sync_roots(table: &str, schema: &Schema, primary: &BPlusTreeManager<Value
         let stored = catalog.get_table(table).and_then(|e| e.indexes.iter().find(|i| i.column_name == col_name).map(|i| i.root_page_id));
         if stored != Some(cur) {
             catalog.update_index_root(table, &col_name, cur)?;
+        }
+    }
+    Ok(())
+}
+
+/// `sync_roots` for the full-text list — B8.
+///
+/// A posting tree splits like any other, and its root moves when it does. The catalog is written
+/// outside the WAL, so a root that is not written back is a tree the next open cannot find: it would
+/// read the pre-split root, which is now an interior node with a *subset* of the postings under it,
+/// and answer a search with a silently short result.
+///
+/// Separate from `sync_roots` because the lists are separate. Matching a full-text column name
+/// inside `TableEntry::indexes` would either miss it or find a same-named B-tree index and record a
+/// token tree's root as that index's.
+pub fn sync_fulltext_roots(table: &str, fulltext: &[FullTextHandle], catalog: &mut Catalog) -> Result<(), FerroError> {
+    for handle in fulltext {
+        let cur = handle.tree.root_page_id.load(Ordering::Relaxed);
+        let stored = catalog.get_table(table).and_then(|e| e.fulltext_indexes.iter().find(|i| i.column_name == handle.column_name).map(|i| i.root_page_id));
+        if stored != Some(cur) {
+            catalog.update_fulltext_root(table, &handle.column_name, cur)?;
         }
     }
     Ok(())

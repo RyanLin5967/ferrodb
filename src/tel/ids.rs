@@ -17,8 +17,32 @@ use crate::branch::types::BranchId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RowId(pub u64);
 
+impl RowId {
+    /// **The table's shape, rather than one of its rows** — B11.
+    ///
+    /// A `ConflictReport` names a `(table, row)` because every conflict the merge engine could
+    /// produce before this was about a cell. A column-level schema conflict is about the table
+    /// itself, and there is no row to name. Rather than making `row` an `Option` — which would
+    /// force every existing reader of a report to handle a case that only one producer can
+    /// generate — the shape gets a reserved id of its own.
+    ///
+    /// `u64::MAX` is safe to reserve because a `RowId` is minted by `row_id_of`, an FNV-1a hash of
+    /// the row's primary key, and `is_schema` below is the only thing that reads it back. A row
+    /// that hashed to it would be reported as a schema conflict, which is why the value is at the
+    /// far end of the space rather than a small number anything could collide with by accident.
+    pub const SCHEMA: RowId = RowId(u64::MAX);
+
+    /// True for [`RowId::SCHEMA`]. Read this rather than comparing against `u64::MAX` inline.
+    pub fn is_schema(&self) -> bool {
+        *self == RowId::SCHEMA
+    }
+}
+
 impl Display for RowId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_schema() {
+            return f.write_str("schema");
+        }
         write!(f, "row{}", self.0)
     }
 }

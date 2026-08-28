@@ -1,6 +1,12 @@
-use std::{fs::{File, OpenOptions}, mem::take, path::PathBuf, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+use std::{fs::OpenOptions, mem::take, path::PathBuf, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
 
-use crate::{catalog::column::DataType, error::FerroError, storage::disk_manager::{pread, pwrite}};
+use crate::{
+    branch::types::BranchId,
+    catalog::column::DataType,
+    error::FerroError,
+    provenance::{ProvId, RunEntity},
+    storage::storage::Storage,
+};
 
 const HEADER_SIZE: usize = 24;
 const MAGIC: u32 = 0xF3_EE_DB_01;
@@ -10,7 +16,12 @@ const MIN_FRAME: usize = 33;
 
 // need next_txn_id for mvcc, and then multi txn statements before mvcc
 pub struct WalManager {
-    pub file: Mutex<File>,
+    /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
+    /// this log — a torn frame, a lost frame, a flush that reports success it did not achieve. Those
+    /// are the faults `scan_valid_end` and the CRC exist to survive, and until this seam existed the
+    /// only way to stage one was to edit the file after closing it. `impl Storage for File` keeps the
+    /// production path on the same syscalls.
+    pub file: Mutex<Arc<dyn Storage>>,
     pub buffer: Mutex<WalBuffer>,
     pub next_lsn: AtomicU64,
     pub flushed_lsn: AtomicU64,
@@ -72,10 +83,43 @@ pub struct WalBuffer {
 }
 
 /// What a [`RecKind::Ddl`] record describes.
-#[derive(Debug, PartialEq, Clone, Copy)]
+///
+/// **No longer `Copy`, on purpose.** `AlterColumn` carries the column names the change is about,
+/// and those cannot be reconstructed from the record's `columns` list: a rename's *old* name is
+/// gone from the new shape, and a retype's *old* type is gone from it too. A reader handed only
+/// the resulting shape sees a rename as one column vanishing and another appearing, which a sink
+/// would apply as DROP + ADD — losing the column's data. So the alteration travels with the op.
+#[derive(Debug, PartialEq, Clone)]
 pub enum DdlOp {
     CreateTable,
     DropTable,
+    /// A column-level change. The record's `columns` still carries the table's **full shape after
+    /// the change**, exactly as `CreateTable` does, so one retained record per table remains a
+    /// complete description of it.
+    AlterColumn(ColumnAlteration),
+}
+
+/// Which column-level change a [`DdlOp::AlterColumn`] describes, and the half of it that the
+/// resulting shape does not record.
+#[derive(Debug, PartialEq, Clone)]
+pub enum ColumnAlteration {
+    /// A column appended at the end. Its type and nullability are in the record's `columns`.
+    Add { column: String },
+    /// A column renamed. `to` is in the record's `columns`; `from` is nowhere else.
+    Rename { from: String, to: String },
+    /// A column's type changed. The new type is in the record's `columns`; `from` is nowhere else.
+    Retype { column: String, from: DataType },
+}
+
+impl ColumnAlteration {
+    /// The column the change is about, named as it is **after** the change.
+    pub fn column(&self) -> &str {
+        match self {
+            ColumnAlteration::Add { column } => column,
+            ColumnAlteration::Rename { to, .. } => to,
+            ColumnAlteration::Retype { column, .. } => column,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -101,6 +145,32 @@ pub enum RecKind {
         /// `(name, type, nullable)` per column. Empty for a drop.
         columns: Vec<(String, DataType, bool)>,
     },
+    /// **Who wrote this transaction**: one interned [`RunEntity`], bound to the record's `txn_id`.
+    ///
+    /// Tag 10. Tags 0..9 were taken when this arrived, and it takes the next free number rather
+    /// than reusing one, so a WAL written before this variant existed still replays — the same
+    /// additive discipline the wide column types followed at `DataType::BigInt`.
+    ///
+    /// # It carries the whole entity, and that is not redundancy
+    ///
+    /// A bare `prov_id` would be a reference into a table the log does not contain. Provenance is
+    /// interned *in memory*, so a reader of an archived log — or of a log whose database is gone —
+    /// would hold a number naming nothing. Carrying the tuple makes the log self-describing about
+    /// its writers for exactly the reason [`RecKind::Ddl`] carries the columns rather than a table
+    /// id: a decoder must be able to answer from the log alone.
+    ///
+    /// The density argument in `provenance` is untouched by this. Interning is about the cost per
+    /// *row version*, and this is one record per **transaction**, not per row.
+    ///
+    /// # Two jobs, one variant, told apart by `txn_id`
+    ///
+    /// * `txn_id != 0` — a **binding**: this transaction's changes were written by this run. It is
+    ///   appended immediately before the `Commit`, and [`crate::replication::logical`] documents
+    ///   at length why anywhere else loses it.
+    /// * `txn_id == 0` — a **declaration**: this run exists. Written by `TxnManager` after every
+    ///   checkpoint, because a checkpoint discards the log whole, exactly as `replay_schema` does
+    ///   for DDL. Transaction 0 never commits, so a declaration binds nothing.
+    RunIdentity { run: RunEntity },
 }
 
 pub struct LogRecord {
@@ -111,7 +181,12 @@ pub struct LogRecord {
 }
 
 /// Length-prefixed string, so a name containing anything at all cannot desync the reader.
-fn write_str(buffer: &mut Vec<u8>, s: &str) {
+///
+/// `pub(crate)` rather than private because the durable provenance store writes the same
+/// length-prefixed strings into its own file. One encoder means the two formats cannot disagree
+/// about what a string is, and a second hand-written one is a second place for the same
+/// off-by-two to live.
+pub(crate) fn write_str(buffer: &mut Vec<u8>, s: &str) {
     buffer.extend_from_slice(&(s.len() as u16).to_be_bytes());
     buffer.extend_from_slice(s.as_bytes());
 }
@@ -119,36 +194,93 @@ fn write_str(buffer: &mut Vec<u8>, s: &str) {
 // Bounds-checked readers. These bytes arrive from a disk or a socket, so every read has to be able
 // to refuse: indexing past the end of a truncated record panics the whole process, which is a
 // denial of service triggered by a corrupt log rather than a parse error.
-fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
+pub(crate) fn take_u8(bytes: &[u8], at: &mut usize) -> Result<u8, FerroError> {
     let v = *bytes.get(*at).ok_or_else(|| short(*at, 1, bytes.len()))?;
     *at += 1;
     Ok(v)
 }
 
-fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
+pub(crate) fn take_u16(bytes: &[u8], at: &mut usize) -> Result<u16, FerroError> {
     let end = *at + 2;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 2, bytes.len()))?;
     *at = end;
     Ok(u16::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
+pub(crate) fn take_u32(bytes: &[u8], at: &mut usize) -> Result<u32, FerroError> {
     let end = *at + 4;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 4, bytes.len()))?;
     *at = end;
     Ok(u32::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
+pub(crate) fn take_u64(bytes: &[u8], at: &mut usize) -> Result<u64, FerroError> {
+    let end = *at + 8;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, 8, bytes.len()))?;
+    *at = end;
+    Ok(u64::from_be_bytes(slice.try_into().unwrap()))
+}
+
+/// Exactly `N` bytes, refusing a record too short to hold them.
+pub(crate) fn take_array<const N: usize>(
+    bytes: &[u8],
+    at: &mut usize,
+) -> Result<[u8; N], FerroError> {
+    let end = *at + N;
+    let slice = bytes.get(*at..end).ok_or_else(|| short(*at, N, bytes.len()))?;
+    *at = end;
+    Ok(slice.try_into().unwrap())
+}
+
+pub(crate) fn take_str(bytes: &[u8], at: &mut usize) -> Result<String, FerroError> {
     let len = take_u16(bytes, at)? as usize;
     let end = *at + len;
     let slice = bytes.get(*at..end).ok_or_else(|| short(*at, len, bytes.len()))?;
     *at = end;
     String::from_utf8(slice.to_vec())
-        .map_err(|e| FerroError::Wal(format!("ddl record holds a non-utf8 name: {e}")))
+        .map_err(|e| FerroError::Wal(format!("log record holds a non-utf8 string: {e}")))
 }
 
-fn short(at: usize, want: usize, have: usize) -> FerroError {
+/// A [`DataType`] as one tag byte plus whatever payload the type carries.
+///
+/// One definition, two call sites: a column in the record's shape list, and the *old* type inside
+/// a [`ColumnAlteration::Retype`]. Written as a function rather than twice inline so a type added
+/// to `DataType` fails to compile here instead of acquiring two different tags.
+fn write_data_type(buffer: &mut Vec<u8>, ty: &DataType) {
+    // Varchar's length is part of the type, so a consumer that recreates the column gets the same
+    // width. Tags 0..3 are fixed by every DDL record already in a log; the wide types took the
+    // next free numbers so an existing WAL still replays.
+    match ty {
+        DataType::Integer => buffer.push(0),
+        DataType::Float => buffer.push(1),
+        DataType::Boolean => buffer.push(2),
+        DataType::Varchar(n) => {
+            buffer.push(3);
+            buffer.extend_from_slice(&n.to_be_bytes());
+        }
+        DataType::BigInt => buffer.push(4),
+        DataType::Decimal => buffer.push(5),
+        DataType::Timestamp => buffer.push(6),
+    }
+}
+
+fn read_data_type(bytes: &[u8], at: &mut usize) -> Result<DataType, FerroError> {
+    Ok(match take_u8(bytes, at)? {
+        0 => DataType::Integer,
+        1 => DataType::Float,
+        2 => DataType::Boolean,
+        3 => DataType::Varchar(take_u16(bytes, at)?),
+        4 => DataType::BigInt,
+        5 => DataType::Decimal,
+        6 => DataType::Timestamp,
+        other => return Err(FerroError::Wal(format!("unknown column type tag {other}"))),
+    })
+}
+
+// `pub(crate)`, which is HEAD's visibility: B10's `storage::sim`, `branch::arena`,
+// `branch::record` and `cow::page_header` all read from this module, and B11's private `fn short`
+// would have made this file's own error helper unreachable from them.
+pub(crate) fn short(at: usize, want: usize, have: usize) -> FerroError {
     FerroError::Wal(format!(
         "log record is truncated: wanted {want} byte(s) at offset {at} but the record is {have} bytes"
     ))
@@ -190,31 +322,54 @@ impl RecKind {
             }
             RecKind::Ddl { op, table, dir_root, time_travel_root, columns } => {
                 buffer.push(9);
-                buffer.push(match op { DdlOp::CreateTable => 0, DdlOp::DropTable => 1 });
+                // Tags 0 and 1 keep their meaning and their position, so every DDL record already
+                // in a log still deserializes byte for byte. The alteration's payload is written
+                // immediately after the op byte and only for tag 2, so nothing that reads an older
+                // record is offset by it.
+                match op {
+                    DdlOp::CreateTable => buffer.push(0),
+                    DdlOp::DropTable => buffer.push(1),
+                    DdlOp::AlterColumn(alt) => {
+                        buffer.push(2);
+                        match alt {
+                            ColumnAlteration::Add { column } => {
+                                buffer.push(0);
+                                write_str(buffer, column);
+                            }
+                            ColumnAlteration::Rename { from, to } => {
+                                buffer.push(1);
+                                write_str(buffer, from);
+                                write_str(buffer, to);
+                            }
+                            ColumnAlteration::Retype { column, from } => {
+                                buffer.push(2);
+                                write_str(buffer, column);
+                                write_data_type(buffer, from);
+                            }
+                        }
+                    }
+                }
                 buffer.extend_from_slice(&dir_root.to_be_bytes());
                 buffer.extend_from_slice(&time_travel_root.to_be_bytes());
                 write_str(buffer, table);
                 buffer.extend_from_slice(&(columns.len() as u16).to_be_bytes());
                 for (name, ty, nullable) in columns {
                     write_str(buffer, name);
-                    // Type tag, then any payload the type carries. Varchar's length is part of the
-                    // type, so a consumer that recreates the column gets the same width.
-                    match ty {
-                        DataType::Integer => buffer.push(0),
-                        DataType::Float => buffer.push(1),
-                        DataType::Boolean => buffer.push(2),
-                        DataType::Varchar(n) => {
-                            buffer.push(3);
-                            buffer.extend_from_slice(&n.to_be_bytes());
-                        }
-                        // Tags 0..3 are fixed by every DDL record already in a log; the wide
-                        // types take the next free numbers so an existing WAL still replays.
-                        DataType::BigInt => buffer.push(4),
-                        DataType::Decimal => buffer.push(5),
-                        DataType::Timestamp => buffer.push(6),
-                    }
+                    write_data_type(buffer, ty);
                     buffer.push(if *nullable { 1 } else { 0 });
                 }
+            }
+            RecKind::RunIdentity { run } => {
+                buffer.push(10);
+                buffer.extend_from_slice(&run.prov_id.0.to_be_bytes());
+                write_str(buffer, &run.agent_id);
+                write_str(buffer, &run.run_id);
+                write_str(buffer, &run.model);
+                write_str(buffer, &run.model_version);
+                buffer.extend_from_slice(&run.prompt_hash);
+                buffer.extend_from_slice(&run.started_at.to_be_bytes());
+                buffer.extend_from_slice(&run.parent_branch.id.to_be_bytes());
+                buffer.extend_from_slice(&run.parent_branch.generation.to_be_bytes());
             }
             RecKind::Clr { undone_lsn, undo_next, redo } => {
                 buffer.push(8);
@@ -260,6 +415,22 @@ impl RecKind {
                 let op = match take_u8(bytes, &mut at)? {
                     0 => DdlOp::CreateTable,
                     1 => DdlOp::DropTable,
+                    2 => DdlOp::AlterColumn(match take_u8(bytes, &mut at)? {
+                        0 => ColumnAlteration::Add { column: take_str(bytes, &mut at)? },
+                        1 => ColumnAlteration::Rename {
+                            from: take_str(bytes, &mut at)?,
+                            to: take_str(bytes, &mut at)?,
+                        },
+                        2 => ColumnAlteration::Retype {
+                            column: take_str(bytes, &mut at)?,
+                            from: read_data_type(bytes, &mut at)?,
+                        },
+                        other => {
+                            return Err(FerroError::Wal(format!(
+                                "unknown column alteration tag {other}"
+                            )))
+                        }
+                    }),
                     other => return Err(FerroError::Wal(format!("unknown ddl op {other}"))),
                 };
                 let dir_root = take_u32(bytes, &mut at)?;
@@ -269,22 +440,44 @@ impl RecKind {
                 let mut columns = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     let name = take_str(bytes, &mut at)?;
-                    let ty = match take_u8(bytes, &mut at)? {
-                        0 => DataType::Integer,
-                        1 => DataType::Float,
-                        2 => DataType::Boolean,
-                        3 => DataType::Varchar(take_u16(bytes, &mut at)?),
-                        4 => DataType::BigInt,
-                        5 => DataType::Decimal,
-                        6 => DataType::Timestamp,
-                        other => {
-                            return Err(FerroError::Wal(format!("unknown column type tag {other}")))
-                        }
-                    };
+                    let ty = read_data_type(bytes, &mut at)?;
                     let nullable = take_u8(bytes, &mut at)? != 0;
                     columns.push((name, ty, nullable));
                 }
                 Ok(RecKind::Ddl { op, table, dir_root, time_travel_root, columns })
+            }
+            10 => {
+                // Bounds-checked throughout, for the same reason the DDL arm is: these bytes came
+                // off a disk, and a truncated record must be refused rather than indexed past.
+                let mut at = 1usize;
+                let prov_id = ProvId(take_u32(bytes, &mut at)?);
+                if prov_id.is_none() {
+                    return Err(FerroError::Wal(
+                        "run identity record names ProvId::NONE, which is the value meaning \
+                         'unattributed'; a record claiming a writer must name one"
+                            .into(),
+                    ));
+                }
+                let agent_id = take_str(bytes, &mut at)?;
+                let run_id = take_str(bytes, &mut at)?;
+                let model = take_str(bytes, &mut at)?;
+                let model_version = take_str(bytes, &mut at)?;
+                let prompt_hash = take_array::<32>(bytes, &mut at)?;
+                let started_at = take_u64(bytes, &mut at)?;
+                let branch_id = take_u64(bytes, &mut at)?;
+                let generation = take_u32(bytes, &mut at)?;
+                Ok(RecKind::RunIdentity {
+                    run: RunEntity::new(
+                        prov_id,
+                        agent_id,
+                        run_id,
+                        model,
+                        model_version,
+                        prompt_hash,
+                        started_at,
+                        BranchId::new(branch_id, generation),
+                    ),
+                })
             }
             8 => {
                 let undone_lsn = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -298,9 +491,16 @@ impl RecKind {
 }
 
 impl WalManager {
+    /// Open the log on a real file. The production entry point.
     pub fn new(path: PathBuf) -> Result<Self, FerroError> {
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| FerroError::Wal(e.to_string()))?;
-        let len = file.metadata().map_err(|e| FerroError::Wal(e.to_string()))?.len();
+        Self::with_storage(Arc::new(file), path)
+    }
+
+    /// Open the log on any [`Storage`]. `path` is still carried because callers report it and
+    /// `WalManager::path` is public; nothing here opens it.
+    pub fn with_storage(file: Arc<dyn Storage>, path: PathBuf) -> Result<Self, FerroError> {
+        let len = file.len().map_err(|e| FerroError::Wal(e.to_string()))?;
 
         let (base_lsn, header_txn_id) = if len == 0 {
             let mut header = [0u8; HEADER_SIZE];
@@ -308,12 +508,12 @@ impl WalManager {
             header[4..8].copy_from_slice(&VERSION.to_be_bytes());
             header[8..16].copy_from_slice(&INITIAL_LSN.to_be_bytes());
             header[16..24].copy_from_slice(&1u64.to_be_bytes());
-            pwrite_all(&file, &header, 0)?;
+            pwrite_all(&*file, &header, 0)?;
             file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
             (INITIAL_LSN, 1u64)
         } else {
             let mut header = [0u8; HEADER_SIZE];
-            pread_all(&file, &mut header, 0)?;
+            pread_all(&*file, &mut header, 0)?;
             if u32::from_be_bytes(header[0..4].try_into().unwrap()) != MAGIC {
                 return Err(FerroError::Wal("incorrect magic".into()));
             }
@@ -324,7 +524,7 @@ impl WalManager {
             let txn_hwn = u64::from_be_bytes(header[16..24].try_into().unwrap());
             (base, txn_hwn)
         };
-        let valid_end = scan_valid_end(&file, base_lsn, len)?;
+        let valid_end = scan_valid_end(&*file, base_lsn, len)?;
         let file_end = HEADER_SIZE as u64 + (valid_end - base_lsn);
         if file_end < len {
             file.set_len(file_end).map_err(|e| FerroError::Wal(e.to_string()))?;
@@ -416,13 +616,13 @@ impl WalManager {
             })?;
             let offset = HEADER_SIZE as u64 + rel;
             let mut len_buf = [0u8; 4];
-            pread_all(&file, &mut len_buf, offset)?;
+            pread_all(&**file, &mut len_buf, offset)?;
             let total = u32::from_be_bytes(len_buf) as usize;
             if total < MIN_FRAME {
                 return Err(FerroError::Wal("incorrect record length".into()));
             }
             let mut buf = vec![0u8; total];
-            pread_all(&file, &mut buf, offset)?;
+            pread_all(&**file, &mut buf, offset)?;
             buf
         };
         let total = frame.len();
@@ -496,7 +696,7 @@ impl WalManager {
             FerroError::Wal(format!("lsn {lsn} is below the log's base; it was truncated away"))
         })?;
         let mut buf = vec![0u8; len];
-        pread_all(&file, &mut buf, HEADER_SIZE as u64 + rel)?;
+        pread_all(&**file, &mut buf, HEADER_SIZE as u64 + rel)?;
         Ok(buf)
     }
 
@@ -533,7 +733,7 @@ impl WalManager {
         header[4..8].copy_from_slice(&VERSION.to_be_bytes());
         header[8..16].copy_from_slice(&next.to_be_bytes());
         header[16..24].copy_from_slice(&next_txn_id.to_be_bytes());
-        pwrite_all(&file, &mut header, 0)?;
+        pwrite_all(&**file, &mut header, 0)?;
         file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))?;
         file.set_len(HEADER_SIZE as u64).map_err(|e| FerroError::Wal(e.to_string()))?;
         file.sync_all().map_err(|e| FerroError::Wal(e.to_string()))?;
@@ -575,7 +775,7 @@ impl WalManager {
         let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn.load(Ordering::SeqCst));
         let wrote = {
             let file = self.file.lock().unwrap();
-            pwrite_all(&file, &bytes, offset)
+            pwrite_all(&**file, &bytes, offset)
                 .and_then(|()| file.sync_data().map_err(|e| FerroError::Wal(e.to_string())))
         };
         if let Err(e) = wrote {
@@ -600,7 +800,7 @@ impl WalManager {
     }
 }
 
-pub fn scan_valid_end(file: &File, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{
+pub fn scan_valid_end(file: &dyn Storage, base_lsn: u64, file_len: u64) -> Result<u64, FerroError>{
     let mut offset = HEADER_SIZE as u64;
     loop {
         if offset + 4 > file_len {
@@ -664,9 +864,9 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-pub fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> Result<(), FerroError> {
+pub fn pwrite_all(file: &dyn Storage, mut buf: &[u8], mut offset: u64) -> Result<(), FerroError> {
     while !buf.is_empty() {
-        match pwrite(file, buf, offset) {
+        match file.pwrite(buf, offset) {
             Ok(0) => return Err(FerroError::Wal("wrote 0 bytes".into())),
             Ok(n) => {
                 buf = &buf[n..];
@@ -678,10 +878,10 @@ pub fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> Result<(), Fe
     Ok(())
 }
 
-pub fn pread_all(file: &File, buf: &mut [u8], mut offset: u64) -> Result<(), FerroError>{
+pub fn pread_all(file: &dyn Storage, buf: &mut [u8], mut offset: u64) -> Result<(), FerroError>{
     let mut total_read = 0;
     while total_read < buf.len() {
-        match pread(file, &mut buf[total_read..], offset) {
+        match file.pread(&mut buf[total_read..], offset) {
             Ok(0) => return Err(FerroError::Wal("eof before finished record".into())),
             Ok(n) => {
                 total_read += n;
@@ -797,7 +997,17 @@ mod tests {
             RecKind::HeapInsert { dir_root: 1, page_id: 2, slot: 3, tuple: vec![4, 5, 6] },
             RecKind::HeapDelete { dir_root: 1, page_id: 2, slot: 4, old: vec![7, 8, 9] },
             RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![1], new: vec![4,5] },
-            RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) }
+            RecKind::Clr { undone_lsn: 2, undo_next: 4, redo: Box::new(RecKind::HeapUpdate { dir_root: 1, page_id: 3, slot: 4, old: vec![4, 5], new: vec![1] }) },
+            RecKind::RunIdentity { run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(7),
+                "restock-agent",
+                "run-42",
+                "claude-opus",
+                "2026-05",
+                [0xab; 32],
+                1_700_000_000_000,
+                crate::branch::types::BranchId::new(4, 3),
+            ) },
         ];
 
         for case in cases {
@@ -891,5 +1101,204 @@ mod tests {
     fn deserialize_rejects_empty_and_unknown_tag() {
         assert!(RecKind::deserialize(&[]).is_err());
         assert!(RecKind::deserialize(&[99]).is_err());
+    }
+
+    /// **The additive-tag discipline, for tag 10.**
+    ///
+    /// Tags 0..9 were taken when `RunIdentity` arrived, so it took the next free number. A log
+    /// written before it existed contains none of them, and every record in it must still decode —
+    /// which is the property that lets this variant be added to a running database at all. Checked
+    /// by decoding one of every older tag after the new one was introduced.
+    ///
+    /// Breaking shape: reusing an existing tag, or renumbering. Either produces a build in which
+    /// yesterday's log decodes into today's record type with the wrong fields, which is far worse
+    /// than a decode error because it succeeds.
+    #[test]
+    fn an_older_logs_records_still_decode_after_the_new_tag_was_added() {
+        for (tag, kind) in [
+            (0u8, RecKind::Begin),
+            (1, RecKind::Commit),
+            (2, RecKind::Abort),
+            (3, RecKind::TxnEnd),
+            (4, RecKind::Checkpoint),
+        ] {
+            let mut buf = Vec::new();
+            kind.serialize(&mut buf);
+            assert_eq!(buf[0], tag, "the tag of {kind:?} moved; an existing log now misdecodes");
+            assert_eq!(RecKind::deserialize(&buf).unwrap(), kind);
+        }
+        let mut buf = Vec::new();
+        RecKind::Ddl {
+            op: DdlOp::CreateTable,
+            table: "t".into(),
+            dir_root: 1,
+            time_travel_root: 2,
+            columns: vec![("c".into(), DataType::Integer, true)],
+        }
+        .serialize(&mut buf);
+        assert_eq!(buf[0], 9, "the DDL tag moved");
+
+        let mut buf = Vec::new();
+        RecKind::RunIdentity {
+            run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(1),
+                "a",
+                "r",
+                "m",
+                "v",
+                [0u8; 32],
+                0,
+                crate::branch::types::BranchId::TRUNK,
+            ),
+        }
+        .serialize(&mut buf);
+        assert_eq!(buf[0], 10, "run identity must be tag 10; 0..9 are taken by existing logs");
+    }
+
+    /// A run identity record must name a run. `ProvId::NONE` is the value meaning *unattributed*,
+    /// so a record carrying it would claim a writer and name none — and every row of that commit
+    /// would then be attributed to a slot that resolves to nothing.
+    #[test]
+    fn a_run_identity_record_that_names_no_run_is_refused() {
+        let run = crate::provenance::RunEntity::new(
+            crate::provenance::ProvId(3),
+            "restock-agent",
+            "run-42",
+            "claude-opus",
+            "2026-05",
+            [1u8; 32],
+            5,
+            crate::branch::types::BranchId::new(2, 0),
+        );
+        let mut buf = Vec::new();
+        RecKind::RunIdentity { run }.serialize(&mut buf);
+        // Anti-vacuity: it decodes as written, so the refusal below is about the id and not about
+        // the record being unreadable.
+        RecKind::deserialize(&buf).expect("a well-formed run identity record was refused");
+
+        // prov_id occupies bytes 1..5.
+        buf[1..5].copy_from_slice(&0u32.to_be_bytes());
+        let err = RecKind::deserialize(&buf).expect_err("a record naming ProvId::NONE was accepted");
+        assert!(format!("{err}").contains("ProvId::NONE"), "{err}");
+    }
+
+    /// A truncated run identity record is refused rather than indexed past. These bytes arrive from
+    /// a disk; reading off the end of one panics the whole process.
+    #[test]
+    fn a_truncated_run_identity_record_is_refused_rather_than_panicking() {
+        let mut buf = Vec::new();
+        RecKind::RunIdentity {
+            run: crate::provenance::RunEntity::new(
+                crate::provenance::ProvId(1),
+                "restock-agent",
+                "run-42",
+                "claude-opus",
+                "2026-05",
+                [9u8; 32],
+                77,
+                crate::branch::types::BranchId::new(1, 0),
+            ),
+        }
+        .serialize(&mut buf);
+        assert!(RecKind::deserialize(&buf).is_ok(), "the intact record was refused");
+        for cut in 1..buf.len() {
+            let err = RecKind::deserialize(&buf[..cut]);
+            assert!(err.is_err(), "a record truncated to {cut} bytes decoded as if it were whole");
+        }
+    }
+
+    // ---- B11: column-level DDL records ---------------------------------------------------------
+
+    fn ddl(op: DdlOp, columns: Vec<(String, DataType, bool)>) -> RecKind {
+        RecKind::Ddl { op, table: "inventory".into(), dir_root: 7, time_travel_root: 8, columns }
+    }
+
+    fn round_trip(rec: &RecKind) -> RecKind {
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        RecKind::deserialize(&bytes).expect("a record this code just wrote did not read back")
+    }
+
+    /// **Breaking shape: an alteration whose payload is not recoverable from the resulting shape.**
+    ///
+    /// A rename's old name and a retype's old type exist nowhere except in the op itself. If the
+    /// op byte were written without its payload — as tags 0 and 1 are — these three records would
+    /// all deserialize as the same thing, and a consumer would see a rename as a drop plus an add.
+    #[test]
+    fn every_column_alteration_survives_the_log_round_trip() {
+        let shape = vec![
+            ("id".to_string(), DataType::Integer, false),
+            ("note".to_string(), DataType::Varchar(20), true),
+        ];
+        for op in [
+            DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+            DdlOp::AlterColumn(ColumnAlteration::Rename {
+                from: "memo".into(),
+                to: "note".into(),
+            }),
+            DdlOp::AlterColumn(ColumnAlteration::Retype {
+                column: "note".into(),
+                from: DataType::Varchar(4),
+            }),
+        ] {
+            let rec = ddl(op.clone(), shape.clone());
+            assert_eq!(round_trip(&rec), rec, "{op:?} did not survive serialization");
+        }
+    }
+
+    /// **Anti-vacuity, and the compatibility claim in `serialize`'s comment, measured.**
+    ///
+    /// Tags 0 and 1 must still lay down the exact bytes they laid down before the alteration
+    /// payload existed, or every DDL record already in a log stops replaying. Breaking shape: an
+    /// alteration payload written unconditionally after the op byte.
+    #[test]
+    fn create_and_drop_records_keep_their_byte_layout() {
+        let shape = vec![("id".to_string(), DataType::Integer, false)];
+        for (op, tag) in [(DdlOp::CreateTable, 0u8), (DdlOp::DropTable, 1u8)] {
+            let rec = ddl(op.clone(), shape.clone());
+            let mut bytes = Vec::new();
+            rec.serialize(&mut bytes);
+            assert_eq!(bytes[0], 9, "the record kind tag moved");
+            assert_eq!(bytes[1], tag, "the ddl op tag moved");
+            // dir_root is the next four bytes, exactly as before: nothing was inserted between.
+            assert_eq!(u32::from_be_bytes(bytes[2..6].try_into().unwrap()), 7);
+            assert_eq!(round_trip(&rec), rec);
+        }
+    }
+
+    /// A truncated alteration payload must be refused, not indexed past. These bytes arrive off a
+    /// disk. Breaking shape: a record cut anywhere inside the alteration's strings.
+    #[test]
+    fn a_truncated_alteration_is_refused_rather_than_panicking() {
+        let rec = ddl(
+            DdlOp::AlterColumn(ColumnAlteration::Rename {
+                from: "memo".into(),
+                to: "note".into(),
+            }),
+            vec![("note".to_string(), DataType::Varchar(20), true)],
+        );
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        for cut in 2..bytes.len() {
+            // Every prefix is either a clean refusal or, for a prefix that happens to be a valid
+            // shorter record, something that is not this record. Never a panic.
+            let _ = RecKind::deserialize(&bytes[..cut]);
+        }
+        assert!(RecKind::deserialize(&bytes[..4]).is_err(), "a 4-byte alteration record parsed");
+    }
+
+    /// An alteration tag this build does not know is refused by name, not silently read as one it
+    /// does know. Breaking shape: a log written by a newer build.
+    #[test]
+    fn an_unknown_alteration_tag_is_refused() {
+        let rec = ddl(
+            DdlOp::AlterColumn(ColumnAlteration::Add { column: "note".into() }),
+            vec![("note".to_string(), DataType::Varchar(20), true)],
+        );
+        let mut bytes = Vec::new();
+        rec.serialize(&mut bytes);
+        bytes[2] = 99; // the alteration sub-tag
+        let err = RecKind::deserialize(&bytes).expect_err("an unknown alteration tag was accepted");
+        assert!(format!("{err}").contains("column alteration tag"), "{err}");
     }
 }

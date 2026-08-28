@@ -107,19 +107,27 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // catalog is a map that re-issues pages the catalog still points at.
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
-    let runtime = Arc::new(if arena_exists {
-        AgentRuntime::reopen_with_storage(
-            branches.clone() as Arc<dyn BranchCatalog>,
-            Arc::new(MemEffectLog::new()),
-            store.clone() as Arc<dyn PageStore>,
-        )?
-    } else {
-        AgentRuntime::with_storage(
-            branches.clone() as Arc<dyn BranchCatalog>,
-            Arc::new(MemEffectLog::new()),
-            store.clone() as Arc<dyn PageStore>,
-        )?
-    });
+    // Provenance on disk, not in this process. Without this the runtime interns runs into a
+    // `MemProvenanceStore`, so `who_wrote_row` and `ferro_row_authors` answer correctly for as long
+    // as the CLI is open and answer nothing after a restart — the rows keep their author stamp, and
+    // the table mapping a slot to an agent is gone. Applied here because this is the layer that owns
+    // the database's name; the constructors take page stores and have no path to open.
+    let runtime = Arc::new(
+        if arena_exists {
+            AgentRuntime::reopen_with_storage(
+                branches.clone() as Arc<dyn BranchCatalog>,
+                Arc::new(MemEffectLog::new()),
+                store.clone() as Arc<dyn PageStore>,
+            )?
+        } else {
+            AgentRuntime::with_storage(
+                branches.clone() as Arc<dyn BranchCatalog>,
+                Arc::new(MemEffectLog::new()),
+                store.clone() as Arc<dyn PageStore>,
+            )?
+        }
+        .with_durable_provenance(format!("{db_path}.provenance"))?,
+    );
     let mut session = Session::with_runtime(runtime);
     println!("ferrodb: type .exit to quit");
     let stdin = io::stdin();
@@ -185,6 +193,17 @@ fn print_outcome(out: &Outcome) {
         }
         Outcome::Affected(n) => println!("({} row{} affected)", n, if *n == 1 {""} else {"s"}),
         Outcome::Explain(s) => println!("{}", s.trim_end()),
+        // Column names, then rows, then the count. A system view read at the CLI with no rows still
+        // prints its header, so "nothing is quarantined" and "this view is broken" do not look the
+        // same here either.
+        Outcome::Table(t) => {
+            println!("{}", t.header().join(" | "));
+            for row in &t.rows {
+                let cells: Vec<String> = row.iter().map(display_value).collect();
+                println!("{}", cells.join(" | "));
+            }
+            println!("({} row{})", t.rows.len(), if t.rows.len() == 1 { "" } else { "s" });
+        }
         Outcome::Agent(a) => println!("{}", a),
         Outcome::Ok => println!("ok"),
     }

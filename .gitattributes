@@ -1,0 +1,18 @@
+# Line endings, pinned. This repo's CI runs on windows-latest, and without a policy git checks out
+# CRLF there while ubuntu and macos get LF — so any test that parses text with a hardcoded "\n"
+# passes on two platforms and fails on the third.
+#
+# That is not hypothetical: CI run 33146510964 failed on windows-latest ONLY, in
+# tests/integration_capability_envelope.rs, which locates a struct's end with find("\n}\n"). The
+# test's own assertion was never reached on Windows, so its field allowlist had been guarding
+# nothing there while reporting nothing wrong.
+#
+# `text=auto eol=lf` normalises on commit and checks out LF everywhere. Rust, cargo and rustfmt are
+# all indifferent to this; the tests are not.
+* text=auto eol=lf
+
+# Binary, so git must not touch them. A "line ending" inside a page image or a WAL fixture is data.
+*.png binary
+*.pdf binary
+*.db binary
+*.wal binary

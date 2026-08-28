@@ -123,6 +123,7 @@ Here is the SQL syntax that has been implemented so far:
 ```
 CREATE TABLE name (col TYPE [NOT NULL], ...)
 CREATE INDEX name ON table(col);
+CREATE FULLTEXT INDEX name ON table(col);
 
 INSERT INTO table VALUES (...);
 UPDATE table SET col = expr [, ...] [WHERE expr];
@@ -132,6 +133,8 @@ SELECT cols
 FROM table [AS] [alias] 
 [ [INNER | LEFT [OUTER]] JOIN table2 [AS] [alias] ON expr] 
 [WHERE expr];
+
+SEARCH table (col) FOR 'search text' [TOP k];
 ```
 
 - **Types:** INTEGER (i32), BIGINT (i64), DECIMAL / NUMERIC (exact, unbounded digits),
@@ -145,6 +148,61 @@ FROM table [AS] [alias]
   add them. Comparison is numeric, so `1.50` and `1.5` are equal.
 - **Operators:** = != <= > >= + - * / AND OR NOT
 - **Columns:** *, qualified references, table aliases, qualified star
+- **Full-text search.** `CREATE FULLTEXT INDEX` on a VARCHAR column builds a posting list, which
+  here is not a new structure at all: it is the same B+tree a secondary index uses, keyed
+  `(token, primary key)` instead of `(column value, primary key)`. `SEARCH` reads it and returns the
+  best-matching rows by BM25, each row followed by **one extra column holding its score**.
+  - The tokenizer lowercases and splits on every non-alphanumeric character. There is no stemming
+    and no stopword list, `don't` is two tokens, and a run of CJK is one token, because word
+    segmentation for unspaced scripts is not attempted.
+  - There is no `ORDER BY` and no `LIMIT` in this SQL, so **the operator supplies its own bound**:
+    `SEARCH` returns at most 10 rows unless `TOP k` says otherwise. A query with 400 matches returns
+    10 rows by design.
+  - A search sees what a `SELECT` in the same transaction would: a deleted row drops out, and an
+    entry left behind by an `UPDATE` cannot resurrect one, because the operator re-checks the text of
+    the version it resolved.
+
+### System views over the agent layer
+
+Five read-only views, selectable like any table, with `WHERE` and projection:
+
+| View | One row per | Lifetime |
+|---|---|---|
+| `ferro_branches` | every branch the catalog holds, live or reaped | durable |
+| `ferro_runs` | live agent branch, with its agent / run / model | in memory, gone at `MERGE` |
+| `ferro_row_authors` | published row, with the run that wrote it | in memory, survives the merge |
+| `ferro_quarantine` | branch the verification gate is holding, **with the reason** | membership durable, reason in memory |
+| `ferro_run_activity` | live agent branch, with what it has written and read | in memory, gone at `MERGE` |
+
+```sql
+SELECT branch_id, state, depth FROM ferro_branches WHERE depth > 0;
+SELECT agent_id, run_id, staged_rows, rows_read_exact, blind_writes FROM ferro_run_activity;
+SELECT branch_name, reason FROM ferro_quarantine;
+```
+
+They are **presentation, not bookkeeping**: every row is materialised on each read from an API the
+agent layer already exposed, so there is no second record of what an agent did that could disagree
+with the first. That also means they are outside MVCC — a view read inside `BEGIN` sees the runtime
+as it is now, not as the transaction's snapshot saw it.
+
+Three consequences worth knowing before you rely on them:
+
+- A view's **lifetime is its source's**. `ferro_runs` answers from the branch's workspace, which
+  `MERGE` and `ABANDON` drop, so a merged run leaves it. `ferro_row_authors` is the question that
+  keeps answering afterwards. A `NULL` reason in `ferro_quarantine` means the branch is still held
+  and the reason did not survive a restart — not that it was held for nothing.
+- They are **read-only, and refuse by name**. `INSERT INTO ferro_runs` says so; it does not answer
+  `unknown table`.
+- `CREATE TABLE ferro_runs` is **refused**, because such a table's rows would be unreachable behind
+  the view. A table that already carries one of these names — from a database written before the
+  views existed — keeps its rows: the table wins, and the view yields.
+
+Two names are `branch_name` and `model_name` rather than `branch` and `model` because both of the
+shorter ones are reserved words here (`AS OF BRANCH`, `MODEL '...'`), and a column named after a
+keyword can only be reached through `SELECT *`.
+
+`u64` values that do not fit `i64` (a branch lease of `u64::MAX`, a `row_id` hashed from a
+non-integer key) are `DECIMAL`, so they arrive as exact digits rather than as a negative `BIGINT`.
 
 ### Try it yourself
 Start the REPL (either `cargo run`/`cargo run -- mydb.db` or by unziping then executing the binary).
@@ -183,6 +241,22 @@ ferrodb=> .exit
 bye bye
 ```
 You can also create indexes (`CREATE INDEX idx ON users (age);`), updates (`UPDATE users SET age = 31 WHERE id = 1;`), and deletes (`DELETE FROM posts WHERE id = 2;`).
+
+Full-text search over that same `posts` table. Note the trailing score column, and that the row
+matching both words outranks the two that match one — the two of those tie, and the tie is broken by
+primary key so the result is reproducible:
+
+```
+ferrodb=> CREATE FULLTEXT INDEX ptitle ON posts (title);
+ok
+ferrodb=> INSERT INTO posts VALUES (3, 1, 'hello world again');
+(1 row affected)
+ferrodb=> SEARCH posts (title) FOR 'hello world';
+3 | 1 | hello world again | 0.7082246468086428
+1 | 1 | hello | 0.561960861054684
+2 | 1 | world | 0.561960861054684
+(3 rows)
+```
 
 Here is a resource for the SQL language (refer back to `Supported SQL` to see what syntax is supported): https://www.w3schools.com/sql/default.asp 
 ## How it works
@@ -376,6 +450,31 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
 {"op":"DELETE","table":"inventory","after":null}
 ```
 
+### A publication decides what the feed may carry
+
+The feed above carries every column of every table. A **publication** — an allowlist, read by both the
+database and the independent Go consumer — says what may leave:
+
+```
+$ cat pub.txt
+publication analytics
+# ssn must never leave the database
+customers: id, name
+exclude audit_log
+
+$ cargo run --example cdc_feed -- demo.db pub.txt > feed.jsonl
+$ go run . validate ../feed.jsonl -publication ../pub.txt
+OK 6
+```
+
+A column the file does not name is **withheld**: absent from every image, and named nowhere — the
+`CREATE_TABLE` shape is projected by the same rule, so the consumer is told about exactly the columns
+it will receive. A table it does not name at all is **refused**: the feed stops there rather than
+stepping over it, and resumes when the policy decides, either by publishing the table or by excluding
+it. `cdc_server`, `cdc_feed` and `table_dump` each take a publication file as their last argument;
+`cdc-consumer` takes `-publication <file>` on `validate`, `sink`, `follow`, `diff` and `precision`, and
+enforces its own copy of the rule rather than trusting the producer's.
+
 - **Only committed transactions, in commit order.** Changes buffer per transaction and release on
   `Commit`; an `Abort` discards them and an in-flight transaction is reported as withheld rather
   than emitted. A consumer shown an aborted transaction's rows has been told about data that never
@@ -413,6 +512,11 @@ $ cargo run --example cdc_feed | jq -c '{op, table, after}'
   drops on that same scenario.
 - **Never ahead of durability.** No change is emitted from a WAL record the primary has not durably
   written, because a CDC consumer *acts* on events and a crash cannot un-send a webhook.
+- **Every change can carry its writer.** The event envelope names the agent run behind it — agent,
+  run, model, `model_version` and a SHA-256 of the prompt — or `null` where no agent run produced it,
+  and the commits that ship with no writer are **counted and reported** rather than assumed absent.
+  *Nothing on the SQL path binds a run yet*, so a feed from the shipped binary carries `null` for
+  every event; see *Run identity* below for what is connected and what is not.
 
 Two things the log says that a naive decoder gets wrong, both found by decoding real executor
 output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
@@ -451,6 +555,81 @@ The tests judge the feed by comparing that materialised table against the source
 well-formed, correctly ordered and *wrong* still fails. An encoder validated only by its own
 author's idea of the format agrees with itself about any shared misreading.
 
+### Run identity: which agent wrote each row, after a restart and after the wire
+
+Provenance answers *which agent + run + model wrote this row*. Two things used to end that answer
+early, and both were silent.
+
+**It did not survive the process.** `MemProvenanceStore` was the only implementation, and every
+`AgentRuntime` constructor built one — including `reopen_with_storage`, whose whole job is to attach
+to a tree another process wrote. So a database reopened with every row intact answered *nothing*
+about any of them. `DurableProvenanceStore` is an append-only file replayed on open: one record per
+interned run, one small record per stamped version, a torn tail healed and **reported** rather than
+swallowed. It wraps the in-memory store rather than reimplementing it, so the same guards and the
+same `footprint_bytes` / `literal_footprint_bytes` density instruments apply unchanged.
+
+> **Not yet wired.** `AgentRuntime`'s three constructors still build a `MemProvenanceStore`, and
+> nothing on the SQL path calls `TxnManager::bind_run`. So on every path a shipped binary takes,
+> restarting still loses attribution and every feed event carries `"writer":null`. What is done is
+> the store, the log record, the wire format and the consumer — each proven by tests — and the
+> remaining hop is one line in each of `runtime.rs:276`, `:332`, `:369` plus a `bind_run` call where
+> a session's transaction is opened. Stated here rather than left for a reader to infer from a
+> feature that appears to be on.
+
+**It stopped at the database boundary.** `ChangeEvent` carried no writer, so a consumer holding a
+million rows from a model since found unsound could not ask which of them came from it. Now every
+event carries one:
+
+```json
+{"op":"INSERT","table":"inventory","writer":{"prov_id":1,"agent":"restock-agent","run":"run-42",
+ "model":"claude-opus","model_version":"2026-05","prompt_sha256":"e3b0c442…","started_at":"1700000000000",
+ "branch":"b1@g0"},"after":{"id":1,"qty":10}}
+```
+
+The prompt travels as a digest and never as text — that is the field's purpose, so a prompt holding
+customer data does not become a durable copy of it in every consumer's destination table. The Go
+consumer enforces it with an **allowlist** of the eight keys a `writer` object may carry, checked
+against the raw JSON rather than the decoded struct, because `encoding/json` silently drops keys it
+has no field for and a leak would decode cleanly.
+
+**The hard part is where the record sits in the log.** The feed cursor may never advance past the
+earliest *staged* record of a still-open transaction. An identity record written when the session
+begins stages nothing, so it sits *below* that clamp: read once, stepped over, never read again —
+and when the transaction finally commits, every one of its rows ships attributed to nobody while the
+pump reports a clean run. It is therefore written in the append **immediately before the `Commit`
+record**, where a clamp cannot separate the two.
+`tests/integration_run_identity_feed.rs` streams the same workload under both placements; the early
+one loses the attribution and the count catches it.
+
+Retention needs its own answer because `checkpoint()` discards the WAL **whole** rather than by
+prefix, exactly as it does for DDL. `TxnManager` re-declares its retained run table at the head of
+the new log, so a reader starting at the new base can still name the database's writers.
+
+#### Retract by model version
+
+Every destination row the sink lands carries its writer, which makes the operational question
+answerable at the destination — with no source database and no untruncated log:
+
+```
+$ cdc-consumer sink feed.jsonl -db dest.sqlite -key id
+$ cdc-consumer retract dest.sqlite -table inventory -model-version 2026-07
+RETRACTED 3 OF 6 table=inventory model_version=2026-07 mode=quarantine
+$ cdc-consumer scan dest.sqlite -table inventory      # ground truth, from a full scan
+ROW id=1 prov_id=1 agent=restock-agent model_version=2026-05 retracted=0 deleted=0
+ROW id=2 prov_id=2 agent=restock-agent model_version=2026-07 retracted=1 deleted=0
+…
+```
+
+`-mode delete` tombstones as well as marks, and `-engine duckdb` targets the analytical destination
+— both sinks land the same attribution columns, pinned by
+`TestBothSinksLandTheSameWriterColumnNames` because `retract` addresses them by name. A retraction
+naming a version nothing wrote is **refused**, not reported as a clean run of zero rows — the likely
+cause is a typo, and the error names the versions that are present. Rows with no writer at all are
+never swept up, whatever string is passed, and a destination landed before attribution existed is
+upgraded in place rather than refused. `tests/integration_cdc_retract_by_model.rs` runs the whole
+pipeline and checks the 100%-of-one / 0%-of-any-other property from `scan`, which did not do the
+retracting.
+
 ### Wide values ship as strings, on purpose
 
 JSON has one number type and no stated precision, and the overwhelmingly common consumer
@@ -462,7 +641,7 @@ is raised** for any of it: the parse succeeds and the number is simply wrong.
 
 So `BIGINT`, `DECIMAL` and `TIMESTAMP` are emitted as JSON **strings**, which no parser coerces
 (envelope fields elided here — a real line also carries `txn`, `lsn`, `commit_lsn`,
-`commit_end_lsn` and `before`):
+`commit_end_lsn`, `writer` and `before`):
 
 ```json
 {"op":"INSERT","table":"wide","after":{"id":1,"big":"9223372036854775807","dec":"1.50","ts":"1700000000123"}}
@@ -536,6 +715,10 @@ $ go run . diff ../feed.jsonl ../source.json -key id
 MATCH 2 row(s) from 6 event(s)
 ```
 
+Under a publication both sides take the same one — `table_dump <db> <table> [publication]` and
+`diff ... -publication <file>` — because a dump is egress too, and a projected feed compared against an
+unprojected source would report the withheld column as a data mismatch.
+
 Two rows rather than the three the sink lands, because the sink keeps a **tombstone** for the deleted
 row and the source simply does not have it — the diff compares live state to live state.
 
@@ -574,11 +757,48 @@ scalars agree by accident and prove nothing.
 `-engine duckdb` needs **cgo** (`github.com/marcboeker/go-duckdb` links DuckDB statically), so
 `CGO_ENABLED=0` will not build the consumer at all — the cost is module-wide, not per-engine.
 
+### Column-level schema evolution
+
+The feed carries five schema ops, not two: `CREATE_TABLE`, `DROP_TABLE`, and — through
+`ALTER TABLE ... ADD COLUMN` / `RENAME COLUMN` / `ALTER COLUMN ... TYPE` — `ADD_COLUMN`,
+`RENAME_COLUMN` and `ALTER_COLUMN_TYPE`. Each arrives **in band and in log order**, at the position
+the DDL actually occupied, so the events before it describe the old shape and the ones after it
+describe the new one.
+
+Every column-level event carries **both halves**: `after.columns` is the table's full shape
+afterwards, which the sinks reconcile their destination against positionally; `after.alter` says
+which change produced that shape. Both are needed, because a rename and a drop-plus-add leave
+identical column lists and only one of them keeps the column's data.
+
+Three things are worth knowing about the shape of the feature rather than the wire format:
+
+- **The two whole-table ops are declarations; the three column-level ones are news.** A
+  `CREATE_TABLE` is re-emitted at every checkpoint and a consumer may apply it any number of times.
+  An `ALTER` is delivered exactly once, and a consumer that applied one twice would rename a column
+  that no longer has the old name. An alter updates the source's *retained declaration* instead of
+  being retained itself, which is also how the new shape survives a log truncation and a restart.
+- **A column is added at the end, and there is no `DROP COLUMN`.** A column's ordinal is its
+  identity below the parser — tuple bytes are positional, and every recorded effect, guard and
+  merge policy holds an ordinal — so removing one, or inserting one mid-table, would silently
+  re-point all of them at a different column.
+- **Retypes are an allowlist of conversions that are total for every stored value**: `INTEGER` to
+  `BIGINT` or `DECIMAL`, `BIGINT` to `DECIMAL`, and `VARCHAR(n)` to `VARCHAR(m)` where `m >= n`.
+  Anything else would have to decide what to do with a value that does not fit, and every answer to
+  that is data loss. Retyping the primary key is refused.
+
+Two agents can evolve one schema concurrently. A branch's `ALTER` is **pending** — invisible to
+main and to siblings until `MERGE`, and gone if the branch is abandoned — and at merge it is
+three-way merged against the shape the target has *then*. Two branches adding different columns
+compose (`Commuting`); two retyping one column to different types `Conflict`, and the agent is
+handed back the violated predicate itself, e.g. `typeof(inventory.qty) = INTEGER`. An edit the
+target already satisfies identically is absorbed rather than refused.
+
 **Limits:** there is no wire framing beyond newline delimiting, and the feed is JSON rather than a
-compact binary format. `ALTER TABLE` is not carried — `CREATE_TABLE` and `DROP_TABLE` are, so a
-consumer learns a table's shape and its disappearance but not a column added later. The sinks
-replace whole rows rather than merging, which is correct only because this feed always emits full
-before/after images.
+compact binary format. The sinks replace whole rows rather than merging, which is correct only
+because this feed always emits full before/after images. An `ALTER` rewrites the table in place and
+is refused while any transaction is open; like every other DDL here it is not crash-atomic, because
+the catalog is written outside the WAL and recovery does not replay it. An alter also truncates the
+table's MVCC version chains, which is unobservable only because it requires that quiesce.
 
 ## Replication — what it gives you, and what it cannot
 
@@ -662,6 +882,9 @@ Three further limits, each found by a test rather than reasoned about:
 - [x] Quarantine: a declined branch stays unmerged but still queryable
 - [x] Escrow at fork, so a bounded-counter overdraw fails at write time
 - [x] Depth guard + `COLLAPSE` at ancestry depth 8
+- [x] System views over the agent layer (`ferro_branches`, `ferro_runs`, `ferro_row_authors`,
+      `ferro_quarantine`, `ferro_run_activity`), and structured agent results as typed columns on
+      the wire rather than one `Debug` string
 - [ ] SQL statements writing directly to CoW pages (the largest remaining gap, above)
 
 ## Why I built it
