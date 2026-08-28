@@ -341,12 +341,18 @@ impl ArenaPageStore {
     fn revoke_stale_authority(&self) -> u64 {
         let epoch = crate::cluster::epoch();
         if self.authority_epoch.swap(epoch, Ordering::SeqCst) != epoch {
-            let mut st = self.state.lock().unwrap();
-            // Same rule and same reason as `load_state`'s `current.clear()`: never resume filling
-            // an extent whose provenance this process can no longer vouch for.
-            st.current.clear();
-            st.claim_epoch.clear();
-            st.recycled.clear();
+            // **One mechanism, not three.** Clearing `current` and `recycled` as well was the
+            // first version, and the mutation sweep showed both were dead weight: removing either
+            // failed no test, because dropping the stamp already makes `arena_for` skip its fast
+            // path and `alloc_in_arena` refuse before it pops a recycled page. Three overlapping
+            // guards where one is load-bearing means two of them are untested code that a later
+            // reader will trust.
+            //
+            // What is left behind is harmless and deliberate: `current` may still name a stale
+            // arena, which `arena_for` filters and then overwrites via `alloc_arena`; `recycled`
+            // may still hold its pages, which `alloc_in_arena` refuses and `free_arena` reclaims
+            // whole. Neither is reachable as a page.
+            self.state.lock().unwrap().claim_epoch.clear();
         }
         epoch
     }

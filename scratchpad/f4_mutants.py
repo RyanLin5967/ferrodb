@@ -252,13 +252,16 @@ MUTANTS = [
      "            if false {",
      "--test integration_cluster_grants", "superseded_authority"),
 
-    ("M21", "an authority change also drops the per-arena recycled pages",
+    ("M21", "an authority change drops the per-arena claim stamps - the one mechanism",
      "src/branch/arena.rs",
-     """            st.current.clear();
-            st.claim_epoch.clear();
-            st.recycled.clear();""",
-     """            st.current.clear();
-            st.claim_epoch.clear();""",
+     "            self.state.lock().unwrap().claim_epoch.clear();",
+     "            let _ = &self.state;",
+     "--test integration_cluster_grants", "superseded_authority"),
+
+    ("M21b", "same mechanism, via the recycled-page way in",
+     "src/branch/arena.rs",
+     "            self.state.lock().unwrap().claim_epoch.clear();",
+     "            let _ = &self.state;",
      "--test integration_cluster_grants", "a_recycled_page_inside_a_stale_extent"),
 
     ("M22", "the fill fast path SURVIVES for a granted extent - the guard must not refuse everything",
