@@ -1,0 +1,304 @@
+[
+ {
+  "id": "M1a",
+  "desc": "election restriction compares (round, term) instead of (term, round)",
+  "status": "KILLED",
+  "per": {
+   "the_election_restriction_compares_last_term_before_last_round": "KILLED",
+   "the_election_restriction_compares_last_term_before_last_round::msg": "thread 'consensus::election::tests_election::the_election_restriction_compares_last_term_before_last_round' (15538624) panicked at src/consensus/tests_election.rs:201:5:"
+  }
+ },
+ {
+  "id": "M1b",
+  "desc": "election restriction compares rounds only, ignoring the term",
+  "status": "KILLED",
+  "per": {
+   "the_election_restriction_compares_last_term_before_last_round": "KILLED",
+   "the_election_restriction_compares_last_term_before_last_round::msg": "thread 'consensus::election::tests_election::the_election_restriction_compares_last_term_before_last_round' (15539469) panicked at src/consensus/tests_election.rs:201:5:",
+   "the_election_restriction_is_applied_to_pre_votes_too": "KILLED",
+   "the_election_restriction_is_applied_to_pre_votes_too::msg": "thread 'consensus::election::tests_election::the_election_restriction_is_applied_to_pre_votes_too' (15539501) panicked at src/consensus/tests_election.rs:241:5:"
+  }
+ },
+ {
+  "id": "M2",
+  "desc": "a pre-campaign raises the term",
+  "status": "KILLED",
+  "per": {
+   "a_pre_campaign_does_not_raise_this_nodes_term_and_writes_nothing_durable": "KILLED",
+   "a_pre_campaign_does_not_raise_this_nodes_term_and_writes_nothing_durable::msg": "thread 'consensus::election::tests_election::a_pre_campaign_does_not_raise_this_nodes_term_and_writes_nothing_durable' (15540365) panicked at src/consensus/tests_election.rs:256:5:"
+  }
+ },
+ {
+  "id": "M3a",
+  "desc": "answering a pre-vote consumes the real vote and writes hard state",
+  "status": "KILLED",
+  "per": {
+   "answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state": "KILLED",
+   "answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state::msg": "thread 'consensus::election::tests_election::answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state' (15541837) panicked at src/consensus/tests_election.rs:288:5:"
+  }
+ },
+ {
+  "id": "M3b",
+  "desc": "answering a pre-vote adopts the hypothetical term",
+  "status": "KILLED",
+  "per": {
+   "answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state": "KILLED",
+   "answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state::msg": "thread 'consensus::election::tests_election::answering_a_pre_vote_neither_raises_the_voters_term_nor_writes_hard_state' (15545015) panicked at src/consensus/tests_election.rs:286:5:"
+  }
+ },
+ {
+  "id": "M4",
+  "desc": "votes counted against the live configuration instead of the captured campaign",
+  "status": "KILLED",
+  "per": {
+   "a_membership_change_mid_campaign_does_not_move_the_denominator": "KILLED",
+   "a_membership_change_mid_campaign_does_not_move_the_denominator::msg": "thread 'consensus::election::tests_election::a_membership_change_mid_campaign_does_not_move_the_denominator' (15546386) panicked at src/consensus/tests_election.rs:348:5:"
+  }
+ },
+ {
+  "id": "M5",
+  "desc": "a vote from outside the campaign configuration is counted",
+  "status": "KILLED",
+  "per": {
+   "a_vote_from_a_node_outside_the_campaign_configuration_is_not_counted": "KILLED",
+   "a_vote_from_a_node_outside_the_campaign_configuration_is_not_counted::msg": "thread 'consensus::election::tests_election::a_vote_from_a_node_outside_the_campaign_configuration_is_not_counted' (15547443) panicked at src/consensus/tests_election.rs:366:5:"
+  }
+ },
+ {
+  "id": "M6a",
+  "desc": "the granted vote is sent before it is made durable",
+  "status": "KILLED",
+  "per": {
+   "a_granted_vote_is_made_durable_before_it_is_sent": "KILLED",
+   "a_granted_vote_is_made_durable_before_it_is_sent::msg": "thread 'consensus::election::tests_election::a_granted_vote_is_made_durable_before_it_is_sent' (15548503) panicked at src/consensus/tests_election.rs:58:9:",
+   "a_node_does_not_vote_twice_in_one_term": "KILLED",
+   "a_node_does_not_vote_twice_in_one_term::msg": "thread 'consensus::election::tests_election::a_node_does_not_vote_twice_in_one_term' (15548527) panicked at src/consensus/tests_election.rs:58:9:"
+  }
+ },
+ {
+  "id": "M6b",
+  "desc": "a candidate asks for votes before its own vote is durable",
+  "status": "KILLED",
+  "per": {
+   "the_campaign_configuration_is_captured_in_the_same_step_that_raises_the_term": "KILLED",
+   "the_campaign_configuration_is_captured_in_the_same_step_that_raises_the_term::msg": "thread 'consensus::election::tests_election::the_campaign_configuration_is_captured_in_the_same_step_that_raises_the_term' (15549882) panicked at src/consensus/tests_election.rs:58:9:"
+  }
+ },
+ {
+  "id": "M7",
+  "desc": "a node may vote twice in one term",
+  "status": "KILLED",
+  "per": {
+   "a_node_does_not_vote_twice_in_one_term": "KILLED",
+   "a_node_does_not_vote_twice_in_one_term::msg": "thread 'consensus::election::tests_election::a_node_does_not_vote_twice_in_one_term' (15551469) panicked at src/consensus/tests_election.rs:434:5:",
+   "one_term_never_elects_two_leaders_even_when_every_node_campaigns": "KILLED",
+   "one_term_never_elects_two_leaders_even_when_every_node_campaigns::msg": "thread 'consensus::election::tests_election::one_term_never_elects_two_leaders_even_when_every_node_campaigns' (15551492) panicked at src/consensus/tests_election.rs:505:13:"
+  }
+ },
+ {
+  "id": "M8",
+  "desc": "a pre-vote answer about any term is counted",
+  "status": "KILLED",
+  "per": {
+   "a_pre_vote_answer_about_another_term_is_not_counted": "KILLED",
+   "a_pre_vote_answer_about_another_term_is_not_counted::msg": "thread 'consensus::election::tests_election::a_pre_vote_answer_about_another_term_is_not_counted' (15554054) panicked at src/consensus/tests_election.rs:385:5:"
+  }
+ },
+ {
+  "id": "M9",
+  "desc": "a node with a live leader still grants pre-votes",
+  "status": "KILLED",
+  "per": {
+   "a_pre_vote_is_refused_by_a_node_that_is_still_being_served_by_a_leader": "KILLED",
+   "a_pre_vote_is_refused_by_a_node_that_is_still_being_served_by_a_leader::msg": "thread 'consensus::election::tests_election::a_pre_vote_is_refused_by_a_node_that_is_still_being_served_by_a_leader' (15556523) panicked at src/consensus/tests_election.rs:531:5:",
+   "a_node_campaigning_into_a_wall_never_raises_the_clusters_term": "KILLED",
+   "a_node_campaigning_into_a_wall_never_raises_the_clusters_term::msg": "thread 'consensus::election::tests_election::a_node_campaigning_into_a_wall_never_raises_the_clusters_term' (15556547) panicked at src/consensus/tests_election.rs:962:5:"
+  }
+ },
+ {
+  "id": "M10",
+  "desc": "a node with a live leader still grants a real vote at the current term",
+  "status": "KILLED",
+  "per": {
+   "a_vote_in_the_current_term_is_refused_by_a_node_that_still_has_a_live_leader": "KILLED",
+   "a_vote_in_the_current_term_is_refused_by_a_node_that_still_has_a_live_leader::msg": "thread 'consensus::election::tests_election::a_vote_in_the_current_term_is_refused_by_a_node_that_still_has_a_live_leader' (15557482) panicked at src/consensus/tests_election.rs:553:5:"
+  }
+ },
+ {
+  "id": "M11",
+  "desc": "`behind` / `unjoined` / not-a-voter no longer block a campaign",
+  "status": "KILLED",
+  "per": {
+   "a_node_that_knows_its_configuration_is_stale_does_not_campaign": "KILLED",
+   "a_node_that_knows_its_configuration_is_stale_does_not_campaign::msg": "thread 'consensus::election::tests_election::a_node_that_knows_its_configuration_is_stale_does_not_campaign' (15558540) panicked at src/consensus/tests_election.rs:571:5:",
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks": "KILLED",
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks::msg": "thread 'consensus::election::tests_election::an_unjoined_node_is_not_cleared_by_any_number_of_ticks' (15558564) panicked at src/consensus/tests_election.rs:620:5:",
+   "a_node_absent_from_its_own_configuration_never_campaigns": "KILLED",
+   "a_node_absent_from_its_own_configuration_never_campaigns::msg": "thread 'consensus::election::tests_election::a_node_absent_from_its_own_configuration_never_campaigns' (15558603) panicked at src/consensus/tests_election.rs:846:5:"
+  }
+ },
+ {
+  "id": "M12",
+  "desc": "`unjoined` cleared by a timer",
+  "status": "KILLED",
+  "per": {
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks": "KILLED",
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks::msg": "thread 'consensus::election::tests_election::an_unjoined_node_is_not_cleared_by_any_number_of_ticks' (15560506) panicked at src/consensus/tests_election.rs:619:5:"
+  }
+ },
+ {
+  "id": "M13",
+  "desc": "`unjoined` requires a non-zero watermark, so an empty cluster can never elect",
+  "status": "KILLED",
+  "per": {
+   "joining_an_empty_cluster_still_lets_a_new_member_stand": "KILLED",
+   "joining_an_empty_cluster_still_lets_a_new_member_stand::msg": "thread 'consensus::election::tests_election::joining_an_empty_cluster_still_lets_a_new_member_stand' (15561906) panicked at src/consensus/tests_election.rs:661:5:"
+  }
+ },
+ {
+  "id": "M14",
+  "desc": "`unjoined` cleared by any watermark at all, without comparing to this node's store",
+  "status": "KILLED",
+  "per": {
+   "an_unjoined_node_stands_only_once_it_holds_what_a_quorum_holds": "KILLED",
+   "an_unjoined_node_stands_only_once_it_holds_what_a_quorum_holds::msg": "thread 'consensus::election::tests_election::an_unjoined_node_stands_only_once_it_holds_what_a_quorum_holds' (15563088) panicked at src/consensus/tests_election.rs:633:5:"
+  }
+ },
+ {
+  "id": "M15",
+  "desc": "applying a configuration clears `unjoined` too",
+  "status": "KILLED",
+  "per": {
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks": "KILLED",
+   "an_unjoined_node_is_not_cleared_by_any_number_of_ticks::msg": "thread 'consensus::election::tests_election::an_unjoined_node_is_not_cleared_by_any_number_of_ticks' (15564370) panicked at src/consensus/tests_election.rs:612:5:"
+  }
+ },
+ {
+  "id": "M16a",
+  "desc": "the lease window is the election timeout",
+  "status": "KILLED",
+  "per": {
+   "a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win": "KILLED",
+   "a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win::msg": "thread 'consensus::election::tests_election::a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win' (15565417) panicked at src/consensus/tests_election.rs:688:5:"
+  }
+ },
+ {
+  "id": "M16b",
+  "desc": "the lease window is the election base",
+  "status": "KILLED",
+  "per": {
+   "a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win": "KILLED",
+   "a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win::msg": "thread 'consensus::election::tests_election::a_leader_that_stops_hearing_from_a_majority_demotes_itself_before_any_peer_can_win' (15566878) panicked at src/consensus/tests_election.rs:688:5:"
+  }
+ },
+ {
+  "id": "M17",
+  "desc": "the lease measures the MOST silent voter instead of a majority",
+  "status": "KILLED",
+  "per": {
+   "a_leader_that_keeps_hearing_from_a_majority_keeps_its_office": "KILLED",
+   "a_leader_that_keeps_hearing_from_a_majority_keeps_its_office::msg": "thread 'consensus::election::tests_election::a_leader_that_keeps_hearing_from_a_majority_keeps_its_office' (15567889) panicked at src/consensus/tests_election.rs:719:9:"
+  }
+ },
+ {
+  "id": "M18",
+  "desc": "the lease is satisfied by any single answer, not a majority",
+  "status": "KILLED",
+  "per": {
+   "a_leader_that_hears_only_from_a_minority_still_demotes": "KILLED",
+   "a_leader_that_hears_only_from_a_minority_still_demotes::msg": "thread 'consensus::election::tests_election::a_leader_that_hears_only_from_a_minority_still_demotes' (15568825) panicked at src/consensus/tests_election.rs:740:9:"
+  }
+ },
+ {
+  "id": "M19",
+  "desc": "a new leader appends no term-establishing entry",
+  "status": "KILLED",
+  "per": {
+   "a_new_leader_appends_a_no_op_of_its_own_term_before_it_can_commit_anything": "KILLED",
+   "a_new_leader_appends_a_no_op_of_its_own_term_before_it_can_commit_anything::msg": "thread 'consensus::election::tests_election::a_new_leader_appends_a_no_op_of_its_own_term_before_it_can_commit_anything' (15570131) panicked at src/consensus/tests_election.rs:783:10:"
+  }
+ },
+ {
+  "id": "M20",
+  "desc": "a new leader records optimism as evidence (matched = next)",
+  "status": "KILLED",
+  "per": {
+   "a_new_leader_starts_every_peer_with_no_evidence_and_optimistic_next": "KILLED",
+   "a_new_leader_starts_every_peer_with_no_evidence_and_optimistic_next::msg": "thread 'consensus::election::tests_election::a_new_leader_starts_every_peer_with_no_evidence_and_optimistic_next' (15572152) panicked at src/consensus/tests_election.rs:823:9:"
+  }
+ },
+ {
+  "id": "M21",
+  "desc": "a new leader waits for the heartbeat interval before asserting its office",
+  "status": "KILLED",
+  "per": {
+   "a_new_leader_asserts_its_office_at_once_and_then_on_its_heartbeat_interval": "KILLED",
+   "a_new_leader_asserts_its_office_at_once_and_then_on_its_heartbeat_interval::msg": "thread 'consensus::election::tests_election::a_new_leader_asserts_its_office_at_once_and_then_on_its_heartbeat_interval' (15574876) panicked at src/consensus/tests_election.rs:798:5:"
+  }
+ },
+ {
+  "id": "M22",
+  "desc": "the election timeout is drawn once and never redrawn",
+  "status": "KILLED",
+  "per": {
+   "every_campaign_redraws_its_timeout_inside_the_documented_window": "KILLED",
+   "every_campaign_redraws_its_timeout_inside_the_documented_window::msg": "thread 'consensus::election::tests_election::every_campaign_redraws_its_timeout_inside_the_documented_window' (15718132) panicked at src/consensus/tests_election.rs:870:5:"
+  }
+ },
+ {
+  "id": "M23",
+  "desc": "a timeout campaigns for real instead of pre-voting first",
+  "status": "KILLED",
+  "per": {
+   "a_campaign_that_wins_nothing_is_retried_from_the_pre_vote_and_not_from_a_raised_term": "KILLED",
+   "a_campaign_that_wins_nothing_is_retried_from_the_pre_vote_and_not_from_a_raised_term::msg": "thread 'consensus::election::tests_election::a_campaign_that_wins_nothing_is_retried_from_the_pre_vote_and_not_from_a_raised_term' (15578776) panicked at src/consensus/tests_election.rs:110:5:"
+  }
+ },
+ {
+  "id": "M24",
+  "desc": "a campaign in flight is left running after this node learns it is stale",
+  "status": "KILLED",
+  "per": {
+   "a_campaign_in_flight_is_abandoned_when_this_node_learns_it_is_stale": "KILLED",
+   "a_campaign_in_flight_is_abandoned_when_this_node_learns_it_is_stale::msg": "thread 'consensus::election::tests_election::a_campaign_in_flight_is_abandoned_when_this_node_learns_it_is_stale' (15583717) panicked at src/consensus/tests_election.rs:77:5:"
+  }
+ },
+ {
+  "id": "M25",
+  "desc": "a pre-candidate counts real votes it never asked for",
+  "status": "KILLED",
+  "per": {
+   "a_pre_candidate_does_not_count_real_votes_it_never_asked_for": "KILLED",
+   "a_pre_candidate_does_not_count_real_votes_it_never_asked_for::msg": "thread 'consensus::election::tests_election::a_pre_candidate_does_not_count_real_votes_it_never_asked_for' (15591993) panicked at src/consensus/tests_election.rs:400:5:"
+  }
+ },
+ {
+  "id": "M26",
+  "desc": "a node that is its own majority still waits for somebody to answer",
+  "status": "KILLED",
+  "per": {
+   "a_single_voter_configuration_elects_itself_without_asking_anybody": "KILLED",
+   "a_single_voter_configuration_elects_itself_without_asking_anybody::msg": "thread 'consensus::election::tests_election::a_single_voter_configuration_elects_itself_without_asking_anybody' (15600005) panicked at src/consensus/tests_election.rs:77:5:"
+  }
+ },
+ {
+  "id": "M27",
+  "desc": "the election timeout is a constant, so nothing is spread and nothing replays distinctly",
+  "status": "KILLED",
+  "per": {
+   "a_campaign_replays_identically_from_a_seed_and_its_windows_are_not_all_equal": "KILLED",
+   "a_campaign_replays_identically_from_a_seed_and_its_windows_are_not_all_equal::msg": "thread 'consensus::election::tests_election::a_campaign_replays_identically_from_a_seed_and_its_windows_are_not_all_equal' (15727194) panicked at src/consensus/tests_election.rs:1004:5:",
+   "every_campaign_redraws_its_timeout_inside_the_documented_window": "KILLED",
+   "every_campaign_redraws_its_timeout_inside_the_documented_window::msg": "thread 'consensus::election::tests_election::every_campaign_redraws_its_timeout_inside_the_documented_window' (15727223) panicked at src/consensus/tests_election.rs:870:5:"
+  }
+ },
+ {
+  "id": "M28",
+  "desc": "a configuration report at the version already held marks a current node stale",
+  "status": "KILLED",
+  "per": {
+   "an_older_configuration_report_does_not_mark_a_current_node_stale": "KILLED",
+   "an_older_configuration_report_does_not_mark_a_current_node_stale::msg": "thread 'consensus::election::tests_election::an_older_configuration_report_does_not_mark_a_current_node_stale' (15605800) panicked at src/consensus/tests_election.rs:597:5:"
+  }
+ }
+]

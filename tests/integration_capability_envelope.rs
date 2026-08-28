@@ -1317,7 +1317,22 @@ fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap()
 #[test]
 fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let runtime = std::fs::read_to_string(root.join("src/agent_sql/runtime.rs")).unwrap();
+    // NORMALISE LINE ENDINGS BEFORE ANY PATTERN TOUCHES THIS TEXT.
+    //
+    // This test parses Rust source as a string and locates a struct's end with `find("\n}\n")`.
+    // On Windows, git checks out CRLF by default, so the file holds "\r\n", that pattern never
+    // matches, and the `.expect("unterminated struct")` below fires — which is exactly what
+    // happened: CI run 33146510964 failed on windows-latest only, 1 failed / 22 passed, while
+    // ubuntu was green. The assertion this test makes was never reached on that platform, so the
+    // field allowlist had been guarding nothing there.
+    //
+    // Fixed here as well as by `.gitattributes` (which pins `eol=lf` repo-wide), because
+    // `.gitattributes` only governs fresh checkouts: an existing Windows clone keeps its CRLF
+    // working tree, and a test whose correctness depends on somebody's git configuration is a test
+    // that passes for reasons unrelated to the code.
+    let runtime = std::fs::read_to_string(root.join("src/agent_sql/runtime.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
 
     // Anti-vacuity for the instrument: a moved or renamed file would otherwise make every
     // assertion below pass against an empty string.

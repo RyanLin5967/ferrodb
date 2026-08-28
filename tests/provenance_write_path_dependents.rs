@@ -13,7 +13,6 @@ use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::agent_sql::MergeReport;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -71,14 +70,6 @@ impl Db {
         match self.exec(sql, session) {
             Ok(o) => o,
             Err(e) => panic!("{} failed: {}", sql, e),
-        }
-    }
-
-    fn rows_of(&mut self, sql: &str) -> Vec<Vec<Value>> {
-        let mut s = self.session();
-        match self.ok(sql, &mut s) {
-            Outcome::Rows(r) => r,
-            _ => panic!("expected rows from {sql}, got a different Outcome variant"),
         }
     }
 }
@@ -204,8 +195,18 @@ fn probe(w: &Workload) -> String {
 
 const UP_INSERT_IN: &[&str] = &["INSERT INTO inventory VALUES (7, 30, 'a');"];
 
-/// Exploratory: prints every shape's answer. Never fails; the per-shape tests below are the
-/// assertions.
+/// **Exploratory only. THIS FILE ASSERTS NOTHING about the behaviour it measures.**
+///
+/// It prints a table of what each of the 18 shapes does and then passes, unconditionally. The
+/// `assert!`s elsewhere in this file are helper sanity checks — "the statement parsed", "the merge
+/// applied" — not claims about the write-path dependency question the sweep exists to answer.
+///
+/// This docstring used to end "the per-shape tests below are the assertions". **There are no such
+/// tests, and there never were** — so the sentence promised a guard that did not exist, which is
+/// worse than saying nothing. Corrected 2026-08-28; the work of writing those assertions is ledger
+/// row **I22**.
+///
+/// Until then, treat a green run of this file as evidence of nothing except that it compiled.
 #[test]
 fn sweep() {
     let shapes: Vec<(&str, &'static [&'static str], Option<&'static str>, &'static [&'static str])> = vec![
