@@ -349,6 +349,37 @@ mod tests {
         ]);
     }
 
+    /// **E79b: `PROMPT` is deliberately NOT in the keyword table, and this test is the pin.**
+    ///
+    /// `BEGIN AGENT SESSION ... PROMPT 'text'` is matched by lexeme in the parser instead, the same
+    /// idiom `ADMIT ALL` uses and for the reason stated there: reserving a word costs every user of
+    /// it forever, and `prompt` is a plausible column name — in a database whose subject is agent
+    /// runs it is close to inevitable, `CREATE TABLE prompts (prompt VARCHAR(512))` being the
+    /// obvious first table somebody writes.
+    ///
+    /// The rule this names: **adding the PROMPT clause must not take the word `prompt` away from
+    /// users.** Break it by adding `"PROMPT" => TokenType::Prompt` to the table above and the two
+    /// DDL/DML statements below stop scanning as identifiers.
+    #[test]
+    fn prompt_is_not_a_reserved_word() {
+        use TokenType::*;
+        let toks = scan("CREATE TABLE prompts (prompt VARCHAR(512));");
+        assert_eq!(toks, vec![
+            Create, Table, Identifier, LeftParen, Identifier, TypeVarchar, LeftParen, Number,
+            RightParen, RightParen, Semicolon, Eof
+        ]);
+        let toks = scan("SELECT prompt FROM prompts WHERE prompt = 'x';");
+        assert_eq!(toks, vec![
+            Select, Identifier, From, Identifier, Where, Identifier, Equal, String, Semicolon, Eof
+        ]);
+        // And in clause position it is still an Identifier — the parser, not the scanner, is what
+        // gives it meaning there.
+        let toks = scan("BEGIN AGENT SESSION AS 'a' PROMPT 'restock';");
+        assert_eq!(toks, vec![
+            Begin, Agent, Session, As, String, Identifier, String, Semicolon, Eof
+        ]);
+    }
+
     #[test]
     fn test_agent_keywords_are_case_insensitive() {
         use TokenType::*;

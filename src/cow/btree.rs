@@ -12,8 +12,9 @@
 //! [`CowTree::get`], [`CowTree::range_scan`] and [`CowTree::walk_pages`] take a **root page id and
 //! nothing else**. They are structurally incapable of asking a parent branch anything, which is
 //! the spec requirement: `child.root == parent.root` at fork, so ordinary descent already reaches
-//! parent data. BranchBench measured the "not found here, ask my parent" overlay pattern at up to
-//! 5400x read degradation, so this is enforced by the signature rather than by a comment.
+//! parent data. BranchBench (arXiv:2604.17180) measured the "not found here, ask my parent" overlay
+//! pattern at up to 4000x read degradation, so this is enforced by the signature rather than by a
+//! comment.
 //!
 //! # Copy-up, and when it stops
 //!

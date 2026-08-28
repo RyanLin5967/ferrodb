@@ -48,7 +48,11 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
             _ => {}
         }
     }
-    txn.next_txn_id.fetch_max(max_txn + 1, Ordering::SeqCst);
+    // F4: the counter is a leader-granted range now, not an atomic. The call is the same
+    // statement it always was -- "at least this much was issued" -- and is still monotone; it
+    // deliberately does NOT create a grant, so a recovered cluster member still refuses to begin a
+    // transaction until the leader gives it one.
+    txn.raise_next_txn_id(max_txn + 1);
 
     // **Every loop below walks `touched` in this fixed order, not the `HashSet`'s.**
     //

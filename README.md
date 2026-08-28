@@ -52,7 +52,7 @@ ok
 ferrodb=> INSERT INTO inv VALUES (1, 10);
 (1 row affected)
 
-ferrodb=> BEGIN AGENT SESSION AS 'pricing' RUN 'r_1';
+ferrodb=> BEGIN AGENT SESSION AS 'pricing' RUN 'r_1' PROMPT 'reprice the slow movers';
 agent session b_1 on b1@g0 (agent=pricing run=r_1)
 ferrodb=> INSERT INTO inv VALUES (2, 20);
 (1 row affected)
@@ -299,8 +299,15 @@ durable metadata record, and **zero data pages read, written, or refcounted**.
 
 Because the child's root *is* the parent's root at fork time, ordinary B+tree descent already
 reaches parent data, so the read path never walks a parent chain. That is a hard rule, not an
-optimisation: BranchBench (arXiv 2604.17180) measured the "not found here, ask my parent" overlay
-pattern at up to **5400x read degradation** as branches accumulate.
+optimisation: BranchBench (arXiv:2604.17180) measured the "not found here, ask my parent" overlay
+pattern at up to **4000x read degradation** as branches deepen, across Neon, DoltgreSQL, Xata and
+Tiger Data.
+
+*Corrected 2026-08-28: this said **5400x** in the README, in `src/branch/mod.rs`, in
+`src/cow/btree.rs` and in `bench/branch_scaling.txt`. The paper's sentence is "up to **5-4000x**
+slower reads as branches deepen" — a range whose top is 4000x. 5400x was that string with the hyphen
+dropped, and it was never anyone's measurement. The figure is also **BranchBench's measurement of
+other systems**, never ferrodb's: `bench/branch_scaling.txt` says so and reproduces nothing of it.*
 
 Storage is a copy-on-write B+tree with shadow paging, fixed 4KB pages, and a self-describing page
 header carrying `birth_epoch`. Reclamation is ZFS-style birth-time algebra generalised from a linear
@@ -515,8 +522,11 @@ enforces its own copy of the rule rather than trusting the producer's.
 - **Every change can carry its writer.** The event envelope names the agent run behind it — agent,
   run, model, `model_version` and a SHA-256 of the prompt — or `null` where no agent run produced it,
   and the commits that ship with no writer are **counted and reported** rather than assumed absent.
-  *Nothing on the SQL path binds a run yet*, so a feed from the shipped binary carries `null` for
-  every event; see *Run identity* below for what is connected and what is not.
+  A `MERGE` binds its branch's run to the publishing transaction (E79), so an agent's merged rows
+  ship attributed over the ordinary SQL path, and the prompt half of that tuple is a real digest
+  once the session declared one (E79b) — `integration_run_identity_feed.rs`'s
+  `a_prompt_declared_over_sql_reaches_the_feed_as_a_digest` drives the whole chain. A plain SQL
+  write still binds nothing and keeps its honest `null`.
 
 Two things the log says that a naive decoder gets wrong, both found by decoding real executor
 output rather than hand-built records: a SQL `DELETE` is an MVCC `HeapUpdate` (so mapping record
@@ -587,7 +597,10 @@ event carries one:
 ```
 
 The prompt travels as a digest and never as text — that is the field's purpose, so a prompt holding
-customer data does not become a durable copy of it in every consumer's destination table. The Go
+customer data does not become a durable copy of it in every consumer's destination table. It is
+hashed once, in `AgentRuntime::begin_session_as`, and the text is dropped there: nothing downstream
+of that call — the interned `RunEntity`, the WAL identity record, the provenance file, the open
+session, the row the statement returns — holds anything but the 32 bytes. The Go
 consumer enforces it with an **allowlist** of the eight keys a `writer` object may carry, checked
 against the raw JSON rather than the decoded struct, because `encoding/json` silently drops keys it
 has no field for and a leak would decode cleanly.
@@ -876,7 +889,8 @@ Three further limits, each found by a test rather than reasoned about:
 - [x] Per-branch arenas and write buffers
 - [x] Non-cooperative lease reaper (**the thesis**) — observed firing, pages back to baseline
 - [x] Provenance capture on the write path: a merge-published version names its agent, run and model
-- [x] SQL surface: `BEGIN AGENT SESSION`, `AS OF BRANCH`, `DIFF`, `MERGE`, `REVERT ... CASCADE`
+- [x] SQL surface: `BEGIN AGENT SESSION ... [RUN] [MODEL] [PROMPT]`, `AS OF BRANCH`, `DIFF`,
+      `MERGE`, `REVERT ... CASCADE`
 - [x] Verification gate tiers, ordered by cost ÷ rejection-probability, and the
       `write-set \ read-set` blind-write metric
 - [x] Quarantine: a declined branch stays unmerged but still queryable

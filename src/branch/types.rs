@@ -7,7 +7,6 @@
 //! no parent-chain walk on the read path, no content addressing, no refcounts.
 
 use std::fmt::{Display, Formatter};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::FerroError;
 
@@ -135,25 +134,91 @@ impl Display for CommitHash {
 pub struct LeaseDeadline(pub u64);
 
 impl LeaseDeadline {
-    /// Milliseconds since the unix epoch, right now.
+    /// Milliseconds since the unix epoch **as this cluster reckons them**.
+    ///
+    /// # F4: this used to be `SystemTime::now()`, and that is a cluster bug
+    ///
+    /// Wall clocks disagree. Two nodes reading their own clocks disagree about whether a branch is
+    /// live, and disagreeing about that is not a stale read — reaping frees the branch's arenas
+    /// and then bumps its `BranchId` generation, which exists precisely so a reaped id can never
+    /// be mistaken for a live one, and which therefore makes a wrongly-reaped branch
+    /// **unrecoverable**. Exit criterion 9 is that two nodes never disagree here.
+    ///
+    /// So the reading comes from [`crate::cluster::lease_now_millis`]:
+    ///
+    /// * standalone — the local wall clock, unchanged, because a node with no cluster configured
+    ///   *is* its own leader and its clock is this one-node cluster's time;
+    /// * a cluster member — the last applied [`crate::consensus::Command::LeaseTick`], which every
+    ///   member of the cluster applies at the same round and therefore agrees on.
+    ///
+    /// # Why it panics rather than returning a wrong number
+    ///
+    /// A cluster member that has applied no tick does not know the time, and this signature cannot
+    /// say so. Every value it could return is worse than aborting: a local reading is exactly the
+    /// divergence being removed; a value in the past reaps live branches, destructively and
+    /// unrecoverably; a value in the future silently stops reaping and defeats exit criterion 8
+    /// with no symptom. The house already answers this shape the same way — see the
+    /// `unreachable!` in `consensus::Body::stale_refusal`, chosen so that a missing case "fails
+    /// loudly here instead of sending a wrong answer".
+    ///
+    /// **It is unreachable on a single node**, where [`crate::cluster::lease_now_millis`] never
+    /// fails, which is why the existing suite is untouched. Cluster callers use
+    /// [`LeaseDeadline::try_now_millis`], which returns the refusal instead.
+    #[track_caller]
     pub fn now_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        Self::try_now_millis().unwrap_or_else(|e| {
+            panic!(
+                "lease time was read on a node that does not know the cluster's time: {e}. Use \
+                 LeaseDeadline::try_now_millis to handle this rather than abort."
+            )
+        })
     }
 
-    /// A deadline `millis` from now.
+    /// [`LeaseDeadline::now_millis`], refusing instead of aborting. **The cluster-facing path.**
+    pub fn try_now_millis() -> Result<u64, crate::cluster::GrantError> {
+        crate::cluster::lease_now_millis()
+    }
+
+    /// A deadline `millis` from the cluster's now.
+    ///
+    /// Deterministic across nodes: each node computes `tick + millis` from the same applied tick,
+    /// so a fork replicated as `BranchOp::Fork { lease_millis, .. }` produces the *same* deadline
+    /// everywhere it is applied — which is what makes the durable `lease_deadline` in the branch
+    /// record agree between nodes without shipping it.
+    ///
+    /// Panics on a cluster member with no applied tick; see [`LeaseDeadline::now_millis`]. Use
+    /// [`LeaseDeadline::try_from_now`] on a cluster path.
+    #[track_caller]
     pub fn from_now(millis: u64) -> Self {
         LeaseDeadline(Self::now_millis().saturating_add(millis))
     }
 
+    /// [`LeaseDeadline::from_now`], refusing instead of aborting. **The cluster-facing path.**
+    pub fn try_from_now(millis: u64) -> Result<Self, crate::cluster::GrantError> {
+        Ok(LeaseDeadline(Self::try_now_millis()?.saturating_add(millis)))
+    }
+
+    /// Whether this deadline has passed at `now_millis`.
+    ///
+    /// Deliberately still a **pure comparison** with the clock supplied by the caller, and it is
+    /// what `reaper::reap_expired` uses. Keeping it pure is the reason two nodes cannot disagree:
+    /// the only thing left that could differ is the `now` they were given, and that now comes from
+    /// the replicated tick.
     pub fn is_expired_at(&self, now_millis: u64) -> bool {
         now_millis >= self.0
     }
 
-    pub fn is_expired(&self) -> bool {
-        self.is_expired_at(Self::now_millis())
+    /// Whether this deadline has passed **as the cluster reckons time**.
+    ///
+    /// Fallible, and returns a refusal rather than `false`, because this is the destructive
+    /// direction: `false` would read as "still live" and silently stop reaping.
+    ///
+    /// This replaces an infallible `is_expired(&self)` that read `SystemTime::now()` itself. That
+    /// method had no callers anywhere in the repository, and it was the one remaining way to make
+    /// a reap decision from a node-local clock — removed rather than guarded, because a guard on a
+    /// method nobody calls is a guard somebody deletes.
+    pub fn is_expired_now(&self) -> Result<bool, crate::cluster::GrantError> {
+        Ok(self.is_expired_at(Self::try_now_millis()?))
     }
 }
 

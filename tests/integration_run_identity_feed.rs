@@ -188,6 +188,64 @@ fn every_committed_row_change_names_the_run_that_wrote_it() {
     assert_ne!(decoded.runs[&1].prompt_hash, decoded.runs[&2].prompt_hash);
 }
 
+/// **E79b: the same assertion, over the SQL path.**
+///
+/// The test above builds its `RunEntity` in Rust and hands it to `bind_run`, so its non-zero
+/// `prompt_hash` proves only that the field can hold a digest — it says nothing about the path a
+/// client actually uses. Over SQL the value was `[0u8; 32]` at every site, because
+/// `begin_session_with_model` had no prompt parameter and `BEGIN AGENT SESSION` had no clause
+/// carrying one. The whole chain is exercised here instead: the clause is parsed, the runtime hashes
+/// it into the interned run, `MERGE` binds that run to the publishing transaction, and the digest
+/// comes back out of the **real** `LogicalDecoder` on the change event.
+///
+/// **Breaking shape:** one agent session whose prompt is known to the test, so the digest can be
+/// asserted against `prompt_digest` of the exact text rather than against "not all zeroes" — the
+/// weaker assertion is one a second wrong constant would pass.
+#[test]
+fn a_prompt_declared_over_sql_reaches_the_feed_as_a_digest() {
+    let mut d = db("sql_prompt");
+    d.sql("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER NOT NULL);");
+
+    let prompt = "top up everything below reorder";
+    d.sql(&format!(
+        "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus/2026-05' \
+         PROMPT '{prompt}';"
+    ));
+    d.sql("INSERT INTO inventory VALUES (1, 10);");
+    d.sql("MERGE;");
+
+    let decoded = d.decode_all();
+    let rows = writes(&decoded);
+    assert_eq!(rows.len(), 1, "expected the merged insert on the feed, got {:?}", rows.len());
+
+    let w = rows[0].writer.as_ref().expect("the merged row carried no writer");
+    assert_eq!(w.agent_id, "restock-agent");
+    assert_eq!(w.run_id, "run-42");
+    assert_ne!(w.prompt_hash, [0u8; 32], "the prompt hash is the all-zero placeholder over SQL");
+    assert_eq!(
+        w.prompt_hash,
+        prompt_digest(prompt),
+        "the feed carries a hash, but not this prompt's"
+    );
+
+    // The log describes its own writer, so a consumer needs no provenance store to read the digest.
+    assert_eq!(decoded.runs.len(), 1, "{:?}", decoded.runs);
+    let (_, run) = decoded.runs.iter().next().unwrap();
+    assert_eq!(run.prompt_hash, prompt_digest(prompt));
+
+    // And the plaintext went nowhere: what the WAL holds is 32 bytes, which is the claim
+    // `provenance::sha256`'s header makes for the whole field.
+    let wal_bytes = std::fs::read(d.dir.path().join("sql_prompt.wal")).expect("no wal file");
+    assert!(
+        !wal_bytes.windows(prompt.len()).any(|c| c == prompt.as_bytes()),
+        "the prompt was written to the WAL in plain text"
+    );
+    assert!(
+        wal_bytes.windows(32).any(|c| c == prompt_digest(prompt)),
+        "the digest is not in the WAL either, so the assertion above proved nothing"
+    );
+}
+
 /// **The anti-vacuity half, and the count that must never be assumed to be zero.**
 ///
 /// A transaction nobody bound a run to is a legitimate thing — every ordinary SQL write is one — and

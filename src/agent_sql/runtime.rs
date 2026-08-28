@@ -23,7 +23,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use crate::catalog::alter::{conform_row, resulting_schema};
+use crate::catalog::alter::{
+    conform_row, refuse_if_the_row_cannot_land, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
+};
 use crate::execution::executor::alteration_of;
 use crate::parser::parser::AlterAction;
 use crate::agent_sql::changeset::{
@@ -64,6 +66,7 @@ use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
 use crate::provenance::store::MemProvenanceStore;
+use crate::provenance::sha256::prompt_digest;
 use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::tel::frame::TxnFrame;
@@ -310,6 +313,33 @@ pub struct RunActivity {
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {
     fn resolve_branch(&self, name: &str) -> Result<BranchId, FerroError>;
+}
+
+/// Everything a caller declares about the run behind a session — what provenance interns.
+///
+/// A struct rather than four more positional parameters on `begin_session_with_model`. Three of
+/// the four fields are optional and two of those are `Option<&str>`: as parameters, `run_id` and
+/// `prompt` would sit in one argument list with nothing in the type system between them, and a
+/// swapped pair would attribute every row of the run to a prompt while hashing the run id — a
+/// mistake with no symptom, because both values are strings and both are accepted.
+///
+/// [`Default`] gives the shape a caller who declares only an agent: no run, no model, no prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunIdentity<'a> {
+    /// Stable identity of the agent across runs. The one field that is required.
+    pub agent_id: &'a str,
+    /// This particular invocation. `None` is recorded as the literal `<unnamed>`.
+    pub run_id: Option<&'a str>,
+    /// `(name, version)`. `None` is recorded as `unspecified` in both halves, which reads as
+    /// "never declared" rather than attributing the writes to a model nobody named.
+    pub model: Option<(&'a str, &'a str)>,
+    /// The prompt behind the run, as text. It is hashed by `begin_session_as` and never stored:
+    /// `RunEntity::prompt_hash` is the digest, so a prompt carrying customer data does not become
+    /// a durable copy of it.
+    ///
+    /// `None` — no prompt declared — is the all-zero hash, deliberately **not**
+    /// `prompt_digest("")`. An empty prompt is a prompt.
+    pub prompt: Option<&'a str>,
 }
 
 pub struct AgentRuntime {
@@ -627,7 +657,7 @@ impl AgentRuntime {
         run_id: Option<&str>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
-        self.begin_session_with_model(agent_id, run_id, None, parent)
+        self.begin_session_as(RunIdentity { agent_id, run_id, ..RunIdentity::default() }, parent)
     }
 
     /// As [`AgentRuntime::begin_session`], but recording the model behind the run.
@@ -642,6 +672,21 @@ impl AgentRuntime {
         model: Option<(&str, &str)>,
         parent: BranchId,
     ) -> Result<AgentSession, FerroError> {
+        self.begin_session_as(RunIdentity { agent_id, run_id, model, prompt: None }, parent)
+    }
+
+    /// The full form: fork a branch and intern the run under everything the caller declared
+    /// about it, the prompt included.
+    ///
+    /// This is the only one of the three with a body; the other two are the shapes that predate
+    /// [`RunIdentity`] and delegate here. One body is the point — a second copy of the interning
+    /// sequence is how the `[0u8; 32]` this row exists to remove survived being fixed once.
+    pub fn begin_session_as(
+        &self,
+        id: RunIdentity<'_>,
+        parent: BranchId,
+    ) -> Result<AgentSession, FerroError> {
+        let RunIdentity { agent_id, run_id, model, prompt } = id;
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
@@ -655,9 +700,17 @@ impl AgentRuntime {
         let txn = TxnId(state.next_txn);
         let run = run_id.unwrap_or("<unnamed>").to_string();
         let (model_name, model_version) = model.unwrap_or(("unspecified", "unspecified"));
+        // **This is where the prompt stops being text.** Hashed once, here, and the `&str` is
+        // dropped at the end of the call: what the store, the WAL identity record, the change feed
+        // and `ferro_runs` all receive is 32 bytes. `None` — no `PROMPT` clause — is the all-zero
+        // hash, which is not `prompt_digest("")` and must never become it: "no prompt was declared"
+        // and "the prompt was empty" are different facts about a run.
+        let prompt_hash = prompt.map(prompt_digest).unwrap_or([0u8; 32]);
         // Intern first so the store assigns the id, then rebuild the entity carrying it. The
         // store returns the SAME id for a repeated (agent, run), which is what makes attribution
-        // run-level; it also refuses a re-intern whose actor tuple disagrees.
+        // run-level; it also refuses a re-intern whose actor tuple disagrees. `same_actor` counts
+        // `prompt_hash`, so re-beginning one run under a different prompt is refused here rather
+        // than quietly reusing the first prompt's slot.
         let started = LeaseDeadline::now_millis();
         let prov = self.prov_store.intern(&RunEntity::new(
             ProvId::NONE,
@@ -665,7 +718,7 @@ impl AgentRuntime {
             run.clone(),
             model_name,
             model_version,
-            [0u8; 32],
+            prompt_hash,
             started,
             parent,
         ))?;
@@ -675,7 +728,7 @@ impl AgentRuntime {
             run.clone(),
             model_name,
             model_version,
-            [0u8; 32],
+            prompt_hash,
             started,
             parent,
         );
@@ -2698,6 +2751,162 @@ impl AgentRuntime {
             post: pending.iter().filter_map(|w| w.published_image()).collect(),
         };
 
+        // **Everything this merge can refuse, it refuses HERE — before the first byte is written.**
+        //
+        // E82. This function used to publish the rows, commit them, and only then execute the
+        // branch's schema edits, one `Catalog::alter_table` call at a time. Each of those calls is
+        // individually atomic — `catalog::alter` argues at length that because the heap rewrite is
+        // unlogged, "refused" and "unchanged" have to be the same state — and the merge around them
+        // was not atomic at all. An edit refused at position *k* left edits `1..k-1` installed in
+        // the catalog, flushed to disk and emitted to the change feed, and left every row the
+        // branch wrote published and visible on the target, from a statement that returned `Err`.
+        // Retrying then found a branch whose rows were already on the target, reported
+        // `applied_to_target = false`, and silently dropped the edit it had never applied.
+        //
+        // So the merge is a plan and then an execution, which is the split one alteration already
+        // had, raised to the whole statement:
+        //
+        // 1. plan every table's whole chain of edits, which makes every refusal any of them can
+        //    make while the tables are untouched;
+        // 2. carry every row this merge is about to publish into the shape it will land in, and
+        //    measure it there;
+        // 3. apply the plans;
+        // 4. publish the rows.
+        //
+        // **The schema now goes first, and the order is load-bearing rather than incidental.** The
+        // comment this replaces justified rows-then-schema on the grounds that the alter's rewrite
+        // widens every row in the table including the ones just published, so publishing narrow and
+        // altering afterwards was the same single pass the alter was always going to make. That is
+        // true, and it is not the constraint. The constraint is that a plan's decision is only
+        // valid for the heap it read: publish rows between deciding and writing and the plan no
+        // longer describes the heap it is about to lay down. Schema first, and the deciding pass
+        // and the writing pass see the same heap — while the rows go straight into the shape the
+        // edits produced, carried there by `conform_row`, the same function that already carries a
+        // branch's rows across a sibling's merged `ADD COLUMN`.
+        //
+        // **What is still fallible after step 3, stated exactly rather than generously.** It is what
+        // `catalog::alter` already calls environmental — a disk write that fails, a buffer pool with
+        // no evictable frame, the arena floor exhausted by a relocation that `reserve_free_space`
+        // could not see coming. Two shapes of residue, and the second is not the first:
+        //
+        // - **one table**: its shape is applied and no row is published. The merge returns `Err`
+        //   and the target is a table with the edit and none of the branch's rows.
+        // - **more than one table**: the tables before the failure are altered and the ones after
+        //   it are not. `Catalog::apply_plan` persists as it installs, so table X is durable before
+        //   table Y is attempted, and there is no undo because the rewrite is unlogged. A merge
+        //   over two altered tables is atomic in its REFUSALS and not in its FAILURES.
+        //
+        // Neither is closed here, for the reason `catalog::alter` gives for refusing rather than
+        // rolling back: an undo would be a second unlogged mutation whose own failure would have no
+        // repair at all. Closing them needs the heap rewrite logged, which is a larger change than
+        // this row. What IS closed, below, is the change feed — it never carries half of a
+        // multi-table merge.
+        let prov = Arc::clone(self.provenance());
+        let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
+        for (i, report) in schema_reports.iter().enumerate() {
+            if report.to_apply.is_empty() {
+                continue;
+            }
+            let actions: Vec<AlterAction> = report.to_apply.iter().map(|e| e.as_action()).collect();
+            let plan = ctx
+                .catalog
+                .plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))
+                .map_err(in_a_merge_the_narrowing_comes_first)?;
+            plans.push((i, plan));
+        }
+
+        // The shape each table's rows will land in — the one this merge's edits produce where it
+        // has any, and the table's current shape everywhere else.
+        //
+        // A table this merge does not alter is in the map too, and deliberately: a row too wide for
+        // a table nobody altered would otherwise be refused by `Tuple::serialize` from inside the
+        // publish transaction, after a DIFFERENT table's edits had already landed. One merge, one
+        // decision, over every table it touches.
+        let mut landing: BTreeMap<String, (Schema, Schema)> = BTreeMap::new();
+        for w in &pending {
+            let name = w.table();
+            if landing.contains_key(name) {
+                continue;
+            }
+            let from = ctx.catalog.require_table(name)?.schema.clone();
+            let to = plans
+                .iter()
+                .find(|(i, _)| schema_reports[*i].table == name)
+                .map(|(_, plan)| plan.final_shape().clone())
+                .unwrap_or_else(|| from.clone());
+            landing.insert(name.to_string(), (from, to));
+        }
+
+        let mut ready: Vec<PendingWrite> = Vec::with_capacity(pending.len());
+        for w in pending {
+            let (from, to) = landing.get(w.table()).ok_or_else(|| {
+                FerroError::Internal(format!(
+                    "no landing shape for '{}', which this merge is about to write to",
+                    w.table()
+                ))
+            })?;
+            ready.push(w.conform_to(from, to)?);
+        }
+
+        // ---- the schema, applied while no row of this merge has been written -------------------
+        //
+        // Executed through exactly the path a non-agent `ALTER TABLE` takes — the catalog's own
+        // plan and apply, then a flush, then `log_ddl` — so a column an agent added reaches the
+        // change feed as the same in-band, in-log-order event as one a human added, and the
+        // retained declaration is updated the same way. A second producer of schema events would be
+        // a second chance to disagree with the consumer.
+        //
+        // One DDL record per edit, carrying the shape THAT edit produced, even though the chain is
+        // laid down in one pass: the feed is a sequence of events, and a consumer applying them in
+        // order arrives at the same final shape it would have reached from the statements typed one
+        // at a time.
+        //
+        // Flushed rather than checkpointed, for the reason spelled out in the executor's
+        // `AlterTable` arm: truncating the log here would delete the change history of the very
+        // table this merge is about to publish rows into.
+        let mut records: Vec<crate::wal::txn::DdlRecord> = Vec::new();
+        for (i, plan) in plans {
+            let table = schema_reports[i].table.clone();
+            let (dir_root, tt_root) = {
+                let entry = ctx.catalog.require_table(&table)?;
+                (entry.first_directory_page_id, entry.time_travel_root)
+            };
+            // Read BEFORE the change, and from the plan rather than the catalog: a rename's old
+            // name and a retype's old type live only in the shape the action was applied to, and
+            // for every action after the first, that shape never exists in the catalog at all.
+            let alterations = plan
+                .steps()
+                .map(|(action, before)| alteration_of(action, before))
+                .collect::<Result<Vec<_>, FerroError>>()?;
+            let shapes = ctx.catalog.apply_plan(plan, &ctx.txn)?;
+            for (alteration, columns) in alterations.into_iter().zip(shapes) {
+                records.push(crate::wal::txn::DdlRecord {
+                    op: crate::wal::log::DdlOp::AlterColumn(alteration),
+                    table: table.clone(),
+                    dir_root,
+                    time_travel_root: tt_root,
+                    columns,
+                });
+            }
+        }
+
+        // **One flush and one run of feed records for the whole merge**, after every table's
+        // rewrite has succeeded — rather than one of each per table, inside the loop above.
+        //
+        // It does not make a multi-table merge atomic; nothing short of logging the heap rewrite
+        // can, for the reason given above the loop. What it does buy is that the CHANGE FEED never
+        // carries half of one. A consumer rebuilding from the feed sees every table this merge
+        // altered or none of them, where flushing and logging per table would have handed it table
+        // X's new column and no word about table Y, permanently and with no later record to
+        // reconcile it against.
+        if !records.is_empty() {
+            ctx.bp.flush_all()?;
+            ctx.bp.disk_manager.sync()?;
+            for record in records {
+                ctx.txn.log_ddl(record)?;
+            }
+        }
+
         // **Reserve the version sequence BEFORE the rows become visible.**
         //
         // `record_applied` runs after `commit`, and it used to be where `apply_seq` advanced. That
@@ -2724,7 +2933,15 @@ impl AgentRuntime {
         // it is appended to once per stamped version, never pruned, and written by nobody but the
         // stamping loop, so it answers "has this number been handed out" without consulting the
         // arithmetic that produced the number. Refused here rather than asserted after `commit`,
-        // because here the rows are not yet visible and a refusal is still a clean one.
+        // because here the rows are not yet visible.
+        //
+        // **"Clean" now means clean of published rows, and not clean of everything.** This sits
+        // after the schema apply above, so a refusal here returns with the schema edits already
+        // durable. It is left here rather than hoisted above them deliberately: hoisting would
+        // trade a refusal that can only fire if the no-two-versions-share-a-`begin_ts` invariant is
+        // ALREADY broken for a leaked reservation on every ORDINARY refusal — and the schema
+        // refusals above fire whenever an agent stages an edit its table cannot take, which is a
+        // thing that happens.
         let reserved: std::ops::Range<u64> = {
             let mut state = self.state.lock().unwrap();
             let base = state.apply_seq;
@@ -2738,15 +2955,10 @@ impl AgentRuntime {
         // failed halfway visible on the target, which is exactly the state a merge exists to
         // avoid: the report says the merge landed or it says it did not.
         //
-        // Rows go in under the shape the catalog has NOW — every image was conformed to it above,
-        // where the cell merge could still see both shapes — and the branch's own schema edits are
-        // executed afterwards. Two reasons, and the order is not interchangeable:
-        //
-        // - `ALTER` is refused inside a transaction, so the edits cannot run inside the publish
-        //   transaction at all;
-        // - the alter's own heap rewrite widens every row in the table, which includes the ones
-        //   just published — so publishing narrow and altering after is not a compromise, it is
-        //   the same single pass over the heap that the alter was always going to make.
+        // The rows are `ready` rather than `pending`: already carried into the shape the schema
+        // edits above left the table in, and already measured against it. `ALTER` is refused
+        // inside a transaction, so the edits could never have run inside this one; they ran
+        // before it opened.
         let publish_txn = ctx.txn.begin()?;
         // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
         //
@@ -2776,7 +2988,7 @@ impl AgentRuntime {
             }
         }
         let mut published = 0usize;
-        for w in pending {
+        for w in ready {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
             crash_after_rows(published);
             let author = Some((Arc::clone(self.provenance()), snapshot.prov));
@@ -2787,41 +2999,6 @@ impl AgentRuntime {
             published += 1;
         }
         ctx.txn.commit(publish_txn)?;
-
-        // The schema, last, and outside the publish transaction because DDL is refused inside one.
-        // Executed through exactly the path a non-agent `ALTER TABLE` takes — `Catalog::alter_table`
-        // then a checkpoint then `log_ddl` — so a column an agent added reaches the change feed as
-        // the same in-band, in-log-order event as one a human added, and the retained declaration
-        // is updated the same way. A second producer of schema events would be a second chance to
-        // disagree with the consumer.
-        for report in &schema_reports {
-            for edit in &report.to_apply {
-                let action = edit.as_action();
-                let (dir_root, tt_root, alteration) = {
-                    let entry = ctx.catalog.require_table(&report.table)?;
-                    (
-                        entry.first_directory_page_id,
-                        entry.time_travel_root,
-                        alteration_of(&action, &entry.schema)?,
-                    )
-                };
-                let prov = Arc::clone(self.provenance());
-                let shape =
-                    ctx.catalog.alter_table(&report.table, &action, &ctx.txn, Some(&prov))?;
-                // Flushed rather than checkpointed, for the reason spelled out in the executor's
-                // `AlterTable` arm: truncating the log here would delete the change history of the
-                // very table this merge just published rows into.
-                ctx.bp.flush_all()?;
-                ctx.bp.disk_manager.sync()?;
-                ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
-                    op: crate::wal::log::DdlOp::AlterColumn(alteration),
-                    table: report.table.clone(),
-                    dir_root,
-                    time_travel_root: tt_root,
-                    columns: shape,
-                })?;
-            }
-        }
 
         self.record_applied(
             from,
@@ -3646,6 +3823,39 @@ fn numeric(v: &Value) -> Option<i64> {
     }
 }
 
+/// The row-width refusal, told what it means inside a `MERGE`.
+///
+/// `catalog::alter`'s message ends "Narrow the row first ... and run the ALTER again". That is
+/// complete advice for a statement and incomplete advice for a merge, and the difference is not
+/// cosmetic: a merge decides its schema edits against the target **as it stands when the merge
+/// begins**, so a narrowing `UPDATE` this same merge is carrying has not reached the target yet and
+/// re-running the merge refuses identically, forever. The narrowing has to land in a merge of its
+/// own first.
+///
+/// That is a consequence of deciding before writing rather than an oversight, and it is the price
+/// of the whole row: the heap rewrite is unlogged, so a merge's schema edits have to be decided
+/// against a heap that is not moving underneath them, and the only heap that is not moving is the
+/// one before this merge publishes anything. Publishing first and deciding after is what E82 was.
+///
+/// Recognised through the marker `catalog::alter` exports rather than by matching its prose, and
+/// every other error is passed through untouched.
+fn in_a_merge_the_narrowing_comes_first(e: FerroError) -> FerroError {
+    // Destructured rather than stringified: `FerroError::Constraint` Displays with a
+    // "constraint error: " prefix, so wrapping `e.to_string()` in another `Constraint` produces a
+    // refusal that says it twice.
+    let FerroError::Constraint(msg) = e else { return e };
+    if !msg.contains(NARROW_THE_ROW_FIRST) {
+        return FerroError::Constraint(msg);
+    }
+    FerroError::Constraint(format!(
+        "{msg} Inside a MERGE the narrowing has to reach the target first: merge the UPDATE that \
+         shortens the row, then merge the schema edit. This merge's own rows have not been \
+         published yet — a merge decides its schema edits against the target as it stands when it \
+         begins, because the heap rewrite is unlogged and cannot be decided against a heap that is \
+         still moving."
+    ))
+}
+
 /// Fault injection for crash-safety testing (D8). **Inert unless `FERRODB_CRASH_AFTER_ROWS` is
 /// set**, and read once rather than per row.
 ///
@@ -3930,6 +4140,57 @@ enum PendingWrite {
 }
 
 impl PendingWrite {
+    /// The table this write lands on.
+    fn table(&self) -> &str {
+        match self {
+            PendingWrite::Insert { table, .. }
+            | PendingWrite::Update { table, .. }
+            | PendingWrite::Delete { table, .. } => table,
+        }
+    }
+
+    /// Carry this write from the shape the target had when the merge was scored (`from`) into the
+    /// shape it will have when the write lands (`to`), and refuse it if the result does not fit a
+    /// page.
+    ///
+    /// **Both halves belong together, and both belong before anything is written.** A merge that
+    /// alters a table publishes into the ALTERED shape, so an image scored against the old one has
+    /// the wrong arity and possibly the wrong type — and `Tuple::serialize` would say so from
+    /// inside the publish transaction, after the schema edits had already landed. The width is the
+    /// same story one step further on: `INTEGER -> BIGINT` moves every column after the retyped one
+    /// and an appended column costs at least the bytes the null bitmap grows by, so a row that fit
+    /// when it was scored can fail to fit when it lands. Measured here, a merge that cannot publish
+    /// its rows refuses before it has changed anything; measured at insertion, it refuses after.
+    ///
+    /// `from == to` — the ordinary merge, which alters nothing — makes `conform_row` a copy and the
+    /// width check a serialization the executor was about to do anyway.
+    ///
+    /// A delete carries nothing. It names a primary key, and a primary key's type cannot be
+    /// altered (`catalog::alter::resulting_schema` refuses it), so the value it names means the
+    /// same thing under both shapes. The key's column NAME can change, and `into_stmt` reads that
+    /// from the catalog at the moment it builds the statement — which is after the rename landed.
+    fn conform_to(self, from: &Schema, to: &Schema) -> Result<PendingWrite, FerroError> {
+        match self {
+            PendingWrite::Insert { table, row } => {
+                let row = conform_row(&row, from, to)?;
+                let which = format!("the row this merge inserts with key {:?}", row.first());
+                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
+                Ok(PendingWrite::Insert { table, row })
+            }
+            PendingWrite::Update { table, schema: _, key, row, before } => {
+                let row = conform_row(&row, from, to)?;
+                let before = conform_row(&before, from, to)?;
+                let which = format!("the row this merge updates with key {key:?}");
+                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
+                // The landing shape, not the scored one: `into_stmt` builds the `UPDATE`'s
+                // assignments from these column names, and after a rename the scored shape names a
+                // column the table no longer has.
+                Ok(PendingWrite::Update { table, schema: to.clone(), key, row, before })
+            }
+            PendingWrite::Delete { table, key } => Ok(PendingWrite::Delete { table, key }),
+        }
+    }
+
     /// `(table, row)` this write lands on, or `None` for a write with no row image to key by.
     fn row_key(&self) -> Option<(u32, u64)> {
         match self {

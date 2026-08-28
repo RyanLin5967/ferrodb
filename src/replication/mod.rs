@@ -60,7 +60,41 @@ pub mod sync;
 /// `0xFEDB` then a protocol version, so a mismatched peer is rejected at the handshake rather than
 /// misparsed into nonsense several frames later.
 pub const REPL_MAGIC: u32 = 0xFEDB_0001;
-pub const REPL_VERSION: u16 = 1;
+
+/// **2 since F3.** Version 1 spoke only the four log-shipping frames below. Version 2 additionally
+/// carries consensus traffic under [`CONSENSUS_TAG`], and a v1 peer has no arm for that tag.
+///
+/// The bump is the whole point: without it a v1 peer would complete the handshake, receive a frame
+/// whose tag it does not know, and fail *several frames in* with "unknown replication frame" — an
+/// error that describes the symptom at an arbitrary point in the stream rather than the
+/// incompatibility at the point it could have been refused. Both peers of a pair are built from
+/// this same constant, so they always move together; a mixed-version pair is an operator running
+/// two builds, and that is exactly the case this refuses.
+pub const REPL_VERSION: u16 = 2;
+
+/// The one tag carrying a `consensus::Message` — see [`crate::consensus::transport`].
+///
+/// **One tag for the whole consensus protocol, not one per `Body` variant, and that is deliberate.**
+/// The kind of a consensus message is a byte *inside* the body, so:
+///
+/// * this shared file gains exactly one constant and never needs another. Every lane in Phase F
+///   edits a different file and a change here conflicts with all of them, so the number of future
+///   edits this file needs is itself a design property;
+/// * the u8 tag space stays available to replication. Claiming eight ASCII letters for consensus
+///   would permanently constrain a protocol that has nothing to do with it;
+/// * a consensus `Body` variant can be added — F5's membership, F6's snapshot chunks, F7's signed
+///   envelope — without touching the tag registry at all.
+///
+/// It is `b'C'` rather than a free numeric byte so that a human reading a hex dump, or the
+/// `unknown replication frame '{}'` message in [`Message::read_from`], sees a printable letter in
+/// the same style as `H`/`R`/`U`/`E`.
+///
+/// **It must stay disjoint from every replication tag.** A consensus client that dials a
+/// replication listener now passes the handshake — both speak version 2 — and is caught one frame
+/// later by that tag mismatch instead. `consensus::transport` pins the disjointness with a test
+/// that reads the tag byte off each encoded `Message` rather than off a constant, so the check is
+/// against the real wire bytes.
+pub const CONSENSUS_TAG: u8 = b'C';
 
 /// Largest batch a single `Records` frame may carry, so a replica cannot be made to allocate an
 /// unbounded buffer by a peer claiming a huge length.

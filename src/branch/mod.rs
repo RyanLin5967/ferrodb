@@ -8,8 +8,8 @@
 //!    the parent's `live_children`. Nothing else.
 //! 2. **The read path never walks the parent chain.** The child's root *is* the parent's root at
 //!    fork time, so ordinary B+tree descent already reaches parent data. Any "not found here,
-//!    ask my parent" step is a spec violation (BranchBench measured that pattern at up to 5400x
-//!    read degradation).
+//!    ask my parent" step is a spec violation (BranchBench, arXiv:2604.17180, measured that
+//!    pattern at up to 4000x read degradation in Neon, DoltgreSQL, Xata and Tiger Data).
 //! 3. **No refcounts, no content addressing, no compaction.** Liveness is answered by the
 //!    epoch interval rule in [`record::reclaimable`], never by a global reachability question.
 //! 4. **Reading a reaped branch is a hard error, never stale data.**

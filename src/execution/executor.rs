@@ -1260,7 +1260,7 @@ use crate::wal::log::WalManager;
             run(stmts.into_iter().next().unwrap(), catalog, bp.clone(), txn.clone(), s)
         };
         exec("CREATE TABLE t (id INTEGER NOT NULL, str VARCHAR(10));", &mut catalog, &mut s).unwrap();
-        let expected = txn.next_txn_id.load(Ordering::SeqCst);
+        let expected = txn.next_txn_id();
         exec("INSERT INTO t VALUES (1, 'a');", &mut catalog, &mut s).unwrap();
         let entry = catalog.get_table("t").unwrap();
         let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());

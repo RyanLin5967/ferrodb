@@ -22,7 +22,9 @@ diverged branches, 10 -> 1000:
   pages 64 -> 2044
 
 These are ferrodb's numbers against ITSELF at three branch counts, on this machine.
-BranchBench's 5400x figure is that paper's measurement of other systems' overlay pattern;
+BranchBench's up-to-4000x figure is that paper's measurement of other systems' overlay pattern
+(arXiv:2604.17180, "up to 5-4000x slower reads as branches deepen"; this file said 5400x until
+2026-08-28, which was that range with the hyphen dropped);
 nothing here reproduces it and none of the above is a comparison against it.
 
 read latency did not degrade materially with branch count.

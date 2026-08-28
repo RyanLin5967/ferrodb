@@ -1,0 +1,60 @@
+
+### M1 PROMPT reserved as a keyword
+    patch: src/parser/scanner.rs
+    cmd:   cargo test --lib parser::
+    test result: FAILED. 35 passed; 4 failed; 0 ignored; 0 measured; 786 filtered out; finished in 0.00s
+    failing tests: ['parser::parser::tests::a_prompt_clause_is_optional_and_absent_is_not_empty', 'parser::parser::tests::a_repeated_or_misplaced_clause_is_named_without_quoting_the_prompt', 'parser::parser::tests::prompt_is_still_a_usable_column_and_table_name', 'parser::scanner::tests::prompt_is_not_a_reserved_word']
+    *** THE DETECTOR DID NOT FIRE for ['prompt_is_not_a_reserved_word', 'prompt_is_still_a_usable_column_and_table_name'] ***
+
+### M2 an omitted clause defaults to the empty prompt
+    patch: src/parser/parser.rs
+    cmd:   cargo test --test integration_prompt_clause
+    test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+    failing tests: ['an_omitted_clause_is_all_zero_and_an_empty_prompt_is_not']
+    detector fired for every named test
+
+### M3 an empty prompt special-cased back to the placeholder
+    patch: src/agent_sql/runtime.rs
+    cmd:   cargo test --test integration_prompt_clause
+    test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+    failing tests: ['an_omitted_clause_is_all_zero_and_an_empty_prompt_is_not']
+    detector fired for every named test
+
+### M4 the prompt trimmed before hashing
+    patch: src/agent_sql/runtime.rs
+    cmd:   cargo test --test integration_prompt_clause
+    test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+    failing tests: ['two_prompts_that_differ_produce_two_hashes']
+    detector fired for every named test
+
+### M5 RUN and PROMPT transposed on the way to the runtime
+    patch: src/agent_sql/dispatch.rs
+    cmd:   cargo test --test integration_prompt_clause
+    test result: FAILED. 2 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+    failing tests: ['a_prompt_declared_in_sql_becomes_the_runs_digest', 'an_omitted_clause_is_all_zero_and_an_empty_prompt_is_not', 'resuming_a_run_under_a_different_prompt_is_refused_and_under_the_same_one_is_not', 'the_open_session_holds_no_prompt_text', 'the_prompt_text_never_reaches_the_durable_provenance_file', 'the_run_id_and_the_prompt_are_not_transposed']
+    detector fired for every named test
+
+### M6 the prompt text kept beside the digest (recorded as the run id)
+    patch: src/agent_sql/runtime.rs
+    cmd:   cargo test --test integration_prompt_clause
+    test result: FAILED. 4 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+    failing tests: ['resuming_a_run_under_a_different_prompt_is_refused_and_under_the_same_one_is_not', 'the_open_session_holds_no_prompt_text', 'the_prompt_text_never_reaches_the_durable_provenance_file', 'the_run_id_and_the_prompt_are_not_transposed']
+    detector fired for every named test
+
+### M7 the misplaced-clause error quotes the token before it
+    patch: src/parser/parser.rs
+    cmd:   cargo test --lib parser::parser::tests::a_repeated_or_misplaced_clause
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 824 filtered out; finished in 0.00s
+    failing tests: ['parser::parser::tests::a_repeated_or_misplaced_clause_is_named_without_quoting_the_prompt']
+    *** THE DETECTOR DID NOT FIRE for ['a_repeated_or_misplaced_clause_is_named_without_quoting_the_prompt'] ***
+
+### M8 the clause parsed and then dropped at dispatch
+    patch: src/agent_sql/dispatch.rs
+    cmd:   cargo test --test integration_prompt_clause --test integration_run_identity_feed --test integration_system_views
+    test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+    failing tests: ['a_prompt_declared_in_sql_becomes_the_runs_digest', 'an_omitted_clause_is_all_zero_and_an_empty_prompt_is_not', 'resuming_a_run_under_a_different_prompt_is_refused_and_under_the_same_one_is_not', 'the_open_session_holds_no_prompt_text', 'the_prompt_text_never_reaches_the_durable_provenance_file', 'the_run_id_and_the_prompt_are_not_transposed', 'two_prompts_that_differ_produce_two_hashes']
+    *** THE DETECTOR DID NOT FIRE for ['a_prompt_declared_over_sql_reaches_the_feed_as_a_digest', 'ferro_runs_reports_the_digest_of_a_declared_prompt'] ***
+
+tree after restore: clean
+
+SOMETHING DID NOT FIRE — see above

@@ -772,7 +772,6 @@ mod tests {
     /// the failure that used to trigger it.
     #[test]
     fn a_snapshot_whose_resume_point_cannot_be_pinned_leaves_no_reader_behind() {
-        use std::sync::atomic::Ordering;
         let (_d, txn) = engine("exact_pin_fail");
 
         // An open transaction whose `Begin` becomes the resume point, then the log truncated out
@@ -780,7 +779,7 @@ mod tests {
         // WAL is told directly. Fault injection, deliberately: the path is rare and used to be
         // unrecoverable.
         let open = txn.begin().unwrap();
-        txn.wal.truncate(txn.next_txn_id.load(Ordering::SeqCst)).unwrap();
+        txn.wal.truncate(txn.next_txn_id()).unwrap();
 
         let mut buf = Vec::new();
         let err = snapshot_table_exact("t", &txn, &Publication::unrestricted(), &mut buf, |_reader| Ok(rows()))

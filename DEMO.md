@@ -301,9 +301,18 @@ Listed because each one bounds a verdict above.
     which made the "model" half of criterion 9 unanswerable. A bare `MODEL 'gpt-9'` leaves the
     version half explicitly `unspecified` rather than inventing one, and an empty or half-empty
     model is refused at bind time.
-13. **Act II's criteria are demonstrated on one small table** (`inventory`, 2–3 rows). They are
+13. **`PROMPT` is a new optional clause (E79b), added the same way `MODEL` was.**
+    `BEGIN AGENT SESSION ... PROMPT '<text>'` did not exist, so every `RunEntity` the SQL surface
+    built passed `[0u8; 32]` and criterion 9's prompt half was unanswerable through SQL even though
+    `prompt_digest` had been correct since B5. The clause hashes through `prompt_digest`; omitting it
+    still works and still yields the all-zero hash, which is deliberately **not**
+    `prompt_digest("")` — "no prompt was declared" and "the prompt was empty" are different facts.
+    `PROMPT` reserves no word: it is matched by lexeme, so `prompt` remains a usable column name.
+14. **Act II's criteria are demonstrated on one small table** (`inventory`, 2–3 rows). They are
     correctness demonstrations, not performance ones. **No benchmark in this demo measures the
-    5400x read-degradation claim** that motivated the no-parent-chain rule; criterion 1 shows the
+    up-to-4000x read-degradation claim** (BranchBench, arXiv:2604.17180 — written 5400x here until
+    2026-08-28, which was "up to 5-4000x" with the hyphen dropped) that motivated the
+    no-parent-chain rule; criterion 1 shows the
     child descends from a shared root, which is the structural precondition, not the measurement.
 
 ### Stubs: seven exist in the tree, none on the demo path
