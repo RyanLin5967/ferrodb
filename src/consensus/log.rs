@@ -712,7 +712,15 @@ impl RoundLog {
 
         let file = Arc::clone(&self.files[self.live]);
         if let Err(e) = file.set_len(new_end).and_then(|()| file.sync_all()) {
-            return Err(LogError::Io(format!("{e}")));
+            // POISON, never a plain `Io`. The in-memory index has already been shortened above, so
+            // if the `set_len`/`sync_all` pair did not reach the device the file may still be long
+            // while this handle believes it is short. A caller that saw a recoverable-looking
+            // `Io` and appended would write its new tail at `new_end`, over bytes whose removal
+            // was never made durable — and a crash there leaves a log whose recovery cannot tell
+            // the replacement suffix from the one it replaced.
+            let why = format!("a truncation to round {} could not be made durable: {e}", from - 1);
+            self.poisoned = Some(why.clone());
+            return Err(LogError::Poisoned(why));
         }
         Ok(())
     }
