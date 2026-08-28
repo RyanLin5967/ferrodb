@@ -705,6 +705,19 @@ impl ArenaPageStore {
 
     /// Replace the free-space map from a checkpoint. Refuses a truncated or corrupt image rather
     /// than loading a partial map — a free-space map that is half right hands out live pages.
+    /// # F4: the two counters are **raised**, never set
+    ///
+    /// This used to `store()` the image's values straight into the two atomics. It now calls
+    /// `GrantedCounter::raise_issued_through`, which takes the maximum. Every caller in the tree
+    /// passes a freshly assembled store whose watermark is still `base_page`, so on every real path
+    /// the two are identical — but this is a `pub` method, and on a store that has already issued,
+    /// the old behaviour would rewind the counter and re-hand-out pages it had already given away.
+    /// Raising cannot do that.
+    ///
+    /// The free-space map is still replaced wholesale, so on such a store the map and the watermark
+    /// can disagree. That disagreement is in the conservative direction — fresh extents start above
+    /// what the map suggests — and the alternative, lowering the watermark to match, is the
+    /// aliasing bug.
     pub fn load_state(&self, bytes: &[u8]) -> Result<(), FerroError> {
         let body = bytes
             .len()

@@ -190,12 +190,26 @@ impl LeaseDeadline {
     /// [`LeaseDeadline::try_from_now`] on a cluster path.
     #[track_caller]
     pub fn from_now(millis: u64) -> Self {
-        LeaseDeadline(Self::now_millis().saturating_add(millis))
+        LeaseDeadline(Self::saturating_deadline(Self::now_millis(), millis))
     }
 
     /// [`LeaseDeadline::from_now`], refusing instead of aborting. **The cluster-facing path.**
     pub fn try_from_now(millis: u64) -> Result<Self, crate::cluster::GrantError> {
-        Ok(LeaseDeadline(Self::try_now_millis()?.saturating_add(millis)))
+        Ok(LeaseDeadline(Self::saturating_deadline(Self::try_now_millis()?, millis)))
+    }
+
+    /// `now + millis`, saturating at **one below** `u64::MAX`.
+    ///
+    /// The last value is reserved: `branch/catalog.rs`'s `TRUNK_LEASE` is `LeaseDeadline(u64::MAX)`
+    /// and means *never expires*. A plain `saturating_add` therefore turns an over-long lease — a
+    /// huge `lease_millis`, or a cluster tick far in the future — into a branch that is
+    /// indistinguishable from trunk and can never be reaped, which defeats exit criterion 8 with no
+    /// symptom at all: nothing errors, the branch simply stays for ever.
+    ///
+    /// Saturating one lower keeps the sentinel unforgeable while costing a millisecond nobody can
+    /// observe — `u64::MAX - 1` ms after the epoch is roughly 584 million years.
+    fn saturating_deadline(now: u64, millis: u64) -> u64 {
+        now.saturating_add(millis).min(u64::MAX - 1)
     }
 
     /// Whether this deadline has passed at `now_millis`.

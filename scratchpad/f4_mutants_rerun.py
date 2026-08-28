@@ -14,10 +14,11 @@ interrupted mid-sweep must leave the evidence it already collected.
 import subprocess, sys, pathlib, os
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "scratchpad" / "f4-mutants.txt"
+OUT = ROOT / "scratchpad" / "f4-mutants-rerun.txt"
 ENV = dict(os.environ, PATH=os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"])
 
 # (id, rule, file, needle, replacement, cargo target, test filter)
+SELECT = ['M11', 'M12', 'M13', 'M19', 'M20', 'M21', 'M21b', 'M8', 'M8b', 'M9']
 MUTANTS = [
     ("M1", "a cluster member with no grant REFUSES; it never falls back to a local counter",
      "src/cluster/mod.rs",
@@ -270,12 +271,6 @@ MUTANTS = [
      "        let epoch = self.revoke_stale_authority();\n        let _ = epoch;\n        if false {\n            let st = self.state.lock().unwrap();\n            if let Some(&arena) = st.current.get(&branch) {",
      "--test integration_cluster_grants", "a_granted_extent_is_filled_without_any_further_consensus"),
 
-    ("M23", "a computed deadline cannot collide with the never-expires trunk sentinel",
-     "src/branch/types.rs",
-     "        now.saturating_add(millis).min(u64::MAX - 1)",
-     "        now.saturating_add(millis)",
-     "--test integration_cluster_grants", "an_over_long_lease_cannot_forge"),
-
     ("M13", "the epoch-aware remaining() cannot disagree with the guard that refuses",
      "src/cluster/mod.rs",
      """    fn remaining_values(&mut self, now_epoch: AuthorityEpoch) -> u64 {
@@ -360,7 +355,7 @@ def main():
     # unit test and an integration test), and applying it once per group instead of once per id
     # halves the rebuilds. Rebuilding is the entire cost of this sweep.
     groups = []
-    for m in MUTANTS:
+    for m in [x for x in MUTANTS if x[0] in SELECT]:
         mid, rule, path, needle, repl, target, filt = m
         key = (path, needle, repl)
         for g in groups:
@@ -378,7 +373,7 @@ def main():
 
     log("F4 mutation evidence — every rule broken on purpose, then restored.")
     log("=" * 90)
-    log(f"{len(MUTANTS)} checks over {len(groups)} distinct mutations.")
+    log(f"RERUN of {SELECT}: {len(groups)} distinct mutations.")
     verdicts = []
     for g in groups:
         path, needle, repl = g["key"]
