@@ -24,6 +24,8 @@ use super::*;
 use crate::consensus::transport::{
     decode, decode_verified, encode, encode_signed, Transport, TransportOptions,
 };
+use crate::consensus::config::Config;
+use crate::consensus::node::{Node, NodeOptions, RecordingApplier};
 use crate::consensus::{Body, Message, NodeId};
 use crate::provenance::sha256::{from_hex, sha256, to_hex};
 use crate::replication::{read_handshake, write_handshake, CONSENSUS_TAG, MAX_FRAME_BYTES};
@@ -1022,6 +1024,69 @@ fn an_attacker_raising_the_term_on_the_wire_never_reaches_the_state_machine() {
     let got = expect_recv(&unguarded, Duration::from_secs(5));
     assert_eq!(got.term, 500, "unsigned, the demotion lands: this is the attack the key closes");
     unguarded.shutdown();
+}
+
+/// Drive one `Node` until a condition holds or the deadline passes.
+fn poll_until(node: &mut Node<RecordingApplier>, within: Duration, done: impl Fn(&Node<RecordingApplier>) -> bool) {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline && !done(node) {
+        node.poll(Duration::from_millis(20)).unwrap();
+    }
+}
+
+#[test]
+fn a_keyless_peer_cannot_raise_the_term_of_a_node_built_through_the_driver() {
+    // **The row's claim, at the surface a product actually uses.** Everything above tests
+    // `Transport` directly; this tests `Node` — the driver that owns the clock, the socket and the
+    // disk, and the thing `examples/consensus_node.rs` constructs. An adversarial pass pointed out
+    // that a `Node` had no way to express a key at all, so the whole of F7 was unreachable from the
+    // product surface and a keyless attacker set a real node's term to 500. `NodeOptions::signed_with`
+    // is the answer, and this is its evidence.
+    //
+    // Both halves, because the refusal proves nothing unless the attack works without the key.
+    let forged = Message {
+        from: NodeId(2),
+        to: NodeId(1),
+        term: 500,
+        body: Body::RequestVote { last_term: 400, last_round: 9000 },
+    };
+    let frame = encode(&forged).unwrap();
+
+    // 1. SIGNED: the attacker's unsigned frame never reaches the state machine.
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0);
+    let opts = NodeOptions::new(dir.path(), BTreeMap::new(), 7)
+        .tick_of(Duration::from_millis(20))
+        .signed_with(Arc::new(a_key(50)));
+    let mut node = Node::start(NodeId(1), cfg.clone(), listener, opts, RecordingApplier::default()).unwrap();
+    let before = node.term();
+
+    raw_send(addr, &frame);
+    poll_until(&mut node, Duration::from_secs(3), |n| n.term() >= 500);
+    let after = node.term();
+    node.shutdown();
+    assert_eq!(
+        after, before,
+        "a peer holding no key moved a signed node's term from {before} to {after}"
+    );
+    assert!(after < 500, "the forged term must never be adopted");
+
+    // 2. UNSIGNED, the anti-vacuity half: the identical bytes at a node with no key DO land, and
+    // the term becomes 500. This is the attack DISTRIBUTED.md §F7 names, and it is what the key
+    // closes — asserted here so the refusal above cannot be a node that was simply deaf.
+    let dir2 = tempfile::tempdir().unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let opts2 = NodeOptions::new(dir2.path(), BTreeMap::new(), 7).tick_of(Duration::from_millis(20));
+    let mut bare = Node::start(NodeId(1), cfg, listener2, opts2, RecordingApplier::default()).unwrap();
+
+    raw_send(addr2, &frame);
+    poll_until(&mut bare, Duration::from_secs(5), |n| n.term() >= 500);
+    let landed = bare.term();
+    bare.shutdown();
+    assert_eq!(landed, 500, "unsigned, a keyless peer sets this node's term: that is the attack");
 }
 
 #[test]
