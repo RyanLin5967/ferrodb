@@ -127,10 +127,27 @@ fn installed(m: &Message) -> &SnapshotMeta {
 }
 
 /// Deliver a whole snapshot to `c`, chunk by chunk, and return every action it produced.
+///
+/// **Bounded, and the bound is a rule rather than a convenience.** A transfer that cannot converge
+/// is a real failure mode of this protocol — a receiver that keeps answering the same resume point
+/// while the sender keeps re-sending the same chunk makes no progress and never errors — and an
+/// unbounded loop here turns that failure into a hung test, which reads like an environment
+/// problem. The budget is far above the chunk count of any fixture in this file.
 fn deliver_all(c: &mut Consensus, from: NodeId, term: Term, snap: &Snapshot) -> Vec<Action> {
+    let budget = (snap.meta.total_bytes / SNAPSHOT_CHUNK_BYTES as u64 + 8) as usize;
     let mut out = Vec::new();
     let mut offset = 0u64;
-    while offset < snap.meta.total_bytes {
+    for step in 0..=budget {
+        if offset >= snap.meta.total_bytes {
+            return out;
+        }
+        assert!(
+            step < budget,
+            "the transfer did not converge: {budget} chunks delivered and the receiver still holds \
+             {offset} of {} bytes. A transfer that makes no progress and reports no error is the \
+             failure this bound exists to name.",
+            snap.meta.total_bytes
+        );
         let msg = install_msg(from, c.id(), term, snap, offset);
         let acts = c.step(Event::Recv(msg));
         offset = received_through(&only_send(&acts));
