@@ -757,11 +757,15 @@ fn directories_to_check(path: &Path) -> Result<Vec<PathBuf>, FerroError> {
                     let target = fs::read_link(&here).map_err(|e| {
                         FerroError::Io(format!("the symlink at {} could not be read: {e}", here.display()))
                     })?;
-                    // An absolute target restarts the walk at the root; a relative one continues
-                    // from the directory the LINK sits in, never from the process's cwd.
-                    if target.is_absolute() {
-                        resolved = PathBuf::new();
-                    }
+                    // A relative target continues from the directory the LINK sits in, never from
+                    // the process's cwd — which is what leaving `resolved` alone does.
+                    //
+                    // An absolute target needs no special case, and a mutant proved it: an explicit
+                    // `if target.is_absolute() { resolved = PathBuf::new() }` was here, deleting it
+                    // changed nothing, and the reason is that an absolute path's first step IS
+                    // `Step::Root`, whose arm already sets `resolved` to `/`. The line was a second
+                    // statement of one rule, and the kind that goes stale. Removed rather than kept
+                    // as a branch no test can reach.
                     for step in steps_of(&target).into_iter().rev() {
                         queue.push_front(step);
                     }
