@@ -1694,6 +1694,77 @@ fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
         &e[..e.len().min(300)]
     );
 
+    // **The case only the re-encode check can catch**, and the reason the assertion above is not
+    // enough on its own: a truncation that reparses SUCCESSFULLY, but to a different record.
+    //
+    // A mutant that deleted the re-encode check SURVIVED the assertion above, because an all-'x'
+    // name makes the truncated record unparseable and the sibling branch refuses it instead. So the
+    // check was untested. This name is built so the record parses cleanly and wrongly:
+    //
+    //   * its length is 65536 + 4, so `write_str`'s `as u16` writes a prefix of 4;
+    //   * `take_str` therefore reads four bytes as the whole table name;
+    //   * the next two bytes are NUL, so the column count reads as ZERO and parsing stops there;
+    //   * `RecKind::deserialize`'s `Ddl` arm never compares its cursor to the buffer length, so the
+    //     remaining 65534 bytes are silently discarded and it returns `Ok`.
+    //
+    // The result is a valid-looking `Ddl` for a table called "aaaa" with no columns. Only
+    // re-encoding it and comparing the bytes notices that it is not what was sent.
+    let mut sneaky = String::from("aaaa");
+    sneaky.push('\0');
+    sneaky.push('\0');
+    sneaky.push_str(&"b".repeat(65536 + 4 - 6));
+    assert_eq!(sneaky.len(), 65536 + 4, "the construction depends on this exact length");
+
+    let m3 = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::Catalog {
+                    op: DdlOp::CreateTable,
+                    table: sneaky.clone(),
+                    columns: vec![("id".into(), DataType::Integer, false)],
+                },
+            }],
+            commit: 0,
+        },
+    };
+    let e3 = format!("{}", encode(&m3).unwrap_err());
+    assert!(
+        e3.contains("does not survive its own encoding"),
+        "a name that reparses to a DIFFERENT record was framed and sent; only the re-encode check \
+         can see this, and it did not fire. Got: {}",
+        &e3[..e3.len().min(200)]
+    );
+
+    // And prove the premise rather than assuming it: the record really does deserialize cleanly to
+    // the wrong thing. If this ever stops being true the test above stops testing anything, so the
+    // premise is asserted rather than described.
+    let rec = crate::wal::log::RecKind::Ddl {
+        op: DdlOp::CreateTable,
+        table: sneaky,
+        dir_root: 0,
+        time_travel_root: 0,
+        columns: vec![("id".into(), DataType::Integer, false)],
+    };
+    let mut bytes = Vec::new();
+    rec.serialize(&mut bytes);
+    match crate::wal::log::RecKind::deserialize(&bytes) {
+        Ok(crate::wal::log::RecKind::Ddl { table, columns, .. }) => {
+            assert_eq!(table, "aaaa", "the truncated prefix no longer yields a short table name");
+            assert!(columns.is_empty(), "the NUL bytes no longer read as a zero column count");
+        }
+        other => panic!(
+            "the premise of this test no longer holds: the record does not reparse cleanly, it \
+             gives {other:?}. The re-encode check is then untested again"
+        ),
+    }
+
     // Anti-vacuity: a name one byte inside the limit still encodes and round-trips, so the refusal
     // is about the truncation and not about long names in general.
     let ok = "y".repeat(u16::MAX as usize);
