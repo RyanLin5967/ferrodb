@@ -2088,3 +2088,93 @@ fn one_frame_cannot_spend_more_config_nodes_than_its_whole_budget() {
     let Body::Append { entries, .. } = &m.body else { panic!("shape changed") };
     assert_eq!(entries.len(), 4);
 }
+
+
+#[test]
+fn the_outbound_queue_is_bounded_in_bytes_as_well_as_messages() {
+    // A depth in MESSAGES is not a bound on memory: a message is anything from 18 bytes to 8 MiB,
+    // so `queue_depth: 1024` alone permits 8.6 GB queued per peer. Both bounds apply and whichever
+    // binds first wins.
+    //
+    // Here the count bound is deliberately slack (1024) and the byte bound tight (4 MiB), so only
+    // the byte bound can be what drops anything: eight 1 MiB frames against a 4 MiB budget.
+    let mut opts = fast();
+    opts.queue_depth = 1024;
+    opts.queue_bytes = 4 * 1024 * 1024;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Port 1 refuses instantly, so nothing is ever dequeued and the queue is the only thing moving.
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let t =
+        Transport::from_listener(NodeId(1), l, BTreeMap::from([(NodeId(2), dead)]), opts).unwrap();
+
+    let big = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::WalBatch { start_lsn: 0, bytes: vec![0x22; 1024 * 1024] },
+            }],
+            commit: 0,
+        },
+    };
+    for i in 0..8u64 {
+        t.send(&big(i)).unwrap();
+    }
+    assert_eq!(t.sent(), 8);
+    assert!(
+        t.dropped() >= 4,
+        "eight 1 MiB frames against a 4 MiB byte budget dropped only {}; the queue is still \
+         bounded in messages alone, so one peer can hold gigabytes",
+        t.dropped()
+    );
+    // The count bound was never reached, so the byte bound is provably what acted.
+    assert!(t.dropped() < 8, "everything was dropped, so nothing was measured");
+}
+
+#[test]
+fn the_options_added_after_the_first_validation_pass_are_validated_too() {
+    // Each of these was added later and initially missed, which is exactly how a validation loop
+    // rots: the loop is written once and the next field does not join it.
+    let bind = |opts: TransportOptions| {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts)
+    };
+
+    // A zero idle deadline closes every inbound connection before its first frame.
+    let mut o = fast();
+    o.idle_deadline = Duration::ZERO;
+    let e = bind(o).unwrap_err();
+    assert!(
+        format!("{e}").contains("idle_deadline") && format!("{e}").contains("is zero"),
+        "got {e}"
+    );
+
+    // A zero connection cap refuses every peer while the outbound meters read healthy.
+    let mut o = fast();
+    o.max_inbound_conns = 0;
+    let e = bind(o).unwrap_err();
+    assert!(format!("{e}").contains("max_inbound_conns"), "got {e}");
+
+    // **An inbox budget below one frame is the subtle one.** A maximal frame could then never be
+    // admitted however patiently the caller drains, so it is refused for ever rather than delayed —
+    // and consensus reads a permanently-refused append as a follower it cannot catch up, not as a
+    // misconfiguration here.
+    let mut o = fast();
+    o.inbox_bytes = MAX_FRAME_BYTES - 1;
+    let e = bind(o).unwrap_err();
+    assert!(
+        format!("{e}").contains("inbox_bytes") && format!("{e}").contains("frame limit"),
+        "got {e}"
+    );
+
+    // Anti-vacuity: exactly one frame's worth is legal, so the refusal is about being under the
+    // frame limit and not about the value being unusual.
+    let mut o = fast();
+    o.inbox_bytes = MAX_FRAME_BYTES;
+    bind(o).expect("a budget of exactly one maximal frame must be accepted");
+}
