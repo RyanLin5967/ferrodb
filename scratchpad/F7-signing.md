@@ -152,6 +152,54 @@ defects** — both now in the module header, because an operator rotating a key 
 the same key zero-padded to at most 64 bytes are the *same key*; and a key longer than 64 bytes and
 its own SHA-256 are the *same key*. Appending NULs to a key file is not a rotation.
 
+## The chain walk: a fix that was itself broken, and what replaced it
+
+The symlink fix above (M14/M15) checked the path as given and the canonicalised path. **A second
+adversarial pass broke it deterministically**, and the mechanism is worth recording because the fix
+looked obviously right:
+
+```text
+safe/cluster.key   parent 0700   <- the path as given: checked
+  -> open/k        parent 0777   <- an intermediate name: checked by NOBODY
+    -> known       parent 0700   <- the canonicalised path: checked
+```
+
+`canonicalize` **collapses** the chain, so the two things being checked are its two endpoints and
+every hop between them is invisible. The attacker renames a symlink over the middle name, pointing
+it at any file the node can already read — a rotated key, a fixture, a log. **They never author a
+key file at all**, so the mode rule passes on the target's own `0600` and nothing about ownership
+catches them. The lever is redirection, not authorship, which is exactly why a fix aimed at
+"symlinks" missed it.
+
+The reviewer also corrected their own earlier finding in the same message: the original substitution
+needed a *same-uid* attacker, which they had not said. A different-uid attacker cannot get a file
+they authored past the mode rule. That correction makes the chain finding the more serious of the
+two, and it is recorded here because volunteering it is what made the rest credible.
+
+`directories_to_check` now walks the chain hop by hop, checking the directory each *name* sits in,
+bounded at 40 hops.
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M18 | The walk stops at the first hop — i.e. the endpoints-only fix that was broken | `no_hop_of_the_symlink_chain_escapes_the_directory_rule` | `the middle hop sits in a 0777 directory ... : Key { bytes: <32 redacted>, source: Some(...) }` — it loaded |
+| M19 | A relative link target resolves against the cwd, not the link's directory | `a_relative_link_target_resolves_against_the_links_own_directory` | panicked at the 0777 assertion |
+| M20 | The hop bound is removed | **SURVIVED** — see below |
+
+**M20 survived, and that is recorded rather than hidden.** Removing `MAX_HOPS` did not make the
+cycle test fail, because a cycle is refused earlier: `fs::metadata` in the shape check returns
+`ELOOP` (`os error 62`). The test was passing for a reason other than the one in its name, which is
+the vacuous shape this project keeps meeting — so it was renamed to
+`a_symlink_cycle_is_refused_by_the_shape_check_before_the_walk_begins` and now asserts that exact
+cause. A non-cyclic chain longer than the bound cannot be built either: every OS here caps symlink
+resolution near 32, below the bound. The bound is belt-and-braces against an edit that removes the
+shape check, and it has no killing test *here, by this mechanism, today* — phrased that way because
+this file has already been wrong once about calling a branch untestable.
+
+Two further shapes were reasoned about and then pinned rather than left as arguments: a symlinked
+directory *component* is judged by what it points at (`check_directory` uses `fs::metadata`, which
+follows — the opposite of the walk, where not following is the point), and a relative target with a
+`..` traversal resolves against the link's own directory.
+
 ## A correction to this file's own method
 
 The first run of the M12/M13 harness was made against a tree with **uncommitted** work in it. The
