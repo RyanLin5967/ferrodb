@@ -8,6 +8,7 @@ use crate::agent_sql::dispatch::{is_agent_stmt, run_agent_alter, run_agent_stmt,
 use crate::binder::binder::BoundExpr;
 use crate::buffer::buffer_pool::BufferPoolManager;
 use crate::catalog::catalog::Catalog;
+use crate::catalog::system_views::{self, NamedRows};
 use crate::provenance::{ProvId, ProvenanceStore};
 use crate::catalog::column::Value;
 use crate::catalog::schema::Schema;
@@ -44,10 +45,29 @@ pub enum Outcome {
     Explain(String),
     /// The structured result of an agent-session statement.
     Agent(AgentOutput),
+    /// Rows that carry their own column names and declared types.
+    ///
+    /// A separate variant from `Rows` rather than a widening of it, deliberately. `Rows` is what
+    /// every heap-backed `SELECT` returns and it has thirty-odd consumers across the suite; giving
+    /// it a schema would rewrite all of them for no gain, because a heap-backed row's names are
+    /// already recoverable from the catalog. What could not be recovered from anywhere was the
+    /// schema of a result with **no table behind it** — a system view — and that is what this
+    /// carries (B9).
+    Table(NamedRows),
     Ok,
 }
 
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
+    // B9 — read-only system views over the agent layer, checked BEFORE every other route.
+    //
+    // The order is not a preference. A view name is not in `Catalog::tables`, so every other route
+    // rejects it as an unknown table: the binder at `bind_scan`, the planner at `require_table`, and
+    // `runtime.select` inside an agent session. Checking here also means a view is readable from
+    // inside an agent session, which matters — an agent asking what the branch engine thinks of its
+    // own branch is the main reason these exist.
+    if let Some(answer) = system_views::intercept(&stmt, catalog, session.runtime.as_ref()) {
+        return answer.map(Outcome::Table);
+    }
     // Agent-session statements, and any read explicitly qualified with AS OF BRANCH.
     if is_agent_stmt(&stmt) {
         return run_agent_stmt(stmt, catalog, bp, txn, session);
@@ -195,6 +215,16 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
             // from the catalog with no `DROP_TABLE` record logged, so a consumer would keep the
             // table in its own schema forever and simply never hear of it again.
             txn.ddl_checkpointed(|| catalog.drop_table(&table))?;
+            // B9: the agent layer keys row authorship and version stamps by a hash of the table
+            // NAME, so a table recreated under this name would inherit them and `ferro_row_authors`
+            // would attribute the new table's rows to an agent that never touched it. See
+            // `AgentRuntime::forget_table`.
+            //
+            // AFTER the barrier's `?`, deliberately: a refused DROP must not forget a table that is
+            // still there. B9's own `txn.checkpoint()?` is dropped rather than kept — the wrapper
+            // above already checkpoints (`ddl_checkpointed` -> `checkpoint_locked`), and a second
+            // one would take a lock the first still holds.
+            session.runtime.forget_table(&table);
             txn.log_ddl(DdlRecord {
                 op: DdlOp::DropTable,
                 table: table.clone(),

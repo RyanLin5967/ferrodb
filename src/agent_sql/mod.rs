@@ -42,7 +42,7 @@ pub use gate::{
 pub use mem_catalog::MemBranchCatalog;
 pub use merge_engine::{CellState, PolicyTable, SurfaceMerger};
 pub use paged_rows::PagedRows;
-pub use runtime::{AgentRuntime, BranchResolver, ExecCtx, MergeEvaluation};
+pub use runtime::{AgentRuntime, BranchResolver, ExecCtx, MergeEvaluation, RunActivity};
 pub use simulate::{
     AdmitPolicy, Assertion, Candidate, CandidateScore, SimulationPlan, SimulationReport, Verdict,
 };

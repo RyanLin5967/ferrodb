@@ -320,6 +320,16 @@ impl Statement {
                         let n = rows.len();
                         RunResult { rows, tag: Some(format!("SELECT {n}")) }
                     }
+                    // B9's variant, carrying its own column names and declared types. E78a takes
+                    // only the rows, so the merged tree compiles and behaves like `Rows`; making
+                    // the wire actually USE `t.columns` — field names and OIDs through B12's
+                    // `Field`/`encode_row`, in both the simple and extended paths — is E78b, and is
+                    // a rewrite rather than a merge because B9 never faced B12's constraint that
+                    // fields are computed at PARSE time by `describe_stmt`.
+                    Outcome::Table(t) => {
+                        let n = t.rows.len();
+                        RunResult { rows: t.rows, tag: Some(format!("SELECT {n}")) }
+                    }
                     Outcome::Affected(k) => {
                         RunResult { rows: Vec::new(), tag: Some(format!("{verb} {k}")) }
                     }

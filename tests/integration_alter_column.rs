@@ -151,6 +151,9 @@ fn outcome_name(o: &Outcome) -> &'static str {
         Outcome::Affected(_) => "Affected",
         Outcome::Explain(_) => "Explain",
         Outcome::Agent(_) => "Agent",
+        // B9's variant. This match is exhaustive with no wildcard on purpose, so a new `Outcome`
+        // forces itself to be named here rather than panicking as some other variant's message.
+        Outcome::Table(_) => "Table",
         Outcome::Ok => "Ok",
     }
 }

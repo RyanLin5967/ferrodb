@@ -282,6 +282,31 @@ struct State {
     policy: PolicyTable,
 }
 
+/// What one live agent task has written and read, as counts. See [`AgentRuntime::run_activity`]
+/// for what each field does and does not include.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunActivity {
+    pub branch: BranchId,
+    /// The name this branch answers to in SQL (`b_3`).
+    pub branch_name: String,
+    /// `None` only if the interned run went missing, which would be a bug rather than a state.
+    pub run: Option<RunEntity>,
+    /// Typed ops in this task's own frame. Not inherited at fork.
+    pub ops_captured: u64,
+    /// Guards in this task's own frame. Not inherited at fork.
+    pub guards_captured: u64,
+    /// Rows in the workspace map. **Inherited at fork** from an open parent session.
+    pub staged_rows: u64,
+    /// Distinct `(table, row)` pairs read as exact versions.
+    pub rows_read_exact: u64,
+    /// Range / full-scan reads, which retain a predicate summary rather than versions.
+    pub scan_reads: u64,
+    /// Rows those scans reported observing. Diagnostic; never feeds a decision.
+    pub scan_rows_observed: u64,
+    /// Rows staged without ever being read — DESIGN.md section 4's cheap metric.
+    pub blind_writes: u64,
+}
+
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {
     fn resolve_branch(&self, name: &str) -> Result<BranchId, FerroError>;
@@ -634,7 +659,13 @@ impl AgentRuntime {
             started,
             parent,
         );
-        state.runs.insert(prov.0, entity);
+        // `or_insert`, not `insert`. Attribution is run-level: `MemProvenanceStore::intern` returns
+        // the EXISTING `ProvId` when `same_actor` holds, and `same_actor` deliberately excludes
+        // `started_at` because that is when a particular session began, not part of who the actor is.
+        // Overwriting therefore stamped every branch of one run with the LAST session's start time, so
+        // `ferro_runs` reported a run starting after a branch it had already forked. First start wins,
+        // which is the only one that is a fact about the run.
+        state.runs.entry(prov.0).or_insert(entity);
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
@@ -726,6 +757,146 @@ impl AgentRuntime {
             .filter(|((t, _), _)| *t == tbl)
             .filter_map(|((_, r), p)| state.runs.get(&p.0).map(|e| (RowId(*r), e.clone())))
             .collect()
+    }
+
+    /// Per-run counters for the observability views, one row per **live** agent task.
+    ///
+    /// **Counts only; this adds no bookkeeping.** Every number here is the length of something the
+    /// workspace already holds — the captured frame, the staged row map, the retained read-set — so
+    /// this is a read-only projection of state the runtime maintains for merge, not a new ledger
+    /// kept for reporting. Nothing here is durable: a workspace exists only between
+    /// `BEGIN AGENT SESSION` and `MERGE` / `ABANDON` (`seal` drops it), so this answers about work
+    /// in flight and says nothing about work already published. `authors_of` is the question to ask
+    /// about published rows.
+    ///
+    /// The counters are deliberately separate rather than summed into one "writes" and one "reads",
+    /// because they are not interchangeable and adding them would invent a number:
+    ///
+    /// * `ops_captured` / `guards_captured` come from this task's own `TxnFrame`, which is **not**
+    ///   copied at fork, so they count only what this run did.
+    /// * `staged_rows` is the workspace's row map, which **is** copied at fork from an open parent
+    ///   session (`begin_session_with_model`). For a branch forked from another live agent task it
+    ///   therefore includes rows inherited at fork time, not only rows this run wrote. Named
+    ///   `staged_rows` and not `rows_written` for exactly that reason. **`blind_writes` is derived
+    ///   from the same map and inherits the same caveat**: for a branch forked from an open session
+    ///   it counts inherited rows the child never read, which is true of the map and is not a
+    ///   statement about what the child did.
+    /// * `rows_read_exact` counts DISTINCT `(table, row)` pairs across the exact-version read-sets;
+    ///   a point read repeated is one premise, not two.
+    /// * `scan_reads` / `scan_rows_observed` are the range and full-scan reads, kept apart from the
+    ///   exact ones because a scan retains a predicate summary rather than versions — DESIGN.md
+    ///   section 2's "chosen by ACCESS SHAPE, never by size". `rows_observed` is that summary's own
+    ///   diagnostic count.
+    pub fn run_activity(&self) -> Vec<RunActivity> {
+        use crate::provenance::readset::ReadSet;
+        let state = self.state.lock().unwrap();
+        let mut out = Vec::with_capacity(state.workspaces.len());
+        for (id, ws) in state.workspaces.iter() {
+            // The generation lives in `names`, not in the workspace: `workspaces` is keyed by the id
+            // SLOT alone. Falling back to generation 0 would name a *different* branch after an id
+            // slot is recycled, so the name map is the authority and its absence is reported as
+            // generation 0 only when there is no name at all — which `seal` makes impossible while a
+            // workspace is present.
+            let branch = state
+                .names
+                .get(&ws.name)
+                .copied()
+                .unwrap_or_else(|| BranchId::new(*id, 0));
+            // A `BTreeSet`, not a sorted `Vec`. `Vec::insert` memmoves the tail, so building the
+            // distinct set was O(n^2) in the size of a branch's read-set — and it ran while holding
+            // the one Mutex every write path also takes, so reading `ferro_run_activity` against a
+            // branch with a large read-set stalled every other connection. This is documented as
+            // "counts only"; it should not be able to block a writer.
+            let mut exact: BTreeSet<(u32, u64)> = BTreeSet::new();
+            let mut scan_reads = 0u64;
+            let mut scan_rows_observed = 0u64;
+            // B4 deleted `Workspace::reads` as a second copy of the read-set the runtime already
+            // keeps in `State::captures`, and B9 was written before that deletion. Derived here the
+            // way every other consumer derives it (see the same expression at `:905` and `:2079`),
+            // so this view still reads the one read-set rather than reviving the duplicate.
+            let reads = state.captures.get(&ws.txn.0).map(|c| c.read_sets()).unwrap_or_default();
+            for rs in &reads {
+                match rs {
+                    ReadSet::ExactVersions(versions) => {
+                        for v in versions {
+                            exact.insert((v.tbl.0, v.row.0));
+                        }
+                    }
+                    ReadSet::Predicate(p) => {
+                        scan_reads += 1;
+                        scan_rows_observed += p.rows_observed;
+                    }
+                }
+            }
+            out.push(RunActivity {
+                branch,
+                branch_name: ws.name.clone(),
+                run: state.runs.get(&ws.prov.0).cloned(),
+                ops_captured: ws.frame.ops.len() as u64,
+                guards_captured: ws.frame.guards.len() as u64,
+                staged_rows: ws.rows.len() as u64,
+                rows_read_exact: exact.len() as u64,
+                scan_reads,
+                scan_rows_observed,
+                blind_writes: blind_writes_of(&ws.rows, &reads).len() as u64,
+            });
+        }
+        out.sort_by_key(|a| (a.branch.id, a.branch.generation));
+        out
+    }
+
+    /// Forget every per-row record this runtime holds for `table`. Called when a table is dropped.
+    ///
+    /// # Why a drop has to reach in here at all
+    ///
+    /// `row_author` and `versions` are keyed by `table_id(name)` — an FNV hash of the table's
+    /// **name**, chosen because the catalog mints no table ids and a name hash is stable across
+    /// processes where an assignment counter would not be. The cost of that choice is that a table
+    /// dropped and recreated under the same name is, to these maps, the same table: the new one
+    /// inherits the old one's authorship and version stamps.
+    ///
+    /// Before B9 that was invisible, because `authors_of` and `who_wrote_row` had no SQL surface.
+    /// `ferro_row_authors` gives them one, and it then reported rows of the *previous* table —
+    /// attributed to an agent that never touched the new one, for row ids the new table does not
+    /// contain. `Catalog::drop_table` already purges `stats` for the same reason (E69 fixed exactly
+    /// that omission); this is the same omission one layer over.
+    ///
+    /// # `versions` is deliberately NOT purged, and the first version of this function purged it
+    ///
+    /// It looked symmetrical: `versions` is keyed the same way, so a stale stamp under a recycled name
+    /// could report a moved premise for a row the branch never read. Purging it **disarmed B1's
+    /// read-premise gate**, and the test
+    /// `integration_system_views::dropping_a_table_does_not_silence_the_read_premise_gate` exists
+    /// because of it.
+    ///
+    /// `versions` is what the gate compares against at merge admission, and the comparison reads an
+    /// **absent** entry as "the premise holds" (`merge`, the `_ => {}` arm). Erasing the entries
+    /// therefore erases the evidence: a branch whose premise had already been replaced merged `Clean`
+    /// instead of being held. Measured, with a control proving the gate fires in the same fixture
+    /// without the drop. It is the same absence-reads-as-unchanged confusion the comment beside that
+    /// arm records having already been fixed once, arriving from the opposite direction.
+    ///
+    /// The two directions are not symmetrical in cost, which is what decides this. A stale stamp
+    /// over-approximates staleness and routes to **quarantine** — a hold that stays queryable and can
+    /// be released. A missing stamp under-approximates it and **publishes** a merge computed from
+    /// state that no longer exists. One is recoverable and the other is not, so absence is the error
+    /// worth avoiding. And nothing in this module needed `versions` purged in the first place: no
+    /// view exposes it, so purging it bought nothing and cost a safety check.
+    ///
+    /// **What this deliberately does NOT purge**, stated rather than left to be discovered:
+    /// `versions` as above, plus the escrow ledger, the dependency graph and the applied-op log. None
+    /// of the latter three is exposed by the observability views, and each is keyed by something other
+    /// than the table alone — undoing them on a drop is a separate decision about `REVERT`'s reach,
+    /// not a presentation fix.
+    ///
+    /// Note that authorship deliberately survives an ordinary `DELETE` of the row. That is an audit
+    /// record answering "which agent wrote this", which is criterion 9, and it outliving the row is
+    /// the point; a dropped *table* is different, because the name can come back attached to
+    /// different data.
+    pub fn forget_table(&self, table: &str) {
+        let tbl = table_id(table).0;
+        let mut state = self.state.lock().unwrap();
+        state.row_author.retain(|(t, _), _| *t != tbl);
     }
 
     // ---- reads -----------------------------------------------------------------------------
@@ -1748,13 +1919,26 @@ impl AgentRuntime {
         if rec.state == BranchState::Quarantined {
             return Ok(());
         }
-        rec.state = BranchState::Quarantined;
-        self.branches.put(&rec)?;
+        // **The reason is recorded BEFORE the state is published, and the order is the whole point.**
+        //
+        // These are two stores with two locks: the reason lives in this runtime's in-memory state, the
+        // state flag in the durable branch record. `put` makes `Quarantined` visible to every reader
+        // on every connection — the runtime is shared by all of them (`pgwire::ServerContext`) — so
+        // publishing first left a window in which `ferro_quarantine` showed a held branch with a NULL
+        // reason. `system_views` tells the reader that a NULL there means the reason did not survive a
+        // restart, which would have been a false statement about a live process.
+        //
+        // Reversed, the only window left is a branch whose reason is recorded and whose state is still
+        // `Live` — invisible to the view, because it selects on state, so a reader sees either nothing
+        // or a hold with its reason. `release_from_quarantine` already has the safe order for the same
+        // reason: it clears the state first and the reason after.
         self.state
             .lock()
             .unwrap()
             .quarantine_reasons
             .insert(branch.id, reason.to_string());
+        rec.state = BranchState::Quarantined;
+        self.branches.put(&rec)?;
         Ok(())
     }
 
