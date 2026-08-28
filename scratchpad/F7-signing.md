@@ -5,10 +5,13 @@ has a test named against it, and every one of those tests has been **seen to fai
 deliberate defect in the rule it names. A rule with no mutant is a rule nobody has shown matters;
 a test nobody has seen fail is not evidence.
 
-Method: apply the defect to the working tree, run only the named test(s), record what they printed,
-`git checkout --` the file, and assert the tree is clean before the next one. The driver is
-`/tmp/mutants.py`; its structured output is reproduced below verbatim. All eleven were killed, by
-fifteen test-kills in total, and the tree was clean at the end (`GIT STATUS: (clean)`).
+Method: assert the tree is clean and **committed**, apply the defect, run only the named test(s),
+record what they printed, `git checkout --` the file, and assert the tree is clean again. The
+drivers are `/tmp/mutants.py` and `/tmp/mutants3.py`; their output is reproduced below verbatim.
+
+Eleven chosen mutants, killed by fifteen test-kills. A twelfth was not chosen: an adversarial pass
+found it as a **live bug**, and it is in its own section below along with two further findings.
+Every run ended `GIT STATUS: (clean)`.
 
 Run on 2026-08-28, macOS (darwin 25.6.0), `rustc 1.97.1`, under CI's own flags
 `RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"`.
@@ -50,6 +53,57 @@ Why 1 MiB and not the 32 bytes a tag actually is: at 32 bytes a short-circuiting
 scan are both a handful of nanoseconds, so the test would pass against the very implementation it
 exists to reject. That is the vacuous-detector shape this project keeps meeting, and it was avoided
 by choosing a size at which the two are three orders of magnitude apart.
+
+## The two rules the adversarial pass added
+
+The eleven above were mutants I chose. An adversarial review in fresh contexts then found two
+things I had not, and both became rules with their own tests. They are listed separately because
+the distinction matters: the first eleven test rules I already believed; these two exist because
+somebody attacked the work.
+
+| # | The defect | Test that killed it | What it printed |
+|---|---|---|---|
+| M12 | The empty parent is filtered out as "nothing to check" — the code as originally written | `the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked` | `two spellings of one path must reach one verdict; bare=None dotted=Some("io error: the directory holding the consensus signing key, ., has mode 0777 ...")` |
+
+**M12 was a live bug, not a hypothetical.** `Path::parent()` of a bare relative name is `Some("")`,
+which means the *current* directory and not "there is no directory". Filtering it out meant
+`Key::load("cluster.key")` skipped the directory-permission check entirely while
+`Key::load("./cluster.key")` performed it — the same file, in the same directory, with the spelling
+of the path deciding whether a security check ran at all. The reviewer demonstrated it by replacing
+the key in a `0777` directory and showing the loader accepted the attacker's key.
+
+**M13 has no killing test and is recorded as such rather than counted.** The same review found that
+a failed `stat` of the directory fell through to `Ok(())` — a guard that cannot read its own input
+must refuse, and it now does. But that branch cannot be reached from a test here: `File::open` has
+already resolved the path by the time the directory is stat'd, so every way to make the stat fail
+also makes the open fail, and the open reports first. The only remaining route is a genuine race,
+which a test cannot schedule. The change is therefore a refuse-by-default posture, not a detected
+rule, and `a_key_whose_directory_is_gone_is_refused` says so in its own body.
+
+**A third finding needed no mutant because it was an absence.** The review showed that
+`NodeOptions` had no way to express a key at all, so `examples/consensus_node.rs` built an unsigned
+node and a keyless peer set its term to 500 — the whole row was unreachable from the surface a
+product uses. `NodeOptions::signed_with` closes it, and
+`a_keyless_peer_cannot_raise_the_term_of_a_node_built_through_the_driver` carries both halves: the
+signed node's term does not move, and the identical bytes at an unsigned node do set it to 500.
+
+## A correction to this file's own method
+
+The first run of the M12/M13 harness was made against a tree with **uncommitted** work in it. The
+harness restores with `git checkout --`, which discarded the fix before it was committed — so a
+commit whose message described the fix contained only its tests. At the same time, review agents
+were installing their own mutants in this same worktree, and one of them reasonably reported the
+resulting failure as a live defect.
+
+Both are recorded here rather than tidied away, because the method is part of the evidence:
+
+* **Mutate only a committed tree.** The harness now asserts `git status --porcelain` is empty before
+  it starts, and M12's re-run above was made under that assertion and ended `GIT STATUS: (clean)`.
+* **One writer per worktree.** Mutation-running reviewers get their own tree from
+  `~/.claude/bin/wt new <branch>`; two agents mutating one checkout produced results neither could
+  attribute.
+
+Every number in this file was re-measured after that correction.
 
 ## What has no mutant, and why
 
