@@ -596,6 +596,16 @@ fn the_symlink_hole_lets_an_attacker_substitute_the_cluster_key() {
 
     // The attacker's move: same directory, same final name, a key of their choosing. `rename` is
     // what the sticky-bit exception exists to prevent and what 0777-without-sticky permits.
+    //
+    // **Threat-model note, because this test writes the substitute as the SAME uid.** A
+    // different-uid attacker cannot get a file they authored past the next check: 0644 is refused
+    // by the `mode & 0o077` rule (pinned by `a_key_file_readable_by_group_or_other_is_refused`),
+    // and 0600 owned by them is unreadable by the node, so `File::open` fails. What this test
+    // therefore proves on its own is that the DIRECTORY GUARD DOES NOT RUN -- the substitution as
+    // written needs a same-uid attacker (a compromised sidecar, a shared service account, a CI
+    // job). The cross-uid version needs no ownership of anything and is
+    // `the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between`: point the name at a file
+    // the node can ALREADY read, and the mode check sees the target's own 0600 and passes.
     let theirs = open.join(".theirs");
     std::fs::write(&theirs, b"ATTACKER-CHOSEN-CLUSTER-KEY!!!!!").unwrap();
     chmod(&theirs, 0o600);
@@ -709,4 +719,86 @@ fn the_debug_rendering_of_every_refusal_is_also_free_of_the_key() {
     }
     chmod(&open, 0o700);
     assert!(sightings.is_empty(), "PROBE HIT: {sightings:?}");
+}
+
+// =============================================================================================
+// F. Against the PROPOSED canonicalize fix
+// =============================================================================================
+
+/// Which of two known keys a loaded `Key` is, decided without reading its bytes.
+fn identify(loaded: &Key, candidates: &[(&str, &[u8])]) -> String {
+    let probe = loaded.tag(b"which key is this");
+    for (name, bytes) in candidates {
+        let k = Key::from_bytes_for_test(bytes.to_vec()).unwrap();
+        if k.tag(b"which key is this") == probe {
+            return (*name).to_string();
+        }
+    }
+    "<neither>".to_string()
+}
+
+/// **The canonicalize fix checks the two ENDPOINTS of the resolution and no hop in between.**
+///
+/// `path.parent()` is the directory of the name as written. `canonicalize(path).parent()` is the
+/// directory of the inode finally reached. An attacker whose write access is at an INTERMEDIATE
+/// hop is in neither, so both checks pass and the resolution still ran through a directory they
+/// control.
+///
+/// No race, no ownership assumption, no same-uid assumption: the attacker's only move is to point
+/// a name they may write at a file the node can already read.
+#[test]
+fn the_canonicalize_fix_checks_both_ends_and_neither_hop_in_between() {
+    let root = tempfile::tempdir().unwrap();
+    chmod(root.path(), 0o700);
+
+    const GOOD: &[u8; 32] = b"THE-OPERATORS-REAL-CLUSTER-KEY!!";
+    const OTHER: &[u8; 32] = b"SOME-OTHER-NODE-READABLE-FILE!!!";
+
+    // The operator's key, in a private directory.
+    let safe = root.path().join("safe");
+    std::fs::create_dir(&safe).unwrap();
+    chmod(&safe, 0o700);
+    let good = safe.join("good");
+    std::fs::write(&good, GOOD).unwrap();
+    chmod(&good, 0o600);
+
+    // Any other file the node can already read: 0600, node-owned, in a private directory. A log, a
+    // rotated key, a fixture -- the attacker needs no write access to it, only its name.
+    let known = root.path().join("known");
+    std::fs::write(&known, OTHER).unwrap();
+    chmod(&known, 0o600);
+
+    // The middle hop: a directory the attacker may write.
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    chmod(&open, 0o777);
+
+    // The configured path, in a directory the operator locked down.
+    let configured = safe.join("cluster.key");
+    std::os::unix::fs::symlink(open.join("k"), &configured).unwrap();
+
+    // Honest state: the chain lands on the operator's key.
+    std::os::unix::fs::symlink(&good, open.join("k")).unwrap();
+    let honest = Key::load(&configured).expect("the honest chain must load");
+    assert_eq!(identify(&honest, &[("good", GOOD), ("other", OTHER)]), "good");
+
+    // The attacker's whole move: repoint the middle name. `rename` over it, which 0777-non-sticky
+    // permits and which needs no ownership of anything at either end.
+    let tmp = open.join(".t");
+    std::os::unix::fs::symlink(&known, &tmp).unwrap();
+    std::fs::rename(&tmp, open.join("k")).unwrap();
+
+    let after = Key::load(&configured);
+    println!("configured  = {}  (parent mode {:04o})", configured.display(), mode_of(&safe));
+    println!("middle hop  = {}  (parent mode {:04o})  <- the attacker writes here", open.join("k").display(), mode_of(&open));
+    println!("canonical   = {:?}", std::fs::canonicalize(&configured));
+    match &after {
+        Ok(k) => println!("Key::load -> Ok, and it is the {} key", identify(k, &[("good", GOOD), ("other", OTHER)])),
+        Err(e) => println!("Key::load -> {e}"),
+    }
+    let loaded = after.expect_err(
+        "PROBE HIT: both endpoint checks passed and the node loaded a file the attacker chose -- \
+         the world-writable directory was an intermediate hop and neither check looked at it",
+    );
+    let _ = loaded;
 }
