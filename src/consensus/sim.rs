@@ -99,7 +99,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use super::config::Config;
-use super::{Action, Body, Command, Consensus, Entry, Event, HardState, Message, NodeId, Rng, Role, Round, Term};
+use super::{
+    Action, Body, BranchOp, Command, Consensus, Entry, Event, HardState, Message, NodeId, Rng, Role,
+    Round, Term,
+};
 
 /// Sub-tick resolution. A message crosses the wire in a fraction of a tick or in several of them,
 /// and two nodes' ticks do not land on the same instant — both of which are only expressible if the
@@ -885,6 +888,7 @@ impl<P: Peer> Sim<P> {
     /// Run the whole configured length.
     pub fn run(&mut self) -> Result<Report, Violation> {
         self.run_ticks(self.cfg.ticks)?;
+        self.mix_final_state();
         let mut r = self.report.clone();
         r.seeds = 1;
         r.ticks = self.cfg.ticks;
@@ -1027,6 +1031,7 @@ impl<P: Peer> Sim<P> {
         self.nodes[i].applied = 0;
         self.nodes[i].overlap = 0;
         self.report.crashes += 1;
+        self.mix_digest(&[0xC0, self.now, n.0 as u64]);
         self.log_line(format!("{n} CRASH durable={}", self.nodes[i].store.durable_round()));
     }
 
@@ -1046,6 +1051,7 @@ impl<P: Peer> Sim<P> {
         self.nodes[i].lease = peer.lease_window();
         self.nodes[i].peer = Some(peer);
         self.report.restarts += 1;
+        self.mix_digest(&[0xC1, self.now, n.0 as u64, log.len() as u64]);
         self.log_line(format!("{n} RESTART durable={}", log.len()));
     }
 
@@ -1186,6 +1192,11 @@ impl<P: Peer> Sim<P> {
         // Counted from what actually changed, not from what was attempted.
         let added: Vec<(u32, u32)> =
             self.blocked.difference(&before).copied().collect();
+        let net: Vec<u64> = std::iter::once(0xC2)
+            .chain(std::iter::once(self.now))
+            .chain(self.blocked.iter().map(|(a, b)| (*a as u64) << 8 | *b as u64))
+            .collect();
+        self.mix_digest(&net);
         if !added.is_empty() {
             self.report.partitions += 1;
             // Asymmetric only if one of the links this event added has an open reverse. A one-way
@@ -1249,6 +1260,7 @@ impl<P: Peer> Sim<P> {
                 }
             }
             self.mix_digest(&[self.now, m.from.0 as u64, m.to.0 as u64, m.term, body_code(&m.body)]);
+            self.mix_body(&m.body);
             self.log_line(format!(
                 "{}->{} t{} {}",
                 m.from,
@@ -1360,6 +1372,38 @@ impl<P: Peer> Sim<P> {
         // against a caller that does not.
         let mut release = self.now;
         for a in actions {
+            // Every action shapes the run, so every action shapes the digest. Persist and Truncate
+            // move bytes, Apply and RoleChanged move agreement, Refuse is an answer to a client.
+            match &a {
+                Action::PersistHardState { term, voted_for } => self.mix_digest(&[
+                    0xA1,
+                    i as u64,
+                    *term,
+                    voted_for.map(|v| v.0 as u64 + 1).unwrap_or(0),
+                ]),
+                Action::Persist { entries } => {
+                    let vs: Vec<u64> = std::iter::once(0xA2)
+                        .chain(std::iter::once(i as u64))
+                        .chain(entries.iter().flat_map(|e| {
+                            [e.term, e.round, command_code(&e.command)]
+                        }))
+                        .collect();
+                    self.mix_digest(&vs);
+                }
+                Action::Truncate { from } => self.mix_digest(&[0xA3, i as u64, *from]),
+                Action::Send(m) => {
+                    self.mix_digest(&[0xA4, i as u64, m.to.0 as u64, m.term, body_code(&m.body)])
+                }
+                Action::Apply { through } => self.mix_digest(&[0xA5, i as u64, *through]),
+                Action::RoleChanged { role, term, leader } => self.mix_digest(&[
+                    0xA6,
+                    i as u64,
+                    *role as u64,
+                    *term,
+                    leader.map(|v| v.0 as u64 + 1).unwrap_or(0),
+                ]),
+                Action::Refuse { .. } => self.mix_digest(&[0xA7, i as u64]),
+            }
             match a {
                 Action::PersistHardState { term, voted_for } => {
                     let hs = HardState { term, voted_for };
@@ -1604,6 +1648,72 @@ impl<P: Peer> Sim<P> {
         self.trace.push_back(format!("u{:<6} {line}", self.now));
     }
 
+    /// Fold a message's **payload** into the digest, not merely its variant tag.
+    ///
+    /// The digest's whole job is to make `the_same_seed_replays_the_same_run` able to see a
+    /// divergence. Hashing only the tag left it blind to `granted`, `success`, `matched`, `commit`
+    /// and every entry — so two runs that moved identically-shaped messages at identical instants
+    /// while committing *different commands* had the same digest, which is exactly the divergence
+    /// the headline detector exists for.
+    fn mix_body(&mut self, b: &Body) {
+        match b {
+            Body::PreVote { last_term, last_round }
+            | Body::RequestVote { last_term, last_round } => {
+                self.mix_digest(&[*last_term, *last_round]);
+            }
+            Body::PreVoteResp { granted } | Body::RequestVoteResp { granted } => {
+                self.mix_digest(&[*granted as u64]);
+            }
+            Body::Append { prev_round, prev_term, entries, commit } => {
+                self.mix_digest(&[*prev_round, *prev_term, entries.len() as u64, *commit]);
+                let vs: Vec<u64> = entries
+                    .iter()
+                    .flat_map(|e| [e.term, e.round, command_code(&e.command)])
+                    .collect();
+                self.mix_digest(&vs);
+            }
+            Body::AppendResp { success, matched, hint, digest } => {
+                self.mix_digest(&[*success as u64, *matched, *hint, *digest]);
+            }
+            Body::InstallSnapshot { meta, offset, data, done } => {
+                self.mix_digest(&[
+                    meta.last_round,
+                    meta.last_term,
+                    meta.total_bytes,
+                    *offset,
+                    data.len() as u64,
+                    *done as u64,
+                ]);
+            }
+            Body::InstallSnapshotResp { received_through } => {
+                self.mix_digest(&[*received_through]);
+            }
+        }
+    }
+
+    /// The state the run ended in, folded once.
+    ///
+    /// The streaming mix above sees traffic; this sees *outcome*. Together they make the digest a
+    /// fingerprint of what the cluster agreed rather than of how much it talked.
+    fn mix_final_state(&mut self) {
+        let mut vs: Vec<u64> = Vec::new();
+        for (r, e) in &self.committed {
+            vs.push(*r);
+            vs.push(e.term);
+            vs.push(command_code(&e.command));
+        }
+        for n in &self.nodes {
+            vs.push(n.store.durable_len as u64);
+            vs.push(n.store.hard.term);
+            vs.push(n.store.hard.voted_for.map(|v| v.0 as u64 + 1).unwrap_or(0));
+            vs.push(n.peer.is_some() as u64);
+            for e in &n.store.log {
+                vs.push(e.term ^ e.round.rotate_left(8) ^ command_code(&e.command));
+            }
+        }
+        self.mix_digest(&vs);
+    }
+
     fn mix_digest(&mut self, vs: &[u64]) {
         for v in vs {
             let mut x = self.report.digest ^ v.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1637,6 +1747,51 @@ pub fn sweep<P: Peer>(first_seed: u64, count: u64, cfg: &SimConfig) -> Sweep {
 // ---------------------------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------------------------
+
+/// A numeric fingerprint of a command, for the run digest.
+///
+/// Allocation-free on purpose: it is folded once per entry per delivery and once per committed
+/// round at the end of every run, and a million-seed sweep cannot afford a `format!`.
+fn command_code(c: &Command) -> u64 {
+    match c {
+        Command::WalBatch { start_lsn, bytes } => {
+            let head = bytes.first().copied().unwrap_or(0) as u64;
+            let tail = bytes.last().copied().unwrap_or(0) as u64;
+            1 ^ start_lsn.rotate_left(8) ^ (bytes.len() as u64) << 24 ^ head ^ tail.rotate_left(16)
+        }
+        Command::Catalog { op, table, columns } => {
+            // `DdlOp::AlterColumn` carries a payload, so it is not castable; discriminated by hand
+            // rather than by `as`, which would stop compiling the moment a variant grew a field.
+            let opc = match op {
+                crate::wal::log::DdlOp::CreateTable => 1u64,
+                crate::wal::log::DdlOp::DropTable => 2,
+                crate::wal::log::DdlOp::AlterColumn(_) => 3,
+            };
+            let mut h = 2 ^ opc.rotate_left(8) ^ (table.len() as u64) << 16;
+            for (n, _, nullable) in columns {
+                h ^= (n.len() as u64).rotate_left(3) ^ (*nullable as u64);
+                h = h.rotate_left(5);
+            }
+            h
+        }
+        Command::Branch { op } => match op {
+            BranchOp::Fork { child, parent, .. } => 3 ^ child.rotate_left(8) ^ parent,
+            BranchOp::Merge { branch, base_round } => 4 ^ branch.rotate_left(8) ^ base_round,
+            BranchOp::Abandon { branch } => 5 ^ branch.rotate_left(8),
+            BranchOp::Reap { branch, generation } => 6 ^ branch.rotate_left(8) ^ *generation as u64,
+        },
+        Command::ArenaGrant { node, first_page, page_count } => {
+            7 ^ (node.0 as u64) ^ (*first_page as u64).rotate_left(8) ^ (*page_count as u64) << 32
+        }
+        Command::TxnIdRange { node, lo, hi } => 8 ^ (node.0 as u64) ^ lo.rotate_left(8) ^ hi,
+        Command::LeaseTick { unix_millis } => 9 ^ unix_millis.rotate_left(8),
+        Command::Checkpoint => 10,
+        Command::Membership { config } => {
+            11 ^ config.version.rotate_left(8) ^ (config.len() as u64) << 32 ^ config.term
+        }
+        Command::NoOp => 12,
+    }
+}
 
 fn body_code(b: &Body) -> u64 {
     match b {
