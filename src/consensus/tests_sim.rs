@@ -56,6 +56,11 @@ pub const D_QUORUM_OVER_NEXT: u32 = 1 << 5;
 pub const D_NO_LEASE: u32 = 1 << 6;
 /// Treat an incoming pre-vote as a real later term, raising this node's own.
 pub const D_PREVOTE_RAISES_TERM: u32 = 1 << 7;
+/// REVIEW-ONLY: the already-fixed bug — ack the log's length rather than the confirmed position.
+pub const D_ACK_LOG_LEN: u32 = 1 << 8;
+/// REVIEW-ONLY *FIX* flag: answer a PreVote with the hypothetical term from the envelope, the way
+/// etcd does, instead of with the responder's own (possibly stale) term.
+pub const F_PREVOTE_RESP_TERM: u32 = 1 << 9;
 
 /// The reference machine with every rule intact.
 type Correct = RefNode<0>;
@@ -135,6 +140,25 @@ impl<const D: u32> RefNode<D> {
         self.log.get((r - 1) as usize).map(|e| e.term).unwrap_or(0)
     }
 
+    fn count_digest(&self, matched: Round, dig: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        DIG_TOTAL.fetch_add(1, Relaxed);
+        if dig != self.digest_at(matched) {
+            DIG_MISMATCH.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn digest_at(&self, through: Round) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in self.log.iter().take(through as usize) {
+            for v in [e.term, e.round] {
+                h ^= v;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
     /// A rolling hash of the durable prefix, for the divergence detector `AppendResp` carries.
     fn digest(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -183,6 +207,11 @@ impl<const D: u32> RefNode<D> {
             out.push(Action::PersistHardState { term, voted_for: None });
         }
         self.role = Role::Follower;
+        if self.leader != leader {
+            // An acknowledgement owed to a leader this node no longer follows is a message to the
+            // wrong node in the wrong term. Dropped rather than sent and ignored.
+            self.ack_owed = false;
+        }
         self.leader = leader;
         self.votes.clear();
         self.since_heard = 0;
@@ -286,6 +315,7 @@ impl<const D: u32> RefNode<D> {
         self.role = Role::Leader;
         self.leader = Some(self.id);
         self.votes.clear();
+        self.ack_owed = false;
         self.since_heartbeat = 0;
         let next = self.last_round() + 1;
         self.progress = self
@@ -324,7 +354,8 @@ impl<const D: u32> RefNode<D> {
                 let granted = m.term > self.term
                     && no_leader_lately
                     && self.log_is_up_to_date(last_term, last_round);
-                out.push(self.send(m.from, self.term, Body::PreVoteResp { granted }));
+                let reply_term = if Self::has(F_PREVOTE_RESP_TERM) && granted { m.term } else { self.term };
+                out.push(self.send(m.from, reply_term, Body::PreVoteResp { granted }));
             }
             Body::PreVoteResp { granted } => {
                 // **A refused pre-vote carries a real term, and this is the only place it can be
@@ -494,8 +525,10 @@ impl<const D: u32> RefNode<D> {
 
                 if fresh.is_empty() {
                     // Nothing was handed to the disk, so the durable watermark is already honest.
-                    let d = self.ack_through.min(self.durable);
+                    let base = if Self::has(D_ACK_LOG_LEN) { self.last_round() } else { self.ack_through };
+                    let d = base.min(self.durable);
                     let dig = self.digest();
+                    self.count_digest(d, dig);
                     out.push(self.send(
                         m.from,
                         self.term,
@@ -584,8 +617,10 @@ impl<const D: u32> RefNode<D> {
         if self.ack_owed {
             if let Some(l) = self.leader {
                 self.ack_owed = false;
-                let d = self.ack_through.min(self.durable);
+                let base = if Self::has(D_ACK_LOG_LEN) { self.last_round() } else { self.ack_through };
+                let d = base.min(self.durable);
                 let dig = self.digest();
+                self.count_digest(d, dig);
                 out.push(self.send(
                     l,
                     self.term,
@@ -822,6 +857,17 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
     assert!(s.violation.is_none(), "unexpected violation:\n{}", s.violation.as_ref().unwrap());
     assert!(t.dropped_loss > 0, "no message was ever dropped: {t:?}");
     assert!(t.duplicated > 0, "no message was ever duplicated: {t:?}");
+    assert!(
+        t.duplicates_delivered > 0,
+        "every duplicate was dropped before it arrived, so nothing was ever asked to be idempotent: \
+         {t:?}"
+    );
+    assert!(
+        t.reordered > 0,
+        "no message ever arrived after a later-sent one on the same link. Reorder is emergent here \
+         rather than injected — it comes from drawing each latency independently — which is exactly \
+         why it is asserted rather than assumed: {t:?}"
+    );
     assert!(t.dropped_partition > 0, "no message was ever cut off by a partition: {t:?}");
     assert!(
         t.one_way_partitions > 0,
@@ -1711,4 +1757,178 @@ fn a_send_still_waiting_on_its_fsync_does_not_survive_the_crash() {
         "crash model: {} messages destroyed by a crash before they left the machine, over 400 seeds",
         s.totals.unsent_at_crash
     );
+}
+
+// ============ REVIEW-ONLY probes (not part of the deliverable) ============
+
+#[test]
+fn review_ack_truth_probe_fires_on_the_ack_log_len_mutant() {
+    let s = sweep::<RefNode<D_ACK_LOG_LEN>>(SEED_MUTANT, 2000, &chaos_cfg());
+    let v = s.violation.expect("ack-truth probe never fired on the ack-log-length mutant");
+    eprintln!("PROBE fired: seed {} rule {:?} -- {}", v.seed, v.rule, v.detail);
+}
+
+#[test]
+fn review_quorum_probe_fires_on_the_quorum_over_next_mutant() {
+    let s = sweep::<RefNode<D_QUORUM_OVER_NEXT>>(SEED_MUTANT, 400, &chaos_cfg());
+    let v = s.violation.expect("probe never fired on the quorum-over-next mutant");
+    eprintln!("PROBE fired: seed {} rule {:?} -- {}", v.seed, v.rule, v.detail);
+}
+
+#[test]
+fn review_quorum_probe_big_sweep_on_correct() {
+    let n: u64 = std::env::var("REVIEW_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+    let s = sweep::<Correct>(0xA11CE, n, &chaos_cfg());
+    if let Some(v) = s.violation {
+        panic!("CORRECT RefNode tripped {:?} on seed {}: {}", v.rule, v.seed, v.detail);
+    }
+    eprintln!("clean over {} seeds: {:?}", s.seeds_run, s.totals);
+}
+
+
+/// REVIEW-ONLY: a granted pre-vote from a node whose own term is behind the campaigner's is
+/// answered with the RESPONDER's term, so the campaigner drops it as stale (mod.rs's own
+/// `m.term < self.hard.term` rule). etcd answers with the envelope's term for exactly this reason.
+fn prevote_stale_term_scenario<P: Peer>(seed: u64) -> Option<u64> {
+    let mut sim = Sim::<P>::new(seed, scripted());
+    let l = wait_for_leader(&mut sim, 80).ok()??;
+    // Cut one follower off entirely so it never learns of any later term.
+    let odd = (1..=5u32).map(NodeId).find(|n| *n != l).unwrap();
+    sim.isolate(odd);
+    // Push the surviving four through two more elections so their term outruns `odd`'s.
+    let mut cur = l;
+    for _ in 0..2 {
+        sim.crash(cur);
+        let next = wait_for_leader(&mut sim, 120).ok()??;
+        sim.restart(cur);
+        cur = next;
+        sim.run_ticks(6).ok()?;
+    }
+    let high = (1..=5u32).map(NodeId).filter_map(|n| sim.term_of(n)).max()?;
+    let low = sim.term_of(odd)?;
+    if low >= high {
+        return None; // scenario did not set itself up
+    }
+    // Leave exactly a quorum alive: `odd` (stale term) plus two up-to-date nodes.
+    let up: Vec<NodeId> = (1..=5u32).map(NodeId).filter(|n| *n != odd && sim.is_up(*n)).collect();
+    for n in up.iter().skip(2) {
+        sim.crash(*n);
+    }
+    sim.heal();
+    // Nobody leads now; how many ticks until the surviving quorum elects one?
+    for n in (1..=5u32).map(NodeId) {
+        if sim.role_of(n) == Some(Role::Leader) {
+            sim.crash(n);
+            sim.restart(n);
+        }
+    }
+    let mut ticks = 0u64;
+    while ticks < 400 {
+        sim.run_ticks(1).ok()?;
+        ticks += 1;
+        if sim.leader().is_some() {
+            return Some(ticks);
+        }
+    }
+    None
+}
+
+#[test]
+fn review_prevote_response_term_costs_elections() {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for seed in 1..=40u64 {
+        if let Some(t) = prevote_stale_term_scenario::<Correct>(seed) { a.push(t); }
+        if let Some(t) = prevote_stale_term_scenario::<RefNode<F_PREVOTE_RESP_TERM>>(seed) { b.push(t); }
+    }
+    eprintln!("as written  : n={} ticks {:?}", a.len(), a);
+    eprintln!("etcd reply  : n={} ticks {:?}", b.len(), b);
+    let sa: u64 = a.iter().sum();
+    let sb: u64 = b.iter().sum();
+    eprintln!("mean as-written {:.1}  mean etcd {:.1}", sa as f64 / a.len().max(1) as f64, sb as f64 / b.len().max(1) as f64);
+}
+
+
+#[test]
+fn review_even_and_odd_cluster_sizes_under_both_probes() {
+    for nodes in [2u32, 3, 4, 5, 6, 7] {
+        let cfg = SimConfig::chaos(nodes, 240);
+        let s = sweep::<Correct>(0xB0B0, 4000, &cfg);
+        if let Some(v) = s.violation {
+            panic!("nodes={nodes} tripped {:?} on seed {}: {}", v.rule, v.seed, v.detail);
+        }
+        eprintln!(
+            "nodes={nodes}: {} seeds, {} elections, {} committed rounds, max_overlap {}",
+            s.seeds_run, s.totals.elections, s.totals.committed_rounds, s.totals.max_overlap_ticks
+        );
+    }
+}
+
+#[test]
+fn review_partitioned_campaigner_over_many_seeds() {
+    let mut disturbed = Vec::new();
+    let mut nolead = 0;
+    for seed in 1..=400u64 {
+        match survives_a_partitioned_campaigner::<Correct>(seed) {
+            None => nolead += 1,
+            Some((l, before, still, after)) => {
+                if before != after || still != Some(l) {
+                    disturbed.push((seed, l, before, still, after));
+                }
+            }
+        }
+    }
+    eprintln!("no-leader seeds: {nolead}; disturbed: {:?}", &disturbed[..disturbed.len().min(20)]);
+    assert!(disturbed.is_empty(), "{} of 400 seeds were disturbed by a partitioned campaigner", disturbed.len());
+}
+
+
+#[test]
+fn review_strict_fsync_trace() {
+    let v = Sim::<Correct>::replay(659926, chaos_cfg()).expect_err("expected the strict probe to fire");
+    eprintln!("RULE {:?} at unit {}\n{}", v.rule, v.at, v.detail);
+    for l in v.trace.iter().rev().take(40).rev() {
+        eprintln!("{l}");
+    }
+}
+
+
+#[test]
+fn review_strict_fsync_frequency() {
+    let mut hits = 0u64;
+    let n = 3000u64;
+    for k in 0..n {
+        let mut sim = Sim::<Correct>::new(0xA11CE + k, chaos_cfg());
+        if let Err(v) = sim.run() {
+            if v.rule == "an append was acknowledged beyond the strictly fsynced prefix" {
+                hits += 1;
+            } else {
+                panic!("other rule {:?} on seed {}: {}", v.rule, v.seed, v.detail);
+            }
+        }
+    }
+    eprintln!("strict-fsync probe fired on {hits} of {n} chaos seeds");
+    assert!(hits > 0);
+}
+
+
+/// REVIEW-ONLY: how often does the digest an `AppendResp` carries describe a DIFFERENT round from
+/// the `matched` it is attached to? The contract says a leader compares "its own digest at that
+/// round"; if the follower hashed a longer prefix, a correct leader latches a false divergence.
+pub static DIG_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DIG_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+fn review_digest_describes_a_different_round_than_matched() {
+    use std::sync::atomic::Ordering::Relaxed;
+    DIG_TOTAL.store(0, Relaxed);
+    DIG_MISMATCH.store(0, Relaxed);
+    let s = sweep::<Correct>(0xD16E, 2000, &chaos_cfg());
+    assert!(s.violation.is_none(), "{:?}", s.violation.map(|v| v.rule));
+    eprintln!(
+        "successful acks: {}, of which the digest hashes a longer prefix than `matched`: {}",
+        DIG_TOTAL.load(Relaxed),
+        DIG_MISMATCH.load(Relaxed)
+    );
+    assert!(DIG_TOTAL.load(Relaxed) > 0);
 }

@@ -63,6 +63,29 @@
 //! digest of two runs of one seed, and its anti-vacuity twin requires two *different* seeds to
 //! disagree — a digest that is constant would pass the first test and prove nothing.
 //!
+//! # What this simulator does NOT model, stated rather than left to be discovered
+//!
+//! A guard whose blind spots are undocumented is one whose silence means nothing.
+//!
+//! * **Snapshots.** [`Store`] requires rounds contiguous from 1 and refuses a write that leaves a
+//!   hole, so a node whose log begins above `snapshot_round` is outside the model. `Body::Append`
+//!   and `Body::InstallSnapshot` are routed to the state machine either way, but nothing here
+//!   checks a snapshot install. F6 extends this file; until then the properties are asserted for
+//!   clusters whose logs still begin at round 1.
+//! * **Membership changes.** The configuration is fixed for the life of a run. A
+//!   `Command::Membership` in the log is carried like any other command and changes nothing about
+//!   who the simulator counts. F5 extends this file.
+//! * **Torn or lying writes.** The crash model loses the unfsynced suffix whole. It does not tear a
+//!   record, corrupt one, or keep a write that was reported as failed — and, deliberately, it does
+//!   **not** lose a write that was reported as succeeding. That last one is not an omission: no
+//!   consensus protocol survives a lying fsync, so injecting one produces violations that say
+//!   nothing about the protocol. `storage/sim.rs` is where that class of fault belongs, and
+//!   `log.rs` (F0b) is where the two meet.
+//! * **Byzantine behaviour.** Every node here runs the same code and tells the truth as it knows
+//!   it. A peer that lies is F7's problem and is refused at the transport, before the state machine.
+//! * **Message corruption and partial frames.** The wire carries whole `Message` values; framing is
+//!   F3's.
+//!
 //! # Relationship to `storage/sim.rs`
 //!
 //! That file is the other simulator: a durable-IO fabric that faults individual writes. It is not
@@ -418,6 +441,14 @@ pub struct Report {
     pub dropped_loss: u64,
     pub dropped_down: u64,
     pub duplicated: u64,
+    /// Duplicates that actually arrived. `duplicated` counts copies put on the wire; a copy dropped
+    /// by a partition tested nothing, so the two numbers are reported separately.
+    pub duplicates_delivered: u64,
+    /// Deliveries that arrived after a later-sent message on the same directed link. Named in
+    /// `DISTRIBUTED.md` §F8 alongside drops and duplication, and reported because reorder here is
+    /// an *emergent* consequence of independent latency draws rather than an injected fault — the
+    /// kind of thing that quietly stops happening when a constant is changed.
+    pub reordered: u64,
     pub crashes: u64,
     pub restarts: u64,
     pub partitions: u64,
@@ -457,6 +488,8 @@ impl Report {
         self.dropped_loss += other.dropped_loss;
         self.dropped_down += other.dropped_down;
         self.duplicated += other.duplicated;
+        self.duplicates_delivered += other.duplicates_delivered;
+        self.reordered += other.reordered;
         self.crashes += other.crashes;
         self.restarts += other.restarts;
         self.partitions += other.partitions;
@@ -490,13 +523,18 @@ pub struct Sweep {
 // ---------------------------------------------------------------------------------------------
 
 /// One scheduled fsync completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It carries the hard state **by value** rather than a flag saying "and take whatever is pending".
+/// With two `PersistHardState` actions outstanding, a flag lets the first completion install the
+/// second one's value — a write landing before it was issued, which is not a fault a disk has.
+#[derive(Debug, Clone, PartialEq)]
 struct Flush {
     at: u64,
     /// Log length this flush makes durable.
     len: usize,
-    /// Whether it also carries the pending hard state.
-    hard: bool,
+    hard: Option<HardState>,
+    /// REVIEW INSTRUMENTATION: the exact bytes this fsync was issued for.
+    snapshot: Vec<Entry>,
 }
 
 /// The bytes a node would still have after `kill -9`.
@@ -514,6 +552,9 @@ struct Store {
     log: Vec<Entry>,
     /// `log[..durable_len]` has reached the disk. The rest is lost on a crash.
     durable_len: usize,
+    /// REVIEW INSTRUMENTATION: the prefix whose OWN fsync completed with the same content still in
+    /// place. The model's `durable_len` may exceed this, because a completion is credited by length.
+    strict_len: usize,
     flushes: VecDeque<Flush>,
     last_flush_at: u64,
 }
@@ -594,6 +635,7 @@ impl Store {
                 }
                 self.log.truncate(idx);
                 self.durable_len = self.durable_len.min(idx);
+                self.strict_len = self.strict_len.min(idx);
             }
             self.log.push(e.clone());
         }
@@ -614,6 +656,7 @@ impl Store {
         }
         self.log.truncate(idx);
         self.durable_len = self.durable_len.min(idx);
+        self.strict_len = self.strict_len.min(idx);
         Ok(())
     }
 
@@ -622,10 +665,11 @@ impl Store {
     /// Completions are forced monotone: a disk does not answer an earlier fsync of the same file
     /// after a later one, and a watermark that arrived out of order would be a fiction the state
     /// machine cannot be blamed for mishandling.
-    fn schedule(&mut self, now: u64, latency: u64, hard: bool) -> u64 {
+    fn schedule(&mut self, now: u64, latency: u64, hard: Option<HardState>) -> u64 {
         let at = (now + latency).max(self.last_flush_at + 1);
         self.last_flush_at = at;
-        self.flushes.push_back(Flush { at, len: self.log.len(), hard });
+        let snapshot = self.log.clone();
+        self.flushes.push_back(Flush { at, len: self.log.len(), hard, snapshot });
         at
     }
 
@@ -640,6 +684,19 @@ impl Store {
 // ---------------------------------------------------------------------------------------------
 // A node
 // ---------------------------------------------------------------------------------------------
+
+/// One message on the wire.
+struct Wired {
+    /// The unit at which it actually left its sender — after every fsync it was queued behind. A
+    /// crash before this instant destroys it; see [`Sim::crash`].
+    released: u64,
+    /// Whether this is the duplicate copy rather than the original.
+    dup: bool,
+    msg: Message,
+    /// REVIEW INSTRUMENTATION: for a successful AppendResp, the sender's own log prefix through
+    /// `matched`, captured at the instant the acknowledgement left the state machine.
+    proof: Option<Vec<Entry>>,
+}
 
 struct Node<P> {
     id: NodeId,
@@ -674,9 +731,12 @@ pub struct Sim<P: Peer> {
     seq: u64,
     nodes: Vec<Node<P>>,
     /// The wire, keyed by `(delivery unit, sequence)` so that delivery order is total and
-    /// reproducible even when two messages land in the same unit. The value carries the unit at
-    /// which the message actually **left** its sender — see [`Sim::crash`].
-    wire: BTreeMap<(u64, u64), (u64, Message)>,
+    /// reproducible even when two messages land in the same unit.
+    wire: BTreeMap<(u64, u64), Wired>,
+    /// Highest sequence delivered on each directed link, for the reorder counter. Duplicates are
+    /// excluded from it, so "reordered" means two *different* messages crossed, not a copy of one
+    /// overtaking its original.
+    link_seq: BTreeMap<(u32, u32), u64>,
     /// Directed blocks. `(a, b)` present means nothing from `a` reaches `b`; `(b, a)` absent means
     /// the reverse still works, which is the asymmetric case.
     blocked: BTreeSet<(u32, u32)>,
@@ -727,6 +787,7 @@ impl<P: Peer> Sim<P> {
             seq: 0,
             nodes,
             wire: BTreeMap::new(),
+            link_seq: BTreeMap::new(),
             blocked: BTreeSet::new(),
             committed: BTreeMap::new(),
             leaders: BTreeMap::new(),
@@ -936,7 +997,7 @@ impl<P: Peer> Sim<P> {
         self.nodes[i].peer = None;
         let now = self.now;
         let before = self.wire.len();
-        self.wire.retain(|_, (released, m)| !(m.from == n && *released >= now));
+        self.wire.retain(|_, w| !(w.msg.from == n && w.released >= now));
         self.report.unsent_at_crash += (before - self.wire.len()) as u64;
         let lost = self.nodes[i].store.log.len() - self.nodes[i].store.durable_len;
         self.report.discarded_entries += lost as u64;
@@ -1123,7 +1184,8 @@ impl<P: Peer> Sim<P> {
             .map(|(k, _)| *k)
             .collect();
         for key in due {
-            let Some((_, m)) = self.wire.remove(&key) else { continue };
+            let Some(w) = self.wire.remove(&key) else { continue };
+            let m = w.msg;
             let Some(i) = self.node(m.to) else { continue };
             // Checked again at delivery: a partition raised while a message was on the wire eats
             // it, which is what a real cut does to packets already in flight.
@@ -1136,6 +1198,17 @@ impl<P: Peer> Sim<P> {
                 continue;
             }
             self.report.delivered += 1;
+            let link = (m.from.0, m.to.0);
+            if w.dup {
+                self.report.duplicates_delivered += 1;
+            } else {
+                let last = self.link_seq.entry(link).or_insert(0);
+                if key.1 < *last {
+                    self.report.reordered += 1;
+                } else {
+                    *last = key.1;
+                }
+            }
             self.mix_digest(&[self.now, m.from.0 as u64, m.to.0 as u64, m.term, body_code(&m.body)]);
             self.log_line(format!(
                 "{}->{} t{} {}",
@@ -1144,6 +1217,28 @@ impl<P: Peer> Sim<P> {
                 m.term,
                 body_summary(&m.body)
             ));
+            // REVIEW INSTRUMENTATION: a successful acknowledgement is a claim that the sender holds
+            // the LEADER's log through `matched`. Check the claim against both stores at the moment
+            // the leader is about to act on it.
+            if let (Some(proof), Body::AppendResp { success: true, matched, .. }) = (&w.proof, &m.body) {
+                let leader_now = self.nodes[i]
+                    .peer
+                    .as_ref()
+                    .map(|p| p.role() == Role::Leader && p.term() == m.term)
+                    .unwrap_or(false);
+                if leader_now {
+                    let k = (*matched as usize).min(self.nodes[i].store.log.len());
+                    let mine = &self.nodes[i].store.log[..k];
+                    if k < *matched as usize || mine != &proof[..k.min(proof.len())] || proof.len() < *matched as usize {
+                        let detail = format!(
+                            "{} acknowledged round {} to leader {} in term {}, but the two logs \
+                             disagree below it (acker held {} rounds, leader holds {})",
+                            m.from, matched, m.to, m.term, proof.len(), self.nodes[i].store.log.len()
+                        );
+                        return Err(self.violation("a follower acknowledged a prefix the leader does not share", detail));
+                    }
+                }
+            }
             let acts = self.nodes[i].peer.as_mut().unwrap().step(Event::Recv(m));
             self.handle_actions(i, acts)?;
         }
@@ -1163,11 +1258,22 @@ impl<P: Peer> Sim<P> {
                 }
                 let st = &mut self.nodes[i].store;
                 let landed = due.len.min(st.log.len());
+                // REVIEW INSTRUMENTATION: the strict model credits only the prefix that still holds
+                // the bytes this fsync was issued for.
+                let mut agree = 0usize;
+                while agree < landed
+                    && agree < due.snapshot.len()
+                    && st.log[agree] == due.snapshot[agree]
+                {
+                    agree += 1;
+                }
+                st.strict_len = st.strict_len.max(agree);
                 st.durable_len = st.durable_len.max(landed);
-                if due.hard {
-                    if let Some(h) = st.hard_pending.take() {
-                        st.hard = h;
-                    }
+                if let Some(h) = due.hard {
+                    st.hard = h;
+                }
+                if !st.flushes.iter().any(|f| f.hard.is_some()) {
+                    st.hard_pending = None;
                 }
                 let term = st.hard.term;
                 let round = st.durable_round();
@@ -1249,9 +1355,10 @@ impl<P: Peer> Sim<P> {
         for a in actions {
             match a {
                 Action::PersistHardState { term, voted_for } => {
-                    self.nodes[i].store.hard_pending = Some(HardState { term, voted_for });
+                    let hs = HardState { term, voted_for };
+                    self.nodes[i].store.hard_pending = Some(hs.clone());
                     let lat = self.draw(self.cfg.faults.fsync);
-                    let at = self.nodes[i].store.schedule(self.now, lat, true);
+                    let at = self.nodes[i].store.schedule(self.now, lat, Some(hs));
                     release = release.max(at);
                     self.log_line(format!(
                         "{} ACT PersistHardState term={term} voted_for={voted_for:?}",
@@ -1270,7 +1377,7 @@ impl<P: Peer> Sim<P> {
                         return Err(self.violation(rule, d));
                     }
                     let lat = self.draw(self.cfg.faults.fsync);
-                    let at = self.nodes[i].store.schedule(self.now, lat, false);
+                    let at = self.nodes[i].store.schedule(self.now, lat, None);
                     release = release.max(at);
                     self.log_line(format!("{} ACT Persist {span}", self.nodes[i].id));
                 }
@@ -1284,7 +1391,14 @@ impl<P: Peer> Sim<P> {
                 }
                 Action::Send(m) => {
                     self.check_send(i, &m)?;
-                    self.enqueue(m, release);
+                    let proof = match &m.body {
+                        Body::AppendResp { success: true, matched, .. } if *matched > 0 => {
+                            let k = (*matched as usize).min(self.nodes[i].store.log.len());
+                            Some(self.nodes[i].store.log[..k].to_vec())
+                        }
+                        _ => None,
+                    };
+                    self.enqueue(m, release, proof);
                 }
                 Action::Apply { through } => {
                     self.on_apply(i, through)?;
@@ -1333,6 +1447,18 @@ impl<P: Peer> Sim<P> {
                 }
             }
             Body::AppendResp { success: true, matched, .. } => {
+                let strict = self.nodes[i].store.strict_len as Round;
+                if *matched > strict && std::env::var("REVIEW_STRICT_FSYNC").is_ok() {
+                    let detail = format!(
+                        "{} acknowledged round {} to {} with only {} strictly fsynced (the model's \
+                         length-credited watermark says {})",
+                        m.from, matched, m.to, strict, self.nodes[i].store.durable_round()
+                    );
+                    return Err(self.violation(
+                        "an append was acknowledged beyond the strictly fsynced prefix",
+                        detail,
+                    ));
+                }
                 let durable = self.nodes[i].store.durable_round();
                 if *matched > durable {
                     let detail = format!(
@@ -1349,7 +1475,7 @@ impl<P: Peer> Sim<P> {
         Ok(())
     }
 
-    fn enqueue(&mut self, m: Message, release: u64) {
+    fn enqueue(&mut self, m: Message, release: u64, proof: Option<Vec<Entry>>) {
         self.report.sent += 1;
         if self.node(m.to).is_none() {
             return;
@@ -1364,11 +1490,13 @@ impl<P: Peer> Sim<P> {
         }
         let at = release + self.draw(self.cfg.faults.latency);
         self.seq += 1;
-        self.wire.insert((at, self.seq), (release, m.clone()));
+        self.wire.insert((at, self.seq), Wired { released: release, dup: false, msg: m.clone(), proof: proof.clone() });
         if self.draw_pct(self.cfg.faults.dup_pct) {
+            // An independent latency draw, so a copy may land before its original: duplication and
+            // reordering at once, which is what a retransmitting network actually does.
             let at2 = release + self.draw(self.cfg.faults.latency);
             self.seq += 1;
-            self.wire.insert((at2, self.seq), (release, m));
+            self.wire.insert((at2, self.seq), Wired { released: release, dup: true, msg: m, proof });
             self.report.duplicated += 1;
         }
     }
@@ -1376,6 +1504,35 @@ impl<P: Peer> Sim<P> {
     /// **State-machine safety.** A round is committed the first time any node applies it, and from
     /// then on no node may apply a different command there.
     fn on_apply(&mut self, i: usize, through: Round) -> Result<(), Violation> {
+        // REVIEW INSTRUMENTATION: when a LEADER commits a round, a quorum of nodes must actually
+        // hold that leader's entry at that round, fsynced. This is the Raft commit rule stated
+        // directly over the stores, independent of anything the state machine believes.
+        let is_leader =
+            self.nodes[i].peer.as_ref().map(|p| p.role() == Role::Leader).unwrap_or(false);
+        if is_leader {
+            let lo = self.nodes[i].applied + 1;
+            let q = self.cluster.quorum();
+            for r in lo..=through {
+                let Some(e) = self.nodes[i].store.entry_at(r).cloned() else { continue };
+                let holders = self
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        n.store.durable_len as Round >= r && n.store.entry_at(r) == Some(&e)
+                    })
+                    .count();
+                if holders < q {
+                    let detail = format!(
+                        "leader {} committed round {r} (term {}) with only {holders} of {} nodes \
+                         holding it durably; quorum is {q}",
+                        self.nodes[i].id,
+                        e.term,
+                        self.nodes.len()
+                    );
+                    return Err(self.violation("a leader committed a round no quorum holds", detail));
+                }
+            }
+        }
         if through < self.nodes[i].applied {
             let detail = format!(
                 "{} applied through {} having already applied through {}",
