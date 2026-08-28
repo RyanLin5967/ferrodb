@@ -640,6 +640,69 @@ impl From<CapabilityRefusal> for FerroError {
 /// allow, including a value the floor check cannot compare — a bound it cannot evaluate is a bound
 /// that refuses, not one that waves the write past.
 ///
+/// # What it does not govern, and this is the load-bearing sentence
+///
+/// "Cannot be written" is a claim about ONE funnel — `AgentRuntime::stage_all` — and it is exactly
+/// as wide as that funnel and no wider. A statement that does not reach `stage_all` is not governed
+/// at all, and there are **three** tiers of those. (This sentence has said "one" and then "two";
+/// each time a review found another tier. Treat the number as the current floor, not a total.)
+///
+/// - **The agent verbs**, diverted by `is_agent_stmt` above everything else. Two of them write the
+///   ROWS of a forbidden table: `REVERT MERGE ... CASCADE` replays a previous merge's writes
+///   backwards, and `MERGE BRANCH <other>` publishes a *different* branch's private workspace. Both
+///   return `Ok` and charge nothing on a branch whose envelope forbids the table. This is the
+///   sharper half of the gap — shared *content*, not structure — and it is the half an earlier
+///   version of this paragraph omitted entirely. Pinned by
+///   `merge_and_revert_rewrite_a_forbidden_tables_rows_and_this_is_a_known_gap`.
+/// - **The DDL that reaches the executor's `match`**: `CREATE INDEX`, `CREATE FULLTEXT INDEX`,
+///   `CREATE TABLE`, `DROP TABLE` and `ANALYZE` all fall through to the **shared catalog**, with no
+///   branch and no `MERGE`, so a branch that may not write one row of a table can still index it,
+///   read every row of it into a full-text index, and drop it. (`ANALYZE` changes no schema and
+///   nothing durable — it writes the in-memory `Catalog::stats` and never calls `persist`; it is
+///   here because it is ungoverned, not because it is DDL.) `BEGIN` / `COMMIT` / `ROLLBACK` are
+///   admitted too, though no row can land through them. Pinned by
+///   `no_ddl_verb_is_governed_by_the_envelope_and_this_is_a_known_gap`, which drives each verb
+///   against a table the envelope refuses, or — for `CREATE TABLE` — against a table it never
+///   granted.
+///
+/// And the DDL does not only escape the envelope: `DROP TABLE` + `CREATE TABLE` **widens** it,
+/// which `restrict` exists to make impossible. Table identity is the name and a column's is its
+/// index, so rebuilding a granted table detaches a floor from the column it guarded and can turn a
+/// standing refusal into a permission, without the envelope bytes ever changing. Pinned by
+/// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns` and
+/// `the_substitution_strips_a_column_floor_and_unlocks_a_refused_delete`.
+///
+/// **None of that is a read escalation, because there is nothing to escalate.** The envelope has no
+/// read dimension at all — [`Verb`] is `Insert | Update | Delete`, [`CapabilityEnvelope::admit`]
+/// decides on row images, and it is consulted on the write path only. A governed branch can already
+/// `SELECT` every row of a table it may not write. What the ungoverned DDL adds is authority over
+/// shared *structure*, and, through `DROP TABLE` + `CREATE TABLE`, authority over what the
+/// branch's own grant points at — see
+/// `dropping_and_recreating_a_granted_table_repoints_the_grant_at_different_columns`.
+///
+/// - **The branch-scoped schema path.** `ALTER TABLE` inside an agent session is diverted at
+///   `src/execution/executor.rs:216` to `run_agent_alter`, which calls `stage_schema_edit` — so it
+///   reaches a branch's *own* staged state without passing `stage_all`. It is neither of the two
+///   tiers above: not an agent verb, and it never reaches the executor's `match`. Detailed
+///   immediately below, because it is also what falsified the single-funnel premise.
+///
+/// **And `stage_all` is no longer the only way into a branch's own staged state.** That was a
+/// premise, not a guarantee, and B11's branch-scoped `ALTER TABLE` — merged at `398e361` — breaks
+/// it: `AgentRuntime::stage_schema_edit` reaches the workspace directly, consulting no envelope and
+/// charging no budget. A branch granted only `inventory` can `ADD`, `RENAME` and `RETYPE` the
+/// columns of `payroll`, and `MERGE` publishes every one of those edits into the shared catalog.
+/// Driven as SQL by `branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap`;
+/// the funnel count itself is pinned by `the_envelope_reads_one_funnel_while_three_reach_branch_state`,
+/// which is where the number to watch lives — one site reads the envelope, three reach branch state.
+///
+/// (The predecessor of those two was a text check written while `ALTER` did not exist in this tree.
+/// It asserted the single-funnel premise and fired on the merge that falsified it, which is what it
+/// was for.)
+///
+/// All of these are recorded gaps rather than oversights — but read them before reading the
+/// paragraph above as "a session cannot touch what it was not granted", because that is not what it
+/// says.
+///
 /// A branch with **no** envelope (`BranchRecord::envelope == None`) is ungoverned. That is stated
 /// rather than implied, and `an_ungoverned_branch_writes_exactly_as_before` asserts it. It is the
 /// compatibility default for two reasons: a record written before this field existed has to load
