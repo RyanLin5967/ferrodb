@@ -803,6 +803,9 @@ fn fast() -> TransportOptions {
         poll_interval: Duration::from_millis(5),
         reconnect_delay: Duration::from_millis(5),
         handshake_deadline: Duration::from_secs(5),
+        inbox_bytes: 32 * 1024 * 1024,
+        max_inbound_conns: 256,
+        idle_deadline: Duration::from_secs(60),
     }
 }
 
@@ -1289,4 +1292,367 @@ fn a_stopped_transport_is_distinguishable_from_a_quiet_one() {
     assert!(a.is_stopped());
     assert!(a.recv_timeout(Duration::from_millis(20)).is_none());
     drop(b);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Defects found by a fresh-context adversarial review of 4c85d22
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_configuration_naming_more_nodes_than_the_wire_allows_is_refused_before_any_id_is_read() {
+    // **This was a remote denial of service.** The disjointness check was
+    // `learners.iter().find(|n| members.contains(n))`, and `Vec::contains` is linear, so it was
+    // O(learners × members); `Config::with_learners`'s `retain` is a second O(learners × members).
+    // One 8 MiB frame carries 2,097,152 `u32` node ids, so two lists of ~1M each cost on the order
+    // of 10^12 comparisons — one frame from any peer that completed the handshake, one CPU, hours.
+    //
+    // The frame limit bounds the BYTES a peer can make this process hold. It says nothing about the
+    // WORK a peer can make this process do, and that was the hole.
+    let mut b = Vec::new();
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&2u32.to_be_bytes());
+    b.extend_from_slice(&1u64.to_be_bytes());
+    b.push(4); // Append
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&0u64.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&1u64.to_be_bytes());
+    b.extend_from_slice(&1u64.to_be_bytes());
+    b.push(7); // Membership
+    b.extend_from_slice(&1u64.to_be_bytes()); // version
+    b.extend_from_slice(&1u64.to_be_bytes()); // term
+    // A claim of a million members, and then NOTHING. If the count is honoured before it is
+    // sanity-checked, the decoder walks a million ids it does not have; if it is refused first,
+    // this frame costs nothing at all. The body being far too short to hold the claim is the point.
+    b.extend_from_slice(&1_000_000u32.to_be_bytes());
+
+    let e = decode(&b).unwrap_err();
+    assert!(
+        format!("{e}").contains("over the") && format!("{e}").contains("limit"),
+        "a million-member configuration was not refused by the node cap: {e}"
+    );
+
+    // Anti-vacuity: a configuration at the cap is legal and decodes, so the refusal is about the
+    // size and not about the frame being malformed.
+    let ok = Config::new((1..=MAX_CONFIG_NODES as u32).map(NodeId), 1, 1);
+    assert_eq!(ok.members().len(), MAX_CONFIG_NODES);
+    let m = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::Membership { config: ok },
+            }],
+            commit: 0,
+        },
+    };
+    assert_eq!(decode_frame(&encode(&m).unwrap()).unwrap(), m, "a configuration at the cap must work");
+
+    // ...and one node over the cap is refused to its SENDER, so this node never emits a frame every
+    // peer would refuse for a reason it could not see.
+    let too_big = Config::new((1..=MAX_CONFIG_NODES as u32 + 1).map(NodeId), 1, 1);
+    let e = encode(&Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::Membership { config: too_big },
+            }],
+            commit: 0,
+        },
+    })
+    .unwrap_err();
+    assert!(format!("{e}").contains("the wire format"), "got {e}");
+}
+
+#[test]
+fn the_oldest_queued_frame_is_the_one_dropped_and_the_newest_always_survives() {
+    // The existing overflow test counts drops and never observes WHICH frames survived, so a
+    // `pop_back()` would pass it — the review found that, and it is right: the policy the test is
+    // named for was unmeasured.
+    //
+    // Oldest and not newest is load-bearing. Consensus messages are cumulative: a later `Append`
+    // carries a higher `commit` and later entries, and a later heartbeat supersedes an earlier one.
+    // A queue that dropped the newest would hold a stale view of the leader's state and never catch
+    // up, so the peer would be told something that is permanently out of date.
+    let ob = Outbox {
+        addr: "127.0.0.1:1".parse().unwrap(),
+        state: Mutex::new(OutboxState { queue: VecDeque::new(), live: None, stopped: false }),
+        woken: Condvar::new(),
+        depth: 4,
+        dropped: std::sync::atomic::AtomicU64::new(0),
+    };
+
+    // Ten frames, each identifiable by its term.
+    for term in 1..=10u64 {
+        let m = Message { from: NodeId(1), to: NodeId(2), term, body: Body::PreVoteResp { granted: true } };
+        ob.push(encode(&m).unwrap());
+    }
+
+    let st = ob.state.lock().unwrap();
+    assert_eq!(st.queue.len(), 4, "the queue grew past its depth");
+    let surviving: Vec<u64> = st
+        .queue
+        .iter()
+        .map(|f| decode(&f[5..]).expect("a queued frame must still decode").term)
+        .collect();
+    assert_eq!(
+        surviving,
+        vec![7, 8, 9, 10],
+        "the queue kept {surviving:?}; dropping the OLDEST must leave the four newest, in order. \
+         Keeping 1..4 would mean this peer is permanently told a stale view of the leader"
+    );
+    assert_eq!(ob.dropped.load(std::sync::atomic::Ordering::SeqCst), 6);
+}
+
+#[test]
+fn an_undrained_inbox_is_bounded_in_bytes_and_every_refusal_is_counted() {
+    // The frame limit caps ONE frame; the channel to the caller was std's unbounded mpsc, so a peer
+    // writing faster than the caller drains — the normal state whenever the state machine is
+    // applying or fsyncing — chose this process's memory however small each frame was.
+    //
+    // Refused rather than blocked: blocking the connection thread would park it where `shutdown`
+    // cannot reach it.
+    let mut opts = fast();
+    opts.inbox_bytes = 4096; // a few hundred small messages' worth, reached quickly and precisely
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(2), l, BTreeMap::new(), opts).unwrap();
+
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut hs = Vec::new();
+    crate::replication::write_handshake(&mut hs).unwrap();
+    s.write_all(&hs).unwrap();
+    s.flush().unwrap();
+    let mut theirs = [0u8; 6];
+    s.read_exact(&mut theirs).unwrap();
+
+    // A message with a 1 KiB payload: five of them exceed a 4 KiB budget, and the caller never
+    // drains.
+    let frame = encode(&Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::WalBatch { start_lsn: 0, bytes: vec![0x11; 1024] },
+            }],
+            commit: 0,
+        },
+    })
+    .unwrap();
+    for _ in 0..40 {
+        s.write_all(&frame).unwrap();
+    }
+    s.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.inbound_dropped() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        t.inbound_dropped() > 0,
+        "40 undrained messages against a 4096-byte budget refused none of them, so the inbox is \
+         still unbounded and a peer chooses this process's memory"
+    );
+    assert!(
+        t.inbox_bytes() <= 4096,
+        "the inbox holds {} bytes, over its own {} byte budget",
+        t.inbox_bytes(),
+        4096
+    );
+
+    // ...and the budget is RETURNED as the caller drains, or the transport wedges shut after one
+    // burst. This is the half a one-way counter would pass and a working bound must not.
+    let before = t.inbox_bytes();
+    assert!(before > 0, "nothing was queued at all, so nothing was measured");
+    let got = t.recv_timeout(Duration::from_secs(5)).expect("a message must be deliverable");
+    assert!(matches!(got.body, Body::Append { .. }));
+    assert!(
+        t.inbox_bytes() < before,
+        "draining a message did not return its bytes to the budget ({} then {}), so the inbox \
+         fills once and refuses for ever",
+        before,
+        t.inbox_bytes()
+    );
+}
+
+
+#[test]
+fn concurrent_inbound_connections_are_capped_and_the_refusals_are_counted() {
+    // This transport does NOT authenticate — F7 does — so anything that can reach the port may
+    // open a connection, and each costs a thread and two descriptors. An unbounded accept loop is
+    // therefore an unauthenticated peer choosing how many threads this process runs, which is the
+    // same class of hole the frame limit closes for bytes.
+    let mut opts = fast();
+    opts.max_inbound_conns = 4;
+    opts.idle_deadline = Duration::from_secs(60);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    // Held open, so they stay established and the cap is actually reached.
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            let mut hs = Vec::new();
+            crate::replication::write_handshake(&mut hs).unwrap();
+            let _ = s.write_all(&hs);
+            let _ = s.flush();
+            held.push(s);
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.refused_conns() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        t.refused_conns() > 0,
+        "24 connections against a cap of 4 refused none; the accept loop is unbounded and a peer \
+         chooses how many threads this process runs"
+    );
+    assert!(
+        t.live_inbound_conns() <= 4,
+        "the cap is 4 but {} connections are established",
+        t.live_inbound_conns()
+    );
+    drop(held);
+}
+
+#[test]
+fn a_silent_peer_is_closed_on_the_idle_deadline_rather_than_pinning_a_thread_for_ever() {
+    // A peer whose host vanishes without a FIN leaves a socket that never becomes readable and
+    // never errors, so its thread and both descriptors are held for the life of the process.
+    // Consensus heartbeats every few ticks, so silence past the deadline is a gone peer, not a slow
+    // one.
+    let mut opts = fast();
+    opts.idle_deadline = Duration::from_millis(200);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut hs = Vec::new();
+    crate::replication::write_handshake(&mut hs).unwrap();
+    s.write_all(&hs).unwrap();
+    s.flush().unwrap();
+    let mut theirs = [0u8; 6];
+    s.read_exact(&mut theirs).unwrap();
+    // ...and then say nothing at all, for ever.
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.idle_closed() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(t.idle_closed(), 1, "a silent peer was never closed on the idle deadline");
+
+    // The descriptor goes with it: this is the half that proves the close actually happened rather
+    // than a counter being bumped.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && t.live_inbound_conns() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(t.live_inbound_conns(), 0, "the idle connection was counted but not closed");
+}
+
+#[test]
+fn a_send_after_shutdown_is_refused_rather_than_silently_discarded() {
+    // Every other loss in this module has a counter. A stopped transport used to return `Ok`,
+    // increment `sent`, and discard the frame — the one silent loss left, and the module header
+    // claims there are none.
+    let (a, b) = pair(fast());
+    a.shutdown();
+    let e = a
+        .send(&Message {
+            from: NodeId(1),
+            to: NodeId(2),
+            term: 1,
+            body: Body::PreVoteResp { granted: true },
+        })
+        .unwrap_err();
+    assert!(format!("{e}").contains("shut down"), "got {e}");
+    assert_eq!(a.refused_after_stop(), 1);
+    assert_eq!(a.sent(), 0, "a refused send was counted as sent");
+    drop(b);
+}
+
+#[test]
+fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
+    // `wal::log::write_str` writes `s.len() as u16`, UNCHECKED. A name over 65535 bytes gets a
+    // truncated length prefix followed by its full bytes, so `encode` would emit a frame the peer
+    // misparses. The receiver's re-encode check catches it — on the wrong side of the wire, where
+    // the useful information (that THIS node produced rubbish) is gone.
+    let long = "x".repeat(70_000);
+    let m = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::Catalog {
+                    op: DdlOp::CreateTable,
+                    table: long.clone(),
+                    columns: vec![("id".into(), DataType::Integer, false)],
+                },
+            }],
+            commit: 0,
+        },
+    };
+    let e = format!("{}", encode(&m).unwrap_err());
+    // Either refusal is correct and which one fires depends on how the truncated length happens to
+    // reparse: the record may come back as a DIFFERENT readable record, or as no readable record at
+    // all. What must never happen is that it is framed and sent.
+    assert!(
+        e.contains("does not survive its own encoding")
+            || e.contains("did not encode to a readable log record"),
+        "a 70,000-byte table name was framed instead of refused: {}",
+        &e[..e.len().min(300)]
+    );
+
+    // Anti-vacuity: a name one byte inside the limit still encodes and round-trips, so the refusal
+    // is about the truncation and not about long names in general.
+    let ok = "y".repeat(u16::MAX as usize);
+    let m2 = Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term: 1,
+        body: Body::Append {
+            prev_round: 0,
+            prev_term: 0,
+            entries: vec![Entry {
+                term: 1,
+                round: 1,
+                command: Command::Catalog {
+                    op: DdlOp::CreateTable,
+                    table: ok,
+                    columns: vec![("id".into(), DataType::Integer, false)],
+                },
+            }],
+            commit: 0,
+        },
+    };
+    assert_eq!(decode_frame(&encode(&m2).unwrap()).unwrap(), m2, "a maximal name must round trip");
 }

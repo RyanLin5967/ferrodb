@@ -26,8 +26,15 @@
 //! up by `hint` rather than assuming delivery. So this transport is allowed to drop, and
 //! [`Transport::send`] never blocks the state machine: a leader that blocked writing to one
 //! partitioned follower would stop heartbeating the healthy majority, turning one node's failure
-//! into the cluster's. Drops are **counted** ([`Transport::dropped`]) rather than silent, because
-//! an invisible drop is indistinguishable from a protocol bug.
+//! into the cluster's.
+//!
+//! **Every way a message can be lost here has its own counter**, because an invisible drop is
+//! indistinguishable from a protocol bug, and because the three causes call for different actions:
+//! [`Transport::dropped`] means a peer is too slow to keep up,
+//! [`Transport::lost_in_flight`] means a connection broke mid-frame, and
+//! [`Transport::inbound_dropped`] means *this* node is not draining its own inbox. A send after
+//! shutdown is **refused** rather than counted, because a caller still producing `Action::Send`
+//! after stopping its transport has a bug rather than a slow peer.
 //!
 //! # The wire format
 //!
@@ -55,7 +62,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -101,6 +108,21 @@ const B_FORK: u8 = 0;
 const B_MERGE: u8 = 1;
 const B_ABANDON: u8 = 2;
 const B_REAP: u8 = 3;
+
+/// Most voters, and most learners, a configuration may carry **on the wire**.
+///
+/// Not a limit on what a cluster may be — a limit on what a *frame* may claim it is. One 8 MiB
+/// frame holds 2,097,152 `u32` node ids, and both the disjointness check below and
+/// `Config::with_learners` compare each learner against every member, so two million ids cost on
+/// the order of 10^12 comparisons: one frame, one CPU, hours. The frame limit bounds the *bytes* a
+/// peer can make this process hold and says nothing about the *work* it can make this process do,
+/// which is the hole this closes.
+///
+/// 1024 is far above anything real and far below anything measurable. Membership changes here are
+/// single-node by construction (`membership.rs`) and quorum arithmetic makes a cluster of even
+/// fifty voters unusable, so a configuration naming a thousand is already not a configuration; at
+/// 1024 the quadratic term is about a million comparisons, which is microseconds.
+pub const MAX_CONFIG_NODES: usize = 1024;
 
 /// `RecKind::Ddl`'s tag in `wal::log`. Named here because [`Command::Catalog`] is carried *as* one
 /// of those records, and because the tag has to be checked before the record is handed to
@@ -272,6 +294,37 @@ fn encode_command(b: &mut Vec<u8>, c: &Command) -> Result<(), FerroError> {
             };
             let mut rec_bytes = Vec::new();
             rec.serialize(&mut rec_bytes);
+
+            // **`RecKind::serialize` writes every string length as `s.len() as u16`, unchecked.**
+            // A table or column name over 65535 bytes therefore gets a truncated length prefix
+            // followed by its full bytes, and the frame that results is one the peer misparses —
+            // the receiver's re-encode check would catch it, but that is the wrong side of the wire
+            // to find out that this node emitted rubbish.
+            //
+            // Checked by round-tripping the record here, the same total check `decode_catalog`
+            // applies. It costs one encode of a schema description, on a DDL path, and it catches
+            // every present and future truncation in an encoder this file does not own.
+            match RecKind::deserialize(&rec_bytes) {
+                Ok(back) => {
+                    let mut again = Vec::new();
+                    back.serialize(&mut again);
+                    if again != rec_bytes {
+                        return Err(FerroError::Wal(format!(
+                            "a Catalog command for table {table:?} does not survive its own \
+                             encoding, so the frame would be misparsed by the peer rather than \
+                             refused. `wal::log` writes string lengths as `as u16`, so a name over \
+                             {} bytes truncates its prefix",
+                            u16::MAX
+                        )));
+                    }
+                }
+                Err(e) => {
+                    return Err(FerroError::Wal(format!(
+                        "a Catalog command for table {table:?} did not encode to a readable log \
+                         record ({e}); refused here rather than sent for a peer to choke on"
+                    )))
+                }
+            }
             put_bytes(b, &rec_bytes)?;
         }
         Command::Branch { op } => {
@@ -334,6 +387,17 @@ fn encode_config(b: &mut Vec<u8>, cfg: &Config) -> Result<(), FerroError> {
     put_u64(b, cfg.version);
     put_u64(b, cfg.term);
     for list in [cfg.members(), cfg.learners()] {
+        // Refused to the SENDER as well, at the same limit the decoder uses. Otherwise this node
+        // emits a frame every peer refuses and never learns why — a cluster that silently cannot
+        // replicate its own configuration.
+        if list.len() > MAX_CONFIG_NODES {
+            return Err(FerroError::Wal(format!(
+                "a configuration holds {} nodes, over the {MAX_CONFIG_NODES} the wire format \
+                 allows; a peer would refuse this frame, so it is refused here where the cause is \
+                 visible",
+                list.len()
+            )));
+        }
         room(b, 4 + list.len() * 4)?;
         put_u32(b, u32::try_from(list.len()).map_err(|_| too_big(list.len()))?);
         for n in list {
@@ -620,6 +684,15 @@ fn decode_branch_op(bytes: &[u8], at: &mut usize) -> Result<BranchOp, FerroError
 /// are not the bytes this node would re-emit, and F7's MAC is taken over bytes.
 fn decode_node_list(bytes: &[u8], at: &mut usize, what: &str) -> Result<Vec<NodeId>, FerroError> {
     let count = take_u32(bytes, at)? as usize;
+    // Refused before a single id is read. See [`MAX_CONFIG_NODES`]: the frame limit bounds the
+    // bytes a peer can make this process hold, not the work it can make this process do.
+    if count > MAX_CONFIG_NODES {
+        return Err(FerroError::Wal(format!(
+            "a configuration claims {count} {what}s, over the {MAX_CONFIG_NODES} limit. A frame is \
+             allowed to be large; the comparisons a configuration costs are quadratic in its two \
+             list lengths, so a large one is a request for this node's CPU rather than a cluster"
+        )));
+    }
     // Not pre-allocated from `count`, for the reason given in `decode_append`.
     let mut out: Vec<NodeId> = Vec::new();
     for _ in 0..count {
@@ -640,6 +713,22 @@ fn decode_node_list(bytes: &[u8], at: &mut usize, what: &str) -> Result<Vec<Node
     Ok(out)
 }
 
+/// The first node present in both lists, or `None`.
+///
+/// Linear, because both lists are already known to be strictly ascending — which
+/// [`decode_node_list`] has just guaranteed. A two-pointer walk, not a nested scan.
+fn first_common(a: &[NodeId], b: &[NodeId]) -> Option<NodeId> {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return Some(a[i]),
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    None
+}
+
 fn decode_config(bytes: &[u8], at: &mut usize) -> Result<Config, FerroError> {
     let version = take_u64(bytes, at)?;
     let term = take_u64(bytes, at)?;
@@ -649,7 +738,12 @@ fn decode_config(bytes: &[u8], at: &mut usize) -> Result<Config, FerroError> {
     // A node cannot be both. `with_learners` drops such a learner silently, which is the right
     // thing for a *builder* — the voter entry is the stronger statement — and the wrong thing for a
     // decoder, because the config this node would then hold is not the one the leader sent.
-    if let Some(n) = learners.iter().find(|n| members.contains(n)) {
+    //
+    // A linear merge rather than `find(|n| members.contains(n))`, which was O(learners × members).
+    // [`MAX_CONFIG_NODES`] already bounds that product, so this is belt as well as braces — but a
+    // linear check over two lists already known to be strictly ascending is both cheaper and
+    // simpler than relying on the cap, and it does not become a defect again if the cap is raised.
+    if let Some(n) = first_common(&members, &learners) {
         return Err(FerroError::Wal(format!(
             "a configuration lists {n} as both a voter and a learner. Accepting it would mean this \
              node holds a different configuration from the one the leader replicated, while both \
@@ -891,6 +985,29 @@ pub struct TransportOptions {
     pub reconnect_delay: Duration,
     /// How long an accepted connection may take to finish its handshake before it is closed.
     pub handshake_deadline: Duration,
+    /// Most inbound connections accepted at once.
+    ///
+    /// The transport does not authenticate (F7 does), so anything that can reach this port can open
+    /// a connection, and each one costs a thread and two descriptors. Without a cap that is an
+    /// unauthenticated peer choosing how many threads this process runs — the same class of hole as
+    /// letting one choose how many bytes it allocates, which the frame limit already closes.
+    /// Beyond the cap a connection is closed immediately rather than queued, and counted.
+    pub max_inbound_conns: usize,
+    /// How long an established connection may stay silent before it is closed.
+    ///
+    /// A peer whose host vanishes without sending a FIN leaves a connection that is never readable
+    /// and never errors, so its thread and descriptors are pinned for the life of the process.
+    /// Consensus heartbeats every few ticks, so a genuinely live peer is never silent for long, and
+    /// closing costs only a reconnect.
+    pub idle_deadline: Duration,
+    /// Most bytes of undelivered inbound messages held before further ones are refused.
+    ///
+    /// **The frame limit alone does not bound inbound memory.** It caps one frame; the channel to
+    /// the caller is unbounded, so a peer that writes faster than the caller drains — the normal
+    /// state whenever the state machine is applying or fsyncing — accumulates every frame it sends.
+    /// Bounded in bytes rather than messages because a message is anything from 18 bytes to 8 MiB,
+    /// so a depth in messages is not a bound on anything.
+    pub inbox_bytes: usize,
 }
 
 impl Default for TransportOptions {
@@ -900,6 +1017,9 @@ impl Default for TransportOptions {
             poll_interval: Duration::from_millis(50),
             reconnect_delay: Duration::from_millis(100),
             handshake_deadline: Duration::from_secs(5),
+            inbox_bytes: 32 * 1024 * 1024,
+            max_inbound_conns: 256,
+            idle_deadline: Duration::from_secs(60),
         }
     }
 }
@@ -914,6 +1034,20 @@ struct Counters {
     misrouted: AtomicU64,
     refused_handshakes: AtomicU64,
     connect_failures: AtomicU64,
+    /// Inbound messages refused because the caller had not drained `inbox_bytes` worth yet.
+    inbound_dropped: AtomicU64,
+    /// Outbound frames already dequeued and then lost to a failed write. Counted separately from
+    /// queue-overflow drops because the two say different things to an operator: overflow means a
+    /// peer is slow, this means a connection broke.
+    lost_in_flight: AtomicU64,
+    /// Bytes of decoded messages sitting in the inbox, undelivered.
+    inbox_bytes: AtomicUsize,
+    /// Connections closed immediately because `max_inbound_conns` were already established.
+    refused_conns: AtomicU64,
+    /// Connections closed for going silent longer than `idle_deadline`.
+    idle_closed: AtomicU64,
+    /// Outbound messages refused because the transport is stopped.
+    refused_after_stop: AtomicU64,
 }
 
 /// One peer's queue and its current connection.
@@ -971,10 +1105,17 @@ pub struct Transport {
     /// Behind a `Mutex` so `Transport` is `Sync` and can live in an `Arc`: an `mpsc::Receiver` is
     /// `Send` but not `Sync`, and a driver that sends from one thread and receives on another is
     /// the ordinary arrangement.
-    inbox: Mutex<mpsc::Receiver<Message>>,
+    /// Carries the message and its encoded size, so `recv` can give the size back to the byte
+    /// budget the connection thread charged it against.
+    inbox: Mutex<mpsc::Receiver<(Message, usize)>>,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Held for the whole of [`Transport::shutdown`], so a concurrent second call waits for the
+    /// first to finish joining rather than taking an empty thread list and returning early. Without
+    /// it "a second call is a barrier" was true only for a sequential caller — and a `Drop` racing
+    /// an explicit `shutdown` is exactly the concurrent case.
+    shutdown_lock: Mutex<()>,
     /// Every **live** inbound socket, so shutdown can unblock their readers at once instead of
     /// waiting a `poll_interval` for each.
     ///
@@ -1071,11 +1212,18 @@ impl Transport {
 
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
+        // Every `?` from here on would otherwise return with `threads` and `stop` still local.
+        // Dropping a `JoinHandle` DETACHES its thread, and dropping the only other `Arc<AtomicBool>`
+        // leaves it with no way to be told to stop — so a spawn failure part way through this
+        // function would leak a sender thread per peer already started, for the life of the
+        // process. `started` collects them so the teardown below can reach them.
+        let mut started: Vec<JoinHandle<()>> = Vec::new();
+        let mut outbox_list: Vec<Arc<Outbox>> = Vec::new();
         let inbound_conns: Arc<Mutex<BTreeMap<u64, TcpStream>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         // Lives only in the accept thread, which is the only place a connection id is minted.
         let next_conn_id = Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::channel::<Message>();
+        let (tx, rx) = mpsc::channel::<(Message, usize)>();
         let mut threads = Vec::new();
 
         let mut outboxes = BTreeMap::new();
@@ -1092,16 +1240,26 @@ impl Transport {
                 dropped: AtomicU64::new(0),
             });
             outboxes.insert(peer, Arc::clone(&ob));
+            outbox_list.push(Arc::clone(&ob));
             let stop_c = Arc::clone(&stop);
             let counters_c = Arc::clone(&counters);
             let opts_c = opts.clone();
-            threads.push(
-                std::thread::Builder::new()
-                    .name(format!("consensus-out-{self_id}-to-{peer}"))
-                    .spawn(move || sender_loop(ob, stop_c, counters_c, opts_c))
-                    .map_err(|e| FerroError::Io(e.to_string()))?,
-            );
+            match std::thread::Builder::new()
+                .name(format!("consensus-out-{self_id}-to-{peer}"))
+                .spawn(move || sender_loop(ob, stop_c, counters_c, opts_c))
+            {
+                Ok(h) => started.push(h),
+                Err(e) => {
+                    stop_started(&stop, &outbox_list, started);
+                    return Err(FerroError::Io(format!(
+                        "could not start the sender thread for {peer}: {e}. The {} thread(s) \
+                         already started were stopped and joined rather than detached",
+                        outbox_list.len() - 1
+                    )));
+                }
+            }
         }
+        threads.append(&mut started);
 
         // The accept thread owns the per-connection threads it spawns, and joins them before it
         // returns. Nothing here is detached: a transport that has been shut down must have no
@@ -1112,14 +1270,20 @@ impl Transport {
         let conns_c = Arc::clone(&inbound_conns);
         let ids_c = next_conn_id;
         let opts_c = opts.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("consensus-accept-{self_id}"))
-                .spawn(move || {
-                    accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c)
-                })
-                .map_err(|e| FerroError::Io(e.to_string()))?,
-        );
+        match std::thread::Builder::new()
+            .name(format!("consensus-accept-{self_id}"))
+            .spawn(move || {
+                accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c)
+            }) {
+            Ok(h) => threads.push(h),
+            Err(e) => {
+                stop_started(&stop, &outbox_list, threads);
+                return Err(FerroError::Io(format!(
+                    "could not start the accept thread for {self_id}: {e}. Every sender thread \
+                     already started was stopped and joined rather than detached"
+                )));
+            }
+        }
 
         Ok(Transport {
             self_id,
@@ -1129,6 +1293,7 @@ impl Transport {
             counters,
             stop,
             threads: Mutex::new(threads),
+            shutdown_lock: Mutex::new(()),
             inbound_conns,
         })
     }
@@ -1154,6 +1319,18 @@ impl Transport {
     /// Both are silent partitions if they are dropped, and a silent partition is the failure this
     /// whole layer exists to make impossible.
     pub fn send(&self, m: &Message) -> Result<(), FerroError> {
+        // A stopped transport discards, and a discard with no error and no counter is the silent
+        // loss this module claims not to have. Refused, because a caller still stepping its state
+        // machine after shutting down its transport has a bug that this is the only chance to name.
+        if self.stop.load(Ordering::SeqCst) {
+            self.counters.refused_after_stop.fetch_add(1, Ordering::SeqCst);
+            return Err(FerroError::Internal(format!(
+                "this transport has been shut down, so the message to {} was refused rather than \
+                 dropped. A node that keeps producing `Action::Send` after its transport stopped is \
+                 stepping a state machine whose output goes nowhere",
+                m.to
+            )));
+        }
         if m.to == self.self_id {
             return Err(FerroError::Internal(format!(
                 "{} tried to send a consensus message to itself; the state machine addresses peers \
@@ -1179,13 +1356,29 @@ impl Transport {
 
     /// The next message that has arrived, or `None` if none has.
     pub fn try_recv(&self) -> Option<Message> {
-        self.inbox.lock().unwrap().try_recv().ok()
+        let got = self.inbox.lock().unwrap().try_recv().ok();
+        got.map(|(m, n)| self.credit(m, n))
     }
 
     /// The next message, waiting up to `d`. `None` means nothing arrived in that window — which is
-    /// an ordinary and expected answer, not an error.
+    /// an ordinary and expected answer, not an error. See [`Transport::is_stopped`] for telling a
+    /// quiet window from a closed transport.
     pub fn recv_timeout(&self, d: Duration) -> Option<Message> {
-        self.inbox.lock().unwrap().recv_timeout(d).ok()
+        let got = self.inbox.lock().unwrap().recv_timeout(d).ok();
+        got.map(|(m, n)| self.credit(m, n))
+    }
+
+    /// Return a delivered message's bytes to the inbound budget.
+    fn credit(&self, m: Message, n: usize) -> Message {
+        // `fetch_sub` cannot underflow here: every message in the channel was charged before it was
+        // sent, and each is credited exactly once on the way out. Saturating anyway, because an
+        // underflowing byte counter would silently disable the bound it exists to enforce.
+        let _ = self.counters.inbox_bytes.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+        m
     }
 
     /// Messages handed to a peer's queue.
@@ -1204,6 +1397,24 @@ impl Transport {
     pub fn received(&self) -> u64 {
         self.counters.received.load(Ordering::SeqCst)
     }
+    /// Inbound messages refused because the caller had not drained `inbox_bytes` worth yet.
+    ///
+    /// Not a silent loss: consensus re-sends, but a climbing number here means the caller is not
+    /// draining fast enough and the cluster is losing traffic to this node's own back pressure.
+    pub fn inbound_dropped(&self) -> u64 {
+        self.counters.inbound_dropped.load(Ordering::SeqCst)
+    }
+
+    /// Outbound frames dequeued and then lost to a failed write — one per broken connection.
+    pub fn lost_in_flight(&self) -> u64 {
+        self.counters.lost_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Bytes of decoded inbound messages waiting for the caller.
+    pub fn inbox_bytes(&self) -> usize {
+        self.counters.inbox_bytes.load(Ordering::SeqCst)
+    }
+
     /// Messages that decoded but were addressed to a different node, and were therefore refused.
     pub fn misrouted(&self) -> u64 {
         self.counters.misrouted.load(Ordering::SeqCst)
@@ -1228,6 +1439,18 @@ impl Transport {
     pub fn refused_handshakes(&self) -> u64 {
         self.counters.refused_handshakes.load(Ordering::SeqCst)
     }
+    /// Connections closed immediately because `max_inbound_conns` were already established.
+    pub fn refused_conns(&self) -> u64 {
+        self.counters.refused_conns.load(Ordering::SeqCst)
+    }
+    /// Connections closed for exceeding `idle_deadline` without a frame.
+    pub fn idle_closed(&self) -> u64 {
+        self.counters.idle_closed.load(Ordering::SeqCst)
+    }
+    /// Sends refused because the transport is stopped.
+    pub fn refused_after_stop(&self) -> u64 {
+        self.counters.refused_after_stop.load(Ordering::SeqCst)
+    }
     /// Failed dials. A peer that is down makes this climb steadily; it is the meter that says
     /// "unreachable" rather than "quiet".
     pub fn connect_failures(&self) -> u64 {
@@ -1249,10 +1472,11 @@ impl Transport {
     /// alternative is failing a legitimately slow connect, and a slow shutdown is the cheaper
     /// failure.
     pub fn shutdown(&self) {
-        if self.stop.swap(true, Ordering::SeqCst) {
-            // Already shut down. Still join below, so a second call is a barrier rather than a
-            // no-op that returns while threads are alive.
-        }
+        // Taken first and held throughout: a second caller blocks here until the first has finished
+        // joining, which is what makes the barrier claim true for a concurrent caller and not just
+        // a sequential one. `Drop` racing an explicit `shutdown` is that concurrent case.
+        let _barrier = self.shutdown_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop.store(true, Ordering::SeqCst);
         for ob in self.outboxes.values() {
             let mut st = ob.state.lock().unwrap();
             st.stopped = true;
@@ -1269,6 +1493,27 @@ impl Transport {
         for h in handles {
             let _ = h.join();
         }
+    }
+}
+
+/// Stop and join threads started before a failure in [`Transport::from_listener`].
+///
+/// The same teardown [`Transport::shutdown`] performs, reachable before a `Transport` exists to
+/// call it on. Written as a function rather than inlined twice because the failure it handles is
+/// the one nobody tests by hand, so it must not have two implementations.
+fn stop_started(stop: &Arc<AtomicBool>, outboxes: &[Arc<Outbox>], threads: Vec<JoinHandle<()>>) {
+    stop.store(true, Ordering::SeqCst);
+    for ob in outboxes {
+        let mut st = ob.state.lock().unwrap();
+        st.stopped = true;
+        st.queue.clear();
+        if let Some(s) = st.live.take() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        ob.woken.notify_all();
+    }
+    for h in threads {
+        let _ = h.join();
     }
 }
 
@@ -1291,6 +1536,10 @@ impl std::fmt::Debug for Transport {
             .field("received", &self.received())
             .field("misrouted", &self.misrouted())
             .field("refused_handshakes", &self.refused_handshakes())
+            .field("refused_conns", &self.refused_conns())
+            .field("idle_closed", &self.idle_closed())
+            .field("inbound_dropped", &self.inbound_dropped())
+            .field("lost_in_flight", &self.lost_in_flight())
             .field("connect_failures", &self.connect_failures())
             .field("stopped", &self.stop.load(Ordering::SeqCst))
             .finish()
@@ -1311,7 +1560,7 @@ fn sender_loop(
         }
 
         if conn.is_none() {
-            match dial(ob.addr, &opts) {
+            match dial(ob.addr, &stop, &opts) {
                 Ok(s) => {
                     match s.try_clone() {
                         Ok(c) => {
@@ -1322,7 +1571,12 @@ fn sender_loop(
                             st.live = Some(c);
                         }
                         Err(_) => {
+                            // Wait before retrying, exactly as a failed dial does. Retrying
+                            // immediately is a 100%-CPU loop and a connection storm against a peer
+                            // that has done nothing wrong.
                             counters.connect_failures.fetch_add(1, Ordering::SeqCst);
+                            let st = ob.state.lock().unwrap();
+                            let _ = ob.woken.wait_timeout(st, opts.reconnect_delay);
                             continue;
                         }
                     }
@@ -1362,6 +1616,12 @@ fn sender_loop(
         // connection is dropped, which is what makes the peer's reader see EOF and reset. The frame
         // is lost, and that is the documented policy of this transport: consensus re-sends.
         if s.write_all(&frame).and_then(|()| s.flush()).is_err() {
+            // The frame was already dequeued, and a partial write cannot be resumed — the peer's
+            // reader is inside a frame that will never finish. So it is lost, and it is COUNTED:
+            // this happens at least once on every reconnect, which is this transport's only
+            // recovery path, and an uncounted loss here is the difference between "a connection
+            // broke" and an unexplained gap between `sent()` and the peer's `received()`.
+            counters.lost_in_flight.fetch_add(1, Ordering::SeqCst);
             let mut st = ob.state.lock().unwrap();
             if let Some(old) = st.live.take() {
                 let _ = old.shutdown(Shutdown::Both);
@@ -1384,7 +1644,11 @@ fn sender_loop(
 /// That ordering is `examples/repl_replica.rs`'s, and the accepting side's is
 /// `examples/repl_primary.rs`'s — read then write. Keeping the two halves as they already are is
 /// what stops this from being a third convention on one wire.
-fn dial(addr: SocketAddr, opts: &TransportOptions) -> Result<TcpStream, FerroError> {
+fn dial(
+    addr: SocketAddr,
+    stop: &AtomicBool,
+    opts: &TransportOptions,
+) -> Result<TcpStream, FerroError> {
     let mut s = TcpStream::connect_timeout(&addr, opts.handshake_deadline)
         .map_err(|e| FerroError::Io(e.to_string()))?;
     s.set_read_timeout(Some(opts.poll_interval)).map_err(|e| FerroError::Io(e.to_string()))?;
@@ -1397,6 +1661,12 @@ fn dial(addr: SocketAddr, opts: &TransportOptions) -> Result<TcpStream, FerroErr
     let mut got = 0usize;
     let started = Instant::now();
     while got < 6 {
+        // `stop` is checked here as well as by the caller. Without it a shutdown that arrives while
+        // a peer is accepting-but-silent waits out a whole `handshake_deadline` on top of the one
+        // `connect_timeout` may already have spent — twice the bound `shutdown`'s own doc states.
+        if stop.load(Ordering::SeqCst) {
+            return Err(FerroError::Io("transport is shutting down".into()));
+        }
         if started.elapsed() > opts.handshake_deadline {
             return Err(FerroError::Wal(
                 "a peer accepted the connection but did not answer the handshake".to_string(),
@@ -1418,7 +1688,7 @@ fn dial(addr: SocketAddr, opts: &TransportOptions) -> Result<TcpStream, FerroErr
 fn accept_loop(
     listener: TcpListener,
     self_id: NodeId,
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<(Message, usize)>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
@@ -1429,6 +1699,31 @@ fn accept_loop(
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // **Refused before a thread is spawned for it.** This transport does not
+                // authenticate, so an unbounded accept loop is an unauthenticated peer choosing how
+                // many threads this process runs.
+                //
+                // The check and the reservation happen under ONE lock, and the slot is taken HERE
+                // rather than inside the spawned thread. Checking here and registering there was
+                // measured as not a cap at all: a test opening 24 connections against a cap of 4
+                // established 6, because several accepts each passed a check that only the first
+                // should have — the connections were accepted faster than the threads could
+                // register them.
+                let id = ids.fetch_add(1, Ordering::SeqCst);
+                let Ok(mine) = stream.try_clone() else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
+                {
+                    let mut map = conns.lock().unwrap();
+                    if map.len() >= opts.max_inbound_conns {
+                        counters.refused_conns.fetch_add(1, Ordering::SeqCst);
+                        drop(map);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    map.insert(id, mine);
+                }
                 // An accepted socket's blocking mode is not portably inherited from its listener,
                 // so it is set explicitly rather than assumed. The read timeout is what lets the
                 // connection thread notice a shutdown.
@@ -1443,14 +1738,19 @@ fn accept_loop(
                 let counters_c = Arc::clone(&counters);
                 let conns_c = Arc::clone(&conns);
                 let opts_c = opts.clone();
-                let id = ids.fetch_add(1, Ordering::SeqCst);
                 match std::thread::Builder::new()
                     .name(format!("consensus-in-{self_id}"))
                     .spawn(move || {
                         conn_loop(stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c)
                     }) {
                     Ok(h) => conn_threads.push(h),
-                    Err(_) => continue,
+                    Err(_) => {
+                        // The slot was reserved above and no thread will release it, so it is
+                        // released here. Without this a run of spawn failures would fill the cap
+                        // with connections that do not exist and refuse every real peer after.
+                        conns.lock().unwrap().remove(&id);
+                        continue;
+                    }
                 }
                 // Reap finished connection threads so a long-lived node does not accumulate
                 // handles for every connection it has ever accepted.
@@ -1473,19 +1773,17 @@ fn conn_loop(
     mut stream: TcpStream,
     id: u64,
     self_id: NodeId,
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<(Message, usize)>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     opts: TransportOptions,
 ) {
-    // Registered before the handshake, so a peer that connects and then goes silent is still
-    // reachable by `shutdown` rather than pinned until its deadline. The guard deregisters on every
-    // exit path, including the early return below.
+    // The accept thread already reserved this connection's slot and registered its socket, so
+    // `shutdown` can reach a peer that connects and then goes silent. All this thread owns is the
+    // guard that releases the slot again, on every exit path including the refused-handshake
+    // return below.
     let _registration = ConnRegistration { id, conns: Arc::clone(&conns) };
-    if let Ok(c) = stream.try_clone() {
-        conns.lock().unwrap().insert(id, c);
-    }
 
     let verdict = recv_handshake(&mut stream, &stop, opts.handshake_deadline);
 
@@ -1512,14 +1810,24 @@ fn conn_loop(
     }
 
     let mut reader = FrameReader::new();
+    let mut last_heard = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        // A peer whose host vanished without a FIN leaves a socket that never becomes readable and
+        // never errors. Without this, its thread and both its descriptors are held for the life of
+        // the process. Consensus heartbeats every few ticks, so silence past this deadline is not a
+        // slow peer — it is a gone one.
+        if last_heard.elapsed() > opts.idle_deadline {
+            counters.idle_closed.fetch_add(1, Ordering::SeqCst);
             break;
         }
         match reader.poll(&mut stream) {
             Ok(Poll::Pending) => continue,
             Ok(Poll::Eof) => break,
             Ok(Poll::Frame(tag, body)) => {
+                last_heard = Instant::now();
                 if tag != CONSENSUS_TAG {
                     // A frame this listener cannot route. The connection is closed rather than
                     // skipped: a stream carrying a tag we do not know is a stream we cannot claim
@@ -1536,8 +1844,25 @@ fn conn_loop(
                             counters.misrouted.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
+                        // **Charged against a byte budget before it is queued.** The frame limit
+                        // caps one frame and the channel to the caller is unbounded, so without
+                        // this a peer outrunning the caller's drain chooses this process's memory
+                        // however small each frame is. Refused rather than blocked: blocking here
+                        // would park a connection thread where `shutdown` cannot reach it.
+                        let charge = body.len();
+                        let fits = counters
+                            .inbox_bytes
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                                (cur + charge <= opts.inbox_bytes).then_some(cur + charge)
+                            })
+                            .is_ok();
+                        if !fits {
+                            counters.inbound_dropped.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
                         counters.received.fetch_add(1, Ordering::SeqCst);
-                        if tx.send(m).is_err() {
+                        if tx.send((m, charge)).is_err() {
+                            counters.inbox_bytes.fetch_sub(charge, Ordering::SeqCst);
                             break;
                         }
                     }
