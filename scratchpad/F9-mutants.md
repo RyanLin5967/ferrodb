@@ -76,3 +76,40 @@ or a kill would prove nothing.
   - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.06s`
 - **mutant** `a_merge_whose_base_never_stops_moving_is_refused_with_the_round_that_moved` — M17 the re-evaluation bound is 100x looser
   - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.06s`
+
+## Later run: M19, M20, M21
+
+- **clean** `a_promoted_leader_disposes_of_a_dead_nodes_branches_by_a_replicated_decision` — M19 the orphan sweep is not filtered by owner
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.04s`
+- **clean** `a_node_cannot_sweep_its_own_branches_as_orphans` — M20 a node may declare itself dead and sweep its own branches
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.03s`
+- **clean** `a_reap_goes_through_the_log_and_carries_the_generation` — M21 a reap is decided locally instead of through the log
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.03s`
+- **mutant** `a_promoted_leader_disposes_of_a_dead_nodes_branches_by_a_replicated_decision` — M19 the orphan sweep is not filtered by owner
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.03s`
+- **mutant** `a_node_cannot_sweep_its_own_branches_as_orphans` — M20 a node may declare itself dead and sweep its own branches
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.06s`
+- **mutant** `a_reap_goes_through_the_log_and_carries_the_generation` — M21 a reap is decided locally instead of through the log
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.08s`
+
+## Later run: M22, M23
+
+- **clean** `no_two_nodes_disagree_about_whether_a_branch_is_live` — M22 the verdict depends on something that is not in the log (liveness half)
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **clean** `a_followers_committed_log_holds_the_merge_and_not_one_agent_row` — M23 the branch applier swallows the rounds instead of chaining them on
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.69s`
+- **mutant** `no_two_nodes_disagree_about_whether_a_branch_is_live` — M22 the verdict depends on something that is not in the log (liveness half)
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `a_followers_committed_log_holds_the_merge_and_not_one_agent_row` — M23 the branch applier swallows the rounds instead of chaining them on
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.79s`
+
+## Later run: M27, M28
+
+- **clean** `a_fork_off_a_parent_the_cluster_does_not_hold_is_refused` — M27 an unknown fork parent is treated as the trunk instead of refused
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **clean** `a_branch_whose_owner_died_is_named_as_lost_work_and_its_merged_sibling_is_not` — M28 the orphan list is not filtered by the node that died
+  - `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `a_fork_off_a_parent_the_cluster_does_not_hold_is_refused` — M27 an unknown fork parent is treated as the trunk instead of refused
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`
+- **mutant** `a_branch_whose_owner_died_is_named_as_lost_work_and_its_merged_sibling_is_not` — M28 the orphan list is not filtered by the node that died
+  - `test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s`

@@ -124,6 +124,71 @@ M = [
   [("                    if reevaluations > self.max_reevaluations {",
     "                    if reevaluations > self.max_reevaluations * 100 {")],
   "a_merge_whose_base_never_stops_moving_is_refused_with_the_round_that_moved"),
+ ("M19 the orphan sweep is not filtered by owner",
+  [("""        let orphans = lock(&self.ledger).orphans_of(dead);""",
+    """        let orphans: Vec<ClusterBranchId> =
+            lock(&self.ledger).all().filter(|b| b.state.is_live()).map(|b| b.id).collect();""")],
+  "a_promoted_leader_disposes_of_a_dead_nodes_branches_by_a_replicated_decision"),
+
+ ("M20 a node may declare itself dead and sweep its own branches",
+  [("        if dead == self.node {", "        if false && dead == self.node {")],
+  "a_node_cannot_sweep_its_own_branches_as_orphans"),
+
+ ("M21 a reap is decided locally instead of through the log",
+  [("""        let round =
+            self.repl.propose(Command::Branch { op: BranchOp::Reap { branch: id.0, generation } })?;
+        lock(&self.cost).proposals += 1;
+        Ok(round)""",
+    """        let _ = (id, generation);
+        Ok(self.repl.committed_head())""")],
+  "a_reap_goes_through_the_log_and_carries_the_generation"),
+
+ ("M22 the verdict depends on something that is not in the log (liveness half)",
+  [("    rejections: VecDeque<String>,\n}", "    rejections: VecDeque<String>,\n    mutant_instance: u64,\n}"),
+   ("            rejections: VecDeque::new(),\n        }",
+    "            rejections: VecDeque::new(),\n            mutant_instance: {\n                static S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n                S.fetch_add(1, std::sync::atomic::Ordering::SeqCst)\n            },\n        }"),
+   ("        if self.last_base_move > base_round {",
+    "        if self.last_base_move > base_round || self.mutant_instance % 2 == 1 {")],
+  "no_two_nodes_disagree_about_whether_a_branch_is_live"),
+
+ ("M23 the branch applier swallows the rounds instead of chaining them on",
+  [("""        match self.next.as_mut() {
+            Some(n) => n.apply(entry),
+            None => Ok(()),
+        }""", "        Ok(())")],
+  "a_followers_committed_log_holds_the_merge_and_not_one_agent_row"),
+
+ ("M24 the trunk is packed like any other branch instead of being id 0 everywhere",
+  [("        if local.id == 0 {", "        if false && local.id == 0 {")],
+  "the_trunk_is_the_same_branch_on_every_node_and_has_no_owner"),
+
+ ("M25 node 0 may own a branch",
+  [("        if node.0 == 0 {", "        if false && node.0 == 0 {")],
+  "node_zero_cannot_own_a_branch"),
+
+ ("M26 a merge that applied does not move the base",
+  [("                    self.last_base_move = round;\n", "\n")],
+  "a_merge_that_applied_moves_the_base_for_the_merge_behind_it"),
+
+ ("M27 an unknown fork parent is treated as the trunk instead of refused",
+  [("                match self.branches.get(&parent_id.0) {",
+    "                match self.branches.get(&0u64) {")],
+  "a_fork_off_a_parent_the_cluster_does_not_hold_is_refused"),
+
+ ("M28 the orphan list is not filtered by the node that died",
+  [("""    pub fn orphans_of(&self, dead: NodeId) -> Vec<ClusterBranchId> {
+        self.live_owned_by(dead)
+    }""",
+    """    pub fn orphans_of(&self, dead: NodeId) -> Vec<ClusterBranchId> {
+        let _ = dead;
+        self.branches
+            .values()
+            .filter(|b| b.state.is_live() && b.id != ClusterBranchId::TRUNK)
+            .map(|b| b.id)
+            .collect()
+    }""")],
+  "a_branch_whose_owner_died_is_named_as_lost_work_and_its_merged_sibling_is_not"),
+
 ]
 
 def run(test):
@@ -136,6 +201,11 @@ def run(test):
     if "error[" in r.stderr or "error:" in r.stderr:
         return "DID NOT COMPILE: " + next((l for l in r.stderr.splitlines() if l.startswith("error")), "?")
     return "NO RESULT LINE"
+
+ONLY = list(sys.argv[1:])
+if ONLY:
+    M = [m for m in M if m[0].split()[0] in ONLY]
+    assert M, f"no mutant matched {ONLY}"
 
 base = open(SRC).read()
 out = []
@@ -164,9 +234,13 @@ for name, subs, test in M:
 
 open(SRC,'w').write(base)
 print("== restored ==")
-with open('scratchpad/F9-mutants.md','w') as f:
-    f.write("# F9 mutants\n\nEach rule, the mutant that breaks it, and what the test named against it printed.\n")
-    f.write("Driver: `scratchpad/F9-mutants.py`. Every test was first shown to pass on the clean tree,\n")
-    f.write("or a kill would prove nothing.\n\n")
+mode = 'a' if ONLY else 'w'
+with open('scratchpad/F9-mutants.md', mode) as f:
+    if mode == 'w':
+        f.write("# F9 mutants\n\nEach rule, the mutant that breaks it, and what the test named against it printed.\n")
+        f.write("Driver: `scratchpad/F9-mutants.py`. Every test was first shown to pass on the clean tree,\n")
+        f.write("or a kill would prove nothing.\n\n")
+    else:
+        f.write("\n## Later run: " + ", ".join(ONLY) + "\n\n")
     for kind, name, test, line in out:
         f.write(f"- **{kind}** `{test}` — {name}\n  - `{line}`\n")
