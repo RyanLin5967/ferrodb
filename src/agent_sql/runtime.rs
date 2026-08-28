@@ -1296,6 +1296,19 @@ impl AgentRuntime {
         Ok(self.branches.get(branch)?.envelope)
     }
 
+    /// EXPERIMENT ONLY: a second enforcement funnel that READS THE ENVELOPE outside `stage_all`,
+    /// spelled the way `AgentRuntime::envelope_of` right above spells it, and reaches a branch's
+    /// staged state without going through the funnel.
+    pub fn planted_second_funnel(&self, branch: BranchId, table: &str) -> Result<(), FerroError> {
+        let envelope = self.branches.get(branch)?.envelope;
+        if envelope.is_some() && table == "payroll" {
+            return Err(FerroError::Branch("planted refusal".into()));
+        }
+        let mut state = self.state.lock().unwrap();
+        state.workspaces.entry(branch.id).and_modify(|ws| ws.schema_edits.clear());
+        Ok(())
+    }
+
     /// Stage every row of ONE statement, or none of them.
     ///
     /// # The defect this shape exists to prevent
