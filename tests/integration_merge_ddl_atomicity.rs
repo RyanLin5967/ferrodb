@@ -538,45 +538,54 @@ fn a_rename_follows_its_column_into_the_fulltext_index_too() {
 // -------------------------------------------------------------------------------------------
 // RULE: planning a merge's schema edits writes NOTHING — not even an empty page.
 //
-// `Catalog::plan_alters` says "write nothing at all" and `AgentRuntime::merge` leans on it: every
-// table is planned first and the rows are measured after, so a reservation taken while planning
-// table A can be followed by a refusal about a row destined for table B — and that refusal's
-// message says "Nothing has been written". `reserve_free_space` appends empty pages, so it lives
-// in `apply_plan` and not in the plan.
+// `Catalog::plan_alters` says "write nothing at all" and `AgentRuntime::merge` leans on it: EVERY
+// table is planned before any row is measured, so a reservation taken while planning the first
+// table can be followed by a refusal about the second — and that refusal's message ends "Nothing
+// has been written". `reserve_free_space` appends empty pages through `add_empty_page`, so it
+// belongs in `apply_plan` and not in the plan.
 //
-// A tuple scan cannot see this: appended empty pages hold no tuples, which is why the other
-// refusal tests here would pass with the reservation back in the planning half. The page COUNT is
-// what sees it.
+// Two tables, named so the alphabetical order the merge walks them in is the order this needs:
+// `aa`'s retype fits and makes every row grow, which is what forces a reservation; `zz`'s does not
+// fit, which is what refuses after it. One table cannot show this — its own plan refuses before
+// its own reservation is reached.
+//
+// A tuple scan cannot see the residue either: appended empty pages hold no tuples, which is why
+// every other refusal test here would pass with the reservation back in the planning half. The
+// page high-water mark is what sees it.
 // -------------------------------------------------------------------------------------------
 #[test]
 fn planning_a_refused_merge_does_not_even_append_an_empty_page() {
-    // The width where `ADD COLUMN` still fits and the retype behind it does not: the ADD is what
-    // makes every row grow, so a plan for it has to reserve, and the retype is what refuses after
-    // the reservation would have been taken.
-    let w = width_where_add_fits_and_retype_does_not();
-    let big = "x".repeat(w);
+    let over = "x".repeat(width_the_retype_pushes_over());
     let mut d = db();
-    d.sql(WIDE);
-    // Rows that all but fill their pages, so the rewrite the ADD implies must reserve space.
+    d.sql("CREATE TABLE aa (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));");
+    // Rows that leave room for the retype but nearly fill their pages, so growing them has to
+    // reserve space rather than being absorbed.
+    let mid = "y".repeat(1900);
     for i in 1..6 {
-        d.sql(&format!("INSERT INTO t VALUES ({i}, {i}00, '{big}', '{big}');"));
+        d.sql(&format!("INSERT INTO aa VALUES ({i}, {i}00, '{mid}', '{mid}');"));
     }
+    d.sql("CREATE TABLE zz (id INTEGER NOT NULL, n INTEGER, a VARCHAR(2100), b VARCHAR(2100));");
+    d.sql(&format!("INSERT INTO zz VALUES (1, 100, '{over}', '{over}');"));
 
     let pages_before = d.bp.disk_manager.high_water().unwrap();
-    let heap_before = d.heap("t");
+    let aa_before = d.heap("aa");
+    let aa_shape_before = d.shape("aa");
 
     let mut agent = d.branch("agent-pages");
-    d.exec("ALTER TABLE t ADD COLUMN c1 VARCHAR(20);", &mut agent).expect("stage add");
-    d.exec(RETYPE, &mut agent).expect("stage retype");
-    let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
+    d.exec("ALTER TABLE aa ALTER COLUMN n TYPE BIGINT;", &mut agent).expect("stage aa retype");
+    d.exec("ALTER TABLE zz ALTER COLUMN n TYPE BIGINT;", &mut agent).expect("stage zz retype");
+    let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused, by zz");
     eprintln!("--- refusal = {e}");
+    assert!(e.to_string().contains("'zz'"), "the refusal came from the wrong table: {e}");
 
     let pages_after = d.bp.disk_manager.high_water().unwrap();
-    eprintln!("--- pages before = {pages_before}, after = {pages_after}");
-    assert_eq!(heap_before, d.heap("t"), "the refused MERGE moved a tuple");
+    eprintln!("--- page high-water before = {pages_before}, after = {pages_after}");
+    assert_eq!(aa_shape_before, d.shape("aa"), "the refused MERGE altered the first table");
+    assert_eq!(aa_before, d.heap("aa"), "the refused MERGE moved a tuple in the first table");
     assert_eq!(
         pages_before, pages_after,
-        "the refused MERGE allocated {} page(s) while claiming nothing had been written",
+        "planning the first table allocated {} page(s), and then the merge was refused with a \
+         message that says nothing had been written",
         pages_after.saturating_sub(pages_before)
     );
 }

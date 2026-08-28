@@ -3789,9 +3789,12 @@ fn numeric(v: &Value) -> Option<i64> {
 /// Recognised through the marker `catalog::alter` exports rather than by matching its prose, and
 /// every other error is passed through untouched.
 fn in_a_merge_the_narrowing_comes_first(e: FerroError) -> FerroError {
-    let msg = e.to_string();
+    // Destructured rather than stringified: `FerroError::Constraint` Displays with a
+    // "constraint error: " prefix, so wrapping `e.to_string()` in another `Constraint` produces a
+    // refusal that says it twice.
+    let FerroError::Constraint(msg) = e else { return e };
     if !msg.contains(NARROW_THE_ROW_FIRST) {
-        return e;
+        return FerroError::Constraint(msg);
     }
     FerroError::Constraint(format!(
         "{msg} Inside a MERGE the narrowing has to reach the target first: merge the UPDATE that \
