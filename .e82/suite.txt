@@ -1,0 +1,6 @@
+HEAD 0c1856f  dirty:0
+=== lib ===
+test result: ok. 820 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.43s
+=== adv_f4_false_refusal ===
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+=== adv_f5_probe ===
