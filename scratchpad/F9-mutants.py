@@ -102,6 +102,24 @@ M = [
     "        if self.last_base_move > base_round || self.mutant_instance % 2 == 1 {")],
   "every_node_reaches_the_same_verdict_for_every_merge_command"),
 
+ ("M18 a merge whose fork the cluster refused just times out",
+  [("""        if let Err(timeout) = self.pump_until(&format!("the fork of {cid}"), |l| l.get(cid).is_some())
+        {
+            let refusal = lock(&self.ledger)
+                .rejections()
+                .into_iter()
+                .rev()
+                .find(|r| r.contains(&cid.to_string()));
+            return Err(match refusal {
+                Some(w) => FerroError::Merge(format!(
+                    "{cid} cannot be merged: the cluster refused its fork \u2014 {w}"
+                )),
+                None => timeout,
+            });
+        }""",
+    """        self.pump_until(&format!("the fork of {cid}"), |l| l.get(cid).is_some())?;""")],
+  "a_merge_whose_fork_the_cluster_refused_says_so_rather_than_timing_out"),
+
  ("M17 the re-evaluation bound is 100x looser",
   [("                    if reevaluations > self.max_reevaluations {",
     "                    if reevaluations > self.max_reevaluations * 100 {")],

@@ -42,7 +42,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
 use ferrodb::consensus::config::Config;
-use ferrodb::consensus::node::{Node, NodeOptions};
+use ferrodb::consensus::node::{Applier, Node, NodeOptions};
 use ferrodb::consensus::{BranchOp, Command, Entry, NodeId, Round};
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
@@ -468,6 +468,45 @@ fn a_fork_off_a_parent_the_cluster_does_not_hold_is_refused() {
     assert!(l.rejections().iter().any(|r| r.contains("which no committed round created")), "{:?}", l.rejections());
 }
 
+/// **Exit criterion 9, at the branch level:** two nodes never disagree about whether a branch is
+/// live. Every disposal — merge, abandon, reap — is a committed decision, so nodes driving one log
+/// hold identical answers about every branch in it. Nothing here reads a clock, which is the point:
+/// wall clocks disagree, and reaping is destructive and unrecoverable.
+#[test]
+fn no_two_nodes_disagree_about_whether_a_branch_is_live() {
+    let a = ClusterBranchId::of(N1, BranchId::new(1, 0)).unwrap();
+    let child = ClusterBranchId::of(N1, BranchId::new(2, 0)).unwrap();
+    let b = ClusterBranchId::of(N2, BranchId::new(1, 0)).unwrap();
+    let d = ClusterBranchId::of(N3, BranchId::new(1, 0)).unwrap();
+    let log = vec![
+        entry(1, fork_op(a, ClusterBranchId::TRUNK)),
+        entry(2, fork_op(b, ClusterBranchId::TRUNK)),
+        entry(3, fork_op(child, a)),
+        entry(4, fork_op(d, ClusterBranchId::TRUNK)),
+        // An hour of clock skew between the nodes would change nothing below: no node decides any
+        // of this from its own clock, and the tick is just another round.
+        entry(5, Command::LeaseTick { unix_millis: 1_000 }),
+        entry(6, merge_op(a, 4)),
+        entry(7, Command::Branch { op: BranchOp::Abandon { branch: b.0 } }),
+        entry(8, Command::Branch { op: BranchOp::Reap { branch: d.0, generation: 1 } }),
+    ];
+    let ledgers: Vec<BranchLedger> = (0..3).map(|_| drive(&log)).collect();
+    let states: Vec<Vec<(ClusterBranchId, ReplicatedState)>> =
+        ledgers.iter().map(|l| l.all().map(|x| (x.id, x.state)).collect()).collect();
+    for (i, st) in states.iter().enumerate() {
+        assert_eq!(st, &states[0], "node {i} holds a different opinion of which branches are live");
+    }
+
+    // Anti-vacuity: all four dispositions must actually be in there, or three nodes are agreeing
+    // that nothing happened.
+    let get = |id: ClusterBranchId| states[0].iter().find(|(x, _)| *x == id).unwrap().1;
+    assert_eq!(get(a), ReplicatedState::Merged { at: 6 });
+    assert_eq!(get(b), ReplicatedState::Abandoned { at: 7 });
+    assert_eq!(get(child), ReplicatedState::Live);
+    assert_eq!(get(d), ReplicatedState::Reaped { at: 8, generation: 1 });
+    assert_eq!(get(ClusterBranchId::TRUNK), ReplicatedState::Live);
+}
+
 // =================================================================================================
 // What a node's death does to a branch, and what a promoted leader inherits
 // =================================================================================================
@@ -857,6 +896,106 @@ fn a_merge_the_gate_declines_costs_no_consensus_at_all() {
     assert_eq!(lock(agents.ledger()).get(cs.cluster_id).unwrap().state, ReplicatedState::Live);
 }
 
+/// A fork the cluster refused never arrives, so a merge that waits for it would otherwise end in a
+/// timeout that says nothing. The ledger recorded why; the refusal must carry it.
+#[test]
+fn a_merge_whose_fork_the_cluster_refused_says_so_rather_than_timing_out() {
+    let (mut db, repl, agents) = scripted_cluster();
+    let agents = agents.with_pump_budget(200);
+
+    let parent = agents.fork(agent("first"), BranchId::TRUNK).unwrap();
+    repl.settle();
+
+    // The cluster disposes of the parent — a lease expiry, an operator, a promoted leader sweeping
+    // a dead node's work — in the same breath as this node forks a child off it. Injected rather
+    // than proposed through `abandon`, so the parent stays live *locally* and the local fork
+    // succeeds: the whole point is a branch that exists here and not there.
+    repl.inject_before_next_proposal(Command::Branch {
+        op: BranchOp::Abandon { branch: parent.cluster_id.0 },
+    });
+    let child = agents.fork(agent("second"), parent.branch()).unwrap();
+    repl.settle();
+    db.on_branch(&child, "UPDATE inventory SET qty = 42 WHERE id = 1;");
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let e = agents.merge(&mut ctx, child.branch()).unwrap_err();
+    let msg = format!("{e}");
+    assert!(
+        msg.contains("the cluster refused its fork"),
+        "the merge timed out instead of reporting why the fork never arrived: {msg}"
+    );
+    assert!(
+        msg.contains("Abandoned"),
+        "the refusal did not carry the ledger's reason, so an operator has to go looking: {msg}"
+    );
+    assert_eq!(db.main_qty(1), Some(100), "a branch the cluster never accepted published anyway");
+}
+
+/// **What a promoted leader does with a dead node's work.** Its rows are gone — they were
+/// node-local by design and were never replicated — so what is left is a disposal decision, and it
+/// has to be a *replicated* one: two nodes disagreeing about whether one of these is live ends in
+/// a reap, and a reap is unrecoverable.
+#[test]
+fn a_promoted_leader_disposes_of_a_dead_nodes_branches_by_a_replicated_decision() {
+    let (_db, repl, agents) = scripted_cluster();
+    let mine = agents.fork(agent("mine"), BranchId::TRUNK).unwrap();
+    let theirs_a = ClusterBranchId::of(N2, BranchId::new(1, 0)).unwrap();
+    let theirs_b = ClusterBranchId::of(N2, BranchId::new(2, 0)).unwrap();
+    // n2's forks reached the log, as every fork does. Its rows never did, and never could.
+    repl.propose(fork_op(theirs_a, ClusterBranchId::TRUNK)).unwrap();
+    repl.propose(fork_op(theirs_b, ClusterBranchId::TRUNK)).unwrap();
+    repl.settle();
+    assert!(!agents.rows_are_here(theirs_a), "this node claims rows only n2 ever held");
+    assert!(agents.rows_are_here(mine.cluster_id));
+
+    let disposed = agents.abandon_orphans_of(N2).unwrap();
+    assert_eq!(
+        disposed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![theirs_a, theirs_b],
+        "the sweep did not name exactly what n2 was working on"
+    );
+    repl.settle();
+
+    let l = lock(agents.ledger());
+    assert!(matches!(l.get(theirs_a).unwrap().state, ReplicatedState::Abandoned { .. }));
+    assert!(matches!(l.get(theirs_b).unwrap().state, ReplicatedState::Abandoned { .. }));
+    assert_eq!(
+        l.get(mine.cluster_id).unwrap().state,
+        ReplicatedState::Live,
+        "the sweep took this node's own live branch with it"
+    );
+}
+
+/// A node does not declare itself dead, and abandoning every branch it is working on is not a
+/// recovery step.
+#[test]
+fn a_node_cannot_sweep_its_own_branches_as_orphans() {
+    let (_db, _repl, agents) = scripted_cluster();
+    let e = agents.abandon_orphans_of(N1).unwrap_err();
+    assert!(format!("{e}").contains("is this node"), "{e}");
+}
+
+/// Reaping is destructive and unrecoverable, so it is proposed by whoever runs the lease scan and
+/// **decided** by the log — never by one node's clock.
+#[test]
+fn a_reap_goes_through_the_log_and_carries_the_generation() {
+    let (_db, repl, agents) = scripted_cluster();
+    let cs = agents.fork(agent("done"), BranchId::TRUNK).unwrap();
+    repl.settle();
+    agents.abandon(&cs).unwrap();
+    repl.settle();
+
+    let round = agents.propose_reap(cs.cluster_id, 1).unwrap();
+    repl.settle();
+    assert_eq!(
+        lock(agents.ledger()).get(cs.cluster_id).unwrap().state,
+        ReplicatedState::Reaped { at: round, generation: 1 },
+        "the reap did not reach the log, so a second node could still believe the branch is live"
+    );
+}
+
 /// Exit criterion 10's anti-vacuity half, at this layer: a write to a node that does not lead is
 /// **refused**, never silently served. A branch created on a follower would take writes no quorum
 /// will ever see.
@@ -937,7 +1076,22 @@ fn a_merge_that_loses_the_leadership_mid_flight_refuses_and_publishes_nothing() 
 struct Fleet {
     reps: Vec<Arc<NodeReplicator>>,
     ledgers: Vec<Arc<Mutex<BranchLedger>>>,
+    /// Every command each node actually applied, in order. Behind the branch ledger via
+    /// [`BranchApplier::chained`], which is how a real server hangs its WAL applier off the same
+    /// node: the ledger must see every round, not only the branch ones.
+    tallies: Vec<Arc<Mutex<Vec<Command>>>>,
     _dirs: Vec<tempfile::TempDir>,
+}
+
+/// Records what a node committed, so "an agent's rows never reached a quorum" can be *read* off a
+/// follower rather than inferred from a counter on the leader.
+struct Tally(Arc<Mutex<Vec<Command>>>);
+
+impl Applier for Tally {
+    fn apply(&mut self, e: &Entry) -> Result<(), FerroError> {
+        lock(&self.0).push(e.command.clone());
+        Ok(())
+    }
 }
 
 impl Fleet {
@@ -953,6 +1107,7 @@ impl Fleet {
 
         let mut reps = Vec::new();
         let mut ledgers = Vec::new();
+        let mut tallies = Vec::new();
         let mut dirs = Vec::new();
         for (i, l) in listeners.into_iter().enumerate() {
             let id = NodeId(i as u32 + 1);
@@ -961,16 +1116,18 @@ impl Fleet {
             let peers: BTreeMap<NodeId, SocketAddr> =
                 addrs.iter().filter(|(k, _)| **k != id).map(|(k, v)| (*k, *v)).collect();
             let ledger = Arc::new(Mutex::new(BranchLedger::new()));
+            let tally = Arc::new(Mutex::new(Vec::new()));
             // Distinct seeds: two nodes drawing the same election timeout split every vote.
             let opts = NodeOptions::new(dir.path(), peers, 0x5eed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9))
                 .tick_of(Duration::from_millis(20));
-            let node =
-                Node::start(id, cfg.clone(), l, opts, BranchApplier::new(ledger.clone())).unwrap();
+            let applier = BranchApplier::chained(ledger.clone(), Box::new(Tally(tally.clone())));
+            let node = Node::start(id, cfg.clone(), l, opts, applier).unwrap();
             reps.push(Arc::new(NodeReplicator::new(node, Duration::from_millis(1))));
             ledgers.push(ledger);
+            tallies.push(tally);
             dirs.push(dir);
         }
-        Arc::new(Fleet { reps, ledgers, _dirs: dirs })
+        Arc::new(Fleet { reps, ledgers, tallies, _dirs: dirs })
     }
 
     /// One turn of every node's driver loop.
@@ -1183,6 +1340,60 @@ fn on_a_real_cluster_a_fork_on_a_follower_is_refused_and_names_the_leader() {
     }
     assert!(format!("{e}").contains("reconnect there"));
     assert_eq!(agents.cost().proposals, 0, "a refused fork still reached the log");
+    fleet.shutdown();
+}
+
+/// **Read off a follower, not inferred from the leader.** A node that never ran the agent holds,
+/// in its committed log, its leader's term-establishing `NoOp`, the fork, and the merge — and not
+/// one of the agent's rows. That is `DISTRIBUTED.md`'s claim stated as a thing you can look at.
+#[test]
+fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
+    let mut db = Db::new();
+    db.seed();
+
+    let fleet = Fleet::start(3);
+    let leader = fleet.elect();
+    let follower = (leader + 1) % 3;
+    let agents = ClusterAgents::new(
+        NodeId(leader as u32 + 1),
+        db.runtime.clone(),
+        Arc::new(FleetSeam { me: leader, fleet: fleet.clone() }),
+        fleet.ledgers[leader].clone(),
+    );
+
+    let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
+    for i in 0..30 {
+        db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
+        fleet.pump_all();
+    }
+    fleet.settle_to(cs.fork_round);
+
+    let bp = db.bp.clone();
+    let txn = db.txn.clone();
+    let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+    let report = agents.merge(&mut ctx, cs.branch()).unwrap();
+    drop(ctx);
+    fleet.settle_to(report.merge_round.unwrap());
+
+    let cmds = lock(&fleet.tallies[follower]).clone();
+    let forks = cmds.iter().filter(|c| matches!(c, Command::Branch { op: BranchOp::Fork { .. } })).count();
+    let merges = cmds.iter().filter(|c| matches!(c, Command::Branch { op: BranchOp::Merge { .. } })).count();
+    let batches = cmds.iter().filter(|c| matches!(c, Command::WalBatch { .. })).count();
+
+    // Anti-vacuity first: a follower that applied nothing at all would pass the interesting
+    // assertion trivially.
+    assert_eq!(forks, 1, "the follower did not receive the fork: {cmds:?}");
+    assert_eq!(merges, 1, "the follower did not receive the merge: {cmds:?}");
+    assert_eq!(
+        batches, 0,
+        "an agent's speculative rows reached a follower as {batches} WAL batch(es); only the \
+         accepted result may reach a quorum"
+    );
+    assert!(
+        cmds.iter().all(|c| matches!(c, Command::NoOp | Command::Branch { .. })),
+        "a follower's committed log carries more than the term-establishing NoOp and the two \
+         branch commands: {cmds:?}"
+    );
     fleet.shutdown();
 }
 

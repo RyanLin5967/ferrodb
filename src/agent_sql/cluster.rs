@@ -998,6 +998,10 @@ impl ClusterAgents {
                 // The cluster will never know about this branch, so neither may this node: a
                 // branch the log does not carry cannot be reaped by a replicated decision, and an
                 // unreapable branch pins its arenas for ever.
+                //
+                // A failure to abandon is swallowed in favour of the proposal's own error, which
+                // is the one the caller can act on. The record it leaves behind is not lost work:
+                // leases are non-cooperative, so it expires and is reaped like any other.
                 let _ = self.runtime.abandon(session.branch);
                 Err(e)
             }
@@ -1095,7 +1099,23 @@ impl ClusterAgents {
         // A merge names a branch the cluster agreed exists. Ordinarily this has been true for as
         // long as the agent has been running and costs nothing; an agent that merges in the same
         // breath as it forks waits here, and that wait is the fork's, not the merge's.
-        self.pump_until(&format!("the fork of {cid}"), |l| l.get(cid).is_some())?;
+        //
+        // A fork the cluster *refused* never arrives, so the wait would otherwise end in a timeout
+        // that says nothing about why. The ledger recorded the refusal; report that instead.
+        if let Err(timeout) = self.pump_until(&format!("the fork of {cid}"), |l| l.get(cid).is_some())
+        {
+            let refusal = lock(&self.ledger)
+                .rejections()
+                .into_iter()
+                .rev()
+                .find(|r| r.contains(&cid.to_string()));
+            return Err(match refusal {
+                Some(w) => FerroError::Merge(format!(
+                    "{cid} cannot be merged: the cluster refused its fork — {w}"
+                )),
+                None => timeout,
+            });
+        }
 
         let mut reevaluations = 0u32;
         loop {
@@ -1124,7 +1144,24 @@ impl ClusterAgents {
             let verdict = lock(&self.ledger).verdict_at(round).cloned();
             match verdict {
                 Some(MergeVerdict::Applied { .. }) => {
-                    let report = self.runtime.publish_evaluation(ctx, eval)?;
+                    // **Past this point the branch is sealed on every node**, so a publish that
+                    // fails here leaves a merge the cluster agreed on whose rows did not land. The
+                    // error says so rather than reading as an ordinary refusal, because the two
+                    // call for entirely different actions: an ordinary refusal means run `MERGE`
+                    // again, and this one cannot be retried at all — a second merge of a sealed
+                    // branch is refused as not-live, by design.
+                    //
+                    // It is narrow rather than merely unlikely. `publish_evaluation` re-checks the
+                    // base fingerprint, and the only writer that could have moved the base is this
+                    // process — which cannot, because `ExecCtx` holds `&mut Catalog` and
+                    // `pgwire`'s catalog is one `Mutex<Catalog>` shared by every connection, so no
+                    // other statement runs at all while this merge holds it. What is left is a
+                    // suffix replayed onto this node by a promotion, and an I/O error.
+                    let report = self.runtime.publish_evaluation(ctx, eval).map_err(|e| {
+                        FerroError::Merge(format!(
+                            "round {round} committed the merge of {cid} and every node has sealed                              it, but publishing its rows here then failed: {e}. This merge cannot                              be re-run — the branch is no longer live — and the target does not                              hold what the cluster agreed it would"
+                        ))
+                    })?;
                     return Ok(ClusterMergeReport {
                         report,
                         base_round,
