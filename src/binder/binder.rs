@@ -12,6 +12,15 @@ pub enum BoundAgentStmt {
         /// `MODEL 'name/version'`, already split into its halves. `None` when the client
         /// declared no model at all — which is distinct from declaring an empty one.
         model: Option<(String, String)>,
+        /// `PROMPT 'text'`, still as text. It is **not** hashed here: `AgentRuntime` is the layer
+        /// that builds the `RunEntity`, so hashing there keeps one call to `prompt_digest` on the
+        /// whole path. A digest computed in two places is a digest that can disagree with itself,
+        /// and a runtime taking a bare `[u8; 32]` would accept 32 bytes that are not a prompt's
+        /// hash at all.
+        ///
+        /// `None` is the clause omitted, and stays the all-zero hash rather than becoming
+        /// `prompt_digest("")`.
+        prompt: Option<String>,
         /// The branch to fork from: trunk, or the current session's branch for a nested task.
         parent: BranchId,
     },
@@ -251,7 +260,7 @@ impl<'a> Binder<'a> {
             }
         };
         match stmt {
-            Stmt::BeginAgentSession { agent, run, model } => {
+            Stmt::BeginAgentSession { agent, run, model, prompt } => {
                 if agent.trim().is_empty() {
                     return Err(FerroError::Bind("agent id must not be empty".into()));
                 }
@@ -265,6 +274,12 @@ impl<'a> Binder<'a> {
                     agent_id: agent.clone(),
                     run_id: run.clone(),
                     model,
+                    // Deliberately NOT refused when empty or blank, unlike the agent and run ids.
+                    // Those two are names a person reads back; a prompt is an opaque input whose
+                    // only use here is to be hashed, and an empty one is a fact about the run
+                    // rather than a mistake in the statement. Refusing it would also remove the
+                    // one value that proves the omitted clause is not silently the empty string.
+                    prompt: prompt.clone(),
                     // Forking from the session's own branch nests the task; from trunk otherwise.
                     parent: current.unwrap_or(BranchId::TRUNK),
                 })
@@ -1034,10 +1049,11 @@ mod tests {
     #[test]
     fn test_bind_begin_agent_session() {
         match bind_agent("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';", None).unwrap() {
-            BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, parent } => {
+            BoundAgentStmt::BeginAgentSession { agent_id, run_id, model, prompt, parent } => {
                 assert_eq!(agent_id, "pricing-agent");
                 assert_eq!(run_id.as_deref(), Some("r_8fk2"));
                 assert!(model.is_none());
+                assert!(prompt.is_none(), "no PROMPT clause must bind as no prompt");
                 assert_eq!(parent, BranchId::TRUNK);
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),

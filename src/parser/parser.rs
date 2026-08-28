@@ -227,10 +227,11 @@ pub enum Stmt {
     Begin, Commit, Rollback,
 
     // ---- agent-isolation surface (DESIGN.md section 5) --------------------------------------
-    /// `BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2' MODEL 'claude-opus-5/2026-05';`
+    /// `BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2' MODEL 'claude-opus-5/2026-05'`
+    /// `  PROMPT 'top up everything below reorder';`
     ///
     /// Forks a branch for one agent task. The fork copies zero data pages (exit criterion 1);
-    /// the agent identity, run id and model are what provenance interns (exit criterion 9).
+    /// the agent identity, run id, model and prompt are what provenance interns (exit criterion 9).
     ///
     /// `MODEL` is optional because a non-agent client has no model to declare, but criterion 9
     /// names the model explicitly, so leaving it out is recorded as the literal string
@@ -240,6 +241,15 @@ pub enum Stmt {
         run: Option<String>,
         /// `name/version`; the version half is optional.
         model: Option<String>,
+        /// The prompt behind the run, as typed. **Held as text only as far as the runtime**, which
+        /// interns `prompt_digest(prompt)` into `RunEntity::prompt_hash` and drops the text: the
+        /// digest is the whole point of the field, so that a prompt containing customer data does
+        /// not become a durable copy of it.
+        ///
+        /// `None` is the clause omitted and stays the all-zero hash, which is a *different* value
+        /// from `prompt_digest("")` — "no prompt was declared" and "the prompt was empty" are
+        /// different facts and the column must be able to tell them apart.
+        prompt: Option<String>,
     },
     /// `DIFF;` — the structured changeset this session's branch would merge (exit criterion 4).
     Diff {
@@ -834,7 +844,13 @@ impl Parser {
         Ok(stmt)
     }
 
-    // BEGIN AGENT SESSION AS 'agent-id' [RUN 'run-id'] [MODEL 'name/version']
+    // BEGIN AGENT SESSION AS 'agent-id' [RUN 'run-id'] [MODEL 'name/version'] [PROMPT 'text']
+    //
+    // The clauses keep a fixed order, the same one `SIMULATE` already uses for its `RUN` / `MODEL`
+    // prefix. Accepting them in any order here would have made two statements that read alike
+    // disagree about what is legal, which is a worse thing to explain than an ordering; what the
+    // fixed order costs in diagnostics is paid back by `end_of_agent_session_clauses`, which names
+    // the misplaced or repeated word instead of reporting `expected ;` at it.
     pub fn parse_begin_agent_session(&mut self) -> Result<Stmt, FerroError> {
         self.consume(TokenType::Session, "expected SESSION after BEGIN AGENT")?;
         self.consume(TokenType::As, "expected AS after BEGIN AGENT SESSION")?;
@@ -849,8 +865,66 @@ impl Parser {
         } else {
             None
         };
+        let prompt = if self.match_prompt() {
+            // Neither trimmed nor refused when empty. The digest IS the run's identity, so two
+            // prompts differing only in whitespace are two prompts and normalising them here would
+            // silently merge two actors; and `PROMPT ''` must hash the empty string, because the
+            // one value it has to stay distinguishable from is the all-zero hash of no clause.
+            Some(
+                self.consume(TokenType::String, "expected the prompt in single quotes after PROMPT")?
+                    .lexeme,
+            )
+        } else {
+            None
+        };
+        self.end_of_agent_session_clauses()?;
         self.consume(TokenType::Semicolon, "expected ;")?;
-        Ok(Stmt::BeginAgentSession { agent, run, model })
+        Ok(Stmt::BeginAgentSession { agent, run, model, prompt })
+    }
+
+    /// `PROMPT` in clause position, matched by **lexeme rather than reserved as a keyword**.
+    ///
+    /// This is the idiom `ADMIT ALL` already uses and for the same stated reason: `prompt` is a
+    /// plausible column name — in a database whose whole subject is agent runs it is close to
+    /// inevitable — and reserving a word costs every user of it forever. The scanner is therefore
+    /// deliberately unchanged by this clause, and `scanner::tests::prompt_is_not_a_reserved_word`
+    /// pins that so a later change cannot reserve it by accident.
+    fn peek_prompt(&self) -> bool {
+        self.check(TokenType::Identifier) && self.peek().lexeme.eq_ignore_ascii_case("prompt")
+    }
+
+    fn match_prompt(&mut self) -> bool {
+        if self.peek_prompt() {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    /// Refuse a repeated or out-of-order clause **by name**.
+    ///
+    /// Without this the fixed clause order reports `expected ;` at the offending word, which tells
+    /// a caller that something is wrong and nothing about what. It names the word instead — and
+    /// names only the word: `Parser::error` echoes the offending token's lexeme, so the check has
+    /// to fire on `PROMPT`, never on the string after it, or a syntax error would quote prompt text
+    /// back into a message the whole feature exists to keep it out of.
+    fn end_of_agent_session_clauses(&mut self) -> Result<(), FerroError> {
+        let word = if self.check(TokenType::Run) {
+            "RUN"
+        } else if self.check(TokenType::Model) {
+            "MODEL"
+        } else if self.peek_prompt() {
+            "PROMPT"
+        } else {
+            return Ok(());
+        };
+        Err(Parser::error(
+            self.peek(),
+            format!(
+                "{word} is repeated or out of order; the clauses are BEGIN AGENT SESSION \
+                 AS 'agent' [RUN 'run'] [MODEL 'name/version'] [PROMPT 'text']"
+            ),
+        ))
     }
 
     // REVERT MERGE m_44 [CASCADE]
@@ -1319,19 +1393,21 @@ mod tests {
     #[test]
     fn test_parse_begin_agent_session() {
         match one("BEGIN AGENT SESSION AS 'pricing-agent' RUN 'r_8fk2';") {
-            Stmt::BeginAgentSession { agent, run, model } => {
+            Stmt::BeginAgentSession { agent, run, model, prompt } => {
                 assert_eq!(agent, "pricing-agent");
                 assert_eq!(run.as_deref(), Some("r_8fk2"));
                 assert!(model.is_none());
+                assert!(prompt.is_none(), "no PROMPT clause must parse as no prompt");
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),
         }
         // RUN is optional
         match one("BEGIN AGENT SESSION AS 'pricing-agent';") {
-            Stmt::BeginAgentSession { agent, run, model } => {
+            Stmt::BeginAgentSession { agent, run, model, prompt } => {
                 assert_eq!(agent, "pricing-agent");
                 assert!(run.is_none());
                 assert!(model.is_none());
+                assert!(prompt.is_none());
             }
             other => panic!("expected BeginAgentSession, got {:?}", other),
         }
