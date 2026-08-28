@@ -758,6 +758,60 @@ fn no_hop_of_the_symlink_chain_escapes_the_directory_rule() {
 
 #[cfg(unix)]
 #[test]
+fn a_symlinked_directory_component_is_judged_by_what_it_points_at() {
+    // A DIRECTORY in the path being a symlink, rather than the key itself. `check_directory` uses
+    // `fs::metadata`, which follows, so it judges the directory the component resolves to and not
+    // the link. Asserted rather than assumed: "metadata follows symlinks" is exactly the kind of
+    // thing that is true until somebody reaches for `symlink_metadata` for consistency with the
+    // walk above, where NOT following is the point.
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let via = root.path().join("via");
+    std::os::unix::fs::symlink(&real, &via).unwrap();
+    write_key_file(&real, "k", &key_bytes(54));
+    let through = via.join("k");
+
+    chmod(&real, 0o700);
+    Key::load(&through).expect("a link to a closed directory is fine");
+
+    chmod(&real, 0o777);
+    let err = Key::load(&through).expect_err("the directory it POINTS AT is 0777");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    chmod(&real, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_link_target_resolves_against_the_links_own_directory() {
+    // A relative target must resolve against the directory the LINK sits in, never the process's
+    // current directory — otherwise the walk inspects a directory that has nothing to do with the
+    // chain, and reports a verdict about the wrong filesystem location entirely. `..` in the target
+    // is included because that is how a real relative link reaches a sibling tree.
+    let root = tempfile::tempdir().unwrap();
+    let links = root.path().join("links");
+    let store = root.path().join("store");
+    std::fs::create_dir(&links).unwrap();
+    std::fs::create_dir(&store).unwrap();
+    write_key_file(&store, "k", &key_bytes(55));
+
+    let entry = links.join("k");
+    std::os::unix::fs::symlink("../store/k", &entry).unwrap();
+    chmod(&links, 0o700);
+
+    chmod(&store, 0o700);
+    Key::load(&entry).expect("a relative link into a closed directory is fine");
+
+    // Only the directory the RELATIVE target lands in changes.
+    chmod(&store, 0o777);
+    let err = Key::load(&entry).expect_err("the directory the relative target lands in is 0777");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+    assert!(err.to_string().contains("store"), "the error must name where the target lands: {err}");
+    chmod(&store, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_symlink_cycle_is_refused_rather_than_followed() {
     // The walk is bounded, so a cycle is a refusal instead of a hang or an ELOOP from somewhere
     // deeper. Named here because the bound is the thing that makes the walk safe to write at all.
