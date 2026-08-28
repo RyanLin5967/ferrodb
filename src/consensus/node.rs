@@ -33,10 +33,12 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::config::Config;
 use super::log::{LogError, RoundLog};
+use super::signing::Key;
 use super::transport::{Transport, TransportOptions};
 use super::{Action, Command, Consensus, Entry, Event, HardState, NodeId, Role, Round, Term};
 use crate::error::FerroError;
@@ -89,6 +91,16 @@ pub struct NodeOptions {
     /// split the vote every term, so a cluster must give each node a different one.
     pub seed: u64,
     pub transport: TransportOptions,
+    /// The cluster's signing key, if this node's traffic is authenticated (F7, `signing.rs`).
+    ///
+    /// **`None` means every frame this node sends is unsigned and every frame it receives is
+    /// believed.** That is a real and supported configuration — a cluster on a network the operator
+    /// already trusts — but it is the one in which anything that can reach the port can assert a
+    /// later term and demote a healthy leader. Set it with [`NodeOptions::signed_with`].
+    ///
+    /// It lives here rather than on [`TransportOptions`] for the reason `transport.rs` gives: the
+    /// options struct is knobs with defensible defaults, and a key has no default that is right.
+    pub signing_key: Option<Arc<Key>>,
 }
 
 impl NodeOptions {
@@ -99,7 +111,23 @@ impl NodeOptions {
             tick: Duration::from_millis(50),
             seed,
             transport: TransportOptions::default(),
+            signing_key: None,
         }
+    }
+
+    /// Authenticate this node's traffic with the cluster key.
+    ///
+    /// Every frame it sends carries an HMAC-SHA256 tag over its own body, and every frame it
+    /// receives is verified before it is parsed — so a peer that cannot produce a tag reaches
+    /// neither the decoder nor the state machine. See [`super::signing`] for what that proves
+    /// (possession of the key) and what it does not (**freshness** — there is no replay
+    /// protection).
+    ///
+    /// Every node in the cluster must be given the same key: there is no negotiation, so a node
+    /// with a key and a node without one cannot talk to each other in either direction.
+    pub fn signed_with(mut self, key: Arc<Key>) -> Self {
+        self.signing_key = Some(key);
+        self
     }
 
     /// Set the wall-clock duration of one tick.
@@ -226,7 +254,12 @@ impl<A: Applier> Node<A> {
         let entries = read_all(&log)?;
         sm.restore(hard, log.snapshot_round(), log.snapshot_term(), entries);
 
-        let net = Transport::from_listener(self_id, listener, opts.peers, opts.transport)?;
+        let net = match opts.signing_key {
+            Some(key) => {
+                Transport::from_listener_with_key(self_id, listener, opts.peers, opts.transport, key)?
+            }
+            None => Transport::from_listener(self_id, listener, opts.peers, opts.transport)?,
+        };
         let now = Instant::now();
         Ok(Node {
             sm,

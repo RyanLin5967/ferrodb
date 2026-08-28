@@ -24,6 +24,8 @@ use super::*;
 use crate::consensus::transport::{
     decode, decode_verified, encode, encode_signed, Transport, TransportOptions,
 };
+use crate::consensus::config::Config;
+use crate::consensus::node::{Node, NodeOptions, RecordingApplier};
 use crate::consensus::{Body, Message, NodeId};
 use crate::provenance::sha256::{from_hex, sha256, to_hex};
 use crate::replication::{read_handshake, write_handshake, CONSENSUS_TAG, MAX_FRAME_BYTES};
@@ -471,6 +473,73 @@ fn a_key_in_a_group_or_world_writable_directory_is_refused_unless_it_is_sticky()
 
     chmod(&open, 0o700);
     Key::load(&p).expect("a private directory is fine");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked() {
+    // **Found by an adversarial pass, and it was a real hole.** `Path::parent()` of a bare relative
+    // name is `Some("")`, which means the CURRENT directory — not "there is no directory". The
+    // guard filtered the empty parent out as "nothing to check", so `Key::load("cluster.key")`
+    // skipped the directory check entirely while `Key::load("./cluster.key")` performed it, for the
+    // same file in the same directory. A guard that quietly declines to run returns the same `Ok`
+    // as one that ran and passed, which is the failure shape this module warns about elsewhere.
+    //
+    // Asserted as an EQUIVALENCE rather than as two verdicts, so it cannot be satisfied by making
+    // both spellings skip the check: the third assertion pins that the shared verdict is a refusal.
+    assert_eq!(Path::new("cluster.key").parent(), Some(Path::new("")), "the mechanism");
+    assert_eq!(Path::new("./cluster.key").parent(), Some(Path::new(".")), "the mechanism");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dirp = dir.path().canonicalize().unwrap();
+    write_key_file(&dirp, "cluster.key", &key_bytes(40));
+    chmod(&dirp, 0o777);
+
+    // `set_current_dir` is process-global and cargo runs tests in threads, so the CWD is restored
+    // before anything else can observe it and no assertion happens while it is moved.
+    let restore = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dirp).unwrap();
+    let bare = Key::load("cluster.key");
+    let dotted = Key::load("./cluster.key");
+    std::env::set_current_dir(&restore).unwrap();
+    chmod(&dirp, 0o700);
+
+    assert_eq!(
+        bare.is_err(),
+        dotted.is_err(),
+        "two spellings of one path must reach one verdict; bare={:?} dotted={:?}",
+        bare.as_ref().err().map(|e| e.to_string()),
+        dotted.as_ref().err().map(|e| e.to_string())
+    );
+    let err = bare.err().expect("a key in a world-writable non-sticky directory must be refused");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_whose_directory_is_gone_is_refused() {
+    // What this proves: the disappearance of the key's directory produces a refusal and never an
+    // `Ok`. The refusal comes from the `File::open`, which is the first thing that fails.
+    //
+    // **Stated blind spot, because it shaped the code.** The other half of the same defect — the
+    // directory `stat` itself failing — was `if let Ok(dmeta) = fs::metadata(dir)`, which fell
+    // through to "allowed", and it is now a refusal. That branch has **no killing test and cannot
+    // have one here**: `File::open` has already resolved the path by the time the directory is
+    // stat'd, so every way to make the stat fail also makes the open fail, and the open reports
+    // first. The only remaining route is a genuine race — the directory removed between the two
+    // calls — which a test cannot schedule. So the change is a refuse-by-default posture rather
+    // than a detected rule, and it is recorded as such in `scratchpad/F7-signing.md` rather than
+    // counted as a mutant that was killed.
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("gone");
+    std::fs::create_dir(&inner).unwrap();
+    let p = write_key_file(&inner, "k", &key_bytes(41));
+    Key::load(&p).expect("it loads while its directory is there");
+
+    std::fs::remove_file(&p).unwrap();
+    std::fs::remove_dir(&inner).unwrap();
+    let err = Key::load(&p).expect_err("a key whose directory is gone must be refused");
+    assert!(err.to_string().contains("gone"), "the error must name the path: {err}");
 }
 
 #[test]
@@ -955,6 +1024,69 @@ fn an_attacker_raising_the_term_on_the_wire_never_reaches_the_state_machine() {
     let got = expect_recv(&unguarded, Duration::from_secs(5));
     assert_eq!(got.term, 500, "unsigned, the demotion lands: this is the attack the key closes");
     unguarded.shutdown();
+}
+
+/// Drive one `Node` until a condition holds or the deadline passes.
+fn poll_until(node: &mut Node<RecordingApplier>, within: Duration, done: impl Fn(&Node<RecordingApplier>) -> bool) {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline && !done(node) {
+        node.poll(Duration::from_millis(20)).unwrap();
+    }
+}
+
+#[test]
+fn a_keyless_peer_cannot_raise_the_term_of_a_node_built_through_the_driver() {
+    // **The row's claim, at the surface a product actually uses.** Everything above tests
+    // `Transport` directly; this tests `Node` — the driver that owns the clock, the socket and the
+    // disk, and the thing `examples/consensus_node.rs` constructs. An adversarial pass pointed out
+    // that a `Node` had no way to express a key at all, so the whole of F7 was unreachable from the
+    // product surface and a keyless attacker set a real node's term to 500. `NodeOptions::signed_with`
+    // is the answer, and this is its evidence.
+    //
+    // Both halves, because the refusal proves nothing unless the attack works without the key.
+    let forged = Message {
+        from: NodeId(2),
+        to: NodeId(1),
+        term: 500,
+        body: Body::RequestVote { last_term: 400, last_round: 9000 },
+    };
+    let frame = encode(&forged).unwrap();
+
+    // 1. SIGNED: the attacker's unsigned frame never reaches the state machine.
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0);
+    let opts = NodeOptions::new(dir.path(), BTreeMap::new(), 7)
+        .tick_of(Duration::from_millis(20))
+        .signed_with(Arc::new(a_key(50)));
+    let mut node = Node::start(NodeId(1), cfg.clone(), listener, opts, RecordingApplier::default()).unwrap();
+    let before = node.term();
+
+    raw_send(addr, &frame);
+    poll_until(&mut node, Duration::from_secs(3), |n| n.term() >= 500);
+    let after = node.term();
+    node.shutdown();
+    assert_eq!(
+        after, before,
+        "a peer holding no key moved a signed node's term from {before} to {after}"
+    );
+    assert!(after < 500, "the forged term must never be adopted");
+
+    // 2. UNSIGNED, the anti-vacuity half: the identical bytes at a node with no key DO land, and
+    // the term becomes 500. This is the attack DISTRIBUTED.md §F7 names, and it is what the key
+    // closes — asserted here so the refusal above cannot be a node that was simply deaf.
+    let dir2 = tempfile::tempdir().unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let opts2 = NodeOptions::new(dir2.path(), BTreeMap::new(), 7).tick_of(Duration::from_millis(20));
+    let mut bare = Node::start(NodeId(1), cfg, listener2, opts2, RecordingApplier::default()).unwrap();
+
+    raw_send(addr2, &frame);
+    poll_until(&mut bare, Duration::from_secs(5), |n| n.term() >= 500);
+    let landed = bare.term();
+    bare.shutdown();
+    assert_eq!(landed, 500, "unsigned, a keyless peer sets this node's term: that is the attack");
 }
 
 #[test]

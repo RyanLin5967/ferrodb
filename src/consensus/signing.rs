@@ -146,6 +146,15 @@
 //!   it cannot do is have a message reach the state machine: the first frame that fails to verify
 //!   closes the connection, so the cost of an unauthenticated peer is bounded by the connection
 //!   cap that already exists, and never by the protocol.
+//! * **The identity of the sending node.** The key is **cluster-wide**, so a tag proves its author
+//!   is inside the cluster and says nothing about *which* member it is. `from` is inside the
+//!   authenticated region, so nobody outside can forge it — but any node holding the key can put
+//!   any other node's id there, so a single compromised node can impersonate every other one. Fixing
+//!   that means per-node or per-pair keys and therefore key distribution, which is a larger row than
+//!   this one; it is named here so the property is not mistaken for something this provides.
+//! * **The courtesy `Error` frame sent to a peer whose handshake was refused.** It is unsigned, of
+//!   necessity: a peer that failed the version handshake is by definition speaking a protocol that
+//!   does not know about tags. It carries this node's version string and nothing else.
 //! * **A cluster where only some nodes hold a key.** There is no negotiation. A node with a key
 //!   refuses an unsigned frame (the last 32 bytes of the body are not a valid tag over the rest); a
 //!   node without one refuses a signed frame (the leading 32 bytes decode as nonsense). Mixed
@@ -545,22 +554,43 @@ fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
     // file. The sticky bit is the exception rather than a special case: on a sticky directory only
     // the owner of a file may rename or remove it, which is exactly the property being checked for.
     // This is the rule OpenSSH's StrictModes applies, for the same reason.
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        if let Ok(dmeta) = fs::metadata(dir) {
-            let dmode = dmeta.permissions().mode();
-            let sticky = dmode & 0o1000 != 0;
-            if dmode & 0o022 != 0 && !sticky {
-                return Err(FerroError::Io(format!(
-                    "the directory holding the consensus signing key, {}, has mode {:04o}: it is \
-                     writable by group or other and is not sticky, so anyone who can write there \
-                     can replace the key with one they chose. The key file's own mode does not \
-                     help — the attacker does not need to read it. Fix with `chmod go-w {}`",
-                    dir.display(),
-                    dmode & 0o7777,
-                    dir.display()
-                )));
-            }
-        }
+    // **`Path::parent` of a bare relative name is `Some("")`, and that means the CURRENT directory
+    // — not "there is no directory".** Filtering the empty parent out as "nothing to check" made
+    // the *spelling* of the path decide whether this check ran at all: `./cluster.key` was checked
+    // and `cluster.key` was not, for the same file in the same directory. Found by an adversarial
+    // pass, and it is exactly the shape this file warns about elsewhere — a guard that quietly
+    // declines to run and reports the same `Ok` as one that ran and passed.
+    //
+    // `None` is the only case with genuinely nothing above it: a path that is a root.
+    let dir = match path.parent() {
+        None => return Ok(()),
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+    };
+    // **Refused, not skipped, when the directory cannot be inspected.** This was `if let Ok(..)`,
+    // which fell through to "allowed" whenever the `stat` failed — a guard that cannot read its own
+    // input must refuse, never pass. The file itself was opened successfully a moment ago, so a
+    // failure here is a race or a permission shape nobody intended, and either is a reason to stop.
+    let dmeta = fs::metadata(dir).map_err(|e| {
+        FerroError::Io(format!(
+            "the directory holding the consensus signing key, {}, could not be inspected: {e}. \
+             Refused rather than assumed safe: this check is what stops an attacker who can write \
+             to that directory from replacing the key with one they chose.",
+            dir.display()
+        ))
+    })?;
+    let dmode = dmeta.permissions().mode();
+    let sticky = dmode & 0o1000 != 0;
+    if dmode & 0o022 != 0 && !sticky {
+        return Err(FerroError::Io(format!(
+            "the directory holding the consensus signing key, {}, has mode {:04o}: it is \
+             writable by group or other and is not sticky, so anyone who can write there can \
+             replace the key with one they chose. The key file's own mode does not help — the \
+             attacker does not need to read it. Fix with `chmod go-w {}`",
+            dir.display(),
+            dmode & 0o7777,
+            dir.display()
+        )));
     }
     Ok(())
 }
