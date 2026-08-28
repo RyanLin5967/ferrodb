@@ -288,7 +288,6 @@ pub struct LeaseThread {
     halt: Arc<Halt>,
     handle: Option<std::thread::JoinHandle<()>>,
     resumed: Vec<BranchId>,
-    interval: Duration,
 }
 
 impl LeaseThread {
@@ -346,17 +345,12 @@ impl LeaseThread {
                 })?
         };
 
-        Ok(LeaseThread { counters, halt, handle: Some(handle), resumed, interval })
+        Ok(LeaseThread { counters, halt, handle: Some(handle), resumed })
     }
 
     /// Branches whose interrupted reap [`LeaseThread::start`] finished.
     pub fn resumed(&self) -> &[BranchId] {
         &self.resumed
-    }
-
-    /// The configured scan period.
-    pub fn interval(&self) -> Duration {
-        self.interval
     }
 
     /// What the thread has done so far. Safe to read while it runs.

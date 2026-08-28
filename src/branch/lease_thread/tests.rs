@@ -341,8 +341,63 @@ fn a_reaped_branchs_workspace_is_forgotten_without_the_client_saying_anything() 
 // Stoppable cleanly.
 // -------------------------------------------------------------------------------------------
 
+/// Wait up to [`PATIENCE`] for `flag`, without ever joining the thread that sets it.
+///
+/// **Never `join`.** The defect these two tests exist to catch — a `thread::sleep` where the
+/// condition variable should be — leaves the scan thread parked for a whole interval, and a `join`
+/// against that parks the *test* for a whole interval too. A test that hangs instead of failing
+/// reports nothing and takes the suite with it, so the wait is a poll on an atomic and the thread
+/// is abandoned to the end of the process.
+fn wait_for_flag(what: &str, flag: &std::sync::atomic::AtomicBool) -> Duration {
+    let t0 = Instant::now();
+    while t0.elapsed() < PATIENCE {
+        if flag.load(Ordering::SeqCst) {
+            return t0.elapsed();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("{what} had not happened {PATIENCE:?} after it was signalled");
+}
+
+#[test]
+fn a_signalled_halt_returns_at_once_instead_of_sleeping_the_interval() {
+    // The rule, at the level it lives: `Halt::wait` must be *woken*, not time out. Tested here and
+    // not only through `stop()` because `stop()` signals and then joins, and a signal that lands
+    // before the thread has reached the wait is caught by the early flag check — so an
+    // implementation that sleeps the interval out can win that race and pass. It did: this test
+    // replaced one that a `thread::sleep` mutant survived.
+    let halt = Arc::new(Halt { stopping: Mutex::new(false), wake: Condvar::new() });
+    let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let halt = Arc::clone(&halt);
+        let returned = Arc::clone(&returned);
+        let parked = Arc::clone(&parked);
+        std::thread::spawn(move || {
+            parked.store(true, Ordering::SeqCst);
+            halt.wait(NEVER);
+            returned.store(true, Ordering::SeqCst);
+        });
+    }
+    // Parked for certain: the flag says the thread has been scheduled, and the sleep covers the few
+    // instructions between the flag and the wait.
+    wait_for_flag("the waiter to start", &parked);
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!returned.load(Ordering::SeqCst), "the wait returned before it was signalled");
+
+    halt.signal();
+    let took = wait_for_flag("the signalled wait to return", &returned);
+    assert!(
+        took < Duration::from_secs(5),
+        "a signalled wait took {took:?} against a {NEVER:?} interval, so it is sleeping the \
+         interval out rather than being woken: a server would appear to hang on shutdown"
+    );
+}
+
 #[test]
 fn stop_does_not_wait_out_the_scan_interval() {
+    // The same rule through the public API, and with the same no-join discipline: `stop()` runs on
+    // a helper thread so that an implementation which parks cannot park this test with it.
     let f = fixture();
     let lease = LeaseThread::start(
         Arc::clone(&f.reaper),
@@ -351,13 +406,21 @@ fn stop_does_not_wait_out_the_scan_interval() {
         NEVER,
     )
     .unwrap();
-    let t0 = Instant::now();
-    lease.stop();
-    let took = t0.elapsed();
+    // Parked in the wait, not still scanning: otherwise a prompt `stop` proves only that the flag
+    // was already set before the thread looked at it.
+    wait_for("the first scan to finish", || lease.stats().scans >= 1);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stopped);
+    std::thread::spawn(move || {
+        lease.stop();
+        flag.store(true, Ordering::SeqCst);
+    });
+    let took = wait_for_flag("stop() to return", &stopped);
     assert!(
         took < Duration::from_secs(5),
-        "stop took {took:?} against a {NEVER:?} interval, so it is sleeping the interval out \
-         rather than being woken: a server would appear to hang on shutdown"
+        "stop took {took:?} against a {NEVER:?} interval"
     );
 }
 
