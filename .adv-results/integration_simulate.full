@@ -1,0 +1,89 @@
+warning: multiple fields are never read
+   --> src/consensus/mod.rs:352:16
+    |
+324 | pub struct Consensus {
+    |            --------- fields in this struct
+...
+352 |     pub(crate) acked: std::collections::BTreeMap<NodeId, config::CfgAt>,
+    |                ^^^^^
+...
+384 |     pub(crate) since_quorum: u32,
+    |                ^^^^^^^^^^^^
+...
+387 |     pub(crate) election_timeout: u32,
+    |                ^^^^^^^^^^^^^^^^
+388 |     /// The base election timeout; the drawn one lies in `[base, 2*base)`.
+389 |     pub(crate) election_base: u32,
+    |                ^^^^^^^^^^^^^
+...
+398 |     pub(crate) heartbeat: u32,
+    |                ^^^^^^^^^
+399 |     pub(crate) since_heartbeat: u32,
+    |                ^^^^^^^^^^^^^^^
+...
+407 |     pub(crate) progress: std::collections::BTreeMap<NodeId, replicate::Progress>,
+    |                ^^^^^^^^
+...
+412 |     pub(crate) applied: Round,
+    |                ^^^^^^^
+...
+415 |     pub(crate) durable: Round,
+    |                ^^^^^^^
+...
+418 |     pub(crate) last_term: Term,
+    |                ^^^^^^^^^
+419 |     pub(crate) last_round: Round,
+    |                ^^^^^^^^^^
+...
+423 |     pub(crate) snapshot_round: Round,
+    |                ^^^^^^^^^^^^^^
+424 |     pub(crate) snapshot_term: Term,
+    |                ^^^^^^^^^^^^^
+...
+430 |     pub(crate) rng: Rng,
+    |                ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `may_campaign` is never used
+   --> src/consensus/mod.rs:494:19
+    |
+433 | impl Consensus {
+    | -------------- method in this implementation
+...
+494 |     pub(crate) fn may_campaign(&self) -> bool {
+    |                   ^^^^^^^^^^^^
+
+warning: `ferrodb` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_simulate.rs (target/debug/deps/integration_simulate-06f5eef80820bb87)
+
+running 24 tests
+test a_reaper_wired_to_a_different_catalog_is_caught_at_the_first_seal ... ok
+test a_simulation_refuses_to_run_with_no_assertions_no_candidates_or_a_duplicate_name ... ok
+test an_assertion_on_an_unknown_table_or_column_is_refused_at_bind_time ... ok
+test a_candidate_writing_an_escrow_bounded_cell_errors_visibly_rather_than_overdrawing ... ok
+test a_candidate_whose_body_errors_is_reported_and_never_admitted ... ok
+test a_read_only_candidate_reports_no_rows_written ... ok
+test a_plan_that_never_says_admit_publishes_nothing ... ok
+test publishing_an_evaluation_the_gate_declined_is_refused ... ok
+test an_admitted_candidates_rows_are_attributed_to_that_candidate ... ok
+test a_candidate_is_scored_by_the_same_gate_a_production_merge_uses ... ok
+test a_candidate_the_first_score_refused_is_admitted_once_the_base_has_moved ... ok
+test a_third_candidate_that_composes_with_either_of_a_pair_is_refused_against_both ... ok
+test every_candidate_is_scored_against_one_identical_base ... ok
+test a_losing_candidate_is_left_for_the_reaper_rather_than_quarantined ... ok
+test an_evaluation_whose_read_premise_moved_is_refused_even_though_it_wrote_a_different_table ... ok
+test an_assertion_that_examined_no_rows_blocks_admission_instead_of_passing ... ok
+test k_candidates_cost_k_path_copies_not_k_database_copies ... ok
+test publishing_an_evaluation_whose_base_moved_is_refused_and_publishing_a_fresh_one_is_not ... ok
+test forking_k_candidates_copies_zero_pages_and_the_trunk_really_had_pages_to_copy ... ok
+test simulate_is_refused_inside_an_agent_session ... ok
+test simulate_is_refused_inside_a_transaction_block_because_it_would_escape_the_rollback ... ok
+test state_for_branches_the_reaper_took_is_dropped_rather_than_retained_forever ... ok
+test the_simulate_statement_runs_end_to_end_through_the_sql_surface ... ok
+test the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_return_to_baseline ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+exit=0
