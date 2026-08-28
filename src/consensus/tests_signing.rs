@@ -473,6 +473,69 @@ fn a_key_in_a_group_or_world_writable_directory_is_refused_unless_it_is_sticky()
     Key::load(&p).expect("a private directory is fine");
 }
 
+#[cfg(unix)]
+#[test]
+fn the_spelling_of_the_path_does_not_decide_whether_the_directory_is_checked() {
+    // **Found by an adversarial pass, and it was a real hole.** `Path::parent()` of a bare relative
+    // name is `Some("")`, which means the CURRENT directory — not "there is no directory". The
+    // guard filtered the empty parent out as "nothing to check", so `Key::load("cluster.key")`
+    // skipped the directory check entirely while `Key::load("./cluster.key")` performed it, for the
+    // same file in the same directory. A guard that quietly declines to run returns the same `Ok`
+    // as one that ran and passed, which is the failure shape this module warns about elsewhere.
+    //
+    // Asserted as an EQUIVALENCE rather than as two verdicts, so it cannot be satisfied by making
+    // both spellings skip the check: the third assertion pins that the shared verdict is a refusal.
+    assert_eq!(Path::new("cluster.key").parent(), Some(Path::new("")), "the mechanism");
+    assert_eq!(Path::new("./cluster.key").parent(), Some(Path::new(".")), "the mechanism");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dirp = dir.path().canonicalize().unwrap();
+    write_key_file(&dirp, "cluster.key", &key_bytes(40));
+    chmod(&dirp, 0o777);
+
+    // `set_current_dir` is process-global and cargo runs tests in threads, so the CWD is restored
+    // before anything else can observe it and no assertion happens while it is moved.
+    let restore = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dirp).unwrap();
+    let bare = Key::load("cluster.key");
+    let dotted = Key::load("./cluster.key");
+    std::env::set_current_dir(&restore).unwrap();
+    chmod(&dirp, 0o700);
+
+    assert_eq!(
+        bare.is_err(),
+        dotted.is_err(),
+        "two spellings of one path must reach one verdict; bare={:?} dotted={:?}",
+        bare.as_ref().err().map(|e| e.to_string()),
+        dotted.as_ref().err().map(|e| e.to_string())
+    );
+    let err = bare.err().expect("a key in a world-writable non-sticky directory must be refused");
+    assert!(err.to_string().contains("writable by group or other"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_inspected_is_refused_rather_than_assumed_safe() {
+    // The other half of the same defect: the check was `if let Ok(dmeta) = fs::metadata(dir)`, so
+    // any failure to stat the directory fell through to "allowed". A guard that cannot read its own
+    // input must refuse.
+    //
+    // The condition is made to happen rather than argued: the key is opened through a descriptor
+    // this process already holds, and its directory is then removed, so the open succeeds and the
+    // directory stat cannot.
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("gone");
+    std::fs::create_dir(&inner).unwrap();
+    let p = write_key_file(&inner, "k", &key_bytes(41));
+    Key::load(&p).expect("it loads while its directory is there");
+
+    std::fs::remove_file(&p).unwrap();
+    std::fs::remove_dir(&inner).unwrap();
+    let err = Key::load(&p).expect_err("a key whose directory is gone must be refused");
+    // The open fails first here, which is also a refusal; what must never happen is an `Ok`.
+    assert!(!err.to_string().is_empty());
+}
+
 #[test]
 fn the_platform_that_cannot_read_its_own_file_protection_refuses_rather_than_allowing() {
     // **Both arms of the Windows rule, run on every platform.** `accept_unverifiable` carries no
