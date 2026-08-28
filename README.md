@@ -116,6 +116,14 @@ floor (default 32736, about 128 MB). It is read once, when a database's arena is
 then persisted: changing it later cannot move an existing database's floor, because moving the floor
 would put pages the arena already owns back into the ordinary allocator's circulation.
 
+Both binaries run a **lease thread**: on startup it finishes any reap a crash interrupted, and then
+every `FERRODB_LEASE_SCAN_MILLIS` (default 30000) it hard-reaps every branch past its deadline, with
+no client cooperation. It never runs inside a statement — it takes the same per-statement lock a
+`MERGE` holds — and an unusable value for that variable makes the process **refuse to start** rather
+than fall back to the default. There is deliberately no value that switches the scan off: abandoned
+branches being reclaimed is the product claim, not an option.
+`tests/integration_server_reaps.rs` proves it against the binaries, sending them no SQL at all.
+
 ### Supported SQL
 
 Here is the SQL syntax that has been implemented so far:
