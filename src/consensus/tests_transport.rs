@@ -1144,12 +1144,32 @@ fn a_frame_with_an_unknown_tag_closes_the_connection_rather_than_being_skipped()
     // **Observed, not defaulted.** `let _ = read_to_end(..)` then `assert!(rest.is_empty())`
     // passes whenever the read ERRORS, because `rest` is then still empty — it asserts on a default
     // rather than on a close. This distinguishes the two: a clean close is `Ok(0)`, an abortive one
-    // is `ConnectionReset`, and anything else is a failure.
+    // is `ConnectionReset` or `ConnectionAborted`, and anything else is a failure.
+    //
+    // **Both abortive kinds, because this close is necessarily abortive and Windows names it
+    // differently.** The listener closes while the frame written behind the unroutable one is still
+    // unread in its receive buffer, and TCP requires a close with unread data to send RST rather
+    // than FIN — so the peer never sees a clean `Ok(0)` here. Linux and macOS surface that RST as
+    // `ECONNRESET`; Windows surfaces the same event as `WSAECONNABORTED` (10053) or `WSAECONNRESET`
+    // (10054) depending on which side of the stack observes it first. Accepting only `ConnectionReset`
+    // therefore made this test a coin flip on windows-latest: it passed in the pull_request run for
+    // `872a7d9` and failed in the push run for that same commit.
+    //
+    // This widens which OS *spelling* of "the listener closed" is accepted, and not what the test
+    // demands. Every failure mode it exists to catch is still rejected below: a listener that stayed
+    // open times out (`WouldBlock`/`TimedOut`), a listener that skipped the frame and carried on
+    // returns `Ok(n)` with bytes, and `b.received() == 0` is checked separately after the sleep
+    // regardless of which arm was taken. Fire-checked on both counts — see the note on that
+    // assertion.
     let mut rest = Vec::new();
     match s.read_to_end(&mut rest) {
-        // A clean close, or an abortive one. Both mean the listener closed.
+        // A clean close, or an abortive one. All three mean the listener closed.
         Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
         Ok(n) => panic!("the connection stayed open and sent {n} byte(s): {:?}", &rest[..n.min(16)]),
         // **The mutant's signature, named explicitly.** A read timeout expiring means the socket is
         // STILL OPEN with nothing to read — the listener kept the connection after a frame it
