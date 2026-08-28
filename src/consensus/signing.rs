@@ -102,7 +102,14 @@
 //! protected the file by other means says so explicitly with
 //! [`PermissionCheck::AcceptUnverifiable`]. Falling through to "allowed" on the platform where the
 //! check cannot run would make this a guard that reports a file protected when it inspected
-//! nothing.
+//! nothing. On Unix that value changes nothing: where the evidence exists it decides, so a
+//! group-readable key is refused under either.
+//!
+//! The decision lives in `accept_unverifiable`, a plain function with no `cfg` of its own, called
+//! by `check_protection` when [`PROTECTION_IS_CHECKABLE`] is false. That is deliberate: both of its
+//! arms are then exercised by the ordinary test run on every platform, and the only thing the
+//! Windows runner alone can prove is a one-line wiring. A guard whose evidence arrives from one CI
+//! runner is a guard nobody here has seen work.
 //!
 //! Two further dimensions are **not** checked, stated here rather than left to be discovered:
 //!
@@ -318,7 +325,7 @@ impl Key {
             ))
         })?;
         if !meta.is_file() {
-            return Err(FerroError::Internal(format!(
+            return Err(FerroError::Io(format!(
                 "{} is not a regular file, so it cannot be a signing key. A directory or a device \
                  named where a key was expected is a configuration mistake, and reading it would \
                  produce a key whose bytes nobody chose",
@@ -335,7 +342,7 @@ impl Key {
             let n = bytes.len();
             let mut bytes = bytes;
             wipe(&mut bytes);
-            return Err(FerroError::Internal(format!(
+            return Err(FerroError::Io(format!(
                 "the consensus signing key at {} is {n} byte(s); {MIN_KEY_BYTES} is the minimum. \
                  The tag it would produce is {MAC_LEN} bytes wide, so a shorter key makes that \
                  width a decoration rather than a bound. Generate one with \
@@ -355,7 +362,7 @@ impl Key {
     #[cfg(test)]
     pub(crate) fn from_bytes_for_test(bytes: Vec<u8>) -> Result<Key, FerroError> {
         if bytes.len() < MIN_KEY_BYTES {
-            return Err(FerroError::Internal(format!(
+            return Err(FerroError::Io(format!(
                 "a signing key of {} byte(s) is under the {MIN_KEY_BYTES}-byte minimum",
                 bytes.len()
             )));
@@ -423,15 +430,70 @@ impl Drop for Key {
     }
 }
 
-/// The file-protection rule, split out so there is exactly one copy of it and one place a platform
-/// is added.
+/// Whether `std` on the platform this was compiled for can show **who may read** a file.
+///
+/// True on Unix, where the mode bits answer it. False on Windows, where the answer lives in an ACL
+/// that `std` does not expose and that this crate has no dependency to read.
+pub const PROTECTION_IS_CHECKABLE: bool = cfg!(unix);
+
+/// The file-protection rule. One copy, and one place a platform is added.
+fn check_protection(
+    path: &Path,
+    meta: &fs::Metadata,
+    check: PermissionCheck,
+) -> Result<(), FerroError> {
+    if !PROTECTION_IS_CHECKABLE {
+        return accept_unverifiable(check, path);
+    }
+    #[cfg(unix)]
+    {
+        unix_protection(path, meta)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        unreachable!("PROTECTION_IS_CHECKABLE is false off Unix, so this returned above")
+    }
+}
+
+/// What to do on a platform whose file protection this build cannot read.
+///
+/// **Refuses under [`PermissionCheck::Enforce`]**, and says why. `std` exposes no way to read a
+/// Windows ACL and this crate has no dependencies to borrow one from. The alternative — returning
+/// `Ok(())` on the platform where nothing was inspected — is the failure shape this project keeps
+/// meeting: a check that reports "protected" having verified nothing. So the guard asks, exactly as
+/// a guard that cannot parse its own input must, and the operator answers.
+///
+/// **Split out from [`check_protection`] and taking no `cfg` of its own, so that both of its arms
+/// are reachable from a test on every platform.** A rule that only the Windows runner can execute
+/// is a rule whose evidence arrives once a day from somewhere else; here the decision is an
+/// ordinary function and only its one-line wiring to `PROTECTION_IS_CHECKABLE` is platform-shaped.
+fn accept_unverifiable(check: PermissionCheck, path: &Path) -> Result<(), FerroError> {
+    match check {
+        PermissionCheck::AcceptUnverifiable => Ok(()),
+        PermissionCheck::Enforce => Err(FerroError::Io(format!(
+            "this build cannot read the access control list on {}, so it cannot show that the \
+             consensus signing key is readable only by its owner. Reading a Windows ACL needs an \
+             API `std` does not expose and a crate this build does not have. Rather than report a \
+             file protected having inspected nothing, loading is refused: protect the file with \
+             `icacls` and pass `PermissionCheck::AcceptUnverifiable` to say that you have.",
+            path.display()
+        ))),
+    }
+}
+
+/// The Unix rule: the file's own mode, and then the directory that holds it.
+///
+/// [`PermissionCheck`] is deliberately **not** a parameter. Where the evidence exists it decides,
+/// and an operator cannot accept away a mode this build can see — otherwise the escape hatch for
+/// the platform that cannot check would become an escape hatch for the platform that can.
 #[cfg(unix)]
-fn check_protection(path: &Path, meta: &fs::Metadata, _check: PermissionCheck) -> Result<(), FerroError> {
+fn unix_protection(path: &Path, meta: &fs::Metadata) -> Result<(), FerroError> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
-        return Err(FerroError::Internal(format!(
+        return Err(FerroError::Io(format!(
             "the consensus signing key at {} has mode {:04o}; it must not be readable by group or \
              other. Anyone who can read this file can forge any message from any node, including a \
              later term that demotes a healthy leader. Fix with `chmod 600 {}`",
@@ -450,7 +512,7 @@ fn check_protection(path: &Path, meta: &fs::Metadata, _check: PermissionCheck) -
             let dmode = dmeta.permissions().mode();
             let sticky = dmode & 0o1000 != 0;
             if dmode & 0o022 != 0 && !sticky {
-                return Err(FerroError::Internal(format!(
+                return Err(FerroError::Io(format!(
                     "the directory holding the consensus signing key, {}, has mode {:04o}: it is \
                      writable by group or other and is not sticky, so anyone who can write there \
                      can replace the key with one they chose. The key file's own mode does not \
@@ -463,28 +525,6 @@ fn check_protection(path: &Path, meta: &fs::Metadata, _check: PermissionCheck) -
         }
     }
     Ok(())
-}
-
-/// The Windows half. **Refuses under [`PermissionCheck::Enforce`]**, and says why.
-///
-/// `std` exposes no way to read a Windows ACL, and this crate has no dependencies to borrow one
-/// from. The alternative — returning `Ok(())` on the platform where nothing was inspected — is the
-/// failure shape this project keeps meeting: a check that reports "protected" having verified
-/// nothing. So the guard asks, exactly as the guard rule says it must, and the operator answers
-/// with [`PermissionCheck::AcceptUnverifiable`].
-#[cfg(not(unix))]
-fn check_protection(path: &Path, _meta: &fs::Metadata, check: PermissionCheck) -> Result<(), FerroError> {
-    match check {
-        PermissionCheck::AcceptUnverifiable => Ok(()),
-        PermissionCheck::Enforce => Err(FerroError::Internal(format!(
-            "this build cannot read the access control list on {}, so it cannot show that the \
-             consensus signing key is readable only by its owner. Reading a Windows ACL needs an \
-             API `std` does not expose and a crate this build does not have. Rather than report a \
-             file protected having inspected nothing, loading is refused: protect the file with \
-             `icacls` and pass `PermissionCheck::AcceptUnverifiable` to say that you have.",
-            path.display()
-        ))),
-    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -533,7 +573,7 @@ pub fn verify_frame<'a>(key: &Key, signed: &'a [u8]) -> Result<&'a [u8], FerroEr
     }
     let (mac, body) = signed.split_at(MAC_LEN);
     if !key.verify(body, mac) {
-        return Err(FerroError::Internal(format!(
+        return Err(FerroError::Wal(format!(
             "a consensus frame of {} byte(s) did not authenticate against this node's signing key. \
              It was refused before it was parsed, so nothing in it reached the state machine. The \
              two ordinary causes are a peer holding a different key file and a peer not signing at \
