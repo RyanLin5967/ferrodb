@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -411,7 +411,7 @@ fn a_huge_entry_list_is_refused_before_it_is_built_and_not_after() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn an_oversized_length_is_refused_without_allocating() {
+fn an_oversized_length_is_refused_before_a_single_body_byte_is_read() {
     // A peer must not get to choose this process's memory usage. Checked before `vec![0u8; len]`,
     // in the same order `replication::Message::read_from` checks it.
     // Both the absurd case and the boundary case. The boundary is what makes this a test of THE
@@ -433,7 +433,61 @@ fn an_oversized_length_is_refused_without_allocating() {
             format!("{e}").contains("over the"),
             "a length of {claim} was not refused by the frame limit: {e}"
         );
+        // **The "before anything is read" half, which the old name claimed and never checked.**
+        // The cursor has moved exactly five bytes — the tag and the length — so the limit was
+        // compared before `vec![0u8; len]` was reached. Had the allocation come first, a claim of
+        // `u32::MAX` would have asked for four gigabytes to fill from a two-byte stream.
+        assert_eq!(
+            cur.position(),
+            5,
+            "the reader consumed {} bytes for a frame it refused; the limit is being checked after \
+             the body is touched rather than before",
+            cur.position()
+        );
     }
+}
+
+#[test]
+fn a_frame_claiming_four_billion_entries_is_refused_rather_than_reserved_for() {
+    // The decoder's stated rule: nothing is reserved from a peer-chosen `count`, because
+    // `Vec::with_capacity` on one is exactly the amplification the frame limit exists to prevent —
+    // eight megabytes on the wire asking for gigabytes of address space.
+    //
+    // This is the test that distinguishes the two implementations: growing as entries decode gives
+    // an error on the first missing byte, while reserving from the count aborts the process. An
+    // abort is a failing test, so either way the rule is measured rather than asserted.
+    let mut b = Vec::new();
+    b.extend_from_slice(&1u32.to_be_bytes()); // from
+    b.extend_from_slice(&2u32.to_be_bytes()); // to
+    b.extend_from_slice(&1u64.to_be_bytes()); // term
+    b.push(4); // Append
+    b.extend_from_slice(&0u64.to_be_bytes()); // prev_round
+    b.extend_from_slice(&0u64.to_be_bytes()); // prev_term
+    b.extend_from_slice(&0u64.to_be_bytes()); // commit
+    b.extend_from_slice(&u32::MAX.to_be_bytes()); // ...and four billion entries, none of them present
+    let e = decode(&b).unwrap_err();
+    assert!(
+        format!("{e}").contains("entry 0 of 4294967295"),
+        "a four-billion-entry claim was not refused at its first missing entry: {e}"
+    );
+
+    // The same for a node list, which has its own count.
+    let mut c = Vec::new();
+    c.extend_from_slice(&1u32.to_be_bytes());
+    c.extend_from_slice(&2u32.to_be_bytes());
+    c.extend_from_slice(&1u64.to_be_bytes());
+    c.push(4);
+    c.extend_from_slice(&0u64.to_be_bytes());
+    c.extend_from_slice(&0u64.to_be_bytes());
+    c.extend_from_slice(&0u64.to_be_bytes());
+    c.extend_from_slice(&1u32.to_be_bytes());
+    c.extend_from_slice(&1u64.to_be_bytes());
+    c.extend_from_slice(&1u64.to_be_bytes());
+    c.push(7); // Membership
+    c.extend_from_slice(&1u64.to_be_bytes());
+    c.extend_from_slice(&1u64.to_be_bytes());
+    c.extend_from_slice(&u32::MAX.to_be_bytes()); // four billion members
+    assert!(decode(&c).is_err(), "a four-billion-member claim was accepted");
 }
 
 #[test]
@@ -1087,9 +1141,17 @@ fn a_frame_with_an_unknown_tag_closes_the_connection_rather_than_being_skipped()
     s.write_all(&smuggled).unwrap();
     s.flush().unwrap();
 
+    // **Observed, not defaulted.** `let _ = read_to_end(..)` then `assert!(rest.is_empty())`
+    // passes whenever the read ERRORS, because `rest` is then still empty — it asserts on a default
+    // rather than on a close. This distinguishes the two: a clean close is `Ok(0)`, an abortive one
+    // is `ConnectionReset`, and anything else is a failure.
     let mut rest = Vec::new();
-    let _ = s.read_to_end(&mut rest);
-    assert!(rest.is_empty(), "the connection was not closed on an unroutable tag");
+    match s.read_to_end(&mut rest) {
+        Ok(0) => {}
+        Ok(n) => panic!("the connection stayed open and sent {n} byte(s): {:?}", &rest[..n.min(16)]),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("reading after an unroutable frame failed for another reason: {e}"),
+    }
 
     // Give a reader that wrongly carried on every chance to deliver the frame behind it.
     std::thread::sleep(Duration::from_millis(200));
@@ -1655,4 +1717,173 @@ fn a_catalog_name_too_long_for_the_wire_is_refused_by_the_sender() {
         },
     };
     assert_eq!(decode_frame(&encode(&m2).unwrap()).unwrap(), m2, "a maximal name must round trip");
+}
+
+
+#[test]
+fn a_peer_that_connects_and_says_nothing_is_closed_on_the_handshake_deadline() {
+    // Otherwise a peer pins a thread and two descriptors by doing nothing at all, which is cheaper
+    // for the attacker than any of the frames this codec refuses.
+    let mut opts = fast();
+    opts.handshake_deadline = Duration::from_millis(300);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let t = Transport::from_listener(NodeId(1), l, BTreeMap::new(), opts).unwrap();
+
+    let s = TcpStream::connect(addr).unwrap();
+    // Not one byte is sent.
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && t.refused_handshakes() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        t.refused_handshakes(),
+        1,
+        "a peer that connected and sent nothing was never refused, so it holds a thread for ever"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && t.live_inbound_conns() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(t.live_inbound_conns(), 0, "the silent connection was counted but not released");
+    drop(s);
+}
+
+#[test]
+fn a_broken_connection_is_reconnected_and_the_frame_lost_to_it_is_counted() {
+    // **The transport's ONLY recovery path, and it had no test.** Every write failure drops the
+    // connection and relies on the next iteration to redial; if that redial did not work, a single
+    // transient error would partition this node permanently while every meter read healthy.
+    //
+    // Driven by a hand-rolled peer so the break is deliberate rather than hoped for: accept, read
+    // one frame, abort the connection, then accept again and read the next.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let t = Transport::from_listener(
+        NodeId(1),
+        l,
+        BTreeMap::from([(NodeId(2), peer_addr)]),
+        fast(),
+    )
+    .unwrap();
+
+    let msg = |term: u64| Message {
+        from: NodeId(1),
+        to: NodeId(2),
+        term,
+        body: Body::PreVoteResp { granted: true },
+    };
+
+    // --- first connection: take one frame, then abort it -------------------------------------
+    let (mut c1, _) = listener.accept().expect("the transport should dial on its own");
+    c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut hs = [0u8; 6];
+    c1.read_exact(&mut hs).expect("the dialer sends its handshake first");
+    let mut ours = Vec::new();
+    crate::replication::write_handshake(&mut ours).unwrap();
+    c1.write_all(&ours).unwrap();
+    c1.flush().unwrap();
+
+    t.send(&msg(1)).unwrap();
+    let mut head = [0u8; 5];
+    c1.read_exact(&mut head).expect("the first frame should arrive");
+    assert_eq!(head[0], CONSENSUS_TAG);
+    let n = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; n];
+    c1.read_exact(&mut body).unwrap();
+    assert_eq!(decode(&body).unwrap().term, 1);
+
+    // Close hard, then keep sending. `set_linger` would force an immediate RST but it is still
+    // unstable (rust#88494), so this relies on the loop below instead: the first write after a FIN
+    // may succeed, the peer answers RST, and the next one fails with EPIPE. Either way the sender
+    // meets a real write error, which is the condition under test.
+    let _ = c1.shutdown(Shutdown::Both);
+    drop(c1);
+
+    // --- keep sending; at least one frame is lost to the broken socket ------------------------
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut term = 2u64;
+    while Instant::now() < deadline && t.lost_in_flight() == 0 {
+        let _ = t.send(&msg(term));
+        term += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        t.lost_in_flight() > 0,
+        "no frame was recorded as lost, so a broken connection is losing messages silently"
+    );
+
+    // --- and it reconnects, which is the half that matters ------------------------------------
+    let (mut c2, _) = listener
+        .accept()
+        .expect("the transport must redial after a write failure; without this the node is \
+                 permanently partitioned by one transient error");
+    c2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c2.read_exact(&mut hs).unwrap();
+    c2.write_all(&ours).unwrap();
+    c2.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut arrived = None;
+    while Instant::now() < deadline && arrived.is_none() {
+        let _ = t.send(&msg(term));
+        term += 1;
+        if c2.read_exact(&mut head).is_ok() {
+            let n = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+            let mut body = vec![0u8; n];
+            if c2.read_exact(&mut body).is_ok() {
+                arrived = Some(decode(&body).unwrap().term);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let got = arrived.expect("no frame arrived on the reconnected socket");
+    assert!(got >= 2, "the frame on the new connection was term {got}, from before the break");
+}
+
+
+#[test]
+fn the_spawn_failure_teardown_actually_stops_the_threads_it_is_given() {
+    // The defect: a failed `thread::spawn` in `from_listener` returned via `?`, which dropped the
+    // local `threads` vec — DETACHING every sender thread already started — and dropped the only
+    // remaining `stop` handle. Those threads then dialled their peers for the life of the process
+    // with nothing able to tell them to stop, and the caller held nothing that could reap them.
+    //
+    // The failure itself is not reachable from a test: it needs `pthread_create` to return EAGAIN,
+    // i.e. RLIMIT_NPROC exhaustion, which a test cannot arrange without wrecking the run. So the
+    // TEARDOWN is tested directly instead — that is the part that was missing, and a test of it is
+    // worth more than no test at all. Named so nobody mistakes it for a test of the spawn failure.
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters = Arc::new(Counters::default());
+    let opts = fast();
+    let ob = Arc::new(Outbox {
+        addr: "127.0.0.1:1".parse().unwrap(), // refuses instantly, so the loop is in its retry path
+        state: Mutex::new(OutboxState { queue: VecDeque::new(), live: None, stopped: false }),
+        woken: Condvar::new(),
+        depth: 4,
+        dropped: std::sync::atomic::AtomicU64::new(0),
+    });
+    let ob_c = Arc::clone(&ob);
+    let stop_c = Arc::clone(&stop);
+    let counters_c = Arc::clone(&counters);
+    let opts_c = opts.clone();
+    let h = std::thread::spawn(move || sender_loop(ob_c, stop_c, counters_c, opts_c));
+
+    // Let it get properly into the dial-and-retry loop, which is where an orphan would live.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && counters.connect_failures.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        counters.connect_failures.load(Ordering::SeqCst) > 0,
+        "the thread never reached its retry loop, so this test would pass without stopping anything"
+    );
+
+    // The teardown must return only once that thread is done. If it did not stop it, the join below
+    // would hang and the test would time out rather than pass.
+    stop_started(&stop, &[Arc::clone(&ob)], vec![h]);
+    assert!(stop.load(Ordering::SeqCst), "the teardown did not raise the stop flag");
+    assert!(ob.state.lock().unwrap().stopped, "the teardown did not stop the outbox");
 }
