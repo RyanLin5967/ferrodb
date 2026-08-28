@@ -756,18 +756,6 @@ fn expect_quiet(s: &Sweep, what: &str) {
     );
 }
 
-/// Run one seed to a leader, or say how long it waited. Used by the scenario tests, which need a
-/// cluster in a known state before they break anything.
-fn run_to_leader<P: Peer>(sim: &mut Sim<P>, max_ticks: u64) -> Option<NodeId> {
-    for _ in 0..max_ticks {
-        sim.run_ticks(1).expect("no violation while merely electing");
-        if let Some(l) = sim.leader() {
-            return Some(l);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------------------------
 // The harness itself
 // ---------------------------------------------------------------------------------------------
@@ -848,6 +836,11 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
          claim this model never tested: {t:?}"
     );
     assert!(t.heals > 0, "the network never healed, so nothing could make progress: {t:?}");
+    assert!(
+        t.unsent_at_crash > 0,
+        "no crash ever destroyed a message that was still waiting behind an fsync, so the ordering \
+         the contract requires of a caller was never actually enforced: {t:?}"
+    );
     eprintln!("fault model over {} seeds: {t:?}", s.seeds_run);
 }
 
@@ -861,7 +854,7 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
 /// landed, cast again by the same node after a crash.
 #[test]
 fn at_most_one_leader_per_term_across_a_chaos_sweep() {
-    let n = sweep_seeds(400);
+    let n = sweep_seeds(2_000);
     let s = sweep::<Correct>(SEED_SAFETY, n, &chaos_cfg());
     expect_quiet(&s, "at most one leader per term");
     eprintln!(
@@ -876,7 +869,7 @@ fn at_most_one_leader_per_term_across_a_chaos_sweep() {
 /// overwritten by a later leader that never held it.
 #[test]
 fn a_committed_round_is_never_lost_across_a_chaos_sweep() {
-    let n = sweep_seeds(400);
+    let n = sweep_seeds(2_000);
     let s = sweep::<Correct>(SEED_SAFETY + 500_000, n, &chaos_cfg());
     expect_quiet(&s, "a committed round is never lost");
     eprintln!(
@@ -891,7 +884,7 @@ fn a_committed_round_is_never_lost_across_a_chaos_sweep() {
 fn the_safety_properties_hold_under_partitions_alone() {
     let mut cfg = chaos_cfg();
     cfg.faults = Faults::partitioned();
-    let s = sweep::<Correct>(SEED_SAFETY + 900_000, sweep_seeds(300), &cfg);
+    let s = sweep::<Correct>(SEED_SAFETY + 900_000, sweep_seeds(1_500), &cfg);
     expect_quiet(&s, "safety under partitions alone");
     assert!(
         s.totals.one_way_partitions > 0,
@@ -1396,5 +1389,326 @@ fn committing_an_inherited_round_by_counting_replicas_loses_it_in_the_figure_8_s
         "with §5.4.2 enforced the shorter log must not have been electable once round {} was \
          committed",
         ok.round
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pre-vote: a partitioned node must not depose a healthy leader
+// ---------------------------------------------------------------------------------------------
+
+/// Run a cluster to a leader, cut one node's *inbound* traffic so it campaigns for ever into a wall
+/// while the majority stays healthy, and report what the majority's leadership looked like before
+/// and after. `None` means no leader was ever elected in the first place.
+///
+/// The one-way cut is the point: the partitioned node's pre-votes still reach everybody, so this
+/// asks whether they are *answered* harmlessly, not whether they arrive.
+fn survives_a_partitioned_campaigner<P: Peer>(seed: u64) -> Option<(NodeId, Term, Option<NodeId>, Term)> {
+    let mut sim = Sim::<P>::new(seed, scripted());
+    let l = wait_for_leader(&mut sim, 80).ok()??;
+    let before = sim.term_of(l)?;
+    let odd = (1..=5u32).map(NodeId).find(|n| *n != l).unwrap();
+    sim.isolate_inbound(odd);
+    sim.run_ticks(120).expect("no safety violation is expected here; this is a liveness claim");
+    let after = (1..=5u32).map(NodeId).filter_map(|n| sim.term_of(n)).max().unwrap_or(before);
+    Some((l, before, sim.leader(), after))
+}
+
+/// **The pre-vote rule: a pre-vote must not raise anybody's term.**
+///
+/// Two halves, and the second is the more damning of the two. A node partitioned away from the
+/// cluster must not disturb it by campaigning into a wall — and a receiver that treats the
+/// deliberately-one-higher term on a pre-vote as a real one does not merely disturb the cluster,
+/// it takes elections away from it altogether: every node raises its term to the hypothetical, and
+/// the pre-vote it raised the term for is then refused for not being about a future term. Nobody
+/// can ever win.
+#[test]
+fn a_pre_vote_must_not_raise_anybodys_term() {
+    let (l, before, still, after) = survives_a_partitioned_campaigner::<Correct>(31)
+        .expect("fixture: the healthy cluster never elected anybody");
+    assert_eq!(
+        before, after,
+        "a node that could hear nobody raised the healthy cluster's term from {before} to {after} \
+         over 120 ticks; that is the disruption pre-vote exists to prevent"
+    );
+    assert_eq!(
+        still,
+        Some(l),
+        "{l} lost the office to a node that was campaigning into a one-way partition"
+    );
+
+    // The mutant, over a spread of seeds so this is not one unlucky draw.
+    let seeds: Vec<u64> = (31..41).collect();
+    let broken: Vec<u64> = seeds
+        .iter()
+        .copied()
+        .filter(|s| survives_a_partitioned_campaigner::<RefNode<D_PREVOTE_RAISES_TERM>>(*s).is_some())
+        .collect();
+    let healthy: Vec<u64> = seeds
+        .iter()
+        .copied()
+        .filter(|s| survives_a_partitioned_campaigner::<Correct>(*s).is_some())
+        .collect();
+    assert_eq!(
+        healthy.len(),
+        seeds.len(),
+        "fixture: the correct machine failed to elect on {:?}, so 'the mutant cannot elect' would \
+         say nothing about pre-vote",
+        seeds.iter().filter(|s| !healthy.contains(s)).collect::<Vec<_>>()
+    );
+    assert!(
+        broken.is_empty(),
+        "the mutant that treats a pre-vote as a real later term still elected leaders on {broken:?}"
+    );
+    eprintln!(
+        "MUTANT pre-vote raises the term: killed on all of {seeds:?} -- raising the term on the \
+         hypothetical leaves a healthy five-node cluster unable to elect anybody at all, while the \
+         correct machine elected on every one of them and held term {before} throughout a \
+         one-way partition"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Liveness — asserted only where the faults have healed, and shown able to fail
+// ---------------------------------------------------------------------------------------------
+
+/// **`DISTRIBUTED.md` exit criterion 1.** Three nodes elect a leader from a cold start, over many
+/// seeds. Run at five as well, because an even split is only reachable above three.
+#[test]
+fn a_cold_cluster_elects_exactly_one_leader_within_an_election_window() {
+    let window = 60u64; // election_timeout is drawn in [10, 20) ticks; this allows several rounds.
+    for nodes in [3u32, 5] {
+        let mut worst = 0u64;
+        let seeds = sweep_seeds(200);
+        for k in 0..seeds {
+            let seed = SEED_LIVENESS + k;
+            let mut sim = Sim::<Correct>::new(seed, SimConfig::healthy(nodes, window));
+            let mut at = None;
+            for t in 0..window {
+                sim.run_ticks(1).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+                if sim.leader().is_some() {
+                    at = Some(t);
+                    break;
+                }
+            }
+            let at = at.unwrap_or_else(|| {
+                panic!(
+                    "seed {seed}: {nodes} healthy nodes elected nobody in {window} ticks, with \
+                     leaders {:?}",
+                    sim.leaders()
+                )
+            });
+            worst = worst.max(at);
+        }
+        eprintln!("cold start, {nodes} nodes, {seeds} seeds: slowest election was {worst} ticks");
+    }
+}
+
+/// The anti-vacuity twin of the test above: the liveness check must be able to fail, or "a leader
+/// was elected" is a sentence about the harness rather than about the protocol.
+#[test]
+fn a_cluster_cut_into_two_minorities_elects_nobody() {
+    let mut sim = Sim::<Correct>::new(77, scripted());
+    sim.cut(&[NodeId(1), NodeId(2)]);
+    sim.isolate(NodeId(5));
+    sim.run_ticks(120).expect("a partition is not a safety violation");
+    assert!(
+        sim.leaders().is_empty(),
+        "a cluster with no majority anywhere elected {:?}; the liveness assertions elsewhere in \
+         this file would then be measuring nothing",
+        sim.leaders()
+    );
+    sim.heal();
+    let back = wait_for_leader(&mut sim, 120).unwrap();
+    assert!(back.is_some(), "the cluster never recovered after the partition healed");
+}
+
+/// **`DISTRIBUTED.md` exit criterion 2**, at simulator level: the leader is killed under load, a
+/// new one takes over, and nothing that had been committed is lost.
+#[test]
+fn killing_the_leader_under_load_costs_no_committed_round() {
+    let seeds = sweep_seeds(60);
+    let mut failovers = 0u64;
+    let mut preserved = 0u64;
+    for k in 0..seeds {
+        let seed = SEED_LIVENESS + 100_000 + k;
+        let mut sim = Sim::<Correct>::new(seed, SimConfig::healthy(5, 0));
+        let Some(l) = wait_for_leader(&mut sim, 60).unwrap() else {
+            panic!("seed {seed}: fixture: nobody was elected");
+        };
+        // Load, then kill mid-flight.
+        for j in 0..12u64 {
+            let cmd = Command::WalBatch { start_lsn: 7000 + j, bytes: vec![j as u8] };
+            sim.propose_to(l, cmd).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+            sim.run_units(3).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+        }
+        sim.run_ticks(4).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+        let before: BTreeMap<Round, Entry> = sim.committed().clone();
+        assert!(
+            !before.is_empty(),
+            "seed {seed}: fixture: nothing was committed before the kill, so nothing could be lost"
+        );
+        sim.crash(l);
+
+        let next = wait_for_leader(&mut sim, 120).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+        let next = next.unwrap_or_else(|| panic!("seed {seed}: no leader after {l} was killed"));
+        assert_ne!(next, l, "seed {seed}: the killed leader was somehow still leading");
+        failovers += 1;
+        sim.run_ticks(30).unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+
+        // Every round committed before the kill must still be committed, with the same command, and
+        // the new leader must hold it.
+        for (r, e) in &before {
+            assert_eq!(
+                sim.committed().get(r),
+                Some(e),
+                "seed {seed}: round {r} was committed before {l} was killed and is not the same \
+                 entry afterwards"
+            );
+            let held = sim.durable_log(next);
+            assert_eq!(
+                held.get((*r - 1) as usize),
+                Some(e),
+                "seed {seed}: the new leader {next} does not hold committed round {r}"
+            );
+        }
+        preserved += before.len() as u64;
+    }
+    eprintln!(
+        "failover: {failovers} leader kills over {seeds} seeds, {preserved} committed rounds \
+         checked across them"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The crash model
+// ---------------------------------------------------------------------------------------------
+
+/// **A restart keeps exactly what was fsynced, and no more.**
+///
+/// Anti-vacuity is the whole test: if no crash ever landed in the window between a write and its
+/// durability, the "loses everything not persisted" model would be an unexercised claim and every
+/// restart in this file would be a pause.
+#[test]
+fn a_restarted_node_comes_back_with_only_what_it_had_fsynced() {
+    let mut lost_something = 0u64;
+    let mut total_lost = 0u64;
+    let seeds = sweep_seeds(80);
+    for k in 0..seeds {
+        let seed = SEED_LIVENESS + 200_000 + k;
+        let mut sim = Sim::<Correct>::new(seed, chaos_cfg());
+        let r = sim.run().unwrap_or_else(|v| panic!("seed {seed}:\n{v}"));
+        if r.discarded_entries > 0 {
+            lost_something += 1;
+            total_lost += r.discarded_entries;
+        }
+    }
+    assert!(
+        lost_something > 0,
+        "across {seeds} seeds no crash ever discarded an unfsynced entry, so the crash model never \
+         did the one thing it exists to do"
+    );
+    eprintln!(
+        "crash model: {lost_something} of {seeds} seeds lost unfsynced entries, {total_lost} \
+         entries in total"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real state machine
+// ---------------------------------------------------------------------------------------------
+
+/// The same harness, pointed at the shipped [`Consensus`].
+///
+/// While `election.rs` and `replicate.rs` are `unimplemented!()` this records that fact and says so
+/// out loud. It is **not** `#[ignore]`d: in this repo `#[ignore]` means "known-open defect", and an
+/// ignored test also needs somebody to remember to un-ignore it. This one starts asserting on its
+/// own the moment F1 and F2 land, and until then it insists the panic is the *expected* one — a
+/// half-built handler that panics for some other reason is not the same fact.
+#[test]
+fn the_real_consensus_state_machine_runs_under_this_simulator_the_moment_f1_and_f2_land() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| {
+        let mut sim = Sim::<Consensus>::new(5, SimConfig::healthy(3, 80));
+        sim.run().map(|r| (r, sim.leaders()))
+    });
+    std::panic::set_hook(hook);
+
+    match outcome {
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("not built yet"),
+                "Consensus panicked with {msg:?}, which is not the `unimplemented!(\"... not built \
+                 yet\")` that election.rs and replicate.rs still carry. Either a handler is half \
+                 built, or this test is now hiding a real crash."
+            );
+            eprintln!(
+                "F8: the real Consensus is still unimplemented ({}); the simulator drove it until \
+                 the first handler panicked and will assert on it as soon as F1 and F2 land.",
+                msg.lines().next().unwrap_or("")
+            );
+        }
+        Ok(Ok((report, leaders))) => {
+            assert!(
+                report.elections > 0,
+                "the real Consensus ran 80 ticks on a healthy three-node network and elected \
+                 nobody: {report:?}"
+            );
+            assert_eq!(leaders.len(), 1, "the real Consensus ended with leaders {leaders:?}");
+            assert!(
+                report.committed_rounds > 0,
+                "the real Consensus elected a leader but committed nothing: {report:?}"
+            );
+            eprintln!("F8: the real Consensus is live under the simulator: {report:?}");
+        }
+        Ok(Err(v)) => panic!("the real Consensus violated an invariant:\n{v}"),
+    }
+}
+
+
+
+/// **A send still waiting behind an fsync has not left the machine, and the crash that killed the
+/// machine kills it too.**
+///
+/// This is a rule about the *simulator*, and it is here because the simulator got it wrong. Seed
+/// 1592682576 of a 100 000-seed sweep reported `two leaders in one term` against a state machine
+/// that had done nothing wrong: a node crashed with its vote still queued behind an unfinished
+/// fsync, the vote was delivered anyway and completed one quorum, and the node came back having
+/// forgotten a vote it had never durably cast and completed a second. Delivering that message is
+/// modelling a disk that reports a write it did not keep, and no consensus protocol survives one.
+///
+/// The seed is pinned rather than described: it is the only thing that proves the repair holds.
+#[test]
+fn a_send_still_waiting_on_its_fsync_does_not_survive_the_crash() {
+    let r = Sim::<Correct>::replay(1_592_682_576, chaos_cfg()).unwrap_or_else(|v| {
+        panic!(
+            "the seed that exposed the unsound crash model is failing again. If the rule below \
+             still holds, this is a real protocol defect; if it does not, the simulator has gone \
+             back to letting a crashed node speak.\n{v}"
+        )
+    });
+    assert_eq!(
+        r.unsent_at_crash, 1,
+        "seed 1592682576 is supposed to crash a node with exactly one message queued behind an \
+         unfinished fsync; it destroyed {} instead, so this is no longer the scenario it pins: {r:?}",
+        r.unsent_at_crash
+    );
+
+    let s = sweep::<Correct>(SEED_SAFETY, 400, &chaos_cfg());
+    expect_quiet(&s, "the crash model");
+    assert!(
+        s.totals.unsent_at_crash > 0,
+        "400 seeds never once crashed a node with a message still behind an fsync, so this rule is \
+         not being exercised at all: {:?}",
+        s.totals
+    );
+    eprintln!(
+        "crash model: {} messages destroyed by a crash before they left the machine, over 400 seeds",
+        s.totals.unsent_at_crash
     );
 }

@@ -1,19 +1,20 @@
 # F8 — deterministic simulator
 
 **Done**
-- `src/consensus/sim.rs` — the simulator (one added line in the frozen `mod.rs`: `pub mod sim;`).
-- `src/consensus/tests_sim.rs` — `RefNode` reference Raft + 7 const-generic defects. 17 tests green.
-- Every detector forced to fire and then shown quiet. Two mutants needed scripted scenarios rather
-  than sweeps, and that is measured, not assumed: 400 seeds of chaos never produced figure 8.
-- Contract findings so far: (1) `Consensus` has no log and no way to read one, so `Body::Append`
-  cannot be populated; (2) `mod.rs` exempts every `PreVoteResp` from the later-term rule, and a
-  *refused* one carries a real term — without acting on it a restarted node can deadlock.
+- `src/consensus/sim.rs` + `src/consensus/tests_sim.rs`. 24 tests, all green. One line added to the
+  frozen `mod.rs`: `pub mod sim;`.
+- Safety: 100 000 seeds per property in release — 346 982 elections, 3 013 990 committed rounds,
+  410 028 crashes, zero violations. Default `cargo test` sweeps 2 000 seeds per property.
+- Every detector fired by a deliberate defect and then shown quiet. Figure 8 and the lease are
+  scripted, because 400 seeds of chaos measurably never produce them.
+- Four real defects found, three in the reference machine and ONE IN THE SIMULATOR ITSELF: a node
+  that crashed with a vote still queued behind an unfinished fsync had the vote delivered anyway,
+  which is a lying fsync and reported two leaders in a term against a correct protocol. Seed
+  1592682576 is pinned as a regression test.
 
 **Doing now**
-- The remaining coverage: the pre-vote disruption mutant, liveness (cold start, failover, and the
-  anti-vacuity "a cluster cut in half elects nobody"), the restart-durability test, and the test
-  that drives the real `Consensus` and starts asserting the moment F1/F2 land.
+- Adversarial review in a fresh context, then the summary.
 
 **Next action**
-- Add those tests, clear every `-D dead_code` warning (CI denies it), run the 10k-seed sweep in
-  release, then the full suite.
+- Run the review workflow over sim.rs + tests_sim.rs; fix what it confirms; write
+  `/Users/idide/wt/artie-research/build-F/F8-sim.md`.

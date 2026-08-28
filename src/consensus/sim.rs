@@ -430,6 +430,10 @@ pub struct Report {
     /// crash model never actually took anything away, which makes every "survived a restart" claim
     /// in this file vacuous — so it is asserted on, not merely reported.
     pub discarded_entries: u64,
+    /// Messages a crash destroyed because they were still waiting behind an fsync and had therefore
+    /// not left the machine. See [`Sim::crash`] — a simulator that delivered these reports two
+    /// leaders in one term against a protocol that did nothing wrong.
+    pub unsent_at_crash: u64,
     /// Transitions into [`Role::Leader`].
     pub elections: u64,
     pub proposals: u64,
@@ -459,6 +463,7 @@ impl Report {
         self.one_way_partitions += other.one_way_partitions;
         self.heals += other.heals;
         self.discarded_entries += other.discarded_entries;
+        self.unsent_at_crash += other.unsent_at_crash;
         self.elections += other.elections;
         self.proposals += other.proposals;
         self.refusals += other.refusals;
@@ -669,8 +674,9 @@ pub struct Sim<P: Peer> {
     seq: u64,
     nodes: Vec<Node<P>>,
     /// The wire, keyed by `(delivery unit, sequence)` so that delivery order is total and
-    /// reproducible even when two messages land in the same unit.
-    wire: BTreeMap<(u64, u64), Message>,
+    /// reproducible even when two messages land in the same unit. The value carries the unit at
+    /// which the message actually **left** its sender — see [`Sim::crash`].
+    wire: BTreeMap<(u64, u64), (u64, Message)>,
     /// Directed blocks. `(a, b)` present means nothing from `a` reaches `b`; `(b, a)` absent means
     /// the reverse still works, which is the asymmetric case.
     blocked: BTreeSet<(u32, u32)>,
@@ -903,13 +909,35 @@ impl<P: Peer> Sim<P> {
 
     // -- crash and restart ---------------------------------------------------------------------
 
-    /// `kill -9`: volatile state and unfsynced writes are gone, in-flight fsyncs never complete.
+    /// `kill -9`: volatile state and unfsynced writes are gone, in-flight fsyncs never complete,
+    /// and **anything still waiting behind one of those fsyncs was never sent.**
+    ///
+    /// That last clause is not a refinement, it is the difference between a sound crash model and
+    /// an unsound one, and this simulator had it wrong. The contract makes the caller order
+    /// `PersistHardState` before the `Send` of a vote, so a node that crashes before the fsync
+    /// lands has not spoken. Letting the message escape anyway models a disk that reports a write
+    /// it did not keep — and **no consensus protocol survives a lying fsync**, so every safety
+    /// property becomes unfalsifiable noise.
+    ///
+    /// It was found rather than reasoned about: seed 1592682576 of the 100 000-seed sweep reported
+    /// two leaders in term 2. n4 crashed at unit 1152; its vote for n2, still queued behind an
+    /// unfinished fsync, was delivered at unit 1172 and completed n2's quorum; n4 came back at unit
+    /// 1856 having forgotten a vote it had never durably cast, and won the same term with the other
+    /// two nodes. The protocol was correct throughout. **A simulator's own model is the first thing
+    /// a violation impugns.**
+    ///
+    /// `>= now` rather than `> now` because a crash is processed before the fsyncs of that same
+    /// unit: a completion scheduled for exactly now has not landed yet.
     pub fn crash(&mut self, n: NodeId) {
         let Some(i) = self.node(n) else { return };
         if self.nodes[i].peer.is_none() {
             return;
         }
         self.nodes[i].peer = None;
+        let now = self.now;
+        let before = self.wire.len();
+        self.wire.retain(|_, (released, m)| !(m.from == n && *released >= now));
+        self.report.unsent_at_crash += (before - self.wire.len()) as u64;
         let lost = self.nodes[i].store.log.len() - self.nodes[i].store.durable_len;
         self.report.discarded_entries += lost as u64;
         self.nodes[i].store.crash();
@@ -1095,7 +1123,7 @@ impl<P: Peer> Sim<P> {
             .map(|(k, _)| *k)
             .collect();
         for key in due {
-            let Some(m) = self.wire.remove(&key) else { continue };
+            let Some((_, m)) = self.wire.remove(&key) else { continue };
             let Some(i) = self.node(m.to) else { continue };
             // Checked again at delivery: a partition raised while a message was on the wire eats
             // it, which is what a real cut does to packets already in flight.
@@ -1336,11 +1364,11 @@ impl<P: Peer> Sim<P> {
         }
         let at = release + self.draw(self.cfg.faults.latency);
         self.seq += 1;
-        self.wire.insert((at, self.seq), m.clone());
+        self.wire.insert((at, self.seq), (release, m.clone()));
         if self.draw_pct(self.cfg.faults.dup_pct) {
             let at2 = release + self.draw(self.cfg.faults.latency);
             self.seq += 1;
-            self.wire.insert((at2, self.seq), m);
+            self.wire.insert((at2, self.seq), (release, m));
             self.report.duplicated += 1;
         }
     }
