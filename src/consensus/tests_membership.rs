@@ -3,37 +3,40 @@
 //!
 //! Three things about how these are written.
 //!
-//! **Nothing waits.** Time is `Event::Tick` and the network is a `Vec<Action>`, so an election
-//! storm across a changing configuration is exact rather than probable, and every failure names a
-//! seed.
+//! **Nothing waits.** Time is `Event::Tick` and the network is a `Vec<Action>`, so an election storm
+//! across a changing configuration is exact rather than probable, and every failure names a seed.
 //!
-//! **Every step goes through [`Cluster::step`]**, which records every `RoleChanged` into a
-//! per-term table and re-asserts the one property this row exists to protect on *every* action list
-//! any test here ever produces: **no term ever has two leaders.** A rule checked in one test is a
-//! rule checked on one path, and a membership change is precisely the thing that can produce a
-//! second leader of one term without any node behaving incorrectly.
+//! **Every step in a cluster goes through [`Cluster::step`]**, which records every `RoleChanged`
+//! into a per-term table and re-asserts on *every* action list the property this row exists to
+//! protect: **no term ever has two leaders.** A rule checked in one test is a rule checked on one
+//! path, and a membership change is precisely the thing that can produce a second leader of one term
+//! without any node behaving incorrectly.
 //!
 //! **`replicate.rs` (F2) is `unimplemented!()` on this branch**, so `Event::Persisted`,
 //! `Event::Propose` and any `Append`/`AppendResp` delivered through `step` panic. Two consequences,
 //! both deliberate and both labelled at every site:
 //!
-//! * Appends are **dropped** by the router rather than delivered. That makes these tests strictly
-//!   harsher, not weaker: no node ever hears a heartbeat, so every node believes there is no leader
-//!   and campaigns, which is the worst case for the property above.
-//! * Where a test needs the effect of an append — a peer's `matched` advancing, a leader's
-//!   `commit` advancing, a follower accepting a heartbeat — it writes the field and says which F2
-//!   handler it is standing in for. The membership rules themselves are always driven through
-//!   `plan_change` / `begin_membership` / `note_config_ack` / `note_config_in_log` /
-//!   `apply_committed_config`, never by reaching into `acked` or `cfg`.
+//! * Appends are **dropped** by the router rather than delivered. That makes these tests harsher,
+//!   not weaker: no node ever hears a heartbeat, so every node believes there is no leader and
+//!   campaigns, which is the worst case for the property above.
+//! * Where a test needs the effect of an append — a peer's `matched` advancing, a leader's `commit`
+//!   advancing, a follower accepting a heartbeat — it writes the field and says which F2 handler it
+//!   stands in for. The membership rules themselves are always driven through `plan_change` /
+//!   `begin_membership` / `note_config_in_log` / `note_config_ack` / `note_bootstrap_config`, never
+//!   by reaching into `acked` or `cfg`.
 //!
 //! The election-driving helpers mirror `tests_election.rs`'s because that module's are private to
-//! it; they are the only duplication here and they drive the real protocol rather than modelling it.
+//! it; they are the only duplication here, and they drive the real protocol rather than modelling it.
 
-use super::Change;
+use super::{Change, OwnTermCommitted};
 use crate::consensus::config::{CfgAt, Config};
 use crate::consensus::*;
 use crate::error::FerroError;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Every test that is not *about* rule 3 passes this, so the rule is stated once and the call sites
+/// stay about the rule they are testing.
+const YES: OwnTermCommitted = OwnTermCommitted::Yes;
 
 // ---------------------------------------------------------------- small helpers
 
@@ -58,16 +61,18 @@ fn sends(out: &[Action]) -> Vec<Message> {
         .collect()
 }
 
-/// The reason inside a refusal, so a test can say *which* rule refused without matching on a whole
-/// rendered message.
 fn why(e: &FerroError) -> String {
     match e {
-        FerroError::Constraint(s) => s.clone(),
-        FerroError::Corruption(s) => s.clone(),
+        FerroError::Constraint(s) | FerroError::Corruption(s) => s.clone(),
         other => format!("{other}"),
     }
 }
 
+/// Assert a refusal names the rule that produced it.
+///
+/// Which rule refused is behaviour rather than decoration: "wait for a majority" and "this can never
+/// be valid" call for opposite actions from an operator, and every refusal here is the same
+/// `FerroError` variant, so the reason is the only thing that distinguishes them.
 fn assert_refused(e: &FerroError, naming: &str) {
     assert!(
         why(e).contains(naming),
@@ -85,12 +90,7 @@ fn precampaign(c: &mut Consensus) -> Vec<Action> {
         }
         out.extend(c.step(Event::Tick));
     }
-    assert_ne!(
-        c.role(),
-        Role::Follower,
-        "node {} never left Follower in {budget} ticks",
-        c.id()
-    );
+    assert_ne!(c.role(), Role::Follower, "node {} never left Follower in {budget} ticks", c.id());
     out
 }
 
@@ -101,17 +101,12 @@ fn precampaign(c: &mut Consensus) -> Vec<Action> {
 fn win_election(c: &mut Consensus, granters: &[u32]) -> Vec<Action> {
     let me = c.id().0;
     let mut out = precampaign(c);
-    // A single-voter configuration is its own majority: `start_precampaign` runs straight through
-    // to leader and there is nobody to ask.
+    // A single-voter configuration is its own majority: `start_precampaign` runs straight through to
+    // leader and there is nobody to ask.
     if c.role() == Role::Leader {
         return out;
     }
-    assert_eq!(
-        c.role(),
-        Role::PreCandidate,
-        "node {me} never started a pre-campaign (term {})",
-        c.term()
-    );
+    assert_eq!(c.role(), Role::PreCandidate, "node {me} never pre-campaigned (term {})", c.term());
 
     let asked = c.term() + 1;
     for g in granters {
@@ -133,36 +128,52 @@ fn win_election(c: &mut Consensus, granters: &[u32]) -> Vec<Action> {
     out
 }
 
-/// A leader of `cfg`, elected through the protocol, holding the acknowledgements a cluster that has
-/// never changed its membership holds: **none**.
+/// A leader of a cluster an operator has just started: elected through the protocol, with the
+/// bootstrap configuration's provenance recorded.
 ///
-/// That is not a shortcut. A configuration handed to `Consensus::new` is the operator's assertion
-/// about a cluster they are starting, not a change any leader made, so there is no `Membership`
-/// entry for anybody to have acknowledged — which is exactly the state
-/// `the_first_change_of_a_clusters_life_needs_no_acknowledgement` pins.
+/// `note_bootstrap_config` is not a convenience. Without it the configuration in force has no
+/// recorded provenance and **every** change is refused — see
+/// `a_configuration_with_no_recorded_provenance_refuses_rather_than_permits`.
 fn fresh_leader(id: u32, cfg: Config, seed: u64) -> Consensus {
     let peers: Vec<u32> = cfg.members().iter().map(|m| m.0).filter(|p| *p != id).collect();
     let mut c = Consensus::new(n(id), cfg, seed);
+    c.note_bootstrap_config();
     win_election(&mut c, &peers);
     c
 }
 
-/// A leader whose current configuration arrived as a **committed change**, so the precondition has
-/// something to be satisfied about.
-///
-/// Built by making the change through F5's own surface — plan, begin, the caller's report, the
-/// acknowledgements, then the apply — rather than by writing `cfg` and `acked`, so that a test
-/// resting on it is resting on the code under test.
+/// A node whose configuration came from its log rather than from an operator, elected leader.
+fn leader_from_log(id: u32, cfg: Config, term: Term, seed: u64) -> Consensus {
+    let peers: Vec<u32> = cfg.members().iter().map(|m| m.0).filter(|p| *p != id).collect();
+    let mut c = Consensus::new(n(id), cfg.clone(), seed);
+    let mut out = Vec::new();
+    c.note_config_in_log(cfg, &mut out).expect("what my log holds");
+    c.hard.term = term;
+    win_election(&mut c, &peers);
+    c
+}
+
+/// A leader whose configuration in force arrived as a **change**, made through F5's own surface —
+/// plan, begin, the caller's durability report, a peer's acknowledgement — rather than by writing
+/// `cfg` and `acked`, so a test resting on it rests on the code under test.
 fn leader_after_one_change(seed: u64) -> (Consensus, Config) {
     let mut l = fresh_leader(1, cfg3(), seed);
-    let target = l.plan_change(Change::AddLearner(n(4))).expect("the first change of a cluster's life");
-    l.begin_membership(&target).expect("the first change of a cluster's life");
-    // The caller has fsynced the entry and reports what its log now holds.
-    l.note_config_in_log(target.at());
-    // A majority of the creating set fsyncs it too, which is what commits it.
+    let mut out = Vec::new();
+    let target = l.plan_change(Change::AddLearner(n(4)), YES).expect("the first change");
+    l.begin_membership(&target, YES, &mut out).expect("the first change");
+    // The caller has fsynced the entry and reports what its log now durably holds.
+    l.note_config_in_log(target.clone(), &mut out).expect("a configuration from the log");
+    // A peer fsyncs it too, which is what commits it.
     l.note_config_ack(n(2), target.at());
-    l.apply_committed_config(target.clone()).expect("a committed configuration");
     (l, target)
+}
+
+/// The configuration `cfg` becomes with `id` demoted, built the way `membership.rs` builds it.
+fn demoted_config(cfg: &Config, id: NodeId, term: u64) -> Config {
+    let members = cfg.members().iter().copied().filter(|x| *x != id);
+    let mut learners: Vec<NodeId> = cfg.learners().to_vec();
+    learners.push(id);
+    Config::new(members, cfg.version + 1, term).with_learners(learners)
 }
 
 // ---------------------------------------------------------------- the cluster harness
@@ -173,17 +184,17 @@ struct Cluster {
     nodes: Vec<Consensus>,
     /// Every node that has ever announced itself leader, by the term it announced it in.
     leaders: BTreeMap<Term, BTreeSet<NodeId>>,
-    /// Appends the router dropped, because F2 cannot receive them yet. Counted rather than ignored:
-    /// a router that silently dropped *everything* would make every property here vacuous, and the
-    /// count is what tells a reader the vote traffic really flowed.
+    /// Appends the router dropped, because F2 cannot receive them yet, and vote messages it
+    /// delivered. Counted rather than ignored: a router that silently dropped *everything* would
+    /// make every property here vacuous, and these are what tell a reader the traffic really flowed.
     dropped_appends: usize,
     delivered_votes: usize,
 }
 
 impl Cluster {
     /// `configs[i]` is what node `ids[i]` holds. Different configurations on different nodes is the
-    /// point: the two-leader window a membership change opens exists precisely while some nodes
-    /// have applied the change and others have not.
+    /// point: the two-leader window a membership change opens exists precisely while some nodes hold
+    /// the change and others do not.
     fn new(ids: &[u32], configs: &[Config], seed: u64) -> Self {
         assert_eq!(ids.len(), configs.len());
         let nodes = ids
@@ -206,15 +217,13 @@ impl Cluster {
         self.nodes.iter().find(|c| c.id() == id).expect("no such node")
     }
 
-    /// The only way this file steps a node in a cluster.
+    /// Record every leadership an action list announces, and re-assert that no term has two.
     ///
-    /// **Records every leadership and re-asserts that no term has two.** That is the property a
-    /// membership change threatens, so it is checked on every action list rather than in one test:
-    /// two leaders of one term is not a state any single node can detect, and each of them behaves
-    /// correctly given the configuration it believes in.
-    fn step(&mut self, id: NodeId, ev: Event) -> Vec<Action> {
-        let out = self.at(id).step(ev);
-        for a in &out {
+    /// Two leaders of one term is not a state any single node can detect — each behaves correctly
+    /// given the configuration it believes in — so it is checked on every action list rather than in
+    /// one test.
+    fn record(&mut self, id: NodeId, out: &[Action]) {
+        for a in out {
             if let Action::RoleChanged { role: Role::Leader, term, .. } = a {
                 let holders = self.leaders.entry(*term).or_default();
                 holders.insert(id);
@@ -228,14 +237,19 @@ impl Cluster {
                 );
             }
         }
+    }
+
+    /// The only way this file steps a node in a cluster.
+    fn step(&mut self, id: NodeId, ev: Event) -> Vec<Action> {
+        let out = self.at(id).step(ev);
+        self.record(id, &out);
         out
     }
 
     /// Deliver every message the queue holds, and everything they produce, until it drains.
     ///
     /// `Append`, `AppendResp` and the snapshot bodies are dropped: `replicate.rs` is a stub and
-    /// delivering one panics. Dropping them makes every test here harsher — no node ever hears a
-    /// leader, so every node campaigns.
+    /// delivering one panics.
     fn deliver(&mut self, mut q: VecDeque<Message>) {
         let mut budget = 20_000;
         while let Some(m) = q.pop_front() {
@@ -272,11 +286,9 @@ impl Cluster {
         self.deliver(q);
     }
 
-    /// Let every node try to win, for as long as it takes several campaigns each.
-    ///
-    /// The assertion is inside [`Cluster::step`], so this is a driver and not a test: it exists to
-    /// make the state machine produce as many campaigns as possible against configurations that
-    /// disagree.
+    /// Let every node try to win, for as long as several campaigns each. The assertion lives in
+    /// [`Cluster::record`], so this is a driver: it exists to make the state machine produce as many
+    /// campaigns as possible against configurations that disagree.
     fn election_storm(&mut self, rounds: u32) {
         for _ in 0..rounds {
             self.tick_all();
@@ -286,11 +298,10 @@ impl Cluster {
     /// Stand in for `replicate.rs`: the leader's heartbeat reached every peer and every peer
     /// answered.
     ///
-    /// `Progress::silent` is zeroed (F2 does this on an `AppendResp`, and `mod.rs` documents the
-    /// field as "ticks since this peer last answered, feeding the leader's own lease"), and each
-    /// peer's `since_heard`/`leader` are set (F2 does this on an accepted `Append`). Without it a
-    /// leader's lease dies within `lease` ticks and no test could hold a leader long enough to make
-    /// two membership changes.
+    /// `Progress::silent` is zeroed (F2 does this on an `AppendResp`) and each peer's
+    /// `since_heard`/`leader` are set (F2 does this on an accepted `Append`). Without it a leader's
+    /// lease dies within `lease` ticks and no test could hold a leader long enough to make two
+    /// membership changes.
     fn heartbeat_round(&mut self, leader: u32) {
         let l = n(leader);
         let cfg = self.get(l).config().clone();
@@ -317,248 +328,316 @@ impl Cluster {
     }
 }
 
-// ================================================================ R1: only a leader
+// ================================================================ rule 1: the log, not the apply
+
+#[test]
+fn the_configuration_a_node_counts_against_is_the_newest_in_its_log() {
+    // **The defect this pins is a split brain that no per-term check can see.** Tie the denominator
+    // to a node's *applied* configuration and nothing bounds how far it can lag: a node whose log is
+    // complete through several changes but whose applier is behind counts a majority of the
+    // three-node set the cluster left — two votes — and wins, while the real five-node cluster still
+    // has a leader that hears 3 of 5 and keeps its lease. Two leaders, disjoint quorums, in
+    // DIFFERENT terms, so no per-term uniqueness check anywhere can catch it.
+    //
+    // Tied to the log, the denominator is never staler than what this node's log proves, and the
+    // election restriction does the rest.
+    let five = Config::new([n(1), n(2), n(3), n(4), n(5)], 2, 0);
+    let mut c = Consensus::new(n(1), cfg3(), 71);
+    c.note_bootstrap_config();
+
+    let mut out = Vec::new();
+    c.note_config_in_log(five.clone(), &mut out).expect("a configuration from the log");
+    assert_eq!(c.config(), &five, "the newest configuration in the log was not installed");
+
+    // The observable: the campaign asks the FIVE-node set and needs three of it.
+    let asks = precampaign(&mut c);
+    let asked_peers: Vec<NodeId> = sends(&asks)
+        .iter()
+        .filter(|m| matches!(m.body, Body::PreVote { .. }))
+        .map(|m| m.to)
+        .collect();
+    assert_eq!(
+        asked_peers,
+        vec![n(2), n(3), n(4), n(5)],
+        "the campaign asked {asked_peers:?}: the denominator did not follow the log"
+    );
+
+    // And it needs a majority of five: this node plus TWO grants, where the three-node set it
+    // would have counted against needs this node plus one.
+    let asked = c.term() + 1;
+    c.step(msg(2, 1, asked, Body::PreVoteResp { granted: true }));
+    assert_eq!(
+        c.role(),
+        Role::PreCandidate,
+        "one grant carried a campaign — the denominator is still the three-node cluster's, so this \
+         node would win an election the five-node cluster did not hold"
+    );
+    c.step(msg(3, 1, asked, Body::PreVoteResp { granted: true }));
+    assert_eq!(c.role(), Role::Candidate, "a majority of five did not carry the campaign");
+}
+
+#[test]
+fn a_configuration_report_may_move_down_after_a_truncation_and_a_repeat_is_idempotent() {
+    // A leader appends a change, loses office, and its successor's appends truncate the entry away.
+    // The report must be allowed to move down, or this node counts against a configuration that is
+    // in nobody's log and refuses every change for ever.
+    let mut l = fresh_leader(1, cfg3(), 137);
+    let mut out = Vec::new();
+    let target = l.plan_change(Change::AddLearner(n(4)), YES).unwrap();
+    l.begin_membership(&target, YES, &mut out).unwrap();
+    assert_eq!(l.config(), &target);
+
+    l.note_config_in_log(cfg3(), &mut out).expect("the newest surviving configuration");
+    assert_eq!(l.config(), &cfg3(), "a truncated configuration was not given up");
+
+    // A repeat of the configuration in force is what a recovery replay does: it records durability
+    // and changes nothing else.
+    l.note_config_in_log(cfg3(), &mut out).expect("a replayed configuration");
+    assert_eq!(l.config(), &cfg3());
+    assert_eq!(l.acked.get(&l.id()).copied(), Some(cfg3().at()));
+}
+
+#[test]
+fn a_configuration_that_is_damage_latches_this_node_out_of_office() {
+    // Refusing a configuration with an error alone is a caller obligation with nothing enforcing it,
+    // and a node that goes on counting majorities against a configuration the cluster has left is
+    // the one failure `mod.rs` says nothing later in the protocol can detect. So damage steps the
+    // node down and sets `behind`: it can neither lead nor campaign until it installs a good one.
+    for (label, damaged) in [
+        ("an empty voter set", Config::new(Vec::<NodeId>::new(), 2, 0)),
+        // Same (version, term) as the configuration in force, different members. Acknowledgements
+        // are matched on that pair, so a collision makes a majority of one set count as a majority
+        // of the other.
+        ("a colliding identity", Config::new([n(7), n(8), n(9)], 1, 0)),
+    ] {
+        let mut l = fresh_leader(1, cfg3(), 149);
+        let mut out = Vec::new();
+        let err = l.note_config_in_log(damaged, &mut out).expect_err(label);
+        assert!(matches!(err, FerroError::Corruption(_)), "{label} was not reported as damage: {err}");
+        assert_eq!(l.role(), Role::Follower, "{label} left this node in office");
+        assert!(l.behind, "{label} left this node believing its configuration is the cluster's");
+        assert!(!l.may_campaign(), "{label} left this node able to campaign");
+        assert_eq!(l.config(), &cfg3(), "{label} was installed anyway");
+        assert!(
+            out.iter().any(|a| matches!(a, Action::RoleChanged { role: Role::Follower, .. })),
+            "the step-down was not announced, so the surrounding server would go on serving writes"
+        );
+    }
+}
+
+// ================================================================ provenance
+
+#[test]
+fn a_configuration_with_no_recorded_provenance_refuses_rather_than_permits() {
+    // `acked` is not durable state and there is no recovery constructor, so an empty map is the
+    // state of every node on every restart — it cannot be read as "no change has ever been made".
+    // Permitting here would let a leader that crashed mid-change begin a second one with no
+    // evidence at all about the first. A guard that cannot see its input must ask.
+    let mut bare = Consensus::new(n(1), cfg3(), 11);
+    win_election(&mut bare, &[2, 3]);
+    let err = bare.plan_change(Change::AddLearner(n(4)), YES).unwrap_err();
+    assert_refused(&err, "no recorded provenance");
+    assert!(bare.change_in_flight(), "a configuration with no provenance was reported settled");
+
+    // Either report gives it provenance. The operator's assertion, which starts a cluster:
+    let boot = fresh_leader(1, cfg3(), 11);
+    boot.plan_change(Change::AddLearner(n(4)), YES).expect("a bootstrap cluster cannot grow");
+
+    // Or the log's, which is how a restarted node gets it — and then it waits for evidence like any
+    // other configuration, rather than being exempt.
+    let restored = leader_from_log(1, Config::new([n(1), n(2), n(3)], 4, 2), 2, 11);
+    let err = restored.plan_change(Change::AddLearner(n(4)), YES).unwrap_err();
+    assert_refused(&err, "held durably by 1 of its 3 voters");
+}
+
+// ================================================================ rule 3: the erratum
+
+#[test]
+fn a_membership_change_is_refused_until_this_leader_has_committed_an_entry_of_its_own_term() {
+    // Without this, a leader elected WITHOUT an earlier leader's uncommitted configuration entry
+    // counts against the configuration before it and proposes a different change from there. The two
+    // configurations one step either side of a common parent can have disjoint majorities:
+    // {1,2,3,4}+{5} and {1,2,3,4}+{6} have 3-of-5 majorities {1,2,5} and {3,4,6}, which share
+    // nothing — two leaders of one term, each counting a correct majority of the set it believes in.
+    let l = fresh_leader(1, cfg3(), 23);
+    let err = l.plan_change(Change::AddLearner(n(4)), OwnTermCommitted::NotYet).unwrap_err();
+    assert_refused(&err, "has not committed an entry of its own term");
+    assert_eq!(
+        l.may_change_membership(OwnTermCommitted::NotYet).unwrap_err(),
+        err,
+        "the two entry points disagree about the same rule"
+    );
+
+    // `NotYet` is also the answer a caller that cannot tell must give, so the refusal must not
+    // depend on anything else being wrong: the same call with `Yes` is admitted.
+    l.plan_change(Change::AddLearner(n(4)), YES).expect("an established term was refused");
+
+    // And it is checked on the proposal path too, not only in the planner.
+    let mut m = fresh_leader(1, cfg3(), 23);
+    let target = m.plan_change(Change::AddLearner(n(4)), YES).unwrap();
+    let mut out = Vec::new();
+    let err = m.begin_membership(&target, OwnTermCommitted::NotYet, &mut out).unwrap_err();
+    assert_refused(&err, "has not committed an entry of its own term");
+    assert_eq!(m.config(), &cfg3(), "a refused change was installed anyway");
+}
+
+// ================================================================ only a leader
 
 #[test]
 fn only_a_leader_may_begin_a_membership_change() {
-    // A follower cannot know what is in flight elsewhere, so its answer to "may this change begin"
-    // would be a guess. The refusal is `NotLeader`, which is a redirect rather than a wait.
+    // A follower cannot know what is in flight elsewhere, so its answer would be a guess. The
+    // refusal is `NotLeader`, which is a redirect rather than a wait.
     let mut f = Consensus::new(n(2), cfg3(), 9);
-    let err = f.plan_change(Change::AddLearner(n(4))).unwrap_err();
+    f.note_bootstrap_config();
+    let err = f.plan_change(Change::AddLearner(n(4)), YES).unwrap_err();
     assert_eq!(err, FerroError::NotLeader { leader: None }, "a follower planned a membership change");
-    assert_eq!(
-        f.may_change_membership().unwrap_err(),
-        FerroError::NotLeader { leader: None }
-    );
+    assert_eq!(f.may_change_membership(YES).unwrap_err(), FerroError::NotLeader { leader: None });
     let hand_built = f.config().adding_learner(n(4), 0);
+    let mut out = Vec::new();
     assert_eq!(
-        f.begin_membership(&hand_built).unwrap_err(),
+        f.begin_membership(&hand_built, YES, &mut out).unwrap_err(),
         FerroError::NotLeader { leader: None },
         "a follower began a membership change through the proposal gate"
     );
 
-    // A candidate is not a leader either: its campaign may still lose, and a change begun in a
-    // term nobody won is a change nobody can finish.
+    // A candidate is not a leader either: its campaign may still lose, and a change begun in a term
+    // nobody won is a change nobody can finish.
     let mut c = Consensus::new(n(1), cfg3(), 9);
+    c.note_bootstrap_config();
     precampaign(&mut c);
     c.step(msg(2, 1, c.term() + 1, Body::PreVoteResp { granted: true }));
     assert_eq!(c.role(), Role::Candidate, "the harness did not produce a candidate");
-    assert!(matches!(
-        c.plan_change(Change::AddLearner(n(4))),
-        Err(FerroError::NotLeader { .. })
-    ));
-    assert!(matches!(c.may_change_membership(), Err(FerroError::NotLeader { .. })));
+    assert!(matches!(c.plan_change(Change::AddLearner(n(4)), YES), Err(FerroError::NotLeader { .. })));
 
-    // The mirror, so a rule that simply refuses everything does not pass: a leader may.
+    // The mirror, so a rule that refuses everything does not pass this test.
     let l = fresh_leader(1, cfg3(), 9);
-    l.plan_change(Change::AddLearner(n(4))).expect("a leader could not begin the first change");
-    l.may_change_membership().expect("a leader was told it may not change membership");
+    l.plan_change(Change::AddLearner(n(4)), YES).expect("a leader could not begin the first change");
+    l.may_change_membership(YES).expect("a leader was told it may not change membership");
 }
 
-// ================================================================ R2: nothing in flight
+// ================================================================ rule 2: a majority holds it
 
 #[test]
-fn a_change_is_refused_while_the_previous_one_is_still_in_this_nodes_log() {
+fn a_change_is_refused_until_the_configuration_in_force_is_durable_on_a_majority() {
     let mut l = fresh_leader(1, cfg3(), 21);
-    assert!(!l.change_in_flight(), "a cluster that has changed nothing had a change in flight");
+    assert!(!l.change_in_flight(), "a bootstrap cluster reported a change in flight");
 
-    let first = l.plan_change(Change::AddLearner(n(4))).unwrap();
-    l.begin_membership(&first).expect("the first change");
+    let mut out = Vec::new();
+    let first = l.plan_change(Change::AddLearner(n(4)), YES).unwrap();
+    l.begin_membership(&first, YES, &mut out).expect("the first change");
+    assert_eq!(l.config(), &first, "the leader did not install the configuration it appended");
     assert!(
         l.change_in_flight(),
-        "a change was begun and the leader does not know it is in flight — the window between the \
+        "a change was begun and the leader does not know it is unfinished — the window between the \
          proposal and the caller's report after its fsync is exactly where a second change slips in"
     );
 
-    // The second change is refused, and refused for the right reason.
-    let err = l.plan_change(Change::Remove(n(3))).unwrap_err();
-    assert_refused(&err, "still in this node's log unapplied");
-    // And through the proposal gate too, which is the path a `Command` arriving over a transport
-    // takes: a rule enforced only in the planner is a rule a retry walks around.
-    let hand_built = Config::new([n(1), n(2)], first.version, l.term());
-    assert!(l.begin_membership(&hand_built).is_err(), "an ungated proposal began a second change");
-
-    // The caller's report after its fsync does not clear it — durability is not commitment.
-    l.note_config_in_log(first.at());
-    assert!(l.change_in_flight(), "an fsync was mistaken for a commit");
-    assert!(l.plan_change(Change::Remove(n(3))).is_err());
-
-    // Applying it does, and only then.
-    l.note_config_ack(n(2), first.at());
-    l.apply_committed_config(first.clone()).expect("a committed configuration");
-    assert!(!l.change_in_flight(), "an applied change was still reported in flight");
-    l.plan_change(Change::Promote(n(4))).expect("a change was refused after the previous one applied");
-}
-
-// ================================================================ R3: a majority of the creating set
-
-#[test]
-fn a_change_waits_for_the_previous_one_to_be_durable_on_a_majority_of_the_voters_now_in_force() {
-    let (mut l, first) = leader_after_one_change(33);
-    // `leader_after_one_change` acknowledged node 2, so the precondition holds here. Take it away
-    // by making the next change and applying it with only this node's own acknowledgement, which
-    // is what a leader holds the instant a change commits on a bare majority that does not include
-    // enough of the *new* set.
-    l.note_config_ack(n(3), first.at());
-    let second = l.plan_change(Change::Promote(n(4))).expect("promotion of a caught-up learner");
-    l.begin_membership(&second).unwrap();
-    l.note_config_in_log(second.at());
-    l.apply_committed_config(second.clone()).expect("a committed configuration");
-
-    // Voters are now {1,2,3,4}: a quorum is 3 and only this node is known to hold version 3.
-    assert_eq!(l.config().quorum(), 3);
-    let err = l.plan_change(Change::AddLearner(n(5))).unwrap_err();
-    assert_refused(&err, "durably by 1 of the 4 voters");
-
-    // One more is still not a majority of four.
-    l.note_config_ack(n(2), second.at());
-    assert!(
-        l.plan_change(Change::AddLearner(n(5))).is_err(),
-        "two of four voters was counted as a majority"
+    // The leader does not count ITSELF until its own fsync is reported. An append is not durability,
+    // and the rule that stops a follower acking an unfsynced round applies to this node too.
+    assert_refused(
+        &l.plan_change(Change::Promote(n(4)), YES).unwrap_err(),
+        "held durably by 0 of its 3 voters",
     );
 
-    // Three is.
-    l.note_config_ack(n(3), second.at());
-    l.plan_change(Change::AddLearner(n(5)))
-        .expect("a change was refused although a majority holds the configuration that created it");
-}
-
-#[test]
-fn an_in_flight_change_is_acknowledged_by_a_majority_of_the_set_that_created_it() {
-    // The literal precondition of `DISTRIBUTED.md` §F5, counted in the one state where the creating
-    // set exists to be counted: while the change is in flight, `cfg` still IS the set that created
-    // it, because a configuration takes effect at commit. Once it applies, nothing retains the old
-    // set — which is why `check_precondition` counts the set now in force instead, and why that has
-    // to be the stronger of the two rather than an approximation of it.
-    let mut l = fresh_leader(1, cfg3(), 37);
-    assert_eq!(l.pending_change_is_acknowledged(), None, "a change was in flight before one was made");
-
-    let target = l.plan_change(Change::AddLearner(n(4))).unwrap();
-    l.begin_membership(&target).unwrap();
-    assert_eq!(
-        l.pending_change_is_acknowledged(),
-        Some(false),
-        "a change was acknowledged by a majority the instant it was begun, before any peer had it"
+    l.note_config_in_log(first.clone(), &mut out).expect("the caller's report after its fsync");
+    assert_refused(
+        &l.plan_change(Change::Promote(n(4)), YES).unwrap_err(),
+        "held durably by 1 of its 3 voters",
     );
-    // `None` and `Some(false)` are different answers: "nothing to wait for" and "wait".
     assert!(l.change_in_flight());
 
-    // One of three is not a majority. Two is.
-    l.note_config_ack(n(2), target.at());
-    assert_eq!(l.pending_change_is_acknowledged(), Some(true));
-
-    // A learner cannot make up the number, and neither can a node outside the creating set.
-    let mut m = fresh_leader(1, cfg3(), 38);
-    let t2 = m.plan_change(Change::AddLearner(n(4))).unwrap();
-    m.begin_membership(&t2).unwrap();
-    m.note_config_ack(n(4), t2.at());
-    assert_eq!(
-        m.pending_change_is_acknowledged(),
-        Some(false),
-        "the node being admitted acknowledged its own admission into a majority of the set that \
-         has not yet admitted it"
-    );
-
-    // And once it applies, the question is no longer about the creating set at all.
-    m.note_config_ack(n(2), t2.at());
-    m.apply_committed_config(t2).expect("a committed configuration");
-    assert_eq!(m.pending_change_is_acknowledged(), None);
+    // A majority, and only then.
+    l.note_config_ack(n(2), first.at());
+    assert!(!l.change_in_flight(), "a majority holding the configuration was not counted");
+    l.plan_change(Change::Promote(n(4)), YES).expect("a change was refused after a majority held it");
 }
 
 #[test]
-fn the_first_change_of_a_clusters_life_needs_no_acknowledgement() {
-    // A configuration handed to `Consensus::new` is the operator's assertion about a cluster they
-    // are starting, not a change a leader made: there is no `Membership` entry for anybody to have
-    // acknowledged. Requiring evidence here would refuse the first change for ever, and a cluster
-    // that can never be grown is a worse failure than one that grows slowly.
-    let l = fresh_leader(1, cfg3(), 41);
-    assert!(l.acked.is_empty(), "a bootstrap configuration produced acknowledgements from nowhere");
-    l.plan_change(Change::AddLearner(n(4)))
-        .expect("the first change of a cluster's life was refused, so the cluster can never grow");
+fn a_change_that_grows_the_voter_set_waits_for_a_majority_of_the_larger_set() {
+    // `DISTRIBUTED.md` §F5 says "a majority of the set that created it". The set now in force is
+    // counted instead, because no field retains the creating set — and it is the stronger of the
+    // two, never the weaker: a majority of the new set intersects every majority of the creating
+    // set. This is where the difference shows, and it is also how Raft counts a configuration
+    // entry's commit.
+    let (mut l, first) = leader_after_one_change(33);
+    let mut out = Vec::new();
+    let second = l.plan_change(Change::Promote(n(4)), YES).expect("a caught-up learner");
+    l.begin_membership(&second, YES, &mut out).unwrap();
+    l.note_config_in_log(second.clone(), &mut out).unwrap();
+    assert!(first.at() < second.at(), "versions do not move forward");
+    assert_eq!(l.config().quorum(), 3, "a fourth voter did not enlarge the quorum");
 
-    // And the exemption is exactly once: after that change applies, the next one waits for a
-    // majority, which is what stops the exemption from being a hole.
-    let (l2, _) = leader_after_one_change(41);
-    assert!(!l2.acked.is_empty());
+    // Two of the three voters that created it is a majority of THAT set — and not of the four in
+    // force now, so the next change waits.
+    l.note_config_ack(n(2), second.at());
+    assert_refused(
+        &l.plan_change(Change::AddLearner(n(5)), YES).unwrap_err(),
+        "held durably by 2 of its 4 voters",
+    );
+    // The node just promoted holds it by construction: it was promoted *because* its `matched` had
+    // reached the committed round, so this is a wait of one round-trip and not a stall.
+    l.note_config_ack(n(4), second.at());
+    l.plan_change(Change::AddLearner(n(5)), YES).expect("three of four voters is a majority");
 }
-
-// ================================================================ R4: the (version, term) pair
 
 #[test]
 fn an_acknowledgement_of_another_terms_configuration_of_the_same_version_does_not_count() {
     // Two *different* configurations can both be version 2: one created by a leader of term 3 that
-    // died before committing it, one created by this leader in term 5. A stale acknowledgement of
-    // the first counted toward the second is how the precondition silently stops holding — and then
-    // two changes are in flight over an unacknowledged one, whose first and third sets are two
-    // apart and whose majorities need not intersect.
-    let mut l = Consensus::new(n(1), Config::new([n(1), n(2), n(3)], 2, 4), 55);
-    l.hard.term = 4;
-    win_election(&mut l, &[2, 3]);
-    assert_eq!(l.term(), 5, "the campaign did not land in the term this test is about");
-
-    // The caller reports that the newest configuration in this node's log is the one in force.
-    let held = l.config().at();
-    assert_eq!(held, CfgAt { version: 2, term: 4 });
-    l.note_config_in_log(held);
-    assert!(l.plan_change(Change::AddLearner(n(4))).is_err(), "one of three voters was a majority");
+    // died before committing it, one created by a leader of term 4. A stale acknowledgement of the
+    // first counted toward the second is how the precondition silently stops holding.
+    let held = Config::new([n(1), n(2), n(3)], 2, 4);
+    let mut l = leader_from_log(1, held.clone(), 4, 55);
+    assert_eq!(l.term(), 5);
+    assert_eq!(l.config().at(), CfgAt { version: 2, term: 4 });
 
     // The stale pair: same version, an earlier term. It is a different configuration.
     l.note_config_ack(n(2), CfgAt { version: 2, term: 3 });
-    let err = l.plan_change(Change::AddLearner(n(4))).unwrap_err();
-    assert_refused(&err, "durably by 1 of the 3 voters");
+    assert_refused(
+        &l.plan_change(Change::AddLearner(n(4)), YES).unwrap_err(),
+        "held durably by 1 of its 3 voters",
+    );
 
     // The real one counts.
     l.note_config_ack(n(2), CfgAt { version: 2, term: 4 });
-    l.plan_change(Change::AddLearner(n(4)))
+    l.plan_change(Change::AddLearner(n(4)), YES)
         .expect("an acknowledgement of the configuration in force was not counted");
 }
 
-// ================================================================ R5/R8: who may be counted
-
 #[test]
 fn a_learners_acknowledgement_is_not_counted_toward_a_majority() {
-    // A learner is replicated to and never counted. Counting one here would satisfy the
-    // precondition on the word of a node that cannot vote, so the next change would begin against
-    // a set that has not got the previous one.
-    let mut l = Consensus::new(n(1), Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]), 61);
-    win_election(&mut l, &[2, 3]);
-    let held = l.config().at();
-    l.note_config_in_log(held);
+    // A learner is replicated to and never counted. Counting one here would satisfy the precondition
+    // on the word of a node that cannot vote, so the next change would begin against a set that has
+    // not got the previous one.
+    let held = Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]);
+    let mut l = leader_from_log(1, held.clone(), 0, 61);
+    assert!(l.config().is_known(n(4)) && !l.config().contains(n(4)), "the harness set up no learner");
 
-    l.note_config_ack(n(4), held);
-    assert!(
-        l.config().is_known(n(4)) && !l.config().contains(n(4)),
-        "the harness did not set up a learner"
+    l.note_config_ack(n(4), held.at());
+    assert_refused(
+        &l.plan_change(Change::Demote(n(3)), YES).unwrap_err(),
+        "held durably by 1 of its 3 voters",
     );
-    let err = l.plan_change(Change::Remove(n(3))).unwrap_err();
-    assert_refused(&err, "durably by 1 of the 3 voters");
 
     // A voter's acknowledgement does count, so this is not a rule that refuses everything.
-    l.note_config_ack(n(2), held);
-    l.plan_change(Change::Remove(n(3))).expect("a voter's acknowledgement was not counted");
+    l.note_config_ack(n(2), held.at());
+    l.plan_change(Change::Demote(n(3)), YES).expect("a voter's acknowledgement was not counted");
 }
 
 #[test]
-fn a_removed_members_acknowledgement_is_dropped_when_the_change_that_removed_it_applies() {
+fn a_departed_members_acknowledgement_is_dropped_when_the_change_that_dropped_it_is_installed() {
     // Hygiene rather than safety — the count filters to the current voters, so a stale entry could
     // not be counted anyway. It is here because `acked` is read on every change and a map that
     // accumulates every node a long-lived cluster has ever held is unbounded growth on a hot path.
-    let mut l = Consensus::new(n(1), Config::new([n(1), n(2), n(3), n(4), n(5)], 2, 0), 71);
-    win_election(&mut l, &[2, 3, 4, 5]);
-    let held = l.config().at();
-    l.note_config_in_log(held);
+    let held = Config::new([n(1), n(2), n(3), n(4)], 2, 0).with_learners([n(5)]);
+    let mut l = leader_from_log(1, held.clone(), 0, 71);
     for p in [2, 3, 4, 5] {
-        l.note_config_ack(n(p), held);
+        l.note_config_ack(n(p), held.at());
     }
-    let target = l.plan_change(Change::Remove(n(5))).unwrap();
-    l.begin_membership(&target).unwrap();
-    l.note_config_in_log(target.at());
-    // Node 5 is still a member while the change is in flight, so it can and does acknowledge the
-    // very change that removes it.
-    l.note_config_ack(n(5), target.at());
-    assert!(l.acked.contains_key(&n(5)));
+    assert!(l.acked.contains_key(&n(5)), "a learner's acknowledgement was not recorded at all");
 
-    l.apply_committed_config(target).expect("a committed configuration");
+    let mut out = Vec::new();
+    let target = l.plan_change(Change::Remove(n(5)), YES).expect("removing a learner");
+    l.begin_membership(&target, YES, &mut out).unwrap();
     assert!(
         !l.acked.contains_key(&n(5)),
         "a node in no configuration kept its entry in `acked`: {:?}",
@@ -569,13 +648,29 @@ fn a_removed_members_acknowledgement_is_dropped_when_the_change_that_removed_it_
     assert!(!l.acked.contains_key(&n(5)), "a node outside the configuration was recorded");
 }
 
-// ================================================================ R6: a learner first
+#[test]
+fn a_peers_acknowledgement_never_moves_backwards_and_a_peer_cannot_state_this_nodes() {
+    // An older report is a reordered message, not news. Letting one move an entry down would make a
+    // majority that has been reached un-reach itself, and the change it gated would be refused for
+    // ever.
+    let (mut l, first) = leader_after_one_change(139);
+    l.note_config_ack(n(3), first.at());
+    l.note_config_ack(n(3), CfgAt { version: 1, term: 0 });
+    assert_eq!(l.acked.get(&n(3)).copied(), Some(first.at()), "a reordered report moved a peer back");
+
+    // This node's own entry is a fact about its own log, and only `note_config_in_log` may state it.
+    let mine = l.acked.get(&l.id()).copied();
+    l.note_config_ack(l.id(), CfgAt { version: 99, term: 99 });
+    assert_eq!(l.acked.get(&l.id()).copied(), mine, "a peer report rewrote this node's own record");
+}
+
+// ================================================================ a learner first
 
 #[test]
 fn a_node_being_added_joins_as_a_learner_and_never_straight_as_a_voter() {
     let l = fresh_leader(1, cfg3(), 83);
 
-    let target = l.plan_change(Change::AddLearner(n(4))).unwrap();
+    let target = l.plan_change(Change::AddLearner(n(4)), YES).unwrap();
     assert_eq!(target.members(), cfg3().members(), "an addition moved a voter");
     assert_eq!(target.learners(), [n(4)], "the added node is not a learner");
     assert_eq!(
@@ -585,90 +680,166 @@ fn a_node_being_added_joins_as_a_learner_and_never_straight_as_a_voter() {
          believes they are raising it"
     );
 
-    // `Change` cannot express adding a voter, but a `Command::Membership` arriving over a transport
-    // carries a whole `Config` and can. The proposal gate refuses it.
-    let straight_to_voter = l.config().adding(n(4), l.term());
-    assert!(straight_to_voter.contains(n(4)));
+    // `Change` cannot express adding a voter, but a `Command::Membership` carries a whole `Config`
+    // and can. The proposal gate refuses it.
     let mut l2 = fresh_leader(1, cfg3(), 83);
-    let err = l2.begin_membership(&straight_to_voter).unwrap_err();
-    assert_refused(&err, "joins as a learner");
+    let mut out = Vec::new();
+    let straight_to_voter = l2.config().adding(n(4), l2.term());
+    assert!(straight_to_voter.contains(n(4)));
+    assert_refused(
+        &l2.begin_membership(&straight_to_voter, YES, &mut out).unwrap_err(),
+        "joins as a learner",
+    );
+    assert_eq!(l2.config(), &cfg3(), "a refused change was installed anyway");
 
     // Promoting a node that is in no configuration is the same mistake asked a different way.
-    assert_refused(&l.plan_change(Change::Promote(n(9))).unwrap_err(), "joins as a learner first");
+    assert_refused(&l.plan_change(Change::Promote(n(9)), YES).unwrap_err(), "joins as a learner first");
 }
-
-// ================================================================ R7: promotion needs catch-up
 
 #[test]
 fn a_learner_is_promoted_only_once_it_holds_the_leaders_committed_round() {
     let (mut l, _) = leader_after_one_change(97);
     assert_eq!(l.config().learners(), [n(4)]);
 
-    // Standing in for `replicate.rs`: the leader has committed through round 7 and the learner
-    // holds three of them. `commit` is F2's to advance and `Progress::matched` is F2's to record.
+    // Standing in for `replicate.rs`: the leader has committed through round 7 and the learner holds
+    // three of them. `commit` is F2's to advance and `Progress::matched` is F2's to record.
     l.commit = 7;
-    l.progress.get_mut(&n(4)).expect("apply_config did not open progress for the learner").matched = 3;
+    l.progress.get_mut(&n(4)).expect("apply_config opened no progress for the learner").matched = 3;
 
-    let err = l.plan_change(Change::Promote(n(4))).unwrap_err();
-    assert_refused(&err, "it holds through round 3 and the leader has committed through round 7");
+    assert_refused(
+        &l.plan_change(Change::Promote(n(4)), YES).unwrap_err(),
+        "it holds through round 3 and the leader has committed through round 7",
+    );
     assert_eq!(l.config().quorum(), 2, "a refused promotion moved the quorum anyway");
 
     // Caught up, and only then.
     l.progress.get_mut(&n(4)).unwrap().matched = 7;
-    let target = l.plan_change(Change::Promote(n(4))).expect("a caught-up learner was refused");
+    let target = l.plan_change(Change::Promote(n(4)), YES).expect("a caught-up learner was refused");
     assert!(target.contains(n(4)), "a promotion did not make the learner a voter");
     assert!(target.learners().is_empty(), "a promoted node stayed a learner as well");
     assert_eq!(target.quorum(), 3, "a fourth voter did not enlarge the quorum");
 
-    // The rule is a comparison against this leader's committed round, not "has some rounds": a
-    // cluster whose committed log is empty must still be able to promote, or a new cluster can
-    // never grow. (Same shape as F1's `unjoined` watermark rule, and for the same reason.)
+    // The comparison is against the leader's committed round, not "has some rounds": a cluster that
+    // has committed nothing must still be able to grow, or a new cluster never can. Same shape as
+    // F1's `unjoined` watermark clearing at zero, and for the same reason.
     let (fresh, _) = leader_after_one_change(98);
     assert_eq!(fresh.commit, 0);
     assert_eq!(fresh.progress.get(&n(4)).unwrap().matched, 0);
-    fresh.plan_change(Change::Promote(n(4))).expect("a learner in an empty-log cluster can never be promoted");
+    fresh.plan_change(Change::Promote(n(4)), YES).expect("a new cluster can never promote anybody");
 }
 
 #[test]
 fn a_promotion_is_refused_for_a_node_with_no_replication_progress_at_all() {
-    // Distinct from "behind": no `Progress` entry means the leader has never had a single answer
-    // from that node, so it has no evidence at all. Treating absent evidence as satisfied evidence
-    // is the same defect as counting `next` instead of `matched`.
-    let mut l = Consensus::new(n(1), Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]), 101);
-    win_election(&mut l, &[2, 3]);
+    // Absent evidence is not satisfied evidence — the same defect as counting `next` instead of
+    // `matched`. Unreachable through the public surface (a leader has `progress` for every member of
+    // its configuration), so this pins the DIRECTION of the arm rather than a reachable state: if it
+    // ever becomes reachable, it must refuse.
+    let held = Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]);
+    let mut l = leader_from_log(1, held.clone(), 0, 101);
+    l.note_config_ack(n(2), held.at());
     l.commit = 5;
     l.progress.remove(&n(4));
-    let err = l.plan_change(Change::Promote(n(4))).unwrap_err();
-    assert_refused(&err, "no replication progress at all");
+    assert_refused(
+        &l.plan_change(Change::Promote(n(4)), YES).unwrap_err(),
+        "no replication progress at all",
+    );
 }
 
-// ================================================================ R9: never an empty voter set
+// ================================================================ a demotion before a removal
+
+#[test]
+fn a_voter_is_demoted_before_it_can_be_removed() {
+    // A voter dropped in one step is never told: the leader drops it from `progress` in the same
+    // step, so no further `Append` can reach it, and it keeps a configuration containing itself and
+    // campaigns at a cluster it has left for ever. Demoted first, it receives the configuration that
+    // stops it voting.
+    let mut l = fresh_leader(1, cfg3(), 151);
+    assert_refused(&l.plan_change(Change::Remove(n(3)), YES).unwrap_err(), "demote it to learner first");
+
+    // And on the proposal path, where a hand-built `Config` can express it.
+    let mut out = Vec::new();
+    let dropped_outright = l.config().removing(n(3), l.term());
+    assert_refused(
+        &l.begin_membership(&dropped_outright, YES, &mut out).unwrap_err(),
+        "refused to remove voter n3 in one step",
+    );
+
+    // The demotion is a one-node change, and it shrinks the quorum because a learner is not counted.
+    let demoted = l.plan_change(Change::Demote(n(3)), YES).expect("a voter could not be demoted");
+    assert_eq!(demoted.members(), [n(1), n(2)]);
+    assert_eq!(demoted.learners(), [n(3)]);
+    assert_eq!(demoted.quorum(), 2);
+
+    l.begin_membership(&demoted, YES, &mut out).unwrap();
+    l.note_config_in_log(demoted.clone(), &mut out).unwrap();
+    l.note_config_ack(n(2), demoted.at());
+    // Only now may it go.
+    let gone = l.plan_change(Change::Remove(n(3)), YES).expect("a learner could not be removed");
+    assert_eq!(gone.members(), [n(1), n(2)]);
+    assert!(gone.learners().is_empty());
+}
+
+#[test]
+fn a_demoted_node_can_never_campaign_again() {
+    // This is what the demotion buys, and it is the only mechanism in this row that makes a
+    // departing node harmless by TELLING it rather than by walling it off: a node that is not a voter
+    // in its own configuration fails `may_campaign` for ever.
+    let three = Config::new([n(1), n(2), n(3)], 1, 0);
+    let mut departing = Consensus::new(n(3), three.clone(), 163);
+    departing.note_bootstrap_config();
+    assert!(departing.may_campaign(), "the harness produced a node that could not campaign anyway");
+
+    let mut out = Vec::new();
+    departing
+        .note_config_in_log(demoted_config(&three, n(3), 1), &mut out)
+        .expect("the configuration that demotes it");
+    assert!(
+        !departing.may_campaign(),
+        "a demoted node can still campaign, so telling it it is no longer a voter changes nothing"
+    );
+    // And no number of ticks brings it back: time is not evidence about a configuration.
+    for _ in 0..200 {
+        departing.step(Event::Tick);
+    }
+    assert_eq!(departing.role(), Role::Follower, "a demoted node campaigned on a timer");
+}
+
+#[test]
+fn a_leader_may_not_demote_itself() {
+    // `election.rs` steps a leader down the moment it is not a voter in its own configuration, and
+    // rule 1 installs a configuration when it is APPENDED — so a leader that demoted itself would
+    // lose office before the change could commit, and the change would silently not happen.
+    let l = fresh_leader(1, cfg3(), 167);
+    assert_refused(&l.plan_change(Change::Demote(n(1)), YES).unwrap_err(), "which is this leader");
+    // Promoting itself is refused for the ordinary reason: it is already a voter.
+    assert_refused(&l.plan_change(Change::Promote(n(1)), YES).unwrap_err(), "already a voter");
+}
+
+// ================================================================ never an empty voter set
 
 #[test]
 fn a_change_may_not_leave_a_cluster_with_no_voters() {
-    // An empty voter set has no majority, so no leader can ever be elected — including the one
-    // that would repair it. It is the one membership outcome that cannot be undone by a later
-    // change, which is why it is refused rather than warned about.
+    // An empty voter set has no majority, so no leader can ever be elected — including the one that
+    // would repair it. It is the one membership outcome a later change cannot undo.
+    //
+    // A one-voter cluster's only voter is its leader, and a leader may not demote itself, so that
+    // refusal is what holds the line on the planning path; `check_shape` holds it on the path a
+    // hand-built `Config` takes.
     let mut solo = fresh_leader(1, Config::new([n(1)], 1, 0), 113);
-    let err = solo.plan_change(Change::Remove(n(1))).unwrap_err();
-    assert_refused(&err, "the last voter");
+    assert_refused(&solo.plan_change(Change::Demote(n(1)), YES).unwrap_err(), "which is this leader");
 
-    // And through the proposal gate, which is the path a `Command` takes: `Change` cannot express
-    // an empty configuration, a message can.
     let empty = Config::new(Vec::<NodeId>::new(), solo.config().version + 1, solo.term());
     assert!(empty.is_empty());
-    let err = solo.begin_membership(&empty).unwrap_err();
-    assert_refused(&err, "empty voter set");
+    let mut out = Vec::new();
+    assert_refused(&solo.begin_membership(&empty, YES, &mut out).unwrap_err(), "empty voter set");
     assert_eq!(solo.config().len(), 1, "a refused change moved the configuration anyway");
 
-    // Applying one is damage rather than a decision, so it is `Corruption` and it is refused.
-    let err = solo.apply_committed_config(empty).unwrap_err();
-    assert!(matches!(err, FerroError::Corruption(_)), "an empty voter set was installed: {err}");
-    assert_eq!(solo.config().len(), 1);
-
-    // The mirror: a two-voter cluster may drop to one.
-    let pair = fresh_leader(1, Config::new([n(1), n(2)], 1, 0), 113);
-    pair.plan_change(Change::Remove(n(2))).expect("a two-voter cluster could not shrink");
+    // The mirror: a two-voter cluster may shrink to one, which is a majority of one.
+    let mut pair = fresh_leader(1, Config::new([n(1), n(2)], 1, 0), 113);
+    let demoted = pair.plan_change(Change::Demote(n(2)), YES).expect("a two-voter cluster could not shrink");
+    assert_eq!(demoted.members(), [n(1)]);
+    pair.begin_membership(&demoted, YES, &mut out).unwrap();
+    assert_eq!(pair.config().quorum(), 1);
 }
 
 // ================================================================ the shape of one change
@@ -676,34 +847,32 @@ fn a_change_may_not_leave_a_cluster_with_no_voters() {
 #[test]
 fn a_change_moves_exactly_one_node() {
     // Two nodes apart is the whole hazard: `{1,2,3}` and `{1,2,3,4,5}` have majorities of 2 and 3,
-    // which need not intersect, so `{1,2}` and `{3,4,5}` are two leaders of one term with every
-    // node counting a correct majority of the set it believes in.
+    // which need not intersect, so `{1,2}` and `{3,4,5}` are two leaders of one term with every node
+    // counting a correct majority of the set it believes in.
     let mut l = fresh_leader(1, cfg3(), 127);
     let term = l.term();
+    let v = l.config().version;
+    let mut out = Vec::new();
 
-    let two_at_once = Config::new([n(1), n(2), n(4)], l.config().version + 1, term);
-    let err = l.begin_membership(&two_at_once).unwrap_err();
-    assert_refused(&err, "moves 2 nodes");
+    let two_at_once = Config::new([n(1), n(2), n(4)], v + 1, term);
+    assert_refused(&l.begin_membership(&two_at_once, YES, &mut out).unwrap_err(), "moves 2 nodes");
 
-    // A change that moves nobody is refused too, and not as a harmless no-op: it burns a version
-    // and consumes the precondition that serialises the real ones.
-    let moves_nobody = Config::new([n(1), n(2), n(3)], l.config().version + 1, term);
-    let err = l.begin_membership(&moves_nobody).unwrap_err();
-    assert_refused(&err, "moves 0 nodes");
+    // A change that moves nobody is refused too, and not as a harmless no-op: it burns a version and
+    // consumes the precondition that serialises the real ones.
+    let moves_nobody = Config::new([n(1), n(2), n(3)], v + 1, term);
+    assert_refused(&l.begin_membership(&moves_nobody, YES, &mut out).unwrap_err(), "moves 0 nodes");
 
     // A promotion and an admission in one entry is two changes however it is spelled — which is why
     // the comparison is over each node's *standing* and not over the voter set alone.
-    let mut m = Consensus::new(n(1), Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]), 127);
-    win_election(&mut m, &[2, 3]);
-    m.commit = 0;
-    let promote_and_admit =
-        Config::new([n(1), n(2), n(3), n(4)], 3, m.term()).with_learners([n(5)]);
-    let err = m.begin_membership(&promote_and_admit).unwrap_err();
-    assert_refused(&err, "moves 2 nodes");
+    let held = Config::new([n(1), n(2), n(3)], 2, 0).with_learners([n(4)]);
+    let mut m = leader_from_log(1, held.clone(), 0, 127);
+    m.note_config_ack(n(2), held.at());
+    let promote_and_admit = Config::new([n(1), n(2), n(3), n(4)], 3, m.term()).with_learners([n(5)]);
+    assert_refused(&m.begin_membership(&promote_and_admit, YES, &mut out).unwrap_err(), "moves 2 nodes");
 
     // The mirror: exactly one is accepted.
     let one = l.config().adding_learner(n(4), term);
-    l.begin_membership(&one).expect("a one-node change was refused");
+    l.begin_membership(&one, YES, &mut out).expect("a one-node change was refused");
 }
 
 #[test]
@@ -711,100 +880,42 @@ fn a_change_is_refused_unless_it_is_one_version_and_this_term() {
     let mut l = fresh_leader(1, cfg3(), 131);
     let v = l.config().version;
     let term = l.term();
+    let mut out = Vec::new();
 
     // A version that skips cannot be told from one built against a set this node has never held.
     let skips = Config::new([n(1), n(2), n(3)], v + 2, term).with_learners([n(4)]);
-    assert_refused(&l.begin_membership(&skips).unwrap_err(), "at version");
+    assert_refused(&l.begin_membership(&skips, YES, &mut out).unwrap_err(), "at version");
 
     // A version that repeats is a change built on the set *before* the one in force.
     let repeats = Config::new([n(1), n(2), n(3)], v, term).with_learners([n(4)]);
-    assert_refused(&l.begin_membership(&repeats).unwrap_err(), "at version");
+    assert_refused(&l.begin_membership(&repeats, YES, &mut out).unwrap_err(), "at version");
 
     // An older term is a replay of a change a dead leader began. Counting acknowledgements of it
     // toward this term's change is exactly the ambiguity the (version, term) pair removes.
     let replay = Config::new([n(1), n(2), n(3)], v + 1, term - 1).with_learners([n(4)]);
-    assert_refused(&l.begin_membership(&replay).unwrap_err(), "created in term");
-}
-
-// ================================================================ the seams
-
-#[test]
-fn the_report_of_this_nodes_log_may_move_down_but_never_below_the_applied_configuration() {
-    let (mut l, first) = leader_after_one_change(137);
-    let held = l.config().at();
-    assert_eq!(held, first.at());
-
-    // A change is begun, then the leader loses and regains office and its successor's appends
-    // truncated the entry away. Without the report being allowed to move down, this leader would
-    // believe a change was in flight for ever and refuse every change until it restarted.
-    let next = l.plan_change(Change::Promote(n(4))).unwrap();
-    l.begin_membership(&next).unwrap();
-    assert!(l.change_in_flight());
-    l.note_config_in_log(held);
-    assert!(
-        !l.change_in_flight(),
-        "a truncated `Membership` entry left a leader refusing every change for ever"
-    );
-    l.plan_change(Change::Promote(n(4))).expect("a leader could not recover from a truncation");
-
-    // It may not go below the applied configuration: a committed entry is never truncated, so such
-    // a report cannot be true, and refusing to believe it keeps the guard on the strict side.
-    l.note_config_in_log(CfgAt { version: 0, term: 0 });
-    assert_eq!(
-        l.acked.get(&l.id()).copied(),
-        Some(held),
-        "a report below the applied configuration was believed"
-    );
+    assert_refused(&l.begin_membership(&replay, YES, &mut out).unwrap_err(), "created in term");
+    assert_eq!(l.config(), &cfg3(), "a refused change was installed anyway");
 }
 
 #[test]
-fn a_peers_acknowledgement_never_moves_backwards() {
-    // Durability does not expire, so an older report is a reordered message rather than news.
-    // Letting one move an entry down would make a majority that has been reached un-reach itself,
-    // and the change it gated would be refused for ever.
-    let (mut l, first) = leader_after_one_change(139);
-    l.note_config_ack(n(3), first.at());
-    l.note_config_ack(n(3), CfgAt { version: 1, term: 0 });
-    assert_eq!(l.acked.get(&n(3)).copied(), Some(first.at()), "a reordered report moved a peer back");
-}
-
-#[test]
-fn applying_a_committed_configuration_is_idempotent_and_never_goes_backwards() {
-    let (mut l, first) = leader_after_one_change(149);
-    let held = l.config().at();
-
-    // Idempotent: a caller replaying its committed log on recovery must be able to apply the same
-    // configuration twice without a refusal.
-    let acts = l.apply_committed_config(first.clone()).expect("re-applying the configuration in force");
-    assert!(acts.is_empty(), "re-applying the configuration in force did something: {acts:?}");
-    assert_eq!(l.config().at(), held);
-
-    // Backwards is refused: a configuration is replaced wholesale, so installing an older one moves
-    // the quorum backwards, which is a majority counted against the wrong number.
-    let older = Config::new([n(1), n(2), n(3), n(4), n(5)], held.version - 1, held.term);
-    let err = l.apply_committed_config(older).unwrap_err();
-    assert_refused(&err, "going backwards moves the quorum backwards");
-    assert_eq!(l.config().at(), held, "an older configuration was installed anyway");
-}
-
-#[test]
-fn applying_a_committed_configuration_clears_behind_and_leaves_unjoined_alone() {
+fn installing_a_configuration_clears_behind_and_leaves_unjoined_alone() {
     // F5 must not clear `unjoined` while installing a configuration: knowing the voter set says
-    // nothing about holding a single round of the log, and clearing them together is how a node
-    // added to a running cluster pre-votes on its very next tick holding nothing. The rule is
-    // F1's; this pins that F5's wrapper did not quietly undo it.
+    // nothing about holding a single round of the log, and clearing them together is how a node added
+    // to a running cluster pre-votes on its very next tick holding nothing. The rule is F1's; this
+    // pins that F5's install path did not quietly undo it.
     let mut joiner = Consensus::joining(n(4), 151);
     assert!(joiner.behind && joiner.unjoined);
     let cfg = Config::new([n(1), n(2), n(3)], 2, 1).with_learners([n(4)]);
-    joiner.apply_committed_config(cfg).expect("a joining node could not be told its configuration");
-    assert!(!joiner.behind, "applying a configuration did not clear `behind`");
+    let mut out = Vec::new();
+    joiner.note_config_in_log(cfg, &mut out).expect("a joining node could not be told its configuration");
+    assert!(!joiner.behind, "installing a configuration did not clear `behind`");
     assert!(
         joiner.unjoined,
-        "applying a configuration cleared `unjoined` too — they are cleared by different evidence"
+        "installing a configuration cleared `unjoined` too — they are cleared by different evidence"
     );
 }
 
-// ================================================================ R10: 3 -> 5
+// ================================================================ 3 -> 5
 
 /// The four configurations 3 -> 5 passes through, in order, as one leader would create them.
 fn growth_sequence() -> Vec<Config> {
@@ -824,13 +935,9 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
     cl.nodes.push(Consensus::joining(n(4), 4001));
     cl.nodes.push(Consensus::joining(n(5), 5001));
 
-    // A leader, elected through real vote traffic.
+    cl.at(n(1)).note_bootstrap_config();
     let out = win_election(cl.at(n(1)), &[2, 3]);
-    for a in &out {
-        if let Action::RoleChanged { role: Role::Leader, term, .. } = a {
-            cl.leaders.entry(*term).or_default().insert(n(1));
-        }
-    }
+    cl.record(n(1), &out);
     assert_eq!(cl.get(n(1)).role(), Role::Leader);
 
     let expected_quorums = [2usize, 2, 3, 3, 3];
@@ -846,8 +953,8 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
     for (i, change) in changes.into_iter().enumerate() {
         cl.heartbeat_round(1);
 
-        // A learner is promoted only once it holds the leader's committed round. Standing in for
-        // F2: replication has carried everything committed to the node about to be promoted.
+        // A learner is promoted only once it holds the leader's committed round. Standing in for F2:
+        // replication has carried everything committed to the node about to be promoted.
         if let Change::Promote(p) = change {
             let commit = cl.get(n(1)).commit;
             cl.at(n(1)).progress.get_mut(&p).expect("no progress for the learner").matched = commit;
@@ -855,7 +962,7 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
 
         let target = cl
             .at(n(1))
-            .plan_change(change)
+            .plan_change(change, YES)
             .unwrap_or_else(|e| panic!("change {i} ({change}) was refused: {e}"));
         assert_eq!(
             target,
@@ -863,83 +970,55 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
             "change {i} ({change}) did not produce the configuration 3 -> 5 passes through"
         );
 
-        cl.at(n(1)).begin_membership(&target).unwrap_or_else(|e| panic!("gate refused {change}: {e}"));
-        // The caller fsyncs and reports what its log holds.
-        let at = target.at();
-        cl.at(n(1)).note_config_in_log(at);
-
-        // **The next change must be refused right here**, whatever it is — this is the precondition
-        // doing its job in the middle of a real sequence rather than in a unit test of itself.
-        assert!(
-            cl.at(n(1)).plan_change(Change::AddLearner(n(9))).is_err(),
-            "a second change was admitted while {change} was still in flight"
-        );
-
-        // A majority of the set that created it fsyncs the entry. Standing in for F2: the caller
-        // sees each peer's `matched` cover the entry's round and reports the configuration it
-        // therefore holds. Exactly a majority and no more, so that the creating-set count is
-        // measured at the boundary rather than swamped.
-        let creating = cl.get(n(1)).config().clone();
-        assert_eq!(
-            cl.get(n(1)).pending_change_is_acknowledged(),
-            Some(false),
-            "{change} was acknowledged by a majority of its creating set before any peer held it"
-        );
-        let mut acked = 1; // this node
-        for p in creating.members().iter().copied().filter(|p| *p != n(1)) {
-            if acked >= creating.quorum() {
-                break;
-            }
-            cl.at(n(1)).note_config_ack(p, at);
-            acked += 1;
-        }
-        assert_eq!(
-            cl.get(n(1)).pending_change_is_acknowledged(),
-            Some(true),
-            "{change} reached a majority of the {} voters that created it and was not counted",
-            creating.len()
-        );
-
-        // It commits, and every node that holds the entry applies it — including the node being
-        // admitted, which is how it learns it is a member at all.
-        let holders: Vec<NodeId> = cl.nodes.iter().map(|c| c.id()).collect();
-        for h in holders {
-            cl.at(h)
-                .apply_committed_config(target.clone())
-                .unwrap_or_else(|e| panic!("node {h} could not apply {change}: {e}"));
-        }
+        let mut out = Vec::new();
+        cl.at(n(1))
+            .begin_membership(&target, YES, &mut out)
+            .unwrap_or_else(|e| panic!("the gate refused {change}: {e}"));
+        cl.record(n(1), &out);
+        assert_eq!(cl.get(n(1)).config(), &target, "the leader did not install what it appended");
         assert_eq!(
             cl.get(n(1)).config().quorum(),
             expected_quorums[i + 1],
             "after {change} the quorum is wrong, which is a majority counted against the wrong number"
         );
-        assert!(!cl.at(n(1)).change_in_flight());
 
-        // **A change that grew the voter set is not finished when it commits.** The majority that
-        // committed it was a majority of the smaller set that created it, so the next change waits
-        // until a majority of the LARGER set is known to hold it — which is the strengthening the
-        // module header argues for, happening here in the middle of a real sequence.
-        let now = cl.get(n(1)).config().clone();
-        let holders = now
-            .members()
-            .iter()
-            .filter(|m| cl.get(n(1)).acked.get(m).is_some_and(|a| *a >= at))
-            .count();
-        if !now.has_quorum(holders) {
+        // **The next change must be refused right here**, whatever it is — the precondition doing its
+        // job in the middle of a real sequence rather than in a unit test of itself.
+        assert!(
+            cl.at(n(1)).plan_change(Change::AddLearner(n(9)), YES).is_err(),
+            "a second change was admitted while {change} was still unacknowledged"
+        );
+
+        // The caller fsyncs and reports, then replication carries the entry to a majority of the
+        // voters now in force — exactly a majority and no more, so the count is measured at its
+        // boundary rather than swamped.
+        cl.at(n(1)).note_config_in_log(target.clone(), &mut out).expect("the caller's report");
+        let voters: Vec<NodeId> = target.members().to_vec();
+        let quorum = target.quorum();
+        for (k, p) in voters.iter().copied().filter(|p| *p != n(1)).enumerate() {
+            if k + 2 > quorum {
+                break;
+            }
             assert!(
-                cl.at(n(1)).plan_change(Change::AddLearner(n(9))).is_err(),
-                "after {change} the voter set grew to {} and only {holders} are known to hold \
-                 version {}, yet the next change was admitted",
-                now.len(),
-                at.version
+                cl.at(n(1)).change_in_flight(),
+                "{change} was reported settled before a majority held it"
             );
+            cl.at(n(1)).note_config_ack(p, target.at());
         }
-        // Replication continues, and every node that holds the entry is reported. This is not a
-        // convenience: the node just promoted was promoted *because* its `matched` had reached the
-        // committed round, so it holds this entry, and a test that never reported it would be
-        // measuring a stall that the real system does not have.
-        for p in now.members().iter().copied().filter(|p| *p != n(1)) {
-            cl.at(n(1)).note_config_ack(p, at);
+        assert!(!cl.at(n(1)).change_in_flight(), "a majority holding {change} was not counted");
+
+        // Every node that receives the entry installs it — including the node being admitted, which
+        // is how it learns it is a member at all.
+        let all: Vec<NodeId> = cl.nodes.iter().map(|c| c.id()).collect();
+        for h in all {
+            if h == n(1) {
+                continue;
+            }
+            let mut o = Vec::new();
+            cl.at(h)
+                .note_config_in_log(target.clone(), &mut o)
+                .unwrap_or_else(|e| panic!("node {h} could not install {change}: {e}"));
+            cl.record(h, &o);
         }
     }
 
@@ -948,9 +1027,14 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
     assert!(final_cfg.learners().is_empty());
     assert_eq!(final_cfg.quorum(), 3);
     assert_eq!(cl.get(n(1)).role(), Role::Leader, "the leader did not survive its own growth");
+    // The nodes that joined hold the cluster's configuration and are voters in it — and are still
+    // `unjoined`, because holding a configuration says nothing about holding the log. That is F1's
+    // rule, and this is the composite state F5 hands it.
+    for j in [4, 5] {
+        assert_eq!(cl.get(n(j)).config(), &final_cfg, "node {j} was never told the configuration");
+        assert!(cl.get(n(j)).unjoined, "node {j} may campaign holding none of the log");
+    }
 
-    // No term ever had two leaders. `Cluster::step` asserts this on every step; this is the same
-    // claim stated once at the end so a reader does not have to trust a helper.
     for (term, holders) in &cl.leaders {
         assert_eq!(holders.len(), 1, "term {term} had leaders {holders:?}");
     }
@@ -958,14 +1042,15 @@ fn three_grows_to_five_one_node_at_a_time_and_each_change_waits_for_the_last() {
 
 #[test]
 fn no_term_elects_two_leaders_while_the_configuration_is_changing_underneath() {
-    // **The two-leader window is when some nodes have applied a change and others have not**, so
-    // that is what this builds: every adjacent pair in the 3 -> 5 sequence, at every split of the
-    // cluster between the old configuration and the new one, driven by an election storm in which
-    // every node campaigns for real. Appends are dropped, so no node believes a leader exists and
-    // every node campaigns on every window — the harshest case for the property.
+    // **The two-leader window is when some nodes hold a change and others do not**, so that is what
+    // this builds: every adjacent pair in the 3 -> 5 sequence, at every split of the cluster between
+    // the old configuration and the new one, driven by an election storm in which every node
+    // campaigns for real. Appends are dropped, so no node believes a leader exists and every node
+    // campaigns on every window — the harshest case for the property.
     let seq = growth_sequence();
     let mut storms = 0;
     let mut elections = 0;
+    let mut dropped = 0;
     for seed in [1u64, 2, 3, 5, 8, 13, 21] {
         for pair in seq.windows(2) {
             let (old, new) = (&pair[0], &pair[1]);
@@ -983,20 +1068,19 @@ fn no_term_elects_two_leaders_while_the_configuration_is_changing_underneath() {
                 v
             };
             for split in 0..=ids.len() {
-                let configs: Vec<Config> = ids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| if i < split { new.clone() } else { old.clone() })
+                let configs: Vec<Config> = (0..ids.len())
+                    .map(|i| if i < split { new.clone() } else { old.clone() })
                     .collect();
                 let mut cl = Cluster::new(&ids, &configs, seed);
                 cl.election_storm(60);
                 storms += 1;
                 elections += cl.leaders.values().map(|s| s.len()).sum::<usize>();
+                dropped += cl.dropped_appends;
                 for (term, holders) in &cl.leaders {
                     assert_eq!(
                         holders.len(),
                         1,
-                        "seed {seed}, split {split}, {} -> {}: term {term} elected {holders:?}",
+                        "seed {seed}, split {split}, v{} -> v{}: term {term} elected {holders:?}",
                         old.version,
                         new.version
                     );
@@ -1008,42 +1092,53 @@ fn no_term_elects_two_leaders_while_the_configuration_is_changing_underneath() {
     assert!(storms >= 100, "only {storms} storms ran");
     assert!(
         elections >= storms,
-        "only {elections} leaderships across {storms} storms — the storm is not electing anybody, \
-         so the property holds over an empty record"
+        "only {elections} leaderships across {storms} storms — the storm is not electing anybody, so \
+         the property holds over an empty record"
     );
+    assert!(dropped > 0, "no leader ever heartbeated, so no leader ever took office");
 }
 
-// ================================================================ R11: a removed node
+// ================================================================ a removed node
 
 #[test]
 fn a_removed_node_that_keeps_running_cannot_disrupt_the_cluster() {
-    // Node 5 is removed and never finds out: nobody replicates to it any more, so it never applies
-    // the change that removed it and it keeps its old five-node configuration for ever.
+    // Two protections, and they are different. A node that was TOLD (demoted) can never campaign
+    // again — F5's own mechanism, in `a_demoted_node_can_never_campaign_again`. A node that was never
+    // told is walled off instead, by F1's pre-vote and the election restriction, and this is that
+    // composite: F5's part is that the leader stops tracking it and stops counting it, so it cannot
+    // contribute to any majority either.
     let five = Config::new([n(1), n(2), n(3), n(4), n(5)], 2, 0);
-    let mut cl = Cluster::new(&[1, 2, 3, 4, 5], &vec![five.clone(); 5], 17);
+    let cfgs = vec![five.clone(); 5];
+    let mut cl = Cluster::new(&[1, 2, 3, 4, 5], &cfgs, 17);
 
-    let out = win_election(cl.at(n(1)), &[2, 3, 4, 5]);
-    for a in &out {
-        if let Action::RoleChanged { role: Role::Leader, term, .. } = a {
-            cl.leaders.entry(*term).or_default().insert(n(1));
-        }
+    for id in [1, 2, 3, 4, 5] {
+        let mut o = Vec::new();
+        cl.at(n(id)).note_config_in_log(five.clone(), &mut o).unwrap();
     }
+    let out = win_election(cl.at(n(1)), &[2, 3, 4, 5]);
+    cl.record(n(1), &out);
     let term_before = cl.get(n(1)).term();
-
-    // Remove node 5, and apply it everywhere EXCEPT on node 5.
-    cl.at(n(1)).note_config_in_log(five.at());
     for p in [2, 3, 4, 5] {
         cl.at(n(1)).note_config_ack(n(p), five.at());
     }
-    let target = cl.at(n(1)).plan_change(Change::Remove(n(5))).expect("removing a voter");
-    cl.at(n(1)).begin_membership(&target).unwrap();
-    cl.at(n(1)).note_config_in_log(target.at());
+
+    // Demote node 5 and then drop it, and let nobody tell node 5 — the case the pre-vote wall is for.
+    let mut out = Vec::new();
+    let demoted = cl.at(n(1)).plan_change(Change::Demote(n(5)), YES).expect("demoting a voter");
+    cl.at(n(1)).begin_membership(&demoted, YES, &mut out).unwrap();
+    cl.at(n(1)).note_config_in_log(demoted.clone(), &mut out).unwrap();
     for p in [2, 3] {
-        cl.at(n(1)).note_config_ack(n(p), target.at());
+        cl.at(n(1)).note_config_ack(n(p), demoted.at());
     }
-    for h in [1, 2, 3, 4] {
-        cl.at(n(h)).apply_committed_config(target.clone()).expect("a committed configuration");
+    for h in [2, 3, 4] {
+        let mut o = Vec::new();
+        cl.at(n(h)).note_config_in_log(demoted.clone(), &mut o).unwrap();
+        cl.record(n(h), &o);
     }
+    let gone = cl.at(n(1)).plan_change(Change::Remove(n(5)), YES).expect("removing a learner");
+    cl.at(n(1)).begin_membership(&gone, YES, &mut out).unwrap();
+    cl.at(n(1)).note_config_in_log(gone.clone(), &mut out).unwrap();
+    cl.record(n(1), &out);
     assert_eq!(cl.get(n(1)).config().members(), [n(1), n(2), n(3), n(4)]);
     assert_eq!(cl.get(n(5)).config().members(), [n(1), n(2), n(3), n(4), n(5)], "node 5 was told");
 
@@ -1052,10 +1147,8 @@ fn a_removed_node_that_keeps_running_cannot_disrupt_the_cluster() {
     assert!(!cl.get(n(1)).progress.contains_key(&n(5)), "the leader still tracks a removed node");
     assert!(!cl.get(n(1)).acked.contains_key(&n(5)), "the leader still counts a removed node");
 
-    // (i) With the leader alive, node 5 campaigns into a wall. Its pre-votes are refused by every
-    //     node that is still being served, so **the cluster's term never rises** — which is the
-    //     disruption. Pre-vote is what makes this true; F5's part is that node 5 is no longer
-    //     replicated to, so it is the one node whose leader has gone quiet.
+    // (i) With the leader alive, node 5 campaigns into a wall: every node still being served refuses
+    //     its pre-vote, so **the cluster's term never rises** — which is the disruption.
     for _ in 0..40 {
         cl.heartbeat_round(1);
         let out = cl.step(n(5), Event::Tick);
@@ -1068,14 +1161,14 @@ fn a_removed_node_that_keeps_running_cannot_disrupt_the_cluster() {
             term_before,
             "a removed node raised node {id}'s term, which deposes a leader that never stopped working"
         );
-        assert!(cl.get(n(id)).role() != Role::Candidate);
     }
     assert_eq!(cl.get(n(1)).role(), Role::Leader, "a removed node deposed a healthy leader");
     assert!(cl.get(n(5)).term() <= term_before, "a removed node raised its own term for real");
+    assert!(cl.delivered_votes > 0, "node 5 never asked anybody for anything");
 
-    // (ii) And with the leader gone, it still cannot win, because it has not been replicated to:
-    //      the election restriction refuses a candidate whose log is less complete than the
-    //      voter's. Standing in for F2: the cluster committed rounds while node 5 was out.
+    // (ii) And with the leader gone it still cannot win, because it has not been replicated to: the
+    //      election restriction refuses a candidate whose log is less complete than the voter's.
+    //      Standing in for F2: the cluster committed rounds while node 5 was out.
     for id in [1, 2, 3, 4] {
         let c = cl.at(n(id));
         c.last_term = c.term();
@@ -1094,26 +1187,5 @@ fn a_removed_node_that_keeps_running_cannot_disrupt_the_cluster() {
         cl.get(n(5)).role(),
         Role::Leader,
         "a removed node holding {stale} rounds was elected leader of a cluster that has 12"
-    );
-}
-
-#[test]
-fn a_leader_that_removes_itself_stops_leading_when_the_change_commits() {
-    // Allowed, and it is the ordinary way an operator retires the node that happens to lead. The
-    // step-down is F1's `apply_config`; what F5 owes is that the change is admissible at all and
-    // that it is one node.
-    let mut l = Consensus::new(n(1), Config::new([n(1), n(2), n(3)], 2, 0), 163);
-    win_election(&mut l, &[2, 3]);
-    l.note_config_in_log(l.config().at());
-    let at = l.config().at();
-    l.note_config_ack(n(2), at);
-    let target = l.plan_change(Change::Remove(n(1))).expect("a leader could not retire itself");
-    l.begin_membership(&target).unwrap();
-    l.note_config_in_log(target.at());
-    let acts = l.apply_committed_config(target).expect("a committed configuration");
-    assert_eq!(l.role(), Role::Follower, "a leader voted out of its own configuration kept leading");
-    assert!(
-        acts.iter().any(|a| matches!(a, Action::RoleChanged { role: Role::Follower, .. })),
-        "the step-down was not announced, so the surrounding server would go on serving writes: {acts:?}"
     );
 }
