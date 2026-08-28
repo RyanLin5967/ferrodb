@@ -390,3 +390,56 @@ fn an_index_follows_its_column_across_the_renames_a_merge_applies() {
     d.sql("INSERT INTO inv VALUES (2, 20);");
     d.sql("DELETE FROM inv WHERE id = 2;");
 }
+
+// -------------------------------------------------------------------------------------------
+// RULE: a merge cannot narrow a row and retype the column behind it in the SAME merge, and the
+// refusal says which order works.
+//
+// This is the one behaviour the fix takes away, pinned here rather than left to be discovered.
+// A merge decides its schema edits against the target as it stands when the merge begins, because
+// the heap rewrite is unlogged and cannot be decided against a heap that is still moving —
+// publishing first and deciding after is precisely what E82 was. So a narrowing this same merge is
+// carrying has not landed when the edit is judged, and re-running the merge refuses identically
+// forever unless the refusal says what to do instead.
+//
+// Two merges do work, and the second half of this test is what makes that a fact rather than an
+// assumption: an `UPDATE` supersedes the wide version rather than leaving it in the main heap, so
+// once the narrowing has landed the retype has nothing left to refuse.
+// -------------------------------------------------------------------------------------------
+#[test]
+fn narrowing_a_row_and_retyping_behind_it_takes_two_merges_and_the_refusal_says_so() {
+    let w = width_the_retype_pushes_over();
+    let big = "x".repeat(w);
+    let mut d = db();
+    d.sql(WIDE);
+    d.sql("INSERT INTO t VALUES (1, 100, 'small', 'small');");
+    d.sql(&format!("INSERT INTO t VALUES (2, 200, '{big}', '{big}');"));
+
+    let mut both = d.branch("agent-both");
+    d.exec("UPDATE t SET a = 'small', b = 'small' WHERE id = 2;", &mut both)
+        .expect("narrow on the branch");
+    d.exec(RETYPE, &mut both).expect("stage the retype behind it");
+    let e = d.exec("MERGE;", &mut both).err().expect("one merge cannot do both");
+    let msg = e.to_string();
+    eprintln!("--- refusal = {msg}");
+    assert!(
+        msg.contains("the narrowing has to reach the target first"),
+        "the refusal gave a statement's advice to a merge, which cannot act on it: {msg}"
+    );
+    assert_eq!(d.shape("t")[1].1, DataType::Integer, "the refused merge retyped anyway");
+    assert_eq!(
+        d.rows("SELECT a FROM t WHERE id = 2;")[0][0],
+        Value::Varchar(big.clone()),
+        "the refused merge published the narrowing anyway"
+    );
+
+    // The order the refusal names.
+    let mut narrow = d.branch("agent-narrow");
+    d.exec("UPDATE t SET a = 'small', b = 'small' WHERE id = 2;", &mut narrow).expect("narrow");
+    d.exec("MERGE;", &mut narrow).expect("the narrowing merges on its own");
+    let mut retype = d.branch("agent-retype");
+    d.exec(RETYPE, &mut retype).expect("stage the retype");
+    d.exec("MERGE;", &mut retype).expect("and now the retype merges");
+    assert_eq!(d.shape("t")[1].1, DataType::BigInt, "the two-merge path did not land");
+    assert_eq!(d.rows("SELECT n FROM t WHERE id = 1;")[0][0], Value::BigInt(100));
+}

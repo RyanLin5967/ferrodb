@@ -423,6 +423,14 @@ pub fn refuse_if_too_wide(
     )))
 }
 
+/// The sentence every row-width refusal ends with.
+///
+/// Exported so a caller can recognise its OWN refusal coming back out of a plan without matching
+/// on the rest of the prose — `AgentRuntime::merge` appends what the advice means inside a merge,
+/// and a caller testing for a marker that is built from this same constant cannot drift from the
+/// message that carries it.
+pub const NARROW_THE_ROW_FIRST: &str = "Narrow the row first";
+
 /// How many bytes `values` occupies once written under `schema`.
 ///
 /// One definition of the measurement, so [`prepare_rewrite`] and [`refuse_if_too_wide`] cannot
@@ -948,9 +956,9 @@ fn prepare_rewrite(
              {MAX_TUPLE_SIZE} bytes a tuple can occupy: {which} would become {widest} bytes. \
              Nothing has been written — the rewrite converts the heap in place and is not logged, \
              so it is refused before the first tuple moves rather than abandoned part way \
-             through, which would leave rows in the new shape under the old schema. Narrow the row \
-             first (shorten an oversized VARCHAR with UPDATE, or move the wide column into its own \
-             table) and run the ALTER again."
+             through, which would leave rows in the new shape under the old schema. \
+             {NARROW_THE_ROW_FIRST} (shorten an oversized VARCHAR with UPDATE, or move the wide \
+             column into its own table) and run the ALTER again."
         )));
     }
 

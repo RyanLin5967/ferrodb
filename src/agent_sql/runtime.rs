@@ -23,7 +23,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use crate::catalog::alter::{conform_row, refuse_if_too_wide, resulting_schema, AlterPlan};
+use crate::catalog::alter::{
+    conform_row, refuse_if_too_wide, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
+};
 use crate::execution::executor::alteration_of;
 use crate::parser::parser::AlterAction;
 use crate::agent_sql::changeset::{
@@ -2743,7 +2745,10 @@ impl AgentRuntime {
                 continue;
             }
             let actions: Vec<AlterAction> = report.to_apply.iter().map(|e| e.as_action()).collect();
-            let plan = ctx.catalog.plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))?;
+            let plan = ctx
+                .catalog
+                .plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))
+                .map_err(in_a_merge_the_narrowing_comes_first)?;
             plans.push((i, plan));
         }
 
@@ -3729,6 +3734,36 @@ fn numeric(v: &Value) -> Option<i64> {
         Value::Float(f) if f.is_finite() => Some(*f as i64),
         _ => None,
     }
+}
+
+/// The row-width refusal, told what it means inside a `MERGE`.
+///
+/// `catalog::alter`'s message ends "Narrow the row first ... and run the ALTER again". That is
+/// complete advice for a statement and incomplete advice for a merge, and the difference is not
+/// cosmetic: a merge decides its schema edits against the target **as it stands when the merge
+/// begins**, so a narrowing `UPDATE` this same merge is carrying has not reached the target yet and
+/// re-running the merge refuses identically, forever. The narrowing has to land in a merge of its
+/// own first.
+///
+/// That is a consequence of deciding before writing rather than an oversight, and it is the price
+/// of the whole row: the heap rewrite is unlogged, so a merge's schema edits have to be decided
+/// against a heap that is not moving underneath them, and the only heap that is not moving is the
+/// one before this merge publishes anything. Publishing first and deciding after is what E82 was.
+///
+/// Recognised through the marker `catalog::alter` exports rather than by matching its prose, and
+/// every other error is passed through untouched.
+fn in_a_merge_the_narrowing_comes_first(e: FerroError) -> FerroError {
+    let msg = e.to_string();
+    if !msg.contains(NARROW_THE_ROW_FIRST) {
+        return e;
+    }
+    FerroError::Constraint(format!(
+        "{msg} Inside a MERGE the narrowing has to reach the target first: merge the UPDATE that \
+         shortens the row, then merge the schema edit. This merge's own rows have not been \
+         published yet — a merge decides its schema edits against the target as it stands when it \
+         begins, because the heap rewrite is unlogged and cannot be decided against a heap that is \
+         still moving."
+    ))
 }
 
 /// Fault injection for crash-safety testing (D8). **Inert unless `FERRODB_CRASH_AFTER_ROWS` is
