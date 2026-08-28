@@ -1568,17 +1568,49 @@ mod tests {
         f
     }
 
+    /// `frames_for` sorts by `(seq, txn_id)`, and `SurfaceMerger::diff` depends on that order —
+    /// it concatenates ops in the order the log hands them back and does not re-sort.
+    ///
+    /// **The fixture is deliberately asymmetric.** The first version of this test appended seq 5
+    /// then seq 2 and asserted `[2, 5]`, which a mutant that replaced the sort with `out.reverse()`
+    /// passed: reversing a two-element append order happens to sort it. It is asserted three ways
+    /// now — three frames whose append order is neither the sorted order nor its reverse, the
+    /// `txn_id` tie-break at equal `seq`, and `from_seq` filtering — because the tie-break is the
+    /// ONE that matters in production: `AgentRuntime` pins `seq` to 0 for every frame it writes, so
+    /// on the SQL path the whole ordering is by `txn_id` and nothing covered it at all.
     #[test]
     fn frames_come_back_in_sequence_order_per_branch() {
         let log = MemEffectLog::new();
+        // Append order 5, 2, 9: sorted is [2, 5, 9] and reversed-append is [9, 2, 5], so neither
+        // append order nor its reverse can pass.
         log.append(&decrement(2, 1, 5, 1)).unwrap();
         log.append(&decrement(1, 1, 2, 1)).unwrap();
+        log.append(&decrement(4, 1, 9, 1)).unwrap();
         log.append(&decrement(3, 2, 1, 1)).unwrap();
 
         let b1 = log.frames_for(BranchId::new(1, 0), 0).unwrap();
-        assert_eq!(b1.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![2, 5]);
+        assert_eq!(b1.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![2, 5, 9]);
         assert_eq!(log.frames_for(BranchId::new(2, 0), 0).unwrap().len(), 1);
-        assert_eq!(log.frames_for(BranchId::new(1, 0), 3).unwrap().len(), 1);
+        assert_eq!(log.frames_for(BranchId::new(1, 3), 0).unwrap().len(), 0);
+        assert_eq!(log.frames_for(BranchId::new(1, 0), 3).unwrap().len(), 2, "from_seq stopped filtering");
+
+        // The tie-break, which is the entire ordering on the SQL path: every frame at seq 0,
+        // appended 3, 1, 2, must come back 1, 2, 3.
+        let flat = MemEffectLog::new();
+        for txn in [3u64, 1, 2] {
+            flat.append(&decrement(txn, 7, 0, 1)).unwrap();
+        }
+        assert_eq!(
+            flat
+                .frames_for(BranchId::new(7, 0), 0)
+                .unwrap()
+                .iter()
+                .map(|f| f.txn_id.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "frames at one seq are not ordered by txn_id, so SurfaceMerger::diff concatenates ops \
+             in whatever order they were appended"
+        );
     }
 
     #[test]

@@ -100,7 +100,16 @@ MUTANTS = [
      ["frames_come_back_in_sequence_order_per_branch"]),
 
     # --- the rules the adversarial pass added ----------------------------------------------------
-    ("read-error-swallowed-as-end-of-file", LOG,
+    # Two entries, one per read site. The scan reads the length prefix and then the record body at
+    # the SAME offset, so a single mutant reverting one of them is killed by a test that only
+    # exercises the other — which is exactly what happened: the body-read mutant survived until the
+    # test started breaking both.
+    ("read-error-swallowed-as-end-of-file--length-prefix", LOG,
+     "            read_or_refuse(file, &mut len_buf, offset, name)?;",
+     "            if pread_all(file, &mut len_buf, offset).is_err() { break offset; }",
+     ["a_read_error_mid_file_refuses_the_open_and_destroys_nothing"]),
+
+    ("read-error-swallowed-as-end-of-file--record-body", LOG,
      "            read_or_refuse(file, &mut rec, offset, name)?;",
      "            if pread_all(file, &mut rec, offset).is_err() { break offset; }",
      ["a_read_error_mid_file_refuses_the_open_and_destroys_nothing"]),
@@ -240,11 +249,23 @@ def main():
             rows.append((name, "KILLED" if ok else "SURVIVED", verdicts))
             print(f"[{name}] {'KILLED' if ok else 'SURVIVED'}  {verdicts}")
         finally:
+            # **`shutil.move` is a rename, so it restores the BACKUP's mtime — which `shutil.copy`
+            # set before the mutated build ran.** The restored source is then OLDER than the test
+            # binary and cargo skips the rebuild, so every later run measures the mutant while the
+            # tree reads as clean. Measured: after one restore, log.rs was 17:59:23 and the binary
+            # 17:59:29, and `cargo test --lib tel::log` reported 28 passed / 1 failed against
+            # source that git said matched HEAD. That is a stale run reporting as a real result,
+            # which is the one failure mode this whole script exists to avoid.
             shutil.move(path + ".orig", path)
+            os.utime(path, None)
 
     after = run("timeout 900 cargo test --lib tel::log 2>&1")
     a = after.stdout + after.stderr
-    print("restored: " + [l for l in a.splitlines() if "test result:" in l][-1])
+    line = [l for l in a.splitlines() if "test result:" in l]
+    print("restored: " + (line[-1] if line else "NO VERDICT LINE"))
+    if "test result: ok" not in a:
+        print("REFUSING: the tree does not pass after the restore; do not trust the verdicts above.")
+        return 2
     if run("git status --porcelain -- src/ tests/").stdout.strip():
         print("WARNING: the tree is dirty after the run; a restore did not complete.")
         return 2

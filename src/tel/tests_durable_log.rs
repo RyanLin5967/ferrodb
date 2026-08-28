@@ -914,6 +914,34 @@ fn a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out() {
     assert!(text.contains("one too deep"), "the refusal did not name the predicate: {text}");
     assert!(text.contains(&MAX_GUARD_DEPTH.to_string()), "{text}");
     assert_eq!(log.len(), 1, "the refused frame reached the index");
+
+    // **And the refusal does not WALK the tree it is refusing.**
+    //
+    // `Guard::violated_predicate` falls back to `expr.to_string()` when there is no source text,
+    // and `GuardExpr`'s `Display` is recursive — so building the message that way would recurse over
+    // the whole tree on the one input the cap exists to protect against, which is a stack overflow
+    // reached through the refusal path. The observable form of "does not walk it" is that the
+    // message does not contain the rendered expression, and a synthesised guard is the only case
+    // where the two differ.
+    let mut synthesised = TxnFrame::new(TxnId(3), b(1), CommitHash::ZERO, 0, 1);
+    synthesised.push_guard(Guard::new(nest(MAX_GUARD_DEPTH + 1), Value::Boolean(true)));
+    let err = log.append(&synthesised).expect_err("a synthesised guard past the cap was written");
+    let text = format!("{err}");
+    assert!(
+        text.contains("synthesised") && text.contains("no source text"),
+        "the refusal did not say the guard carries no source: {text}"
+    );
+    assert!(
+        !text.contains("NOT"),
+        "the refusal rendered the expression it was refusing, so it walked the whole tree: {} \
+         chars of message",
+        text.len()
+    );
+    assert!(
+        text.len() < 400,
+        "the refusal is {} chars long, which is the rendered tree rather than a message",
+        text.len()
+    );
     drop(log);
 
     let log = open_on(&fabric.restart()).unwrap();
@@ -1307,14 +1335,20 @@ fn a_failed_append_leaves_a_store_that_still_works_and_a_file_that_still_opens()
 struct FailOneRead {
     bytes: Mutex<Vec<u8>>,
     fail_at: u64,
+    /// Which read at that offset to break. **The scan reads the 4-byte length prefix and then the
+    /// whole record at the SAME offset**, so an offset alone names two reads and only ever reaches
+    /// the first — a mutant that reverted just the second one survived until this field existed.
+    /// `Some(4)` breaks the length prefix, `Some(n)` the body, `None` either.
+    fail_len: Option<usize>,
     reads_failed: Mutex<usize>,
 }
 
 impl FailOneRead {
-    fn new(bytes: Vec<u8>, fail_at: u64) -> Arc<Self> {
+    fn new(bytes: Vec<u8>, fail_at: u64, fail_len: Option<usize>) -> Arc<Self> {
         Arc::new(FailOneRead {
             bytes: Mutex::new(bytes),
             fail_at,
+            fail_len,
             reads_failed: Mutex::new(0),
         })
     }
@@ -1332,7 +1366,7 @@ impl crate::storage::storage::Storage for FailOneRead {
     }
 
     fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        if offset == self.fail_at {
+        if offset == self.fail_at && self.fail_len.is_none_or(|n| n == buf.len()) {
             *self.reads_failed.lock().unwrap() += 1;
             return Err(std::io::Error::other("simulated media error: EIO"));
         }
@@ -1389,25 +1423,42 @@ fn a_read_error_mid_file_refuses_the_open_and_destroys_nothing() {
     let offsets = record_offsets(&image);
     assert_eq!(offsets.len(), 3, "expected three records to have something to lose");
 
-    // Fail the read of the SECOND record's length prefix. Records one and three are untouched.
-    let media = FailOneRead::new(bytes.clone(), offsets[1] as u64);
-    let err = DurableEffectLog::with_storage(TEL, Arc::clone(&media) as Arc<dyn Storage>)
-        .expect_err("a read error was healed into a torn tail");
-    let text = format!("{err}");
-    assert!(text.contains("refuses to open"), "it failed, but not by this guard: {text}");
-    assert!(text.contains("EIO"), "the refusal did not carry the underlying error: {text}");
-    assert_eq!(*media.reads_failed.lock().unwrap(), 1, "the fault did not fire");
+    // The scan performs TWO reads at each record's offset — the 4-byte length prefix, then the
+    // whole record — so **both** have to be broken, one at a time. Breaking only the first leaves
+    // the second unexercised, and a mutant that reverted the second read alone survived until this
+    // loop existed.
+    let second_total =
+        u32::from_be_bytes(bytes[offsets[1]..offsets[1] + 4].try_into().unwrap()) as usize;
+    for (what, fail_len) in
+        [("the length prefix", 4usize), ("the record body", second_total)]
+    {
+        let media = FailOneRead::new(bytes.clone(), offsets[1] as u64, Some(fail_len));
+        let err = DurableEffectLog::with_storage(TEL, Arc::clone(&media) as Arc<dyn Storage>)
+            .err()
+            .unwrap_or_else(|| panic!("a read error on {what} was healed into a torn tail"));
+        let text = format!("{err}");
+        assert!(
+            text.contains("refuses to open"),
+            "{what}: it failed, but not by this guard: {text}"
+        );
+        assert!(
+            text.contains("EIO"),
+            "{what}: the refusal did not carry the underlying error: {text}"
+        );
+        assert_eq!(*media.reads_failed.lock().unwrap(), 1, "{what}: the fault did not fire");
 
-    // **Nothing was destroyed.** Byte for byte, the file is what it was.
-    assert_eq!(
-        *media.bytes.lock().unwrap(),
-        bytes,
-        "the refused open truncated the file anyway, so the records after the bad sector are gone"
-    );
+        // **Nothing was destroyed.** Byte for byte, the file is what it was.
+        assert_eq!(
+            *media.bytes.lock().unwrap(),
+            bytes,
+            "{what}: the refused open truncated the file anyway, so the records after the bad \
+             sector are gone"
+        );
+    }
 
     // And the healthy media still opens and still holds everything, which is what proves the
     // refusal was about the read and not about the file.
-    let healthy = FailOneRead::new(bytes, u64::MAX);
+    let healthy = FailOneRead::new(bytes, u64::MAX, None);
     let log = DurableEffectLog::with_storage(TEL, healthy as Arc<dyn Storage>).unwrap();
     assert_eq!(log.recovery().frames, 2);
     assert_eq!(log.recovery().extensions, 1);
