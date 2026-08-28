@@ -1130,7 +1130,20 @@ impl DurableEffectLog {
         let name = name.into();
         let len = file.len().map_err(|e| FerroError::Io(format!("{name}: {e}")))?;
         let mem = MemEffectLog::new();
-        let (recovery, end) = if len == 0 {
+        // **The boundary is `<=` and not `== 0`, and the reason is a torn first write.**
+        //
+        // The very first thing a brand-new log does is write its 12-byte header, and a crash that
+        // tears that leaves a few bytes and no records at all. Refusing there would brick a log over
+        // a file that has never held anything. The boundary is exact rather than generous: records
+        // begin at `HEADER_SIZE`, so a file no longer than the header cannot contain a byte of any
+        // frame, and initialising over it can lose nothing. A file *longer* than the header might,
+        // and `replay` refuses a bad header there rather than reinitialising over effects a merge
+        // was computed from. `consensus::log` draws the same line for the same reason.
+        //
+        // No `set_len` first, and that is provable rather than hopeful: this arm is only reached
+        // when the file is at most `HEADER_SIZE` bytes and the write below is exactly `HEADER_SIZE`
+        // bytes at offset 0, so every byte a torn earlier attempt left is overwritten.
+        let (recovery, end) = if len <= HEADER_SIZE {
             // Written and fsynced before a single record may be appended. A header that is not
             // durable when the records above it are is a log that reopens as empty.
             pwrite_all(&*file, &header_bytes(), 0)?;
@@ -1149,22 +1162,18 @@ impl DurableEffectLog {
         mem: &MemEffectLog,
         name: &str,
     ) -> Result<(RecoveryReport, u64), FerroError> {
-        if len < HEADER_SIZE {
-            // A file shorter than its own header is either a torn first write or somebody else's
-            // file. It cannot hold a byte of any record — records begin at `HEADER_SIZE` — so
-            // there is nothing to lose by refusing, and refusing is what keeps a mistyped path
-            // from being reinitialised over.
-            return Err(FerroError::Corruption(format!(
-                "{name} is {len} bytes, too short to hold a typed effect log header"
-            )));
-        }
+        debug_assert!(
+            len > HEADER_SIZE,
+            "with_storage initialises a file this short rather than replaying it"
+        );
         let mut header = [0u8; HEADER_SIZE as usize];
         pread_all(file, &mut header, 0)?;
         if crc32(&header[0..8]) != u32::from_be_bytes(header[8..12].try_into().unwrap()) {
             return Err(FerroError::Corruption(format!(
-                "{name}'s header fails its own checksum. Refusing rather than reading it as a fresh \
-                 log: an empty effect log and a damaged one both answer 'no frames' for every \
-                 branch, and only one of them is a fact about this database."
+                "{name}'s header fails its own checksum, and the file is {len} bytes — room for \
+                 records. Refusing rather than reinitialising over them: an empty effect log and a \
+                 damaged one both answer 'no frames' for every branch, and only one of those is a \
+                 fact about this database."
             )));
         }
         if u32::from_be_bytes(header[0..4].try_into().unwrap()) != MAGIC {

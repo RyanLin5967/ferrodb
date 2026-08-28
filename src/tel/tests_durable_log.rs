@@ -757,12 +757,30 @@ fn a_foreign_file_and_a_damaged_header_are_both_refused() {
     }
     refuse(image, "version 99");
 
-    // A file too short to hold a header at all.
+    // **A file too short to hold a header is REINITIALISED, not refused**, and that boundary is
+    // exact rather than generous. The very first thing a new log does is write its 12-byte header,
+    // so a crash that tears that write leaves a few bytes and no records; refusing there would
+    // brick a log over a file that has never held anything. Records begin at `HEADER_SIZE`, so
+    // nothing can be lost by writing over a file no longer than it.
+    for short in [1usize, 3, HEADER_SIZE as usize] {
+        let mut image = BTreeMap::new();
+        image.insert(TEL.to_string(), vec![0u8; short]);
+        let fabric = SimFabric::from_images(image, None, Durability::SyncOnly);
+        let log = open_on(&fabric)
+            .unwrap_or_else(|e| panic!("a {short}-byte file was refused instead of initialised: {e}"));
+        assert_eq!(log.len(), 0);
+        log.append(&decrement(1, 1, 0, 1, 5)).unwrap();
+        drop(log);
+        let log = open_on(&fabric.restart()).unwrap();
+        assert_eq!(log.recovery().frames, 1, "the reinitialised log did not keep its first frame");
+    }
+
+    // One byte PAST the header is where the refusal starts, because that byte could be a record's.
     let mut image = BTreeMap::new();
-    image.insert(TEL.to_string(), vec![0u8; 3]);
+    image.insert(TEL.to_string(), vec![0u8; HEADER_SIZE as usize + 1]);
     let fabric = SimFabric::from_images(image, None, Durability::SyncOnly);
-    let err = open_on(&fabric).expect_err("a 3-byte file was opened");
-    assert!(format!("{err}").contains("too short"), "{err}");
+    let err = open_on(&fabric).expect_err("a garbage file with room for a record was opened");
+    assert!(format!("{err}").contains("room for"), "{err}");
 
     // Anti-vacuity: an absent file is created, not refused.
     let fresh = SimFabric::clean(Durability::SyncOnly);
@@ -898,78 +916,103 @@ fn a_crash_at_any_point_during_an_append_loses_nothing_already_acknowledged() {
         total += sweep_an_append(durability);
     }
     // A sweep that collected nothing has not passed.
-    assert!(total >= 8, "the sweep ran only {total} points, so it tested almost nothing");
+    assert!(total >= 40, "the sweep ran only {total} points, so it tested almost nothing");
 }
 
 fn sweep_an_append(durability: Durability) -> usize {
     const SEED: u64 = 0xF10;
 
-    // A starting image from a normal, fault-free run: one three-statement task, acknowledged.
-    let fabric = SimFabric::clean(durability);
-    {
-        let log = open_on(&fabric).unwrap();
-        log.append(&grown(7, 1, 0, &[(1, 5)])).unwrap();
-        log.append(&grown(7, 1, 0, &[(1, 5), (2, 3)])).unwrap();
-        log.append(&decrement(8, 1, 1, 9, 4)).unwrap();
-    }
-    let base = fabric.restart().durable_image();
+    // The workload: everything a fresh log does. The header write and its fsync, one `FrameOpen`,
+    // two `FrameExtend`s as the task grows, and a second transaction — so the fault lands at every
+    // operation of a real agent task rather than only inside one append.
+    let workload = |log: &DurableEffectLog| -> Vec<usize> {
+        let mut acked = Vec::new();
+        for (n, rows) in [
+            (1usize, &[(1u64, 5i64)][..]),
+            (2, &[(1, 5), (2, 3)][..]),
+            (3, &[(1, 5), (2, 3), (3, 2)][..]),
+        ] {
+            if log.append(&grown(7, 1, 0, rows)).is_err() {
+                return acked;
+            }
+            acked.push(n);
+        }
+        if log.append(&decrement(8, 1, 1, 9, 4)).is_ok() {
+            acked.push(99);
+        }
+        acked
+    };
 
-    // Census: the same next append with no fault, to learn which operation indices are faultable.
-    let census = SimFabric::from_images(base.clone(), None, durability);
+    // Census: the same workload with no fault, from an EMPTY fabric, to learn every faultable
+    // operation index — the header's included.
+    let census = SimFabric::clean(durability);
     let l = open_on(&census).unwrap();
-    let mark = census.op_count();
-    l.append(&grown(7, 1, 0, &[(1, 5), (2, 3), (3, 2)])).unwrap();
+    assert_eq!(workload(&l).len(), 4, "the census run did not complete under {durability:?}");
     drop(l);
-    let points: Vec<u64> = census.faultable_ops().into_iter().filter(|i| *i >= mark).collect();
-    assert!(!points.is_empty(), "no faultable operation in an append under {durability:?}");
+    let points = census.faultable_ops();
+    assert!(
+        points.len() >= 6,
+        "only {} faultable ops in a whole task under {durability:?}",
+        points.len()
+    );
 
     let mut ran = 0usize;
     for at in points {
         for shape in [WriteShape::Drop, WriteShape::Tear, WriteShape::Corrupt] {
-            let f =
-                SimFabric::from_images(base.clone(), Some(FaultPlan::at_shaped(at, SEED, shape)), durability);
-            let broken = open_on(&f).unwrap();
-            let outcome = broken.append(&grown(7, 1, 0, &[(1, 5), (2, 3), (3, 2)]));
-            let fired = f.fired();
+            let f = SimFabric::with_fault(FaultPlan::at_shaped(at, SEED, shape), durability);
             let where_ = format!("{durability:?} seed {SEED:#x} at op {at} shape {shape:?}");
+            // The fault can land on the header write, so opening is itself allowed to fail.
+            let acked = match open_on(&f) {
+                Ok(log) => {
+                    let acked = workload(&log);
+                    drop(log);
+                    acked
+                }
+                Err(_) => Vec::new(),
+            };
+            let fired = f.fired();
             assert!(fired.is_some(), "{where_}: no fault fired, so this point tested nothing");
-            assert!(outcome.is_err(), "{where_}: an append survived its own crash");
-            drop(broken);
 
             let restarted = f.restart();
             let after = match open_on(&restarted) {
                 Ok(a) => a,
                 Err(e) => panic!("{where_} ({:?}) left a log that will not open: {e}", fired.unwrap()),
             };
-            // Everything acknowledged before the crash is still there, byte for byte.
-            let held = after.frame(b(1), TxnId(7)).expect("the acknowledged frame is gone");
-            assert_eq!(
-                after.frame(b(1), TxnId(8)).map(|f| exactly(&f)),
-                Some(exactly(&decrement(8, 1, 1, 9, 4))),
-                "{where_} ({:?}) lost a frame that had been acknowledged",
-                fired.clone().unwrap()
-            );
-            // And the interrupted append is all-or-nothing: two ops (it never landed) or three (it
-            // did). Never one, and never four.
+
+            // **Everything acknowledged is still there, and nothing that was not is invented.**
+            let held = after.frame(b(1), TxnId(7));
+            let ops = held.as_ref().map(|f| f.ops.len()).unwrap_or(0);
+            let highest = acked.iter().copied().filter(|n| *n <= 3).max().unwrap_or(0);
             assert!(
-                held.ops.len() == 2 || held.ops.len() == 3,
-                "{where_} ({:?}) left the frame holding {} ops, so an append landed in part",
-                fired.clone().unwrap(),
-                held.ops.len()
-            );
-            let expect = if held.ops.len() == 2 {
-                grown(7, 1, 0, &[(1, 5), (2, 3)])
-            } else {
-                grown(7, 1, 0, &[(1, 5), (2, 3), (3, 2)])
-            };
-            assert_eq!(
-                exactly(&held),
-                exactly(&expect),
-                "{where_} ({:?}) changed an op it had already stored",
+                ops >= highest,
+                "{where_} ({:?}) came back with {ops} ops after {highest} statements had been \
+                 acknowledged",
                 fired.clone().unwrap()
             );
+            // All-or-nothing per append: never half of a statement's effects, because half of a
+            // statement's effects is a counter a merge will get wrong and never notice.
+            assert!(ops <= 3, "{where_} ({:?}) invented ops: {ops}", fired.clone().unwrap());
+            if let Some(f7) = &held {
+                let rows: Vec<(u64, i64)> = [(1u64, 5i64), (2, 3), (3, 2)][..ops].to_vec();
+                assert_eq!(
+                    exactly(f7),
+                    exactly(&grown(7, 1, 0, &rows)),
+                    "{where_} ({:?}) changed effects it had already stored",
+                    fired.clone().unwrap()
+                );
+            }
+            if acked.contains(&99) {
+                assert_eq!(
+                    after.frame(b(1), TxnId(8)).map(|f| exactly(&f)),
+                    Some(exactly(&decrement(8, 1, 1, 9, 4))),
+                    "{where_} ({:?}) lost an acknowledged frame",
+                    fired.clone().unwrap()
+                );
+            }
             // The log still works after the crash it survived.
-            after.append(&decrement(9, 1, 2, 4, 1)).unwrap();
+            after.append(&decrement(10, 1, 2, 4, 1)).unwrap_or_else(|e| {
+                panic!("{where_} ({:?}) left a log that refuses appends: {e}", fired.unwrap())
+            });
             ran += 1;
         }
     }
