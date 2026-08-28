@@ -63,6 +63,29 @@
 //! digest of two runs of one seed, and its anti-vacuity twin requires two *different* seeds to
 //! disagree — a digest that is constant would pass the first test and prove nothing.
 //!
+//! # What this simulator does NOT model, stated rather than left to be discovered
+//!
+//! A guard whose blind spots are undocumented is one whose silence means nothing.
+//!
+//! * **Snapshots.** [`Store`] requires rounds contiguous from 1 and refuses a write that leaves a
+//!   hole, so a node whose log begins above `snapshot_round` is outside the model. `Body::Append`
+//!   and `Body::InstallSnapshot` are routed to the state machine either way, but nothing here
+//!   checks a snapshot install. F6 extends this file; until then the properties are asserted for
+//!   clusters whose logs still begin at round 1.
+//! * **Membership changes.** The configuration is fixed for the life of a run. A
+//!   `Command::Membership` in the log is carried like any other command and changes nothing about
+//!   who the simulator counts. F5 extends this file.
+//! * **Torn or lying writes.** The crash model loses the unfsynced suffix whole. It does not tear a
+//!   record, corrupt one, or keep a write that was reported as failed — and, deliberately, it does
+//!   **not** lose a write that was reported as succeeding. That last one is not an omission: no
+//!   consensus protocol survives a lying fsync, so injecting one produces violations that say
+//!   nothing about the protocol. `storage/sim.rs` is where that class of fault belongs, and
+//!   `log.rs` (F0b) is where the two meet.
+//! * **Byzantine behaviour.** Every node here runs the same code and tells the truth as it knows
+//!   it. A peer that lies is F7's problem and is refused at the transport, before the state machine.
+//! * **Message corruption and partial frames.** The wire carries whole `Message` values; framing is
+//!   F3's.
+//!
 //! # Relationship to `storage/sim.rs`
 //!
 //! That file is the other simulator: a durable-IO fabric that faults individual writes. It is not
@@ -418,6 +441,14 @@ pub struct Report {
     pub dropped_loss: u64,
     pub dropped_down: u64,
     pub duplicated: u64,
+    /// Duplicates that actually arrived. `duplicated` counts copies put on the wire; a copy dropped
+    /// by a partition tested nothing, so the two numbers are reported separately.
+    pub duplicates_delivered: u64,
+    /// Deliveries that arrived after a later-sent message on the same directed link. Named in
+    /// `DISTRIBUTED.md` §F8 alongside drops and duplication, and reported because reorder here is
+    /// an *emergent* consequence of independent latency draws rather than an injected fault — the
+    /// kind of thing that quietly stops happening when a constant is changed.
+    pub reordered: u64,
     pub crashes: u64,
     pub restarts: u64,
     pub partitions: u64,
@@ -445,6 +476,12 @@ pub struct Report {
     pub max_overlap_ticks: u32,
     /// Order-sensitive hash of every event in the run. Equal digests mean identical runs.
     pub digest: u64,
+    pub overpromoted: u64,
+    pub overpromote_events: u64,
+    pub noop_cuts: u64,
+    pub phantom_survivors: u64,
+    pub phantom_crashes: u64,
+    pub blind_acks: u64,
 }
 
 impl Report {
@@ -457,6 +494,8 @@ impl Report {
         self.dropped_loss += other.dropped_loss;
         self.dropped_down += other.dropped_down;
         self.duplicated += other.duplicated;
+        self.duplicates_delivered += other.duplicates_delivered;
+        self.reordered += other.reordered;
         self.crashes += other.crashes;
         self.restarts += other.restarts;
         self.partitions += other.partitions;
@@ -470,6 +509,12 @@ impl Report {
         self.committed_rounds += other.committed_rounds;
         self.max_term = self.max_term.max(other.max_term);
         self.max_overlap_ticks = self.max_overlap_ticks.max(other.max_overlap_ticks);
+        self.overpromoted += other.overpromoted;
+        self.overpromote_events += other.overpromote_events;
+        self.noop_cuts += other.noop_cuts;
+        self.phantom_survivors += other.phantom_survivors;
+        self.phantom_crashes += other.phantom_crashes;
+        self.blind_acks += other.blind_acks;
         self.digest ^= other.digest.rotate_left((other.seeds % 64) as u32);
     }
 }
@@ -490,13 +535,18 @@ pub struct Sweep {
 // ---------------------------------------------------------------------------------------------
 
 /// One scheduled fsync completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It carries the hard state **by value** rather than a flag saying "and take whatever is pending".
+/// With two `PersistHardState` actions outstanding, a flag lets the first completion install the
+/// second one's value — a write landing before it was issued, which is not a fault a disk has.
+#[derive(Debug, Clone, PartialEq)]
 struct Flush {
     at: u64,
     /// Log length this flush makes durable.
     len: usize,
-    /// Whether it also carries the pending hard state.
-    hard: bool,
+    /// REVIEW: what `len` would be if truncations clamped in-flight flushes.
+    honest: usize,
+    hard: Option<HardState>,
 }
 
 /// The bytes a node would still have after `kill -9`.
@@ -514,6 +564,7 @@ struct Store {
     log: Vec<Entry>,
     /// `log[..durable_len]` has reached the disk. The rest is lost on a crash.
     durable_len: usize,
+    honest_durable_len: usize,
     flushes: VecDeque<Flush>,
     last_flush_at: u64,
 }
@@ -594,6 +645,8 @@ impl Store {
                 }
                 self.log.truncate(idx);
                 self.durable_len = self.durable_len.min(idx);
+                self.honest_durable_len = self.honest_durable_len.min(idx);
+                for f in self.flushes.iter_mut() { f.honest = f.honest.min(idx); }
             }
             self.log.push(e.clone());
         }
@@ -614,6 +667,8 @@ impl Store {
         }
         self.log.truncate(idx);
         self.durable_len = self.durable_len.min(idx);
+        self.honest_durable_len = self.honest_durable_len.min(idx);
+        for f in self.flushes.iter_mut() { f.honest = f.honest.min(idx); }
         Ok(())
     }
 
@@ -622,16 +677,17 @@ impl Store {
     /// Completions are forced monotone: a disk does not answer an earlier fsync of the same file
     /// after a later one, and a watermark that arrived out of order would be a fiction the state
     /// machine cannot be blamed for mishandling.
-    fn schedule(&mut self, now: u64, latency: u64, hard: bool) -> u64 {
+    fn schedule(&mut self, now: u64, latency: u64, hard: Option<HardState>) -> u64 {
         let at = (now + latency).max(self.last_flush_at + 1);
         self.last_flush_at = at;
-        self.flushes.push_back(Flush { at, len: self.log.len(), hard });
+        self.flushes.push_back(Flush { at, len: self.log.len(), honest: self.log.len(), hard });
         at
     }
 
     /// Everything not fsynced is gone.
     fn crash(&mut self) {
         self.log.truncate(self.durable_len);
+        self.honest_durable_len = self.honest_durable_len.min(self.durable_len);
         self.hard_pending = None;
         self.flushes.clear();
     }
@@ -640,6 +696,16 @@ impl Store {
 // ---------------------------------------------------------------------------------------------
 // A node
 // ---------------------------------------------------------------------------------------------
+
+/// One message on the wire.
+struct Wired {
+    /// The unit at which it actually left its sender — after every fsync it was queued behind. A
+    /// crash before this instant destroys it; see [`Sim::crash`].
+    released: u64,
+    /// Whether this is the duplicate copy rather than the original.
+    dup: bool,
+    msg: Message,
+}
 
 struct Node<P> {
     id: NodeId,
@@ -674,9 +740,12 @@ pub struct Sim<P: Peer> {
     seq: u64,
     nodes: Vec<Node<P>>,
     /// The wire, keyed by `(delivery unit, sequence)` so that delivery order is total and
-    /// reproducible even when two messages land in the same unit. The value carries the unit at
-    /// which the message actually **left** its sender — see [`Sim::crash`].
-    wire: BTreeMap<(u64, u64), (u64, Message)>,
+    /// reproducible even when two messages land in the same unit.
+    wire: BTreeMap<(u64, u64), Wired>,
+    /// Highest sequence delivered on each directed link, for the reorder counter. Duplicates are
+    /// excluded from it, so "reordered" means two *different* messages crossed, not a copy of one
+    /// overtaking its original.
+    link_seq: BTreeMap<(u32, u32), u64>,
     /// Directed blocks. `(a, b)` present means nothing from `a` reaches `b`; `(b, a)` absent means
     /// the reverse still works, which is the asymmetric case.
     blocked: BTreeSet<(u32, u32)>,
@@ -727,6 +796,7 @@ impl<P: Peer> Sim<P> {
             seq: 0,
             nodes,
             wire: BTreeMap::new(),
+            link_seq: BTreeMap::new(),
             blocked: BTreeSet::new(),
             committed: BTreeMap::new(),
             leaders: BTreeMap::new(),
@@ -936,8 +1006,11 @@ impl<P: Peer> Sim<P> {
         self.nodes[i].peer = None;
         let now = self.now;
         let before = self.wire.len();
-        self.wire.retain(|_, (released, m)| !(m.from == n && *released >= now));
+        self.wire.retain(|_, w| !(w.msg.from == n && w.released >= now));
         self.report.unsent_at_crash += (before - self.wire.len()) as u64;
+        let phantom = self.nodes[i].store.durable_len.saturating_sub(self.nodes[i].store.honest_durable_len);
+        self.report.phantom_survivors += phantom as u64;
+        if phantom > 0 { self.report.phantom_crashes += 1; }
         let lost = self.nodes[i].store.log.len() - self.nodes[i].store.durable_len;
         self.report.discarded_entries += lost as u64;
         self.nodes[i].store.crash();
@@ -986,7 +1059,8 @@ impl<P: Peer> Sim<P> {
     fn next_command(&mut self) -> Command {
         let id = self.next_payload;
         self.next_payload += 1;
-        Command::WalBatch { start_lsn: id, bytes: vec![(id & 0xff) as u8, (id >> 8) as u8] }
+        let shift: u64 = std::env::var("FERRODB_REVIEW_PAYLOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        Command::WalBatch { start_lsn: id + shift, bytes: vec![((id + shift) & 0xff) as u8, ((id + shift) >> 8) as u8] }
     }
 
     fn maybe_propose(&mut self) -> Result<(), Violation> {
@@ -1055,6 +1129,7 @@ impl<P: Peer> Sim<P> {
                 let mask = 1 + self.rng.next_u64() % ((1u64 << n) - 1);
                 let side: Vec<NodeId> =
                     (0..n).filter(|k| mask & (1 << k) != 0).map(|k| NodeId(k + 1)).collect();
+                if side.len() as u32 == n { self.report.noop_cuts += 1; }
                 if kind == ChurnKind::Cut {
                     self.cut(&side);
                     self.log_line(format!("NET cut {side:?}"));
@@ -1123,7 +1198,8 @@ impl<P: Peer> Sim<P> {
             .map(|(k, _)| *k)
             .collect();
         for key in due {
-            let Some((_, m)) = self.wire.remove(&key) else { continue };
+            let Some(w) = self.wire.remove(&key) else { continue };
+            let m = w.msg;
             let Some(i) = self.node(m.to) else { continue };
             // Checked again at delivery: a partition raised while a message was on the wire eats
             // it, which is what a real cut does to packets already in flight.
@@ -1136,6 +1212,17 @@ impl<P: Peer> Sim<P> {
                 continue;
             }
             self.report.delivered += 1;
+            let link = (m.from.0, m.to.0);
+            if w.dup {
+                self.report.duplicates_delivered += 1;
+            } else {
+                let last = self.link_seq.entry(link).or_insert(0);
+                if key.1 < *last {
+                    self.report.reordered += 1;
+                } else {
+                    *last = key.1;
+                }
+            }
             self.mix_digest(&[self.now, m.from.0 as u64, m.to.0 as u64, m.term, body_code(&m.body)]);
             self.log_line(format!(
                 "{}->{} t{} {}",
@@ -1163,11 +1250,19 @@ impl<P: Peer> Sim<P> {
                 }
                 let st = &mut self.nodes[i].store;
                 let landed = due.len.min(st.log.len());
+                let honest_landed = due.honest.min(st.log.len());
+                let over = landed.saturating_sub(st.durable_len.max(honest_landed));
+                let landed = if std::env::var("FERRODB_REVIEW_FIX").is_ok() { honest_landed } else { landed };
                 st.durable_len = st.durable_len.max(landed);
-                if due.hard {
-                    if let Some(h) = st.hard_pending.take() {
-                        st.hard = h;
-                    }
+                st.honest_durable_len = st.honest_durable_len.max(honest_landed);
+                self.report.overpromoted += over as u64;
+                if over > 0 { self.report.overpromote_events += 1; }
+                let st = &mut self.nodes[i].store;
+                if let Some(h) = due.hard {
+                    st.hard = h;
+                }
+                if !st.flushes.iter().any(|f| f.hard.is_some()) {
+                    st.hard_pending = None;
                 }
                 let term = st.hard.term;
                 let round = st.durable_round();
@@ -1249,9 +1344,10 @@ impl<P: Peer> Sim<P> {
         for a in actions {
             match a {
                 Action::PersistHardState { term, voted_for } => {
-                    self.nodes[i].store.hard_pending = Some(HardState { term, voted_for });
+                    let hs = HardState { term, voted_for };
+                    self.nodes[i].store.hard_pending = Some(hs.clone());
                     let lat = self.draw(self.cfg.faults.fsync);
-                    let at = self.nodes[i].store.schedule(self.now, lat, true);
+                    let at = self.nodes[i].store.schedule(self.now, lat, Some(hs));
                     release = release.max(at);
                     self.log_line(format!(
                         "{} ACT PersistHardState term={term} voted_for={voted_for:?}",
@@ -1270,7 +1366,7 @@ impl<P: Peer> Sim<P> {
                         return Err(self.violation(rule, d));
                     }
                     let lat = self.draw(self.cfg.faults.fsync);
-                    let at = self.nodes[i].store.schedule(self.now, lat, false);
+                    let at = self.nodes[i].store.schedule(self.now, lat, None);
                     release = release.max(at);
                     self.log_line(format!("{} ACT Persist {span}", self.nodes[i].id));
                 }
@@ -1334,6 +1430,9 @@ impl<P: Peer> Sim<P> {
             }
             Body::AppendResp { success: true, matched, .. } => {
                 let durable = self.nodes[i].store.durable_round();
+                if *matched > self.nodes[i].store.honest_durable_len as Round {
+                    self.report.blind_acks += 1;
+                }
                 if *matched > durable {
                     let detail = format!(
                         "{} acknowledged round {} to {} with only {} fsynced",
@@ -1364,11 +1463,13 @@ impl<P: Peer> Sim<P> {
         }
         let at = release + self.draw(self.cfg.faults.latency);
         self.seq += 1;
-        self.wire.insert((at, self.seq), (release, m.clone()));
+        self.wire.insert((at, self.seq), Wired { released: release, dup: false, msg: m.clone() });
         if self.draw_pct(self.cfg.faults.dup_pct) {
+            // An independent latency draw, so a copy may land before its original: duplication and
+            // reordering at once, which is what a retransmitting network actually does.
             let at2 = release + self.draw(self.cfg.faults.latency);
             self.seq += 1;
-            self.wire.insert((at2, self.seq), (release, m));
+            self.wire.insert((at2, self.seq), Wired { released: release, dup: true, msg: m });
             self.report.duplicated += 1;
         }
     }

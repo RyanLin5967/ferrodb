@@ -822,6 +822,17 @@ fn the_fault_model_injects_every_fault_it_claims_to() {
     assert!(s.violation.is_none(), "unexpected violation:\n{}", s.violation.as_ref().unwrap());
     assert!(t.dropped_loss > 0, "no message was ever dropped: {t:?}");
     assert!(t.duplicated > 0, "no message was ever duplicated: {t:?}");
+    assert!(
+        t.duplicates_delivered > 0,
+        "every duplicate was dropped before it arrived, so nothing was ever asked to be idempotent: \
+         {t:?}"
+    );
+    assert!(
+        t.reordered > 0,
+        "no message ever arrived after a later-sent one on the same link. Reorder is emergent here \
+         rather than injected — it comes from drawing each latency independently — which is exactly \
+         why it is asserted rather than assumed: {t:?}"
+    );
     assert!(t.dropped_partition > 0, "no message was ever cut off by a partition: {t:?}");
     assert!(
         t.one_way_partitions > 0,
@@ -1710,5 +1721,269 @@ fn a_send_still_waiting_on_its_fsync_does_not_survive_the_crash() {
     eprintln!(
         "crash model: {} messages destroyed by a crash before they left the machine, over 400 seeds",
         s.totals.unsent_at_crash
+    );
+}
+
+// =============================================================================================
+// REVIEW EXPERIMENTS (not part of the deliverable)
+// =============================================================================================
+
+/// Fingerprint of the whole observable end-state of a run, independent of Report.digest.
+fn full_fingerprint<P: Peer>(sim: &Sim<P>, r: &Report) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for (round, e) in sim.committed() {
+        mix(*round);
+        mix(e.term);
+        mix(command_key(&e.command));
+    }
+    for k in 1..=5u32 {
+        let n = NodeId(k);
+        mix(0xAAAA);
+        mix(sim.is_up(n) as u64);
+        mix(sim.term_of(n).unwrap_or(u64::MAX));
+        for e in sim.durable_log(n) {
+            mix(e.term);
+            mix(e.round);
+            mix(command_key(&e.command));
+        }
+        let hs = sim.hard_state(n);
+        mix(hs.term);
+        mix(hs.voted_for.map(|x| x.0 as u64).unwrap_or(999));
+    }
+    for v in [
+        r.sent, r.delivered, r.dropped_partition, r.dropped_loss, r.dropped_down, r.duplicated,
+        r.crashes, r.restarts, r.partitions, r.one_way_partitions, r.heals, r.discarded_entries,
+        r.unsent_at_crash, r.elections, r.proposals, r.refusals, r.committed_rounds, r.max_term,
+        r.max_overlap_ticks as u64, r.duplicates_delivered, r.reordered,
+    ] {
+        mix(v);
+    }
+    h
+}
+
+fn command_key(c: &Command) -> u64 {
+    match c {
+        Command::WalBatch { start_lsn, bytes } => 1000 + start_lsn * 7 + bytes.len() as u64,
+        Command::NoOp => 7,
+        _ => 13,
+    }
+}
+
+/// EXPERIMENT 1: does `cfg.trace = true` (what `Sim::replay` sets) change the run?
+#[test]
+fn exp1_trace_does_not_change_the_run() {
+    let mut bad = Vec::new();
+    for seed in 0..400u64 {
+        let mut off = chaos_cfg();
+        off.trace = false;
+        let mut on = chaos_cfg();
+        on.trace = true;
+        let mut sa = Sim::<Correct>::new(seed, off);
+        let a = sa.run().expect("a");
+        let fa = full_fingerprint(&sa, &a);
+        let mut sb = Sim::<Correct>::new(seed, on);
+        let b = sb.run().expect("b");
+        let fb = full_fingerprint(&sb, &b);
+        if a != b || fa != fb {
+            bad.push(seed);
+        }
+    }
+    assert!(bad.is_empty(), "tracing changed the run on seeds {bad:?}");
+    eprintln!("EXP1: 400 seeds, trace on/off identical Report + full fingerprint");
+}
+
+/// EXPERIMENT 2: how often do two genuinely different runs share a `Report.digest`?
+#[test]
+fn exp2_digest_collision_rate() {
+    let n = 3000u64;
+    let mut by_digest: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut fps = BTreeSet::new();
+    for seed in 1..=n {
+        let mut s = Sim::<Correct>::new(seed, chaos_cfg());
+        let r = s.run().expect("clean");
+        let fp = full_fingerprint(&s, &r);
+        fps.insert(fp);
+        by_digest.entry(r.digest).or_default().insert(fp);
+    }
+    let colliding: Vec<(u64, usize)> = by_digest
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, v)| (*k, v.len()))
+        .collect();
+    eprintln!(
+        "EXP2: {n} seeds -> {} distinct full fingerprints, {} distinct Report.digest, {} digests \
+         shared by >1 different run: {:?}",
+        fps.len(),
+        by_digest.len(),
+        colliding.len(),
+        &colliding[..colliding.len().min(10)]
+    );
+}
+
+/// EXPERIMENT 2b: the exact claim the shipped test makes, but with no slack.
+#[test]
+fn exp2b_24_seeds_distinct() {
+    let mut seen = BTreeSet::new();
+    for seed in 1..=24u64 {
+        seen.insert(Sim::<Correct>::new(seed, chaos_cfg()).run().expect("clean").digest);
+    }
+    eprintln!("EXP2b: 24 seeds -> {} distinct digests (shipped test allows 22)", seen.len());
+}
+
+/// EXPERIMENT 3: same seed, many repetitions in one process, plus fresh Sim each time.
+#[test]
+fn exp3_repeatability() {
+    for seed in [1u64, 7, 4242, 1_592_682_576] {
+        let mut fps = BTreeSet::new();
+        for _ in 0..8 {
+            let mut s = Sim::<Correct>::new(seed, chaos_cfg());
+            let r = s.run().expect("clean");
+            fps.insert((r.digest, full_fingerprint(&s, &r)));
+        }
+        assert_eq!(fps.len(), 1, "seed {seed} produced {} different runs", fps.len());
+    }
+    eprintln!("EXP3: repeatability holds in-process");
+}
+
+/// EXPERIMENT 4: does an fsync scheduled before a truncation promote entries that were
+/// written after it and never fsynced?
+#[test]
+fn exp4_stale_flush_promotes_unfsynced_entries() {
+    // Detect purely by observation: run the sim and, at every flush completion, ask whether
+    // `due.len` exceeded the log length -- i.e. the log shrank under an in-flight fsync.
+    // We cannot instrument sim.rs from here, so reproduce the arithmetic with a direct unit test
+    // of Store.
+    let committed = BTreeMap::new();
+    let mut st = Store::default();
+    let e = |t: Term, r: Round| Entry { term: t, round: r, command: Command::NoOp };
+    // Ten entries written, fsync scheduled for all ten.
+    let ten: Vec<Entry> = (1..=10).map(|r| e(1, r)).collect();
+    st.persist(&ten, &committed).unwrap();
+    let at = st.schedule(0, 5, None);
+    assert_eq!(at, 5);
+    // Only the first two ever actually reached the disk (an earlier, completed flush).
+    st.durable_len = 2;
+    // A conflicting leader truncates from round 3 and hands over six different entries.
+    st.truncate(3, &committed).unwrap();
+    assert_eq!(st.log.len(), 2);
+    let six: Vec<Entry> = (3..=8).map(|r| e(2, r)).collect();
+    st.persist(&six, &committed).unwrap();
+    assert_eq!(st.log.len(), 8);
+    // The old flush lands. `deliver_flushes` computes `landed = due.len.min(log.len())`.
+    let due = st.flushes.front().unwrap().clone();
+    let landed = due.len.min(st.log.len());
+    st.durable_len = st.durable_len.max(landed);
+    eprintln!(
+        "EXP4: flush scheduled for len {} landed onto a log of len {}; durable_len is now {} \
+         (rounds 3..=8 of term 2 were written AFTER the fsync was issued and no fsync for them \
+          has completed; there are still {} flushes queued)",
+        due.len, st.log.len(), st.durable_len, st.flushes.len()
+    );
+    assert_eq!(st.durable_len, 8, "the stale flush promoted six never-fsynced entries");
+}
+
+/// EXPERIMENT 5: does the stale-flush over-promotion happen in real chaos runs?
+#[test]
+fn exp5_overpromotion_in_the_wild() {
+    let s = sweep::<Correct>(SEED_SAFETY, 2000, &chaos_cfg());
+    let t = &s.totals;
+    eprintln!(
+        "EXP5 chaos 2000 seeds: overpromote_events={} overpromoted_entries={} \
+         discarded_entries={} noop_cuts={} partitions={} one_way={} committed={}",
+        t.overpromote_events, t.overpromoted, t.discarded_entries, t.noop_cuts,
+        t.partitions, t.one_way_partitions, t.committed_rounds
+    );
+    let p = sweep::<Correct>(SEED_SAFETY + 900_000, 1000, &{
+        let mut c = chaos_cfg(); c.faults = Faults::partitioned(); c
+    });
+    let pt = &p.totals;
+    eprintln!(
+        "EXP5 partitioned 1000 seeds: overpromote_events={} overpromoted_entries={} noop_cuts={} partitions={}",
+        pt.overpromote_events, pt.overpromoted, pt.noop_cuts, pt.partitions
+    );
+}
+
+/// EXPERIMENT 6: quantify what the stale-flush bug costs the crash model.
+/// Env FERRODB_REVIEW_FIX=1 makes `deliver_flushes` use the honest (clamped) length.
+#[test]
+fn exp6_fixed_vs_unfixed_crash_model() {
+    let s = sweep::<Correct>(SEED_SAFETY, 2000, &chaos_cfg());
+    let t = &s.totals;
+    eprintln!(
+        "EXP6 fix={:?}: discarded_entries={} overpromoted={} committed={} digest={:#x}",
+        std::env::var("FERRODB_REVIEW_FIX").ok(),
+        t.discarded_entries, t.overpromoted, t.committed_rounds, t.digest
+    );
+    assert!(s.violation.is_none(), "violation: {}", s.violation.as_ref().unwrap());
+}
+
+/// EXPERIMENT 7: determinism across process boundaries / profiles.
+#[test]
+fn exp7_print_canonical_digests() {
+    for (label, cfg) in [
+        ("chaos5x240", chaos_cfg()),
+        ("healthy5x200", SimConfig::healthy(5, 200)),
+        ("healthy3x200", SimConfig::healthy(3, 200)),
+    ] {
+        let mut acc: u64 = 0;
+        for seed in 1..=200u64 {
+            let mut s = Sim::<Correct>::new(seed, cfg.clone());
+            let r = s.run().expect("clean");
+            acc = acc.rotate_left(7) ^ r.digest ^ full_fingerprint(&s, &r);
+        }
+        println!("EXP7 {label} acc={acc:#018x}");
+    }
+}
+
+/// EXPERIMENT 8: did any entry survive a `kill -9` in the simulator that a real disk would
+/// have lost, because a stale fsync had declared it durable?
+#[test]
+fn exp8_phantom_crash_survivors() {
+    for (label, n, cfg) in [("chaos", 4000u64, chaos_cfg())] {
+        let s = sweep::<Correct>(SEED_SAFETY, n, &cfg);
+        let t = &s.totals;
+        eprintln!(
+            "EXP8 {label} {n} seeds: crashes={} phantom_crashes={} phantom_survivors={} \
+             overpromote_events={} discarded_entries={}",
+            t.crashes, t.phantom_crashes, t.phantom_survivors, t.overpromote_events, t.discarded_entries
+        );
+    }
+}
+
+/// EXPERIMENT 9: how often is an ack sent for a round only a stale fsync claims is durable —
+/// i.e. how often is the "an append was acknowledged before it was durable" detector blind?
+#[test]
+fn exp9_blind_acks() {
+    let s = sweep::<Correct>(SEED_SAFETY, 4000, &chaos_cfg());
+    let t = &s.totals;
+    eprintln!(
+        "EXP9 chaos 4000 seeds: blind_acks={} overpromote_events={} delivered={} committed={}",
+        t.blind_acks, t.overpromote_events, t.delivered, t.committed_rounds
+    );
+    let s2 = sweep::<Correct>(SEED_SAFETY, 4000, &{ let mut c = chaos_cfg(); c.faults = Faults::partitioned(); c });
+    eprintln!("EXP9 partitioned 4000 seeds: blind_acks={} overpromote_events={}", s2.totals.blind_acks, s2.totals.overpromote_events);
+}
+
+/// EXPERIMENT 10: two runs that commit DIFFERENT commands at the same rounds share a digest.
+/// FERRODB_REVIEW_PAYLOAD=N shifts every proposed command's payload; nothing in RefNode reads
+/// a command, so control flow is untouched and only the committed contents differ.
+#[test]
+fn exp10_digest_is_blind_to_committed_contents() {
+    let shift = std::env::var("FERRODB_REVIEW_PAYLOAD").unwrap_or_default();
+    let mut sim = Sim::<Correct>::new(7, chaos_cfg());
+    let r = sim.run().expect("clean");
+    let contents: Vec<String> = sim
+        .committed()
+        .iter()
+        .take(4)
+        .map(|(k, e)| format!("{k}:{}", command_summary(&e.command)))
+        .collect();
+    eprintln!(
+        "EXP10 shift={shift:?} digest={:#018x} committed_rounds={} first={:?}",
+        r.digest, r.committed_rounds, contents
     );
 }
