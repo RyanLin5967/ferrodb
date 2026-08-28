@@ -32,7 +32,7 @@ use ferrodb::branch::types::BranchId;
 use ferrodb::branch::{BranchCatalog, CapabilityEnvelope, ColumnCapability, Verb};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::catalog::column::Value;
+use ferrodb::catalog::column::{DataType, Value};
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Outcome};
 use ferrodb::execution::session::Session;
@@ -1244,6 +1244,22 @@ fn branch_scoped_alter_table_reaches_a_forbidden_table_and_this_is_a_known_gap()
         cols.contains(&"note") && cols.contains(&"pay") && !cols.contains(&"salary"),
         "if a governed branch's schema edits no longer publish, this gap has closed and the \
          module docs, the summary and this test must say so. Shared `payroll` is now: {cols:?}"
+    );
+
+    // The retype's ONLY observable effect is `pay`'s type: the name assertion above is satisfied
+    // by the ADD and the RENAME alone, so without this the third variant is staged and never
+    // demonstrated.
+    let pay = db.catalog.tables["payroll"]
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.name == "pay")
+        .expect("`pay` is gone from the shared catalog");
+    assert_eq!(
+        pay.data_type,
+        DataType::BigInt,
+        "the RETYPE did not publish, so only two of the three variants bypass the envelope at \
+         MERGE and the docs overstate the gap"
     );
 
     // A plain connection sees it, so it is the shared catalog and not the branch that changed.
