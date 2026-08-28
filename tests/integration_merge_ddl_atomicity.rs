@@ -203,15 +203,25 @@ fn a_row_the_merge_would_publish_too_wide_for_the_shape_it_lands_in_refuses_the_
     let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
     let msg = e.to_string();
     eprintln!("--- refusal = {msg}");
-    for needle in ["would publish a row into", "bytes a tuple can occupy", "Nothing has been written"]
-    {
-        assert!(msg.contains(needle), "refused, but not by the publish precheck — no {needle:?} in: {msg}");
-    }
 
+    // **State first, message second.** The rule this test names is that the WHOLE merge is
+    // refused; the wording is how it is refused. Asserting the wording first means a mutant that
+    // breaks the rule dies on the prose and never reaches the assertions that state the rule.
     assert_eq!(shape_before, d.shape("t"), "the refused MERGE altered the table anyway: {msg}");
     assert_eq!(ddl_before, d.ddl(), "the refused MERGE reached the change feed: {msg}");
     assert_eq!(heap_before, d.heap("t"), "the refused MERGE wrote to the heap: {msg}");
     assert_eq!(rows_before, d.rows("SELECT id, n FROM t;"), "the refused MERGE published rows");
+
+    // Which refusal it was. Only the first needle discriminates — the other two appear in the
+    // plan's row-width refusal too — so the plan's own marker is asserted ABSENT. Without that,
+    // this test would pass on a refusal raised by the wrong check.
+    assert!(msg.contains("would publish a row into"), "not the publish precheck: {msg}");
+    assert!(
+        !msg.contains("would widen"),
+        "this was the PLAN's row-width refusal, not the publish precheck — the plan cannot see a \
+         row that is not on the target yet, so a merge refused here is being refused for the \
+         wrong reason: {msg}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------
@@ -279,7 +289,6 @@ fn a_merge_refused_at_its_third_edit_leaves_neither_of_the_first_two_applied() {
     let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
     let msg = e.to_string();
     eprintln!("--- refusal = {msg}");
-    assert!(msg.contains("edit 3 of 3"), "the refusal blamed the wrong edit: {msg}");
 
     assert_eq!(shape_before, d.shape("t"), "the refused MERGE left an edit applied: {msg}");
     assert_eq!(ddl_before, d.ddl(), "the refused MERGE emitted a DDL record anyway: {msg}");
@@ -305,6 +314,13 @@ fn a_merge_refused_at_its_third_edit_leaves_neither_of_the_first_two_applied() {
         vec!["id:Integer", "n:Integer", "a:Varchar(2100)", "b:Varchar(2100)"],
         "the refused MERGE persisted an edit to disk"
     );
+
+    // Last, and deliberately last: which edit was blamed is test
+    // `a_chain_refused_at_its_first_edit_names_that_edit_and_not_the_last`'s rule, not this one.
+    // Asserted ahead of the state above, it killed this test on the naming rule under a mutant
+    // that broke the atomicity rule, and the disk re-read — the strongest assertion here — was
+    // never reached.
+    assert!(msg.contains("edit 3 of 3"), "the refusal blamed the wrong edit: {msg}");
 }
 
 // -------------------------------------------------------------------------------------------
@@ -341,6 +357,7 @@ fn a_merge_publishes_its_rows_into_the_shape_its_own_edits_produced() {
         ]
     );
     let mut rows = d.rows("SELECT id, n, c1 FROM t;");
+    assert_eq!(rows.len(), 2, "the merge published the wrong number of rows: {rows:?}");
     rows.sort_by_key(|r| match r[0] {
         Value::Integer(i) => i,
         _ => 0,
@@ -442,4 +459,124 @@ fn narrowing_a_row_and_retyping_behind_it_takes_two_merges_and_the_refusal_says_
     d.exec("MERGE;", &mut retype).expect("and now the retype merges");
     assert_eq!(d.shape("t")[1].1, DataType::BigInt, "the two-merge path did not land");
     assert_eq!(d.rows("SELECT n FROM t WHERE id = 1;")[0][0], Value::BigInt(100));
+}
+
+// -------------------------------------------------------------------------------------------
+// RULE: a row the merge would publish with a NULL in a NOT NULL column refuses the whole merge,
+// before any schema edit is applied.
+//
+// Nothing on the branch path catches this: `branch_insert` proves arity and a branch-visible
+// duplicate key, and the binder carries `nullable` without refusing on it, so the agent's INSERT
+// is accepted. `InsertOp::execute` refuses it — at publication, which with the schema applied
+// first is after the merge has already altered the table. Deciding it here is what keeps the
+// merge's refusal and its writes on the same side of the line.
+// -------------------------------------------------------------------------------------------
+#[test]
+fn a_row_the_merge_would_publish_with_a_null_in_a_not_null_column_refuses_the_whole_merge() {
+    let mut d = db();
+    d.sql("CREATE TABLE t (id INTEGER NOT NULL, v INTEGER NOT NULL);");
+    d.sql("INSERT INTO t VALUES (1, 10);");
+    let shape_before = d.shape("t");
+    let ddl_before = d.ddl();
+    let rows_before = d.rows("SELECT id, v FROM t;");
+
+    let mut agent = d.branch("agent-null");
+    d.exec("ALTER TABLE t ADD COLUMN note VARCHAR(20);", &mut agent).expect("stage add");
+    d.exec("INSERT INTO t VALUES (2, NULL);", &mut agent)
+        .expect("the branch takes it — nothing on that path checks NOT NULL");
+
+    let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
+    let msg = e.to_string();
+    eprintln!("--- refusal = {msg}");
+
+    assert_eq!(shape_before, d.shape("t"), "the refused MERGE added the column anyway: {msg}");
+    assert_eq!(ddl_before, d.ddl(), "the refused MERGE reached the change feed: {msg}");
+    assert_eq!(rows_before, d.rows("SELECT id, v FROM t;"), "the refused MERGE published rows");
+    assert!(
+        msg.contains("declared NOT NULL"),
+        "refused, but not by the publish precheck — a refusal from inside the publish transaction \
+         arrives after the schema is already durable: {msg}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// RULE: a rename follows its column into BOTH index lists.
+//
+// A `TableEntry` keeps ordinary and full-text indexes in separate vectors and both record their
+// column by NAME. `planner::plan` resolves each with `position(...).ok_or(KeyNotFound)`, so an
+// index left pointing at the old name is not stale — it is unfindable, and every write against
+// the table stops working. The pre-refactor rename arm walked only `indexes`, so this held for
+// the plain `ALTER TABLE` path too and had done since `CREATE FULLTEXT INDEX` existed.
+//
+// The write is the assertion, for the reason `integration_alter_column` gives: the read path
+// declines to use an index it cannot resolve and falls back to a scan, which succeeds either way.
+// -------------------------------------------------------------------------------------------
+#[test]
+fn a_rename_follows_its_column_into_the_fulltext_index_too() {
+    let mut d = db();
+    d.sql("CREATE TABLE docs (id INTEGER NOT NULL, body VARCHAR(200));");
+    d.sql("INSERT INTO docs VALUES (1, 'the quick brown fox');");
+    d.sql("CREATE FULLTEXT INDEX ix ON docs (body);");
+
+    let mut agent = d.branch("agent-ft");
+    d.exec("ALTER TABLE docs RENAME COLUMN body TO text;", &mut agent).expect("stage rename");
+    d.exec("MERGE;", &mut agent).expect("the merge must land");
+
+    assert_eq!(
+        d.shape("docs"),
+        vec![("id".into(), DataType::Integer), ("text".into(), DataType::Varchar(200))]
+    );
+    d.sql("INSERT INTO docs VALUES (2, 'a lazy dog');");
+    d.sql("UPDATE docs SET text = 'the quick red fox' WHERE id = 1;");
+    d.sql("DELETE FROM docs WHERE id = 2;");
+    assert_eq!(
+        d.rows("SELECT text FROM docs WHERE id = 1;")[0][0],
+        Value::Varchar("the quick red fox".into())
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// RULE: planning a merge's schema edits writes NOTHING — not even an empty page.
+//
+// `Catalog::plan_alters` says "write nothing at all" and `AgentRuntime::merge` leans on it: every
+// table is planned first and the rows are measured after, so a reservation taken while planning
+// table A can be followed by a refusal about a row destined for table B — and that refusal's
+// message says "Nothing has been written". `reserve_free_space` appends empty pages, so it lives
+// in `apply_plan` and not in the plan.
+//
+// A tuple scan cannot see this: appended empty pages hold no tuples, which is why the other
+// refusal tests here would pass with the reservation back in the planning half. The page COUNT is
+// what sees it.
+// -------------------------------------------------------------------------------------------
+#[test]
+fn planning_a_refused_merge_does_not_even_append_an_empty_page() {
+    // The width where `ADD COLUMN` still fits and the retype behind it does not: the ADD is what
+    // makes every row grow, so a plan for it has to reserve, and the retype is what refuses after
+    // the reservation would have been taken.
+    let w = width_where_add_fits_and_retype_does_not();
+    let big = "x".repeat(w);
+    let mut d = db();
+    d.sql(WIDE);
+    // Rows that all but fill their pages, so the rewrite the ADD implies must reserve space.
+    for i in 1..6 {
+        d.sql(&format!("INSERT INTO t VALUES ({i}, {i}00, '{big}', '{big}');"));
+    }
+
+    let pages_before = d.bp.disk_manager.high_water().unwrap();
+    let heap_before = d.heap("t");
+
+    let mut agent = d.branch("agent-pages");
+    d.exec("ALTER TABLE t ADD COLUMN c1 VARCHAR(20);", &mut agent).expect("stage add");
+    d.exec(RETYPE, &mut agent).expect("stage retype");
+    let e = d.exec("MERGE;", &mut agent).err().expect("MERGE must be refused");
+    eprintln!("--- refusal = {e}");
+
+    let pages_after = d.bp.disk_manager.high_water().unwrap();
+    eprintln!("--- pages before = {pages_before}, after = {pages_after}");
+    assert_eq!(heap_before, d.heap("t"), "the refused MERGE moved a tuple");
+    assert_eq!(
+        pages_before, pages_after,
+        "the refused MERGE allocated {} page(s) while claiming nothing had been written",
+        pages_after.saturating_sub(pages_before)
+    );
 }

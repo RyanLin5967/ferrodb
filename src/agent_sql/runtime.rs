@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::alter::{
-    conform_row, refuse_if_too_wide, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
+    conform_row, refuse_if_the_row_cannot_land, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
 };
 use crate::execution::executor::alteration_of;
 use crate::parser::parser::AlterAction;
@@ -2733,11 +2733,23 @@ impl AgentRuntime {
         // edits produced, carried there by `conform_row`, the same function that already carries a
         // branch's rows across a sibling's merged `ADD COLUMN`.
         //
-        // What is still fallible after step 3 is what `catalog::alter` already calls environmental:
-        // a disk write that fails, a buffer pool with no evictable frame. A merge that meets one of
-        // those has changed the shape and published no rows. That is the same boundary the rewrite
-        // itself stands on, and moving it needs the rewrite logged, which is a larger change than
-        // this one.
+        // **What is still fallible after step 3, stated exactly rather than generously.** It is what
+        // `catalog::alter` already calls environmental — a disk write that fails, a buffer pool with
+        // no evictable frame, the arena floor exhausted by a relocation that `reserve_free_space`
+        // could not see coming. Two shapes of residue, and the second is not the first:
+        //
+        // - **one table**: its shape is applied and no row is published. The merge returns `Err`
+        //   and the target is a table with the edit and none of the branch's rows.
+        // - **more than one table**: the tables before the failure are altered and the ones after
+        //   it are not. `Catalog::apply_plan` persists as it installs, so table X is durable before
+        //   table Y is attempted, and there is no undo because the rewrite is unlogged. A merge
+        //   over two altered tables is atomic in its REFUSALS and not in its FAILURES.
+        //
+        // Neither is closed here, for the reason `catalog::alter` gives for refusing rather than
+        // rolling back: an undo would be a second unlogged mutation whose own failure would have no
+        // repair at all. Closing them needs the heap rewrite logged, which is a larger change than
+        // this row. What IS closed, below, is the change feed — it never carries half of a
+        // multi-table merge.
         let prov = Arc::clone(self.provenance());
         let mut plans: Vec<(usize, AlterPlan)> = Vec::new();
         for (i, report) in schema_reports.iter().enumerate() {
@@ -2801,6 +2813,7 @@ impl AgentRuntime {
         // Flushed rather than checkpointed, for the reason spelled out in the executor's
         // `AlterTable` arm: truncating the log here would delete the change history of the very
         // table this merge is about to publish rows into.
+        let mut records: Vec<crate::wal::txn::DdlRecord> = Vec::new();
         for (i, plan) in plans {
             let table = schema_reports[i].table.clone();
             let (dir_root, tt_root) = {
@@ -2815,16 +2828,31 @@ impl AgentRuntime {
                 .map(|(action, before)| alteration_of(action, before))
                 .collect::<Result<Vec<_>, FerroError>>()?;
             let shapes = ctx.catalog.apply_plan(plan, &ctx.txn)?;
-            ctx.bp.flush_all()?;
-            ctx.bp.disk_manager.sync()?;
             for (alteration, columns) in alterations.into_iter().zip(shapes) {
-                ctx.txn.log_ddl(crate::wal::txn::DdlRecord {
+                records.push(crate::wal::txn::DdlRecord {
                     op: crate::wal::log::DdlOp::AlterColumn(alteration),
                     table: table.clone(),
                     dir_root,
                     time_travel_root: tt_root,
                     columns,
-                })?;
+                });
+            }
+        }
+
+        // **One flush and one run of feed records for the whole merge**, after every table's
+        // rewrite has succeeded — rather than one of each per table, inside the loop above.
+        //
+        // It does not make a multi-table merge atomic; nothing short of logging the heap rewrite
+        // can, for the reason given above the loop. What it does buy is that the CHANGE FEED never
+        // carries half of one. A consumer rebuilding from the feed sees every table this merge
+        // altered or none of them, where flushing and logging per table would have handed it table
+        // X's new column and no word about table Y, permanently and with no later record to
+        // reconcile it against.
+        if !records.is_empty() {
+            ctx.bp.flush_all()?;
+            ctx.bp.disk_manager.sync()?;
+            for record in records {
+                ctx.txn.log_ddl(record)?;
             }
         }
 
@@ -2854,7 +2882,15 @@ impl AgentRuntime {
         // it is appended to once per stamped version, never pruned, and written by nobody but the
         // stamping loop, so it answers "has this number been handed out" without consulting the
         // arithmetic that produced the number. Refused here rather than asserted after `commit`,
-        // because here the rows are not yet visible and a refusal is still a clean one.
+        // because here the rows are not yet visible.
+        //
+        // **"Clean" now means clean of published rows, and not clean of everything.** This sits
+        // after the schema apply above, so a refusal here returns with the schema edits already
+        // durable. It is left here rather than hoisted above them deliberately: hoisting would
+        // trade a refusal that can only fire if the no-two-versions-share-a-`begin_ts` invariant is
+        // ALREADY broken for a leaked reservation on every ORDINARY refusal — and the schema
+        // refusals above fire whenever an agent stages an edit its table cannot take, which is a
+        // thing that happens.
         let reserved: std::ops::Range<u64> = {
             let mut state = self.state.lock().unwrap();
             let base = state.apply_seq;
@@ -4084,14 +4120,14 @@ impl PendingWrite {
             PendingWrite::Insert { table, row } => {
                 let row = conform_row(&row, from, to)?;
                 let which = format!("the row this merge inserts with key {:?}", row.first());
-                refuse_if_too_wide(&table, to, &row, &which)?;
+                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
                 Ok(PendingWrite::Insert { table, row })
             }
             PendingWrite::Update { table, schema: _, key, row, before } => {
                 let row = conform_row(&row, from, to)?;
                 let before = conform_row(&before, from, to)?;
                 let which = format!("the row this merge updates with key {key:?}");
-                refuse_if_too_wide(&table, to, &row, &which)?;
+                refuse_if_the_row_cannot_land(&table, to, &row, &which)?;
                 // The landing shape, not the scored one: `into_stmt` builds the `UPDATE`'s
                 // assignments from these column names, and after a rename the scored shape names a
                 // column the table no longer has.

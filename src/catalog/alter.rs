@@ -395,25 +395,51 @@ impl AlterPlan {
     }
 }
 
-/// Refuse a row that will not fit a page once it is written under `schema`.
+/// Refuse a row that cannot be written under `schema` — **every reason the write itself would
+/// refuse it for, asked while nothing has been written.**
 ///
-/// **The second caller is the reason this is a function and not an expression inside
-/// [`prepare_rewrite`].** `AgentRuntime::merge` publishes a branch's rows into a table the same
-/// merge is altering, and "will this row fit the shape it is about to land in" is the identical
-/// question pass 1 asks about the rows already there. Asking it with a second copy of
-/// [`MAX_TUPLE_SIZE`] is how two answers to one question start to disagree.
+/// Three questions, one function, because a caller that asks only two of them has a merge that
+/// refuses halfway:
+///
+/// - **arity and type**, from [`Tuple::serialize`] inside [`serialize_and_measure`], which is the
+///   same call the executor's insert makes and which refuses a value whose variant contradicts the
+///   column that declares it;
+/// - **NOT NULL**, which nothing on the branch path checks. `AgentRuntime::branch_insert` proves
+///   arity and a branch-visible duplicate key and stops there, and the binder carries `nullable`
+///   without ever refusing on it, so a `NULL` in a NOT NULL column is accepted when the agent
+///   types it and refused by `InsertOp::execute` at publication — which, now that the schema is
+///   applied first, is after the merge has already changed the table.
+/// - **page fit**, which is the question [`prepare_rewrite`] asks of the rows already there.
+///
+/// **The second caller is why [`serialize_and_measure`] exists.** `AgentRuntime::merge` publishes
+/// a branch's rows into a table the same merge is altering, and "can this row be written in the
+/// shape it is about to land in" is the identical question pass 1 asks about the rows already in
+/// it. Two copies of [`MAX_TUPLE_SIZE`] is how two answers to one question start to disagree.
 ///
 /// `which` names the row for the message — the caller knows whether it has a key to quote.
-pub fn refuse_if_too_wide(
+pub fn refuse_if_the_row_cannot_land(
     table: &str,
     schema: &Schema,
     values: &[Value],
     which: &str,
 ) -> Result<(), FerroError> {
-    let size = width_under(values, schema)?;
-    if size <= MAX_TUPLE_SIZE {
+    for (i, c) in schema.columns.iter().enumerate() {
+        if c.nullable || !matches!(values.get(i), None | Some(Value::Null)) {
+            continue;
+        }
+        return Err(FerroError::Constraint(format!(
+            "this MERGE would publish a row into '{table}' with no value for '{}', which is \
+             declared NOT NULL: {which}. Nothing has been written — the schema edits and the rows \
+             are decided together and refused together, because a merge that applied one without \
+             the other is exactly the half-applied state a merge exists to avoid.",
+            c.name
+        )));
+    }
+    let (tuple, fits) = serialize_and_measure(values, schema)?;
+    if fits {
         return Ok(());
     }
+    let size = tuple.data.len();
     Err(FerroError::Constraint(format!(
         "this MERGE would publish a row into '{table}' that does not fit: {which} would occupy \
          {size} bytes under the shape this merge leaves '{table}' in, past the {MAX_TUPLE_SIZE} \
@@ -431,12 +457,16 @@ pub fn refuse_if_too_wide(
 /// message that carries it.
 pub const NARROW_THE_ROW_FIRST: &str = "Narrow the row first";
 
-/// How many bytes `values` occupies once written under `schema`.
+/// Serialize a row under `schema` and say whether the result fits a page.
 ///
-/// One definition of the measurement, so [`prepare_rewrite`] and [`refuse_if_too_wide`] cannot
-/// answer the same question two ways.
-fn width_under(values: &[Value], schema: &Schema) -> Result<usize, FerroError> {
-    Ok(Tuple::serialize(values, schema, 0)?.data.len())
+/// **One definition, two real callers, and that is the whole reason it is a function.**
+/// [`prepare_rewrite`] measures the rows a table already holds and
+/// [`refuse_if_the_row_cannot_land`] measures the rows a merge is about to publish into it. Same
+/// question, same limit; answered in two places, the two answers start to differ.
+fn serialize_and_measure(values: &[Value], schema: &Schema) -> Result<(Tuple, bool), FerroError> {
+    let tuple = Tuple::serialize(values, schema, 0)?;
+    let fits = tuple.data.len() <= MAX_TUPLE_SIZE;
+    Ok((tuple, fits))
 }
 
 /// **No transaction may be in flight while a table is rewritten in place.**
@@ -548,30 +578,6 @@ impl Catalog {
 
         let prepared = prepare_rewrite(&self.buffer_pool, table, dir_root, &shapes, actions, prov)?;
 
-        // Reserve the space the relocations will need, before the first one happens.
-        //
-        // A row whose converted tuple no longer fits its page is relocated, and a relocation may
-        // have to allocate. `DiskManager::allocate` refuses once the table region below the
-        // copy-on-write arena floor is full — a real end-state, since the floor is fixed at
-        // `DEFAULT_ARENA_HEADROOM` when the database is created — and discovering that in the
-        // middle of the writing pass leaves rows converted under the old schema with no log to
-        // repair them. Asking for the space first turns it into a refusal: the worst this can
-        // leave behind is empty pages the heap's next insert will use, and no tuple has moved.
-        //
-        // Only rows that GREW are counted; a row that shrank or stayed the same is written in
-        // place. The count is bytes rather than pages because that is what the page directory
-        // reports, and it is aggregate rather than per-page — `reserve_free_space` says in its own
-        // words that fragmentation can still defeat it, which is why `HeapFileManager::update`
-        // also reserves each relocation's destination before freeing its source.
-        let growth: usize = prepared
-            .iter()
-            .filter(|p| p.tuple.data.len() > p.was)
-            .map(|p| p.tuple.data.len() + SLOT_ENTRY_SIZE)
-            .sum();
-        if growth > 0 {
-            HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
-        }
-
         Ok(AlterPlan {
             table: table.to_string(),
             shapes,
@@ -604,6 +610,41 @@ impl Catalog {
 
         let AlterPlan { table, shapes, actions, prepared, carried, prov, dir_root, primary_root } =
             plan;
+
+        // Reserve the space the relocations will need, before the first one happens.
+        //
+        // A row whose converted tuple no longer fits its page is relocated, and a relocation may
+        // have to allocate. `DiskManager::allocate` refuses once the table region below the
+        // copy-on-write arena floor is full — a real end-state, since the floor is fixed at
+        // `DEFAULT_ARENA_HEADROOM` when the database is created — and discovering that in the
+        // middle of `commit_rewrite` leaves rows converted under the old schema with no log to
+        // repair them. Asking for the space first turns it into a refusal, and it is still a
+        // refusal before the first tuple moves: the worst it can leave behind is empty pages the
+        // heap's next insert will use.
+        //
+        // **It lives here, in the half that writes, and not in `plan_alters`, because it is not
+        // free of writes.** `reserve_free_space` appends empty pages through `add_empty_page` —
+        // an allocation, a page write, and an unlogged mutation of the page-directory chain. In
+        // `plan_alters` it made "decide a chain, write nothing at all" false, and worse, it made
+        // it false in the one place the claim matters: `AgentRuntime::merge` plans EVERY table and
+        // then measures the rows it would publish, so a reservation for table A could be followed
+        // by a refusal about table B, and a refusal that says "Nothing has been written" would
+        // have left pages behind.
+        //
+        // Only rows that GREW are counted; a row that shrank or stayed the same is written in
+        // place. The count is bytes rather than pages because that is what the page directory
+        // reports, and it is aggregate rather than per-page — `reserve_free_space` says in its own
+        // words that fragmentation can still defeat it, which is why `HeapFileManager::update`
+        // also reserves each relocation's destination before freeing its source.
+        let growth: usize = prepared
+            .iter()
+            .filter(|p| p.tuple.data.len() > p.was)
+            .map(|p| p.tuple.data.len() + SLOT_ENTRY_SIZE)
+            .sum();
+        if growth > 0 {
+            HeapFileManager::open(dir_root, self.buffer_pool.clone()).reserve_free_space(growth)?;
+        }
+
         let primary_root_now =
             commit_rewrite(&self.buffer_pool, dir_root, primary_root, prepared, prov.as_ref())?;
 
@@ -625,7 +666,21 @@ impl Catalog {
         if !renames.is_empty() {
             let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
             for (from, to) in renames {
+                // **Both lists, and the second one is not decoration.** A `TableEntry` keeps
+                // ordinary indexes and full-text indexes in separate vectors, and BOTH record
+                // their column by name. `planner::plan` resolves each of them with
+                // `position(|c| c.name == info.column_name).ok_or(KeyNotFound)` — the full-text one
+                // at `plan.rs:110` exactly as the ordinary one at `:102` — so missing either leaves
+                // an index that is not stale but unfindable, and every write against the table
+                // stops working. The pre-refactor rename arm walked only `indexes`; a full-text
+                // index over a renamed column has been broken since `CREATE FULLTEXT INDEX`
+                // existed, through the plain `ALTER TABLE` path as much as through a merge.
                 for ind in entry.indexes.iter_mut() {
+                    if &ind.column_name == from {
+                        ind.column_name = to.clone();
+                    }
+                }
+                for ind in entry.fulltext_indexes.iter_mut() {
                     if &ind.column_name == from {
                         ind.column_name = to.clone();
                     }
@@ -802,13 +857,21 @@ fn rewrites_rows(shapes: &[Schema]) -> bool {
 /// # Every step is measured, not only the last one
 ///
 /// A chain is applied by [`commit_rewrite`] as one pass, so only the final bytes ever reach the
-/// disk and only the final width is a physical constraint. The width is checked after **every**
-/// action anyway. What is being implemented is "these alterations, in this order" — the same thing
-/// the agent would have got by typing the statements one at a time — and a group that accepts a
-/// chain the individual statements would have refused is a group with different semantics from its
-/// parts. Today the two can only ever agree, because no alteration in this database narrows a row;
-/// checking each step is what keeps that a fact about `AlterAction` rather than an assumption
-/// buried here.
+/// disk and only the final width is a *physical* constraint. The width is checked after **every**
+/// action anyway, and that is load-bearing rather than defensive.
+///
+/// What is being implemented is "these alterations, in this order" — the same thing the agent gets
+/// by typing the statements one at a time — and a group that accepts a chain the individual
+/// statements would have refused is a group whose semantics have drifted from its parts.
+///
+/// **The two genuinely disagree, so this is not a redundant check.** Widths are not monotone
+/// across [`Widening`]: `INTEGER -> DECIMAL` and `BIGINT -> DECIMAL` make a row *smaller*, because
+/// a `BigInt` costs eight bytes at an eight-aligned offset while a `Decimal` costs a two-byte
+/// length prefix and its digits with no padding. So `ALTER COLUMN n TYPE BIGINT` followed by
+/// `ALTER COLUMN n TYPE DECIMAL` can have a final shape that fits and an intermediate that does
+/// not — measured on a four-column row with a `VARCHAR(4030)` padding column, the intermediate is
+/// 4072 bytes against a 4069-byte limit and the final is 4067. Checking only the last step would
+/// accept that chain from a merge and refuse it from two statements.
 ///
 /// # Why an oversized row is a refusal and not a rollback
 ///
@@ -900,8 +963,8 @@ fn prepare_rewrite(
         let mut over = false;
         for step in 1..shapes.len() {
             values = conform_row(&values, &shapes[step - 1], &shapes[step])?;
-            let bytes = Tuple::serialize(&values, &shapes[step], 0)?;
-            if bytes.data.len() > MAX_TUPLE_SIZE {
+            let (bytes, fits) = serialize_and_measure(&values, &shapes[step])?;
+            if !fits {
                 too_wide += 1;
                 if widest.as_ref().is_none_or(|(_, _, w, _)| bytes.data.len() > *w) {
                     widest = Some((rid, key.clone(), bytes.data.len(), step - 1));
