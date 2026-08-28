@@ -303,6 +303,20 @@ inside the argument. So the read returned an empty string and the file was rewri
 Recorded here rather than quietly fixed because it is the same class as the earlier harness bug: an
 edit that assumes it is the only thing touching a file, when it is not — in this case, itself.
 
+## A misattribution of the reviewer's work, corrected
+
+Twice I told the reviewer they had measured an old commit. Once that was true. Once it was not:
+their directory-component finding was made against a merge of my chain-walk commit, at the commit I
+had asked for, and was a real hole in it. Recorded because this file spends most of its length
+holding a reviewer's numbers to a standard, and the same standard applies to claims made *about*
+their numbers.
+
+They also independently found this file empty in the committed tree and reported it with two of
+their own shell loops giving sizes that meant the opposite conclusion. They said so, declined to
+assert a mechanism for the discrepancy they had not checked, and gave five independent
+confirmations of the part they were sure of — including git's canonical empty-blob hash, which is
+the one that settles it. That is why their findings were acted on rather than argued with.
+
 ## A correction to this file's own method
 
 The first run of the M12/M13 harness was made against a tree with **uncommitted** work in it. The
