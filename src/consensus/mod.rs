@@ -50,6 +50,10 @@ pub mod log;
 pub mod membership;
 pub mod replicate;
 pub mod signing;
+/// F8 -- the deterministic simulator. Declared here because a module that `mod.rs` does not name is
+/// not compiled at all, and nothing outside this file can declare a child of `consensus`. This one
+/// line is the whole of F8's edit to the frozen contract: no type, no variant, no `Consensus` field.
+pub mod sim;
 pub mod snapshot;
 pub mod transport;
 
