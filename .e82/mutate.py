@@ -36,22 +36,15 @@ elif MUT == 'M3':
                 continue;
             }
             let actions: Vec<AlterAction> = report.to_apply.iter().map(|e| e.as_action()).collect();
-            let plan = ctx.catalog.plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))?;
+            let plan = ctx
+                .catalog
+                .plan_alters(&report.table, &actions, &ctx.txn, Some(&prov))
+                .map_err(in_a_merge_the_narrowing_comes_first)?;
             plans.push((i, plan));
         }""",
-"""        let plans: Vec<(usize, AlterPlan)> = Vec::new();""")
-    sub(p_rt,
-"""            let alterations = plan
-                .steps()
-                .map(|(action, before)| alteration_of(action, before))
-                .collect::<Result<Vec<_>, FerroError>>()?;
-            let shapes = ctx.catalog.apply_plan(plan, &ctx.txn)?;""",
-"""            let _ = plan;
-            let (alterations, shapes): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());""")
-    # ...and the per-edit loop the fix replaced, reinstated ahead of the (now empty) plan loop
-    sub(p_rt,
-"""        // ---- the schema, applied while no row of this merge has been written -------------------""",
-"""        for report in schema_reports.iter() {
+"""        let plans: Vec<(usize, AlterPlan)> = Vec::new();
+        let _ = in_a_merge_the_narrowing_comes_first;
+        for report in schema_reports.iter() {
             for edit in &report.to_apply {
                 let action = edit.as_action();
                 let (dir_root, tt_root, alteration) = {
@@ -74,9 +67,7 @@ elif MUT == 'M3':
                     columns,
                 })?;
             }
-        }
-
-        // ---- the schema, applied while no row of this merge has been written -------------------""")
+        }""")
 elif MUT == 'M4':
     # rows no longer carried into the shape the merge's own edits produced
     sub(p_rt,
@@ -87,17 +78,13 @@ elif MUT == 'M4':
 elif MUT == 'M5':
     # an index stops following its column across a rename
     sub(p_alter,
-"""        if !renames.is_empty() {
-            let entry = self.tables.get_mut(&table).ok_or(FerroError::KeyNotFound)?;
-            for (from, to) in renames {
-                for ind in entry.indexes.iter_mut() {
+"""                for ind in entry.indexes.iter_mut() {
                     if &ind.column_name == from {
                         ind.column_name = to.clone();
                     }
                 }
-            }
-        }""",
-"""        let _ = renames;""")
+                for ind in entry.fulltext_indexes.iter_mut() {""",
+"""                for ind in entry.fulltext_indexes.iter_mut() {""")
 elif MUT == 'M6':
     # the width refusal stops being told what it means inside a merge
     sub(p_rt,
@@ -112,7 +99,7 @@ elif MUT == 'M7':
             .last()
             .cloned()""",
 """        let new_schema = shapes
-            .get(shapes.len().saturating_sub(2).max(1))
+            .get(shapes.len().saturating_sub(2))
             .cloned()""")
 elif MUT == 'M8':
     # the publish precheck stops asking about NOT NULL
