@@ -712,9 +712,7 @@ impl RoundLog {
 
         let file = Arc::clone(&self.files[self.live]);
         if let Err(e) = file.set_len(new_end).and_then(|()| file.sync_all()) {
-            let why = format!("a truncation to round {} could not be made durable: {e}", from - 1);
-            self.poisoned = Some(why.clone());
-            return Err(LogError::Poisoned(why));
+            return Err(LogError::Io(format!("{e}")));
         }
         Ok(())
     }
