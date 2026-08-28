@@ -18,12 +18,14 @@
 
 pub mod arena;
 pub mod catalog;
+pub mod lease_thread;
 pub mod reaper;
 pub mod record;
 pub mod types;
 
 pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
+pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
 pub use reaper::{PageLinks, TwoTierReaper};
 pub use record::{
     changed_columns, reclaimable, ArenaExtent, BranchRecord, CapabilityEnvelope,
