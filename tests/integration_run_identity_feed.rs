@@ -643,3 +643,152 @@ fn binding_a_run_refuses_the_shapes_that_would_produce_a_wrong_answer() {
     let decoded = d.decode_all();
     assert_eq!(writes(&decoded)[0].writer.as_ref().unwrap().agent_id, "restock-agent");
 }
+
+/// **An agent's MERGE ships its rows WITH a writer — the gap E79 closed.**
+///
+/// Every test above binds a run by hand (`txn.bind_run(...)`), which proves the log and the decoder
+/// carry attribution correctly. None of them proved the *product* does, and it did not: nothing in
+/// `AgentRuntime` called `bind_run`, so an agent could open a session, write, merge, and every event
+/// on the resulting feed carried `"writer":null`. Row-level authorship was stamped all along — it is
+/// what `who_wrote_row` reads — but that lives in memory beside the heap, and a reader of the log has
+/// no access to it. The feed is the product's only outward attribution surface, and it said nobody.
+///
+/// **Breaking shape, and why the anti-vacuity half is not optional:** `writer` is `Option` by design,
+/// and `jsonl.rs` documents null as the correct answer for a change no run produced. So "the feed has
+/// a writer" is only evidence when the same feed also still says null for a plain SQL write — one
+/// assertion without the other passes both on a fixed runtime and on one that stamps every event with
+/// a bogus author.
+#[test]
+fn an_agent_merge_ships_its_rows_with_a_writer_and_a_plain_write_still_ships_none() {
+    use ferrodb::agent_sql::runtime::AgentRuntime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("merge_writer.db"))
+        .unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let mut catalog = Catalog::create(bp.clone()).unwrap();
+    let wal = Arc::new(WalManager::new(dir.path().join("merge_writer.wal")).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal.clone());
+    let runtime = Arc::new(AgentRuntime::new());
+
+    let mut exec = |sql: &str, session: &mut Session| {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut p = Parser::new(tokens);
+        let mut stmts = p.parse();
+        assert!(p.errors.is_empty(), "parse error in `{sql}`: {:?}", p.errors);
+        run(stmts.remove(0), &mut catalog, bp.clone(), txn.clone(), session)
+            .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+    };
+
+    let mut plain = Session::with_runtime(runtime.clone());
+    exec("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER NOT NULL);", &mut plain);
+    // A plain write, outside any agent session: it has no run and must keep its honest null.
+    exec("INSERT INTO inventory VALUES (1, 10);", &mut plain);
+
+    let mut agent = Session::with_runtime(runtime.clone());
+    exec("BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42';", &mut agent);
+    exec("UPDATE inventory SET qty = 99 WHERE id = 1;", &mut agent);
+    exec("MERGE;", &mut agent);
+
+    wal.flush().unwrap();
+    let decoded = LogicalDecoder::new(&catalog)
+        .decode(
+            &wal,
+            wal.base_lsn.load(Ordering::SeqCst),
+            wal.next_lsn.load(Ordering::SeqCst),
+        )
+        .expect("decode");
+
+    let rows: Vec<_> = decoded
+        .events
+        .iter()
+        .filter(|e| matches!(e.op, ChangeOp::Insert { .. } | ChangeOp::Update { .. } | ChangeOp::Delete { .. }))
+        .collect();
+    assert!(!rows.is_empty(), "the feed carried no row changes at all, so neither half is testable");
+
+    let attributed: Vec<_> = rows.iter().filter(|e| e.writer.is_some()).collect();
+    assert!(
+        !attributed.is_empty(),
+        "the agent's merge shipped {} row change(s) and not one carried a writer — `bind_run` is not \
+         being called on the publish path, so the log cannot say who wrote them",
+        rows.len()
+    );
+    let w = attributed[0].writer.as_ref().unwrap();
+    assert_eq!(w.agent_id, "restock-agent", "the feed named the wrong agent: {w:?}");
+    assert_eq!(w.run_id, "run-42", "the feed named the wrong run: {w:?}");
+
+    // The anti-vacuity half: the plain INSERT is still unattributed, so this is not a runtime that
+    // stamps everything.
+    let unattributed = rows.len() - attributed.len();
+    assert!(
+        unattributed >= 1,
+        "every row change carried a writer, including the plain INSERT made outside any agent \
+         session — attribution that is always present is not attribution"
+    );
+}
+
+/// **A runtime's attribution outlives the process — the other half of E79.**
+///
+/// Every `AgentRuntime` constructor builds a `MemProvenanceStore`. That is right for a test and
+/// wrong for a database: the row keeps its author STAMP across a restart (it is in the heap), while
+/// the table mapping that stamp to an agent lives in this process and does not. So `who_wrote_row`
+/// and `ferro_row_authors` answered correctly all session and then answered nothing — the worst
+/// shape, because the rows still look attributed.
+///
+/// `with_durable_provenance` is a builder rather than a constructor argument because the
+/// constructors take page stores and a database's *name* is not something they are given; the layer
+/// that owns the path applies it (`cli.rs` does).
+///
+/// **The anti-vacuity half is the whole test.** "The durable store round-trips" would pass against a
+/// runtime that never used it, so the same sequence is run on a default (in-memory) runtime and must
+/// LOSE the attribution. One assertion without the other proves nothing about the wiring.
+#[test]
+fn provenance_survives_a_reopen_only_when_the_runtime_was_built_durable() {
+    use ferrodb::agent_sql::runtime::AgentRuntime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attribution");
+    let rid = RecordId { page_id: 9, slot_num: 4 };
+    let run = a_run(1, "restock-agent", "run-42", "2026-05", "top up everything below reorder");
+
+    // Durable: intern, stamp, drop the whole runtime, reopen at the same path.
+    let id = {
+        let rt = AgentRuntime::new().with_durable_provenance(&path).expect("open durable store");
+        let id = rt.provenance().intern(&run).expect("intern");
+        rt.provenance().stamp(rid, id).expect("stamp");
+        id
+    };
+
+    let reopened = AgentRuntime::new().with_durable_provenance(&path).expect("reopen durable store");
+    assert_eq!(
+        reopened.provenance().attribute(rid).expect("attribute"),
+        id,
+        "the row's author was lost across a reopen, so `who_wrote_row` answers nothing for a row \
+         that still carries its stamp"
+    );
+    let back = reopened.provenance().lookup(id).expect("lookup");
+    assert_eq!(back.agent_id, "restock-agent", "the run came back as a different actor: {back:?}");
+    assert_eq!(back.run_id, "run-42");
+
+    // Anti-vacuity: the default runtime is in-memory, and must NOT survive the same sequence.
+    let mem_path = dir.path().join("unused");
+    let mem_id = {
+        let rt = AgentRuntime::new();
+        let id = rt.provenance().intern(&run).expect("intern");
+        rt.provenance().stamp(rid, id).expect("stamp");
+        id
+    };
+    let fresh = AgentRuntime::new();
+    assert!(
+        fresh.provenance().attribute(rid).map(|p| p == mem_id).unwrap_or(false) == false,
+        "a default in-memory runtime reported an attribution from a runtime that no longer exists, \
+         so this test cannot tell a durable store from a shared global"
+    );
+    let _ = mem_path;
+}

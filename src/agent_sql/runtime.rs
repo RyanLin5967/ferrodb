@@ -487,6 +487,26 @@ impl AgentRuntime {
     }
 
     /// The provenance store: interned runs, and the author of each version the executor wrote.
+    /// Swap in a provenance store that **outlives the process**.
+    ///
+    /// Every constructor builds a `MemProvenanceStore`, which is right for a test and wrong for a
+    /// database: the run behind each row lives only in this process, so `who_wrote_row` and
+    /// `ferro_row_authors` answer correctly all session and then answer nothing at all after a
+    /// restart. B5 built `DurableProvenanceStore` for exactly this and could not wire it, because
+    /// it opens a PATH and the constructors take page stores — a database file's name is not
+    /// something `with_storage` is given.
+    ///
+    /// So it is a builder rather than a constructor parameter: the caller that owns the database
+    /// path applies it, and the three constructors keep their signatures and their many call sites.
+    /// A runtime built without it still works — it is simply in-memory, which is what a test wants.
+    pub fn with_durable_provenance(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, FerroError> {
+        self.prov_store = Arc::new(crate::provenance::DurableProvenanceStore::open(path)?);
+        Ok(self)
+    }
+
     pub fn provenance(&self) -> &Arc<dyn ProvenanceStore> {
         &self.prov_store
     }
@@ -2728,6 +2748,33 @@ impl AgentRuntime {
         //   just published — so publishing narrow and altering after is not a compromise, it is
         //   the same single pass over the heap that the alter was always going to make.
         let publish_txn = ctx.txn.begin()?;
+        // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
+        //
+        // The loop below already stamps each version's author through `apply_in`, which is what
+        // `who_wrote_row` and `ferro_row_authors` read — but that is in-memory state beside the
+        // heap, and a *reader of the log* has no access to it. `bind_run` appends a
+        // `RecKind::RunIdentity` chained to this transaction, which is the only thing the logical
+        // decoder can turn into a `writer` on a change event. Nothing called it, so every event on
+        // the feed carried `"writer":null` no matter which agent produced it — the attribution B5
+        // built was real and stopped at the process boundary.
+        //
+        // Skipped when the branch has no run: `ProvId::NONE` is the slot that MEANS unattributed,
+        // and `bind_run` refuses it rather than writing an identity record that claims a writer and
+        // names none. A plain SQL write has no run and must keep its honest null.
+        if !snapshot.prov.is_none() {
+            match self.provenance().lookup(snapshot.prov) {
+                Ok(run) => {
+                    if let Err(e) = ctx.txn.bind_run(publish_txn, run) {
+                        ctx.txn.abort(publish_txn)?;
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    ctx.txn.abort(publish_txn)?;
+                    return Err(e);
+                }
+            }
+        }
         let mut published = 0usize;
         for w in pending {
             // Crash point for D8. Inert in every normal run; see `crash_after_rows`.
