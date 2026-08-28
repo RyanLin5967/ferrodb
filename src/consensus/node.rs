@@ -29,8 +29,8 @@
 //! reports healthy while the cluster stalls.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,6 +40,7 @@ use super::log::{LogError, RoundLog};
 use super::transport::{Transport, TransportOptions};
 use super::{Action, Command, Consensus, Entry, Event, HardState, NodeId, Role, Round, Term};
 use crate::error::FerroError;
+use crate::storage::atomic_file::{replace_atomically, OsFileOps};
 
 /// Where a committed entry goes once consensus has agreed on it.
 ///
@@ -420,28 +421,18 @@ fn load_hard_state(dir: &Path) -> Result<HardState, FerroError> {
 
 /// Write the hard state and **return only once it is on the device**.
 ///
-/// Temp-then-rename, with the directory fsynced after: a rename is atomic, so a crash leaves either
-/// the old record or the new one and never a torn one. Writing in place would be one syscall
-/// shorter and would allow exactly the torn record `hard_decode` has to refuse.
+/// Temp-then-rename with both fsyncs, so a crash leaves either the old record or the new one and
+/// never a torn one. Writing in place would be one syscall shorter and would allow exactly the torn
+/// record `hard_decode` has to refuse.
+///
+/// Delegated to [`replace_atomically`] rather than spelled out here. The hand-rolled version fsynced
+/// the directory as `File::open(dir)?.sync_all()`, which is `ERROR_ACCESS_DENIED` on Windows — a
+/// directory needs `FILE_FLAG_BACKUP_SEMANTICS` there — so every store failed on one of the three CI
+/// platforms. `OsFileOps::sync_dir` already carries that platform split, and states in its own doc
+/// comment that the Windows arm is a real gap rather than parity.
 fn store_hard_state(dir: &Path, h: &HardState) -> Result<(), FerroError> {
-    let tmp = dir.join("hardstate.tmp");
-    let dst = hard_path(dir);
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|e| FerroError::Io(e.to_string()))?;
-        f.write_all(&hard_encode(h)).map_err(|e| FerroError::Io(e.to_string()))?;
-        f.sync_all().map_err(|e| FerroError::Io(e.to_string()))?;
-    }
-    fs::rename(&tmp, &dst).map_err(|e| FerroError::Io(e.to_string()))?;
-    // The rename itself must be durable, or a crash can resurrect the previous vote.
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| FerroError::Io(e.to_string()))?;
-    Ok(())
+    replace_atomically(&OsFileOps, &hard_path(dir), &hard_encode(h))
+        .map_err(|e| FerroError::Io(e.to_string()))
 }
 
 #[cfg(test)]
