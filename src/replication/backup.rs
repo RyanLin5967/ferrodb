@@ -82,7 +82,10 @@ pub struct BackupLabel {
 }
 
 impl BackupLabel {
-    fn encode(&self) -> String {
+    /// `pub(crate)` for F6: `consensus/snapshot.rs` explodes a streamed snapshot back into the
+    /// directory shape [`restore`] reads, and writing that label by hand would be a second
+    /// implementation of this format that could disagree with [`BackupLabel::decode`].
+    pub(crate) fn encode(&self) -> String {
         // Deliberately text: a backup that cannot be read without the tool that wrote it is a
         // worse backup, and this file is the first thing anyone looks at when a restore goes wrong.
         format!(
