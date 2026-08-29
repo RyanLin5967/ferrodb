@@ -15,14 +15,14 @@ NAME=$1
 LIBF=${2:-}
 INTF=${3:-}
 
-git checkout -- src/ >/dev/null 2>&1
+git checkout -- src/ examples/ >/dev/null 2>&1
 python3 scratchpad/f11_mutate.py "$NAME" >/dev/null || { echo "$NAME: could not apply"; exit 1; }
 printf '\n### %s\n' "$NAME" >> $OUT
 
 if ! timeout 900 cargo build --lib --examples >"$RAW/$NAME.build" 2>&1; then
   echo "- **DID NOT BUILD** — not evidence about anything:" >> $OUT
   tail -12 "$RAW/$NAME.build" | sed 's/^/      /' >> $OUT
-  git checkout -- src/; timeout 900 cargo build --lib --examples >/dev/null 2>&1
+  git checkout -- src/ examples/; timeout 900 cargo build --lib --examples >/dev/null 2>&1
   echo "$NAME: BUILD FAILED"; exit 1
 fi
 echo "- compiles: yes" >> $OUT
@@ -52,7 +52,7 @@ if [ -n "$INTF" ]; then
   record "$RAW/$NAME.int" "cargo test --test integration_server_reaps -- $INTF" || rc=1
 fi
 
-git checkout -- src/
+git checkout -- src/ examples/
 timeout 900 cargo build --lib --examples >/dev/null 2>&1
 echo "$NAME: done (rc=$rc)"
 exit $rc
