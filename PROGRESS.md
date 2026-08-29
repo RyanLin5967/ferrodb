@@ -1,31 +1,38 @@
 # F10 — a durable Typed Effect Log
 
-## Done
-- `src/tel/log.rs` rewritten: `DurableEffectLog` beside `MemEffectLog`, one shared `classify()` for
-  the re-append rule, a self-describing codec for `TxnFrame` (Value tags are `index_page`'s), and
-  the `Storage` seam so crashes can be aimed. Committed `6c3d45d`.
-- `src/tel/tests_durable_log.rs`: 19 tests, all green. Includes a 60-point aimed crash sweep over a
-  whole agent task × 3 write shapes × 2 durability models.
-- Real defect found by widening that sweep and fixed (`52ef826`): `open` refused any file shorter
-  than its 12-byte header, so a crash tearing the very first write bricked the log for ever.
-- `scratchpad/guard-depth-measurement.md`: measured where `GuardExpr` recursion aborts the process
-  (codec ok at 512, aborts at 768; the pre-existing clone/eval/Display/Drop abort near 1024). Cap
-  set to 256 from the measurement, not a guess.
-- `scratchpad/mutants-f10.py`: 16 mutants, one per rule.
+## Status: DONE except one clause, which is a lane blocker (see below)
 
-## Doing right now
-- Mutant run in flight (background, `scratchpad/mutants-f10.log`). **Do not write into src/ or
-  tests/ while it runs** — it edits `src/tel/log.rs` in place and restores it.
+## Done
+- `src/tel/log.rs` (212 → 1661): `DurableEffectLog` beside `MemEffectLog`, one shared `classify()`
+  for the re-append rule, growth appended as a **delta** so a retry writes nothing and every op
+  reaches the file exactly once, a self-describing `TxnFrame` codec (Value tags are
+  `index_page`'s, strings go through `wal::log::write_str`), the `Storage` seam so crashes are aimed.
+- `src/tel/tests_durable_log.rs` (1560): 24 tests. `tests/integration_durable_tel.rs` (337): 3.
+- `src/tel/mod.rs`: one re-export line. `.gitignore`: `*.tel` and `*.provenance`.
+- **Suite: 86 targets, 1722 passed, 0 failed. Go: 97 ok.** 1695 baseline + 27 new = 1722.
+  Evidence in `scratchpad/suite-f10-*.tsv` and `/Users/idide/wt/artie-research/build-G/`.
+- **Mutants: 23/23 killed** (`scratchpad/mutants-f10.py`, logs beside it).
+- CI gate green: `RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" cargo build --lib --tests
+  --examples` exits 0.
+- Three real defects in my own code found by attacking a pristine export in a fresh context, plus
+  three more I verified from the panel's *refuted* list; all fixed. See the summary.
+
+## The one clause not done, and it is not mine to do
+"…**and is the runtime's default**". `DurableEffectLog::default_for_database(db_path)` exists so the
+edit carries no decision, but the two files that own a database's name are held by live siblings in
+this wave: `src/cli/cli.rs:119,125` and `examples/pgserver.rs:95,102` are **F11's**;
+`src/agent_sql/runtime.rs` is **F9's** (its brief says so in as many words). Four arguments:
+
+```rust
+// src/cli/cli.rs:119 and :125   — fn run_cli(db_path: &str), uses `?`
+-                Arc::new(MemEffectLog::new()),
++                DurableEffectLog::default_for_database(db_path)?,
+// examples/pgserver.rs:95 and :102 — path variable is `db`, file uses `.expect`
+-            Arc::new(MemEffectLog::new()),
++            DurableEffectLog::default_for_database(&db).expect("durable effect log"),
+```
+Apply `DEMO.md:231` with it — "The effect log is `MemEffectLog`, which is a memory implementation
+rather than a durable one" becomes false at that moment.
 
 ## Single next action
-- Read the mutant log; then add `pub use log::{DurableEffectLog, RecoveryReport};` to
-  `src/tel/mod.rs` and create `tests/integration_durable_tel.rs` (drafted in the session
-  scratchpad), then run `tools/verify-suite.sh` in per-target mode.
-
-## OWNERSHIP CONSTRAINT (do not re-derive)
-F9 holds `src/agent_sql/runtime.rs` and F11 holds `src/cli/cli.rs` + `examples/pgserver.rs`, both
-live in this wave (`~/wt/artie-research/phase-f-wave-b.tsv`). So the last mile of the ledger's
-"…and is the runtime's default" — swapping `Arc::new(MemEffectLog::new())` for
-`DurableEffectLog::default_for_database(&db_path)?` at `src/cli/cli.rs:119` and `:125` and
-`examples/pgserver.rs:95` and `:102` — is NOT mine to edit. `default_for_database` exists so that
-edit carries no decision.
+Nothing. Summary written to `/Users/idide/wt/artie-research/build-G/F10-durable-tel.md`.
