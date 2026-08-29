@@ -133,6 +133,27 @@ def _():
     """        .with_durable_provenance(format!("{db_path}.provenance"))?,""")
     sub(CLI, "use crate::branch::{BranchCatalog, Reaper};", "use crate::branch::BranchCatalog;")
 
+@m('M11-parse-after-the-lock')
+def _():
+    """Put the interval parse back after `DbLock::acquire`, so `process::exit` strands the lock."""
+    PG = 'examples/pgserver.rs'
+    parse = """    let interval = scan_interval_from_env().unwrap_or_else(|e| {
+        eprintln!("pgserver: {e}");
+        std::process::exit(1);
+    });
+
+"""
+    sub(PG, parse, "")
+    sub(PG, """    let lease =
+        LeaseThread::start(reaper, runtime, ctx.clone() as Arc<dyn RuntimeLock>, interval)""",
+    """    let interval = scan_interval_from_env().unwrap_or_else(|e| {
+        eprintln!("pgserver: {e}");
+        std::process::exit(1);
+    });
+    let lease =
+        LeaseThread::start(reaper, runtime, ctx.clone() as Arc<dyn RuntimeLock>, interval)""")
+
+
 if __name__ == '__main__':
     if len(sys.argv) != 2 or sys.argv[1] not in M:
         print('\n'.join(M), file=sys.stderr); sys.exit(2)

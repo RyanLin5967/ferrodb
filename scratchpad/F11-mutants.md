@@ -22,8 +22,16 @@ rather than trusted from this file.
 | M8 | `Drop for LeaseThread` does nothing | a dropped thread is stopped | `dropping_the_lease_thread_stops_it` |
 | M9 | `FERRODB_LEASE_SCAN_MILLIS` falls back to the default | refuse, never default | `the_scan_interval_knob_refuses_every_value_it_cannot_use`, `both_binaries_refuse_to_start_on_an_unusable_scan_interval` |
 | M10 | `with_reaper` dropped from the CLI's runtime | a retired branch gives its extent back | `a_merged_branch_gives_its_extent_back_without_any_lease_scan` |
+| M11 | the interval is parsed *after* `DbLock::acquire` again | a refusal leaves no lock behind | `both_binaries_refuse_to_start_on_an_unusable_scan_interval` |
 
-Nine killed on the first firing. **M7 survived**, which is the finding this pass exists for; the
+M11 is not a hypothetical: it is the defect a self-review of the diff found and this row shipped
+with until it was fixed. `pgserver` refuses a bad `FERRODB_LEASE_SCAN_MILLIS` with `process::exit`,
+which does not run destructors, so parsing the variable after `DbLock::acquire` stranded
+`<db>.lock` — and the operator who then corrected the variable would be told the database was
+already open by a process that no longer existed. Both binaries now parse it before they touch a
+file, and the test asserts the absence of the lock file.
+
+Nine of the first ten killed on the first firing. **M7 survived**, which is the finding this pass exists for; the
 test it survived was racy and has been replaced. Two mutants (M6, M9) had to be rewritten because
 the first version did not apply or did not compile — a mutant that does not build prints nothing and
 looks exactly like a surviving one, so neither was counted until it built.
@@ -185,5 +193,17 @@ test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
       the store still lists an extent owned by the merged branch: [(ArenaId(1), BranchId { id: 0, generation: 0 }), (ArenaId(2), BranchId { id: 1, generation: 0 })]
       note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
       test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 49.33s
+      
+      error: test failed, to rerun pass `--test integration_server_reaps`
+
+### M11-parse-after-the-lock
+- compiles: yes
+- `cargo test --test integration_server_reaps -- both_binaries_refuse_to_start_on_an_unusable_scan_interval`:
+      ---- both_binaries_refuse_to_start_on_an_unusable_scan_interval stdout ----
+      
+      thread 'both_binaries_refuse_to_start_on_an_unusable_scan_interval' (25059842) panicked at tests/integration_server_reaps.rs:717:9:
+      pgserver refused FERRODB_LEASE_SCAN_MILLIS="off" but left /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpONN4UB/badsrv0.db.lock behind — its refusal path is `process::exit`, which does not drop the DbLock
+      note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+      test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 79.61s
       
       error: test failed, to rerun pass `--test integration_server_reaps`
