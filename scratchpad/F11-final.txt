@@ -1,0 +1,22 @@
+# F11 — final confirmation after the stale-lock fix
+RUSTFLAGS="-D duplicate_macro_attributes -D dead_code"  HEAD=9e99592  tracked-tree-modified=0
+
+lib                                      test result: ok. 1104 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.84s
+integration_server_reaps                 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 56.36s
+integration_cli_agent_isolation          test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.47s
+integration_pgwire                       test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+integration_system_views_wire            test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+integration_server_stdout                test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 155.42s
+integration_readme_commands              test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 67.34s
+integration_sql_on_durable_branches      test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+agent_sql_surface                        test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+Scope of this run, stated rather than implied: the full per-target suite (scratchpad/F11-suite.txt,
+1715 passing) was measured BEFORE the stale-lock fix. That fix touches only `examples/pgserver.rs`,
+`src/cli/cli.rs` and this row's own test, so the targets that could see it are the ones that spawn
+either binary — `integration_cli_agent_isolation`, `integration_pgwire`, `integration_readme_commands`,
+`integration_server_reaps`, `integration_system_views_wire` (all five hits of
+`grep -rl 'CARGO_BIN_EXE_ferrodb\|example_bin("pgserver")' tests/`) and `integration_server_stdout`,
+which spawns pgserver too. Every one of them is in the list above, plus `--lib` and two targets that
+exercise the agent SQL surface the reaper now hangs off. Test counts are unchanged from the batch
+run, so the 1715 total still holds.
