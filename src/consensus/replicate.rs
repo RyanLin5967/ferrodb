@@ -122,6 +122,21 @@ pub struct Progress {
     /// See the module header. The frozen `Consensus` has no field for entries and this is the one
     /// type in its field set that `replicate.rs` owns.
     pub(crate) own_log: Option<LogTail>,
+
+    /// F6: the snapshot this **leader** is streaming to this peer, if any.
+    ///
+    /// Subordinate to `needs_snapshot`, never a second authority. `on_append_resp` clears
+    /// `needs_snapshot` on every success, so two independent flags would disagree the moment a
+    /// peer answered mid-transfer; instead `send_append_to` reads the cursor only inside the
+    /// `needs_snapshot` branch, and `on_append_resp` drops it wherever it clears the flag.
+    pub(crate) sending: Option<super::snapshot::SendCursor>,
+
+    /// **Only in the entry keyed by the node's own id**: F6's transfer *into* this node.
+    ///
+    /// Beside the log rather than in `Consensus` for the same reason [`LogTail`] is — the frozen
+    /// field set has no room — and it is O(1) in the size of the snapshot by construction: see
+    /// `snapshot.rs`, which owns every rule about it.
+    pub(crate) receiving: Option<super::snapshot::RecvCursor>,
 }
 
 /// The node's own log above the snapshot floor: contiguous, ascending, and digested as it grows.
@@ -215,6 +230,27 @@ impl LogTail {
         self.digests.push(d);
     }
 
+    /// Drop everything at or below `base`, keeping the rest.
+    ///
+    /// The counterpart of [`LogTail::rebased`] for a node checkpointing its **own** log rather than
+    /// installing somebody else's. The surviving digests are carried across unchanged, which is
+    /// sound because a rolling digest is an absolute value at a round and not an offset into this
+    /// vector — so a compaction cannot change what this node reports at any round it still holds.
+    fn compact_to(&mut self, base: Round, base_digest: u64) {
+        assert!(
+            base > self.base && base <= self.last_round(),
+            "compact_to({base}) on a tail covering ({}, {}]: the caller must have checked both \
+             ends, because dropping the wrong prefix silently renumbers every entry above it",
+            self.base,
+            self.last_round()
+        );
+        let drop = (base - self.base) as usize;
+        self.entries.drain(..drop);
+        self.digests.drain(..drop);
+        self.base = base;
+        self.base_digest = base_digest;
+    }
+
     /// Drop `from` and everything above it.
     fn truncate_from(&mut self, from: Round) {
         if from <= self.base {
@@ -241,7 +277,7 @@ impl LogTail {
 /// so the two cannot drift into agreeing on a wrong answer.
 ///
 /// Not a dependency: this crate carries zero runtime dependencies and that is a product claim.
-fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -249,7 +285,7 @@ fn fnv64_update(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Fold a variable-length piece in, length-prefixed.
 ///
@@ -445,6 +481,7 @@ impl Consensus {
         hard: HardState,
         snapshot_round: Round,
         snapshot_term: Term,
+        base_digest: u64,
         entries: Vec<Entry>,
     ) {
         assert!(
@@ -464,10 +501,15 @@ impl Consensus {
         self.last_term = snapshot_term;
 
         // The floor is where the log starts, so the tail is rebased there before anything is
-        // pushed. `base_digest` is 0 because no snapshot is installed (F6): a zero digest means
-        // "not claiming anything below me", which is what `AppendResp` already reads it as.
+        // pushed. `base_digest` is the rolling digest at the floor, which the driver read back from
+        // the record it wrote when the snapshot was installed. **Zero is not a neutral default
+        // here.** Every digest above the floor chains from this value, so restoring the wrong one
+        // makes a healthy node disagree with its leader at every round and be latched as diverged;
+        // zero is the one value `AppendResp` reads as "not claiming anything", so it degrades the
+        // detector to silent instead of to wrong. `node.rs` supplies zero only when it has no
+        // record to read, and says so.
         let tail = self.progress.entry(self.self_id).or_default();
-        tail.own_log = Some(LogTail::rebased(snapshot_round, 0));
+        tail.own_log = Some(LogTail::rebased(snapshot_round, base_digest));
 
         for e in entries {
             if e.round <= snapshot_round {
@@ -480,10 +522,46 @@ impl Consensus {
         }
 
         // Everything on this node's disk is by definition durable. `commit` deliberately stays at
-        // zero: durability is a local fact, and whether a round was COMMITTED is a fact about a
-        // quorum that only a leader's `Append` can re-establish. Restoring a commit index from
-        // local disk is how a node applies a round the cluster later truncated.
+        // the *floor* and not at the tail: durability is a local fact, and whether a round in the
+        // TAIL was COMMITTED is a fact about a quorum that only a leader's `Append` can
+        // re-establish. Restoring a commit index from a local log tail is how a node applies a
+        // round the cluster later truncated.
+        //
+        // **The floor is different in kind and must be restored.** A snapshot floor exists only
+        // because a snapshot covering it was taken at or below a leader's `applied`, which is at or
+        // below its `commit` — so it is committed state by construction, and the storage engine
+        // already holds it. Leaving `applied` at zero would send the next `Action::Apply` walking
+        // rounds that no longer exist anywhere on this node, which is exactly what `node.rs`
+        // refused to do while F6 was unimplemented.
         self.durable = self.last_round;
+        self.commit = snapshot_round;
+        self.applied = snapshot_round;
+    }
+
+    /// Rebase this node's log onto an installed snapshot's floor, discarding every entry.
+    ///
+    /// The seam F6 installs through, here rather than in `snapshot.rs` because [`LogTail`] and its
+    /// digest chain are private to this file and two places building that chain is how they come to
+    /// disagree.
+    ///
+    /// **The whole tail goes, not just the prefix.** A node being re-seeded holds rounds the leader
+    /// serving it cannot vouch for — that is why it is being re-seeded — and `RoundLog` does the
+    /// same on the disk side: a `discard_prefix` above the end of the log empties it.
+    ///
+    /// The caller must have already moved `snapshot_round`, `snapshot_term` and `last_round`, or
+    /// [`Consensus::ensure_log`] will refuse on the very next entry point, naming this call.
+    pub(crate) fn install_snapshot_tail(&mut self, base: Round, base_digest: u64) {
+        let id = self.self_id;
+        self.progress.entry(id).or_default().own_log = Some(LogTail::rebased(base, base_digest));
+    }
+
+    /// Drop this node's log prefix at or below `base`, keeping everything above it.
+    ///
+    /// The other half of the seam above, for a node checkpointing its own log. Same rule about
+    /// ordering: the caller moves `snapshot_round`/`snapshot_term` in the same step, or
+    /// [`Consensus::ensure_log`] refuses on the next entry point.
+    pub(crate) fn compact_tail(&mut self, base: Round, base_digest: u64) {
+        self.tail_mut().compact_to(base, base_digest);
     }
 
     /// The highest round this node's log is confirmed to agree with its current leader's.
@@ -494,7 +572,7 @@ impl Consensus {
         self.progress.get(&self.self_id).map(|p| p.matched).unwrap_or(0)
     }
 
-    fn set_agreed(&mut self, r: Round) {
+    pub(crate) fn set_agreed(&mut self, r: Round) {
         let id = self.self_id;
         self.progress.entry(id).or_default().matched = r;
     }
@@ -602,6 +680,11 @@ impl Consensus {
             p.matched = 0;
             p.silent = 0;
             p.needs_snapshot = false;
+            // A transfer belongs to the leader that armed it: its payload is that leader's image
+            // at that leader's `applied`, and this node has just established a different one.
+            // Reset field by field, like everything above it, so the log and the divergence
+            // latches survive — see this function's own doc.
+            p.sending = None;
         }
         // Written after the loop because `members()` contains this node: a leader's own replica is
         // exactly as far along as its own durability, and starting it at 0 would make a leader
@@ -611,6 +694,11 @@ impl Consensus {
         p.next = next;
         p.matched = durable;
         p.needs_snapshot = false;
+        p.sending = None;
+        // A node that has just won an election is not a node being re-seeded. Abandoning the
+        // incoming transfer here is what stops a `Persisted` for its round arriving later and
+        // installing somebody else's image over a leader's own state.
+        p.receiving = None;
     }
 
     /// Everything a node must do on winning an election: per-peer state, the term-establishing
@@ -656,16 +744,22 @@ impl Consensus {
         }
         self.ensure_log();
         let last = self.last_round;
-        let p = self.progress.entry(peer).or_default();
-        if p.next == 0 {
-            p.next = last + 1;
-        }
-        if p.needs_snapshot {
+        let transferring = {
+            let p = self.progress.entry(peer).or_default();
+            if p.next == 0 {
+                p.next = last + 1;
+            }
+            p.needs_snapshot
+        };
+        if transferring {
             // F6 owns the transfer. Sending entries at a round this leader no longer holds would
-            // be a hole, not a catch-up.
+            // be a hole, not a catch-up. A bare `return` here was the stub, and it muted the peer
+            // for ever: the only thing that cleared the flag was a successful `AppendResp`, which
+            // can no longer arrive.
+            self.send_snapshot_chunk_to(peer, out);
             return;
         }
-        let next = p.next;
+        let next = self.progress[&peer].next;
 
         let prev_round = next.saturating_sub(1);
         let Some(prev_term) = self.term_at(prev_round) else {
@@ -821,20 +915,12 @@ impl Consensus {
             Body::AppendResp { success, matched, hint, digest } => {
                 self.on_append_resp(from, success, matched, hint, digest, out)
             }
-            Body::InstallSnapshot { .. } => {
-                // F6 owns state transfer. Until it lands the honest answer is "nothing was
-                // received": `received_through: 0` leaves the sender's cursor where it was, so it
-                // retries and nothing is lost. Dropping it silently would look like progress, and
-                // `unimplemented!()` would take the process down on a message a healthy cluster
-                // legitimately sends to a follower that has fallen behind log retention.
-                out.push(Action::Send(Message {
-                    from: self.self_id,
-                    to: from,
-                    term: self.hard.term,
-                    body: Body::InstallSnapshotResp { received_through: 0 },
-                }));
+            Body::InstallSnapshot { meta, offset, data, done } => {
+                self.on_install_snapshot(from, m.term, meta, offset, data, done, out)
             }
-            Body::InstallSnapshotResp { .. } => {}
+            Body::InstallSnapshotResp { received_through } => {
+                self.on_install_snapshot_resp(from, received_through, out)
+            }
             other => unreachable!("on_append_msg received a vote body: {other:?}"),
         }
     }
@@ -1112,6 +1198,11 @@ impl Consensus {
         // answer must not undo a back-up the leader has already made.
         p.next = p.next.max(p.matched + 1);
         p.needs_snapshot = false;
+        // The cursor is subordinate to the flag (see `Progress::sending`): a peer that has
+        // acknowledged an append is a peer this leader can serve with entries, so whatever transfer
+        // was armed is finished or moot. Dropping it here and not only in `on_install_snapshot_resp`
+        // is what keeps the two from ever disagreeing.
+        p.sending = None;
         let advanced = p.matched > before;
 
         // **Keep sending while the peer is still behind.** One `Append` carries at most
@@ -1130,6 +1221,20 @@ impl Consensus {
     /// The caller made rounds durable. This is where an ack is emitted — never on receipt.
     pub(crate) fn on_persisted(&mut self, term: Term, round: Round, out: &mut Vec<Action>) {
         self.ensure_log();
+
+        // **F6.** The driver reports a snapshot install with the round it covers, because that is
+        // exactly what the event already means: everything through `round` is on this node's disk.
+        // Reusing it rather than adding an event keeps the frozen contract intact and keeps the one
+        // rule that matters — nothing moves until the fsync returned — in one place.
+        if self.pending_install_round() == Some(round) {
+            if let Err(why) = self.finish_install(out) {
+                // A configuration this node cannot install is damage, and `note_config_in_log` has
+                // already stepped this node down for it. Surfaced rather than swallowed: the
+                // snapshot stays pending, so the transfer is retried rather than silently skipped.
+                out.push(Action::Refuse { why });
+                return;
+            }
+        }
 
         // Durability is a fact about bytes and not about office, so an ordinary step-down between
         // the `Persist` and this event does not invalidate the report — which is why it is bounded

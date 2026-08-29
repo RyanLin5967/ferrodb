@@ -262,3 +262,169 @@ fn a_proposal_to_a_follower_is_refused_rather_than_dropped() {
     );
     n.shutdown();
 }
+
+use crate::consensus::snapshot as snap6;
+use crate::consensus::{Body, Message};
+
+// ---------------------------------------------------------------- F6: the driver's own account
+
+/// A `Snapshot` big enough to need more than one chunk, so a second chunk has somewhere to go
+/// wrong. Two pages of arena and branch bytes are enough to make the payloads distinguishable.
+fn multi_chunk_snapshot(round: Round, term: Term) -> snap6::Snapshot {
+    use crate::replication::backup::BackupLabel;
+    let pages = 512u32;
+    snap6::Snapshot::build(
+        &snap6::SnapshotPoint {
+            last_round: round,
+            last_term: term,
+            config: Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+            base_digest: 0,
+        },
+        1,
+        1,
+        BackupLabel { start_lsn: 1, end_lsn: 2, page_count: pages },
+        &[7u8; 8],
+        &[7u8; 4],
+        &[],
+        vec![7u8; pages as usize * crate::storage::disk_manager::PAGE_SIZE],
+    )
+    .expect("a well-formed payload was refused")
+}
+
+fn chunk_msg(snap: &snap6::Snapshot, offset: u64) -> Message {
+    let bytes = snap.payload();
+    let from = offset as usize;
+    let to = (from + snap6::SNAPSHOT_CHUNK_BYTES).min(bytes.len());
+    Message {
+        from: NodeId(2),
+        to: NodeId(1),
+        term: 1,
+        body: Body::InstallSnapshot {
+            meta: snap.meta.clone(),
+            offset,
+            data: bytes[from..to].to_vec(),
+            done: to == bytes.len(),
+        },
+    }
+}
+
+/// **FORCED FIRE.** A spool that is short of what the state machine digested is refused by name,
+/// at the install, rather than installed.
+///
+/// This is the reconciliation that cannot happen in a healthy run, which is exactly why it needs to
+/// be made to. The state machine digests the bytes it *saw* and this driver installs the bytes it
+/// *wrote*; if a chunk the state machine accepted was one this driver could not place, the spool is
+/// short — and a database assembled from a short spool would be installed with nothing to say
+/// otherwise. Every page of the result passes its own checksum.
+///
+/// The check is at the install and not at the chunk, and that too is a correction: the first
+/// version refused at the chunk, and a chunk re-sent by a leader on its next heartbeat — which
+/// leaves the receive cursor at exactly the value an accept produces — took the whole node down.
+#[test]
+fn a_spool_short_of_what_was_digested_is_refused_rather_than_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1)
+            .with_snapshots(Box::new(CountingStore::default()), 0),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+
+    let snap = multi_chunk_snapshot(4, 1);
+    assert!(
+        snap.meta.total_bytes > 2 * snap6::SNAPSHOT_CHUNK_BYTES as u64,
+        "the fixture needs at least three chunks so one can be lost from the middle"
+    );
+
+    // Chunk 0: both accounts agree.
+    n.pending.push_back(Event::Recv(chunk_msg(&snap, 0)));
+    n.drain().expect("the first chunk was refused");
+    let after_first = n.spooled;
+
+    // Chunk 1: the driver's account is moved out from under it, so it cannot place the chunk. The
+    // state machine still accepts and digests it. **This is not an error** — a chunk the driver
+    // cannot place is indistinguishable from a duplicate the state machine refused, and taking the
+    // node down for one of those was the defect.
+    n.spooled = u64::MAX;
+    n.pending.push_back(Event::Recv(chunk_msg(&snap, after_first)));
+    n.drain().expect("a chunk the driver could not place took the node down");
+    n.spooled = after_first; // the driver believes it is still where it was
+
+    // The rest of the transfer, which the driver places normally, until the payload completes.
+    let mut offset = n.sm.snapshot_incoming().expect("still in flight").received();
+    let err = loop {
+        n.pending.push_back(Event::Recv(chunk_msg(&snap, offset)));
+        match n.drain() {
+            Ok(()) => match n.sm.snapshot_incoming() {
+                Some(c) if !c.is_complete() => offset = c.received(),
+                _ => panic!("the transfer completed and a short spool was installed"),
+            },
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        format!("{err}").contains("have drifted"),
+        "refused, but not for the reason this guard exists: {err}"
+    );
+    assert_eq!(n.snapshots_installed(), 0, "a short spool was installed");
+    n.shutdown();
+}
+
+/// Anti-vacuity for the guard above: the same transfer, with the driver keeping up, installs.
+///
+/// Without this the test above would pass just as well against a driver that refused every install.
+#[test]
+fn a_spool_that_kept_up_installs_rather_than_being_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = Node::start(
+        NodeId(1),
+        Config::new([NodeId(1), NodeId(2), NodeId(3)], 1, 0),
+        listener(),
+        NodeOptions::new(dir.path(), BTreeMap::new(), 1)
+            .with_snapshots(Box::new(CountingStore::default()), 0),
+        RecordingApplier::default(),
+    )
+    .unwrap();
+
+    let snap = multi_chunk_snapshot(4, 1);
+    let mut offset = 0u64;
+    loop {
+        n.pending.push_back(Event::Recv(chunk_msg(&snap, offset)));
+        n.drain().expect("an ordinary chunk was refused");
+        match n.sm.snapshot_incoming() {
+            Some(c) => offset = c.received(),
+            // The cursor is gone, which on this path means the install completed and was accepted.
+            None => break,
+        }
+    }
+    assert_eq!(n.snapshots_installed(), 1, "the transfer never installed");
+    assert_eq!(n.snapshot_round(), 4, "the floor did not move to the installed round");
+    assert!(
+        !spool_path(&n.dir).exists(),
+        "the spool survived an install the state machine accepted"
+    );
+    n.shutdown();
+}
+
+/// A store that accepts anything and reads the spool it is given, so a short one fails here too
+/// rather than silently succeeding. What a REAL install does to real pages is
+/// `tests/integration_cluster_snapshot.rs`.
+#[derive(Default)]
+struct CountingStore {
+    installs: usize,
+}
+
+impl snap6::SnapshotStore for CountingStore {
+    fn capture(&mut self, _at: &snap6::SnapshotPoint) -> Result<snap6::Snapshot, FerroError> {
+        Err(FerroError::Internal("this store captures nothing".into()))
+    }
+    fn install(&mut self, _meta: &snap6::SnapshotMeta, path: &std::path::Path) -> Result<(), FerroError> {
+        let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
+        snap6::PayloadHeader::decode(&bytes).map_err(|e| e.into_ferro())?;
+        self.installs += 1;
+        Ok(())
+    }
+}

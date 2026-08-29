@@ -90,7 +90,9 @@ impl BufferPoolManager {
                     None => {
                         let _ = cache.remove(page_id);
                         return Err(FerroError::Io(format!(
-                            "buffer pool inconsistency: the replacement cache says page {page_id}                              is resident but the page table has no frame for it. The cache entry                              has been dropped; retry the fetch."
+                            "buffer pool inconsistency: the replacement cache says page {page_id} \
+                             is resident but the page table has no frame for it. The cache \
+                             entry has been dropped; retry the fetch."
                         )));
                     }
                 };
@@ -352,6 +354,64 @@ impl BufferPoolManager {
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
             self.arc_cache.lock().unwrap().remove(page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Drop every cached page **without writing any of them back**.
+    ///
+    /// For F6: a snapshot install replaces the page file underneath this pool, so every frame it
+    /// holds describes a database that no longer exists. Writing one back — which is what
+    /// [`BufferPoolManager::flush_all`] would do, and what the eviction path does on its own —
+    /// puts a page of the old database into the middle of the new one, and every such page still
+    /// passes its checksum. So this is the one operation that must *not* flush.
+    ///
+    /// **Refuses whole rather than in part** if any frame is pinned. A pinned frame has a live
+    /// reader holding an index into it; dropping the page underneath that reader would hand it
+    /// another database's bytes with no error anywhere. The caller's answer to a refusal is to
+    /// stop its readers, not to retry.
+    pub fn invalidate_all(&self) -> Result<(), FerroError> {
+        // **`arc_cache` BEFORE `page_table`.** `fetch_page` holds the cache across the whole of its
+        // work and takes the page table inside it, and its comment states the order as
+        // `arc_cache -> page_table -> frame`. Taking them the other way round here — which the
+        // first version of this function did — is a lock inversion against the one path every read
+        // in the database goes through, and the two deadlock: `fetch_page` holding the cache and
+        // blocking on the table, this holding the table and blocking on the cache.
+        // `delete_page` and `free_page` avoid it by dropping the table lock before touching the
+        // cache; this takes the same two locks in the same order as `fetch_page` instead, because
+        // it has to hold both across the whole sweep.
+        let mut cache = self.arc_cache.lock().unwrap();
+        let mut pt = self.page_table.write().unwrap();
+
+        // Every frame is checked before any is touched: a partial invalidation leaves the pool
+        // holding some pages of the old database and some of the new, which is worse than either.
+        for frame in &self.frames {
+            if frame.read().unwrap().pin_counter.load(Ordering::Relaxed) > 0 {
+                return Err(FerroError::PagePinned);
+            }
+        }
+
+        // **Collected, then cleared — never drained with a `?` inside the loop.** A `?` mid-drain
+        // returns while `Drain`'s destructor goes on emptying the map, so the table would come back
+        // empty while the frames it had named still carried `page_id = Some(..)`. Those frames are
+        // then invisible to the free-frame scan in `fetch_page` and leak for the life of the
+        // process, and the cache and the table disagree about every page they held. Nothing below
+        // this line can fail, so "refuse whole rather than in part" is true of the whole function
+        // and not only of the pinned case.
+        let resident: Vec<(u32, usize)> = pt.iter().map(|(id, i)| (*id, *i)).collect();
+        pt.clear();
+        for (page_id, frame_i) in resident {
+            let mut frame = self.frames[frame_i].write().unwrap();
+            frame.page_id = None;
+            frame.data = [0u8; PAGE_SIZE];
+            frame.pin_counter = AtomicU16::new(0);
+            frame.dirty_flag = AtomicBool::new(false);
+            drop(frame);
+            // The cache and the table are being emptied together, so a page the table no longer
+            // names cannot be `remove`d "wrongly" — an error here would say the cache had already
+            // forgotten it, which is the state being aimed at. Ignored rather than propagated, so
+            // that no early return can leave the two half-cleared.
+            let _ = cache.remove(page_id);
         }
         Ok(())
     }

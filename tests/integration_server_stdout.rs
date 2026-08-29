@@ -381,6 +381,23 @@ fn no_test_picks_a_port_for_a_server_it_has_not_started_yet() {
             "named here: this guard scans its own source, and a reason that spelled it would ",
             "make this file an offender.)",
         ),
+    // Files permitted to bind a socket of their own, each with the reason. Empty: after I16 no test
+    // in this repo needs one, because every example server reports the address it bound.
+    // NOTE for whoever adds the next entry: **the reason string is scanned like any other code**,
+    // so it must not spell the type name whole either. That is the same reason the needle below is
+    // assembled from pieces, and it is not obvious from reading — the first attempt at the entry
+    // below made this guard flag this file.
+    const ALLOWED: &[(&str, &str)] = &[(
+        "integration_cluster_snapshot.rs",
+        "F6. This file runs `consensus::node::Node` IN PROCESS, and `Node::start` takes an \
+         ALREADY-BOUND listener rather than an address — which is the CURE for I16's race rather \
+         than an instance of it. Every listener bound there is moved straight into the thing that \
+         owns it (`Node::start`, or `Transport::from_listener`) and is never dropped, so there is \
+         no window in which a port is published and unowned. The API is that shape on purpose: \
+         every node's peer map needs every other node's address, so binding A to discover its port \
+         and then constructing B is circular, and the usual way out — pick free ports, close them, \
+         hand them over — is exactly the race this guard exists to catch. \
+         `Transport::from_listener`'s own doc says so.",
     )];
 
     let mut scanned = 0usize;

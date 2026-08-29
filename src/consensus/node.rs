@@ -22,11 +22,44 @@
 //! reintroduces exactly that bug and no test in `consensus/` can see it, because the state machine
 //! emitted a correct batch either way.
 //!
+//! # State transfer, and the two things only a driver can do
+//!
+//! `Consensus` decides *whether* a snapshot may be sent, accepted or installed; it can do none of
+//! the three, because all three are bytes on a disk. So this file owns exactly two things F6 needs
+//! and nothing else:
+//!
+//! * **the retention policy.** A leader that never checkpoints never has a follower below its
+//!   floor, so state transfer is code that never runs. [`NodeOptions::retain_rounds`] is how many
+//!   rounds of log to keep above what the storage engine has applied; the log below that is
+//!   discarded on both the state machine and the disk *in the same step*, because a floor that
+//!   moved on one and not the other is refused by `ensure_log` on the next event.
+//! * **the bytes.** An arriving chunk goes from the frame to a spool file without ever being
+//!   retained by the state machine (`snapshot.rs` explains why that asymmetry is deliberate), and a
+//!   completed spool is installed through [`SnapshotStore`] before — never after — the state
+//!   machine is told, via the `Persisted` event that already means "this is on the disk".
+//!
+//! A node with no [`SnapshotStore`] configured **refuses loudly** where one would be needed rather
+//! than skipping quietly: a driver that ignores work it cannot perform is a driver that reports
+//! healthy while the cluster stalls.
+//!
 //! # What this module deliberately does not do
 //!
-//! No snapshot install (F6), no signing (F7). Both are refused loudly where they would be needed
-//! rather than skipped quietly — a driver that ignores an action it cannot perform is a driver that
-//! reports healthy while the cluster stalls.
+//! No signing (F7).
+
+/// The snapshot record: the digest at this node's log floor, which nothing else can recompute.
+///
+/// `RoundLog`'s header carries the floor's round and term, and that is enough to *read* the log.
+/// It is not enough to *answer for* it: `AppendResp.digest` is a rolling hash chained from the
+/// digest at the floor, and every entry that value was folded over has been discarded by the
+/// checkpoint that created the floor. A node that came back and anchored its chain at zero would
+/// disagree with its leader at every round above the floor and be latched as diverged — a healthy
+/// node, permanently out of the quorum, reported as byte-level corruption.
+///
+/// Kept beside the hard state rather than inside the log's header because the log's header is a
+/// durable format F0b owns and a fifth field there is a migration; this is a new file that did not
+/// exist before, so it has no old readers to break.
+const SNAP_MAGIC: u32 = 0xF6_5A_00_01;
+const SNAP_LEN: usize = 4 + 8 + 8 + 8 + 4;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
@@ -101,6 +134,19 @@ pub struct NodeOptions {
     /// It lives here rather than on [`TransportOptions`] for the reason `transport.rs` gives: the
     /// options struct is knobs with defensible defaults, and a key has no default that is right.
     pub signing_key: Option<Arc<Key>>,
+    /// How many rounds of log to keep above what the storage engine has applied.
+    ///
+    /// `None` disables checkpointing altogether, which is the right default for a node with no
+    /// storage engine attached: discarding a log you cannot snapshot is discarding it.
+    ///
+    /// **`Some(0)` compacts to `applied` on every turn**, which is what makes a follower one round
+    /// behind need state transfer. That is the anti-vacuity setting for
+    /// `tests/integration_cluster_snapshot.rs`: without it the snapshot path is code that a passing
+    /// test never entered.
+    pub retain_rounds: Option<u64>,
+    /// How this node captures and installs its own state. `None` means it cannot do either, and it
+    /// says so rather than stalling.
+    pub snapshots: Option<Box<dyn super::snapshot::SnapshotStore>>,
 }
 
 impl NodeOptions {
@@ -112,6 +158,8 @@ impl NodeOptions {
             seed,
             transport: TransportOptions::default(),
             signing_key: None,
+            retain_rounds: None,
+            snapshots: None,
         }
     }
 
@@ -127,6 +175,18 @@ impl NodeOptions {
     /// with a key and a node without one cannot talk to each other in either direction.
     pub fn signed_with(mut self, key: Arc<Key>) -> Self {
         self.signing_key = Some(key);
+        self
+    }
+
+    /// Attach a storage engine this node can snapshot and be snapshotted into, and say how much log
+    /// to keep above what it has applied.
+    pub fn with_snapshots(
+        mut self,
+        store: Box<dyn super::snapshot::SnapshotStore>,
+        retain_rounds: u64,
+    ) -> Self {
+        self.snapshots = Some(store);
+        self.retain_rounds = Some(retain_rounds);
         self
     }
 
@@ -156,6 +216,33 @@ pub struct Node<A: Applier> {
     refusals: Vec<FerroError>,
     /// Role transitions since the last drain, for a caller that wants them without polling.
     transitions: Vec<(Role, Term, Option<NodeId>)>,
+    /// F6. See the module header.
+    snapshots: Option<Box<dyn super::snapshot::SnapshotStore>>,
+    retain_rounds: Option<u64>,
+    /// Bytes of the incoming snapshot on this node's spool, and which payload they are of.
+    ///
+    /// **The driver's own account of what it wrote, never inferred from the state machine's.** The
+    /// state machine digests the bytes it saw; the driver installs the bytes it wrote; if the two
+    /// are allowed to disagree about which chunk went where, a payload that digests correctly can
+    /// still install from a spool that is a mixture of two transfers. So a chunk is written only
+    /// when the state machine's cursor and this pair agree on exactly where it belongs, and a chunk
+    /// the state machine accepted and the driver cannot place is refused **loudly** — it means the
+    /// two rules have drifted, which is the one failure neither side can detect on its own.
+    spooled: u64,
+    spooled_header: Option<super::snapshot::PayloadHeader>,
+    /// The round of an install this driver has already performed and is waiting to have confirmed.
+    ///
+    /// The confirmation is an `Event::Persisted` pushed to the back of the queue, so several
+    /// further events are drained before the state machine sees it — and without this the install
+    /// would be attempted again on each of them, against a spool the first one has already removed.
+    installed_round: Option<Round>,
+    /// How many transfers this node has **armed** as a leader — captured a snapshot for a peer
+    /// that could not be served entries. Named for what it counts and not for what a reader would
+    /// like it to mean: arming is not sending, and a leader that arms one and then loses its office
+    /// has still armed it. Whether a transfer *finished* is a fact about the receiver, and
+    /// `snapshots_installed` on that node is where it is counted.
+    snapshots_armed: u64,
+    snapshots_installed: u64,
 }
 
 /// The hard-state record: `term`, then a tagged `voted_for`, then a checksum over both.
@@ -252,7 +339,17 @@ impl<A: Applier> Node<A> {
         // disk says otherwise is the double-vote bug arriving through the restart path instead of
         // the message path.
         let entries = read_all(&log)?;
-        sm.restore(hard, log.snapshot_round(), log.snapshot_term(), entries);
+        let (base_digest, digest_note) =
+            load_snapshot_record(&opts.dir, log.snapshot_round(), log.snapshot_term())?;
+        sm.restore(hard, log.snapshot_round(), log.snapshot_term(), base_digest, entries);
+
+        // **Before the first event, and before the socket exists.** A node whose storage was left
+        // half-replaced by an interrupted install must not join a cluster and start answering for
+        // it; refusing here is the only point at which the answer is still "this node cannot serve",
+        // rather than a database nobody can tell is a mixture of two.
+        if let Some(store) = opts.snapshots.as_ref() {
+            store.check_ready()?;
+        }
 
         let net = match opts.signing_key {
             Some(key) => {
@@ -261,7 +358,8 @@ impl<A: Applier> Node<A> {
             None => Transport::from_listener(self_id, listener, opts.peers, opts.transport)?,
         };
         let now = Instant::now();
-        Ok(Node {
+        let floor = log.snapshot_round();
+        let mut node = Node {
             sm,
             log,
             net,
@@ -269,11 +367,29 @@ impl<A: Applier> Node<A> {
             dir: opts.dir,
             tick: opts.tick,
             next_tick: now + opts.tick,
-            applied: 0,
+            // **Seeded from the floor, not from zero.** Rounds at or below it were applied by
+            // whoever produced the snapshot that created it, and they no longer exist anywhere on
+            // this node — walking up from 0 would ask the log for the first of them and be refused.
+            applied: floor,
             pending: VecDeque::new(),
             refusals: Vec::new(),
             transitions: Vec::new(),
-        })
+            snapshots: opts.snapshots,
+            retain_rounds: opts.retain_rounds,
+            spooled: 0,
+            spooled_header: None,
+            installed_round: None,
+            snapshots_armed: 0,
+            snapshots_installed: 0,
+        };
+        if let Some(why) = digest_note {
+            // Degraded, not wrong: a zero base digest is the one value `AppendResp` reads as "not
+            // claiming anything", so the divergence detector goes quiet for this node rather than
+            // firing on a log it cannot describe. Surfaced through `take_refusals` because a
+            // detector that is off and says nothing is the failure this project keeps writing down.
+            node.refusals.push(why);
+        }
+        Ok(node)
     }
 
     pub fn id(&self) -> NodeId { self.sm.id() }
@@ -287,6 +403,13 @@ impl<A: Applier> Node<A> {
     pub fn applier(&self) -> &A { &self.applier }
     pub fn local_addr(&self) -> SocketAddr { self.net.local_addr() }
     pub fn take_refusals(&mut self) -> Vec<FerroError> { std::mem::take(&mut self.refusals) }
+    /// Where this node's log begins. Everything at or below it is covered by a snapshot.
+    pub fn snapshot_round(&self) -> Round { self.log.snapshot_round() }
+    /// Transfers this node has **armed** as a leader. See the field for why it is not "sent".
+    pub fn snapshots_armed(&self) -> u64 { self.snapshots_armed }
+    /// Transfers this node has installed, as a follower. **The anti-vacuity counter**: a
+    /// convergence test that never sees this move proved only that ordinary replication works.
+    pub fn snapshots_installed(&self) -> u64 { self.snapshots_installed }
     pub fn take_transitions(&mut self) -> Vec<(Role, Term, Option<NodeId>)> {
         std::mem::take(&mut self.transitions)
     }
@@ -350,10 +473,261 @@ impl<A: Applier> Node<A> {
                     self.sm.id()
                 )));
             }
+            // The chunk is taken before the step, because the step consumes the event and the
+            // bytes are needed after the state machine has ruled on them.
+            let chunk = snapshot_chunk_of(&ev);
+
             for a in self.sm.step(ev) {
                 self.perform(a)?;
             }
+
+            if let Some((offset, data)) = chunk {
+                self.spool_accepted_chunk(offset, &data)?;
+            }
+            // Inside the loop, because both are about the event just stepped: the spool write is
+            // the bytes it carried, and the install feeds a `Persisted` back into this same queue.
+            // Release first: on the iteration that carries the `Persisted`, the state machine has
+            // already cleared its cursor, and `install_pending_snapshot` clears `installed_round`
+            // on its way out — so a release that ran after it would find nothing to release and
+            // leak the spool file.
+            self.release_installed_spool();
+            self.install_pending_snapshot()?;
         }
+        // **Outside the loop**, because neither is about any one event and both are expensive.
+        // A checkpoint rewrites the log and fsyncs three times; a capture copies the page file.
+        // Running either once per event rather than once per drain multiplies that by the number
+        // of rounds in a batch — and a driver that spends longer in a drain than a leader's lease
+        // is a driver that loses the office while doing bookkeeping.
+        self.serve_snapshots()?;
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    /// Write a chunk the state machine accepted, at the offset it accepted it at.
+    ///
+    /// The condition is an exact agreement between two independent accounts and never an inference
+    /// from one of them:
+    ///
+    /// * the state machine says it now holds `offset + data.len()` bytes of a payload whose header
+    ///   it names, and
+    /// * this driver says its spool holds exactly `offset` bytes of that same payload — or the
+    ///   chunk is at offset 0, which starts a payload and truncates whatever was there.
+    ///
+    /// **A chunk this driver cannot place is skipped, not refused**, and the reason is that the
+    /// cursor alone cannot tell an accept from a duplicate.
+    ///
+    /// A re-sent chunk at offset X, arriving after the receiver has already accepted it, leaves the
+    /// cursor at exactly `X + len` — the same value an accept produces. The first version of this
+    /// returned a hard error on that case, which killed the node: a leader re-sends from its own
+    /// `acked` on every heartbeat, so any transfer of more than one chunk that spanned a heartbeat
+    /// took the process down. (The integration test escaped it only because its fixture database
+    /// was one chunk.) Skipping is safe in every reading: the spool can end up SHORT, never mixed,
+    /// because a write only ever happens at exactly the length the spool already holds — and a
+    /// short spool is refused, by name, in `install_pending_snapshot`, before a byte of it is
+    /// installed.
+    fn spool_accepted_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
+        let Some(cur) = self.sm.snapshot_incoming() else {
+            // Refused, or superseded. Nothing was accepted, so nothing is written.
+            return Ok(());
+        };
+        let header = *cur.header();
+        if cur.received() != offset + data.len() as u64 {
+            // The state machine did not accept this chunk here.
+            return Ok(());
+        }
+        let starting = offset == 0;
+        let continuing = self.spooled_header == Some(header) && self.spooled == offset;
+        if !starting && !continuing {
+            return Ok(());
+        }
+        self.spool_chunk(offset, data)?;
+        self.spooled = offset + data.len() as u64;
+        self.spooled_header = Some(header);
+        Ok(())
+    }
+
+    /// Positioned rather than appended, and the file is truncated to the new length afterwards, so
+    /// a transfer that restarts at offset 0 overwrites the old one instead of leaving its tail
+    /// behind.
+    ///
+    /// **Deliberately no fsync per chunk.** There would be nothing to resume from: the receive
+    /// cursor lives in `Consensus::progress` and `spooled`/`spooled_header` are plain fields, none
+    /// of which survives a restart, so a crash restarts every transfer at offset 0 whatever reached
+    /// the device. A flush per megabyte would buy thousands of device flushes inside the drain loop
+    /// and no durability at all — and this file's own drain comment warns that a driver which
+    /// spends longer in a drain than a leader's lease loses the office. The one fsync that IS
+    /// load-bearing happens once, in `install_pending_snapshot`, before the bytes are read back.
+    fn spool_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
+        let path = spool_path(&self.dir);
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| FerroError::Io(format!("open the snapshot spool: {e}")))?;
+        crate::storage::disk_manager::pwrite(&f, data, offset)
+            .map_err(|e| FerroError::Io(format!("write the snapshot spool: {e}")))?;
+        f.set_len(offset + data.len() as u64)
+            .map_err(|e| FerroError::Io(format!("size the snapshot spool: {e}")))?;
+        Ok(())
+    }
+
+    /// A fully received snapshot: install it, make it durable, and only then tell the state machine.
+    ///
+    /// The order is the whole of the correctness argument and is the same one `Action::Persist`
+    /// makes for entries: the state machine moves its floor on the strength of `Event::Persisted`,
+    /// so that event must not be fed until the bytes are on this node's device. An install reported
+    /// early is a node answering for a history it does not hold.
+    fn install_pending_snapshot(&mut self) -> Result<(), FerroError> {
+        let Some(round) = self.sm.pending_install_round() else {
+            self.installed_round = None;
+            return Ok(());
+        };
+        if self.installed_round == Some(round) {
+            // Already installed and waiting for the `Persisted` this pushed, which is at the back
+            // of a queue with other events in front of it. Doing it again would open a spool the
+            // first install has already removed — which is exactly how this was found.
+            return Ok(());
+        }
+        let meta = self
+            .sm
+            .snapshot_incoming()
+            .expect("a pending round implies a cursor")
+            .meta()
+            .clone();
+        let digest = self
+            .sm
+            .snapshot_incoming()
+            .expect("a pending round implies a cursor")
+            .header()
+            .base_digest;
+
+        // **The two accounts are reconciled here, once, at the only moment it can be done with
+        // certainty.** The state machine has digested a whole payload; this driver has written what
+        // it could place. If they do not agree on the length, the spool is SHORT of what was
+        // digested — a chunk was skipped because the driver could not place it — and installing
+        // from it would install bytes nothing verified. Refused by name rather than discovered as a
+        // truncated read halfway through `store.install`.
+        let path = spool_path(&self.dir);
+        let spooled_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if self.spooled != meta.total_bytes || spooled_len != meta.total_bytes {
+            return Err(FerroError::Internal(format!(
+                "the state machine verified a {}-byte snapshot for round {round} and this node's \
+                 spool holds {} bytes ({spooled_len} on disk). The two accounts of the transfer \
+                 have drifted, and installing from a spool the state machine did not digest is how \
+                 a payload passes its own checksum while being a mixture of two transfers.",
+                meta.total_bytes, self.spooled
+            )));
+        }
+        // The one fsync that matters, and the only one on this path: everything read back below
+        // must be on the device, because the state machine moves its floor on the strength of the
+        // install having returned.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| FerroError::Io(format!("fsync the snapshot spool: {e}")))?;
+
+        let Some(store) = self.snapshots.as_mut() else {
+            return Err(FerroError::Internal(format!(
+                "a snapshot covering round {round} was received whole, and this node has no \
+                 storage engine attached to install it into. Refusing rather than acknowledging a \
+                 transfer that changed nothing: the follower would report itself caught up and \
+                 serve a database it never received."
+            )));
+        };
+        store.install(&meta, &path)?;
+
+        // The durable log's floor moves with the state machine's, in this step and not another.
+        // The whole tail goes: a node being re-seeded holds rounds the leader serving it cannot
+        // vouch for, which is why it is being re-seeded.
+        if !self.log.is_empty() {
+            self.log.truncate_from(self.log.first_round()).map_err(LogError::into_ferro)?;
+        }
+        self.log.discard_prefix(round, meta.last_term).map_err(LogError::into_ferro)?;
+        store_snapshot_record(&self.dir, round, meta.last_term, digest)?;
+
+        self.applied = self.applied.max(round);
+        self.installed_round = Some(round);
+        self.snapshots_installed += 1;
+        // **The spool is NOT removed here.** The state machine has not yet been told, and
+        // `finish_install` can still refuse — a configuration that is damage latches this node out
+        // of office rather than being applied. Deleting the bytes at this point would leave nothing
+        // to re-drive the install from, with the log already truncated: a node whose state machine
+        // and whose disk describe different histories, permanently. `drain` removes the spool once
+        // the `Persisted` below has been accepted.
+        self.pending.push_back(Event::Persisted { term: self.sm.term(), round });
+        Ok(())
+    }
+
+    /// The state machine has accepted the install. Release what was held for it.
+    ///
+    /// Separate from the install itself because the install cannot know: `finish_install` runs
+    /// inside the state machine's own step, after this returns, and it can still refuse.
+    fn release_installed_spool(&mut self) {
+        if self.installed_round.is_some() && self.sm.pending_install_round().is_none() {
+            let _ = fs::remove_file(spool_path(&self.dir));
+            self.spooled = 0;
+            self.spooled_header = None;
+            self.installed_round = None;
+        }
+    }
+
+    /// Capture a snapshot for every peer this leader cannot serve with entries.
+    ///
+    /// Nothing is sent here: `Consensus::send_append_to` sends the first chunk on the next
+    /// heartbeat and every later one on the peer's acknowledgement, so every byte on the wire still
+    /// leaves through an `Action::Send` the state machine emitted.
+    fn serve_snapshots(&mut self) -> Result<(), FerroError> {
+        let waiting = self.sm.peers_needing_snapshot();
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        let Some(point) = self.sm.snapshot_point() else {
+            // Nothing applied, so there is no state to send. The peer stays marked and is served as
+            // soon as this leader applies a round, which its own term-establishing `NoOp` produces.
+            return Ok(());
+        };
+        let Some(store) = self.snapshots.as_mut() else {
+            self.refusals.push(FerroError::Internal(format!(
+                "peer(s) {waiting:?} need state transfer and this node has no storage engine to \
+                 capture a snapshot from, so they cannot be repaired. Naming it rather than \
+                 leaving them silently stalled."
+            )));
+            return Ok(());
+        };
+        // ONE capture for every waiting peer: the payload is an image at a round, and taking it per
+        // peer would copy the database once per follower.
+        let snap = std::sync::Arc::new(store.capture(&point)?);
+        for peer in waiting {
+            if let Err(why) = self.sm.offer_snapshot_to(peer, std::sync::Arc::clone(&snap)) {
+                self.refusals.push(why.into_ferro());
+            } else {
+                self.snapshots_armed += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard log this node no longer needs, on the state machine and the disk together.
+    fn checkpoint(&mut self) -> Result<(), FerroError> {
+        let Some(keep) = self.retain_rounds else { return Ok(()) };
+        if self.snapshots.is_none() {
+            // Discarding a log you cannot snapshot is discarding it: a follower below the floor
+            // could never then be repaired. Refused by doing nothing, which is the safe direction.
+            return Ok(());
+        }
+        let through = self.applied.saturating_sub(keep);
+        if through <= self.log.snapshot_round() || through == 0 {
+            return Ok(());
+        }
+        let term = self.log.term_at(through).map_err(LogError::into_ferro)?;
+        // The state machine first: it refuses a floor above what the engine has applied, and a
+        // disk floor moved past a refusal would be unrecoverable.
+        self.sm.compact(through).map_err(|e| e.into_ferro())?;
+        self.log.discard_prefix(through, term).map_err(LogError::into_ferro)?;
+        store_snapshot_record(&self.dir, through, term, self.sm.floor_digest())?;
         Ok(())
     }
 
@@ -396,13 +770,16 @@ impl<A: Applier> Node<A> {
                 while self.applied < through {
                     let next = self.applied + 1;
                     if next <= self.log.snapshot_round() {
-                        // F6's row. Refusing here rather than skipping: a node that silently steps
-                        // over rounds it cannot read has applied a different history from its
-                        // peers, and nothing downstream can tell.
+                        // Unreachable in a healthy node: `applied` is seeded from the floor on
+                        // start and moved to it by an install, so nothing ever asks for a round
+                        // below it. Kept as a refusal because if it ever does happen, silently
+                        // stepping over the round would leave this node having applied a different
+                        // history from its peers, and nothing downstream could tell.
                         return Err(FerroError::Internal(format!(
-                            "round {next} is below the snapshot floor {}, so applying it needs \
-                             state transfer (F6), which is not implemented. Refusing rather than \
-                             skipping the round.",
+                            "round {next} is at or below the snapshot floor {}, so the entry that \
+                             carried it no longer exists on this node. The applied cursor was left \
+                             behind a checkpoint or an install; refusing rather than skipping the \
+                             round.",
                             self.log.snapshot_round()
                         )));
                     }
@@ -437,6 +814,117 @@ fn read_all(log: &RoundLog) -> Result<Vec<Entry>, FerroError> {
 
 fn hard_path(dir: &Path) -> PathBuf {
     dir.join("hardstate")
+}
+
+fn snap_path(dir: &Path) -> PathBuf {
+    dir.join("snapshot")
+}
+
+/// Where an in-flight `InstallSnapshot` is spooled. One per node: a node receives from at most one
+/// leader at a time, and a second concurrent transfer would be a second leader of one term.
+fn spool_path(dir: &Path) -> PathBuf {
+    dir.join("snapshot.incoming")
+}
+
+/// The chunk an event carries, if it carries one. Cloned before the step, because the step consumes
+/// the event and the bytes are needed after the state machine has ruled on them.
+fn snapshot_chunk_of(ev: &Event) -> Option<(u64, Vec<u8>)> {
+    match ev {
+        Event::Recv(m) => match &m.body {
+            super::Body::InstallSnapshot { offset, data, .. } => Some((*offset, data.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn snap_encode(round: Round, term: Term, digest: u64) -> [u8; SNAP_LEN] {
+    let mut b = [0u8; SNAP_LEN];
+    b[0..4].copy_from_slice(&SNAP_MAGIC.to_le_bytes());
+    b[4..12].copy_from_slice(&round.to_le_bytes());
+    b[12..20].copy_from_slice(&term.to_le_bytes());
+    b[20..28].copy_from_slice(&digest.to_le_bytes());
+    let sum = crc32(&b[0..28]);
+    b[28..32].copy_from_slice(&sum.to_le_bytes());
+    b
+}
+
+fn store_snapshot_record(
+    dir: &Path,
+    round: Round,
+    term: Term,
+    digest: u64,
+) -> Result<(), FerroError> {
+    replace_atomically(&OsFileOps, &snap_path(dir), &snap_encode(round, term, digest))
+        .map_err(|e| FerroError::Io(e.to_string()))
+}
+
+/// Read back the digest at this node's log floor, refusing to use one that is not about this floor.
+///
+/// Returns `(digest, note)`. A `note` means the digest could not be trusted and zero was used
+/// instead — which switches the divergence detector **off** for this node rather than making it
+/// wrong, because zero is the value `AppendResp` already reads as "not claiming anything". A record
+/// naming a different `(round, term)` than the log's header is not a record about this log: a
+/// crash between the two writes leaves exactly that, and taking it would anchor the digest chain at
+/// a value from a floor this node no longer has.
+fn load_snapshot_record(
+    dir: &Path,
+    floor: Round,
+    floor_term: Term,
+) -> Result<(u64, Option<FerroError>), FerroError> {
+    if floor == 0 {
+        // No snapshot has ever moved this node's floor, so the chain starts at the beginning of the
+        // log and zero is not a fallback but the correct anchor.
+        return Ok((0, None));
+    }
+    let p = snap_path(dir);
+    let mut buf = Vec::new();
+    match File::open(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                0,
+                Some(FerroError::Internal(format!(
+                    "this node's log begins after round {floor} and there is no snapshot record \
+                     beside it, so the rolling digest at that floor cannot be recovered — every \
+                     entry it was folded over has been discarded. Continuing with a zero digest, \
+                     which reports 'not claiming anything' and therefore turns the divergence \
+                     detector OFF for this node until its log is rebuilt from round 1."
+                ))),
+            ));
+        }
+        Err(e) => return Err(FerroError::Io(e.to_string())),
+        Ok(mut f) => {
+            f.read_to_end(&mut buf).map_err(|e| FerroError::Io(e.to_string()))?;
+        }
+    }
+    let bad = |why: String| -> Result<(u64, Option<FerroError>), FerroError> {
+        Ok((0, Some(FerroError::Internal(format!(
+            "{why} Continuing with a zero digest, which turns the divergence detector OFF for this \
+             node rather than making it report a divergence that is not there."
+        )))))
+    };
+    if buf.len() != SNAP_LEN {
+        return bad(format!(
+            "the snapshot record is {} bytes, not {SNAP_LEN}: it was torn by a crash mid-write.",
+            buf.len()
+        ));
+    }
+    if u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) != SNAP_MAGIC {
+        return bad("the snapshot record does not begin with its magic.".into());
+    }
+    if u32::from_le_bytes(buf[28..32].try_into().expect("4 bytes")) != crc32(&buf[0..28]) {
+        return bad("the snapshot record's checksum does not match its body.".into());
+    }
+    let round = u64::from_le_bytes(buf[4..12].try_into().expect("8 bytes"));
+    let term = u64::from_le_bytes(buf[12..20].try_into().expect("8 bytes"));
+    if (round, term) != (floor, floor_term) {
+        return bad(format!(
+            "the snapshot record describes the floor at round {round} term {term} and this node's \
+             log begins after round {floor} term {floor_term}, so it is not a record about this \
+             log — a crash between the two writes leaves exactly this."
+        ));
+    }
+    Ok((u64::from_le_bytes(buf[20..28].try_into().expect("8 bytes")), None))
 }
 
 fn load_hard_state(dir: &Path) -> Result<HardState, FerroError> {

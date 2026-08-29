@@ -79,6 +79,58 @@ impl LogBranchCatalog {
             .open(path)
             .map_err(|e| FerroError::Io(e.to_string()))?;
 
+        let (records, free_ids, max_id, max_epoch) = Self::index(existing, trunk_root);
+
+        Ok(LogBranchCatalog {
+            state: RwLock::new(CatalogState { records, free_ids }),
+            epoch: AtomicU64::new(max_epoch),
+            next_id: AtomicU64::new(max_id + 1),
+            sink: Some(Mutex::new(file)),
+        })
+    }
+
+    /// Re-read `path` and replace this catalog's whole index with what it holds.
+    ///
+    /// For F6: a snapshot install writes a *different* catalog's records over this node's file, and
+    /// nothing else in this type can be told about it. [`LogBranchCatalog::put`] cannot be used for
+    /// that — it appends one record, never removes one the sender no longer has, and does not
+    /// advance `epoch`, `next_id` or `free_ids`, which are derived in [`LogBranchCatalog::open`]
+    /// and nowhere else. A node re-seeded through `put` would keep branches the leader had reaped
+    /// and go on minting ids that collide with the ones it was just given.
+    ///
+    /// Shares `replay` and the derivation with `open` rather than restating either: two places
+    /// computing `free_ids` is two places for the recycling rule to drift.
+    pub fn reload_from(&self, path: &Path, trunk_root: PageId) -> Result<(), FerroError> {
+        let existing = if path.exists() { Self::replay(path)? } else { Vec::new() };
+        let (records, free_ids, max_id, max_epoch) = Self::index(existing, trunk_root);
+
+        // The sink is re-pointed at the file the records came from, so a later `put` appends to the
+        // catalog this node now holds rather than to the one it was replaced from.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| FerroError::Io(e.to_string()))?;
+
+        let mut st = self.state.write().unwrap();
+        st.records = records;
+        st.free_ids = free_ids;
+        drop(st);
+        self.epoch.store(max_epoch, Ordering::SeqCst);
+        self.next_id.store(max_id + 1, Ordering::SeqCst);
+        if let Some(sink) = &self.sink {
+            *sink.lock().unwrap() = file;
+        }
+        Ok(())
+    }
+
+    /// The index a set of replayed records implies: the record map, the recyclable id slots, and
+    /// the two counters derived from them. One copy, shared by `open` and `reload_from`.
+    fn index(
+        existing: Vec<BranchRecord>,
+        trunk_root: PageId,
+    ) -> (HashMap<u64, BranchRecord>, Vec<u64>, u64, u64) {
         let mut records: HashMap<u64, BranchRecord> = HashMap::new();
         records.insert(0u64, BranchRecord::trunk(trunk_root, TRUNK_LEASE));
         // Last write wins per id slot; the log is append-only and strictly ordered.
@@ -104,13 +156,7 @@ impl LogBranchCatalog {
         // serialised into a durable branch record. Two opens of one log gave the same fork two
         // different ids. Sorted, `pop` takes the highest reaped slot and does it reproducibly.
         free_ids.sort_unstable();
-
-        Ok(LogBranchCatalog {
-            state: RwLock::new(CatalogState { records, free_ids }),
-            epoch: AtomicU64::new(max_epoch),
-            next_id: AtomicU64::new(max_id + 1),
-            sink: Some(Mutex::new(file)),
-        })
+        (records, free_ids, max_id, max_epoch)
     }
 
     fn replay(path: &Path) -> Result<Vec<BranchRecord>, FerroError> {

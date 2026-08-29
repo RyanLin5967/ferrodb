@@ -248,8 +248,15 @@ impl Cluster {
 
     /// Deliver every message the queue holds, and everything they produce, until it drains.
     ///
-    /// `Append`, `AppendResp` and the snapshot bodies are dropped: `replicate.rs` is a stub and
-    /// delivering one panics.
+    /// `Append`, `AppendResp` and the snapshot bodies are dropped.
+    ///
+    /// **The original reason — "`replicate.rs` is a stub and delivering one panics" — is no longer
+    /// true**, and was left standing after F2 landed. The behaviour is kept anyway, and now for a
+    /// reason rather than an obstacle: this harness exists to drive membership storms, and
+    /// delivering replication would make every run also a replication test, with the election
+    /// results a function of log convergence rather than of the configuration rules under test.
+    /// `dropped_appends` counts what is skipped and is asserted on as an anti-vacuity witness, so
+    /// the omission is measured rather than assumed.
     fn deliver(&mut self, mut q: VecDeque<Message>) {
         let mut budget = 20_000;
         while let Some(m) = q.pop_front() {
