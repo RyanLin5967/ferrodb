@@ -1197,6 +1197,33 @@ impl Fleet {
         );
     }
 
+    /// Pump until `want` is leader again, or fail by name.
+    ///
+    /// **Why a test needs this at all.** A leader that stops hearing from a majority demotes itself
+    /// on its own lease — that is the point of the lease, and it fires here because the write loop
+    /// below pumps between statements rather than at heartbeat cadence. The node this test's
+    /// `ClusterAgents` is bound to is fixed at construction, so a leadership change mid-loop turns
+    /// the next `fork` into `NotLeader { leader: None }`.
+    ///
+    /// Observed on a Windows CI runner at `c8fdb2c`: the same commit passed on the push run and
+    /// failed on the pull_request run, which is the signature of a race rather than a defect. What
+    /// this test asserts — the log holds only forks and merges, at one proposal each — says nothing
+    /// about leadership being continuous, so that dependency was incidental. Making it explicit
+    /// removes the flake without weakening a single assertion.
+    fn hold_leader(&self, want: usize) {
+        let l = NodeId(want as u32 + 1);
+        for _ in 0..100_000 {
+            self.pump_all();
+            if self.reps.iter().all(|r| r.leader() == Some(l)) {
+                return;
+            }
+        }
+        panic!(
+            "node {want} never regained the leadership; leaders = {:?}",
+            self.reps.iter().map(|r| r.leader()).collect::<Vec<_>>()
+        );
+    }
+
     fn shutdown(&self) {
         for r in &self.reps {
             r.shutdown();
@@ -1421,6 +1448,7 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
 
     let mut merged = Vec::new();
     for row in 1..=3 {
+        fleet.hold_leader(leader);
         let cs = agents.fork(agent("fanout"), BranchId::TRUNK).unwrap();
         fleet.settle_to(cs.fork_round);
         for i in 0..100 {
@@ -1430,6 +1458,7 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
             );
             fleet.pump_all();
         }
+        fleet.hold_leader(leader);
         let bp = db.bp.clone();
         let txn = db.txn.clone();
         let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
