@@ -60,6 +60,14 @@
 //! * the bytes themselves go straight from the arriving frame to the driver's spool file, and the
 //!   driver installs from that file. [`SnapshotStore::install`] takes a path, never a buffer.
 //!
+//! **Three sections are the exception and it is stated rather than glossed.** The arena image, the
+//! branch-catalog image and the redo window are read into memory whole at install time, because
+//! `ArenaPageStore::load_state`, the catalog's own file format and `ReplicaApplier::apply` all take
+//! bytes rather than a reader. They are therefore the only place a peer's number sizes an
+//! allocation, and each is bounded by [`PayloadHeader::MAX_SIDECAR_BYTES`] — checked in the header,
+//! which arrives in the first chunk, so an impossible claim is refused before a byte is spooled.
+//! The page image, which is the large one, is streamed.
+//!
 //! # What this module does NOT defend against, said plainly
 //!
 //! [`MAX_SNAPSHOT_BYTES`] is derived from the format's own field widths — a claim above it cannot
@@ -243,6 +251,17 @@ pub struct PayloadHeader {
     pub branches_len: u32,
     /// `page_count * PAGE_SIZE`, restated so a truncated transfer is arithmetic rather than a guess.
     pub image_len: u64,
+    /// The sender's WAL over `[start_lsn, end_lsn]`, which is what makes the page image
+    /// **consistent** rather than a smear.
+    ///
+    /// `backup.rs` is explicit that its image "is *not* an instant snapshot" — pages are copied
+    /// while writes land — and that `end_lsn` "is the point before which the restored file **must
+    /// not be treated as consistent**". A local restore closes that by streaming the primary's WAL
+    /// from `start_lsn` (`examples/repl_replica.rs`); an install has no stream to follow, so the
+    /// window travels with the image and is replayed by the same `ReplicaApplier` on arrival.
+    /// Without it a follower installs a database torn in time, `finish_install` reports the round
+    /// durable, and nothing ever repairs it.
+    pub wal_len: u32,
     /// A resumable digest over everything after this header.
     pub body_digest: u64,
 }
@@ -255,8 +274,23 @@ const FORMAT_VERSION: u32 = 1;
 impl PayloadHeader {
     /// magic 8 | version 4 | base_digest 8 | last_round 8 | last_term 8 | root 4 | catalog 4 |
     /// start_lsn 8 | end_lsn 8 | page_count 4 | arena_len 4 | branches_len 4 | image_len 8 |
-    /// body_digest 8 | header_digest 8
-    pub const BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 8 + 8;
+    /// wal_len 4 | body_digest 8 | header_digest 8
+    pub const BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + 8 + 4 + 8 + 8;
+
+    /// The largest a sidecar section may claim.
+    ///
+    /// The arena image, the branch-catalog image and the redo window are read into memory whole,
+    /// because the three things that consume them — `ArenaPageStore::load_state`, the catalog's own
+    /// file, and `ReplicaApplier::apply` — all take bytes rather than a reader. So they are the one
+    /// place a receiver's memory is sized by a number a peer chose, and they are bounded here
+    /// rather than trusted: `u32` alone permits 4 GiB apiece, which is precisely the footprint this
+    /// module's header says a receiver must never hand a peer the choice of.
+    ///
+    /// Derived, not picked: `MAX_ENTRY_BYTES` is what the transport can carry in one frame, and
+    /// 32 of them is far above any arena image (tens of bytes per extent), branch catalog (about a
+    /// hundred bytes per branch) or redo window this build produces, while staying two orders of
+    /// magnitude below the page image it accompanies.
+    pub const MAX_SIDECAR_BYTES: u64 = 32 * crate::consensus::log::MAX_ENTRY_BYTES as u64;
 
     fn encode(&self) -> [u8; Self::BYTES] {
         let mut b = [0u8; Self::BYTES];
@@ -273,9 +307,10 @@ impl PayloadHeader {
         b[64..68].copy_from_slice(&self.arena_len.to_be_bytes());
         b[68..72].copy_from_slice(&self.branches_len.to_be_bytes());
         b[72..80].copy_from_slice(&self.image_len.to_be_bytes());
-        b[80..88].copy_from_slice(&self.body_digest.to_be_bytes());
-        let d = digest(&b[..88]);
-        b[88..96].copy_from_slice(&d.to_be_bytes());
+        b[80..84].copy_from_slice(&self.wal_len.to_be_bytes());
+        b[84..92].copy_from_slice(&self.body_digest.to_be_bytes());
+        let d = digest(&b[..92]);
+        b[92..100].copy_from_slice(&d.to_be_bytes());
         b
     }
 
@@ -306,8 +341,8 @@ impl PayloadHeader {
                  fields would parse and mean something else."
             )));
         }
-        let claimed = u64::from_be_bytes(bytes[88..96].try_into().unwrap());
-        let actual = digest(&bytes[..88]);
+        let claimed = u64::from_be_bytes(bytes[92..100].try_into().unwrap());
+        let actual = digest(&bytes[..92]);
         if claimed != actual {
             return Err(SnapshotError::Refused(format!(
                 "the snapshot payload header does not match its own digest ({claimed:#018x} \
@@ -328,7 +363,8 @@ impl PayloadHeader {
             arena_len: u32::from_be_bytes(bytes[64..68].try_into().unwrap()),
             branches_len: u32::from_be_bytes(bytes[68..72].try_into().unwrap()),
             image_len: u64::from_be_bytes(bytes[72..80].try_into().unwrap()),
-            body_digest: u64::from_be_bytes(bytes[80..88].try_into().unwrap()),
+            wal_len: u32::from_be_bytes(bytes[80..84].try_into().unwrap()),
+            body_digest: u64::from_be_bytes(bytes[84..92].try_into().unwrap()),
         };
         h.check_internally_consistent()?;
         Ok(h)
@@ -356,6 +392,21 @@ impl PayloadHeader {
                     .into(),
             ));
         }
+        for (what, len) in [
+            ("the arena image", self.arena_len as u64),
+            ("the branch catalog image", self.branches_len as u64),
+            ("the redo window", self.wal_len as u64),
+        ] {
+            if len > Self::MAX_SIDECAR_BYTES {
+                return Err(SnapshotError::Refused(format!(
+                    "the snapshot header claims {len} bytes for {what}, above the \
+                     {}-byte ceiling. These three sections are the only ones read into memory \
+                     whole, so they are the only place a peer could choose this process's \
+                     footprint. Refused before anything was allocated for it.",
+                    Self::MAX_SIDECAR_BYTES
+                )));
+            }
+        }
         if self.page_count == 0 {
             // `backup::take` refuses to write a zero-page backup for the same reason it is refused
             // here: restoring one produces an empty database that looks like a successful restore.
@@ -371,7 +422,11 @@ impl PayloadHeader {
 
     /// What `total_bytes` must be for a payload with this header.
     pub fn total_bytes(&self) -> u64 {
-        Self::BYTES as u64 + self.arena_len as u64 + self.branches_len as u64 + self.image_len
+        Self::BYTES as u64
+            + self.arena_len as u64
+            + self.branches_len as u64
+            + self.wal_len as u64
+            + self.image_len
     }
 }
 
@@ -461,14 +516,18 @@ impl Snapshot {
         label: crate::replication::backup::BackupLabel,
         arena: &[u8],
         branches: &[u8],
+        redo: &[u8],
         image: Vec<u8>,
     ) -> Result<Snapshot, SnapshotError> {
         let arena_len = fits_u32(arena.len(), "the arena image")?;
         let branches_len = fits_u32(branches.len(), "the branch catalog image")?;
+        let wal_len = fits_u32(redo.len(), "the redo window")?;
 
-        let mut body = Vec::with_capacity(arena.len() + branches.len() + image.len());
+        let mut body =
+            Vec::with_capacity(arena.len() + branches.len() + redo.len() + image.len());
         body.extend_from_slice(arena);
         body.extend_from_slice(branches);
+        body.extend_from_slice(redo);
         body.extend_from_slice(&image);
 
         let header = PayloadHeader {
@@ -483,6 +542,7 @@ impl Snapshot {
             arena_len,
             branches_len,
             image_len: image.len() as u64,
+            wal_len,
             body_digest: digest(&body),
         };
         header.check_internally_consistent()?;
@@ -514,6 +574,14 @@ impl Snapshot {
 }
 
 fn fits_u32(len: usize, what: &'static str) -> Result<u32, SnapshotError> {
+    if len as u64 > PayloadHeader::MAX_SIDECAR_BYTES {
+        return Err(SnapshotError::Refused(format!(
+            "{what} is {len} bytes, above the {}-byte ceiling a receiver will read into memory. \
+             Refused where the error still has somewhere to go, rather than at the far end of a \
+             transfer that has already cost both nodes.",
+            PayloadHeader::MAX_SIDECAR_BYTES
+        )));
+    }
     u32::try_from(len).map_err(|_| {
         SnapshotError::Refused(format!(
             "{what} is {len} bytes, which the format's u32 length field cannot express. Refused \
@@ -565,6 +633,16 @@ pub trait SnapshotStore: Send {
     /// an in-memory index of a database it no longer has, and the only sign of it would be a
     /// restart much later that quietly changed the answers.
     fn install(&mut self, meta: &SnapshotMeta, path: &Path) -> Result<(), FerroError>;
+
+    /// Refuse to start on state an install left half-replaced.
+    ///
+    /// Called once by the driver, before the first event. A store with nothing to check says so by
+    /// doing nothing; [`PageStoreSnapshots`] refuses when its marker is present, because a page
+    /// file from one database beside an arena map from another has no later detection point — every
+    /// page of the mixture passes its own checksum.
+    fn check_ready(&self) -> Result<(), FerroError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -672,7 +750,10 @@ impl Consensus {
         }
         if through > self.applied {
             return Err(SnapshotError::Refused(format!(
-                "cannot checkpoint through round {through}: this node has applied only through {}.                  A floor above what the storage engine holds is a claim about state that was never                  installed, and the rounds that would prove otherwise are what the checkpoint                  discards.",
+                "cannot checkpoint through round {through}: this node has applied only through {}. \
+                 A floor above what the storage engine holds is a claim about state that was never \
+                 installed, and the rounds that would prove otherwise are what the checkpoint \
+                 discards.",
                 self.applied
             )));
         }
@@ -921,6 +1002,25 @@ impl Consensus {
         done: bool,
         out: &mut Vec<Action>,
     ) {
+        // **Validate before anything acts on it, including this node's own office.** `on_append`
+        // states the same rule and for the same reason: adopting the sender as leader and zeroing
+        // `matched` are real changes to this node, and a message that turns out to be malformed
+        // must not have made them. A same-term peer that is not the leader could otherwise send one
+        // impossible snapshot and take this node's real leader's cursor back to zero.
+        if meta.validate().is_err() {
+            self.refuse_snapshot(from, out);
+            return;
+        }
+        // The configuration is checked here, before the transfer starts, and not only when the
+        // install completes. `note_config_in_log` refuses damage by latching this node out of
+        // office — and by the time `finish_install` calls it the driver has already replaced this
+        // node's whole database and truncated its log. Refusing the transfer at its first frame is
+        // the only point at which nothing has been spent.
+        if meta.config.at() == self.cfg.at() && meta.config != self.cfg {
+            self.refuse_snapshot(from, out);
+            return;
+        }
+
         // A leader sending state is still a leader. Adopting it here and not only on `Append` is
         // what stops this node campaigning through a term that already has one, during a transfer
         // that may take many round trips — exactly the window in which no `Append` arrives.
@@ -937,10 +1037,6 @@ impl Consensus {
 
         // ---- refusals, every one of them before a byte is spooled -------------------------------
 
-        if meta.validate().is_err() {
-            self.refuse_snapshot(from, out);
-            return;
-        }
         if meta.last_round <= self.snapshot_round {
             // This node's floor is already at or above the snapshot's. Installing it would move the
             // floor backwards, and it would replace state this node has with older state.
@@ -1259,6 +1355,20 @@ impl PageStoreSnapshots {
 }
 
 impl SnapshotStore for PageStoreSnapshots {
+    fn check_ready(&self) -> Result<(), FerroError> {
+        if install_was_interrupted(&self.paths.page_file) {
+            return Err(FerroError::Corruption(format!(
+                "{} was left part-way through a snapshot install ({} is present). Its page file, \
+                 arena image and branch catalog may be from different databases, and every page of \
+                 that mixture passes its own checksum, so nothing later can tell. Re-seed this \
+                 node: delete its storage and let the leader send a snapshot again.",
+                self.paths.page_file.display(),
+                install_marker(&self.paths.page_file).display()
+            )));
+        }
+        Ok(())
+    }
+
     fn capture(&mut self, at: &SnapshotPoint) -> Result<Snapshot, FerroError> {
         let dir = self.scratch.join(format!("capture-{}", at.last_round));
         // A stale directory from an interrupted capture would leave `take` writing a shorter image
@@ -1274,6 +1384,12 @@ impl SnapshotStore for PageStoreSnapshots {
         let branches = self.branch_image();
         let root = self.trunk_root()?;
 
+        // **The window that makes the image consistent.** Read while the pin is still held, so a
+        // checkpoint cannot discard the range between `take` returning and this reading it — which
+        // is the whole reason `BackupHandle` owns a `WalPin` rather than dropping it at the end of
+        // `take`.
+        let redo = read_redo_window(&self.wal, label.start_lsn, label.end_lsn)?;
+
         let snap = Snapshot::build(
             at,
             root,
@@ -1281,6 +1397,7 @@ impl SnapshotStore for PageStoreSnapshots {
             label,
             &arena,
             &branches,
+            &redo,
             image,
         )
         .map_err(SnapshotError::into_ferro)?;
@@ -1314,6 +1431,7 @@ impl SnapshotStore for PageStoreSnapshots {
         // claims — is the same code path a local base-backup restore takes.
         let arena = read_section(&mut f, header.arena_len as u64)?;
         let branches = read_section(&mut f, header.branches_len as u64)?;
+        let redo = read_section(&mut f, header.wal_len as u64)?;
         stream_section(
             &mut f,
             header.image_len,
@@ -1330,6 +1448,23 @@ impl SnapshotStore for PageStoreSnapshots {
         )
         .map_err(|e| FerroError::Io(format!("write the install label: {e}")))?;
 
+        // **The marker, written and made durable BEFORE a byte of this node's state is touched.**
+        //
+        // What follows replaces three files and cannot be made one atomic step: a crash part-way
+        // leaves a page file from one database beside an arena map from another, and every page of
+        // that mixture passes its own checksum — the hazard `examples/repl_primary.rs` names, with
+        // no detection point at all. So the dangerous state is made *representable and refused*
+        // rather than merely unlikely: `Node::start` refuses to open a node whose marker is
+        // present, and says the remedy is to re-seed it. A refusal an operator can act on beats a
+        // database nobody can tell is wrong.
+        let marker = install_marker(&self.paths.page_file);
+        crate::storage::atomic_file::replace_atomically(
+            &crate::storage::atomic_file::OsFileOps,
+            &marker,
+            format!("snapshot install in progress: round {}\n", meta.last_round).as_bytes(),
+        )
+        .map_err(|e| FerroError::Io(format!("write the install marker: {e}")))?;
+
         // **Invalidate before replacing, and never flush.** Every frame this pool holds describes
         // a database that is about to stop existing, so writing one back would put a page of the
         // old database into the middle of the new one — and `examples/repl_primary.rs` names the
@@ -1338,11 +1473,62 @@ impl SnapshotStore for PageStoreSnapshots {
         // live reader holding a frame index would otherwise be handed another database's bytes.
         self.pool.invalidate_all()?;
 
+        // **Written THROUGH the live paths, not staged and renamed — and that is a correction.**
+        //
+        // Temp-then-rename is this repo's idiom for a durable write and it is wrong here: the
+        // running `DiskManager` holds an open descriptor on the page file, and a rename replaces
+        // the directory entry while leaving that descriptor on the orphaned inode. The process then
+        // goes on reading and writing the database it just replaced, with the right bytes on disk
+        // under the right name and nothing anywhere disagreeing. Measured, not reasoned: the first
+        // version of this used renames and
+        // `a_captured_payload_installs_back_to_the_same_pages` caught the pool serving pre-install
+        // pages after a successful install.
+        //
+        // Crash-atomicity therefore comes from the marker above rather than from the rename. That
+        // is the weaker mechanism for a single file and the stronger one for three, which is what
+        // this is: no rename sequence makes a page file, an arena map and a branch catalog land
+        // together, and the marker covers all three at once.
+        let ops = crate::storage::atomic_file::OsFileOps;
         crate::replication::backup::restore(&dir, &self.paths.page_file)?;
         std::fs::write(&self.paths.arena_image, &arena)
             .map_err(|e| FerroError::Io(format!("write the arena image: {e}")))?;
         std::fs::write(&self.paths.branch_catalog, &branches)
             .map_err(|e| FerroError::Io(format!("write the branch catalog: {e}")))?;
+
+        // **The redo window, which is what turns the image from a smear into a database.**
+        // `backup.rs` says its image is consistent only once replay has reached `end_lsn`; a local
+        // restore gets there by streaming the primary's WAL, and this is that stream, shipped.
+        // Applied through the same `ReplicaApplier` a replica uses, so the idempotence-by-page-LSN
+        // argument is the one that has already been tested rather than a second copy of it.
+        if !redo.is_empty() {
+            let applier = crate::replication::ReplicaApplier::new(
+                std::sync::Arc::clone(&self.pool),
+                header.start_lsn,
+            );
+            applier.apply(header.start_lsn, &redo)?;
+            self.pool.flush_all()?;
+        }
+
+        // **This node's own WAL is discarded.** It describes the database that was just replaced,
+        // and `wal::recovery` would replay it over the installed pages on the next start — the
+        // installed pages carry the SENDER's LSNs, so a receiver record with a higher number is
+        // applied onto a page from a different database with nothing to notice it. `truncate`
+        // throws the log away whole and restarts it at the current end, which is exactly what a
+        // node whose pages are now a checkpoint needs.
+        let before = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        self.wal.truncate(0)?;
+        let after = self.wal.base_lsn.load(std::sync::atomic::Ordering::SeqCst);
+        if after == before && self.wal.next_lsn.load(std::sync::atomic::Ordering::SeqCst) != before {
+            // `truncate` honours a pin by keeping the whole log and still returning `Ok`. Silent
+            // there is right — a checkpoint that reclaims nothing is not a failure — and wrong
+            // here: the records it kept are the ones that must never be replayed.
+            return Err(FerroError::Wal(format!(
+                "this node's WAL could not be discarded before installing a snapshot (base is \
+                 still {before}); something holds a pin below it. Those records describe the \
+                 database this install replaced and recovery would replay them over the installed \
+                 pages."
+            )));
+        }
 
         // The live objects, not only the files. A node that replaced its durable state and went on
         // serving the old in-memory index would answer for a database it no longer has, and the
@@ -1350,14 +1536,22 @@ impl SnapshotStore for PageStoreSnapshots {
         self.arenas.load_state(&arena)?;
         self.branches.reload_from(&self.paths.branch_catalog, header.root_page_id)?;
 
-        // Durable before returning. The state machine moves its floor on the strength of this call
-        // having returned, so an install that is still in a page cache is an install that a power
-        // loss turns into a node claiming a history it does not hold.
-        for p in [&self.paths.page_file, &self.paths.arena_image, &self.paths.branch_catalog] {
-            std::fs::File::open(p)
-                .and_then(|h| h.sync_all())
-                .map_err(|e| FerroError::Io(format!("fsync {}: {e}", p.display())))?;
+        // Durable before returning, and through `OsFileOps::sync_file` rather than
+        // `File::open(..).sync_all()`: Windows' `FlushFileBuffers` refuses a handle with no write
+        // access, so the read-only spelling compiles everywhere and fails on one of the three CI
+        // platforms — which is the defect commit 872a7d9 fixed in `store_hard_state`.
+        {
+            use crate::storage::atomic_file::FileOps;
+            for p in [&self.paths.page_file, &self.paths.arena_image, &self.paths.branch_catalog] {
+                ops.sync_file(p)
+                    .map_err(|e| FerroError::Io(format!("fsync {}: {e}", p.display())))?;
+            }
         }
+
+        // Last, and only now: the marker goes, which is what says this node is a whole database
+        // again.
+        std::fs::remove_file(&marker)
+            .map_err(|e| FerroError::Io(format!("clear the install marker: {e}")))?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -1372,9 +1566,67 @@ fn read_header(f: &mut std::fs::File) -> Result<PayloadHeader, SnapshotError> {
     PayloadHeader::decode(&buf)
 }
 
+/// Where a node records that it is part-way through replacing its own database.
+///
+/// Beside the page file rather than in the consensus directory, because it is a fact about the
+/// STORAGE, and a node whose consensus directory was moved or rebuilt must still find it.
+pub fn install_marker(page_file: &Path) -> PathBuf {
+    let mut p = page_file.as_os_str().to_os_string();
+    p.push(".snapshot-installing");
+    PathBuf::from(p)
+}
+
+/// Whether `page_file` was left part-way through a snapshot install.
+///
+/// A node in that state holds a page file from one database beside an arena map or a branch
+/// catalog from another, and every page of the mixture passes its own checksum. There is no
+/// detection point later, so this is the one.
+pub fn install_was_interrupted(page_file: &Path) -> bool {
+    install_marker(page_file).exists()
+}
+
+/// The sender's redo records over `[start_lsn, end_lsn)`.
+///
+/// Read through [`crate::replication::ReplicationSource`], the same reader a streaming replica
+/// uses, and looped because one call is capped at `max_bytes`.
+fn read_redo_window(
+    wal: &Arc<crate::wal::log::WalManager>,
+    start_lsn: u64,
+    end_lsn: u64,
+) -> Result<Vec<u8>, FerroError> {
+    let src = crate::replication::ReplicationSource::new(wal);
+    let mut out = Vec::new();
+    let mut at = start_lsn;
+    while at < end_lsn {
+        let (bytes, next) = src.read_from(at, crate::consensus::log::MAX_ENTRY_BYTES)?;
+        if bytes.is_empty() || next <= at {
+            // Nothing further is durable, or the reader could not advance. Either way the window
+            // ends here; `end_lsn` was read after the copy and the log is flushed before both, so
+            // in a healthy run this is where `at` has already reached it.
+            break;
+        }
+        out.extend_from_slice(&bytes);
+        at = next;
+        if out.len() as u64 > PayloadHeader::MAX_SIDECAR_BYTES {
+            return Err(FerroError::Wal(format!(
+                "the redo window [{start_lsn}, {end_lsn}) is over the {}-byte ceiling a receiver \
+                 will read into memory. The base backup was taken while this node was writing hard \
+                 enough that the window cannot be shipped with it; take the snapshot again.",
+                PayloadHeader::MAX_SIDECAR_BYTES
+            )));
+        }
+    }
+    Ok(out)
+}
+
 fn read_section(f: &mut std::fs::File, len: u64) -> Result<Vec<u8>, FerroError> {
     use std::io::Read;
-    let mut v = vec![0u8; len as usize];
+    // `usize::try_from`, not `as`: on a 32-bit target `len as usize` wraps, `read_exact` then reads
+    // nothing, and every section after this one is read from the wrong offset — an install of a
+    // shifted database that passes its own length check.
+    let len = usize::try_from(len)
+        .map_err(|_| FerroError::Io(format!("a {len}-byte snapshot section does not fit this target's address space")))?;
+    let mut v = vec![0u8; len];
     f.read_exact(&mut v)
         .map_err(|e| FerroError::Io(format!("read a {len}-byte snapshot section: {e}")))?;
     Ok(v)

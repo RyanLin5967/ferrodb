@@ -12,7 +12,7 @@
 //! "the follower caught up" proves nothing about F6. Two things are asserted instead:
 //!
 //! 1. **The path was taken.** `Node::snapshots_installed` counts completed installs and
-//!    `Node::snapshots_sent` counts armed transfers. A run in which neither moves has not tested
+//!    `Node::snapshots_armed` counts transfers a leader armed. A run in which neither moves has not tested
 //!    state transfer, and the test says so by name rather than passing.
 //! 2. **The bytes moved.** The leader's page file is seeded with pages the follower has never had,
 //!    and the follower's page file is compared against it afterwards. Seeded *after* the cluster
@@ -63,6 +63,7 @@ const BUDGET: Duration = Duration::from_secs(60);
 
 struct Engine {
     pool: Arc<BufferPoolManager>,
+    wal: Arc<WalManager>,
     page_file: PathBuf,
 }
 
@@ -98,6 +99,7 @@ fn engine_at(dir: &Path, tag: &str, fresh: bool) -> (Engine, Box<PageStoreSnapsh
         arena_image: dir.join(format!("{tag}.arena")),
         branch_catalog,
     };
+    let wal_handle = Arc::clone(&wal);
     let store = Box::new(PageStoreSnapshots::new(
         Arc::clone(&pool),
         wal,
@@ -107,7 +109,7 @@ fn engine_at(dir: &Path, tag: &str, fresh: bool) -> (Engine, Box<PageStoreSnapsh
         paths,
         dir.join("scratch"),
     ));
-    (Engine { pool, page_file }, store)
+    (Engine { pool, wal: wal_handle, page_file }, store)
 }
 
 /// Write `n` pages whose bytes are a function of `(mark, page)`, so two engines' files are equal
@@ -207,7 +209,7 @@ fn pump_until(
                 m.node.term(),
                 m.node.commit_round(),
                 m.node.snapshot_round(),
-                m.node.snapshots_sent(),
+                m.node.snapshots_armed(),
                 m.node.snapshots_installed(),
             )
         })
@@ -312,7 +314,7 @@ fn a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges()
          replication and not state transfer"
     );
     assert!(
-        m[leader].node.snapshots_sent() > 0,
+        m[leader].node.snapshots_armed() > 0,
         "no InstallSnapshot was ever armed by the leader"
     );
 
@@ -380,19 +382,20 @@ fn with_the_log_retained_the_same_follower_converges_without_a_snapshot() {
 /// and, at the driver, before anything is written for it either.
 ///
 /// The state machine's half is `tests_snapshot.rs`; this is the half that can be checked from
-/// outside: no spool file appears on the receiving node's disk.
+/// outside: the forged transfer leaves no spool on the receiving node's disk.
+///
+/// **Built with the log retained**, not with `retain_rounds: 0`. Under zero retention a peer that
+/// is momentarily behind is served a legitimate snapshot, which creates a spool the system is right
+/// to create — and an assertion that no spool exists would then fire on it and blame `total_bytes`
+/// for something else entirely.
 #[test]
 fn a_snapshot_claiming_an_implausible_size_leaves_nothing_on_the_receivers_disk() {
-    let mut m = cluster(0);
+    let mut m = cluster(u64::MAX);
     pump_until(&mut m, &[0, 1, 2], "a leader", |m| leader_of(m).is_some());
     let leader = leader_of(&m).expect("checked above");
     let victim = (0..3).find(|&i| i != leader).expect("three nodes, one leader");
 
-    let spool = m[victim]
-        ._dir
-        .path()
-        .join("consensus")
-        .join("snapshot.incoming");
+    let spool = m[victim]._dir.path().join("consensus").join("snapshot.incoming");
     assert!(!spool.exists(), "the fixture started with a spool file already present");
 
     let lie = Message {
@@ -424,8 +427,14 @@ fn a_snapshot_claiming_an_implausible_size_leaves_nothing_on_the_receivers_disk(
     .unwrap();
     liar.send(&lie).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
+    // **Bounded, and made non-vacuous by sending a WELL-FORMED forged transfer afterwards.** The
+    // victim's answer goes to its configured peer address for the leader's id, which is the real
+    // leader's listener and not this socket, so the refusal itself cannot be observed here. What
+    // can be observed is the spool: the impossible transfer must leave none, and a possible one
+    // through the very same socket must leave one. Without the second half this test would pass
+    // against a frame that never arrived at all.
+    let settle = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < settle {
         poll(&mut m, &[0, 1, 2]);
         assert!(
             !spool.exists(),
@@ -434,6 +443,58 @@ fn a_snapshot_claiming_an_implausible_size_leaves_nothing_on_the_receivers_disk(
         );
     }
     assert_eq!(m[victim].node.snapshots_installed(), 0);
+    assert_eq!(m[victim].node.snapshot_round(), 0, "the log was checkpointed despite full retention");
+
+    // The anti-vacuity half: a real payload down the same socket. It is not installable — this
+    // victim's engine is not the sender's — but it IS spoolable, which is the thing being shown to
+    // be reachable.
+    //
+    // The round is deliberately far above anything this cluster has committed. A snapshot of a
+    // round the receiver already holds is answered whole and NOT spooled, which is correct and
+    // would make this half prove nothing — the first version of it named round 1 and did exactly
+    // that.
+    let real = {
+        let at = ferrodb::consensus::snapshot::SnapshotPoint {
+            last_round: 9_999,
+            last_term: 1,
+            config: Config::new(IDS, 1, 0),
+            base_digest: 0,
+        };
+        ferrodb::consensus::snapshot::Snapshot::build(
+            &at,
+            1,
+            CATALOG_PAGE,
+            ferrodb::replication::backup::BackupLabel { start_lsn: 0, end_lsn: 0, page_count: 1 },
+            &[],
+            &[],
+            &[],
+            vec![9u8; PAGE_SIZE],
+        )
+        .expect("a well-formed payload was refused")
+    };
+    liar
+        .send(&Message {
+            from: IDS[leader],
+            to: IDS[victim],
+            term: m[leader].node.term(),
+            body: Body::InstallSnapshot {
+                meta: real.meta.clone(),
+                offset: 0,
+                data: real.payload().to_vec(),
+                done: false,
+            },
+        })
+        .unwrap();
+    let deadline = Instant::now() + BUDGET;
+    while Instant::now() < deadline && !spool.exists() {
+        poll(&mut m, &[0, 1, 2]);
+    }
+    assert!(
+        spool.exists(),
+        "a well-formed transfer down the same socket left no spool either, so the refusal above \
+         proves nothing about `total_bytes` — the frames may never have arrived"
+    );
+
     liar.shutdown();
     shutdown(&m);
 }
@@ -547,5 +608,233 @@ fn a_captured_payload_installs_back_to_the_same_pages() {
         page_through_pool(&from_engine, id).to_vec(),
         "after installing a snapshot this node's buffer pool still serves page {id} of the \
          database the install replaced, and the file on disk says otherwise"
+    );
+}
+
+/// **The redo window is what turns the page image from a smear into a database.**
+///
+/// `backup.rs` says its image "is *not* an instant snapshot" and that `end_lsn` "is the point
+/// before which the restored file **must not be treated as consistent**" — pages are copied while
+/// writes land. A local restore closes that by streaming the primary's WAL from `start_lsn`; an
+/// install has no stream to follow, so the window travels with the payload and is replayed on
+/// arrival.
+///
+/// Forced rather than hoped for: the payload is built with a redo section carrying a record whose
+/// effect is **not** in the image, and the destination must show it afterwards.
+#[test]
+fn the_redo_window_that_travels_with_a_snapshot_is_replayed_into_it() {
+    use ferrodb::consensus::snapshot::{Snapshot, SnapshotPoint, SnapshotStore};
+    use ferrodb::replication::backup::BackupLabel;
+    use ferrodb::replication::ReplicationSource;
+    use ferrodb::wal::log::RecKind;
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    let ids = seed_pages(&from_engine, 4, 0x11);
+    let target = ids[1];
+
+    // A record the page image will NOT contain: written to the log, and the page it describes is
+    // left exactly as it was.
+    let wal = ferrodb::wal::log::WalManager::new(src.path().join("window.wal")).unwrap();
+    let tuple = vec![0xC7u8; 24];
+    wal.append(1, 0, &RecKind::HeapInsert { dir_root: 1, page_id: target, slot: 0, tuple: tuple.clone() })
+        .unwrap();
+    wal.flush().unwrap();
+    let wal = std::sync::Arc::new(wal);
+    let source = ReplicationSource::new(&wal);
+    let base = source.start_lsn();
+    let (redo, _next) = source.read_from(base, 1 << 20).unwrap();
+    assert!(!redo.is_empty(), "the fixture's redo window is empty, so it tests nothing");
+
+    let at = SnapshotPoint {
+        last_round: 5,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let taken = from.capture(&at).expect("capture failed");
+
+    // The same capture, rebuilt with the window attached. Every other section is taken verbatim
+    // from the real payload, so any difference in the destination is the window and nothing else.
+    let body = &taken.payload()[ferrodb::consensus::snapshot::PayloadHeader::BYTES..];
+    let a_len = taken.header.arena_len as usize;
+    let b_len = taken.header.branches_len as usize;
+    let arena = &body[..a_len];
+    let branches = &body[a_len..a_len + b_len];
+    let image = body[a_len + b_len..].to_vec();
+    assert_eq!(image.len() as u64, taken.header.image_len);
+
+    let with_window = Snapshot::build(
+        &at,
+        taken.header.root_page_id,
+        taken.header.catalog_page_id,
+        BackupLabel {
+            start_lsn: base,
+            end_lsn: taken.header.end_lsn,
+            page_count: taken.header.page_count,
+        },
+        arena,
+        branches,
+        &redo,
+        image,
+    )
+    .expect("a well-formed payload was refused");
+
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 1, 0x99);
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, with_window.payload()).unwrap();
+    to.install(&with_window.meta, &spool).expect("install failed");
+
+    // The destination's page carries the record's tuple, which no byte of the image held.
+    let page = page_through_pool(&to_engine, target);
+    assert!(
+        page.windows(tuple.len()).any(|w| w == tuple.as_slice()),
+        "the redo window that travelled with the snapshot was not replayed: page {target} of the \
+         installed database does not carry the record the window describes, so this follower holds \
+         a database torn in time and nothing will ever repair it"
+    );
+}
+
+/// An install discards the receiver's own WAL, and refuses if it cannot.
+///
+/// Those records describe the database the install just replaced. The installed pages carry the
+/// SENDER's LSN sequence, so `wal::recovery` on the next start would meet a receiver record whose
+/// number is higher than the page it names and apply it onto a page from a different database, with
+/// nothing to notice.
+#[test]
+fn an_install_discards_the_receivers_own_wal() {
+    use ferrodb::consensus::snapshot::{SnapshotPoint, SnapshotStore};
+    use std::sync::atomic::Ordering;
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    seed_pages(&from_engine, 3, 0x2A);
+
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 2, 0x5B);
+    // Records of this node's OWN database, which is the state this rule is about. Appended rather
+    // than assumed: writing pages through the pool does not by itself put a record in the log, so a
+    // fixture that relied on it would be testing an empty WAL.
+    to_engine
+        .wal
+        .append(
+            7,
+            0,
+            &ferrodb::wal::log::RecKind::HeapInsert {
+                dir_root: 1,
+                page_id: 1,
+                slot: 0,
+                tuple: vec![0x3Cu8; 16],
+            },
+        )
+        .unwrap();
+    to_engine.wal.flush().unwrap();
+    let before_next = to_engine.wal.next_lsn.load(Ordering::SeqCst);
+    assert!(
+        before_next > to_engine.wal.base_lsn.load(Ordering::SeqCst),
+        "the fixture's receiver has an empty WAL, so it tests nothing"
+    );
+
+    let at = SnapshotPoint {
+        last_round: 3,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    to.install(&snap.meta, &spool).expect("install failed");
+
+    assert_eq!(
+        to_engine.wal.base_lsn.load(Ordering::SeqCst),
+        before_next,
+        "the receiver's WAL still holds records describing the database this install replaced; \
+         recovery would replay them over the installed pages"
+    );
+}
+
+/// A node whose storage was left part-way through an install refuses to start.
+///
+/// Three files are replaced and no rename sequence makes them land together, so the dangerous state
+/// is made representable and refused rather than merely unlikely: a page file from one database
+/// beside an arena map from another has no later detection point, because every page of the mixture
+/// passes its own checksum.
+#[test]
+fn a_node_left_part_way_through_an_install_refuses_to_start() {
+    use ferrodb::consensus::snapshot::install_marker;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, store) = engine_at(dir.path(), "half", true);
+    seed_pages(&engine, 2, 0x7E);
+
+    std::fs::write(install_marker(&engine.page_file), "snapshot install in progress: round 9\n")
+        .unwrap();
+
+    let started = Node::start(
+        IDS[0],
+        Config::new(IDS, 1, 0),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        NodeOptions::new(dir.path().join("consensus"), BTreeMap::new(), 1)
+            .with_snapshots(store, 0),
+        RecordingApplier::default(),
+    );
+    let err = match started {
+        Err(e) => e,
+        Ok(n) => {
+            n.shutdown();
+            panic!("a node whose storage is half-replaced started and joined a cluster");
+        }
+    };
+    assert!(
+        format!("{err}").contains("part-way through a snapshot install"),
+        "refused, but not for the reason this guard exists: {err}"
+    );
+
+    // Anti-vacuity: with the marker gone, the same node starts. Without this the refusal above
+    // would pass just as well against a `Node::start` that refused everything.
+    std::fs::remove_file(install_marker(&engine.page_file)).unwrap();
+    let (_e2, store2) = engine_at(dir.path(), "half", false);
+    let n = Node::start(
+        IDS[0],
+        Config::new(IDS, 1, 0),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        NodeOptions::new(dir.path().join("consensus"), BTreeMap::new(), 1)
+            .with_snapshots(store2, 0),
+        RecordingApplier::default(),
+    )
+    .expect("a node with no marker was refused");
+    n.shutdown();
+}
+
+/// A successful install leaves no marker, or every later start would refuse.
+#[test]
+fn a_completed_install_leaves_no_marker_behind() {
+    use ferrodb::consensus::snapshot::{install_was_interrupted, SnapshotPoint, SnapshotStore};
+
+    let src = tempfile::tempdir().unwrap();
+    let (from_engine, mut from) = engine_at(src.path(), "src", true);
+    seed_pages(&from_engine, 3, 0x4D);
+    let dst = tempfile::tempdir().unwrap();
+    let (to_engine, mut to) = engine_at(dst.path(), "dst", true);
+    seed_pages(&to_engine, 1, 0xB2);
+
+    let at = SnapshotPoint {
+        last_round: 2,
+        last_term: 1,
+        config: Config::new(IDS, 1, 0),
+        base_digest: 0,
+    };
+    let snap = from.capture(&at).expect("capture failed");
+    let spool = dst.path().join("payload");
+    std::fs::write(&spool, snap.payload()).unwrap();
+    to.install(&snap.meta, &spool).expect("install failed");
+
+    assert!(
+        !install_was_interrupted(&to_engine.page_file),
+        "a completed install left its marker behind, so this node will refuse to start for ever"
     );
 }

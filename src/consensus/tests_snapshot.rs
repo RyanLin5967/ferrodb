@@ -69,6 +69,7 @@ fn payload_of(at: &SnapshotPoint, pages: u32, mark: u8) -> Snapshot {
         BackupLabel { start_lsn: 10, end_lsn: 20, page_count: pages },
         &[mark; 8],
         &[mark; 4],
+        &[],
         vec![mark; pages as usize * PAGE_SIZE],
     )
     .expect("a well-formed payload was refused")
@@ -237,6 +238,7 @@ fn a_header_whose_page_count_contradicts_its_image_length_is_refused() {
         BackupLabel { start_lsn: 1, end_lsn: 2, page_count: 4 },
         &[],
         &[],
+        &[],
         vec![0u8; 3 * PAGE_SIZE],
     )
     .expect_err("an image of 3 pages was labelled 4 and accepted");
@@ -248,6 +250,7 @@ fn a_header_whose_page_count_contradicts_its_image_length_is_refused() {
         7,
         1,
         BackupLabel { start_lsn: 1, end_lsn: 2, page_count: 3 },
+        &[],
         &[],
         &[],
         vec![0u8; 3 * PAGE_SIZE],
@@ -269,6 +272,7 @@ fn a_zero_page_image_is_refused_because_installing_it_would_look_like_success() 
         7,
         1,
         BackupLabel { start_lsn: 1, end_lsn: 2, page_count: 0 },
+        &[],
         &[],
         &[],
         Vec::new(),
@@ -1009,33 +1013,48 @@ fn an_installed_snapshot_anchors_the_digest_chain_where_the_leader_is() {
     );
 }
 
-/// An installed configuration goes through the one seam that refuses damage, and the refusal is
-/// propagated rather than swallowed.
+/// **A snapshot whose configuration is damage is refused at its FIRST FRAME**, not when it
+/// completes.
+///
+/// `note_config_in_log` is the one seam that refuses a damaged configuration, and it refuses by
+/// latching this node out of office. But by the time an install reaches it, the driver has already
+/// replaced this node's whole database and truncated its log — so a refusal there leaves a state
+/// machine and a disk describing different histories, with the spool deleted and nothing to
+/// re-drive from. The check is therefore made where nothing has been spent yet.
 #[test]
-fn an_install_whose_configuration_is_damage_latches_this_node_out_of_office() {
+fn a_snapshot_whose_configuration_is_damage_is_refused_before_anything_is_spent() {
     let mut l = Consensus::new(N1, cfg3(), 1);
     seed(&mut l, &[(1, wal(1)), (1, wal(2))]);
     promote(&mut l, 1);
 
     // A configuration claiming the identity the receiver's current one already holds, with a
     // different membership — the collision `note_config_in_log` exists to refuse.
-    let colliding = Config::new([N1, N2], 1, 1);
     let mut at = point_of(&l);
-    at.config = colliding;
+    at.config = Config::new([N1, N2], 1, 1);
     let snap = payload_of(&at, 1, 6);
 
     let mut f = Consensus::new(N2, cfg3(), 3);
     follower_of(&mut f, 1, N1);
-    deliver_all(&mut f, N1, 1, &snap);
-    let out = f.step(Event::Persisted { term: 1, round: snap.meta.last_round });
 
-    assert!(
-        out.iter().any(|a| matches!(a, Action::Refuse { .. })),
-        "damage in a snapshot's configuration was swallowed: {out:#?}"
-    );
-    assert!(f.behind, "a node that installed a damaged configuration may still campaign");
-    assert_eq!(f.snapshot_round, 0, "the floor moved for an install that was refused");
+    let out = f.step(Event::Recv(install_msg(N1, N2, 1, &snap, 0)));
+    assert_eq!(received_through(&only_send(&out)), 0, "a damaged configuration was accepted");
+    assert!(f.snapshot_incoming().is_none(), "a cursor was armed for a transfer that must not run");
+    assert!(f.pending_install_round().is_none());
     assert_eq!(*f.config(), cfg3(), "a colliding configuration was installed");
+    assert!(!f.behind, "the node was latched out of office by a transfer it never accepted");
+
+    // Anti-vacuity: the same payload with a configuration that is NOT damage is accepted, so the
+    // refusal is about the configuration and not about the payload.
+    let mut ok_at = point_of(&l);
+    ok_at.config = Config::new([N1, N2, N3], 2, 1);
+    let good = payload_of(&ok_at, 1, 6);
+    let out = f.step(Event::Recv(install_msg(N1, N2, 1, &good, 0)));
+    assert_eq!(received_through(&only_send(&out)), good.meta.total_bytes);
+    assert_eq!(f.pending_install_round(), Some(good.meta.last_round));
+
+    // And it reaches `note_config_in_log`, which is what clears `behind` on a joining node.
+    f.step(Event::Persisted { term: 1, round: good.meta.last_round });
+    assert_eq!(f.config().version, 2, "the snapshot's configuration was not installed");
 }
 
 /// An install discards the whole log, and the floor moves with it.
@@ -1272,4 +1291,92 @@ fn a_short_done_keeps_the_bytes_already_accepted_and_a_bad_digest_does_not() {
         g.snapshot_incoming().is_none(),
         "a transfer whose bytes do not digest kept a prefix that cannot be trusted"
     );
+}
+
+/// **A refused snapshot does not change this node's office.**
+///
+/// `on_append` states the rule — "Validate the batch before anything acts on it, including this
+/// node's own office" — and the first version of the snapshot path did the opposite: it adopted the
+/// sender as leader and zeroed `matched` before looking at the message. Any same-term peer that was
+/// not the leader could then send one impossible snapshot and take this node's real leader's cursor
+/// back to zero, with the refusal that followed undoing none of it.
+#[test]
+fn a_refused_snapshot_does_not_change_this_nodes_office() {
+    let mut f = Consensus::new(N2, cfg3(), 3);
+    follower_of(&mut f, 2, N1);
+    f.set_agreed(7);
+
+    // From N3, which is in the configuration and is NOT this node's leader.
+    let out = f.step(Event::Recv(Message {
+        from: N3,
+        to: N2,
+        term: 2,
+        body: Body::InstallSnapshot {
+            meta: SnapshotMeta {
+                last_round: 5,
+                last_term: 1,
+                config: cfg3(),
+                total_bytes: u64::MAX, // impossible: refused by `validate`
+            },
+            offset: 0,
+            data: vec![0u8; 64],
+            done: false,
+        },
+    }));
+    assert_eq!(received_through(&only_send(&out)), 0);
+    assert_eq!(f.leader(), Some(N1), "a refused snapshot moved this node's leader");
+    assert_eq!(f.agreed(), 7, "a refused snapshot zeroed what this node had established");
+    assert!(
+        !out.iter().any(|a| matches!(a, Action::RoleChanged { .. })),
+        "a refused snapshot changed this node's office: {out:#?}"
+    );
+}
+
+/// The three sections an install reads into memory whole are bounded, and the bound is checked in
+/// the **header** — which arrives in the first chunk, before a byte is spooled.
+///
+/// They are the only place a peer's number sizes an allocation on the receiving side, which is
+/// exactly what this module's header says a receiver must never allow. `u32` alone permits 4 GiB
+/// apiece.
+#[test]
+fn a_header_claiming_an_unbounded_sidecar_section_is_refused() {
+    let mut c = Consensus::new(N1, cfg3(), 7);
+    seed(&mut c, &[(1, wal(1))]);
+    let good = payload_of(&point_of(&c), 1, 5);
+    let mut h = PayloadHeader::decode(good.payload()).expect("its own header was refused");
+
+    for (name, set) in [
+        ("arena", 0usize),
+        ("branches", 1usize),
+        ("redo", 2usize),
+    ] {
+        let mut bad = h;
+        match set {
+            0 => bad.arena_len = u32::MAX,
+            1 => bad.branches_len = u32::MAX,
+            _ => bad.wal_len = u32::MAX,
+        }
+        let e = PayloadHeader::decode(&bad.encode())
+            .unwrap_err_or_else_panic(&format!("a {name} section of u32::MAX was accepted"));
+        assert!(format!("{e}").contains("ceiling"), "{name}: wrong reason: {e}");
+    }
+
+    // Anti-vacuity: a section at exactly the ceiling is accepted, so the bound is a comparison and
+    // not a refusal of everything.
+    h.arena_len = PayloadHeader::MAX_SIDECAR_BYTES as u32;
+    h.image_len = h.page_count as u64 * PAGE_SIZE as u64;
+    PayloadHeader::decode(&h.encode()).expect("a section at exactly the ceiling was refused");
+}
+
+/// A tiny helper so the loop above reads as one assertion per section.
+trait ExpectErr<T> {
+    fn unwrap_err_or_else_panic(self, why: &str) -> SnapshotError;
+}
+impl<T: std::fmt::Debug> ExpectErr<T> for Result<T, SnapshotError> {
+    fn unwrap_err_or_else_panic(self, why: &str) -> SnapshotError {
+        match self {
+            Err(e) => e,
+            Ok(v) => panic!("{why}: {v:?}"),
+        }
+    }
 }

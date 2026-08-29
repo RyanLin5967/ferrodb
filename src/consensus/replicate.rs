@@ -239,7 +239,8 @@ impl LogTail {
     fn compact_to(&mut self, base: Round, base_digest: u64) {
         assert!(
             base > self.base && base <= self.last_round(),
-            "compact_to({base}) on a tail covering ({}, {}]: the caller must have checked both              ends, because dropping the wrong prefix silently renumbers every entry above it",
+            "compact_to({base}) on a tail covering ({}, {}]: the caller must have checked both \
+             ends, because dropping the wrong prefix silently renumbers every entry above it",
             self.base,
             self.last_round()
         );

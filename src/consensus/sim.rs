@@ -78,8 +78,9 @@
 //!   snapshot message in a run is delivered and answered — but no run here ever produces one,
 //!   because nothing in the model checkpoints. **So the properties below are asserted for clusters
 //!   whose logs still begin at round 1, and that is the whole of the coverage claim.** F6's
-//!   protocol is proven deterministically instead, in `consensus/tests_snapshot.rs` (34 rules, each
-//!   fired by a mutant) and against three real drivers, sockets and page files in
+//!   protocol is proven deterministically instead, in `consensus/tests_snapshot.rs` (every rule
+//!   there fired by a mutant, and the battery is `scratchpad/f6_mutants.py`) and against three real
+//!   drivers, sockets and page files in
 //!   `tests/integration_cluster_snapshot.rs`. Extending `Store` with a floor remains open, and
 //!   whoever takes it should read this paragraph first rather than the sentence that used to be
 //!   here, which said F6 would.

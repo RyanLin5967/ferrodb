@@ -208,10 +208,12 @@ pub struct Node<A: Applier> {
     /// further events are drained before the state machine sees it — and without this the install
     /// would be attempted again on each of them, against a spool the first one has already removed.
     installed_round: Option<Round>,
-    /// How many `InstallSnapshot` transfers this node has served and completed. Counted so a test
-    /// can assert the path was **taken**, not merely that the cluster converged — a cluster that
-    /// converged by ordinary replication passes any convergence check you write.
-    snapshots_sent: u64,
+    /// How many transfers this node has **armed** as a leader — captured a snapshot for a peer
+    /// that could not be served entries. Named for what it counts and not for what a reader would
+    /// like it to mean: arming is not sending, and a leader that arms one and then loses its office
+    /// has still armed it. Whether a transfer *finished* is a fact about the receiver, and
+    /// `snapshots_installed` on that node is where it is counted.
+    snapshots_armed: u64,
     snapshots_installed: u64,
 }
 
@@ -313,6 +315,14 @@ impl<A: Applier> Node<A> {
             load_snapshot_record(&opts.dir, log.snapshot_round(), log.snapshot_term())?;
         sm.restore(hard, log.snapshot_round(), log.snapshot_term(), base_digest, entries);
 
+        // **Before the first event, and before the socket exists.** A node whose storage was left
+        // half-replaced by an interrupted install must not join a cluster and start answering for
+        // it; refusing here is the only point at which the answer is still "this node cannot serve",
+        // rather than a database nobody can tell is a mixture of two.
+        if let Some(store) = opts.snapshots.as_ref() {
+            store.check_ready()?;
+        }
+
         let net = Transport::from_listener(self_id, listener, opts.peers, opts.transport)?;
         let now = Instant::now();
         let floor = log.snapshot_round();
@@ -336,7 +346,7 @@ impl<A: Applier> Node<A> {
             spooled: 0,
             spooled_header: None,
             installed_round: None,
-            snapshots_sent: 0,
+            snapshots_armed: 0,
             snapshots_installed: 0,
         };
         if let Some(why) = digest_note {
@@ -362,8 +372,8 @@ impl<A: Applier> Node<A> {
     pub fn take_refusals(&mut self) -> Vec<FerroError> { std::mem::take(&mut self.refusals) }
     /// Where this node's log begins. Everything at or below it is covered by a snapshot.
     pub fn snapshot_round(&self) -> Round { self.log.snapshot_round() }
-    /// Transfers this node has served to completion, as a leader.
-    pub fn snapshots_sent(&self) -> u64 { self.snapshots_sent }
+    /// Transfers this node has **armed** as a leader. See the field for why it is not "sent".
+    pub fn snapshots_armed(&self) -> u64 { self.snapshots_armed }
     /// Transfers this node has installed, as a follower. **The anti-vacuity counter**: a
     /// convergence test that never sees this move proved only that ordinary replication works.
     pub fn snapshots_installed(&self) -> u64 { self.snapshots_installed }
@@ -443,6 +453,11 @@ impl<A: Applier> Node<A> {
             }
             // Inside the loop, because both are about the event just stepped: the spool write is
             // the bytes it carried, and the install feeds a `Persisted` back into this same queue.
+            // Release first: on the iteration that carries the `Persisted`, the state machine has
+            // already cleared its cursor, and `install_pending_snapshot` clears `installed_round`
+            // on its way out — so a release that ran after it would find nothing to release and
+            // leak the spool file.
+            self.release_installed_spool();
             self.install_pending_snapshot()?;
         }
         // **Outside the loop**, because neither is about any one event and both are expensive.
@@ -465,10 +480,18 @@ impl<A: Applier> Node<A> {
     /// * this driver says its spool holds exactly `offset` bytes of that same payload — or the
     ///   chunk is at offset 0, which starts a payload and truncates whatever was there.
     ///
-    /// Anything else is a disagreement about which bytes are where. It is refused by name rather
-    /// than skipped, because the failure it would otherwise become is a payload that digests
-    /// correctly on the state machine's account of the bytes and installs from a spool that is a
-    /// mixture of two transfers — and every page of that mixture passes its own checksum.
+    /// **A chunk this driver cannot place is skipped, not refused**, and the reason is that the
+    /// cursor alone cannot tell an accept from a duplicate.
+    ///
+    /// A re-sent chunk at offset X, arriving after the receiver has already accepted it, leaves the
+    /// cursor at exactly `X + len` — the same value an accept produces. The first version of this
+    /// returned a hard error on that case, which killed the node: a leader re-sends from its own
+    /// `acked` on every heartbeat, so any transfer of more than one chunk that spanned a heartbeat
+    /// took the process down. (The integration test escaped it only because its fixture database
+    /// was one chunk.) Skipping is safe in every reading: the spool can end up SHORT, never mixed,
+    /// because a write only ever happens at exactly the length the spool already holds — and a
+    /// short spool is refused, by name, in `install_pending_snapshot`, before a byte of it is
+    /// installed.
     fn spool_accepted_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
         let Some(cur) = self.sm.snapshot_incoming() else {
             // Refused, or superseded. Nothing was accepted, so nothing is written.
@@ -476,21 +499,13 @@ impl<A: Applier> Node<A> {
         };
         let header = *cur.header();
         if cur.received() != offset + data.len() as u64 {
-            // The state machine did not accept this chunk here — an out-of-order chunk answered
-            // with a resume point, a duplicate, or a refusal. All of them leave the spool alone.
+            // The state machine did not accept this chunk here.
             return Ok(());
         }
         let starting = offset == 0;
         let continuing = self.spooled_header == Some(header) && self.spooled == offset;
         if !starting && !continuing {
-            return Err(FerroError::Internal(format!(
-                "the state machine accepted a snapshot chunk at offset {offset} and this node's \
-                 spool holds {} bytes of {}. The two accounts of the transfer have drifted, and \
-                 installing from a spool the state machine did not digest is how a payload passes \
-                 its own checksum while being a mixture of two transfers.",
-                self.spooled,
-                if self.spooled_header.is_some() { "another payload" } else { "nothing" }
-            )));
+            return Ok(());
         }
         self.spool_chunk(offset, data)?;
         self.spooled = offset + data.len() as u64;
@@ -501,6 +516,14 @@ impl<A: Applier> Node<A> {
     /// Positioned rather than appended, and the file is truncated to the new length afterwards, so
     /// a transfer that restarts at offset 0 overwrites the old one instead of leaving its tail
     /// behind.
+    ///
+    /// **Deliberately no fsync per chunk.** There would be nothing to resume from: the receive
+    /// cursor lives in `Consensus::progress` and `spooled`/`spooled_header` are plain fields, none
+    /// of which survives a restart, so a crash restarts every transfer at offset 0 whatever reached
+    /// the device. A flush per megabyte would buy thousands of device flushes inside the drain loop
+    /// and no durability at all — and this file's own drain comment warns that a driver which
+    /// spends longer in a drain than a leader's lease loses the office. The one fsync that IS
+    /// load-bearing happens once, in `install_pending_snapshot`, before the bytes are read back.
     fn spool_chunk(&mut self, offset: u64, data: &[u8]) -> Result<(), FerroError> {
         let path = spool_path(&self.dir);
         let f = fs::OpenOptions::new()
@@ -514,7 +537,6 @@ impl<A: Applier> Node<A> {
             .map_err(|e| FerroError::Io(format!("write the snapshot spool: {e}")))?;
         f.set_len(offset + data.len() as u64)
             .map_err(|e| FerroError::Io(format!("size the snapshot spool: {e}")))?;
-        f.sync_all().map_err(|e| FerroError::Io(format!("fsync the snapshot spool: {e}")))?;
         Ok(())
     }
 
@@ -548,12 +570,41 @@ impl<A: Applier> Node<A> {
             .header()
             .base_digest;
 
+        // **The two accounts are reconciled here, once, at the only moment it can be done with
+        // certainty.** The state machine has digested a whole payload; this driver has written what
+        // it could place. If they do not agree on the length, the spool is SHORT of what was
+        // digested — a chunk was skipped because the driver could not place it — and installing
+        // from it would install bytes nothing verified. Refused by name rather than discovered as a
+        // truncated read halfway through `store.install`.
+        let path = spool_path(&self.dir);
+        let spooled_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if self.spooled != meta.total_bytes || spooled_len != meta.total_bytes {
+            return Err(FerroError::Internal(format!(
+                "the state machine verified a {}-byte snapshot for round {round} and this node's \
+                 spool holds {} bytes ({spooled_len} on disk). The two accounts of the transfer \
+                 have drifted, and installing from a spool the state machine did not digest is how \
+                 a payload passes its own checksum while being a mixture of two transfers.",
+                meta.total_bytes, self.spooled
+            )));
+        }
+        // The one fsync that matters, and the only one on this path: everything read back below
+        // must be on the device, because the state machine moves its floor on the strength of the
+        // install having returned.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| FerroError::Io(format!("fsync the snapshot spool: {e}")))?;
+
         let Some(store) = self.snapshots.as_mut() else {
             return Err(FerroError::Internal(format!(
-                "a snapshot covering round {round} was received whole, and this node has no                  storage engine attached to install it into. Refusing rather than acknowledging a                  transfer that changed nothing: the follower would report itself caught up and                  serve a database it never received."
+                "a snapshot covering round {round} was received whole, and this node has no \
+                 storage engine attached to install it into. Refusing rather than acknowledging a \
+                 transfer that changed nothing: the follower would report itself caught up and \
+                 serve a database it never received."
             )));
         };
-        store.install(&meta, &spool_path(&self.dir))?;
+        store.install(&meta, &path)?;
 
         // The durable log's floor moves with the state machine's, in this step and not another.
         // The whole tail goes: a node being re-seeded holds rounds the leader serving it cannot
@@ -563,17 +614,31 @@ impl<A: Applier> Node<A> {
         }
         self.log.discard_prefix(round, meta.last_term).map_err(LogError::into_ferro)?;
         store_snapshot_record(&self.dir, round, meta.last_term, digest)?;
-        let _ = fs::remove_file(spool_path(&self.dir));
 
         self.applied = self.applied.max(round);
-        self.spooled = 0;
-        self.spooled_header = None;
         self.installed_round = Some(round);
         self.snapshots_installed += 1;
-        // The event that already means "everything through this round is on my disk". Reusing it
-        // rather than inventing an event keeps the frozen contract intact.
+        // **The spool is NOT removed here.** The state machine has not yet been told, and
+        // `finish_install` can still refuse — a configuration that is damage latches this node out
+        // of office rather than being applied. Deleting the bytes at this point would leave nothing
+        // to re-drive the install from, with the log already truncated: a node whose state machine
+        // and whose disk describe different histories, permanently. `drain` removes the spool once
+        // the `Persisted` below has been accepted.
         self.pending.push_back(Event::Persisted { term: self.sm.term(), round });
         Ok(())
+    }
+
+    /// The state machine has accepted the install. Release what was held for it.
+    ///
+    /// Separate from the install itself because the install cannot know: `finish_install` runs
+    /// inside the state machine's own step, after this returns, and it can still refuse.
+    fn release_installed_spool(&mut self) {
+        if self.installed_round.is_some() && self.sm.pending_install_round().is_none() {
+            let _ = fs::remove_file(spool_path(&self.dir));
+            self.spooled = 0;
+            self.spooled_header = None;
+            self.installed_round = None;
+        }
     }
 
     /// Capture a snapshot for every peer this leader cannot serve with entries.
@@ -593,7 +658,9 @@ impl<A: Applier> Node<A> {
         };
         let Some(store) = self.snapshots.as_mut() else {
             self.refusals.push(FerroError::Internal(format!(
-                "peer(s) {waiting:?} need state transfer and this node has no storage engine to                  capture a snapshot from, so they cannot be repaired. Naming it rather than                  leaving them silently stalled."
+                "peer(s) {waiting:?} need state transfer and this node has no storage engine to \
+                 capture a snapshot from, so they cannot be repaired. Naming it rather than \
+                 leaving them silently stalled."
             )));
             return Ok(());
         };
@@ -604,7 +671,7 @@ impl<A: Applier> Node<A> {
             if let Err(why) = self.sm.offer_snapshot_to(peer, std::sync::Arc::clone(&snap)) {
                 self.refusals.push(why.into_ferro());
             } else {
-                self.snapshots_sent += 1;
+                self.snapshots_armed += 1;
             }
         }
         Ok(())
