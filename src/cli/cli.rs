@@ -44,6 +44,12 @@ fn arena_headroom() -> u32 {
 
 // super basic cli, make better later
 pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
+    // Read before anything else: it touches no file, and a database that cannot be reaped is a
+    // database that should not be opened. `examples/pgserver.rs` has a harder reason to put it
+    // first — its refusal path is `process::exit`, which does not drop the lock — and the two are
+    // ordered the same way so neither has to be read against the other.
+    let interval = scan_interval_from_env()?;
+
     // FIRST, before anything opens a file. Two processes on one database hand out the same arena
     // pages to different branches, and every such page still passes its checksum — so this refusal
     // is the only point at which the problem is detectable. Held for the whole session: `_lock`
@@ -154,7 +160,6 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // server. One rule, in both places that run SQL, rather than a second lock ordering here.
     let catalog = Arc::new(CatalogLock::new(catalog));
 
-    let interval = scan_interval_from_env()?;
     let lease = LeaseThread::start(
         reaper,
         runtime,

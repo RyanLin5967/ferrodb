@@ -32,6 +32,16 @@ fn main() {
     let db = args.get(1).cloned().unwrap_or_else(|| "ferro.db".into());
     let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:0".into());
 
+    // Read BEFORE the lock, because the refusal path below is `process::exit`, which does not run
+    // destructors. Parsed after `DbLock::acquire`, a misconfigured `FERRODB_LEASE_SCAN_MILLIS`
+    // would exit past the lock's `Drop` and leave `<db>.lock` behind, so the operator's next
+    // attempt — with the variable corrected — would be refused as "already open by process N".
+    // Nothing here touches a file, so there is no reason for it to happen after anything.
+    let interval = scan_interval_from_env().unwrap_or_else(|e| {
+        eprintln!("pgserver: {e}");
+        std::process::exit(1);
+    });
+
     // Before any file is opened: a second writer on one database aliases arena pages, and every
     // aliased page still checksums correctly, so refusing here is the only detection point.
     let _lock = match DbLock::acquire(Path::new(&db)) {
@@ -129,20 +139,13 @@ fn main() {
     // THE LEASE SCAN. Started before the first connection is handled, and holding `ctx`'s catalog
     // mutex — the same outermost lock a statement takes — so a scan can never run inside a `MERGE`.
     // See `branch::lease_thread` for all three rules and why this is the right lock.
-    let interval = scan_interval_from_env().unwrap_or_else(|e| {
-        eprintln!("pgserver: {e}");
-        std::process::exit(1);
-    });
-    let lease = LeaseThread::start(
-        reaper,
-        runtime,
-        ctx.clone() as Arc<dyn RuntimeLock>,
-        interval,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("pgserver: {e}");
-        std::process::exit(1);
-    });
+    //
+    // A failure here PANICS rather than exiting, matching every other post-lock failure in this
+    // file (`.expect("bind")`, `.expect("arena")`): a panic unwinds and drops the `DbLock`, and
+    // `process::exit` would strand the lock file on a database this process is not holding.
+    let lease =
+        LeaseThread::start(reaper, runtime, ctx.clone() as Arc<dyn RuntimeLock>, interval)
+            .unwrap_or_else(|e| panic!("pgserver: {e}"));
     let _ = writeln!(
         std::io::stderr(),
         "pgserver: lease scan every {}ms; {} interrupted reap(s) finished on startup",

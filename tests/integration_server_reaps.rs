@@ -672,8 +672,14 @@ fn both_binaries_refuse_to_start_on_an_unusable_scan_interval() {
     // A knob that silently fell back would let an operator who set five seconds run on thirty and
     // read the delay as a reaper that does not work. Checked through the binaries, because a unit
     // test on the parser cannot see whether either `main` acts on the refusal.
+    //
+    // **And each refusal must leave no lock behind.** `pgserver` refuses with `process::exit`,
+    // which does not run destructors, so parsing this variable after `DbLock::acquire` would strand
+    // `<db>.lock` — and the operator who then corrected the variable would be told the database is
+    // already open by a process that no longer exists. That is exactly what the first version of
+    // this wiring did; the assertion below is what would have caught it.
     let dir = tempfile::tempdir().unwrap();
-    for (n, bad) in ["off", "0", "-1"].iter().enumerate() {
+    for (n, bad) in ["off", "0", "-1", "86400001", ""].iter().enumerate() {
         let db = dir.path().join(format!("bad{n}.db"));
         let cli = Command::new(env!("CARGO_BIN_EXE_ferrodb"))
             .arg(&db)
@@ -688,6 +694,12 @@ fn both_binaries_refuse_to_start_on_an_unusable_scan_interval() {
             "the CLI accepted FERRODB_LEASE_SCAN_MILLIS={bad:?} (exit {:?}):\n{text}",
             cli.status.code()
         );
+        assert!(
+            !side(&db, "lock").exists(),
+            "the CLI refused FERRODB_LEASE_SCAN_MILLIS={bad:?} but left {} behind; the next open \
+             with the variable corrected would be refused as already-in-use",
+            side(&db, "lock").display()
+        );
 
         let sdb = dir.path().join(format!("badsrv{n}.db"));
         let srv = Command::new(example_bin("pgserver"))
@@ -701,6 +713,12 @@ fn both_binaries_refuse_to_start_on_an_unusable_scan_interval() {
             !srv.status.success() && text.contains("FERRODB_LEASE_SCAN_MILLIS"),
             "pgserver accepted FERRODB_LEASE_SCAN_MILLIS={bad:?} (exit {:?}):\n{text}",
             srv.status.code()
+        );
+        assert!(
+            !side(&sdb, "lock").exists(),
+            "pgserver refused FERRODB_LEASE_SCAN_MILLIS={bad:?} but left {} behind — its refusal \
+             path is `process::exit`, which does not drop the DbLock",
+            side(&sdb, "lock").display()
         );
     }
 }
