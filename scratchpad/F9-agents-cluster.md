@@ -82,9 +82,9 @@ one of those is live ends in a reap, and a reap is unrecoverable.
 
 Three harnesses, each where its property can actually fail:
 
-- **Pure ledger** (19 tests) — the namespace, the `moves_base` table named variant by variant, and
+- **Pure ledger** (20 tests) — the namespace, the `moves_base` table named variant by variant, and
   the ordering rule including three ledgers driving one log and being required to agree.
-- **A real `AgentRuntime` against a scripted log** (10) — the race is *placed*, not waited for: a
+- **A real `AgentRuntime` against a scripted log** (11) — the race is *placed*, not waited for: a
   `WalBatch` lands between the gate's read and the merge's own round, every run. This is where the
   headline test lives.
 - **Three real in-process `Node`s** (4) — real listeners, real elections, real round logs, real
