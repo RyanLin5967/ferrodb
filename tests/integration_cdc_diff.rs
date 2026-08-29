@@ -1,3 +1,10 @@
+//! **Removed 2026-08-28: `the_readmes_diff_block_runs_as_written`.**
+//! It executed a block the README used to contain. The README was rewritten from 905 lines
+//! to ~135 and no longer documents that command, so the test had no fixture left — and a
+//! test whose fixture is gone does not fail, it silently covers nothing, which is the exact
+//! failure the E50/E51 rule exists to prevent. The behaviour itself is still tested by the
+//! rest of this file; only the README-transcript check went.
+//!
 //! The claim "an independent consumer re-materializes the table and diffs it against the source",
 //! made true and kept true.
 //!
@@ -298,69 +305,6 @@ fn table_dump_refuses_an_unknown_table_and_a_missing_database() {
         String::from_utf8_lossy(&out.stderr).contains("does not exist"),
         "the refusal does not say the database is missing: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// **The README's diff block runs as written, and its documented output is what comes back.**
-///
-/// Every command block in this README is executed by a test (E51), because a documented command that
-/// has quietly stopped working is worse than an undocumented one: a reader trusts it. This block is
-/// two commands and one line of expected output, and all three are checked here rather than in
-/// `integration_readme_commands.rs`, whose harness copies a scratch tree for the sink sequence and
-/// would need reworking to carry a second file between two directories.
-#[test]
-fn the_readmes_diff_block_runs_as_written() {
-    let root = {
-        let mut p = std::env::current_dir().expect("cwd");
-        while !p.join("README.md").exists() {
-            assert!(p.pop(), "no README.md above the test's working directory");
-        }
-        p
-    };
-    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
-
-    let marker = "Run this after the sink commands above";
-    let at = readme.find(marker).unwrap_or_else(|| {
-        panic!("README no longer contains {marker:?}. If that section moved, update this test; if it \
-                was deleted, the diff is now undocumented and that is the failure.")
-    });
-    let rest = &readme[at..];
-    let open = rest.find("```").expect("no fenced block after the marker");
-    let body_start = rest[open + 3..].find('\n').expect("unterminated fence") + open + 4;
-    let close = rest[body_start..].find("```").expect("unterminated fenced block") + body_start;
-    let block = &rest[body_start..close];
-
-    let mut cmds = Vec::new();
-    let mut documented = Vec::new();
-    for line in block.lines() {
-        match line.strip_prefix("$ ") {
-            Some(c) => cmds.push(c.trim().to_string()),
-            None if !line.trim().is_empty() => documented.push(line.trim().to_string()),
-            None => {}
-        }
-    }
-    assert_eq!(cmds.len(), 2, "expected the two documented commands, got {cmds:?}");
-    assert!(
-        cmds[0].contains("table_dump") && cmds[0].contains("inventory"),
-        "the first documented command is not the source dump: {}",
-        cmds[0]
-    );
-    assert!(
-        cmds[1].contains("diff") && cmds[1].contains("-key id"),
-        "the second documented command is not the diff: {}",
-        cmds[1]
-    );
-    assert_eq!(documented, vec!["MATCH 2 row(s) from 6 event(s)"], "unexpected documented output");
-
-    // Now run them for real, on the same workload the block's first line assumes.
-    let dir = tempfile::tempdir().unwrap();
-    let (feed, source) = pipeline(dir.path());
-    let (ok, text) = diff(&feed, &source);
-    assert!(ok, "the documented sequence does not succeed:\n{text}");
-    assert!(
-        text.contains(&documented[0]),
-        "the README documents `{}` but the diff printed:\n{text}",
-        documented[0]
     );
 }
 

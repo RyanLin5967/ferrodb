@@ -381,13 +381,11 @@ fn no_test_picks_a_port_for_a_server_it_has_not_started_yet() {
             "named here: this guard scans its own source, and a reason that spelled it would ",
             "make this file an offender.)",
         ),
-    // Files permitted to bind a socket of their own, each with the reason. Empty: after I16 no test
-    // in this repo needs one, because every example server reports the address it bound.
+    ),
     // NOTE for whoever adds the next entry: **the reason string is scanned like any other code**,
-    // so it must not spell the type name whole either. That is the same reason the needle below is
-    // assembled from pieces, and it is not obvious from reading — the first attempt at the entry
-    // below made this guard flag this file.
-    const ALLOWED: &[(&str, &str)] = &[(
+    // so it must not spell the type name whole either. That is the same reason the needle above is
+    // assembled from pieces.
+    (
         "integration_cluster_snapshot.rs",
         "F6. This file runs `consensus::node::Node` IN PROCESS, and `Node::start` takes an \
          ALREADY-BOUND listener rather than an address — which is the CURE for I16's race rather \
