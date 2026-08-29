@@ -1,0 +1,12 @@
+skip   lib (already recorded)
+skip   adv_f4_false_refusal (already recorded)
+skip   adv_f5_probe (already recorded)
+skip   adv_f6_dropped_capture (already recorded)
+skip   adversarial_i20 (already recorded)
+skip   agent_sql_surface (already recorded)
+skip   guard_precondition_probe (already recorded)
+skip   integration_alter_column (already recorded)
+skip   integration_alter_refusal_paths (already recorded)
+skip   integration_alter_refusal_safety (already recorded)
+skip   integration_arena_exclusivity (already recorded)
+done   integration_base_backup passed=4 failed=1 rc=101

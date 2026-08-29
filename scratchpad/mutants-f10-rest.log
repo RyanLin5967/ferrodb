@@ -1,0 +1,41 @@
+baseline: test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 1087 filtered out; finished in 0.10s
+[no-guard-depth-cap-on-encode] KILLED  {'a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out': 'failed (killed)'}
+[index-accepts-before-the-record-lands] KILLED  {'a_failed_append_leaves_a_store_that_still_works_and_a_file_that_still_opens': 'failed (killed)'}
+[torn-first-header-bricks-the-log] KILLED  {'a_crash_at_any_point_during_an_append_loses_nothing_already_acknowledged': 'failed (killed)', 'a_foreign_file_and_a_damaged_header_are_both_refused': 'failed (killed)'}
+[frames_for-loses-its-ordering] SURVIVED  {'frames_come_back_in_sequence_order_per_branch': 'PASSED (mutant survived)'}
+[read-error-swallowed-as-end-of-file] SURVIVED  {'a_read_error_mid_file_refuses_the_open_and_destroys_nothing': 'PASSED (mutant survived)'}
+[extend-drops-guards-and-claims] KILLED  {'a_growth_whose_tail_carries_guards_and_claims_replays_with_them': 'failed (killed)'}
+[nan-delta-breaks-a-retry] SURVIVED  {'a_nan_delta_does_not_turn_a_retry_into_a_contradiction': 'UNRECOGNISED: '}
+[non-canonical-boolean-accepted] KILLED  {'a_boolean_byte_that_is_neither_zero_nor_one_is_refused': 'failed (killed)'}
+[depth-refusal-walks-the-tree-it-refuses] SURVIVED  {'a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out': 'PASSED (mutant survived)'}
+[mem-replaces-instead-of-extending] KILLED  {'retyping_a_stored_value_under_growth_cannot_split_the_two_stores': 'failed (killed)'}
+[the-durable-arm-is-secretly-in-memory] KILLED  {'itest:an_agent_tasks_frames_and_its_merge_survive_a_process_restart': 'failed (killed)', 'itest:wide_typed_values_survive_the_restart_with_their_bytes_intact': 'failed (killed)'}
+restored: test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 1087 filtered out; finished in 0.02s
+
+=== summary ===
+      KILLED  no-guard-depth-cap-on-encode
+              a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out: failed (killed)
+      KILLED  index-accepts-before-the-record-lands
+              a_failed_append_leaves_a_store_that_still_works_and_a_file_that_still_opens: failed (killed)
+      KILLED  torn-first-header-bricks-the-log
+              a_crash_at_any_point_during_an_append_loses_nothing_already_acknowledged: failed (killed)
+              a_foreign_file_and_a_damaged_header_are_both_refused: failed (killed)
+    SURVIVED  frames_for-loses-its-ordering
+              frames_come_back_in_sequence_order_per_branch: PASSED (mutant survived)
+    SURVIVED  read-error-swallowed-as-end-of-file
+              a_read_error_mid_file_refuses_the_open_and_destroys_nothing: PASSED (mutant survived)
+      KILLED  extend-drops-guards-and-claims
+              a_growth_whose_tail_carries_guards_and_claims_replays_with_them: failed (killed)
+    SURVIVED  nan-delta-breaks-a-retry
+              a_nan_delta_does_not_turn_a_retry_into_a_contradiction: UNRECOGNISED: 
+      KILLED  non-canonical-boolean-accepted
+              a_boolean_byte_that_is_neither_zero_nor_one_is_refused: failed (killed)
+    SURVIVED  depth-refusal-walks-the-tree-it-refuses
+              a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out: PASSED (mutant survived)
+      KILLED  mem-replaces-instead-of-extending
+              retyping_a_stored_value_under_growth_cannot_split_the_two_stores: failed (killed)
+      KILLED  the-durable-arm-is-secretly-in-memory
+              itest:an_agent_tasks_frames_and_its_merge_survive_a_process_restart: failed (killed)
+              itest:wide_typed_values_survive_the_restart_with_their_bytes_intact: failed (killed)
+
+7/11 killed
