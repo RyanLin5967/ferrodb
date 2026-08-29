@@ -1,0 +1,24 @@
+integration_base_backup::synchronous_commit_waits_for_a_replica_and_says_so_when_there_is_none
+is a PRE-EXISTING load-sensitive flake, not an F7 regression. Measured, not argued.
+
+Instrument: a fresh worktree at af77d8a -- the commit immediately before any F7 work --
+built with `cargo build --examples`, then the target run three times while the agent
+fleet and the F7 suite run loaded the machine.
+
+  baseline af77d8a run 1: FAILED. 4 passed; 1 failed;  finished in 215.92s
+  baseline af77d8a run 2: ok.     5 passed; 0 failed;  finished in  23.19s
+  baseline af77d8a run 3: ok.     5 passed; 0 failed;  finished in  23.21s
+
+Same failure mode as on the F7 branch:
+  panicked at examples/repl_replica.rs:118: connect to primary:
+  Os { code: 61, kind: ConnectionRefused }
+  primary status at that moment: Some(ExitStatus(0)) -- it had already exited.
+
+A process race between the primary exiting and the replica dialling it, which widens
+under CPU contention (216s vs 23s wall clock for the same five tests).
+
+Structural corroboration: `git diff af77d8a..HEAD --name-only` for this row touches
+six files -- PROGRESS.md, scratchpad/F7-signing.md, src/consensus/{node,signing,
+tests_signing,transport}.rs. Nothing in src/replication/, nothing in examples/,
+nothing in tests/. The failing test exercises examples/repl_primary.rs and
+examples/repl_replica.rs over src/replication/, none of which this row can reach.

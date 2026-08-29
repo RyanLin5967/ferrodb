@@ -15,11 +15,23 @@
 //!
 //! # What this module does NOT do
 //!
-//! **It does not authenticate.** `Message::from` is the sender's *claim* and nothing here checks
-//! it. An unauthenticated peer that can reach this port can assert any term and demote a healthy
-//! leader, which is the attack F7 (`signing.rs`) exists to close. Naming it here rather than
-//! leaving a reader to discover it: until `signing.rs` lands, a consensus port must not be exposed
-//! to anything the operator does not already trust at the network layer.
+//! **It authenticates every frame, but only if it was given a key.** F7 landed, and
+//! [`Transport::from_listener_with_key`] is the constructor that turns it on: every outbound frame
+//! carries an HMAC-SHA256 tag over its own body, and every inbound frame is verified *before*
+//! [`decode`] parses it, so a peer that cannot produce a tag never reaches the state machine. See
+//! [`super::signing`] for what that proves — possession of the key — and, just as importantly, what
+//! it does not: **freshness**. There is no replay protection.
+//!
+//! [`Transport::from_listener`] and [`Transport::bind`] construct an **unsigned** transport, and
+//! that is still a real configuration: `Message::from` is then the sender's claim and nothing here
+//! checks it, so an unauthenticated peer that can reach the port can assert any term and demote a
+//! healthy leader. Two separate constructors rather than an option with a default, because a key is
+//! not a knob with a defensible default — a `..Default::default()` that silently left signing off
+//! is exactly how a security posture gets switched off by an unrelated edit.
+//!
+//! **Connection establishment is not authenticated either way.** The six-byte handshake carries no
+//! tag, so anything that can reach the port can occupy an inbound connection slot; what bounds that
+//! is `max_inbound_conns`, not the key. The first frame that fails to verify closes the connection.
 //!
 //! **It does not retry, order, or deduplicate.** Consensus is specified against a network that
 //! drops, reorders and duplicates — that is why `Consensus` re-sends on a refusal and backs a peer
@@ -74,6 +86,7 @@ use crate::replication::{
 use crate::wal::log::{take_u32, take_u64, take_u8, RecKind};
 
 use super::config::Config;
+use super::signing::{self, Key};
 use super::snapshot::SnapshotMeta;
 use super::{Body, BranchOp, Command, Entry, Message, NodeId, Round, Term};
 
@@ -143,6 +156,20 @@ const RECKIND_DDL_TAG: u8 = 9;
 /// fit must make a smaller batch; that is a decision for `replicate.rs`, and it can only make it if
 /// this returns an error instead of a corrupt frame.
 pub fn encode(m: &Message) -> Result<Vec<u8>, FerroError> {
+    encode_signed(m, None)
+}
+
+/// The same frame, authenticated with `key` when there is one.
+///
+/// The tag goes **inside** the frame body, ahead of the message, so the length header still covers
+/// everything after it and a reader needs no second length. What that costs is [`signing::MAC_LEN`]
+/// bytes of the frame budget, which is why a message that fits unsigned can be refused signed —
+/// see [`signing::sign_frame`], which is where that refusal is made and explained.
+///
+/// **The whole message is the authenticated region**, `(from, to, term, kind, fields)`, and the
+/// term being in there is the point of the row: a tag over anything less would leave the one field
+/// an attacker wants to change outside it.
+pub fn encode_signed(m: &Message, key: Option<&Key>) -> Result<Vec<u8>, FerroError> {
     let mut body = Vec::new();
     put_u32(&mut body, m.from.0);
     put_u32(&mut body, m.to.0);
@@ -154,6 +181,11 @@ pub fn encode(m: &Message) -> Result<Vec<u8>, FerroError> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(too_big(body.len()));
     }
+
+    let body = match key {
+        Some(k) => signing::sign_frame(k, &body)?,
+        None => body,
+    };
 
     let mut out = Vec::with_capacity(body.len() + 5);
     out.push(CONSENSUS_TAG);
@@ -448,6 +480,19 @@ pub fn decode(body: &[u8]) -> Result<Message, FerroError> {
         )));
     }
     Ok(Message { from, to, term, body: b })
+}
+
+/// Authenticate a frame body and then decode it — **in that order**, which is the whole hook.
+///
+/// `decode` is the code that has to survive hostile input; running it only on bytes that already
+/// carried a valid tag means an unauthenticated peer cannot reach the parser, let alone the state
+/// machine. With `key` at `None` this is exactly [`decode`], for a transport that was not given a
+/// key.
+pub fn decode_verified(body: &[u8], key: Option<&Key>) -> Result<Message, FerroError> {
+    match key {
+        Some(k) => decode(signing::verify_frame(k, body)?),
+        None => decode(body),
+    }
 }
 
 fn take_bool(bytes: &[u8], at: &mut usize) -> Result<bool, FerroError> {
@@ -987,10 +1032,13 @@ pub struct TransportOptions {
     pub handshake_deadline: Duration,
     /// Most inbound connections accepted at once.
     ///
-    /// The transport does not authenticate (F7 does), so anything that can reach this port can open
-    /// a connection, and each one costs a thread and two descriptors. Without a cap that is an
-    /// unauthenticated peer choosing how many threads this process runs — the same class of hole as
-    /// letting one choose how many bytes it allocates, which the frame limit already closes.
+    /// **Signing does not replace this cap.** F7 authenticates every *frame*, not the handshake, so
+    /// anything that can reach this port can still open a connection, and each one costs a thread
+    /// and two descriptors. Without a cap that is an unauthenticated peer choosing how many threads
+    /// this process runs — the same class of hole as letting one choose how many bytes it
+    /// allocates, which the frame limit already closes. A signed transport closes such a connection
+    /// on its first unverifiable frame, which bounds how long the slot is held but not how many are
+    /// opened.
     /// Beyond the cap a connection is closed immediately rather than queued, and counted.
     pub max_inbound_conns: usize,
     /// How long an established connection may stay silent before it is closed.
@@ -1048,6 +1096,14 @@ struct Counters {
     idle_closed: AtomicU64,
     /// Outbound messages refused because the transport is stopped.
     refused_after_stop: AtomicU64,
+    /// Inbound frames that did not authenticate against this node's signing key, and were refused
+    /// **before** [`decode`] saw them.
+    ///
+    /// Its own counter and not folded into a general "bad frame": a frame that fails to decode is a
+    /// version skew or a bug, and a frame that fails to authenticate is either a misconfigured key
+    /// or somebody who should not be talking to this port at all. An operator seeing this number
+    /// move is being told something no other counter here can tell them.
+    unauthenticated: AtomicU64,
 }
 
 /// One peer's queue and its current connection.
@@ -1126,6 +1182,10 @@ pub struct Transport {
     /// failure, that is the ordinary path and not a pathological one — a long-lived node would
     /// reach `EMFILE` and start refusing connections for reasons nothing in the cluster explains.
     inbound_conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+    /// The cluster signing key, when this transport was built with one. `None` is an unsigned
+    /// transport: see the module header for why that is a separate constructor rather than a
+    /// defaulted field.
+    key: Option<Arc<Key>>,
 }
 
 /// Removes a connection from the live registry however its thread leaves — including the early
@@ -1159,6 +1219,23 @@ impl Transport {
         Transport::from_listener(self_id, listener, peers, opts)
     }
 
+    /// The same, signing every frame it sends and refusing every frame it cannot verify.
+    ///
+    /// A separate constructor rather than a field on [`TransportOptions`], and that is deliberate:
+    /// the options struct is a bag of knobs that all have defensible defaults, and a key does not
+    /// have one. Put there, `..Default::default()` in some later caller would leave a cluster
+    /// unsigned while reading as if it had been configured. Here the choice is a function name.
+    pub fn bind_with_key(
+        self_id: NodeId,
+        listen: impl ToSocketAddrs,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        opts: TransportOptions,
+        key: Arc<Key>,
+    ) -> Result<Transport, FerroError> {
+        let listener = TcpListener::bind(listen).map_err(|e| FerroError::Io(e.to_string()))?;
+        Transport::from_listener_with_key(self_id, listener, peers, opts, key)
+    }
+
     /// The same, over a listener the caller already holds.
     ///
     /// The primitive, with [`Transport::bind`] as the convenience over it. Two reasons it is the
@@ -1172,6 +1249,33 @@ impl Transport {
         listener: TcpListener,
         peers: BTreeMap<NodeId, SocketAddr>,
         opts: TransportOptions,
+    ) -> Result<Transport, FerroError> {
+        Transport::start(self_id, listener, peers, opts, None)
+    }
+
+    /// The same, over a listener the caller already holds, signing every frame.
+    ///
+    /// `Arc` because the key outlives this call in three places at once — this handle, the sender
+    /// threads, and every connection thread — and because a key is the one value in this process
+    /// that should exist exactly once. See [`Transport::bind_with_key`] for why this is a
+    /// constructor and not an option.
+    pub fn from_listener_with_key(
+        self_id: NodeId,
+        listener: TcpListener,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        opts: TransportOptions,
+        key: Arc<Key>,
+    ) -> Result<Transport, FerroError> {
+        Transport::start(self_id, listener, peers, opts, Some(key))
+    }
+
+    /// The one body behind all four constructors, so the signed and unsigned paths cannot drift.
+    fn start(
+        self_id: NodeId,
+        listener: TcpListener,
+        peers: BTreeMap<NodeId, SocketAddr>,
+        opts: TransportOptions,
+        key: Option<Arc<Key>>,
     ) -> Result<Transport, FerroError> {
         if peers.contains_key(&self_id) {
             return Err(FerroError::Internal(format!(
@@ -1270,10 +1374,11 @@ impl Transport {
         let conns_c = Arc::clone(&inbound_conns);
         let ids_c = next_conn_id;
         let opts_c = opts.clone();
+        let key_c = key.clone();
         match std::thread::Builder::new()
             .name(format!("consensus-accept-{self_id}"))
             .spawn(move || {
-                accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c)
+                accept_loop(listener, self_id, tx, stop_c, counters_c, conns_c, ids_c, opts_c, key_c)
             }) {
             Ok(h) => threads.push(h),
             Err(e) => {
@@ -1295,6 +1400,7 @@ impl Transport {
             threads: Mutex::new(threads),
             shutdown_lock: Mutex::new(()),
             inbound_conns,
+            key,
         })
     }
 
@@ -1348,7 +1454,7 @@ impl Transport {
                 self.outboxes.keys().collect::<Vec<_>>()
             ))
         })?;
-        let frame = encode(m)?;
+        let frame = encode_signed(m, self.key.as_deref())?;
         ob.push(frame);
         self.counters.sent.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1438,6 +1544,21 @@ impl Transport {
     /// Connections closed at the handshake — a wrong magic, or a peer speaking another version.
     pub fn refused_handshakes(&self) -> u64 {
         self.counters.refused_handshakes.load(Ordering::SeqCst)
+    }
+
+    /// Inbound frames refused because they did not authenticate. Always zero on a transport built
+    /// without a key, which is a fact about the configuration and not about the network.
+    pub fn unauthenticated(&self) -> u64 {
+        self.counters.unauthenticated.load(Ordering::SeqCst)
+    }
+
+    /// Whether this transport was given a key, and therefore signs what it sends and refuses what
+    /// it cannot verify.
+    ///
+    /// Worth being able to ask: "the cluster is signed" is otherwise a claim about how four
+    /// constructors were called in four processes, with nothing able to answer it.
+    pub fn signs_its_traffic(&self) -> bool {
+        self.key.is_some()
     }
     /// Connections closed immediately because `max_inbound_conns` were already established.
     pub fn refused_conns(&self) -> u64 {
@@ -1541,6 +1662,10 @@ impl std::fmt::Debug for Transport {
             .field("inbound_dropped", &self.inbound_dropped())
             .field("lost_in_flight", &self.lost_in_flight())
             .field("connect_failures", &self.connect_failures())
+            // The key itself is never printed: `signing::Key`'s own `Debug` redacts it, and this
+            // reports only whether there is one.
+            .field("signed", &self.signs_its_traffic())
+            .field("unauthenticated", &self.unauthenticated())
             .field("stopped", &self.stop.load(Ordering::SeqCst))
             .finish()
     }
@@ -1685,6 +1810,7 @@ fn dial(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: TcpListener,
     self_id: NodeId,
@@ -1694,6 +1820,7 @@ fn accept_loop(
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     ids: Arc<AtomicU64>,
     opts: TransportOptions,
+    key: Option<Arc<Key>>,
 ) {
     let mut conn_threads: Vec<JoinHandle<()>> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
@@ -1738,10 +1865,13 @@ fn accept_loop(
                 let counters_c = Arc::clone(&counters);
                 let conns_c = Arc::clone(&conns);
                 let opts_c = opts.clone();
+                let key_c = key.clone();
                 match std::thread::Builder::new()
                     .name(format!("consensus-in-{self_id}"))
                     .spawn(move || {
-                        conn_loop(stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c)
+                        conn_loop(
+                            stream, id, self_id, tx_c, stop_c, counters_c, conns_c, opts_c, key_c,
+                        )
                     }) {
                     Ok(h) => conn_threads.push(h),
                     Err(_) => {
@@ -1769,6 +1899,7 @@ fn accept_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conn_loop(
     mut stream: TcpStream,
     id: u64,
@@ -1778,6 +1909,7 @@ fn conn_loop(
     counters: Arc<Counters>,
     conns: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
     opts: TransportOptions,
+    key: Option<Arc<Key>>,
 ) {
     // The accept thread already reserved this connection's slot and registered its socket, so
     // `shutdown` can reach a peer that connects and then goes silent. All this thread owns is the
@@ -1834,13 +1966,30 @@ fn conn_loop(
                     // to be reading correctly.
                     break;
                 }
-                match decode(&body) {
+                // **F7's hook, and it is here rather than after `decode` on purpose.** A frame
+                // that does not authenticate is refused before the parser runs on it, so an
+                // unauthenticated peer reaches neither `decode` nor the state machine. The
+                // connection is then closed rather than the frame skipped: a peer that cannot
+                // produce a tag is not a peer having a bad moment, and leaving the connection open
+                // would let it hold a slot and keep trying.
+                let verified = match key.as_deref() {
+                    None => &body[..],
+                    Some(k) => match signing::verify_frame(k, &body) {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            counters.unauthenticated.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                    },
+                };
+                match decode(verified) {
                     Ok(m) => {
                         if m.to != self_id {
-                            // Not authentication — `from` is still only a claim, and F7 owns that.
-                            // This catches the configuration mistake where two nodes were given one
-                            // address, which otherwise shows up as one node mysteriously voting
-                            // twice.
+                            // On a signed transport `to` has been authenticated, so this is no
+                            // longer a peer's unchecked claim — but it is still not a security
+                            // check. It catches the configuration mistake where two nodes were
+                            // given one address, which otherwise shows up as one node mysteriously
+                            // voting twice.
                             counters.misrouted.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
