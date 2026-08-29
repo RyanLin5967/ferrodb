@@ -65,8 +65,22 @@ Summary goes to `/Users/idide/wt/artie-research/build-G/F6-snapshot.md` — ONCE
   1695 / 97.
 
 ## Doing now
-- Fresh-context adversarial review of the whole diff.
+- Nothing. The row is closed at the integrator's call.
+
+## State at close
+- Mutants: **50 fired, 48 killed, 2 survived, 0 skipped**, tree clean
+  (`scratchpad/F6-mutants.txt`). Both survivors are mutants my own review fixes made equivalent,
+  named in the summary rather than left as a number.
+- Verified with the AFFECTED TARGETS ONLY, at the integrator's instruction — four other agents were
+  on this machine and five concurrent suites starve each other:
+  `--lib consensus::` 292, `--lib buffer::` 3, `--lib branch::` 93, `--lib replication::backup` 9,
+  `--test integration_cluster_snapshot` 9, `integration_server_stdout` 5,
+  `integration_consensus_failover` 1, `integration_base_backup` 5, `integration_cluster_grants` 35.
+  All rc=0. **The full suite was NOT re-run after the review pass**; the integrator runs it once,
+  serialised, after merging. The last whole-suite number this row measured was 1737 Rust / 0 failed
+  and 97 Go / 0 failed at commit 57638f9, which is BEFORE the review fixes.
+- Examples must be rebuilt (`cargo build --examples`) before any target that spawns one, or its
+  freshness guard fails in a way that reads like a regression.
 
 ## Single next action
-- Act on whatever the review confirms, then write
-  `/Users/idide/wt/artie-research/build-G/F6-snapshot.md` (ONCE, at the end).
+- None. Summary written to `/Users/idide/wt/artie-research/build-G/F6-snapshot.md`.

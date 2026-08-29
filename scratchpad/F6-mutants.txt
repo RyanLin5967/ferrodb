@@ -85,9 +85,9 @@ M26 KILLED    completing_an_install_sets_the_watermark_and_leaves_unjoined_to_th
 M27 KILLED    an_installed_snapshot_anchors_the_digest_chain_where_the_leader_is
       src/consensus/snapshot.rs: self.install_snapshot_tail(cur.meta.last_round, cur.header.base_digest);
       -> test consensus::snapshot::tests_snapshot::an_installed_snapshot_anchors_the_digest_chain_where_the_leader_is ... FAILED
-M28 KILLED    an_install_whose_configuration_is_damage_latches_this_node_out_of_office
+M28 SURVIVED  a_snapshot_whose_configuration_is_damage_is_refused_before_anything_is_spent
       src/consensus/snapshot.rs: self.note_config_in_log(cur.meta.config.clone(), out)?;
-      -> test consensus::snapshot::tests_snapshot::an_install_whose_configuration_is_damage_latches_this_node_out_of_office ... FAILED
+      -> the test passed against a broken rule
 M29 KILLED    an_install_discards_the_whole_log_and_the_floor_moves_with_it
       src/consensus/snapshot.rs: self.applied = self.applied.max(cur.meta.last_round);
       -> test consensus::snapshot::tests_snapshot::an_install_discards_the_whole_log_and_the_floor_moves_with_it ... FAILED
@@ -106,19 +106,46 @@ M33 KILLED    a_restart_above_a_snapshot_floor_comes_back_at_the_floor_and_not_a
 M34 KILLED    a_peer_below_the_floor_is_sent_state_and_never_entries
       src/consensus/replicate.rs: self.send_snapshot_chunk_to(peer, out);
       -> test consensus::snapshot::tests_snapshot::a_peer_below_the_floor_is_sent_state_and_never_entries ... FAILED
-M35 KILLED    a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges
+M35 SURVIVED  a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges
       src/consensus/node.rs: if self.installed_round == Some(round) {
-      -> test a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges ... FAILED
+      -> the test passed against a broken rule
 M36 KILLED    a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges
       src/consensus/node.rs: let through = self.applied.saturating_sub(keep);
       -> test a_follower_partitioned_past_log_retention_rejoins_by_snapshot_and_converges ... FAILED
-M37 KILLED    consensus::node::tests_node::a_chunk_the_driver_cannot_place_is_refused_by_name
-      src/consensus/node.rs: if !starting && !continuing {
-      -> test consensus::node::tests_node::a_chunk_the_driver_cannot_place_is_refused_by_name ... FAILED
+M37 KILLED    consensus::node::tests_node::a_spool_short_of_what_was_digested_is_refused_rather_than_installed
+      src/consensus/node.rs: if self.spooled != meta.total_bytes || spooled_len != meta.total_bytes {
+      -> test consensus::node::tests_node::a_spool_short_of_what_was_digested_is_refused_rather_than_installed ... FAILED
+M42 KILLED    consensus::node::tests_node::a_spool_that_kept_up_installs_rather_than_being_refused
+      src/consensus/node.rs: let starting = offset == 0;
+      -> test consensus::node::tests_node::a_spool_that_kept_up_installs_rather_than_being_refused ... FAILED
+M43 KILLED    a_snapshot_whose_configuration_is_damage_is_refused_before_anything_is_spent
+      src/consensus/snapshot.rs: if meta.config.at() == self.cfg.at() && meta.config != self.cfg {
+      -> test consensus::snapshot::tests_snapshot::a_snapshot_whose_configuration_is_damage_is_refused_before_anything_is_spent ... FAILED
+M44 KILLED    a_refused_snapshot_does_not_change_this_nodes_office
+      src/consensus/snapshot.rs: if meta.validate().is_err() {
+      -> test consensus::snapshot::tests_snapshot::a_refused_snapshot_does_not_change_this_nodes_office ... FAILED
+M45 KILLED    a_header_claiming_an_unbounded_sidecar_section_is_refused
+      src/consensus/snapshot.rs: if len > Self::MAX_SIDECAR_BYTES {
+      -> test consensus::snapshot::tests_snapshot::a_header_claiming_an_unbounded_sidecar_section_is_refused ... FAILED
+M46 KILLED    the_redo_window_that_travels_with_a_snapshot_is_replayed_into_it
+      src/consensus/snapshot.rs: if !redo.is_empty() {
+      -> test the_redo_window_that_travels_with_a_snapshot_is_replayed_into_it ... FAILED
+M47 KILLED    an_install_discards_the_receivers_own_wal
+      src/consensus/snapshot.rs: self.wal.truncate(0)?;
+      -> test an_install_discards_the_receivers_own_wal ... FAILED
+M48 KILLED    a_node_left_part_way_through_an_install_refuses_to_start
+      src/consensus/snapshot.rs: if install_was_interrupted(&self.paths.page_file) {
+      -> test a_node_left_part_way_through_an_install_refuses_to_start ... FAILED
+M49 KILLED    a_completed_install_leaves_no_marker_behind
+      src/consensus/snapshot.rs: std::fs::remove_file(&marker)
+      -> test a_completed_install_leaves_no_marker_behind ... FAILED
+M50 KILLED    a_node_left_part_way_through_an_install_refuses_to_start
+      src/consensus/node.rs: if let Some(store) = opts.snapshots.as_ref() {
+      -> test a_node_left_part_way_through_an_install_refuses_to_start ... FAILED
 M38 KILLED    a_node_restarted_above_a_snapshot_floor_comes_back_on_it
       src/consensus/node.rs: applied: floor,
       -> test a_node_restarted_above_a_snapshot_floor_comes_back_on_it ... FAILED
 M39 KILLED    a_captured_payload_installs_back_to_the_same_pages
       src/consensus/snapshot.rs: self.pool.invalidate_all()?;
       -> test a_captured_payload_installs_back_to_the_same_pages ... FAILED
-41 killed, 0 SURVIVED, 0 skipped, of 41 fired
+48 killed, 2 SURVIVED, 0 skipped, of 50 fired
