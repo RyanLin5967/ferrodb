@@ -50,10 +50,23 @@ Summary goes to `/Users/idide/wt/artie-research/build-G/F6-snapshot.md` — ONCE
     tests_replicate.rs:783.
 
 ## Done
-- (nothing yet)
+- `src/consensus/snapshot.rs` — the payload format, both halves of the protocol, `SnapshotStore`,
+  and `PageStoreSnapshots` over `replication::backup`.
+- `src/consensus/tests_snapshot.rs` — 36 rule tests.
+- `src/consensus/node.rs` — the driver: retention, the spool, the install, the durable floor-digest
+  record. `replicate.rs` — two Progress fields, the tail seams, the dispatch, `restore`'s digest.
+- `tests/integration_cluster_snapshot.rs` — exit criterion 3, with its anti-vacuity half.
+- `BufferPoolManager::invalidate_all` and `LogBranchCatalog::reload_from`: an install replaces the
+  live objects, not only the files.
+- Mutants: 41 fired, 41 killed, tree clean (`scratchpad/F6-mutants.txt`). Seven survived the first
+  pass and every one was a test that did not test the rule it named; all seven are now killed.
+- Suite: `VERIFY_MODE=per-target tools/verify-suite.sh` -> **1737 Rust passed / 0 failed / 0 build
+  errors**, **97 Go passed / 0 failed**, rc=0, head 57638f9. Baseline at the branch point was
+  1695 / 97.
 
 ## Doing now
-- Writing `src/consensus/snapshot.rs`.
+- Fresh-context adversarial review of the whole diff.
 
 ## Single next action
-- `src/consensus/snapshot.rs`: payload format + guards, then commit.
+- Act on whatever the review confirms, then write
+  `/Users/idide/wt/artie-research/build-G/F6-snapshot.md` (ONCE, at the end).
