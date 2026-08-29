@@ -108,24 +108,20 @@ the `duckdb` CLI rather than the driver that produced the rows.
   when the database is made, and raising the knob later won't move it. The error says so.
 - **The Postgres wire protocol is a subset.** Enough for real drivers — asyncpg and pg8000 both run
   parameterised queries against it in CI — not enough to be a drop-in.
-- **The effect log isn't durable yet**, so merges are computed from frames that live in one
-  process's memory.
-- **Snapshot transfer and inter-node auth are unfinished.** A follower that falls too far behind
-  can't catch up, and there's nothing stopping an unauthenticated peer from claiming a term.
+- **Node signing proves possession of the key, not freshness.** There's no replay protection, so a
+  captured frame can be sent again.
 
 These are listed because an admitted gap is worth more than a fabricated pass.
 
 ## Where it stands
 
-1695 Rust tests and 97 Go tests, green on Linux, macOS and Windows. Roughly 60k lines.
+1873 Rust tests and 97 Go, green on Linux, macOS and Windows, in about 60k lines.
 
-Done: disk manager, buffer pool with ARC eviction, B+trees, parser, cost-based optimizer, WAL with
-ARIES recovery, MVCC, Postgres wire, physical replication, change data capture, branch engine with
-lease reaping, typed effect log and the merge algebra, verification gate, escrow, provenance, and
-the consensus layer above.
-
-Still open: durable effect log, snapshot transfer, signed node traffic, and wiring agent branches
-through consensus so a branch survives a leader change.
+The one gap worth knowing about: ordinary SQL still writes to the heap, not to the copy-on-write
+tree. The branch engine is real — zero-copy fork, lease reaping, interval reclamation, all measured
+— but agent rows are staged in memory until a merge publishes them, so the two stores are separate.
+Closing that means migrating `CREATE TABLE`, `INSERT` and `SELECT` onto the tree, and every partial
+version leaves both live and able to disagree quietly, which is why it hasn't been done piecemeal.
 
 ## Why I built it
 
