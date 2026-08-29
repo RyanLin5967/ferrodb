@@ -1,0 +1,107 @@
+skip   lib (already recorded)
+skip   agent_sql_surface (already recorded)
+done   integration_effect_log passed=3 failed=0 rc=0
+done   integration_durable_tel passed=3 failed=0 rc=0
+done   integration_merge_agreement passed=6 failed=0 rc=0
+done   prop_merge_outcomes passed=6 failed=0 rc=0
+done   integration_simulate passed=24 failed=0 rc=0
+done   integration_runtime_reattach passed=4 failed=0 rc=0
+done   integration_runtime_concurrency passed=4 failed=0 rc=0
+done   integration_branch_pages passed=10 failed=0 rc=0
+done   integration_zero_copy_fork passed=6 failed=0 rc=0
+done   integration_trunk_tree_authority passed=3 failed=0 rc=0
+skip   adv_f5_probe (already recorded)
+skip   guard_precondition_probe (already recorded)
+skip   adv_f6_dropped_capture (already recorded)
+skip   adv_f4_false_refusal (already recorded)
+--- priority set done (blast radius); now the rest ---
+skip   adv_f4_false_refusal (already recorded)
+skip   adv_f5_probe (already recorded)
+skip   adv_f6_dropped_capture (already recorded)
+skip   adversarial_i20 (already recorded)
+skip   agent_sql_surface (already recorded)
+skip   guard_precondition_probe (already recorded)
+skip   integration_alter_column (already recorded)
+skip   integration_alter_refusal_paths (already recorded)
+skip   integration_alter_refusal_safety (already recorded)
+skip   integration_arena_exclusivity (already recorded)
+skip   integration_base_backup (already recorded)
+done   integration_blind_writes passed=5 failed=0 rc=0
+skip   integration_branch_pages (already recorded)
+done   integration_buffer_pool_concurrency passed=5 failed=0 rc=0
+done   integration_capability_envelope passed=23 failed=0 rc=0
+done   integration_cdc_cutover_concurrent passed=1 failed=0 rc=0
+done   integration_cdc_cutover passed=4 failed=0 rc=0
+done   integration_cdc_ddl passed=4 failed=0 rc=0
+done   integration_cdc_diff passed=6 failed=0 rc=0
+done   integration_cdc_drop_table passed=4 failed=0 rc=0
+done   integration_cdc_duckdb_sink passed=5 failed=0 rc=0
+done   integration_cdc_feed passed=2 failed=0 rc=0
+done   integration_cdc_go_consumer passed=3 failed=1 rc=101
+done   integration_cdc_key_reuse passed=5 failed=0 rc=0
+done   integration_cdc_latency passed=2 failed=0 rc=0
+scratchpad/suite-resumable.sh: line 21: 45569 Terminated: 15          timeout 1800 cargo test $flag --no-fail-fast > "$log" 2>&1
+SILENT integration_cdc_publication rc=143 — NOT recorded; re-run this target
+done   integration_cdc_retract_by_model passed=3 failed=0 rc=0
+done   integration_cdc_sink passed=3 failed=0 rc=0
+done   integration_cdc_snapshot passed=3 failed=0 rc=0
+done   integration_cdc_stream passed=2 failed=0 rc=0
+done   integration_cdc_wide_types passed=14 failed=0 rc=0
+done   integration_checkpoint_pressure passed=2 failed=0 rc=0
+done   integration_cli_agent_isolation passed=6 failed=0 rc=0
+done   integration_cluster_grants passed=35 failed=0 rc=0
+done   integration_consensus_failover passed=0 failed=1 rc=101
+done   integration_cow_branch passed=3 failed=0 rc=0
+done   integration_crash_safety passed=4 failed=0 rc=0
+done   integration_ddl_refusal_atomicity passed=2 failed=0 rc=0
+done   integration_disk_manager_concurrency passed=4 failed=0 rc=0
+skip   integration_durable_tel (already recorded)
+skip   integration_effect_log (already recorded)
+done   integration_error_messages passed=7 failed=0 rc=0
+done   integration_error_surface passed=10 failed=0 rc=0
+done   integration_escrow passed=13 failed=0 rc=0
+done   integration_executor_provenance passed=5 failed=0 rc=0
+done   integration_flush_concurrency passed=3 failed=0 rc=0
+done   integration_fulltext_retrieval passed=21 failed=0 rc=0
+done   integration_index_debt passed=2 failed=0 rc=0
+done   integration_logical_decoding passed=4 failed=0 rc=0
+skip   integration_merge_agreement (already recorded)
+done   integration_merge_ddl_atomicity passed=9 failed=0 rc=0
+done   integration_pgwire passed=6 failed=0 rc=0
+done   integration_prompt_clause passed=8 failed=0 rc=0
+done   integration_quarantine passed=8 failed=0 rc=0
+done   integration_read_premise passed=3 failed=0 rc=0
+done   integration_readme_commands passed=6 failed=0 rc=0
+done   integration_replica_applier passed=11 failed=0 rc=0
+done   integration_replica_divergence_is_durable passed=5 failed=0 rc=0
+done   integration_replication_e2e passed=2 failed=0 rc=0
+done   integration_replication_source passed=5 failed=0 rc=0
+done   integration_run_identity_feed passed=11 failed=0 rc=0
+done   integration_run_identity_log_readers passed=2 failed=0 rc=0
+skip   integration_runtime_concurrency (already recorded)
+skip   integration_runtime_reattach (already recorded)
+done   integration_secondary_index_debt passed=4 failed=0 rc=0
+done   integration_server_stdout passed=5 failed=0 rc=0
+skip   integration_simulate (already recorded)
+done   integration_sql_on_durable_branches passed=4 failed=0 rc=0
+done   integration_statement_atomicity passed=3 failed=0 rc=0
+done   integration_system_views_wire passed=1 failed=0 rc=0
+done   integration_system_views passed=21 failed=0 rc=0
+done   integration_truncation_race passed=1 failed=0 rc=0
+skip   integration_trunk_tree_authority (already recorded)
+done   integration_txn_concurrency passed=4 failed=0 rc=0
+done   integration_wal_concurrency passed=3 failed=0 rc=0
+skip   integration_zero_copy_fork (already recorded)
+done   prop_cow_diff passed=5 failed=0 rc=0
+done   prop_escrow passed=4 failed=0 rc=0
+done   prop_merge_algebra passed=11 failed=0 rc=0
+skip   prop_merge_outcomes (already recorded)
+done   provenance_e2e passed=5 failed=0 rc=0
+done   provenance_retention_wiring passed=11 failed=0 rc=0
+done   provenance_scan_cascade passed=5 failed=0 rc=0
+done   provenance_write_path_dependents passed=1 failed=0 rc=0
+done   sim_durability passed=16 failed=0 rc=0
+--- totals ---
+targets=85 passed=1714 failed=3
+silent this pass: 1
+INCOMPLETE — re-run to pick up the silent targets
