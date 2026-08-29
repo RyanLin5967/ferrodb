@@ -62,6 +62,12 @@ cargo run --release --example agent_isolation_demo
 
 It computes its own verdicts. Delete the code behind a criterion and the verdict changes.
 
+The server does this too, not just the demo: both binaries run a lease thread that finishes any reap
+a crash interrupted, then scans every 30s and reaps anything past its deadline. It takes the same
+per-statement lock a `MERGE` holds, so it never runs mid-statement, and there's no value that turns
+it off — reclaiming abandoned branches is the product, not an option.
+`tests/integration_server_reaps.rs` proves it against the binaries without sending them any SQL.
+
 ## It's distributed
 
 Three nodes, Raft-style: leader election with pre-vote and a leader lease, log replication with

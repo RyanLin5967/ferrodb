@@ -13,8 +13,10 @@ use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
-use ferrodb::branch::BranchCatalog;
-use ferrodb::cow::PageStore;
+use ferrodb::branch::lease_thread::{scan_interval_from_env, LeaseThread, RuntimeLock};
+use ferrodb::branch::reaper::TwoTierReaper;
+use ferrodb::branch::{BranchCatalog, Reaper};
+use ferrodb::cow::{CowPageLinks, PageStore};
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
@@ -29,6 +31,16 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let db = args.get(1).cloned().unwrap_or_else(|| "ferro.db".into());
     let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:0".into());
+
+    // Read BEFORE the lock, because the refusal path below is `process::exit`, which does not run
+    // destructors. Parsed after `DbLock::acquire`, a misconfigured `FERRODB_LEASE_SCAN_MILLIS`
+    // would exit past the lock's `Drop` and leave `<db>.lock` behind, so the operator's next
+    // attempt — with the variable corrected — would be refused as "already open by process N".
+    // Nothing here touches a file, so there is no reason for it to happen after anything.
+    let interval = scan_interval_from_env().unwrap_or_else(|e| {
+        eprintln!("pgserver: {e}");
+        std::process::exit(1);
+    });
 
     // Before any file is opened: a second writer on one database aliases arena pages, and every
     // aliased page still checksums correctly, so refusing here is the only detection point.
@@ -89,24 +101,63 @@ fn main() {
     });
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
-    let runtime = Arc::new(if arena_exists {
-        AgentRuntime::reopen_with_storage(
-            branches.clone() as Arc<dyn BranchCatalog>,
-            Arc::new(MemEffectLog::new()),
-            store.clone() as Arc<dyn PageStore>,
-        )
-        .expect("reattach the runtime")
-    } else {
-        AgentRuntime::with_storage(
-            branches.clone() as Arc<dyn BranchCatalog>,
-            Arc::new(MemEffectLog::new()),
-            store.clone() as Arc<dyn PageStore>,
-        )
-        .expect("storage-backed runtime")
-    });
+    // F11 — the reaper, built over the SAME catalog and page store as the runtime, which is the
+    // contract `with_reaper` states and cannot check.
+    //
+    // `CowPageLinks` is supplied because `TwoTierReaper::collapse` refuses without a page-layout
+    // walker rather than re-parenting a branch onto ancestor-owned pages, and this is the tree this
+    // server's branches are on. `examples/agent_isolation_demo.rs` attaches the same one.
+    let reaper = Arc::new(
+        TwoTierReaper::new(branches.clone(), store.clone()).with_links(Arc::new(CowPageLinks)),
+    );
+
+    let runtime = Arc::new(
+        if arena_exists {
+            AgentRuntime::reopen_with_storage(
+                branches.clone() as Arc<dyn BranchCatalog>,
+                Arc::new(MemEffectLog::new()),
+                store.clone() as Arc<dyn PageStore>,
+            )
+            .expect("reattach the runtime")
+        } else {
+            AgentRuntime::with_storage(
+                branches.clone() as Arc<dyn BranchCatalog>,
+                Arc::new(MemEffectLog::new()),
+                store.clone() as Arc<dyn PageStore>,
+            )
+            .expect("storage-backed runtime")
+        }
+        // Retiring a branch now reclaims it. Without this, `seal` takes its no-reaper branch: a
+        // merged or abandoned branch is marked `Reaped` and its extents are never freed, so every
+        // `MERGE` and every `ABANDON` this server served leaked the branch's pages.
+        .with_reaper(reaper.clone() as Arc<dyn Reaper>),
+    );
 
     // One `Arc` shared by every connection thread; the catalog inside it is behind a mutex.
-    let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime));
+    let ctx = Arc::new(ServerContext::new(catalog, bp, txn, runtime.clone()));
+
+    // THE LEASE SCAN. Started before the first connection is handled, and holding `ctx`'s catalog
+    // mutex — the same outermost lock a statement takes — so a scan can never run inside a `MERGE`.
+    // See `branch::lease_thread` for all three rules and why this is the right lock.
+    //
+    // A failure here PANICS rather than exiting, matching every other post-lock failure in this
+    // file (`.expect("bind")`, `.expect("arena")`): a panic unwinds and drops the `DbLock`, and
+    // `process::exit` would strand the lock file on a database this process is not holding.
+    let lease =
+        LeaseThread::start(reaper, runtime, ctx.clone() as Arc<dyn RuntimeLock>, interval)
+            .unwrap_or_else(|e| panic!("pgserver: {e}"));
+    let _ = writeln!(
+        std::io::stderr(),
+        "pgserver: lease scan every {}ms; {} interrupted reap(s) finished on startup",
+        interval.as_millis(),
+        lease.resumed().len()
+    );
+
     serve(listener, ctx).unwrap();
+
+    // Stop the scan before the exit checkpoint: a scan that freed an extent after the map was
+    // written would leave a durable map that still charges pages nothing owns.
+    let stats = lease.stop();
+    let _ = writeln!(std::io::stderr(), "pgserver: lease scan stopped after {stats:?}");
     store.checkpoint(Path::new(&arena_path)).expect("checkpoint the arena");
 }

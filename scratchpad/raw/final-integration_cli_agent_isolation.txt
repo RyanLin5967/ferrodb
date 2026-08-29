@@ -1,0 +1,14 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.53s
+     Running tests/integration_cli_agent_isolation.rs (target/debug/deps/integration_cli_agent_isolation-923008426cc1b19f)
+
+running 6 tests
+test a_deleted_arena_checkpoint_is_refused_rather_than_defaulted ... ok
+test a_database_already_open_is_refused_to_a_second_process ... ok
+test reopening_reattaches_to_the_existing_arena_and_branch_catalog ... ok
+test the_binary_allocates_real_pages_above_the_arena_floor ... ok
+test an_agent_sessions_write_is_invisible_to_trunk_and_survives_a_restart ... ok
+test a_merged_write_reaches_trunk_and_is_still_there_after_a_restart ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.47s
+

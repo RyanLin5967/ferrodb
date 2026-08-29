@@ -1,0 +1,20 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.42s
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-38cd1a39b687e856)
+
+running 8 tests
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: NOT reaping — this node does not know the cluster's time (n1 has applied no LeaseTick, so it does not know the cluster's time and will not decide a lease. Reaping is destructive and a BranchId generation makes it unrecoverable, so there is no safe default here). Expired branches keep their pages until a LeaseTick is applied; reaping on a local clock is the divergence this refusal exists to prevent.
+lease: reaped 1 expired branch(es) with no client cooperation (b1@g0); 0 workspace(s) forgotten
+test a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guessing ... ok
+test a_merged_branch_gives_its_extent_back_without_any_lease_scan ... ok
+test the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_baseline ... ok
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... ok
+test a_healthy_database_resumes_nothing_on_startup ... ok
+test the_server_reaps_an_abandoned_branch_without_one_socket_being_opened ... ok
+test the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything ... ok
+test a_live_lease_survives_a_server_that_scans_continuously ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 56.36s
+

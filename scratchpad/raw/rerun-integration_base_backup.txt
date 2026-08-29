@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_base_backup.rs (target/debug/deps/integration_base_backup-3124fa20ccfe26f0)
+
+running 5 tests
+test the_base_backup_carries_pages_the_wal_never_describes ... ok
+test synchronous_commit_waits_for_a_replica_and_says_so_when_there_is_none ... ok
+test a_replica_killed_mid_stream_resumes_from_its_own_lsn_and_converges ... ok
+test a_backup_taken_while_the_primary_is_writing_still_converges ... ok
+test a_replica_restored_from_a_base_backup_converges_past_a_checkpoint ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.80s
+

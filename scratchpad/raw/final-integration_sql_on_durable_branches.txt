@@ -1,0 +1,12 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.27s
+     Running tests/integration_sql_on_durable_branches.rs (target/debug/deps/integration_sql_on_durable_branches-2c300ea841ac9a6c)
+
+running 4 tests
+test abandon_marks_the_branch_reaped_in_the_durable_record_log ... ok
+test branch_writes_stay_invisible_to_main_on_the_durable_catalog ... ok
+test a_guard_violation_is_rejected_with_its_predicate_on_the_durable_catalog ... ok
+test two_branches_decrementing_compose_arithmetically_on_the_durable_catalog ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+

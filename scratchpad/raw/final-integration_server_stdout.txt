@@ -1,0 +1,14 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.65s
+     Running tests/integration_server_stdout.rs (target/debug/deps/integration_server_stdout-65afba2b365f6d09)
+
+running 5 tests
+test no_test_picks_a_port_for_a_server_it_has_not_started_yet ... ok
+test pgserver_survives_a_closed_stdout ... ok
+test cdc_server_survives_a_closed_stdout ... ok
+test repl_primary_survives_a_closed_stdout ... ok
+test every_user_path_binary_refuses_a_database_that_is_already_open has been running for over 60 seconds
+test every_user_path_binary_refuses_a_database_that_is_already_open ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 155.42s
+
