@@ -34,6 +34,49 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.." || exit 1
 
 LABEL=${1:-verify}
+
+# ── 6. A MACHINE-WIDE SUITE LOCK. Only one suite runs at a time, fleet-wide. ──────────────────
+#
+# Measured 2026-08-28: five dispatched agents each reached their verification phase and each ran a
+# full suite at the same time on one machine. They starved each other so badly that every one sat
+# in a `sleep 120` poll loop for over five hours, burning 150-250k tokens apiece waiting on runs
+# that take minutes alone. Nobody was stuck and nothing was broken - the contention WAS the cost.
+#
+# This is a lock rather than a line in an agent brief on purpose. A brief is advice that the next
+# agent may not read; a lock in the script every agent already calls makes the bad state
+# unrepresentable. Serialised suites are also strictly faster in wall-clock here: five runs sharing
+# the CPU finish no sooner than five runs taking turns, and taking turns produces numbers that can
+# be trusted, because a starved run's timings are indistinguishable from a real regression.
+#
+# Set VERIFY_NOLOCK=1 to bypass, for the single-agent case where nothing can contend.
+SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
+LOCK_WAIT=${LOCK_WAIT:-5400}          # how long to queue before giving up
+if [ "${VERIFY_NOLOCK:-0}" != "1" ]; then
+    _waited=0
+    while ! mkdir "$SUITE_LOCK" 2>/dev/null; do
+        _owner=$(cat "$SUITE_LOCK/owner" 2>/dev/null || echo "unknown")
+        _pid=${_owner%% *}
+        # Break a lock ONLY when its holder is genuinely gone. `$$` here is this script's own pid
+        # and it lives for the whole run, so `kill -0` is meaningful - unlike a lock whose recorded
+        # pid was a subshell that exited the instant it wrote the file, where the same check reports
+        # dead for every healthy holder.
+        if [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; then
+            echo "$LABEL: suite lock held by dead pid $_pid — breaking it" >&2
+            rm -rf "$SUITE_LOCK"; continue
+        fi
+        if [ "$_waited" -ge "$LOCK_WAIT" ]; then
+            echo "$LABEL: REFUSING — waited ${LOCK_WAIT}s for the suite lock held by: $_owner" >&2
+            echo "  Another suite is still running. Running anyway would give BOTH runs numbers" >&2
+            echo "  that cannot be told apart from a regression." >&2
+            exit 3
+        fi
+        [ "$_waited" -eq 0 ] && echo "$LABEL: queued behind a running suite ($_owner)" >&2
+        sleep 15; _waited=$((_waited+15))
+    done
+    printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
+    trap 'rm -rf "$SUITE_LOCK"' EXIT INT TERM
+    [ "$_waited" -gt 0 ] && echo "$LABEL: acquired the suite lock after ${_waited}s" >&2
+fi
 OUT=${VERIFY_OUT:-$(mktemp -d)}
 # `mktemp -d` creates its directory; a caller-supplied VERIFY_OUT may not exist. Without this, every
 # redirect below fails, which makes the build step look like it failed and the guard refuse with the

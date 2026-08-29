@@ -361,9 +361,42 @@ fn no_test_picks_a_port_for_a_server_it_has_not_started_yet() {
     // above either — the doc comment says "listener", not the type name.
     let needle = concat!("Tcp", "Listener");
 
-    // Files permitted to bind a socket of their own, each with the reason. Empty: after I16 no test
-    // in this repo needs one, because every example server reports the address it bound.
-    const ALLOWED: &[(&str, &str)] = &[];
+    // Files permitted to bind a socket of their own, each with the reason.
+    //
+    // The list is for the case this guard's message names — a test that "really does need its own
+    // socket" — and it is narrower than it looks. The defect is **discover-then-drop**: bind to
+    // learn a free port, drop the listener, hand the number to a server, and lose the race to
+    // whatever grabbed the port in between. An entry here is only correct when the socket is never
+    // dropped, i.e. the bound listener itself is handed to the thing that will serve on it.
+    const ALLOWED: &[(&str, &str)] = &[(
+        "integration_cluster_agents.rs",
+        concat!(
+            "F9 stands up three in-process consensus nodes, and `Node::start` takes an ",
+            "ALREADY-BOUND listener rather than an address for exactly this reason: its own ",
+            "doc says a cluster cannot be stood up race-free otherwise, because every node's ",
+            "peer map needs every other node's address, so binding A to discover its port and ",
+            "then constructing B is circular. The listener is moved in still bound, so the ",
+            "port is owned continuously and there is no window to lose. That is the opposite ",
+            "of discover-then-drop, not an exemption from it. (The type is deliberately not ",
+            "named here: this guard scans its own source, and a reason that spelled it would ",
+            "make this file an offender.)",
+        ),
+    ),
+    // NOTE for whoever adds the next entry: **the reason string is scanned like any other code**,
+    // so it must not spell the type name whole either. That is the same reason the needle above is
+    // assembled from pieces.
+    (
+        "integration_cluster_snapshot.rs",
+        "F6. This file runs `consensus::node::Node` IN PROCESS, and `Node::start` takes an \
+         ALREADY-BOUND listener rather than an address — which is the CURE for I16's race rather \
+         than an instance of it. Every listener bound there is moved straight into the thing that \
+         owns it (`Node::start`, or `Transport::from_listener`) and is never dropped, so there is \
+         no window in which a port is published and unowned. The API is that shape on purpose: \
+         every node's peer map needs every other node's address, so binding A to discover its port \
+         and then constructing B is circular, and the usual way out — pick free ports, close them, \
+         hand them over — is exactly the race this guard exists to catch. \
+         `Transport::from_listener`'s own doc says so.",
+    )];
 
     let mut scanned = 0usize;
     let mut offenders = Vec::new();

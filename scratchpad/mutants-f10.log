@@ -1,0 +1,13 @@
+baseline: test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 1087 filtered out; finished in 0.11s
+[retry-writes-a-second-copy] KILLED  {'a_retried_frame_does_not_double_its_add_across_a_restart': 'failed (killed)'}
+[growth-rewrites-the-whole-frame] KILLED  {'a_growing_frame_replays_to_its_final_contents_and_not_to_the_sum_of_its_appends': 'failed (killed)'}
+[no-arithmetic-hole-check] KILLED  {'a_delta_whose_prior_counts_do_not_line_up_is_refused': 'failed (killed)'}
+[undeclared-extend-is-healed] KILLED  {'an_extend_for_a_frame_the_file_never_declared_is_refused': 'failed (killed)'}
+[second-open-overwrites] KILLED  {'a_second_open_for_one_key_is_refused': 'failed (killed)'}
+[trailing-bytes-ignored] KILLED  {'an_unknown_tag_and_a_record_with_trailing_bytes_are_both_refused': 'failed (killed)'}
+[torn-tail-not-healed] KILLED  {'a_partial_append_is_discarded_reported_and_then_written_over': 'failed (killed)'}
+[torn-tail-not-reported] KILLED  {'a_partial_append_is_discarded_reported_and_then_written_over': 'failed (killed)'}
+[header-crc-unchecked] KILLED  {'a_foreign_file_and_a_damaged_header_are_both_refused': 'failed (killed)'}
+[unguarded-string-length] KILLED  {'a_value_too_long_for_its_length_prefix_is_refused_rather_than_truncated': 'failed (killed)'}
+[no-guard-depth-cap-on-decode] KILLED  {'a_guard_nested_past_the_cap_is_refused_on_the_way_in_and_on_the_way_out': 'failed (killed by a process abort: stack overflow)'}
+[no-guard-depth-cap-on-encode] NOT APPLIED (anchor matches 0 times)

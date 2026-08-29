@@ -231,25 +231,33 @@ Listed because each one bounds a verdict above.
    - The effect log is `MemEffectLog`, which is a memory implementation rather than a durable one
      configured in memory. Nothing persists captured frames today.
 
-### Criterion 8's mechanism is proven; its scheduling does not exist
+### Criterion 8's scheduling now exists; what the *demo* shows is still the mechanism
 
-4. **No background thread runs in a shipped ferrodb process.** `grep -rn 'thread::spawn' src/`
-   returns two matches, both inside a `#[cfg(test)]` module in `src/replication/sync.rs`, so they
-   do not exist in a release build — this document previously said the grep returned nothing, which
-   stopped being true when synchronous commit gained its tests. `Reaper::reap_expired(now_millis)`
-   is a method that something must call, and outside tests and this demo, nothing calls it. The non-cooperative *mechanism* is real and proven — the
-   demo drives it exactly as a scheduler would — but no scheduler is shipped.
-5. **The demo supplies the clock reading.** `reap_expired` takes `now_millis` explicitly, so the
-   demo passes `now + 100s` rather than sleeping through a 10-second lease. The deadlines are real
-   and really compared; only the clock reading is injected. This is the reaper's own design, not a
-   demo shortcut, but it does mean the demo does not prove wall-clock expiry.
-6. **An abandoned SQL session never frees pages, and on the page-backed path that now leaks.**
-   `AgentRuntime::abandon` marks the branch reaped through the `BranchCatalog` trait only; it does
-   not invoke `TwoTierReaper`. On the map-backed runtime this demo uses there is nothing to free.
-   On a `with_storage` runtime there is: staging allocates real arena pages, and nothing in `src/`
-   calls `reap_expired`, so those pages stay allocated until some caller outside `src/` reaps them.
-   This document used to say "since Act II holds no pages, there is nothing to free", which is true
-   of this binary and not of the path the tests exercise.
+4. **A shipped ferrodb process now runs a lease thread — this entry used to say it did not.**
+   Both statements were true when written and the first is not any more, so it is corrected here
+   rather than deleted. It said: *"No background thread runs in a shipped ferrodb process...
+   `Reaper::reap_expired(now_millis)` is a method that something must call, and outside tests and
+   this demo, nothing calls it... no scheduler is shipped."* F11 shipped the scheduler.
+   `src/branch/lease_thread.rs` finishes any interrupted reap on startup and then scans on an
+   interval (`FERRODB_LEASE_SCAN_MILLIS`, default 30s), and both `src/cli/cli.rs` and
+   `examples/pgserver.rs` start it. `tests/integration_server_reaps.rs` proves it against the
+   binaries: a branch is abandoned, its lease expires, the process is sent **no SQL at all** — and
+   in the server's case never connected to — and the allocated page count returns to baseline.
+5. **The demo supplies the clock reading; the binaries do not.** `reap_expired` takes `now_millis`
+   explicitly, so this demo passes `now + 100s` rather than sleeping through a 10-second lease. The
+   deadlines are real and really compared; only the clock reading is injected, which is the reaper's
+   own design rather than a demo shortcut. It does mean **this demo** does not prove wall-clock
+   expiry. The lease thread does: it reads the cluster's clock through
+   `LeaseDeadline::try_now_millis` and, on a cluster member that has applied no `LeaseTick`,
+   **refuses to reap** rather than substituting a local reading.
+6. **An abandoned SQL session's pages now come back, by either door.** This entry used to read *"an
+   abandoned SQL session never frees pages, and on the page-backed path that now leaks"*, and it was
+   accurate: `AgentRuntime::seal` marked a merged or abandoned branch reaped through the
+   `BranchCatalog` trait only, so its extents stayed charged to it forever. Both shipped binaries now
+   attach `TwoTierReaper` to the runtime, so `MERGE` and `ABANDON` reclaim the branch's extent
+   immediately, and the lease scan reclaims it with no cooperation at all when nobody calls either.
+   `a_merged_branch_gives_its_extent_back_without_any_lease_scan` pins the cooperative half with the
+   scan interval set long enough that it cannot fire.
 
 ### Criterion 9 was PARTIAL; what closed it, and what still bounds it
 
@@ -349,6 +357,7 @@ this was confirmed rather than assumed.
 | SQL surface, criteria 2–7, 10 | `tests/agent_sql_surface.rs` |
 | Criterion 9 at the SQL surface | `tests/agent_sql_surface.rs` (authorship + `MODEL` clause) |
 | Criterion 8, page counts | `src/branch/reaper.rs` (unit tests, crate-internal harness) |
+| Criterion 8 against the **shipped binaries** | `tests/integration_server_reaps.rs`, `src/branch/lease_thread/tests.rs` |
 | Criterion 9 at the storage layer | `tests/provenance_e2e.rs` |
 | CoW tree over arenas, collapse | `tests/integration_cow_branch.rs` |
 | Durable branch engine under SQL | `tests/integration_sql_on_durable_branches.rs` |

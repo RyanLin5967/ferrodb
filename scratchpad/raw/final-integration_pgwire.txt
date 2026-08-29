@@ -1,0 +1,14 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-F11-server-reaps)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.30s
+     Running tests/integration_pgwire.rs (target/debug/deps/integration_pgwire-0203aeec1adf3deb)
+
+running 6 tests
+test an_independent_client_can_connect_and_run_sql_over_the_wire ... ok
+test two_wire_clients_see_branch_isolation_and_share_one_runtime ... ok
+test the_server_accepts_more_than_one_connection ... ok
+test a_second_real_driver_runs_the_same_parameterised_queries ... ok
+test a_real_driver_connects_and_runs_a_parameterised_query ... ok
+test two_concurrent_connections_both_make_progress ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+

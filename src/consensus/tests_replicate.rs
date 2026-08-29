@@ -1141,9 +1141,13 @@ fn a_proposal_on_a_leader_becomes_a_round_of_its_own_term_and_reaches_every_peer
 
 #[test]
 fn an_install_snapshot_is_answered_rather_than_dropped_or_fatal() {
-    // F6 owns state transfer. `received_through: 0` leaves the sender's cursor where it was, so it
-    // retries and nothing is lost; dropping it would look like progress and a panic would take the
-    // process down on a message a healthy cluster legitimately sends.
+    // This was written against F6's stub, which answered every snapshot with `received_through: 0`.
+    // **F6 has landed and this test still passes, for a different reason**, which is worth stating
+    // rather than leaving a reader to infer: `SnapshotMeta::default()` names round 0, and round 0 is
+    // "before the log begins" rather than a round, so `snapshot.rs` refuses it. What the test pins
+    // is what it always pinned and what is still F2's business — a snapshot body is answered rather
+    // than dropped, and never panics. The rules about which snapshots are accepted belong to
+    // `tests_snapshot.rs`, which owns them.
     let mut f = Consensus::new(N2, cfg3(), 94);
     follower_of(&mut f, 1, N1);
     let m = Message {

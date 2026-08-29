@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_server_reaps.rs (target/debug/deps/integration_server_reaps-4e40fd0b14856a0b)
+
+running 1 test
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval has been running for over 60 seconds
+test both_binaries_refuse_to_start_on_an_unusable_scan_interval ... FAILED
+
+failures:
+
+---- both_binaries_refuse_to_start_on_an_unusable_scan_interval stdout ----
+
+thread 'both_binaries_refuse_to_start_on_an_unusable_scan_interval' (25059842) panicked at tests/integration_server_reaps.rs:717:9:
+pgserver refused FERRODB_LEASE_SCAN_MILLIS="off" but left /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/.tmpONN4UB/badsrv0.db.lock behind — its refusal path is `process::exit`, which does not drop the DbLock
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    both_binaries_refuse_to_start_on_an_unusable_scan_interval
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 79.61s
+
+error: test failed, to rerun pass `--test integration_server_reaps`

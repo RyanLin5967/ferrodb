@@ -44,6 +44,11 @@ target
 # when the CLI was wired to the branch engine).
 *.arena
 *.branches
+# The durable Typed Effect Log (F10) and the durable provenance store (E79). Both are written beside
+# the database by the layer that owns its name, and neither was listed here, so a clean clone that
+# ran the quickstart showed them as untracked — the exact problem this section was added for.
+*.tel
+*.provenance
 # A replica's resume position.
 *.replstate
 # The single-writer lock. Scoped to `*.db.lock` on purpose: a bare `*.lock` would swallow
@@ -69,3 +74,4 @@ order.txt
 plan.txt
 # The source-side dump the README diff writes at the repository root.
 source.json
+PROGRESS.md

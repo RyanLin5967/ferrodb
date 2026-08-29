@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-948ae88c7a2c92c9)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (24880656) panicked at tests/integration_consensus_failover.rs:202:29:
+node 1 never said READY (timed out waiting on channel); stderr: 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.01s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`

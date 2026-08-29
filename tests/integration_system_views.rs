@@ -1,3 +1,9 @@
+//! **Removed 2026-08-28: `the_readmes_system_view_examples_run_as_written`.**
+//! It executed the system-view examples the README used to carry. The README was rewritten
+//! from 905 lines to ~135 and no longer documents them, so the test had no fixture left — and
+//! a test whose fixture is gone does not fail, it silently covers nothing. The views
+//! themselves are still tested by the rest of this file.
+//!
 //! B9 — the observability views over the agent layer, from SQL.
 //!
 //! # What is under test
@@ -729,111 +735,6 @@ fn every_write_shape_against_a_view_refuses_by_name() {
     }
     db.ok("DELETE FROM oncall;", &mut s);
     db.ok("DROP TABLE oncall;", &mut s);
-}
-
-
-/// **The README's view examples are executed, not trusted.**
-///
-/// The repo already learned this three times over (`tests/integration_readme_commands.rs`): a
-/// documented command that was true when written, falsified by a later change, and never re-run. The
-/// same risk applies to a documented column name — rename `staged_rows` and the README becomes a
-/// list of statements that error, with nothing failing to say so.
-///
-/// The README is the fixture rather than a copy of it. The SQL is read out of the file, so editing
-/// the block changes what this runs; deleting the block fails the test rather than quietly covering
-/// nothing.
-#[test]
-fn the_readmes_system_view_examples_run_as_written() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
-    let marker = "### System views over the agent layer";
-    let at = readme.find(marker).unwrap_or_else(|| {
-        panic!(
-            "README no longer contains {marker:?}. If that section was renamed, update this test; \
-             if it was deleted, say so here rather than letting this test quietly cover nothing."
-        )
-    });
-    let rest = &readme[at..];
-    let open = rest.find("```sql").expect("no ```sql block after the marker");
-    let body_start = rest[open..].find('\n').expect("unterminated fence") + open + 1;
-    let close = rest[body_start..].find("```").expect("unterminated fenced block") + body_start;
-    let statements: Vec<&str> = rest[body_start..close]
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("--"))
-        .collect();
-    assert!(
-        statements.len() >= 3,
-        "the documented block has {} statements; it is not covering the views",
-        statements.len()
-    );
-
-    // A database with something in EVERY view, so no documented statement can pass by returning
-    // nothing. The first version of this said that and did not do it: nothing was ever quarantined, so
-    // the documented `SELECT ... FROM ferro_quarantine` returned zero rows and the loop below — which
-    // only checks that columns arrive — would have passed against a broken quarantine view. Getting a
-    // branch held takes the read-premise shape, so that is what this builds.
-    let mut db = Db::new();
-    db.seed();
-
-    let mut a = db.session();
-    db.ok("BEGIN AGENT SESSION AS 'readme_a' RUN 'r_a';", &mut a);
-    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut a);
-    let mut held = db.session();
-    db.ok("BEGIN AGENT SESSION AS 'readme_held' RUN 'r_h';", &mut held);
-    db.ok("SELECT qty FROM oncall WHERE id = 1;", &mut held);
-    db.ok("UPDATE oncall SET qty = 111 WHERE id = 1;", &mut a);
-    db.ok("UPDATE oncall SET qty = 222 WHERE id = 2;", &mut held);
-    db.ok("MERGE;", &mut a);
-    db.ok("MERGE;", &mut held);
-    assert_eq!(
-        db.view("SELECT * FROM ferro_quarantine;").len(),
-        1,
-        "the fixture holds nothing, so a documented quarantine query cannot be checked against rows"
-    );
-    assert_eq!(
-        db.view("SELECT * FROM ferro_row_authors;").len(),
-        1,
-        "the fixture published nothing, so a documented authorship query has no rows to check"
-    );
-
-    // A live session too, so ferro_runs and ferro_run_activity are populated as well.
-    let mut a = db.session();
-    db.ok("BEGIN AGENT SESSION AS 'readme' RUN 'r_doc';", &mut a);
-    db.ok("SELECT qty FROM oncall WHERE id = 3;", &mut a);
-    db.ok("UPDATE oncall SET qty = 9 WHERE id = 3;", &mut a);
-    for v in ["ferro_branches", "ferro_runs", "ferro_row_authors", "ferro_quarantine", "ferro_run_activity"] {
-        assert!(
-            !db.view(&format!("SELECT * FROM {v};")).is_empty(),
-            "{v} is empty, so a documented statement over it cannot pass for the right reason"
-        );
-    }
-
-    for sql in statements {
-        let out = db.view(sql);
-        // Every documented column name must resolve — that is the drift this catches — and the
-        // statement must actually be answered by a view rather than by something else.
-        assert!(!out.columns.is_empty(), "the README's `{sql}` returned no columns");
-        assert!(
-            out.columns.iter().all(|c| !c.name.is_empty()),
-            "the README's `{sql}` returned an unnamed column"
-        );
-        // And it must return rows. Without this the loop passes on a view that answers nothing, which
-        // is exactly what it did before the fixture above was made to populate all five.
-        assert!(
-            !out.is_empty(),
-            "the README's `{sql}` returned no rows against a fixture built to populate every view"
-        );
-    }
-
-    // Anti-vacuity: a documented column that does NOT exist must fail here, so the loop above is
-    // checking names rather than merely checking that SELECT runs.
-    let mut s = db.session();
-    let err = refusal(
-        db.exec("SELECT no_such_documented_column FROM ferro_run_activity;", &mut s),
-        "a column the README does not document",
-    );
-    assert!(err.to_string().contains("no_such_documented_column"), "{err}");
 }
 
 
