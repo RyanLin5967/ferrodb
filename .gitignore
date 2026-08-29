@@ -74,3 +74,4 @@ order.txt
 plan.txt
 # The source-side dump the README diff writes at the repository root.
 source.json
+PROGRESS.md
