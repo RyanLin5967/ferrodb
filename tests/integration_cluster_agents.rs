@@ -1388,6 +1388,7 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
         fleet.ledgers[leader].clone(),
     );
 
+    fleet.hold_leader(leader);
     let cs = agents.fork(agent("pricing"), BranchId::TRUNK).unwrap();
     for i in 0..30 {
         db.on_branch(&cs, &format!("UPDATE inventory SET qty = {} WHERE id = 1;", 100 - i));
@@ -1395,6 +1396,7 @@ fn a_followers_committed_log_holds_the_merge_and_not_one_agent_row() {
     }
     fleet.settle_to(cs.fork_round);
 
+    fleet.hold_leader(leader);
     let bp = db.bp.clone();
     let txn = db.txn.clone();
     let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
