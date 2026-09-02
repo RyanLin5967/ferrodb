@@ -74,7 +74,7 @@ use std::sync::Mutex;
 use crate::branch::types::BranchId;
 use crate::error::FerroError;
 use crate::provenance::store::MemProvenanceStore;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceStore, RowKey, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 use crate::wal::log::{
     crc32, pread_all, pwrite_all, take_array, take_str, take_u16, take_u32, take_u64, take_u8,
@@ -82,13 +82,21 @@ use crate::wal::log::{
 };
 
 const MAGIC: u32 = 0xF3_EE_50_01;
-const VERSION: u32 = 1;
+/// Version 2 adds the two logical-row record kinds (`TAG_ROW_STAMP`, `TAG_FORGET_TABLE`) that
+/// E79c needs; version 1 files hold only runs and per-version stamps.
+const VERSION: u32 = 2;
+/// The oldest format this build can read. A v1 file replays exactly as it always did — it simply
+/// carries no row records — and is then **upgraded in place** (see `Self::open`), so a file is
+/// never left describing itself as v1 while a v2 record is appended to it.
+const MIN_READABLE_VERSION: u32 = 1;
 const HEADER_SIZE: u64 = 8;
 /// `total_len(4) + tag(1) + crc(4)`: the smallest frame that can exist.
 const MIN_FRAME: usize = 9;
 
 const TAG_RUN: u8 = 1;
 const TAG_STAMP: u8 = 2;
+const TAG_ROW_STAMP: u8 = 3;
+const TAG_FORGET_TABLE: u8 = 4;
 
 /// What opening the file recovered, and what it threw away.
 ///
@@ -98,6 +106,13 @@ const TAG_STAMP: u8 = 2;
 pub struct RecoveryReport {
     pub runs: usize,
     pub stamps: usize,
+    /// Logical-row records replayed: `stamp_row` and `forget_table` together, counted as the
+    /// events they are rather than as surviving map entries — a row stamped three times is three
+    /// records and one entry, and this is the file's number, not the index's.
+    pub row_records: usize,
+    /// The version the file carried when it was opened. `1` means it was written by a build with
+    /// no logical-row records and has been upgraded in place.
+    pub version_on_open: u32,
     /// Bytes of a torn tail that were discarded. Non-zero means the process that wrote this file
     /// died mid-append.
     pub discarded_tail_bytes: u64,
@@ -156,16 +171,25 @@ impl DurableProvenanceStore {
 
         let mem = MemProvenanceStore::new();
         let recovery = if len == 0 {
-            let mut header = [0u8; HEADER_SIZE as usize];
-            header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
-            header[4..8].copy_from_slice(&VERSION.to_be_bytes());
-            pwrite_all(&file, &header, 0)
-                .map_err(|e| FerroError::Provenance(format!("write header: {e}")))?;
-            file.sync_all()
-                .map_err(|e| FerroError::Provenance(e.to_string()))?;
-            RecoveryReport::default()
+            Self::write_header(&file, VERSION)?;
+            RecoveryReport { version_on_open: VERSION, ..RecoveryReport::default() }
         } else {
-            Self::replay(&file, len, &mem, &path)?
+            let recovery = Self::replay(&file, len, &mem, &path)?;
+            // **Upgrade in place, before the store can accept a single write.**
+            //
+            // A v1 file is readable as-is — it can only hold runs and per-version stamps, both
+            // unchanged in v2 — but the moment this build appends a `TAG_ROW_STAMP` to it, the file
+            // stops matching the version its own header claims. A v1 build reopening it would then
+            // fail with "unknown provenance record tag 3" instead of the version message written
+            // for exactly that case, and the version check would have been load-bearing for nothing.
+            //
+            // The header is 8 fixed bytes at offset 0 and nothing else in the file addresses them,
+            // so this rewrites those bytes and fsyncs. A crash before the fsync leaves a v1 file
+            // that has lost nothing: the upgrade is idempotent and the next open redoes it.
+            if recovery.version_on_open < VERSION {
+                Self::write_header(&file, VERSION)?;
+            }
+            recovery
         };
 
         Ok(DurableProvenanceStore {
@@ -177,6 +201,18 @@ impl DurableProvenanceStore {
             #[cfg(test)]
             fail_next_append: AtomicBool::new(false),
         })
+    }
+
+    /// Write the 8-byte `{magic, version}` header at offset 0 and fsync it.
+    fn write_header(file: &File, version: u32) -> Result<(), FerroError> {
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        header[4..8].copy_from_slice(&version.to_be_bytes());
+        pwrite_all(file, &header, 0)
+            .map_err(|e| FerroError::Provenance(format!("write header: {e}")))?;
+        file.sync_all()
+            .map_err(|e| FerroError::Provenance(e.to_string()))?;
+        Ok(())
     }
 
     /// Replay the file into `mem`, healing a torn tail and refusing internal disagreement.
@@ -202,9 +238,13 @@ impl DurableProvenanceStore {
             )));
         }
         let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
-        if version != VERSION {
+        // Older is read (and upgraded by the caller); NEWER is refused, because a file written by a
+        // later build can carry record kinds this one would skip, and skipping an unknown record is
+        // how a store comes back confidently wrong instead of refusing.
+        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
             return Err(FerroError::Provenance(format!(
-                "{} is provenance format version {version}; this build reads version {VERSION}",
+                "{} is provenance format version {version}; this build reads \
+                 {MIN_READABLE_VERSION}..={VERSION}",
                 path.display()
             )));
         }
@@ -212,6 +252,11 @@ impl DurableProvenanceStore {
         // Pass one: read every intact frame, stopping at the first that is not.
         let mut runs: Vec<(u64, RunEntity)> = Vec::new();
         let mut stamps: Vec<(u64, RecordId, ProvId)> = Vec::new();
+        // Row stamps and table forgets go in ONE list, in file order, because they are not
+        // independent: a forget erases every stamp before it and none after it, so splitting them
+        // into two passes would replay a dropped table's authors back on top of the new table's —
+        // the exact defect `forget_table` was added to fix, reintroduced by the reader.
+        let mut row_events: Vec<(u64, RowEvent)> = Vec::new();
         let mut offset = HEADER_SIZE;
         let good_end = loop {
             if offset + 4 > len {
@@ -237,6 +282,8 @@ impl DurableProvenanceStore {
             match Self::decode(body, offset)? {
                 Frame::Run(run) => runs.push((offset, run)),
                 Frame::Stamp(rid, id) => stamps.push((offset, rid, id)),
+                Frame::RowStamp(key, id) => row_events.push((offset, RowEvent::Stamp(key, id))),
+                Frame::ForgetTable(t) => row_events.push((offset, RowEvent::Forget(t))),
             }
             offset += total;
         };
@@ -307,9 +354,29 @@ impl DurableProvenanceStore {
             }
         }
 
+        // Pass four: logical rows, in FILE order, for the reason given where `row_events` is
+        // declared. `stamp_row` accepts `ProvId::NONE`, so no id check is needed here beyond the
+        // one it makes itself — but an id that names a run this file never declared is the same
+        // disagreement `stamp` reports above, and is refused with the same reasoning.
+        let row_record_count = row_events.len();
+        for (at, ev) in row_events {
+            match ev {
+                RowEvent::Stamp(key, id) => mem.stamp_row(key, id).map_err(|e| {
+                    FerroError::Provenance(format!(
+                        "{}: the row stamp at offset {at} for {key} names {id}, which this file \
+                         never declared: {e}",
+                        path.display()
+                    ))
+                })?,
+                RowEvent::Forget(t) => mem.forget_table(t)?,
+            }
+        }
+
         Ok(RecoveryReport {
             runs: run_count,
             stamps: stamp_count,
+            row_records: row_record_count,
+            version_on_open: version,
             discarded_tail_bytes,
         })
     }
@@ -351,6 +418,15 @@ impl DurableProvenanceStore {
                 let prov_id = ProvId(take_u32(body, &mut at)?);
                 Ok(Frame::Stamp(RecordId { page_id, slot_num }, prov_id))
             }
+            TAG_ROW_STAMP => {
+                let table = take_u32(body, &mut at)?;
+                let row = take_u64(body, &mut at)?;
+                // NOT rejected when zero, unlike `TAG_RUN` above: `ProvId::NONE` is a legitimate
+                // value for a row stamp and means "the last writer of this row was not a run".
+                let prov_id = ProvId(take_u32(body, &mut at)?);
+                Ok(Frame::RowStamp(RowKey::new(table, row), prov_id))
+            }
+            TAG_FORGET_TABLE => Ok(Frame::ForgetTable(take_u32(body, &mut at)?)),
             other => Err(FerroError::Provenance(format!(
                 "unknown provenance record tag {other} at offset {at_offset}"
             ))),
@@ -457,6 +533,14 @@ impl DurableProvenanceStore {
 enum Frame {
     Run(RunEntity),
     Stamp(RecordId, ProvId),
+    RowStamp(RowKey, ProvId),
+    ForgetTable(u32),
+}
+
+/// A logical-row event as replay sees it: the two record kinds that share one ordered pass.
+enum RowEvent {
+    Stamp(RowKey, ProvId),
+    Forget(u32),
 }
 
 impl ProvenanceStore for DurableProvenanceStore {
@@ -525,6 +609,49 @@ impl ProvenanceStore for DurableProvenanceStore {
         }
         Ok(())
     }
+
+    fn attribute_row(&self, key: RowKey) -> Result<ProvId, FerroError> {
+        self.mem.attribute_row(key)
+    }
+
+    fn stamp_row(&self, key: RowKey, id: ProvId) -> Result<(), FerroError> {
+        let file = self.file.lock().unwrap();
+        // Under the lock, and in memory first, for the reasons `intern` and `stamp` give above.
+        self.refuse_if_poisoned()?;
+        self.mem.stamp_row(key, id)?;
+        let mut body = Vec::with_capacity(17);
+        body.push(TAG_ROW_STAMP);
+        body.extend_from_slice(&key.table.to_be_bytes());
+        body.extend_from_slice(&key.row.to_be_bytes());
+        body.extend_from_slice(&id.0.to_be_bytes());
+        if let Err(e) = self.append_locked(&file, &body) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn rows_of_table(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        self.mem.rows_of_table(table)
+    }
+
+    fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+        let file = self.file.lock().unwrap();
+        self.refuse_if_poisoned()?;
+        self.mem.forget_table(table)?;
+        // **A tombstone, not a rewrite.** The stamps this erases are already in the file and an
+        // append-only log cannot unwrite them; the record below is what makes the next `open` erase
+        // them again, in the same place in the order. Without it a drop would hold for exactly as
+        // long as the process, which is the class of defect this whole row is closing.
+        let mut body = Vec::with_capacity(5);
+        body.push(TAG_FORGET_TABLE);
+        body.extend_from_slice(&table.to_be_bytes());
+        if let Err(e) = self.append_locked(&file, &body) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +674,152 @@ mod tests {
 
     fn rid(page: u32, slot: u16) -> RecordId {
         RecordId { page_id: page, slot_num: slot }
+    }
+
+    fn key(table: u32, row: u64) -> RowKey {
+        RowKey::new(table, row)
+    }
+
+    /// **E79c's exit criterion at the store level.** The integration test proves it through the
+    /// shipped binary; this proves the record kind underneath it, including the two behaviours the
+    /// per-version `stamp` deliberately does NOT have.
+    #[test]
+    fn a_row_stamp_outlives_the_store_that_made_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+
+        {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let id = s.intern(&run("restock-agent", "run-42")).unwrap();
+            s.stamp_row(key(9, 3), id).unwrap();
+            s.stamp_row(key(9, 4), id).unwrap();
+            s.stamp_row(key(11, 3), id).unwrap();
+            // Before the reopen too, so the assertion below cannot pass for a store that never
+            // worked at all.
+            assert_eq!(s.attribute_row(key(9, 3)).unwrap(), id);
+        }
+
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert_eq!(s.recovery().row_records, 3, "the row records did not replay");
+        assert_eq!(s.lookup(s.attribute_row(key(9, 3)).unwrap()).unwrap().agent_id, "restock-agent");
+        assert_eq!(
+            s.rows_of_table(9).unwrap().iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![3, 4],
+            "rows_of_table must return this table's rows, in row-id order, and no other table's"
+        );
+    }
+
+    /// A row key is REUSED, so a later unattributed write has to be able to erase an earlier
+    /// answer. `stamp` refuses `ProvId::NONE` and is right to; `stamp_row` accepts it and is right
+    /// to. Leaving the old agent's name standing over bytes it did not write is the one failure
+    /// this module exists to prevent, arriving by another door.
+    #[test]
+    fn an_unattributed_write_erases_the_previous_author_and_the_erasure_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+
+        {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let id = s.intern(&run("restock-agent", "run-42")).unwrap();
+            s.stamp_row(key(9, 3), id).unwrap();
+            s.stamp_row(key(9, 3), ProvId::NONE).unwrap();
+            assert!(s.attribute_row(key(9, 3)).unwrap().is_none());
+            // The per-version stamp keeps the opposite contract, and this is where that is pinned.
+            assert!(s.stamp(rid(9, 3), ProvId::NONE).is_err());
+        }
+
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert!(
+            s.attribute_row(key(9, 3)).unwrap().is_none(),
+            "the erasure was lost on reopen, so the old author came back"
+        );
+        assert!(
+            s.rows_of_table(9).unwrap().is_empty(),
+            "an unattributed row must not appear in a view of authors"
+        );
+    }
+
+    /// The tombstone. An append-only log cannot unwrite the stamps a drop erases, so the drop has
+    /// to be a record of its own — and it has to replay in FILE order, or a stamp written after the
+    /// drop is erased by it.
+    #[test]
+    fn forget_table_survives_a_reopen_and_does_not_reach_past_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+
+        {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let id = s.intern(&run("restock-agent", "run-42")).unwrap();
+            s.stamp_row(key(9, 1), id).unwrap();
+            s.stamp_row(key(11, 1), id).unwrap();
+            s.forget_table(9).unwrap();
+            // Written AFTER the forget, under the same table id: the table came back.
+            s.stamp_row(key(9, 2), id).unwrap();
+        }
+
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert!(
+            s.attribute_row(key(9, 1)).unwrap().is_none(),
+            "the forget did not replay, so a recreated table inherits the dead one's authors"
+        );
+        assert_eq!(
+            s.attribute_row(key(9, 2)).unwrap(),
+            ProvId(1),
+            "the forget replayed out of order and erased a stamp written after it"
+        );
+        assert_eq!(
+            s.attribute_row(key(11, 1)).unwrap(),
+            ProvId(1),
+            "forgetting one table erased another table's authors"
+        );
+    }
+
+    /// A version-1 file — runs and per-version stamps, no row records — opens, replays, and is
+    /// upgraded in place before it can be appended to.
+    ///
+    /// The upgrade is the point. Without it this build would append a `TAG_ROW_STAMP` to a file
+    /// whose header still says v1, and a v1 build reopening it would fail with "unknown provenance
+    /// record tag 3" rather than the version message written for exactly that case — a version
+    /// check that is load-bearing for nothing.
+    #[test]
+    fn a_version_one_file_replays_and_is_upgraded_in_place() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.log");
+
+        {
+            let s = DurableProvenanceStore::open(&path).unwrap();
+            let id = s.intern(&run("restock-agent", "run-42")).unwrap();
+            s.stamp(rid(9, 3), id).unwrap();
+        }
+        // Rewrite the header to version 1, which is what a build before E79c would have left.
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            DurableProvenanceStore::write_header(&f, 1).unwrap();
+        }
+
+        let s = DurableProvenanceStore::open(&path).unwrap();
+        assert_eq!(s.recovery().version_on_open, 1, "the fixture did not become a v1 file");
+        assert_eq!(s.who_wrote(rid(9, 3)).unwrap().agent_id, "restock-agent");
+
+        let mut header = [0u8; HEADER_SIZE as usize];
+        let mut f = File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut header).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            VERSION,
+            "the file was not upgraded, so the next row stamp lands in a file that denies it"
+        );
+
+        // And a NEWER file is refused rather than read with its unknown records skipped.
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            DurableProvenanceStore::write_header(&f, VERSION + 1).unwrap();
+        }
+        let err = DurableProvenanceStore::open(&path).unwrap_err().to_string();
+        assert!(err.contains("format version"), "a future version was not refused: {err}");
     }
 
     /// **Exit criterion: `who_wrote_row` answers after a reopen.**

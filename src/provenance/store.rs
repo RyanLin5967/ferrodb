@@ -22,11 +22,11 @@
 //!   different things to one run id, and quietly picking one of them would corrupt every
 //!   provenance answer downstream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::error::FerroError;
-use crate::provenance::{ProvId, ProvenanceStore, RunEntity};
+use crate::provenance::{ProvId, ProvenanceStore, RowKey, RunEntity};
 use crate::storage::heap_file_manager::RecordId;
 
 /// Maximum distinct runs whose versions may live on one page. Beyond this the per-version slot
@@ -105,6 +105,14 @@ struct Inner {
     runs: Vec<RunEntity>,
     by_run_key: HashMap<(String, String), ProvId>,
     pages: HashMap<u32, PageProvDict>,
+    /// Logical row attribution: `RowKey -> ProvId`. A `BTreeMap` rather than a `HashMap` because
+    /// `rows_of_table` promises row-id order, and getting that from an ordered map is free where
+    /// sorting a hash map's iteration on every call is not.
+    ///
+    /// `ProvId::NONE` is a *recorded* value here, not an absence — see
+    /// [`ProvenanceStore::stamp_row`] for why an unattributed write has to be able to erase an
+    /// earlier answer.
+    rows: BTreeMap<RowKey, ProvId>,
 }
 
 /// In-memory [`ProvenanceStore`]. Durability of the dictionary belongs to the page format; this
@@ -261,6 +269,41 @@ impl ProvenanceStore for MemProvenanceStore {
             )));
         }
         inner.pages.entry(rid.page_id).or_default().stamp(rid.slot_num, id)
+    }
+
+    fn attribute_row(&self, key: RowKey) -> Result<ProvId, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner.rows.get(&key).copied().unwrap_or(ProvId::NONE))
+    }
+
+    fn stamp_row(&self, key: RowKey, id: ProvId) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        // `NONE` is allowed and means "the last writer of this row was not a run"; every other id
+        // must name a run this store has interned, or the stamp would make the store answer with a
+        // slot it cannot resolve.
+        if !id.is_none() && inner.runs.get(id.0 as usize - 1).is_none() {
+            return Err(FerroError::Provenance(format!(
+                "cannot stamp {key} with {id}: not interned"
+            )));
+        }
+        inner.rows.insert(key, id);
+        Ok(())
+    }
+
+    fn rows_of_table(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner
+            .rows
+            .range(RowKey::new(table, 0)..=RowKey::new(table, u64::MAX))
+            .filter(|(_, id)| !id.is_none())
+            .map(|(k, id)| (k.row, *id))
+            .collect())
+    }
+
+    fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        inner.rows.retain(|k, _| k.table != table);
+        Ok(())
     }
 }
 
