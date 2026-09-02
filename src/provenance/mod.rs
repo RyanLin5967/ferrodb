@@ -155,6 +155,47 @@ impl RunEntity {
     }
 }
 
+/// The identity a *caller* asks about: `(table, row)`, both logical.
+///
+/// # Why this exists beside [`RecordId`], rather than one key doing both jobs
+///
+/// [`RecordId`] is `(page_id, slot_num)` — where a version physically sits — and it is the only
+/// thing the executor knows at the moment it writes, so it is the right key for [`stamp`] on the
+/// write path. It is the wrong key for a *question*: `DESIGN.md` states that `RowId` is "an
+/// immutable surrogate minted at insert — the PK is a *constraint*, not identity", and physical
+/// position is explicitly not identity. A row that moves page keeps its `RowId` and loses its
+/// `RecordId`.
+///
+/// So attribution is recorded in both key spaces on purpose. A per-version stamp answers "who
+/// wrote the bytes in this slot"; a per-row stamp answers "who wrote this row", which is the
+/// question exit criterion 9 is written in and the one [`AgentRuntime::who_wrote_row`] asks.
+///
+/// `table` is `table_id(name)` — an FNV hash of the table's **name**, because the catalog mints no
+/// table ids and a name hash is stable across processes where an assignment counter would not be.
+/// The cost of that choice, stated here because it is the reason [`ProvenanceStore::forget_table`]
+/// exists at all: a table dropped and recreated under the same name is the same table to this key,
+/// so a drop has to erase the old one's attribution or the new table inherits it.
+///
+/// [`stamp`]: ProvenanceStore::stamp
+/// [`AgentRuntime::who_wrote_row`]: crate::agent_sql::AgentRuntime::who_wrote_row
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowKey {
+    pub table: u32,
+    pub row: u64,
+}
+
+impl RowKey {
+    pub fn new(table: u32, row: u64) -> Self {
+        RowKey { table, row }
+    }
+}
+
+impl std::fmt::Display for RowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "table {} row {}", self.table, self.row)
+    }
+}
+
 /// Interning store for run entities plus per-version attribution.
 pub trait ProvenanceStore: Send + Sync {
     /// Intern a run, returning its slot. Interning the same run twice must return the same
@@ -168,6 +209,38 @@ pub trait ProvenanceStore: Send + Sync {
 
     /// Stamp a version with its author. Called on the write path, once per version, one `u32`.
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
+
+    /// Which run wrote this *row*, by logical identity. `ProvId::NONE` when unattributed.
+    ///
+    /// Returns `ProvId::NONE` for a row that was never stamped and for one whose last writer was
+    /// unattributed; those are the same answer to the only question asked of it, and no caller can
+    /// act differently on them.
+    fn attribute_row(&self, key: RowKey) -> Result<ProvId, FerroError>;
+
+    /// Record who wrote the current version of a row. Called once per published row at merge.
+    ///
+    /// **Unlike [`stamp`], this ACCEPTS `ProvId::NONE`, and it must.** A version is written once and
+    /// a stamp of "nobody" for it is meaningless, so `stamp` refuses one. A row key is *reused*: an
+    /// unattributed merge can publish over a row an agent wrote earlier, and the honest answer to
+    /// "who wrote this row" then becomes "no run did". Refusing `NONE` here would leave the previous
+    /// agent's name standing over bytes it did not write — a confident wrong answer, which is the
+    /// one failure mode this whole module exists to avoid.
+    ///
+    /// [`stamp`]: ProvenanceStore::stamp
+    fn stamp_row(&self, key: RowKey, id: ProvId) -> Result<(), FerroError>;
+
+    /// Every *attributed* row of `table`, as `(row, run)`, ordered by row id.
+    ///
+    /// Rows whose last writer was unattributed are omitted rather than returned with
+    /// `ProvId::NONE`: this backs `ferro_row_authors`, and a view of authors listing rows with no
+    /// author is a worse surface than a shorter list.
+    fn rows_of_table(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError>;
+
+    /// Forget every row attribution for `table`. Called when the table is dropped.
+    ///
+    /// See [`RowKey`] for why a drop has to reach in here: the key is a hash of the table's *name*,
+    /// so a table recreated under the same name would otherwise inherit the dead one's authors.
+    fn forget_table(&self, table: u32) -> Result<(), FerroError>;
 }
 
 #[cfg(test)]
