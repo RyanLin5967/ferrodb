@@ -89,6 +89,20 @@ const MIN_FRAME: usize = 9;
 
 const TAG_RUN: u8 = 1;
 const TAG_STAMP: u8 = 2;
+/// A LOGICAL row attribution, `(table_id, row_id) -> ProvId`. Sixteen bytes of payload.
+///
+/// A third record kind rather than a reinterpretation of `Stamp`, because the two answer different
+/// questions and neither derives from the other: `Stamp` is keyed by physical `(page, slot)` and a
+/// row that moves pages gets a new one, while this is keyed by the immutable surrogate and must
+/// follow the row. See the row-attribution section of the `ProvenanceStore` trait.
+const TAG_ROW_AUTHOR: u8 = 3;
+/// A whole table's row attributions forgotten, because the table was dropped.
+///
+/// Recorded rather than applied only in memory: without it a reopen replays every `RowAuthor` the
+/// dropped table ever had, and since `table_id` hashes the table NAME, a table recreated under the
+/// same name inherits an author that never touched it. That is the precise defect
+/// `AgentRuntime::forget_table` was added for, arriving by way of the file instead of the map.
+const TAG_FORGET_TABLE: u8 = 4;
 
 /// What opening the file recovered, and what it threw away.
 ///
@@ -98,6 +112,13 @@ const TAG_STAMP: u8 = 2;
 pub struct RecoveryReport {
     pub runs: usize,
     pub stamps: usize,
+    /// Logical `(table, row) -> run` records replayed. Counted apart from `stamps` because they
+    /// are a different question about a different key space, and a total would hide one behind the
+    /// other — a file full of physical stamps and no row authorship replays as "healthy" while
+    /// `who_wrote_row` answers nothing, which is the exact shape E79c closed.
+    pub row_authors: usize,
+    /// `DROP TABLE` records replayed.
+    pub forgets: usize,
     /// Bytes of a torn tail that were discarded. Non-zero means the process that wrote this file
     /// died mid-append.
     pub discarded_tail_bytes: u64,
@@ -210,8 +231,14 @@ impl DurableProvenanceStore {
         }
 
         // Pass one: read every intact frame, stopping at the first that is not.
+        //
+        // Runs are separated out because they must be applied in ID order (pass two). Everything
+        // else keeps FILE order in ONE list, and that is load-bearing rather than tidy: a
+        // `ForgetTable` has to erase the `RowAuthor` records before it and leave the ones after it
+        // alone, so sorting these into per-kind buckets and applying kind by kind would either
+        // resurrect a dropped table's attribution or drop a recreated table's.
         let mut runs: Vec<(u64, RunEntity)> = Vec::new();
-        let mut stamps: Vec<(u64, RecordId, ProvId)> = Vec::new();
+        let mut after: Vec<(u64, Frame)> = Vec::new();
         let mut offset = HEADER_SIZE;
         let good_end = loop {
             if offset + 4 > len {
@@ -236,7 +263,7 @@ impl DurableProvenanceStore {
             let body = &frame[4..total as usize - 4];
             match Self::decode(body, offset)? {
                 Frame::Run(run) => runs.push((offset, run)),
-                Frame::Stamp(rid, id) => stamps.push((offset, rid, id)),
+                other => after.push((offset, other)),
             }
             offset += total;
         };
@@ -273,10 +300,52 @@ impl DurableProvenanceStore {
             }
         }
 
-        // Pass three: stamps, in FILE order. A version stamped twice must end on the later value,
-        // and only file order says which that is.
-        let stamp_count = stamps.len();
-        for (at, rid, id) in stamps {
+        // Pass three: everything else, in FILE order. A version stamped twice must end on the
+        // later value, a row re-published must end on its later author, and a `DROP TABLE` must
+        // erase what came before it and nothing after — only file order says which is which.
+        let mut stamp_count = 0usize;
+        let mut row_author_count = 0usize;
+        let mut forget_count = 0usize;
+        for (at, frame) in after {
+            let (rid, id) = match frame {
+                Frame::Stamp(rid, id) => {
+                    stamp_count += 1;
+                    (rid, id)
+                }
+                Frame::RowAuthor { table, row, id } => {
+                    row_author_count += 1;
+                    if let Err(e) = mem.stamp_row(table, row, id) {
+                        // Told apart the same way the stamp arm below does, and for the same
+                        // reason: `stamp_row` refuses an id that was never interned, which means
+                        // the file disagrees with itself, and that is a different report from any
+                        // other refusal. `ProvId::NONE` is not a refusal here — it CLEARS — so a
+                        // cleared row replays as a clear rather than as damage.
+                        let known = mem.lookup(id).is_ok();
+                        return Err(FerroError::Provenance(if known {
+                            format!(
+                                "{}: the row attribution at offset {at} names {id}, which this \
+                                 file DID declare, so the file is intact — the store refused it \
+                                 for another reason: {e}",
+                                path.display()
+                            )
+                        } else {
+                            format!(
+                                "{}: the row attribution at offset {at} names {id}, which this \
+                                 file never declared: {e}",
+                                path.display()
+                            )
+                        }));
+                    }
+                    continue;
+                }
+                Frame::ForgetTable(table) => {
+                    forget_count += 1;
+                    mem.forget_table(table)?;
+                    continue;
+                }
+                // Runs went to pass two; pass one never puts one in this list.
+                Frame::Run(_) => unreachable!("a run record reached pass three"),
+            };
             if let Err(e) = mem.stamp(rid, id) {
                 // **Two different failures, told apart rather than both blamed on the file.**
                 //
@@ -310,6 +379,8 @@ impl DurableProvenanceStore {
         Ok(RecoveryReport {
             runs: run_count,
             stamps: stamp_count,
+            row_authors: row_author_count,
+            forgets: forget_count,
             discarded_tail_bytes,
         })
     }
@@ -350,6 +421,20 @@ impl DurableProvenanceStore {
                 let slot_num = take_u16(body, &mut at)?;
                 let prov_id = ProvId(take_u32(body, &mut at)?);
                 Ok(Frame::Stamp(RecordId { page_id, slot_num }, prov_id))
+            }
+            TAG_ROW_AUTHOR => {
+                let table = take_u32(body, &mut at)?;
+                let row = take_u64(body, &mut at)?;
+                // `ProvId::NONE` is legal here and is NOT rejected the way the run record rejects
+                // it: this record kind carries "no run is on record for this row any more", and
+                // refusing it would make a clear unreplayable — so a reopen would resurrect the
+                // author the writer had deliberately removed.
+                let id = ProvId(take_u32(body, &mut at)?);
+                Ok(Frame::RowAuthor { table, row, id })
+            }
+            TAG_FORGET_TABLE => {
+                let table = take_u32(body, &mut at)?;
+                Ok(Frame::ForgetTable(table))
             }
             other => Err(FerroError::Provenance(format!(
                 "unknown provenance record tag {other} at offset {at_offset}"
@@ -457,6 +542,8 @@ impl DurableProvenanceStore {
 enum Frame {
     Run(RunEntity),
     Stamp(RecordId, ProvId),
+    RowAuthor { table: u32, row: u64, id: ProvId },
+    ForgetTable(u32),
 }
 
 impl ProvenanceStore for DurableProvenanceStore {
@@ -520,6 +607,57 @@ impl ProvenanceStore for DurableProvenanceStore {
         body.extend_from_slice(&rid.slot_num.to_be_bytes());
         body.extend_from_slice(&id.0.to_be_bytes());
         if let Err(e) = self.append_locked(&file, &body) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // ── Logical row attribution, appended and fsynced exactly like a stamp ──────────────────────
+    //
+    // Same lock order (file -> mem), same poison-on-append-failure, same synchronous fsync. The
+    // three write paths differ only in what they encode, and that is deliberate: a second
+    // durability strategy for the record kind that answers criterion 9 would be a second thing to
+    // keep true.
+
+    fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+        let file = self.file.lock().unwrap();
+        self.refuse_if_poisoned()?;
+        // In memory first, so a refused attribution (an id this store never interned) does not
+        // reach the file and make the next `open` refuse the whole thing.
+        self.mem.stamp_row(table, row, id)?;
+        let mut body = Vec::with_capacity(17);
+        body.push(TAG_ROW_AUTHOR);
+        body.extend_from_slice(&table.to_be_bytes());
+        body.extend_from_slice(&row.to_be_bytes());
+        body.extend_from_slice(&id.0.to_be_bytes());
+        if let Err(e) = self.append_locked(&file, &body) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+        self.mem.row_author(table, row)
+    }
+
+    fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        self.mem.attributed_rows(table)
+    }
+
+    fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+        let file = self.file.lock().unwrap();
+        self.refuse_if_poisoned()?;
+        self.mem.forget_table(table)?;
+        let mut body = Vec::with_capacity(5);
+        body.push(TAG_FORGET_TABLE);
+        body.extend_from_slice(&table.to_be_bytes());
+        if let Err(e) = self.append_locked(&file, &body) {
+            // **The in-memory forget has already happened and cannot be undone**, so this store
+            // now knows LESS than its file — the mirror image of the poison case `intern` and
+            // `stamp` guard, and poisoned for the same reason. Reopening would replay the
+            // attributions this call dropped and hand them to whatever table next takes the name.
             self.poisoned.store(true, Ordering::SeqCst);
             return Err(e);
         }

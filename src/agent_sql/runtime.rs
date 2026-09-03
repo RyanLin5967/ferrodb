@@ -239,7 +239,6 @@ struct Staged {
 struct State {
     workspaces: BTreeMap<u64, Workspace>,
     names: BTreeMap<String, BranchId>,
-    runs: BTreeMap<u32, RunEntity>,
     next_txn: u64,
     next_merge: u64,
     apply_seq: u64,
@@ -249,14 +248,6 @@ struct State {
     quarantine_reasons: BTreeMap<u64, String>,
     /// Reservations over bounded cells, so an overdraw fails when it is written.
     escrow: EscrowLedger,
-    /// Which run last published each row, surviving the merge that published it.
-    ///
-    /// Without this, criterion 9 could only be answered for a row on a *live* branch: `run_of`
-    /// reads the workspace, and `seal` drops the workspace the instant the merge succeeds — so
-    /// the question "which agent wrote this row" became unanswerable at exactly the moment the
-    /// row became visible to anyone else. The map is keyed by row, not by branch, because that
-    /// is the question being asked.
-    row_author: BTreeMap<(u32, u64), ProvId>,
     versions: BTreeMap<(u32, u64), VersionRef>,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.

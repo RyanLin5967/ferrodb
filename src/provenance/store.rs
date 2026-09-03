@@ -22,7 +22,7 @@
 //!   different things to one run id, and quietly picking one of them would corrupt every
 //!   provenance answer downstream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::error::FerroError;
@@ -105,6 +105,13 @@ struct Inner {
     runs: Vec<RunEntity>,
     by_run_key: HashMap<(String, String), ProvId>,
     pages: HashMap<u32, PageProvDict>,
+    /// Which run last published each LOGICAL row, keyed `(table_id, row_id)`. See the trait's
+    /// row-attribution section: this is the map that used to live on `AgentRuntime::State`, and
+    /// moving it here is what makes the answer survive the process for a durable store.
+    ///
+    /// A `BTreeMap` and not a `HashMap`, because `attributed_rows` is documented as ordered by row
+    /// id and a range over one table's key space is how it reads a single table out.
+    row_author: BTreeMap<(u32, u64), ProvId>,
 }
 
 /// In-memory [`ProvenanceStore`]. Durability of the dictionary belongs to the page format; this
@@ -261,6 +268,45 @@ impl ProvenanceStore for MemProvenanceStore {
             )));
         }
         inner.pages.entry(rid.page_id).or_default().stamp(rid.slot_num, id)
+    }
+
+    fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        // `ProvId::NONE` clears rather than refusing; see the trait for why the two stamps differ.
+        if id.is_none() {
+            inner.row_author.remove(&(table, row));
+            return Ok(());
+        }
+        // The same "not interned" guard `stamp` applies, for the same reason: an id the store
+        // cannot resolve would make `who_wrote_row` answer `None` for a row it had been told about,
+        // which is indistinguishable from a row nobody wrote.
+        if inner.runs.get(id.0 as usize - 1).is_none() {
+            return Err(FerroError::Provenance(format!(
+                "cannot attribute row {row} of table {table} to {id}: not interned"
+            )));
+        }
+        inner.row_author.insert((table, row), id);
+        Ok(())
+    }
+
+    fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner.row_author.get(&(table, row)).copied().unwrap_or(ProvId::NONE))
+    }
+
+    fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner
+            .row_author
+            .range((table, u64::MIN)..=(table, u64::MAX))
+            .map(|((_, r), p)| (*r, *p))
+            .collect())
+    }
+
+    fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        inner.row_author.retain(|(t, _), _| *t != table);
+        Ok(())
     }
 }
 
