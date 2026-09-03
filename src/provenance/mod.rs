@@ -168,6 +168,48 @@ pub trait ProvenanceStore: Send + Sync {
 
     /// Stamp a version with its author. Called on the write path, once per version, one `u32`.
     fn stamp(&self, rid: RecordId, id: ProvId) -> Result<(), FerroError>;
+
+    // ── Logical row attribution ─────────────────────────────────────────────────────────────────
+    //
+    // `stamp` / `attribute` above are keyed by the PHYSICAL `(page_id, slot_num)`, because that is
+    // what the executor knows at the moment it writes a version. "Which agent wrote this row" is
+    // asked about the LOGICAL row: DESIGN.md is explicit that `RowId` is the immutable surrogate
+    // and that physical position is not identity, so a row that moves pages must keep its author.
+    //
+    // These four lived on `AgentRuntime`'s `State` as two in-memory `BTreeMap`s until row E79c,
+    // and that is exactly how criterion 9 came to hold for one process and not one moment longer:
+    // the physical stamps survived a restart while the map that turned them into an *answer* did
+    // not, so a reopened database showed rows that still looked attributed and could name nobody.
+    // They belong on the store because the store is the layer that outlives the process — a
+    // `MemProvenanceStore` still forgets, which is the honest behaviour for an in-memory store and
+    // is what the anti-vacuity half of E79c's test asserts.
+    //
+    // The key is `(u32, u64)` — `table_id`'s FNV hash of the table NAME, and `RowId` — rather than
+    // typed ids, because `TableId`/`RowId` live in `tel` and this module sits below it.
+
+    /// Record that the run `id` published the logical row `(table, row)`.
+    ///
+    /// **`ProvId::NONE` clears the attribution rather than being refused**, which is the one place
+    /// this differs from [`ProvenanceStore::stamp`]. A publish carrying no run is a plain write, and
+    /// "nobody is on record for this row any more" is a fact that has to be recordable: the
+    /// alternative leaves the previous run named as the author of a version it did not write, which
+    /// is a confident wrong answer where `None` was available.
+    fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError>;
+
+    /// Which run last published the logical row. `ProvId::NONE` when nobody is on record — never a
+    /// guess, and never the author of a neighbouring row.
+    fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError>;
+
+    /// Every attributed row of one table, as `(row, run)`, ordered by row id.
+    fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError>;
+
+    /// Forget every row attribution for one table, because the TABLE itself is gone.
+    ///
+    /// Deliberately NOT called for a `DELETE`: authorship of a deleted row is the audit record
+    /// criterion 9 exists to keep, and it outliving the row is the point. A dropped table is a
+    /// different question, because `table_id` hashes the table's NAME and that name can come back
+    /// attached to entirely different data.
+    fn forget_table(&self, table: u32) -> Result<(), FerroError>;
 }
 
 #[cfg(test)]

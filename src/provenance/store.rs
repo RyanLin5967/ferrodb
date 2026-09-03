@@ -22,7 +22,7 @@
 //!   different things to one run id, and quietly picking one of them would corrupt every
 //!   provenance answer downstream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use crate::error::FerroError;
@@ -105,6 +105,13 @@ struct Inner {
     runs: Vec<RunEntity>,
     by_run_key: HashMap<(String, String), ProvId>,
     pages: HashMap<u32, PageProvDict>,
+    /// Which run last published each LOGICAL row, keyed `(table_id, row_id)`. See the trait's
+    /// row-attribution section: this is the map that used to live on `AgentRuntime::State`, and
+    /// moving it here is what makes the answer survive the process for a durable store.
+    ///
+    /// A `BTreeMap` and not a `HashMap`, because `attributed_rows` is documented as ordered by row
+    /// id and a range over one table's key space is how it reads a single table out.
+    row_author: BTreeMap<(u32, u64), ProvId>,
 }
 
 /// In-memory [`ProvenanceStore`]. Durability of the dictionary belongs to the page format; this
@@ -262,6 +269,45 @@ impl ProvenanceStore for MemProvenanceStore {
         }
         inner.pages.entry(rid.page_id).or_default().stamp(rid.slot_num, id)
     }
+
+    fn stamp_row(&self, table: u32, row: u64, id: ProvId) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        // `ProvId::NONE` clears rather than refusing; see the trait for why the two stamps differ.
+        if id.is_none() {
+            inner.row_author.remove(&(table, row));
+            return Ok(());
+        }
+        // The same "not interned" guard `stamp` applies, for the same reason: an id the store
+        // cannot resolve would make `who_wrote_row` answer `None` for a row it had been told about,
+        // which is indistinguishable from a row nobody wrote.
+        if inner.runs.get(id.0 as usize - 1).is_none() {
+            return Err(FerroError::Provenance(format!(
+                "cannot attribute row {row} of table {table} to {id}: not interned"
+            )));
+        }
+        inner.row_author.insert((table, row), id);
+        Ok(())
+    }
+
+    fn row_author(&self, table: u32, row: u64) -> Result<ProvId, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner.row_author.get(&(table, row)).copied().unwrap_or(ProvId::NONE))
+    }
+
+    fn attributed_rows(&self, table: u32) -> Result<Vec<(u64, ProvId)>, FerroError> {
+        let inner = self.inner.read().map_err(|_| Self::poisoned())?;
+        Ok(inner
+            .row_author
+            .range((table, u64::MIN)..=(table, u64::MAX))
+            .map(|((_, r), p)| (*r, *p))
+            .collect())
+    }
+
+    fn forget_table(&self, table: u32) -> Result<(), FerroError> {
+        let mut inner = self.inner.write().map_err(|_| Self::poisoned())?;
+        inner.row_author.retain(|(t, _), _| *t != table);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +360,88 @@ mod tests {
         lying.model = "some-other-model".into();
         let err = s.intern(&lying).unwrap_err();
         assert!(format!("{}", err).contains("different actor tuple"));
+    }
+
+    // ---- logical row attribution (E79c) ----------------------------------------------------
+
+    #[test]
+    fn a_logical_row_remembers_which_run_published_it() {
+        let s = MemProvenanceStore::new();
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        let b = s.intern(&run("auditor", "run-2")).unwrap();
+        s.stamp_row(7, 1, a).unwrap();
+        s.stamp_row(7, 2, b).unwrap();
+
+        assert_eq!(s.row_author(7, 1).unwrap(), a);
+        assert_eq!(s.row_author(7, 2).unwrap(), b);
+        // A row nobody published is unattributed, not the nearest neighbour's author.
+        assert_eq!(s.row_author(7, 3).unwrap(), ProvId::NONE);
+        // and a different table with the same row number is a different row.
+        assert_eq!(s.row_author(8, 1).unwrap(), ProvId::NONE);
+    }
+
+    #[test]
+    fn re_publishing_a_row_moves_its_author_to_the_later_run() {
+        let s = MemProvenanceStore::new();
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        let b = s.intern(&run("auditor", "run-2")).unwrap();
+        s.stamp_row(7, 1, a).unwrap();
+        s.stamp_row(7, 1, b).unwrap();
+        assert_eq!(s.row_author(7, 1).unwrap(), b, "the first author outlived the second write");
+    }
+
+    /// `ProvId::NONE` CLEARS rather than being refused — the one place this differs from `stamp`.
+    /// The alternative leaves the previous run named as the author of a version it did not write.
+    #[test]
+    fn attributing_a_row_to_nobody_clears_it_rather_than_being_refused() {
+        let s = MemProvenanceStore::new();
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp_row(7, 1, a).unwrap();
+        assert_eq!(s.row_author(7, 1).unwrap(), a);
+
+        s.stamp_row(7, 1, ProvId::NONE).expect("a clear must be recordable, not refused");
+        assert_eq!(s.row_author(7, 1).unwrap(), ProvId::NONE);
+        assert!(s.attributed_rows(7).unwrap().is_empty(), "a cleared row is still listed");
+    }
+
+    #[test]
+    fn a_row_cannot_be_attributed_to_a_run_this_store_never_interned() {
+        let s = MemProvenanceStore::new();
+        // Anti-vacuity: the same call succeeds once the run exists, so the refusal below is about
+        // the id being unknown and not about `stamp_row` refusing everything.
+        assert!(s.stamp_row(7, 1, ProvId(1)).is_err());
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        assert_eq!(a, ProvId(1));
+        s.stamp_row(7, 1, ProvId(1)).expect("a real run was refused");
+    }
+
+    #[test]
+    fn attributed_rows_reads_one_table_in_row_order() {
+        let s = MemProvenanceStore::new();
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        // Inserted out of order, and interleaved with two neighbouring tables whose rows must not
+        // appear: `attributed_rows` ranges the key space rather than filtering by hand.
+        for (t, r) in [(7, 9u64), (6, 1), (7, 2), (8, 3), (7, 5)] {
+            s.stamp_row(t, r, a).unwrap();
+        }
+        let got: Vec<u64> = s.attributed_rows(7).unwrap().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(got, vec![2, 5, 9]);
+        assert_eq!(s.attributed_rows(6).unwrap().len(), 1);
+        assert_eq!(s.attributed_rows(9).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn forgetting_a_table_drops_its_rows_and_only_its_rows() {
+        let s = MemProvenanceStore::new();
+        let a = s.intern(&run("restock", "run-1")).unwrap();
+        s.stamp_row(7, 1, a).unwrap();
+        s.stamp_row(7, 2, a).unwrap();
+        s.stamp_row(8, 1, a).unwrap();
+
+        s.forget_table(7).unwrap();
+        assert_eq!(s.row_author(7, 1).unwrap(), ProvId::NONE);
+        assert_eq!(s.row_author(7, 2).unwrap(), ProvId::NONE);
+        assert_eq!(s.row_author(8, 1).unwrap(), a, "a neighbouring table lost its authorship");
     }
 
     #[test]

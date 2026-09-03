@@ -239,7 +239,6 @@ struct Staged {
 struct State {
     workspaces: BTreeMap<u64, Workspace>,
     names: BTreeMap<String, BranchId>,
-    runs: BTreeMap<u32, RunEntity>,
     next_txn: u64,
     next_merge: u64,
     apply_seq: u64,
@@ -249,14 +248,6 @@ struct State {
     quarantine_reasons: BTreeMap<u64, String>,
     /// Reservations over bounded cells, so an overdraw fails when it is written.
     escrow: EscrowLedger,
-    /// Which run last published each row, surviving the merge that published it.
-    ///
-    /// Without this, criterion 9 could only be answered for a row on a *live* branch: `run_of`
-    /// reads the workspace, and `seal` drops the workspace the instant the merge succeeds — so
-    /// the question "which agent wrote this row" became unanswerable at exactly the moment the
-    /// row became visible to anyone else. The map is keyed by row, not by branch, because that
-    /// is the question being asked.
-    row_author: BTreeMap<(u32, u64), ProvId>,
     versions: BTreeMap<(u32, u64), VersionRef>,
     /// What each agent task retained: the reads its access shapes demanded — every scan carrying
     /// the snapshot it read at — and every version it published, with the values it published.
@@ -722,23 +713,14 @@ impl AgentRuntime {
             started,
             parent,
         ))?;
-        let entity = RunEntity::new(
-            prov,
-            agent_id,
-            run.clone(),
-            model_name,
-            model_version,
-            prompt_hash,
-            started,
-            parent,
-        );
-        // `or_insert`, not `insert`. Attribution is run-level: `MemProvenanceStore::intern` returns
-        // the EXISTING `ProvId` when `same_actor` holds, and `same_actor` deliberately excludes
-        // `started_at` because that is when a particular session began, not part of who the actor is.
-        // Overwriting therefore stamped every branch of one run with the LAST session's start time, so
-        // `ferro_runs` reported a run starting after a branch it had already forked. First start wins,
-        // which is the only one that is a fact about the run.
-        state.runs.entry(prov.0).or_insert(entity);
+        // No second copy of the entity is kept here, because `intern` is ITSELF first-wins: it
+        // returns the existing `ProvId` when `same_actor` holds and leaves the stored entity
+        // untouched, so the store already holds the record this used to mirror into `State::runs`
+        // — including the first `started_at`. That property is load-bearing and survives the move:
+        // `same_actor` deliberately excludes `started_at`, so a mirror maintained with `insert`
+        // stamped every branch of one run with the LAST session's start and `ferro_runs` reported a
+        // run starting after a branch it had already forked. One record cannot disagree with itself
+        // the way two that had to be kept in step could.
 
         let name = format!("b_{}", branch.id);
         state.names.insert(name.clone(), branch);
@@ -804,9 +786,14 @@ impl AgentRuntime {
     /// Answers only for a *live* branch — the workspace is dropped when the branch merges or is
     /// abandoned. For a row that has already been published, ask [`AgentRuntime::who_wrote_row`].
     pub fn run_of(&self, branch: BranchId) -> Option<RunEntity> {
-        let state = self.state.lock().unwrap();
-        let prov = state.workspaces.get(&branch.id)?.prov;
-        state.runs.get(&prov.0).cloned()
+        // The `state` guard is dropped before the store is touched. Every other path in this file
+        // takes state -> store and never the reverse, and keeping that one direction is what makes
+        // the pair deadlock-free; this is the one place the store answer does not need the guard.
+        let prov = {
+            let state = self.state.lock().unwrap();
+            state.workspaces.get(&branch.id)?.prov
+        };
+        self.prov_store.lookup(prov).ok()
     }
 
     /// Exit criterion 9: which agent + run + model wrote a given row.
@@ -814,21 +801,32 @@ impl AgentRuntime {
     /// Answers for a row in the shared tables — that is, one some merge published — and keeps
     /// answering after the writing branch is gone. A row nobody attributed (seeded before any
     /// agent ran) returns `None`, never a guess.
+    ///
+    /// **And it keeps answering after the PROCESS is gone, when the runtime was built with
+    /// [`AgentRuntime::with_durable_provenance`]** (row E79c). Both halves of the answer — which
+    /// run published the row, and who that run was — now come from the provenance store rather
+    /// than from two maps on `State`, so a reopened database answers instead of going quiet. A
+    /// runtime on the default `MemProvenanceStore` still forgets at exit, which is the honest
+    /// behaviour for an in-memory store and not a regression.
     pub fn who_wrote_row(&self, table: &str, row: RowId) -> Option<RunEntity> {
-        let state = self.state.lock().unwrap();
-        let prov = *state.row_author.get(&(table_id(table).0, row.0))?;
-        state.runs.get(&prov.0).cloned()
+        let prov = self.prov_store.row_author(table_id(table).0, row.0).ok()?;
+        // `ProvId::NONE` means nobody is on record. Returned as `None` explicitly rather than left
+        // to `lookup` to reject, so an unattributed row and a damaged store stay distinguishable.
+        if prov.is_none() {
+            return None;
+        }
+        self.prov_store.lookup(prov).ok()
     }
 
     /// Every attributed row of `table`, as `(row, run)`, ordered by row id.
     pub fn authors_of(&self, table: &str) -> Vec<(RowId, RunEntity)> {
-        let state = self.state.lock().unwrap();
-        let tbl = table_id(table).0;
-        state
-            .row_author
-            .iter()
-            .filter(|((t, _), _)| *t == tbl)
-            .filter_map(|((_, r), p)| state.runs.get(&p.0).map(|e| (RowId(*r), e.clone())))
+        // Ordered by row id because `attributed_rows` ranges a `BTreeMap` over one table's key
+        // space; `ferro_row_authors` presents this directly and the order is part of that contract.
+        self.prov_store
+            .attributed_rows(table_id(table).0)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(r, p)| self.prov_store.lookup(p).ok().map(|e| (RowId(r), e)))
             .collect()
     }
 
@@ -904,7 +902,7 @@ impl AgentRuntime {
             out.push(RunActivity {
                 branch,
                 branch_name: ws.name.clone(),
-                run: state.runs.get(&ws.prov.0).cloned(),
+                run: self.prov_store.lookup(ws.prov).ok(),
                 ops_captured: ws.frame.ops.len() as u64,
                 guards_captured: ws.frame.guards.len() as u64,
                 staged_rows: ws.rows.len() as u64,
@@ -922,11 +920,14 @@ impl AgentRuntime {
     ///
     /// # Why a drop has to reach in here at all
     ///
-    /// `row_author` and `versions` are keyed by `table_id(name)` — an FNV hash of the table's
-    /// **name**, chosen because the catalog mints no table ids and a name hash is stable across
-    /// processes where an assignment counter would not be. The cost of that choice is that a table
-    /// dropped and recreated under the same name is, to these maps, the same table: the new one
-    /// inherits the old one's authorship and version stamps.
+    /// Row authorship (now in the provenance store) and `versions` are both keyed by
+    /// `table_id(name)` — an FNV hash of the table's **name**, chosen because the catalog mints no
+    /// table ids and a name hash is stable across processes where an assignment counter would not
+    /// be. The cost of that choice is that a table dropped and recreated under the same name is, to
+    /// both of them, the same table: the new one inherits the old one's authorship and version
+    /// stamps. Since E79c the authorship half is durable, which makes this sharper rather than
+    /// softer — an unrecorded drop is now inherited across a restart as well as within a session,
+    /// which is why the store persists a `ForgetTable` record instead of only dropping keys.
     ///
     /// Before B9 that was invisible, because `authors_of` and `who_wrote_row` had no SQL surface.
     /// `ferro_row_authors` gives them one, and it then reported rows of the *previous* table —
@@ -968,8 +969,12 @@ impl AgentRuntime {
     /// different data.
     pub fn forget_table(&self, table: &str) {
         let tbl = table_id(table).0;
-        let mut state = self.state.lock().unwrap();
-        state.row_author.retain(|(t, _), _| *t != tbl);
+        // The signature returns `()` and a durable store's append can fail, but the failure is not
+        // swallowed: `DurableProvenanceStore::forget_table` poisons ITSELF when the record does not
+        // reach the file, so every later call through that store refuses rather than reporting a
+        // forget a reopen would silently undo. Discarding the value here loses nothing that is not
+        // already recorded somewhere louder.
+        let _ = self.prov_store.forget_table(tbl);
     }
 
     // ---- reads -----------------------------------------------------------------------------
@@ -2962,9 +2967,11 @@ impl AgentRuntime {
         let publish_txn = ctx.txn.begin()?;
         // **Bind the run to the publishing transaction, so the LOG says who wrote these rows.**
         //
-        // The loop below already stamps each version's author through `apply_in`, which is what
-        // `who_wrote_row` and `ferro_row_authors` read — but that is in-memory state beside the
-        // heap, and a *reader of the log* has no access to it. `bind_run` appends a
+        // The loop below already stamps each version's author through `apply_in`, and
+        // `apply_publish` records the *logical* row's author in the provenance store, which is
+        // what `who_wrote_row` and `ferro_row_authors` read — but the provenance store is a
+        // different artifact from the WAL, so a *reader of the log* has access to neither, and
+        // since E79c that holds whether the store is in memory or on disk. `bind_run` appends a
         // `RecKind::RunIdentity` chained to this transaction, which is the only thing the logical
         // decoder can turn into a `writer` on a change event. Nothing called it, so every event on
         // the feed carried `"writer":null` no matter which agent produced it — the attribution B5
@@ -3008,7 +3015,7 @@ impl AgentRuntime {
             &merge_id,
             &images,
             reserved,
-        );
+        )?;
         self.seal(from, true)?;
 
         Ok(MergeReport {
@@ -3100,7 +3107,7 @@ impl AgentRuntime {
         merge_id: &str,
         images: &PublishedImages,
         reserved: std::ops::Range<u64>,
-    ) {
+    ) -> Result<(), FerroError> {
         let mut state = self.state.lock().unwrap();
         let mut written: Vec<WriteRecord> = Vec::new();
         let mut next_seq = reserved.start;
@@ -3166,8 +3173,10 @@ impl AgentRuntime {
                 if seen.is_empty() {
                     written.push(WriteRecord::new(v, op.col, None));
                 }
-                // Authorship of the published row, kept past `seal` (exit criterion 9).
-                state.row_author.insert((op.tbl.0, op.row.0), snapshot.prov);
+                // Authorship of the published row, kept past `seal` AND past the process
+                // (exit criterion 9). This is the write that makes `who_wrote_row` durable.
+                self.prov_store
+                    .stamp_row(op.tbl.0, op.row.0, snapshot.prov)?;
             }
         }
         // One `get_mut` after the loop rather than one per op: `TxnCapture` lives in the same
@@ -3213,6 +3222,7 @@ impl AgentRuntime {
             merge_id.to_string(),
             MergeRecord { branch, txns: vec![txn] },
         );
+        Ok(())
     }
 
     // ---- ABANDON ---------------------------------------------------------------------------
