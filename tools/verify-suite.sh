@@ -49,6 +49,74 @@ LABEL=${1:-verify}
 # be trusted, because a starved run's timings are indistinguishable from a real regression.
 #
 # Set VERIFY_NOLOCK=1 to bypass, for the single-agent case where nothing can contend.
+#
+# ── 7. A SIGNAL MUST ABORT THE RUN, NOT JUST DROP THE LOCK. ───────────────────────────────────
+#
+# The release below used to be `trap 'rm -rf "$SUITE_LOCK"' EXIT INT TERM`, which is a guard that
+# fails open in the exact situation it exists for. Bash runs a trap handler and then RESUMES the
+# script unless the handler itself exits. So when a caller's `timeout N` fired, that handler
+# deleted the machine-wide suite lock and the suite CARRIED ON — unbounded, and now with fleet-wide
+# mutual exclusion disarmed, which is precisely the five-way starvation note 6 exists to prevent.
+# The failure is silent in both directions: nothing reports that the bound was exceeded, and
+# nothing reports that the lock is gone.
+#
+# MEASURED 2026-09-02, not reasoned about. Run `baseline-2258Z` was started under `timeout 5400`
+# and was found 6447s in — 1047s past its own bound — still starting new targets, with
+# /tmp/ferrodb-suite.lock ALREADY GONE. SIGTERM would not stop it; it took SIGKILL. A three-line
+# fixture reproduces it: `trap 'rm -rf $L' TERM` plus a `sleep`, TERMed mid-sleep, still prints the
+# phase after the signal and leaves the lock deleted.
+#
+# Two things are required and neither is sufficient alone:
+#   a. the handler must EXIT, and exit as a REFUSAL. A suite cut short is not a count, so it must
+#      never reach the total-printing tail — the same rule the zero-collected and tree-moved
+#      guards already apply.
+#   b. it must take its children with it, promptly. Bash defers a trap until the current
+#      FOREGROUND command returns, so a signal arriving inside a 30-minute `cargo test` sits
+#      unhandled for up to 30 minutes; and killing the script alone orphans the running cargo
+#      (observed the same night: an orphaned `--test integration_cdc_feed` outlived its parent and
+#      had to be killed by hand). `run_bounded` therefore backgrounds each child and `wait`s,
+#      because `wait` IS interruptible by a trap while a foreground builtin is not.
+_HELD_LOCK=0
+_release_lock() {
+    [ "${_HELD_LOCK:-0}" = "1" ] || return 0
+    _HELD_LOCK=0
+    rm -rf "$SUITE_LOCK"
+}
+_kill_descendants() {
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_descendants "$c"; done
+    kill -9 "$p" 2>/dev/null
+}
+_abort() {
+    trap '' TERM INT                      # a second signal must not re-enter this handler
+    local c
+    for c in $(pgrep -P $$ 2>/dev/null); do _kill_descendants "$c"; done
+    _release_lock
+    echo "$LABEL: REFUSING — aborted by SIG$1 after ${SECONDS}s. A suite cut short is not a count." >&2
+    echo "  This handler used to release the lock and let the run continue unbounded; see note 7." >&2
+    echo "  log: ${LOG:-<not opened yet>}" >&2
+    exit 143
+}
+# EXIT covers the normal and error paths; TERM/INT must go through _abort so they refuse.
+trap '_release_lock' EXIT
+trap '_abort TERM' TERM
+trap '_abort INT' INT
+
+# Every long child goes through one of these two, never a bare foreground `timeout`. $BOUND is
+# read at call time, so these may be defined before it is set.
+run_bounded() {
+    local dest=$1; shift
+    timeout "$BOUND" "$@" >> "$dest" 2>&1 &
+    _child=$!
+    wait "$_child"
+}
+run_bounded_in() {
+    local dir=$1 dest=$2; shift 2
+    ( cd "$dir" && exec timeout "$BOUND" "$@" ) >> "$dest" 2>&1 &
+    _child=$!
+    wait "$_child"
+}
+
 SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 LOCK_WAIT=${LOCK_WAIT:-5400}          # how long to queue before giving up
 if [ "${VERIFY_NOLOCK:-0}" != "1" ]; then
@@ -74,7 +142,7 @@ if [ "${VERIFY_NOLOCK:-0}" != "1" ]; then
         sleep 15; _waited=$((_waited+15))
     done
     printf '%s %s %s\n' "$$" "$LABEL" "$(date -u +%FT%TZ)" > "$SUITE_LOCK/owner"
-    trap 'rm -rf "$SUITE_LOCK"' EXIT INT TERM
+    _HELD_LOCK=1
     [ "$_waited" -gt 0 ] && echo "$LABEL: acquired the suite lock after ${_waited}s" >&2
 fi
 OUT=${VERIFY_OUT:-$(mktemp -d)}
@@ -91,7 +159,8 @@ h0=$(git log -1 --format=%h); d0=$(git status --short | wc -l | tr -d ' ')
 
 # Examples first — see note 4 above. A failure here is a real build failure and must stop the run:
 # continuing would measure the previous binaries and call the result a suite.
-if ! timeout "$BOUND" cargo build --examples > "$LOG.examples" 2>&1; then
+: > "$LOG.examples"
+if ! run_bounded "$LOG.examples" cargo build --examples; then
     echo "$LABEL: REFUSING — \`cargo build --examples\` failed, so the suite would spawn stale binaries"
     tail -20 "$LOG.examples"
     echo "  log: $LOG.examples"
@@ -113,7 +182,7 @@ case "$MODE" in whole|per-target) ;; *)
 esac
 
 if [ "$MODE" = whole ]; then
-    timeout "$BOUND" cargo test --no-fail-fast > "$LOG" 2>&1; rc=$?
+    : > "$LOG"; run_bounded "$LOG" cargo test --no-fail-fast; rc=$?
 else
     : > "$LOG"; rc=0
     # `--lib` first, then every integration target by name. `ls tests/*.rs` and not a glob in a
@@ -138,7 +207,7 @@ else
 
     echo "=== per-target sweep: --lib plus $(echo "$targets" | wc -l | tr -d ' ') integration targets" >> "$LOG"
     echo "=== target --lib" >> "$LOG"
-    timeout "$BOUND" cargo test --lib --no-fail-fast >> "$LOG" 2>&1 || rc=$?
+    run_bounded "$LOG" cargo test --lib --no-fail-fast || rc=$?
     # The lib run needs the same verdict-line check as every integration target below. Without it a
     # killed `--lib` contributes no `test result:` line, the loop's check never looks at it, and the
     # only remaining net is the zero-collected refusal — which does not fire, because the integration
@@ -152,7 +221,7 @@ else
     fi
     for t in $targets; do
         echo "=== target $t" >> "$LOG"
-        timeout "$BOUND" cargo test --test "$t" --no-fail-fast >> "$LOG" 2>&1 || rc=$?
+        run_bounded "$LOG" cargo test --test "$t" --no-fail-fast || rc=$?
         # Every target must produce a verdict line. A target that produced none was killed, timed
         # out, or failed to build, and its silence must not be averaged away into a green total.
         if ! verdict_since_marker; then
@@ -180,7 +249,8 @@ if [ -f cdc-consumer/go.mod ]; then
     # -count=1 defeats Go's per-package result cache: a cached `ok` is not a run.
     # -mod=readonly so a missing dependency cannot rewrite go.sum and trip the tree-moved check
     # below with a false "the tree moved" instead of the real "your module is incomplete".
-    ( cd cdc-consumer && timeout "$BOUND" go test -v -count=1 -mod=readonly ./... ) > "$GOLOG" 2>&1
+    : > "$GOLOG"
+    run_bounded_in cdc-consumer "$GOLOG" go test -v -count=1 -mod=readonly ./...
     gorc=$?
     gp=$(grep -c '^--- PASS' "$GOLOG"); gf=$(grep -c '^--- FAIL' "$GOLOG")
     # A run that collected nothing has not passed. `go test` prints "no test files" and exits 0,
