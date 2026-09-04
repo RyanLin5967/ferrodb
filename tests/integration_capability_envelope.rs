@@ -1405,8 +1405,11 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     // B11 has since landed, and its two `Workspace` fields are now part of the expected list —
     // which is the point of an allowlist, that a new field has to come here and be declared.
     //
-    // `State` covers the sibling-map shape: `escrow`, `quarantine_reasons` and `row_author` are
-    // already per-branch maps, so a schema-edit map next to them is the established pattern.
+    // `State` covers the sibling-map shape: `escrow` and `quarantine_reasons` are already
+    // per-branch maps, so a schema-edit map next to them is the established pattern. (`row_author`
+    // was the third example this sentence used to give. E79c moved it onto the durable provenance
+    // store, so it is no longer a `State` map and citing it would send the next reader looking for
+    // a field that is not there.)
     // `Workspace` covers B11's actual shape: per-branch state added to the workspace itself, which
     // a statement can then write without ever entering `stage_all`.
     let field_names = |decl: &str, what: &str| -> Vec<String> {
@@ -1445,8 +1448,17 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     assert_eq!(
         field_names("struct State {", "State"),
         [
-            "workspaces", "names", "runs", "next_txn", "next_merge", "apply_seq", "applied",
-            "merges", "quarantine_reasons", "escrow", "row_author", "versions", "captures",
+            "workspaces", "names", "next_txn", "next_merge", "apply_seq", "applied",
+            "merges", "quarantine_reasons", "escrow", "versions", "captures",
+            // `runs` and `row_author` were REMOVED by E79c (`ee01420`), and a removal gets the
+            // same determination an addition does — the difference is which way it can be wrong.
+            // Both were per-branch/per-row maps a write path filled, and both are now four methods
+            // on `ProvenanceStore`, so the state they held survives the process instead of dying
+            // with it. For this guard that is a strict NARROWING: there is one less place a
+            // statement can write branch state without entering `stage_all`, and the surface that
+            // replaced them is not `State` at all, so no funnel moved out from under the envelope.
+            // Recorded here rather than left as a silent shrink, because a list that quietly gets
+            // shorter is how a field leaves the allowlist without anyone deciding it should.
             // I21's, added by the merge at `c6dcb3a`. Declared here only after making the
             // determination this assertion demands, and it is NOT a second funnel:
             //
