@@ -1,6 +1,6 @@
 # ferrodb
 
-A relational database written from scratch in Rust — storage engine, B+trees, query planner, WAL,
+A distributed relational database written from scratch in Rust — storage engine, B+trees, query planner, WAL,
 MVCC, Postgres wire protocol. No runtime dependencies; `[dependencies]` in `Cargo.toml` is empty.
 
 The part worth your time is what sits on top: **the unit of isolation is an agent task, not a
