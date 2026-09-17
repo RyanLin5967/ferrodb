@@ -1027,6 +1027,49 @@ impl BranchCatalog for TableBranchCatalog {
 }
 
 #[cfg(test)]
+mod d10_guard {
+    //! The assert in `write_record_new` is a guard, so it is forced to fire here.
+    //!
+    //! `write_record_new` does not reconcile the arena span. Handing it a record that owns arenas
+    //! would drop them silently, and the reaper frees precisely `record.arenas` -- so the pages
+    //! would leak permanently, which is defect `6e28372` exactly, and that one shipped while the
+    //! obvious assertion (`populated.reserved > baseline.reserved`) PASSED. A guard against a
+    //! defect that has already happened once is worth a real assert and a test that fires it.
+    use super::*;
+
+    fn fresh_catalog() -> (TableBranchCatalog, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ferrodb-d10-{}-{:?}",
+            std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.branchcat");
+        let _ = std::fs::remove_file(&path);
+        (TableBranchCatalog::open_sidecar(&path, 1).expect("open"), path)
+    }
+
+    #[test]
+    #[should_panic(expected = "write_record_new was handed a record with")]
+    fn write_record_new_refuses_a_record_carrying_arenas() {
+        let (cat, _p) = fresh_catalog();
+        let mut rec = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
+        rec.arenas.push(ArenaId(3));
+        cat.write_record_new(&rec).unwrap();
+    }
+
+    /// And it must NOT fire on the shape fork actually produces, or it is a guard that refuses the
+    /// only caller it has.
+    #[test]
+    fn write_record_new_accepts_a_freshly_forked_child() {
+        let (cat, _p) = fresh_catalog();
+        let child = cat.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).expect("fork");
+        assert!(child.arenas.is_empty(), "a fresh child must own no arenas");
+        // The record it wrote must be readable back, with its envelope and state intact.
+        let back = cat.get_raw(child.branch_id.id).expect("child record");
+        assert_eq!(back.branch_id, child.branch_id);
+        assert_eq!(back.state, BranchState::Live);
+    }
+}
+
+#[cfg(test)]
 mod serial_section_profile {
     //! Where does the ~0.22 ms a fork holds `logical` actually go? (S8 / D8)
     //!
