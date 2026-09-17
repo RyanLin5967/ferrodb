@@ -978,6 +978,107 @@ impl BranchCatalog for TableBranchCatalog {
 }
 
 #[cfg(test)]
+mod serial_section_profile {
+    //! Where does the ~0.22 ms a fork holds `logical` actually go? (S8 / D8)
+    //!
+    //! D8 established that fork throughput is `1 / serial_time` -- the device's flush duration
+    //! cancels out, so the only lever is the work done under the lock. Four measurements matched
+    //! that model within 0.15%. What nobody had measured is WHICH of the operations in that
+    //! section costs anything, and this project has been wrong three times about where a wall was.
+    //!
+    //! This lives as an #[ignore]d test rather than as production instrumentation or an example,
+    //! for two reasons: it needs the PRIVATE methods (`core`, `write_record`, `upsert`, ...), and
+    //! a profiler compiled into the write path is overhead in the hot loop it is measuring.
+    //!
+    //!   cargo test --release serial_section_profile -- --ignored --nocapture
+    use super::*;
+    use std::time::Instant;
+
+    fn timed<F: FnMut()>(iters: usize, mut f: F) -> f64 {
+        let t = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    }
+
+    #[test]
+    #[ignore = "profiling, not a correctness test; run with --ignored --nocapture"]
+    fn where_the_serial_section_goes() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-s8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.branchcat");
+        let _ = std::fs::remove_file(&path);
+        let cat = TableBranchCatalog::open_sidecar(&path, 1).expect("open");
+        let lease = LeaseDeadline(u64::MAX);
+
+        // A tree with real depth. A profile taken on an empty tree measures the best case of every
+        // descent and would understate every one of them.
+        const WARM: usize = 20_000;
+        for _ in 0..WARM {
+            cat.fork(BranchId::TRUNK, lease).expect("warm fork");
+        }
+
+        const N: usize = 2_000;
+        let trunk_id = BranchId::TRUNK.id;
+        let child = cat.get_raw(1).expect("some child");
+
+        let t_core = timed(N, || {
+            std::hint::black_box(cat.core(trunk_id).unwrap());
+        });
+        let t_env = timed(N, || {
+            std::hint::black_box(cat.envelope_bytes(trunk_id).unwrap());
+        });
+        let t_free = timed(N, || {
+            let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
+            std::hint::black_box(
+                cat.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi)).unwrap().next(),
+            );
+        });
+        let t_header = timed(N, || {
+            cat.write_header().unwrap();
+        });
+        let t_publish = timed(N, || {
+            cat.publish_root().unwrap();
+        });
+        // One upsert on its own, to price the delete-then-insert that `write_record` does 3x.
+        let t_upsert = timed(N, || {
+            cat.upsert(keys::state(child.state.as_u8(), child.branch_id.id), Vec::new()).unwrap();
+        });
+        let t_write_record = timed(N, || {
+            cat.write_record(&child, None).unwrap();
+        });
+        let t_childkey = timed(N, || {
+            cat.upsert(keys::child(trunk_id, 999_999), 7u64.to_be_bytes().to_vec()).unwrap();
+        });
+
+        let sum = t_core + t_env + t_free + t_write_record + t_childkey + t_header + t_publish;
+        println!();
+        println!("S8: where the serial section goes. {WARM} branches resident, {N} iters each.");
+        println!("  operation                         ms/op     share");
+        for (name, v) in [
+            ("core(parent)            lookup", t_core),
+            ("envelope_bytes(parent)  lookup", t_env),
+            ("FREE_ID first-key       scan  ", t_free),
+            ("write_record (3 upserts)      ", t_write_record),
+            ("child-key insert (1 upsert)   ", t_childkey),
+            ("write_header (1 upsert)       ", t_header),
+            ("publish_root                  ", t_publish),
+        ] {
+            println!("  {name}  {v:8.5}  {:6.1}%", 100.0 * v / sum);
+        }
+        println!("  {:32}  {sum:8.5}", "SUM");
+        println!("  {:32}  {t_upsert:8.5}   <- one upsert alone, for scale", "(upsert)");
+        println!();
+        println!("Compare with the measured serial time per fork: ~0.22 ms (D8).");
+        println!("If SUM is far below that, the cost is NOT this work -- it is lock handoff/convoy,");
+        println!("and D8's options 1 and 4 are aimed at the wrong thing. That is the single most");
+        println!("useful thing this measurement can say, so it is printed either way.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::disk_manager::DiskManager;

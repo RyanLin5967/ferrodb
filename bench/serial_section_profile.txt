@@ -1,0 +1,46 @@
+S8: where the serial section goes. 20000 branches resident, 2000 iters each.
+  operation                         ms/op     share
+  core(parent)            lookup   0.00505     4.4%
+  envelope_bytes(parent)  lookup   0.00683     6.0%
+  FREE_ID first-key       scan     0.00676     5.9%
+  write_record (3 upserts)         0.05752    50.3%
+  child-key insert (1 upsert)      0.02222    19.4%
+  write_header (1 upsert)          0.01597    14.0%
+  publish_root                     0.00000     0.0%
+  SUM                                0.11435
+  (upsert)                           0.01223   <- one upsert alone, for scale
+
+Compare with the measured serial time per fork: ~0.22 ms (D8).
+If SUM is far below that, the cost is NOT this work -- it is lock handoff/convoy,
+and D8's options 1 and 4 are aimed at the wrong thing. That is the single most
+useful thing this measurement can say, so it is printed either way.
+
+WHAT THIS SETTLES, AND WHAT IT DOES NOT:
+
+  SUM of the seven operations = 0.1146 ms.  Measured serial time per fork = ~0.22 ms (D8).
+  So this work is about 52% of the serial section. ~0.105 ms per fork is NOT accounted for here.
+
+  D8's falsifier said: "If the seven operations sum to FAR LESS than 0.22 ms, the cost is not the
+  tree work -- it is lock handoff/convoy, and D8's options 1 and 4 are aimed at the wrong thing."
+  The answer is neither extreme, so BOTH are live: there is ~0.115 ms of real tree work to attack,
+  AND ~0.105 ms that this profile does not explain. Candidates for the remainder, none measured
+  yet, so none of them is a finding: mutex acquire/release and convoy under 64 threads, the buffer
+  pool's own latching, the CommitGroup mutex taken by stage(), and a freshly allocated Vec<u8> for
+  every key built on the path. Naming them is not measuring them.
+
+  WRITES DOMINATE THE PART THAT IS EXPLAINED. Five upserts (3 in write_record, 1 child key,
+  1 header) = 0.094 ms = 82% of the 0.115. The three read lookups together are 0.020 ms. `upsert`
+  is DELETE-THEN-INSERT -- BPlusTreeManager::insert does not replace -- so each is two tree
+  operations, and the fork path performs ten of them.
+
+  THE CHEAPEST REAL TARGET IS write_header: 0.0158 ms, 13.8% of the tree work and ~7% of the whole
+  serial section, spent every single fork to persist next_id and epoch -- BOTH OF WHICH ARE ALSO
+  LIVE ATOMICS IN MEMORY. It is not needed for correctness on the fork path if the same values can
+  be re-derived at open, which looks possible in one descent each (the greatest RECORD key gives
+  next_id; the greatest CHILD key gives the epoch). That is a design question, not a measurement,
+  and it belongs in SCALE-DESIGN before any code.
+
+  INSTRUMENT NOTE. Taken with 20,000 branches resident so descents have real depth; a profile on an
+  empty tree measures the best case of every descent and understates all of them. 2,000 iterations
+  per operation. This is a #[ignore]d test rather than production instrumentation, because a
+  profiler compiled into the write path is overhead inside the loop it is measuring.
