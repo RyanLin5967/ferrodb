@@ -51,21 +51,114 @@ pub struct TableBranchCatalog {
     logical: Mutex<()>,
     next_id: AtomicU64,
     epoch: AtomicU64,
+    /// The buffer pool, kept so the header page can be written without threading it through.
+    pool: Arc<BufferPoolManager>,
+    /// The fixed page naming the tree root. `0` means "none" - `create` builds a catalog with no
+    /// durable bootstrap, which is what the bench and the tests want.
+    header_page: std::sync::atomic::AtomicU32,
+    /// The root page id last written to the header page, so a mutation that did not split the root
+    /// costs one atomic compare rather than a page write.
+    published_root: std::sync::atomic::AtomicU32,
 }
 
+/// Magic in the first four bytes of the header page, so opening the wrong page id is an error
+/// rather than a plausible-looking root taken from whatever was there.
+const HEADER_PAGE_MAGIC: u32 = 0xFE44_0B01;
+
 impl TableBranchCatalog {
+    /// Create a catalog and a **header page whose own id never changes**, returning that id.
+    ///
+    /// The tree's root page id cannot live in the tree (reading the tree needs it) and is not
+    /// stable (it moves whenever the root splits). The caller therefore has to persist *something*
+    /// across restarts, and the choice matters: writing the moving root to a sidecar on every split
+    /// means a crash between the tree write and the sidecar write leaves a database pointing at a
+    /// stale root — silently, because a stale root is a perfectly valid B+tree of an older state.
+    ///
+    /// A fixed indirection page moves the volatile value inside the database, where the buffer
+    /// pool's WAL gate already orders writes, and leaves the caller holding an id that is written
+    /// once and never changes. This is the superblock-pointer arrangement: a known location naming
+    /// a moving root, the same shape as SQLite finding `sqlite_schema` at page 1.
+    pub fn create_with_header(
+        pool: Arc<BufferPoolManager>,
+        trunk_root: PageId,
+    ) -> Result<(Self, u32), FerroError> {
+        let header_page = pool.new_page()?;
+        pool.unpin_page(header_page, false);
+        let cat = Self::create(pool, trunk_root)?;
+        cat.header_page.store(header_page, Ordering::SeqCst);
+        cat.publish_root()?;
+        Ok((cat, header_page))
+    }
+
+    /// Reopen from the header page id the caller persisted at creation.
+    pub fn open_from_header(
+        pool: Arc<BufferPoolManager>,
+        header_page: u32,
+    ) -> Result<Self, FerroError> {
+        let frame_i = pool.fetch_page(header_page)?;
+        let (magic, root) = {
+            let f = pool.frames[frame_i].read().unwrap();
+            (
+                u32::from_be_bytes(f.data[0..4].try_into().unwrap()),
+                u32::from_be_bytes(f.data[4..8].try_into().unwrap()),
+            )
+        };
+        pool.unpin_page(header_page, false);
+        if magic != HEADER_PAGE_MAGIC {
+            return Err(FerroError::Branch(format!(
+                "page {header_page} is not a branch-catalog header (magic {magic:#010x}, expected \
+                 {HEADER_PAGE_MAGIC:#010x}); refusing to read a root page id out of whatever this \
+                 page actually holds"
+            )));
+        }
+        let cat = Self::open(pool, root)?;
+        cat.header_page.store(header_page, Ordering::SeqCst);
+        cat.published_root.store(root, Ordering::SeqCst);
+        Ok(cat)
+    }
+
+    /// Write the current tree root into the header page, if it moved.
+    ///
+    /// Called after every mutation. The comparison is an atomic load, so the common case — no root
+    /// split — costs nothing and the page is written only when a split actually happened.
+    fn publish_root(&self) -> Result<(), FerroError> {
+        let header_page = self.header_page.load(Ordering::SeqCst);
+        if header_page == 0 {
+            // No header page: this catalog was built with `create`, which is the test and bench
+            // path. Nothing to publish, and silently skipping is correct rather than an error -
+            // `create` does not promise a durable bootstrap, `create_with_header` does.
+            return Ok(());
+        }
+        let root = self.tree.root_page_id.load(Ordering::SeqCst);
+        if self.published_root.swap(root, Ordering::SeqCst) == root {
+            return Ok(());
+        }
+        let frame_i = self.pool.fetch_page(header_page)?;
+        {
+            let mut f = self.pool.frames[frame_i].write().unwrap();
+            f.data = [0u8; crate::storage::disk_manager::PAGE_SIZE];
+            f.data[0..4].copy_from_slice(&HEADER_PAGE_MAGIC.to_be_bytes());
+            f.data[4..8].copy_from_slice(&root.to_be_bytes());
+        }
+        self.pool.unpin_page(header_page, true);
+        Ok(())
+    }
+
     /// Create an empty catalog containing only trunk, and return it with the tree's root page id.
     ///
     /// The root page id is the **one** value that cannot live in the tree, because reading the tree
     /// requires it. Everything else — `next_id`, the epoch counter — is a key, so `open` is one
     /// descent rather than a replay.
     pub fn create(pool: Arc<BufferPoolManager>, trunk_root: PageId) -> Result<Self, FerroError> {
-        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(pool)?;
+        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(Arc::clone(&pool))?;
         let cat = TableBranchCatalog {
             tree,
             logical: Mutex::new(()),
             next_id: AtomicU64::new(1),
             epoch: AtomicU64::new(1),
+            pool,
+            header_page: std::sync::atomic::AtomicU32::new(0),
+            published_root: std::sync::atomic::AtomicU32::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -79,12 +172,15 @@ impl TableBranchCatalog {
 
     /// Reopen an existing catalog from its tree root. One descent, no replay.
     pub fn open(pool: Arc<BufferPoolManager>, root_page_id: u32) -> Result<Self, FerroError> {
-        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::open(root_page_id, pool);
+        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::open(root_page_id, Arc::clone(&pool));
         let cat = TableBranchCatalog {
             tree,
             logical: Mutex::new(()),
             next_id: AtomicU64::new(1),
             epoch: AtomicU64::new(1),
+            pool,
+            header_page: std::sync::atomic::AtomicU32::new(0),
+            published_root: std::sync::atomic::AtomicU32::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -293,6 +389,8 @@ impl BranchCatalog for TableBranchCatalog {
         // parent is a GC correctness hole, which is why both happen under one logical lock.
         self.tree.insert(keys::child(parent.id, fork_epoch.0), Vec::new())?;
         self.write_header()?;
+        // Last, so the header page never names a root whose pages are not written yet.
+        self.publish_root()?;
         Ok(child)
     }
 
@@ -305,7 +403,8 @@ impl BranchCatalog for TableBranchCatalog {
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         let old = self.core(record.branch_id.id)?;
-        self.write_record(record, old.as_ref())
+        self.write_record(record, old.as_ref())?;
+        self.publish_root()
     }
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
@@ -314,7 +413,8 @@ impl BranchCatalog for TableBranchCatalog {
         rec.check_readable(branch)?;
         let old = rec.clone();
         rec.root_page_id = root;
-        self.write_record(&rec, Some(&old))
+        self.write_record(&rec, Some(&old))?;
+        self.publish_root()
     }
 
     fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
@@ -425,12 +525,15 @@ impl BranchCatalog for TableBranchCatalog {
         };
         if reusable {
             let _ = self.upsert(keys::free_id(id), Vec::new());
+            let _ = self.publish_root();
         }
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
-        self.remove_if_present(&keys::child(parent_id, fork_epoch.0))
+        let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
+        self.publish_root()?;
+        Ok(removed)
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
@@ -439,7 +542,8 @@ impl BranchCatalog for TableBranchCatalog {
         rec.check_readable(branch)?;
         let old = rec.clone();
         rec.lease_deadline = lease;
-        self.write_record(&rec, Some(&old))
+        self.write_record(&rec, Some(&old))?;
+        self.publish_root()
     }
 
     fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
@@ -464,7 +568,8 @@ impl BranchCatalog for TableBranchCatalog {
             ))
         })?;
         env.charge(n)?;
-        self.upsert(keys::envelope(branch.id), env.serialize())
+        self.upsert(keys::envelope(branch.id), env.serialize())?;
+        self.publish_root()
     }
 }
 
@@ -599,6 +704,51 @@ mod tests {
         let fresh = re.fork(BranchId::TRUNK, LeaseDeadline(50)).unwrap();
         assert_eq!(fresh.branch_id.id, next_id, "a reopened catalog reused a live id");
         let _ = std::fs::remove_file(p);
+    }
+
+    /// **The indirection page earns its keep only if the root actually moves.** This forks enough
+    /// branches to split the root several times and asserts the root id CHANGED before reopening -
+    /// otherwise the test would pass against a catalog that never republished anything.
+    #[test]
+    fn a_reopen_through_the_header_page_follows_a_root_that_moved() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-tablecat-hdr-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+
+        let (c, header_page) = TableBranchCatalog::create_with_header(Arc::clone(&pool), 1).unwrap();
+        let first_root = c.root_page_id();
+        for _ in 0..2000 {
+            c.fork(BranchId::TRUNK, LeaseDeadline(50)).unwrap();
+        }
+        let moved_root = c.root_page_id();
+        assert_ne!(
+            first_root, moved_root,
+            "the root never split, so this fixture cannot tell a working header page from a \
+             constant one - raise the fork count"
+        );
+        let next_id = c.next_id.load(Ordering::SeqCst);
+        drop(c);
+
+        // Reopened knowing ONLY the header page id, which never changed.
+        let re = TableBranchCatalog::open_from_header(Arc::clone(&pool), header_page).unwrap();
+        assert_eq!(re.root_page_id(), moved_root, "the header page named a stale root");
+        assert_eq!(re.live_count().unwrap(), 2001, "trunk plus two thousand");
+        assert_eq!(re.next_id.load(Ordering::SeqCst), next_id, "counters did not survive");
+        let fresh = re.fork(BranchId::TRUNK, LeaseDeadline(50)).unwrap();
+        assert_eq!(fresh.branch_id.id, next_id, "a reopened catalog reused a live id");
+
+        // Opening a page that is not a header must refuse rather than read a root id out of
+        // whatever bytes happen to be there.
+        match TableBranchCatalog::open_from_header(Arc::clone(&pool), moved_root) {
+            Ok(_) => panic!("a tree page was accepted as a header page"),
+            Err(e) => assert!(
+                format!("{e}").contains("not a branch-catalog header"),
+                "refused for the wrong reason: {e}"
+            ),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
