@@ -670,7 +670,15 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
-        let mut rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        // HYDRATED, not core. `core` returns a record whose `arenas` is empty, and `write_record`
+        // makes the arena span match the record it is given - so writing back a core record
+        // DELETES every arena the branch owns. The page store records an arena by appending to
+        // this field and calling `put`; a `set_root` afterwards then silently threw it away, and
+        // the reaper frees exactly `record.arenas`, so nothing was ever returned.
+        //
+        // `LogBranchCatalog::set_root` reads through `get`, which returns a whole record. Two
+        // implementations of one trait method must do the same thing.
+        let mut rec = self.hydrate(self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?)?;
         rec.check_readable(branch)?;
         let old = rec.clone();
         rec.root_page_id = root;
@@ -713,9 +721,20 @@ impl BranchCatalog for TableBranchCatalog {
         let it = self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?;
         // Streaming: the scanner walks leaf by leaf, so a full system view or snapshot holds one
         // record at a time rather than a second copy of the catalog.
-        Ok(Box::new(it.map(|e| {
+        //
+        // HYDRATED, not core. `LogBranchCatalog::scan` returns whole records, and two
+        // implementations of one trait method must mean the same thing by it - the third time that
+        // has bitten in this series. It is not cosmetic here:
+        //   - `consensus::snapshot::branch_image` SERIALIZES these records, so a core-only scan
+        //     would ship a follower every branch with its arenas dropped;
+        //   - the `ferro_branches` system view reports `arenas.len()`, which would read 0 for
+        //     every branch.
+        // `live_children` stays empty, as it does from `get`: it is unbounded and no caller reads
+        // it any more - they use the three indexed queries.
+        Ok(Box::new(it.map(move |e| {
             let (_, v) = e?;
-            BranchRecord::deserialize_core(&v).map_err(FerroError::from)
+            let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
+            self.hydrate(rec)
         })))
     }
 
@@ -817,7 +836,9 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
-        let mut rec = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
+        // back would delete the branch's.
+        let mut rec = self.hydrate(self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?)?;
         rec.check_readable(branch)?;
         let old = rec.clone();
         rec.lease_deadline = lease;
@@ -1451,6 +1472,60 @@ mod tests {
         assert!(!dir.join("y.branches").exists(), "the stale log was left beside the tree");
         assert!(dir.join("y.branches.pre-table").exists(), "the stale log was deleted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exactly what `ArenaPageStore::alloc_arena` does: read the record generation-blind, append
+    /// an arena, write it back. If this does not round-trip, the reaper frees nothing, because it
+    /// frees precisely `record.arenas`.
+    #[test]
+    fn an_arena_appended_the_way_the_page_store_does_it_survives_a_round_trip() {
+        let (c, p, _pool) = cat("arenart");
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+
+        let mut rec = c.get_raw(child.branch_id.id).expect("get_raw");
+        assert!(rec.arenas.is_empty(), "fixture: a fresh branch owns no arena");
+        rec.arenas.push(ArenaId(7));
+        c.put(&rec).expect("put");
+
+        let back = c.get_raw(child.branch_id.id).expect("get_raw after put");
+        assert_eq!(back.arenas, vec![ArenaId(7)], "the arena did not survive put/get_raw");
+
+        // and a second arena appends rather than replaces
+        let mut rec = c.get_raw(child.branch_id.id).unwrap();
+        rec.arenas.push(ArenaId(9));
+        c.put(&rec).unwrap();
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas,
+            vec![ArenaId(7), ArenaId(9)],
+            "appending a second arena lost the first"
+        );
+
+        // **set_root and renew_lease must not wipe them.** They read the record, modify one field
+        // and write it back; reading a CORE record there deletes every arena, because
+        // `write_record` makes the span match the record it is handed. That is exactly what
+        // happened: the page store claimed an extent, recorded it, and the next `set_root` threw
+        // it away - so the reaper, which frees precisely `record.arenas`, returned nothing.
+        c.set_root(child.branch_id, 123).expect("set_root");
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas,
+            vec![ArenaId(7), ArenaId(9)],
+            "set_root deleted the branch's arenas"
+        );
+        c.renew_lease(child.branch_id, LeaseDeadline(5_000)).expect("renew_lease");
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas,
+            vec![ArenaId(7), ArenaId(9)],
+            "renew_lease deleted the branch's arenas"
+        );
+        assert_eq!(c.get_raw(child.branch_id.id).unwrap().root_page_id, 123, "set_root lost");
+
+        // and `scan` must show them too - snapshot serializes what scan yields
+        let scanned = c.scan().unwrap()
+            .map(|r| r.unwrap())
+            .find(|r| r.branch_id.id == child.branch_id.id)
+            .expect("branch missing from scan");
+        assert_eq!(scanned.arenas, vec![ArenaId(7), ArenaId(9)], "scan dropped the arenas");
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::TableBranchCatalog;
 use ferrodb::branch::lease_thread::{LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::record::BranchRecord;
@@ -358,8 +359,19 @@ fn arena_state(db: &Path) -> ArenaState {
         .expect("open the database file");
     let dm = Arc::new(DiskManager::new(file).expect("disk manager"));
     let bp = Arc::new(BufferPoolManager::new(dm));
+    // REFUSE if the catalog is missing rather than open one. `open_sidecar` would CREATE an empty
+    // catalog over a missing file, and this fixture would then see a database with no branches and
+    // assert against it - which is exactly how the switchover's durability bug stayed quiet until
+    // it was driven end to end. A missing catalog is a failure, not an empty one.
+    let cat_path = side(db, "branchcat");
+    assert!(
+        cat_path.exists(),
+        "no branch catalog at {}: the binaries wrote none, so there is nothing to inspect and an \
+         empty one would make every assertion below vacuous",
+        cat_path.display()
+    );
     let branches =
-        Arc::new(LogBranchCatalog::open(&side(db, "branches"), 1).expect("branch catalog"));
+        Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("branch catalog"));
     let store =
         ArenaPageStore::reopen_from_checkpoint(bp, Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, &side(db, "arena"))
             .expect("reattach to the arena");
@@ -371,12 +383,17 @@ fn arena_state(db: &Path) -> ArenaState {
     }
 }
 
-/// Rewrite one branch record in `<db>.branches`, the way a fixture must when it cannot wait out a
+/// Rewrite one branch record in `<db>.branchcat`, the way a fixture must when it cannot wait out a
 /// fifteen-minute lease or crash a process mid-reap on purpose.
 ///
-/// The append-only log's last write per id slot wins, so this is the same mutation the engine makes.
+/// `put` is the same mutation the engine makes, and it commits - flushes and fsyncs - so the
+/// amended record is on disk before the next binary opens the database. With the append-only log
+/// this was true because the last write per id slot won; with the tree it is true because `put`
+/// replaces the record and durably commits.
 fn amend_branch(db: &Path, id: u64, amend: impl FnOnce(&mut BranchRecord)) {
-    let catalog = LogBranchCatalog::open(&side(db, "branches"), 1).expect("branch catalog");
+    let cat_path = side(db, "branchcat");
+    assert!(cat_path.exists(), "no branch catalog at {} to amend", cat_path.display());
+    let catalog = TableBranchCatalog::open_sidecar(&cat_path, 1).expect("branch catalog");
     let mut rec = catalog.get_raw(id).expect("branch record");
     amend(&mut rec);
     catalog.put(&rec).expect("rewrite the branch record");
