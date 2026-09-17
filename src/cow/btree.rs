@@ -707,7 +707,7 @@ mod diff_tests {
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let pool = Arc::new(BufferPoolManager::new(dm));
         let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-        let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+        let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, ARENA_BASE).unwrap());
         let t = CowTree::new(store as Arc<dyn PageStore>);
         (dir, catalog, t)
     }

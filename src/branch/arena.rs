@@ -37,7 +37,6 @@ use crate::branch::record::{ArenaExtent, BranchRecord, PendingFree};
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, Epoch, PageId, ARENA_EXTENT_PAGES,
 };
-use crate::branch::catalog::LogBranchCatalog;
 use crate::branch::BranchCatalog;
 use crate::cluster::GrantedCounter;
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -206,11 +205,13 @@ struct StoreState {
 /// Copy-on-write page store backed by per-branch arenas.
 pub struct ArenaPageStore {
     pool: Arc<BufferPoolManager>,
-    /// Concrete rather than `dyn BranchCatalog` on purpose: GC decisions must be able to read the
-    /// record of a branch that is mid-reap or already reaped (`get_raw`), because that record's
-    /// `live_children` array is still the authority over its parked pages. The trait's `get` is
-    /// generation-guarded and correctly refuses those, so it cannot answer a GC question.
-    catalog: Arc<LogBranchCatalog>,
+    /// `dyn` since D1-wire-runtime. It used to be concrete, and the comment here said that was
+    /// "on purpose: GC decisions must be able to read" things the trait did not expose - namely
+    /// `get_raw`, which is generation-blind and which the reclamation path genuinely needs. That
+    /// was a real requirement expressed the wrong way: it made the CATALOG unswappable in order to
+    /// reach ONE method. `get_raw` and `release_id` are on the trait now, so the requirement is
+    /// stated where it belongs and any catalog can satisfy it.
+    catalog: Arc<dyn BranchCatalog>,
     space: ArenaSpaceManager,
     state: Mutex<StoreState>,
     /// Pages handed out by `alloc_in_arena` and not yet returned to the free space map.
@@ -239,7 +240,7 @@ impl ArenaPageStore {
     /// this store alone.
     pub fn new(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         // NOT `next_page_id` — that counter only advances when a new bitmap page is created, so
@@ -283,7 +284,7 @@ impl ArenaPageStore {
     /// a different arena will alias it, and nothing here can currently detect that.
     pub fn reopen(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         let bitmap_mark = pool.disk_manager.bitmap_high_water()?;
@@ -300,7 +301,7 @@ impl ArenaPageStore {
 
     fn assemble(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         Ok(ArenaPageStore {
@@ -938,7 +939,7 @@ impl ArenaPageStore {
     /// deliberately with [`ArenaPageStore::new`], not something to paper over with a default base.
     pub fn reopen_from_checkpoint(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         path: &std::path::Path,
     ) -> Result<Self, FerroError> {
         let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
@@ -1251,7 +1252,7 @@ impl PageStore for ArenaPageStore {
 pub(crate) mod harness {
     use super::*;
     use crate::branch::catalog::LogBranchCatalog;
-    use crate::storage::disk_manager::DiskManager;
+        use crate::storage::disk_manager::DiskManager;
     use std::fs::OpenOptions;
     use std::sync::atomic::AtomicU64;
 
@@ -1259,7 +1260,7 @@ pub(crate) mod harness {
 
     /// A throwaway store on a real file, deleted when the guard drops.
     pub struct Harness {
-        pub catalog: Arc<LogBranchCatalog>,
+        pub catalog: Arc<dyn BranchCatalog>,
         pub store: Arc<ArenaPageStore>,
         path: std::path::PathBuf,
     }
@@ -1283,7 +1284,7 @@ pub(crate) mod harness {
             let store = Arc::new(
                 ArenaPageStore::new(
                     Arc::clone(&pool),
-                    Arc::clone(&catalog),
+                    Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
                     base,
                 )
                 .unwrap(),
@@ -1320,6 +1321,7 @@ pub(crate) mod harness {
 
 #[cfg(test)]
 mod tests {
+    use crate::branch::catalog::LogBranchCatalog;
     use super::harness::Harness;
     use super::*;
     use crate::branch::types::LeaseDeadline;
@@ -1360,7 +1362,7 @@ mod tests {
                 pool.disk_manager.deallocate(h).unwrap();
             }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as Arc<dyn BranchCatalog>, base).unwrap();
             let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
             let a = store.arena_for(br.branch_id).unwrap();
             let mut pages = Vec::new();
@@ -1383,7 +1385,7 @@ mod tests {
         // this — after a reopen its high-water mark counts the arena's own pages — so reattach is
         // what `reopen` exists for.
         let reattached =
-            ArenaPageStore::reopen(Arc::clone(&pool2), Arc::clone(&catalog2), base);
+            ArenaPageStore::reopen(Arc::clone(&pool2), Arc::clone(&catalog2) as Arc<dyn BranchCatalog>, base);
         assert!(
             reattached.is_ok(),
             "an arena cannot reattach to the region it already owns: {:?}",
@@ -1435,7 +1437,7 @@ mod tests {
             // Push the base off 1 so a wrong base is actually distinguishable from the right one.
             for _ in 0..12 { pool.disk_manager.allocate().unwrap(); }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as Arc<dyn BranchCatalog>, base).unwrap();
             let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
             let a = store.arena_for(br.branch_id).unwrap();
             for _ in 0..4 {
@@ -1486,7 +1488,7 @@ mod tests {
             let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
             for _ in 0..8 { pool.disk_manager.allocate().unwrap(); }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat) as Arc<dyn BranchCatalog>, base).unwrap();
             store.checkpoint_to(ckpt.clone());
             let a = store.arena_for(BranchId::TRUNK).unwrap();
             store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
@@ -1499,7 +1501,7 @@ mod tests {
             let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
             let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
             let store =
-                ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+                ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, &ckpt).unwrap();
             let a = store.arena_for(BranchId::TRUNK).unwrap();
             let p = store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
             // `set_root` appends to the branch log, so this survives the crash. `checkpoint` is
@@ -1511,7 +1513,7 @@ mod tests {
         // --- session 3: reopen from the now-stale checkpoint ---
         let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
         let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
-        let store = ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+        let store = ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, &ckpt).unwrap();
         assert_eq!(store.base_page(), base, "fixture: the region moved between opens");
         assert_eq!(
             cat.get(BranchId::TRUNK).unwrap().root_page_id,

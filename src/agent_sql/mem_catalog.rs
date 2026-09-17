@@ -203,6 +203,23 @@ impl BranchCatalog for MemBranchCatalog {
             .unwrap_or(false))
     }
 
+    fn live_count(&self) -> usize {
+        self.records.lock().unwrap().values().filter(|r| r.state == BranchState::Live).count()
+    }
+
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BranchError::NotFound(BranchId::new(id, 0)).into())
+    }
+
+    /// The in-memory catalog does not recycle ids, so this is a no-op rather than a lie: `fork`
+    /// here always mints a fresh id, and a free list nothing reads would be dead state.
+    fn release_id(&self, _id: u64) {}
+
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let mut records = self.records.lock().unwrap();
         let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };

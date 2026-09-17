@@ -126,6 +126,32 @@ pub trait BranchCatalog: Send + Sync {
     /// Does this id slot have any live children at all? Replaces `rec.live_children.is_empty()`.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError>;
 
+    /// Number of branches in state `Live`, trunk included.
+    ///
+    /// On the trait because it is how every harness in the repo asserts that a reap actually
+    /// happened, and those harnesses hold the catalog through this trait now.
+    fn live_count(&self) -> usize;
+
+    /// Fetch a record **ignoring the generation guard**, by id slot.
+    ///
+    /// Only the reaper and the page-reclamation path may use this. They have to read the record of
+    /// a branch that is mid-reap or already reaped, because its children are still the authority
+    /// over pages parked under its name — a generation-checked read would refuse exactly when the
+    /// answer matters most.
+    ///
+    /// On the trait rather than inherent on one implementation because `ArenaPageStore` and
+    /// `TwoTierReaper` held `Arc<LogBranchCatalog>` *concretely* in order to reach it, which meant
+    /// no other catalog could ever be installed under them.
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError>;
+
+    /// Mark an id slot reusable by a later `fork`.
+    ///
+    /// **Refuses silently while the slot still has live children**, because that set is what
+    /// decides the fate of pages parked under this branch's name: handing the id out again while a
+    /// child still points at it makes the parent of those pages ambiguous. Trunk (`id == 0`) is
+    /// never released.
+    fn release_id(&self, id: u64);
+
     /// Remove one child from `parent_id`'s live set. Returns whether anything was removed.
     ///
     /// **An explicit operation, not a record mutation followed by `put`.** The reaper used to do

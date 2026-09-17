@@ -124,12 +124,26 @@ pub fn child_epoch_from_key(key: &[u8]) -> Option<u64> {
     Some(u64::MAX - c)
 }
 
-/// `[0x04][id]`
+/// `[0x04][u64::MAX - id]` — **complemented**, so the HIGHEST free id is the first key.
+///
+/// Not an aesthetic choice: `LogBranchCatalog` keeps free ids in a sorted `Vec` and `fork` calls
+/// `pop()`, which takes the highest. A catalog that recycled the LOWEST would hand out a different
+/// id for the same sequence of operations, and then no single test could cover both
+/// implementations — which is the whole reason the table catalog lands behind the same trait.
+/// Complemented, "the id `pop()` would have returned" is the first key in the span, one descent.
 pub fn free_id(id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(9);
     k.push(tag::FREE_ID);
-    k.extend_from_slice(&id.to_be_bytes());
+    k.extend_from_slice(&(u64::MAX - id).to_be_bytes());
     k
+}
+
+/// Recover the id from a `FREE_ID` key.
+pub fn free_id_from_key(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key[0] != tag::FREE_ID {
+        return None;
+    }
+    Some(u64::MAX - u64::from_be_bytes(key[1..9].try_into().ok()?))
 }
 
 /// `[0x07]` — the single header key.
@@ -273,11 +287,14 @@ mod tests {
                     a.cmp(&b),
                     "record keys disagree with numeric order at {a} vs {b}"
                 );
+                // DESCENDING, so the highest free id is the first key — the id `Vec::pop()`
+                // would have returned in the log catalog.
                 assert_eq!(
                     free_id(a).cmp(&free_id(b)),
-                    a.cmp(&b),
-                    "free-id keys disagree with numeric order at {a} vs {b}"
+                    b.cmp(&a),
+                    "free-id keys are not descending at {a} vs {b}"
                 );
+                assert_eq!(free_id_from_key(&free_id(a)), Some(a), "free id does not round-trip");
                 // The deadline key is the one the 30-second scan descends. Its PRIMARY component
                 // must dominate: a later deadline sorts after an earlier one whatever the ids are.
                 assert_eq!(

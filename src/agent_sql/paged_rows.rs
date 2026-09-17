@@ -292,7 +292,7 @@ mod tests {
         let pool = Arc::new(BufferPoolManager::new(Arc::clone(&dm)));
         let catalog = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+            Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, ARENA_BASE).unwrap());
         (dir, catalog, store)
     }
 

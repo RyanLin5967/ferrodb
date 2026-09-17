@@ -25,7 +25,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
-use crate::branch::catalog::LogBranchCatalog;
 use crate::branch::record::{reclaimable, BranchRecord};
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
@@ -64,13 +63,13 @@ pub trait PageLinks: Send + Sync {
 const MAX_COLLAPSE_PAGES: usize = 1 << 16;
 
 pub struct TwoTierReaper {
-    catalog: Arc<LogBranchCatalog>,
+    catalog: Arc<dyn BranchCatalog>,
     store: Arc<ArenaPageStore>,
     links: Option<Arc<dyn PageLinks>>,
 }
 
 impl TwoTierReaper {
-    pub fn new(catalog: Arc<LogBranchCatalog>, store: Arc<ArenaPageStore>) -> Self {
+    pub fn new(catalog: Arc<dyn BranchCatalog>, store: Arc<ArenaPageStore>) -> Self {
         TwoTierReaper { catalog, store, links: None }
     }
 
@@ -369,6 +368,7 @@ impl Reaper for TwoTierReaper {
 
 #[cfg(test)]
 mod tests {
+    use crate::branch::catalog::LogBranchCatalog;
     use super::*;
     use crate::branch::arena::harness::Harness;
     use crate::branch::types::{ArenaId, LeaseDeadline, ARENA_EXTENT_PAGES};

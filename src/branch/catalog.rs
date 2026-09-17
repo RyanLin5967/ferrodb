@@ -445,6 +445,20 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(st.records.get(&parent_id).map(|r| !r.live_children.is_empty()).unwrap_or(false))
     }
 
+    fn live_count(&self) -> usize {
+        LogBranchCatalog::live_count(self)
+    }
+
+    /// Delegates to the inherent method of the same name. Rust resolves inherent methods first, so
+    /// callers holding the concrete type are unaffected and `dyn BranchCatalog` callers get this.
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        LogBranchCatalog::get_raw(self, id)
+    }
+
+    fn release_id(&self, id: u64) {
+        LogBranchCatalog::release_id(self, id)
+    }
+
     /// The log catalog keeps the live set inside the record, so this is exactly what the reaper
     /// used to do inline.
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {

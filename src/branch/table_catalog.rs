@@ -275,7 +275,7 @@ impl BranchCatalog for TableBranchCatalog {
             .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
             .next()
             .transpose()?
-            .map(|(k, _)| u64::from_be_bytes(k[1..9].try_into().unwrap()));
+            .and_then(|(k, _)| keys::free_id_from_key(&k));
 
         let (child_num, generation) = match recycled {
             Some(id) => {
@@ -395,6 +395,37 @@ impl BranchCatalog for TableBranchCatalog {
             .next()
             .transpose()?
             .is_some())
+    }
+
+    /// Counts the `Live` state span. Unlike the log catalog's, this is a scan of that span rather
+    /// than of every record, so it is proportional to the answer.
+    fn live_count(&self) -> usize {
+        TableBranchCatalog::live_count(self).unwrap_or(0)
+    }
+
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        // No `check_readable`: that is the whole point. A branch mid-reap or already reaped still
+        // owns the children that decide the fate of its pages.
+        let rec = self.core(id)?.ok_or(BranchError::NotFound(BranchId::new(id, 0)))?;
+        self.hydrate(rec)
+    }
+
+    fn release_id(&self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let _g = self.logical.lock().unwrap();
+        // Refuse while the slot still has live children - that set decides the fate of pages
+        // parked under this branch's name. Errors are swallowed to match the inherent method's
+        // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
+        // which is recoverable, while propagating it would abort a reap midway, which is not.
+        let reusable = match (self.core(id), self.has_live_children(id)) {
+            (Ok(Some(rec)), Ok(false)) => rec.state == BranchState::Reaped,
+            _ => false,
+        };
+        if reusable {
+            let _ = self.upsert(keys::free_id(id), Vec::new());
+        }
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
