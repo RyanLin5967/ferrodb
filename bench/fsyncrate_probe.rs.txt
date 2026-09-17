@@ -1,0 +1,47 @@
+// What is this machine's fsync ceiling? No ferrodb involved.
+//
+// ferrodb's DiskManager::sync calls File::sync_all, which on macOS is fcntl(F_FULLFSYNC) --
+// a true barrier flush all the way to the media, not the plain fsync() most engines use by
+// default (SQLite's `fullfsync` pragma is OFF by default; Postgres uses fsync unless told
+// otherwise). The two differ by an order of magnitude on Apple hardware, so "4,400 forks/sec"
+// cannot be judged without knowing which ceiling it is sitting under.
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
+use std::time::Instant;
+
+extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn fsync(fd: i32) -> i32;
+}
+const F_FULLFSYNC: i32 = 51;
+
+fn bench(path: &str, n: usize, full: bool) -> f64 {
+    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(path).unwrap();
+    let page = vec![0u8; 4096];
+    let fd = f.as_raw_fd();
+    // one untimed warm-up, so file creation and the first allocation are not in the number
+    f.write_all(&page).unwrap();
+    unsafe { if full { fcntl(fd, F_FULLFSYNC, 0); } else { fsync(fd); } }
+    let t0 = Instant::now();
+    for _ in 0..n {
+        f.write_all(&page).unwrap();
+        let rc = unsafe { if full { fcntl(fd, F_FULLFSYNC, 0) } else { fsync(fd) } };
+        assert_eq!(rc, 0, "sync failed");
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let _ = std::fs::remove_file(path);
+    n as f64 / secs
+}
+
+fn main() {
+    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
+    for dir in [std::env::temp_dir(), std::path::PathBuf::from("/Users/idide/projects/ferrodb")] {
+        let p = dir.join("ferrodb-fsyncrate.probe");
+        let ps = p.to_string_lossy().to_string();
+        let full = bench(&ps, n, true);
+        let plain = bench(&ps, n, false);
+        println!("  {:<46} F_FULLFSYNC {:8.1}/sec ({:6.3} ms)   fsync {:9.1}/sec ({:6.3} ms)   ratio x{:.1}",
+                 dir.display(), full, 1000.0/full, plain, 1000.0/plain, plain/full);
+    }
+}

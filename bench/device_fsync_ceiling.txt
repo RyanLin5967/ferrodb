@@ -1,0 +1,41 @@
+S7: is ~4,400 forks/sec the DEVICE's limit, or still ours?
+Instrument: a standalone rustc program, NO ferrodb code involved (bench/fsyncrate_probe.rs.txt).
+300 syncs per cell, one untimed warm-up. Recorded 2026-09-17.
+
+  directory                    F_FULLFSYNC              plain fsync()            ratio
+  /var/folders/.../T/          276.1/sec (3.622 ms)     27549.9/sec (0.036 ms)   x99.8
+  /Users/idide/projects/ferrodb 280.9/sec (3.560 ms)    30674.1/sec (0.033 ms)   x109.2
+
+ANSWER: THE DEVICE. And it is not close.
+
+  ferrodb's DiskManager::sync calls File::sync_all, which on macOS is fcntl(F_FULLFSYNC).
+  Measured F_FULLFSYNC ceiling on this machine:            ~281 /sec
+  fsyncs the fork run actually achieves at 64 threads:     ~317 /sec   (287 syncs / 0.905 s)
+
+  The catalog is AT the device's barrier-flush rate. It is nominally slightly above it, which is
+  measurement overlap rather than magic -- the group's sync runs concurrently with other threads'
+  tree work, and the probe's number is a strict serial loop. Either way there is no headroom:
+  shrinking the serial section further cannot buy throughput that the disk will not give.
+
+  CONFIRMATION FROM AN INDEPENDENT DIRECTION. The single-threaded per-fork latency measured in
+  bench/fork_concurrency_after.txt is 3.574 ms. One F_FULLFSYNC here is 3.560-3.622 ms. A serial
+  fork IS one barrier flush, to three digits. Two instruments that were never calibrated against
+  each other agree, which is the strongest evidence in this file.
+
+SO 4,400 forks/sec IS THE HONEST CEILING for one-barrier-flush-per-group on this hardware, and the
+next move cannot be "do the same work faster".
+
+THE THING THIS MEASUREMENT EXPOSED, WHICH WAS NOT WHAT IT WENT LOOKING FOR:
+
+  plain fsync() is ~100x faster than F_FULLFSYNC here, and ferrodb pays F_FULLFSYNC on every group
+  commit. That is MORE conservative than standard practice, not less:
+    - SQLite's `fullfsync` pragma is OFF by default.
+    - Postgres does not use F_FULLFSYNC by default either (fsync_writethrough exists and is opt-in).
+  So ferrodb is buying power-loss durability that most engines make the user ask for.
+
+  DO NOT READ THIS AS A FREE 100x. It is not a bug and it is not slack -- it is a guarantee. On
+  Apple hardware plain fsync() does not flush the drive's write cache, so a power failure can lose
+  writes the application was told were durable. F_FULLFSYNC is the only call that does. Switching
+  would trade a real guarantee for throughput, which is a decision to be made explicitly and
+  configurably, not a number to harvest quietly. It is written up as an option in SCALE-DESIGN D8
+  with that cost stated, and it is NOT chosen on the strength of being the biggest number available.
