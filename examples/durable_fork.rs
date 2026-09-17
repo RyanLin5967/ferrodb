@@ -70,11 +70,19 @@ fn run_table(n: usize, dir: &std::path::Path) {
     use ferrodb::buffer::buffer_pool::BufferPoolManager;
     use ferrodb::storage::disk_manager::DiskManager;
 
-    let path = dir.join("branches-table.db");
+    // TWO POOLS, because that is what the runtime has: one over the main database and one over the
+    // catalog's own file. The main pool is idle here and that is the point - it is a FIXED cost
+    // (1024 frames x 4 KB = 4 MB) that must appear in the measurement rather than be argued away,
+    // since the earlier curve ran a single pool and the design records that as a falsifier.
+    let main_path = dir.join("main.db");
+    let mf = std::fs::OpenOptions::new().create(true).read(true).write(true)
+        .open(&main_path).unwrap();
+    let _main_pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(mf).unwrap())));
+
+    let path = dir.join("branches.branchcat");
     let _ = std::fs::remove_file(&path);
-    let f = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
-    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
-    let cat = TableBranchCatalog::create(Arc::clone(&pool), 1).expect("create catalog");
+    let cat = TableBranchCatalog::open_sidecar(&path, 1).expect("open catalog");
+    let pool = Arc::clone(cat.pool_handle());
     let lease = LeaseDeadline(u64::MAX);
 
     let mut first = 0f64;

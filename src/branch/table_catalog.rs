@@ -65,6 +65,11 @@ pub struct TableBranchCatalog {
 /// rather than a plausible-looking root taken from whatever was there.
 const HEADER_PAGE_MAGIC: u32 = 0xFE44_0B01;
 
+/// Where the header lives in a dedicated catalog file: the first page after the bitmap, which is
+/// what `BufferPoolManager::new_page` hands out first on a fresh file. Fixed rather than recorded
+/// elsewhere, because a file holding only the catalog needs no second place to look.
+pub const SIDECAR_HEADER_PAGE: u32 = 1;
+
 impl TableBranchCatalog {
     /// Create a catalog and a **header page whose own id never changes**, returning that id.
     ///
@@ -115,6 +120,58 @@ impl TableBranchCatalog {
         cat.header_page.store(header_page, Ordering::SeqCst);
         cat.published_root.store(root, Ordering::SeqCst);
         Ok(cat)
+    }
+
+    /// Open — or create — the branch catalog **in its own file**.
+    ///
+    /// The catalog was briefly put in the main database's pages, and that inherited a ceiling it
+    /// had no reason to: the ordinary allocator is confined below the arena floor, a budget of
+    /// `DEFAULT_ARENA_HEADROOM` (32,736 pages, ~134 MB) shared with every user table and fixed when
+    /// the database is created. At the measured 250 bytes per branch, 10⁶ branches want ~61,000
+    /// pages — 1.87x that entire budget, before one user row.
+    ///
+    /// `LogBranchCatalog`, which this replaces, is a **sidecar** (`{db}.branches`) and never
+    /// competed for it. Keeping that arrangement and changing only the format inside the file
+    /// removes the ceiling without a region table, without bounding the arena, and without touching
+    /// the consensus grant protocol that decides arena page addresses. A sidecar replaces a
+    /// sidecar; `{db}.arena` and `{db}.provenance` are the same pattern.
+    ///
+    /// The second buffer pool is the honest cost: a second frame budget, real memory. It is also
+    /// what keeps the residency win — a bounded pool is bounded whichever file it is over.
+    pub fn open_sidecar(path: &std::path::Path, trunk_root: PageId) -> Result<Self, FerroError> {
+        // Decided BEFORE the file is touched: `DiskManager::new` writes the bitmap into an empty
+        // file, so afterwards the length no longer distinguishes a new catalog from an existing
+        // one, and a fresh `create` over a populated file would silently orphan every branch.
+        let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                FerroError::Io(format!("open branch catalog {}: {e}", path.display()))
+            })?;
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(
+            crate::storage::disk_manager::DiskManager::new(file)?,
+        )));
+
+        if fresh {
+            let (cat, header) = Self::create_with_header(pool, trunk_root)?;
+            // Not an assumption - a check. `open_sidecar` reopens at a FIXED page id, so if page
+            // allocation ever stops making the header the first page after the bitmap, the next
+            // open would read a tree page as a header. Failing here is recoverable; failing there
+            // is a database that cannot find its own branches.
+            if header != SIDECAR_HEADER_PAGE {
+                return Err(FerroError::Branch(format!(
+                    "branch catalog header landed on page {header}, not the expected \
+                     {SIDECAR_HEADER_PAGE}; reopening would read the wrong page as a header"
+                )));
+            }
+            Ok(cat)
+        } else {
+            Self::open_from_header(pool, SIDECAR_HEADER_PAGE)
+        }
     }
 
     /// Write the current tree root into the header page, if it moved.
@@ -196,6 +253,12 @@ impl TableBranchCatalog {
         cat.next_id.store(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), Ordering::SeqCst);
         cat.epoch.store(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), Ordering::SeqCst);
         Ok(cat)
+    }
+
+    /// The pool this catalog is over. For a harness that needs to flush it; the catalog owns its
+    /// own pool when opened as a sidecar.
+    pub fn pool_handle(&self) -> &Arc<BufferPoolManager> {
+        &self.pool
     }
 
     /// The tree's current root page id. **The caller must persist this**: it moves whenever a root
@@ -905,6 +968,62 @@ mod tests {
         c.put(&rec).unwrap();
         assert!(!c.has_live_children(t).unwrap(), "attach_child wrote an unverifiable entry");
         let _ = std::fs::remove_file(p);
+    }
+
+    /// A genuine close-and-reopen: the catalog is dropped, its pool with it, and the next open
+    /// starts from nothing but the file. Everything before this used one long-lived pool, which
+    /// cannot tell a durable write from a page still sitting in a frame.
+    #[test]
+    fn a_sidecar_catalog_survives_being_closed_and_reopened_from_the_file_alone() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-sidecar-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let ids: Vec<u64> = {
+            let c = TableBranchCatalog::open_sidecar(&path, 7).unwrap();
+            assert_eq!(c.get(BranchId::TRUNK).unwrap().root_page_id, 7, "trunk root not stored");
+            let mut ids = Vec::new();
+            // Enough to split the root, so the header page has to have tracked it.
+            for _ in 0..2000 {
+                ids.push(c.fork(BranchId::TRUNK, LeaseDeadline(500)).unwrap().branch_id.id);
+            }
+            c.pool.flush_all().expect("flush");
+            ids
+        };
+
+        let re = TableBranchCatalog::open_sidecar(&path, 7).unwrap();
+        assert_eq!(re.live_count().unwrap(), 2001, "trunk plus two thousand");
+        for id in &ids {
+            let rec = re.get(BranchId::new(*id, 0)).expect("branch lost across reopen");
+            assert_eq!(rec.parent_id, Some(BranchId::TRUNK));
+        }
+        // The id it mints next must not collide with one it just handed back.
+        let fresh = re.fork(BranchId::TRUNK, LeaseDeadline(500)).unwrap();
+        assert!(!ids.contains(&fresh.branch_id.id), "a reopened catalog reused a live id");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Opening a NON-empty file must never create a fresh catalog over it - that would orphan
+    /// every branch silently. The decision is made from the file length BEFORE `DiskManager::new`
+    /// writes a bitmap into it, which is the only moment the two cases are distinguishable.
+    #[test]
+    fn opening_an_existing_catalog_never_creates_a_fresh_one_over_it() {
+        let path = std::env::temp_dir()
+            .join(format!("ferro-sidecar-noclobber-{}.branchcat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            for _ in 0..5 {
+                c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+            }
+            c.pool.flush_all().unwrap();
+        }
+        for _ in 0..3 {
+            let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
+            assert_eq!(c.live_count().unwrap(), 6, "a reopen clobbered the catalog");
+            c.pool.flush_all().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
