@@ -1,0 +1,81 @@
+#!/bin/bash
+# PreCompact hook. Fires immediately BEFORE a compaction (auto or manual).
+#
+# It does NOT ask the session to remember anything — it BANKS the machine-readable half to disk
+# itself, so that half survives even if the session never got the chance to write a handoff. The
+# principle, taken from ~/projects/dbresearch where it was learned the hard way:
+# A REQUEST DELIVERED AS CONTEXT IS BEING DESTROYED IS NOT A GATE. A GATE IS ONE THAT RUNS.
+#
+# What stays the session's job is JUDGEMENT: what is live, which numbers must not be quoted, which
+# threads are open. Everything machine-extractable is extracted, not requested.
+#
+# Never fails the session: every command is bounded and errors are swallowed.
+set -u
+R=/Users/idide/projects/ferrodb
+A=/Users/idide/wt/artie-research
+OUT=$R/COMPACTION_STATE_AUTO.md
+
+STDIN_JSON=$(timeout 5 cat 2>/dev/null || true)
+TRANSCRIPT=$(printf '%s' "$STDIN_JSON" | timeout 5 python3 -c 'import sys,json
+try: print((json.load(sys.stdin) or {}).get("transcript_path","") or "")
+except Exception: print("")' 2>/dev/null)
+timeout 120 python3 "$R/.claude/hooks/precompact_prose.py" "$TRANSCRIPT" 2>&1 | tail -2
+PROSE_RC=${PIPESTATUS[0]:-9}
+
+{
+  echo "# AUTO-BANKED STATE, written by the PreCompact hook. NOT hand-written."
+  echo "# Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ') UTC / $(date '+%Y-%m-%d %H:%M %Z')"
+  echo "# The extracted prose half is COMPACTION_HANDOFF_<date>_AUTO.md — read that FIRST."
+  echo
+  echo "## ferrodb HEAD  (branch, and whether anything is uncommitted == unbanked == at risk)"
+  timeout 20 git -C "$R" log --oneline -8 2>/dev/null | sed 's/^/  /'
+  echo "  branch: $(timeout 10 git -C "$R" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  echo "  ahead of origin/main: $(timeout 20 git -C "$R" rev-list --count origin/main..HEAD 2>/dev/null)"
+  echo
+  echo "## ferrodb UNCOMMITTED at compaction time"
+  timeout 20 git -C "$R" status --porcelain 2>/dev/null | head -40 | sed 's/^/  /'
+  echo
+  echo "## artie-research HEAD  (the LEDGERS live here — it is a SEPARATE git repo)"
+  timeout 20 git -C "$A" log --oneline -6 2>/dev/null | sed 's/^/  /'
+  echo "  uncommitted:"
+  timeout 20 git -C "$A" status --porcelain 2>/dev/null | grep -v '^??' | head -20 | sed 's/^/  /'
+  echo
+  echo "## ★ THE SCALE LEDGER — the loop's ONLY memory. OPEN rows are the work."
+  echo "## A cron-launched pass reads this and nothing else, so an OPEN row that is really done,"
+  echo "## or a DONE row with no numbers in Evidence, misdirects every future pass."
+  timeout 20 grep -E '^\| (S[0-9]+|Row) ' "$A/SCALE-LEDGER.md" 2>/dev/null | cut -c1-240 | sed 's/^/  /'
+  echo
+  echo "## ★ THE LOOP — a cron job is HELD IN MEMORY and dies with this session."
+  echo "## CronList is the authority, never a tick in front of you. If CronList is empty, every"
+  echo "## tick you can see is withdrawn text and the correct action is to do NOTHING."
+  timeout 10 sed -n '/^| revision/,/^$/p' "$A/SCALE-LOOP.md" 2>/dev/null | sed 's/^/  /'
+  echo "  skill revision: $(grep -m1 '^# REVISION' "$HOME/.claude/skills/ferrodb-scale/SKILL.md" 2>/dev/null)"
+  echo
+  echo "## ★ MEASUREMENTS — the committed artifacts. Numbers quoted from anywhere else are recalled."
+  for f in "$R"/bench/*.txt; do
+    [ -f "$f" ] || continue
+    echo "  --- $(basename "$f") ---"
+    timeout 10 grep -E '^ *[0-9]+ \||x[0-9.]+|O\(N' "$f" 2>/dev/null | head -8 | sed 's/^/    /'
+  done
+  echo
+  echo "## RUNNING RIGHT NOW  (a suite or agent invisible to the next session is lost work)"
+  echo "  suites/builds:"
+  timeout 10 pgrep -fl 'cargo test|cargo build|verify-suite|go test' 2>/dev/null | grep -v pgrep | head -6 | cut -c1-110 | sed 's/^/    /'
+  echo "  agent worktrees with a live claude:"
+  for p in $(timeout 10 pgrep -f 'bin/claude' 2>/dev/null | head -20); do
+    c=$(timeout 5 lsof -a -p "$p" -d cwd -Fn 2>/dev/null | grep '^n' | cut -c2-)
+    case "$c" in /Users/idide/wt/ferrodb-*) echo "    $(basename "$c")";; esac
+  done
+  echo "  launchd jobs:"
+  timeout 10 launchctl list 2>/dev/null | grep -iE 'ferrodb|parkwatch|rotate' | sed 's/^/    /'
+  echo
+  echo "## ACCOUNT POOL at compaction time (a park is not a failure; an exhausted pool is)"
+  timeout 30 cswap list 2>/dev/null | grep -E '^ *[0-9]+:|5h:|7d:' | head -24 | sed 's/^/  /'
+} > "$OUT" 2>/dev/null
+
+if [ "${PROSE_RC:-9}" != "0" ]; then
+  echo "⛔ PreCompact: the PROSE extractor REFUSED (rc=${PROSE_RC:-9}). No dated handoff was written."
+  echo "⛔ Write the judgement half BY HAND THIS TURN — the automatic half is gone."
+fi
+echo "PreCompact: banked machine state to COMPACTION_STATE_AUTO.md; the extractable prose half (Ryan verbatim, last tool calls, agents dispatched) is in COMPACTION_HANDOFF_<date>_AUTO.md. STILL YOURS, because it cannot be extracted: which measurements are TRUSTED vs taken under contention; which claims were corrected and must not be repeated (this session corrected several — 'no database records reads', 'nobody gives you the reviewer', 'generational arenas are an insight'); the live cron id and what it runs; and any design decision made in conversation but not yet written to SCALE-DESIGN.md. A handoff carrying only method lets the next session run the machinery perfectly while repeating a claim that was already killed."
+exit 0
