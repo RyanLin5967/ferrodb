@@ -178,6 +178,31 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(Box::new(out.into_iter().map(Ok)))
     }
 
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        Ok(self.records.lock().unwrap().get(&parent_id).and_then(|r| r.live_children.last().copied()))
+    }
+
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        let records = self.records.lock().unwrap();
+        let Some(rec) = records.get(&parent_id) else { return Ok(false) };
+        Ok(!crate::branch::record::reclaimable(&rec.live_children, lo, hi))
+    }
+
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .get(&parent_id)
+            .map(|r| !r.live_children.is_empty())
+            .unwrap_or(false))
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut records = self.records.lock().unwrap();
         let mut rec = Self::lookup(&records, branch)?;

@@ -97,6 +97,33 @@ pub trait BranchCatalog: Send + Sync {
     fn scan(&self)
         -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError>;
 
+    /// The **latest** fork epoch among this id slot's live children, or `None` if it has none.
+    ///
+    /// Generation-blind, like `LogBranchCatalog::get_raw`, and takes a raw `u64` to say so: the
+    /// question is about an id SLOT's children, and the slot's owner may be mid-reap or already
+    /// reaped while its children still pin pages.
+    ///
+    /// Replaces `rec.live_children.last()`. The array it replaces is unbounded — trunk's would hold
+    /// 10⁶ epochs, 8 MB, in a record that must fit a 2 KB leaf page — and every question anyone
+    /// asks of it is a range query over `(parent, fork_epoch)`. See `SCALE-DESIGN.md` D2b.
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError>;
+
+    /// Does this id slot have **any** live child forked in `[lo, hi)`?
+    ///
+    /// **This is the reclamation rule.** A page born at `lo` and freed at `hi` may be reclaimed
+    /// exactly when the answer is `false`: no child forked in the window, so nobody but the owner
+    /// can see it. Half-open deliberately — a child that forked at the instant the page was freed
+    /// never saw it.
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError>;
+
+    /// Does this id slot have any live children at all? Replaces `rec.live_children.is_empty()`.
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError>;
+
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;
 

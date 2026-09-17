@@ -41,6 +41,21 @@ pub mod tag {
     /// over that array; here it is a range-emptiness question over the tree, which is the same
     /// question asked of a structure that can answer it without holding every parent resident.
     pub const CHILD: u8 = 0x03;
+    /// `[0x05][branch id]` → the serialized `CapabilityEnvelope`. **Sparse**: only governed
+    /// branches have one.
+    ///
+    /// Out of the record because it is variable-length and because `envelope_of` is already a
+    /// separate trait method — it exists so the write funnel, which asks on every statement, does
+    /// not clone the rest of the record. Splitting the storage the same way the query is already
+    /// split costs nothing and keeps the core record fixed-size.
+    pub const ENVELOPE: u8 = 0x05;
+    /// `[0x06][branch id][arena id]` → empty. The arenas a branch allocates novel pages from.
+    ///
+    /// **Not optional.** A leaf page holds about 2 KB of entries in total, and a branch that has
+    /// written ~230 MB owns ~900 arena ids — around 3.6 KB on its own. A record that can outgrow a
+    /// page is a wall with no error message, so the unbounded field becomes a key span, where the
+    /// only question anyone asks of it ("which arenas does this branch own?") is a range scan.
+    pub const ARENA: u8 = 0x06;
     /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
     ///
     /// In the tree rather than in the header on purpose: a free-id *list* in a fixed header is
@@ -160,6 +175,40 @@ pub fn children_in_epoch_range(parent_id: u64, lo_epoch: u64, hi_epoch: u64) -> 
     (child(parent_id, lo_epoch), child(parent_id, hi_epoch))
 }
 
+/// `[0x05][id]`
+pub fn envelope(id: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9);
+    k.push(tag::ENVELOPE);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `[0x06][branch][arena]`
+pub fn arena(branch_id: u64, arena_id: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(13);
+    k.push(tag::ARENA);
+    k.extend_from_slice(&branch_id.to_be_bytes());
+    k.extend_from_slice(&arena_id.to_be_bytes());
+    k
+}
+
+/// The half-open span covering every arena owned by `branch`.
+pub fn arenas_of(branch_id: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut lo = Vec::with_capacity(9);
+    lo.push(tag::ARENA);
+    lo.extend_from_slice(&branch_id.to_be_bytes());
+    let hi = match branch_id.checked_add(1) {
+        Some(next) => {
+            let mut h = Vec::with_capacity(9);
+            h.push(tag::ARENA);
+            h.extend_from_slice(&next.to_be_bytes());
+            h
+        }
+        None => vec![tag::ARENA + 1],
+    };
+    (lo, hi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,10 +261,13 @@ mod tests {
             ("state", state(0xFF, u64::MAX)),
             ("child", child(u64::MAX, u64::MAX)),
             ("free_id", free_id(u64::MAX)),
+            ("envelope", envelope(u64::MAX)),
+            ("arena", arena(u64::MAX, u32::MAX)),
         ];
         for (name, t) in
             [("record", tag::RECORD), ("deadline", tag::DEADLINE), ("state", tag::STATE),
-             ("child", tag::CHILD), ("free_id", tag::FREE_ID)]
+             ("child", tag::CHILD), ("free_id", tag::FREE_ID), ("envelope", tag::ENVELOPE),
+             ("arena", tag::ARENA)]
         {
             let (lo, hi) = whole_group(t);
             for (kname, k) in &keys {
@@ -267,6 +319,19 @@ mod tests {
         let (lo, hi) = whole_state(0xFF);
         assert!(state(0xFF, 7) >= lo && state(0xFF, 7) < hi);
         assert!(!(child(0, 0) >= lo && child(0, 0) < hi));
+    }
+
+    #[test]
+    fn an_arena_span_holds_one_branchs_arenas_and_survives_the_wrap() {
+        let (lo, hi) = arenas_of(5);
+        assert!(arena(5, 0) >= lo && arena(5, 0) < hi);
+        assert!(arena(5, u32::MAX) >= lo && arena(5, u32::MAX) < hi);
+        assert!(!(arena(4, u32::MAX) >= lo), "branch 4 must sort below branch 5's span");
+        assert!(!(arena(6, 0) < hi), "branch 6 must sort above branch 5's span");
+
+        let (lo, hi) = arenas_of(u64::MAX);
+        assert!(arena(u64::MAX, 7) >= lo && arena(u64::MAX, 7) < hi, "wrap emptied the span");
+        assert!(!(envelope(0) >= lo && envelope(0) < hi), "must not reach another group");
     }
 
     #[test]

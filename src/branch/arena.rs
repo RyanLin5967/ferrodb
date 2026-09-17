@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::branch::record::{reclaimable, ArenaExtent, BranchRecord, PendingFree};
+use crate::branch::record::{ArenaExtent, BranchRecord, PendingFree};
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, Epoch, PageId, ARENA_EXTENT_PAGES,
 };
@@ -55,10 +55,15 @@ use crate::wal::log::crc32;
 /// a child forked off this branch after the page was born (so that child has it too). The
 /// barrier is therefore the later of this branch's fork epoch and its most recent child's fork
 /// epoch, and it is what gets handed to [`PageHeader::is_private_to`].
-pub fn privacy_barrier(rec: &BranchRecord) -> Epoch {
-    match rec.live_children.last() {
-        Some(latest) => Epoch(rec.fork_epoch.0.max(latest.0)),
-        None => rec.fork_epoch,
+/// Takes the two epochs it actually depends on rather than a whole record, because the second one
+/// used to be `rec.live_children.last()` — the last element of an unbounded array that trunk would
+/// grow to 10⁶ entries. The question "what is my latest live child's fork epoch?" is one index
+/// lookup (`BranchCatalog::max_live_child`); materialising the array to take its last element is
+/// not. Pure, so it is testable without a catalog at all.
+pub fn privacy_barrier(fork_epoch: Epoch, max_live_child: Option<Epoch>) -> Epoch {
+    match max_live_child {
+        Some(latest) => Epoch(fork_epoch.0.max(latest.0)),
+        None => fork_epoch,
     }
 }
 
@@ -570,7 +575,14 @@ impl ArenaPageStore {
         for arena in rec.arenas.iter().copied() {
             for page_id in self.allocated_pages(arena) {
                 let birth = self.page_birth(page_id)?;
-                if reclaimable(&rec.live_children, birth, free_epoch) {
+                // The reclamation rule as an index question rather than an array walk: is
+                // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
+                // structure that can answer it without holding every child resident.
+                if !self.catalog.live_child_in_epoch_range(
+                    rec.branch_id.id,
+                    birth,
+                    free_epoch,
+                )? {
                     self.release_page(page_id, arena);
                     released += 1;
                 } else {
@@ -1036,7 +1048,7 @@ impl PageStore for ArenaPageStore {
         // Hard-errors on a reaped or mid-reap branch: never stale data.
         let rec = self.catalog.get(branch)?;
         let arena = self.arena_for(branch)?;
-        let barrier = privacy_barrier(&rec);
+        let barrier = privacy_barrier(rec.fork_epoch, self.catalog.max_live_child(rec.branch_id.id)?);
 
         let handle = self.read_page(page_id)?;
         let header = handle.header()?;
@@ -1081,24 +1093,30 @@ impl PageStore for ArenaPageStore {
             return Ok(());
         };
 
-        // The owner may be mid-reap or already reaped, and its `live_children` array is still
-        // the authority over this page, so read it raw rather than through the generation guard.
-        let owner_children = match self.catalog.get_raw(owner.id) {
-            Ok(rec) => Some(rec.live_children),
-            Err(_) => None,
-        };
+        // The owner may be mid-reap or already reaped and its children are still the authority
+        // over this page, so the query is generation-blind by construction: it takes an id slot,
+        // not a `BranchId`. An owner with no record at all answers `false` — nothing pins the page.
+        // An owner with no record at all pins nothing: the previous shape matched `None` into the
+        // same branch as "not pinned", so a missing owner and an unpinned page already behaved
+        // identically. `&&` short-circuits on the missing record, so the query is not asked of a
+        // slot that has none.
+        let pinned = self.catalog.get_raw(owner.id).is_ok()
+            && self.catalog.live_child_in_epoch_range(
+                owner.id,
+                header.birth_epoch,
+                free_epoch,
+            )?;
 
-        match owner_children {
-            Some(children) if !reclaimable(&children, header.birth_epoch, free_epoch) => {
-                self.state.lock().unwrap().pending.push(PendingFree {
-                    page_id,
-                    arena_id: arena,
-                    birth_epoch: header.birth_epoch,
-                    free_epoch,
-                    owner,
-                });
-            }
-            _ => self.release_page(page_id, arena),
+        if pinned {
+            self.state.lock().unwrap().pending.push(PendingFree {
+                page_id,
+                arena_id: arena,
+                birth_epoch: header.birth_epoch,
+                free_epoch,
+                owner,
+            });
+        } else {
+            self.release_page(page_id, arena);
         }
         Ok(())
     }
@@ -2107,11 +2125,19 @@ mod tests {
 
     #[test]
     fn privacy_barrier_is_the_later_of_own_fork_and_latest_child_fork() {
+        // Same rule, same asserted values. The call shape changed because the second argument is
+        // now the ONE epoch the rule depends on rather than an unbounded array to take the last of.
         let mut rec = BranchRecord::trunk(1, LeaseDeadline(0));
         rec.fork_epoch = Epoch(10);
-        assert_eq!(privacy_barrier(&rec), Epoch(10));
+        assert_eq!(privacy_barrier(rec.fork_epoch, None), Epoch(10));
         rec.add_live_child(Epoch(25));
         rec.add_live_child(Epoch(17));
-        assert_eq!(privacy_barrier(&rec), Epoch(25));
+        // `add_live_child` keeps the array sorted ascending, so `last()` is the LATEST fork -
+        // which is why 17 arriving after 25 must not move the barrier back.
+        assert_eq!(
+            privacy_barrier(rec.fork_epoch, rec.live_children.last().copied()),
+            Epoch(25)
+        );
+        assert_eq!(rec.live_children.last().copied(), Some(Epoch(25)), "array is not sorted");
     }
 }

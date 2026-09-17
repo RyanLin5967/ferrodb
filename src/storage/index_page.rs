@@ -254,6 +254,36 @@ impl BTreeSerialize for RecordId {
     }
 }
 
+/// Byte strings, for indexes whose key is a composite the caller encodes itself.
+///
+/// The branch catalog uses this for both key and value: one tree holds its records and every index
+/// over them, separated by a leading tag byte (`branch::tree_keys`). That works because `Vec<u8>`'s
+/// `Ord` is **lexicographic**, so a big-endian encoded integer sorts in numeric order and a range
+/// query over a tag prefix is a contiguous scan. See `SCALE-DESIGN.md` D2b.
+///
+/// Length-prefixed rather than delimited: a delimiter would have to be escaped out of the payload,
+/// and an encoded page id can contain any byte including a delimiter.
+impl BTreeSerialize for Vec<u8> {
+    fn serialize(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self);
+    }
+
+    fn deserialize(bytes: &[u8]) -> Result<(Self, usize), FerroError> where Self: Sized {
+        if bytes.len() < 4 {
+            return Err(FerroError::NotEnoughSpace);
+        }
+        let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        // A length that runs past the buffer is a torn or misaligned entry. Returning a truncated
+        // value would hand the caller a silently short record, which for a branch record means a
+        // deserialize error at best and a wrong root page id at worst.
+        if bytes.len() < 4 + len {
+            return Err(FerroError::NotEnoughSpace);
+        }
+        Ok((bytes[4..4 + len].to_vec(), 4 + len))
+    }
+}
+
 impl BTreeSerialize for () {
     fn serialize(&self, _: &mut Vec<u8>) {}
     fn deserialize(_: &[u8]) -> Result<(Self, usize), FerroError> where Self: Sized { Ok(((), 0)) }

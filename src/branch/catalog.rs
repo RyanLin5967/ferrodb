@@ -419,6 +419,32 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(Box::new(out.into_iter().map(Ok)))
     }
 
+    /// Answered from the in-memory `live_children` array this implementation already derives at
+    /// replay. That array is what the table catalog replaces with a key span; the queries are
+    /// declared on the trait so callers stop depending on the representation.
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        let st = self.state.read().unwrap();
+        Ok(st.records.get(&parent_id).and_then(|r| r.live_children.last().copied()))
+    }
+
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        let st = self.state.read().unwrap();
+        let Some(rec) = st.records.get(&parent_id) else { return Ok(false) };
+        // `!reclaimable` is exactly "a live child forked in [lo, hi)". Expressed through the same
+        // function so the two can never drift apart.
+        Ok(!crate::branch::record::reclaimable(&rec.live_children, lo, hi))
+    }
+
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        let st = self.state.read().unwrap();
+        Ok(st.records.get(&parent_id).map(|r| !r.live_children.is_empty()).unwrap_or(false))
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut rec = self.get(branch)?;
         rec.lease_deadline = lease;
@@ -847,6 +873,50 @@ mod tests {
             sorted.sort_unstable();
             assert_eq!(ids, sorted, "{name} came back in hash order");
         }
+    }
+
+    /// The three queries that replace `live_children` as an array. They are the reclamation rule
+    /// and the privacy barrier, so they get asserted directly rather than only through the arena.
+    #[test]
+    fn the_live_child_queries_answer_the_rule_the_array_used_to() {
+        let c = cat();
+        // Children of trunk at successive fork epochs.
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let d = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        assert!(a.fork_epoch < b.fork_epoch && b.fork_epoch < d.fork_epoch, "fixture ordering");
+
+        // max_live_child is the LATEST, which is what the privacy barrier depends on.
+        assert_eq!(c.max_live_child(BranchId::TRUNK.id).unwrap(), Some(d.fork_epoch));
+        assert_eq!(c.max_live_child(a.branch_id.id).unwrap(), None, "a leaf has no children");
+        assert!(c.has_live_children(BranchId::TRUNK.id).unwrap());
+        assert!(!c.has_live_children(a.branch_id.id).unwrap());
+
+        // The reclamation rule, half-open: a page born at `lo` and freed at `hi` is pinned exactly
+        // when some live child forked inside [lo, hi).
+        let t = BranchId::TRUNK.id;
+        assert!(
+            c.live_child_in_epoch_range(t, a.fork_epoch, Epoch(a.fork_epoch.0 + 1)).unwrap(),
+            "a child forked exactly at lo is INSIDE a half-open [lo, hi)"
+        );
+        assert!(
+            !c.live_child_in_epoch_range(t, d.fork_epoch, d.fork_epoch).unwrap(),
+            "an empty window pins nothing"
+        );
+        assert!(
+            !c.live_child_in_epoch_range(t, Epoch(d.fork_epoch.0 + 1), Epoch(d.fork_epoch.0 + 99))
+                .unwrap(),
+            "a window entirely after every child pins nothing"
+        );
+        assert!(
+            c.live_child_in_epoch_range(t, a.fork_epoch, Epoch(d.fork_epoch.0 + 1)).unwrap(),
+            "a window spanning every child is pinned"
+        );
+
+        // A slot with no record answers false rather than erroring: nothing pins the page.
+        assert!(!c.live_child_in_epoch_range(9_999, Epoch(0), Epoch(u64::MAX)).unwrap());
+        assert_eq!(c.max_live_child(9_999).unwrap(), None);
+        assert!(!c.has_live_children(9_999).unwrap());
     }
 
     /// The narrowed surface exists to make a selective question selective. These assert the
