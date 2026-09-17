@@ -15,11 +15,57 @@ R=/Users/idide/projects/ferrodb
 A=/Users/idide/wt/artie-research
 OUT=$R/COMPACTION_STATE_AUTO.md
 
-STDIN_JSON=$(timeout 5 cat 2>/dev/null || true)
-TRANSCRIPT=$(printf '%s' "$STDIN_JSON" | timeout 5 python3 -c 'import sys,json
-try: print((json.load(sys.stdin) or {}).get("transcript_path","") or "")
-except Exception: print("")' 2>/dev/null)
-timeout 120 python3 "$R/.claude/hooks/precompact_prose.py" "$TRANSCRIPT" 2>&1 | tail -2
+# FIXED 2026-09-17, AFTER THIS HOOK'S FIRST REAL FIRING LOST THE PROSE HALF.
+#
+# At 13:08:06 the hook fired for a genuine compaction and the extractor refused with "no
+# transcript path handed to the PreCompact hook": stdin carried nothing. The fire-check six
+# minutes earlier had PIPED a payload in and passed -- proving only that the PARSER works. The
+# instrument was never once tested on the input it actually receives, which is the recorded
+# house failure: a detector that has not been made to fire on the real thing is not a result.
+#
+# Three changes, ordered by how far each is trusted:
+#   1. RECORD THE RAW PAYLOAD. Why stdin was empty is still UNKNOWN, and guessing at a cause is
+#      how the broken version got written. The next firing leaves evidence instead of a theory.
+#   2. session_id is an EXACT second source -- <project slug>/<session_id>.jsonl is the
+#      transcript's real name -- so it is used whenever transcript_path is missing. Not a guess.
+#   3. newest-recently-written .jsonl IS a guess, is bounded to 15 minutes, and is LABELLED so
+#      the handoff itself warns that the words in it may belong to another ferrodb session.
+# `cat` is no longer wrapped in `timeout 5`: if the harness holds the pipe open, a 5s kill turns
+# a slow payload into an empty one -- the very failure being fixed. The hook's own 60s timeout
+# in settings.json bounds it.
+TDIR="$HOME/.claude/projects/-Users-idide-projects-ferrodb"
+DBG="$R/.claude/hooks/.last_precompact_payload.json"
+
+STDIN_JSON=$(cat 2>/dev/null || true)
+{ printf '%s' "$STDIN_JSON"
+  printf '\n--- received %s, %s bytes ---\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${#STDIN_JSON}"
+} > "$DBG" 2>/dev/null
+
+FIELDS=$(printf '%s' "$STDIN_JSON" | timeout 10 python3 -c 'import sys,json
+try: d = json.load(sys.stdin) or {}
+except Exception: d = {}
+print(d.get("transcript_path") or "")
+print(d.get("session_id") or "")' 2>/dev/null)
+TRANSCRIPT=$(printf '%s\n' "$FIELDS" | sed -n 1p)
+SESSION_ID=$(printf '%s\n' "$FIELDS" | sed -n 2p)
+
+SRC=payload
+if [ -z "$TRANSCRIPT" ] || [ ! -s "$TRANSCRIPT" ]; then
+  if [ -n "$SESSION_ID" ] && [ -s "$TDIR/$SESSION_ID.jsonl" ]; then
+    TRANSCRIPT="$TDIR/$SESSION_ID.jsonl"; SRC=session_id
+  else
+    CAND=$(find "$TDIR" -maxdepth 1 -name '*.jsonl' -mmin -15 2>/dev/null \
+           | while read -r f; do printf '%s %s\n' "$(stat -f %m "$f" 2>/dev/null)" "$f"; done \
+           | sort -rn | head -1 | cut -d' ' -f2-)
+    if [ -n "$CAND" ] && [ -s "$CAND" ]; then
+      TRANSCRIPT="$CAND"; SRC=GUESS-newest-recent
+    else
+      TRANSCRIPT=""; SRC=NONE
+    fi
+  fi
+fi
+echo "PreCompact: stdin=${#STDIN_JSON}B transcript source=$SRC path=${TRANSCRIPT:-<none>}"
+timeout 180 python3 "$R/.claude/hooks/precompact_prose.py" "$TRANSCRIPT" "$SRC" 2>&1 | tail -3
 PROSE_RC=${PIPESTATUS[0]:-9}
 
 {

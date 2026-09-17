@@ -11,6 +11,50 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/idide/projects/ferrodb/.claude/hooks/sessionstart_handoff.sh",
+            "timeout": 130
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/idide/projects/ferrodb/.claude/hooks/sessionstart_handoff.sh",
+            "timeout": 130
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/idide/projects/ferrodb/.claude/hooks/sessionstart_handoff.sh",
+            "timeout": 130
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/idide/projects/ferrodb/.claude/hooks/pretooluse_handoff_read.sh",
+            "timeout": 90
+          }
+        ]
+      }
     ]
   }
 }

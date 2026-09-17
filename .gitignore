@@ -66,3 +66,8 @@ plan.txt
 PROGRESS.md
 source.json
 target
+.claude/hooks/.sessionstart_full.txt
+.claude/hooks/.sessionstart_sentinel
+.claude/hooks/.handoff_read.*
+.claude/hooks/.last_precompact_payload.json
+COMPACTION_HANDOFF_*.md

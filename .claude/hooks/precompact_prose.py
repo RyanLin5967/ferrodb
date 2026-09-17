@@ -17,7 +17,7 @@ a summary loses first:
 It REFUSES (exit 2, loud banner in the file) rather than writing a quiet empty handoff:
 a run that collected nothing has not passed.
 """
-import json, os, re, sys, datetime
+import io, json, os, re, sys, datetime
 
 ROOT = "/Users/idide/projects/ferrodb"
 TAIL_BYTES = 40_000_000          # transcripts here reach 328 MB; never parse the whole file
@@ -28,13 +28,43 @@ def main():
     tp = sys.argv[1] if len(sys.argv) > 1 else ""
     today = datetime.date.today().isoformat()
     out = os.path.join(ROOT, "COMPACTION_HANDOFF_%s_AUTO.md" % today)
+    src = sys.argv[2] if len(sys.argv) > 2 else "unknown"
+
+    def refuse(why):
+        """A refusal must REPLACE the handoff file, never append to it.
+
+        MEASURED 2026-09-17 13:08:06, on this hook's FIRST REAL FIRING. The old code appended
+        its banner, so the file kept the header of an earlier successful run --
+        "# HANDOFF 2026-09-17 -- THE PROSE HALF" -- while the refusal sat 11 KB below it. The
+        top of a file is what a reader reads. A stale handoff advertising itself as current is
+        strictly WORSE than no handoff: the next session acts on six-minute-old tool calls
+        believing they are live. So rotate the stale file out from under the canonical name and
+        leave that name holding nothing but the refusal.
+        """
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        rotated = None
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            rotated = out[:-3] + ".STALE-" + stamp.replace(":", "") + ".md"
+            try:
+                os.rename(out, rotated)
+            except Exception:
+                rotated = None
+        with io.open(out, "w", encoding="utf-8") as f:
+            f.write(u"# REFUSED %s - NO PROSE HANDOFF WAS EXTRACTED FOR THIS COMPACTION.\n" % stamp)
+            f.write(u"# %s\n" % why)
+            f.write(u"# transcript source, as resolved by the shell hook: %s\n" % src)
+            f.write(u"#\n# THIS IS A BLOCKER, NOT A CLEAN RUN. The verbatim words, the last tool\n")
+            f.write(u"# calls and the live agents for THIS compaction do not exist anywhere else.\n")
+            f.write(u"# Reconstruct them from the transcript by hand THIS TURN, before acting.\n")
+            if rotated:
+                f.write(u"#\n# An EARLIER handoff was rotated out of the way to:\n#   %s\n" % rotated)
+                f.write(u"# It describes a DIFFERENT compaction. Do not read it as current state.\n")
+            f.write(u"# Raw payload this hook received: %s\n"
+                    % os.path.join(ROOT, ".claude/hooks/.last_precompact_payload.json"))
+        return 2
 
     if not tp or not os.path.exists(tp):
-        with open(out, "a", encoding="utf-8") as f:
-            f.write("\n# REFUSED %s: no transcript path handed to the PreCompact hook.\n"
-                    "# The prose half could not be extracted. This is a BLOCKER, not a clean run.\n"
-                    % datetime.datetime.now().isoformat(timespec="seconds"))
-        return 2
+        return refuse("No usable transcript path reached the extractor (arg was %r)." % tp)
 
     size = os.path.getsize(tp)
     with open(tp, "rb") as f:
@@ -91,11 +121,8 @@ def main():
 
     # FORCED-FIRE DISCIPLINE: an empty extraction is a refusal, never a quiet clean handoff.
     if not users and not tools:
-        with open(out, "a", encoding="utf-8") as f:
-            f.write("\n# REFUSED %s: parsed %d transcript rows and extracted ZERO user messages\n"
-                    "# AND ZERO tool calls. That is an instrument failure, not a quiet session.\n"
-                    % (datetime.datetime.now().isoformat(timespec="seconds"), len(rows)))
-        return 2
+        return refuse("Parsed %d transcript rows and extracted ZERO user messages AND ZERO "
+                      "tool calls. That is an instrument failure, not a quiet session." % len(rows))
 
     # ⛔ A HOLE CLOSED THE SAME HOUR IT WAS OPENED: SessionStart picks the handoff by `ls -1t`,
     # so this regenerated file would outrank a HAND-WRITTEN handoff for the same day every time,
@@ -122,6 +149,11 @@ def main():
     A("# Generated %s from the last %d MB of %s (%d rows parsed)."
       % (datetime.datetime.now().isoformat(timespec="seconds"), TAIL_BYTES // 1_000_000,
          os.path.basename(tp), len(rows)))
+    A("# Transcript resolved via: %s" % src)
+    if "GUESS" in src:
+        A("# \u26d4 THAT SOURCE IS A GUESS. The hook could not get a transcript path from its own")
+        A("# \u26d4 payload and fell back to the newest recently-written transcript for this")
+        A("# \u26d4 project. If another ferrodb session was live, THESE ARE ITS WORDS, NOT YOURS.")
     A("# ⚠ This is EXTRACTED, not summarised. It carries no judgement and no state claims.")
     A("# The machine half is COMPACTION_STATE_AUTO.md. Read both.")
     A("")
