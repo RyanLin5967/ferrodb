@@ -12,10 +12,14 @@
 //!
 //!   cargo run --release --example fork_concurrency -- [N] [T,T,T]
 //!
-//! CALIBRATION, per the standing rule that an instrument which cannot move is not an instrument:
-//! the harness also times the same N forks with the fsync suppressed (FERRODB_FORK_NOSYNC=1). If
-//! that arm is not dramatically faster, the bottleneck is NOT the fsync and every conclusion drawn
-//! from this harness about durability is wrong.
+//! CALIBRATION. The harness reports FORKS PER FSYNC alongside throughput, which is the direct
+//! evidence that batching is happening at all: at one fork per fsync nothing is being shared, and
+//! a rising ratio is group commit working. It also settles where the bottleneck is once throughput
+//! plateaus — if forks/fsync keeps climbing while forks/sec does not, the fsync is no longer the
+//! limit and the remaining cost is the tree mutations under `logical`.
+//! (An earlier draft of this comment promised an env var that SKIPPED the fsync. That was not
+//! built, deliberately: a durability bypass sitting in production code is a footgun, and a counter
+//! answers the same question without one.)
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -51,7 +55,7 @@ fn main() {
     println!("D6: fork throughput vs concurrency. N={n} forks per arm, TableBranchCatalog, release.");
     println!("Recorded {}. One run per cell.", chrono_ish());
     println!();
-    println!("  threads   forks     seconds    forks/sec   per-fork ms");
+    println!("  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync");
 
     for &t in &threads {
         let cat = open_catalog(&dir, &format!("t{t}"));
@@ -71,9 +75,11 @@ fn main() {
             }
         });
         let secs = t0.elapsed().as_secs_f64();
+        let syncs = cat.syncs_issued();
         println!(
-            "  {:7}   {:7}   {:8.3}   {:9.1}   {:8.3}",
-            t, total, secs, total as f64 / secs, secs * 1000.0 / total as f64
+            "  {:7}   {:7}   {:8.3}   {:9.1}   {:8.3}   {:6}   {:9.1}",
+            t, total, secs, total as f64 / secs, secs * 1000.0 / total as f64,
+            syncs, total as f64 / syncs.max(1) as f64
         );
     }
     println!();

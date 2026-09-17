@@ -27,6 +27,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::branch::group_commit::CommitGroup;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
@@ -59,6 +60,10 @@ pub struct TableBranchCatalog {
     /// The root page id last written to the header page, so a mutation that did not split the root
     /// costs one atomic compare rather than a page write.
     published_root: std::sync::atomic::AtomicU32,
+    /// One fsync shared by every writer waiting on it. See `group_commit`: forks used to hold
+    /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
+    /// (measured x0.92, `bench/fork_concurrency_before.txt`).
+    commit_group: CommitGroup,
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -314,10 +319,35 @@ impl TableBranchCatalog {
     /// **That also means the earlier benchmark's "6x less total time" was partly the cost of not
     /// being durable.** The bench artifact said time was not comparable between the two catalogs;
     /// it is now comparable, and the honest number is measured rather than assumed.
-    fn commit(&self) -> Result<(), FerroError> {
+    /// fsyncs issued by this catalog. Exposed so a benchmark can report forks-per-fsync, which is
+    /// the only direct evidence that group commit is batching rather than merely not-regressing.
+    pub fn syncs_issued(&self) -> u64 {
+        self.commit_group.syncs()
+    }
+
+    /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
+    /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
+    /// earlier would let the group's leader mark work durable whose pages were never written.
+    fn stage(&self) -> Result<u64, FerroError> {
         self.publish_root()?;
-        self.pool.flush_all()?;
-        self.pool.disk_manager.sync()
+        Ok(self.commit_group.ticket())
+    }
+
+    /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
+    /// One waiter issues the sync and the rest share it, which is the entire point: holding the
+    /// lock here would put the serialization straight back.
+    fn durable(&self, seq: u64) -> Result<(), FerroError> {
+        self.commit_group.wait_durable(seq, || {
+            self.pool.flush_all()?;
+            self.pool.disk_manager.sync()
+        })
+    }
+
+    /// Stage and wait, for the callers that are NOT holding the logical lock across a mutation.
+    /// Kept so `open`/migration paths read the same as before; it is exactly `stage` then `durable`.
+    fn commit(&self) -> Result<(), FerroError> {
+        let seq = self.stage()?;
+        self.durable(seq)
     }
 
     /// Write the current tree root into the header page, if it moved.
@@ -364,6 +394,7 @@ impl TableBranchCatalog {
             epoch: AtomicU64::new(0),
             pool,
             header_page: std::sync::atomic::AtomicU32::new(0),
+            commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
@@ -386,6 +417,7 @@ impl TableBranchCatalog {
             epoch: AtomicU64::new(1),
             pool,
             header_page: std::sync::atomic::AtomicU32::new(0),
+            commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
@@ -625,7 +657,11 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
         let fork_epoch = self.next_epoch();
-        let _g = self.logical.lock().unwrap();
+        // The lock covers every TREE MUTATION and nothing else. It is dropped before the fsync, so
+        // concurrent forkers share one disk round-trip instead of queueing for private ones. See
+        // `group_commit` for why the ticket is taken last.
+        let (child, seq) = {
+            let _g = self.logical.lock().unwrap();
 
         // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
         // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
@@ -667,10 +703,13 @@ impl BranchCatalog for TableBranchCatalog {
         // whether it is still live. See `live_child_at` for why the entry is only a hint.
         self.tree
             .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
-        self.write_header()?;
-        // Last, so the header page never names a root whose pages are not written yet, and
-        // durable before the caller is told the fork happened.
-        self.commit()?;
+            self.write_header()?;
+            // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
+            // point necessarily covers this fork.
+            (child, self.stage()?)
+        };
+        // Durable before the caller is told the fork happened -- but shared, not private.
+        self.durable(seq)?;
         Ok(child)
     }
 

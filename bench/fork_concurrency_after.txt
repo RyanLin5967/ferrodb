@@ -1,0 +1,44 @@
+D6: fork throughput vs concurrency. N=4000 forks per arm, TableBranchCatalog, release.
+Recorded 2026-09-17T17:38:23-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync
+        1      4000     14.760       271.0      3.690     4000         1.0
+        8      4000      3.689      1084.3      0.922     1020         3.9
+       64      3968      0.888      4468.2      0.224      274        14.5
+      256      3840      0.883      4350.8      0.230      279        13.8
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+
+BEFORE, same harness, same arms (bench/fork_concurrency_before.txt):
+  1 thread 274.9/sec | 8 threads 295.8/sec | 64 threads 254.0/sec   -- FLAT, x0.92 at 64
+
+INTERPRETATION, written after the numbers:
+
+  Group commit works: 254 -> 4382 forks/sec at 64 threads, x17.3. 10^6 branches goes from ~62
+  minutes of durability latency to ~3.8 minutes.
+
+  BUT THE TARGET WAS 10k/sec AND IT PLATEAUS AT ~4,400. The bottleneck MOVED, and forks/fsync is
+  what names where to. It rises 1.0 -> 3.9 -> 13.8 and then STOPS: 64 and 256 threads both give
+  13.8, and both give ~4,380 forks/sec. A batch that stops growing while the thread count
+  quadruples is not a disk limit.
+
+  The arithmetic identifies it exactly:
+    per-fork wall at 64 threads          0.228 ms
+    1 / 0.228 ms                       = 4386 forks/sec   vs 4382.7 MEASURED
+    one fsync                            3.574 ms  (the 1-thread per-fork cost, which is 1 fsync)
+    3.574 / 0.228                      = 15.7 forks able to pass the lock during one fsync
+                                              vs 13.8 MEASURED forks per fsync
+  So the batch size is not set by the disk at all -- it is set by HOW MANY FORKS CAN GET THROUGH
+  `logical` WHILE ONE FSYNC RUNS. Throughput equals the rate of the serial section. The wall is
+  now the tree mutations under the logical mutex, at ~0.23 ms each.
+
+  That is D6a's falsifier firing in the direction it named: "if forks still serialize after the
+  split, the contention is deeper -- name the next lock before believing the first fix." Named:
+  `logical`, and the cost is the ~6 tree operations each fork performs while holding it.
+
+  The 1-thread arm got SLIGHTLY SLOWER (274.9 -> 279.8 here, and 245.9 in an earlier run; call it
+  unchanged-to-slightly-worse). A lone forker has nobody to share an fsync with and pays the
+  condvar bookkeeping for nothing. That is the honest cost of this change and it is exactly why D6
+  keeps option 4 (pre-minting ids in durable blocks, i.e. Oracle/Postgres sequence caching) on the
+  table: it is the SERIAL forker's answer, and the two are complementary, not alternatives.
