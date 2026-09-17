@@ -67,9 +67,9 @@ impl Db {
 
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
         let reaper =
-            Arc::new(TwoTierReaper::new(Arc::clone(&branches), Arc::clone(&store)));
+            Arc::new(TwoTierReaper::new(Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store)));
         let runtime = Arc::new(
             AgentRuntime::with_storage(
                 Arc::clone(&branches) as Arc<dyn BranchCatalog>,
@@ -1144,14 +1144,14 @@ fn a_reaper_wired_to_a_different_catalog_is_caught_at_the_first_seal() {
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
         (bp, branches, store)
     };
     let (bp_a, cat_a, store_a) = mk("a.db");
     let (_bp_b, cat_b, store_b) = mk("b.db");
 
     // The reaper belongs to catalog B; the runtime to catalog A.
-    let wrong = Arc::new(TwoTierReaper::new(Arc::clone(&cat_b), Arc::clone(&store_b)));
+    let wrong = Arc::new(TwoTierReaper::new(Arc::clone(&cat_b) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store_b)));
     let rt = AgentRuntime::with_storage(
         Arc::clone(&cat_a) as Arc<dyn BranchCatalog>,
         Arc::new(MemEffectLog::new()),

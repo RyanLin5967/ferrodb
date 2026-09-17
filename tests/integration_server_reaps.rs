@@ -361,7 +361,7 @@ fn arena_state(db: &Path) -> ArenaState {
     let branches =
         Arc::new(LogBranchCatalog::open(&side(db, "branches"), 1).expect("branch catalog"));
     let store =
-        ArenaPageStore::reopen_from_checkpoint(bp, Arc::clone(&branches), &side(db, "arena"))
+        ArenaPageStore::reopen_from_checkpoint(bp, Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, &side(db, "arena"))
             .expect("reattach to the arena");
     ArenaState {
         live: store.live_page_count().expect("live page count"),
@@ -744,7 +744,7 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
     let bp = Arc::new(BufferPoolManager::new(dm));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
     let base = bp.disk_manager.high_water().unwrap() + HEADROOM;
-    let store = Arc::new(ArenaPageStore::new(bp, Arc::clone(&catalog), base).unwrap());
+    let store = Arc::new(ArenaPageStore::new(bp, Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).unwrap());
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
@@ -754,7 +754,7 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
         .unwrap(),
     );
     let reaper = Arc::new(
-        TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store))
+        TwoTierReaper::new(Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store))
             .with_links(Arc::new(CowPageLinks) as Arc<dyn PageLinks>),
     );
 

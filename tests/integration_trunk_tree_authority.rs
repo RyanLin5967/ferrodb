@@ -73,7 +73,7 @@ fn db(tag: &str) -> Db {
     let branches =
         Arc::new(LogBranchCatalog::open(&dir.path().join(format!("{tag}.branches")), 1).unwrap());
     let base = bp.disk_manager.high_water().unwrap() + 256;
-    let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), base).unwrap());
+    let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).unwrap());
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             branches.clone() as Arc<dyn BranchCatalog>,

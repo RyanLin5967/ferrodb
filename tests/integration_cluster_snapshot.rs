@@ -92,7 +92,7 @@ fn engine_at(dir: &Path, tag: &str, fresh: bool) -> (Engine, Box<PageStoreSnapsh
     let branch_catalog = dir.join(format!("{tag}.branches"));
     let branches = Arc::new(LogBranchCatalog::open(&branch_catalog, 1).unwrap());
     let arenas =
-        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&branches), ARENA_BASE).unwrap());
+        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
 
     let paths = StorePaths {
         page_file: page_file.clone(),

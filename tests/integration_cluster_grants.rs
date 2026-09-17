@@ -60,7 +60,7 @@ fn store(tag: &str) -> Store {
     let pool = Arc::new(BufferPoolManager::new(Arc::clone(&dm)));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
     let store =
-        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), ARENA_BASE).unwrap());
+        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
     Store { store, catalog, _dir: dir }
 }
 
@@ -154,7 +154,7 @@ fn a_node_with_no_cluster_configured_reads_its_own_wall_clock_for_leases() {
 fn a_standalone_node_reaps_on_its_own_clock_exactly_as_before() {
     let _scope = ClusterScope::standalone();
     let s = store("solo_reap");
-    let reaper = TwoTierReaper::new(Arc::clone(&s.catalog), Arc::clone(&s.store));
+    let reaper = TwoTierReaper::new(Arc::clone(&s.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&s.store));
 
     let b = s.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(10_000)).unwrap();
     assert!(
@@ -402,7 +402,7 @@ fn two_nodes_at_the_same_tick_agree_about_whether_a_branch_is_live() {
 #[test]
 fn a_replicated_tick_and_not_the_wall_clock_decides_a_reap() {
     let s = store("cluster_reap");
-    let reaper = TwoTierReaper::new(Arc::clone(&s.catalog), Arc::clone(&s.store));
+    let reaper = TwoTierReaper::new(Arc::clone(&s.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&s.store));
     let _scope = ClusterScope::joined(N1);
 
     // A tick deliberately far from any real wall clock. If anything here read `SystemTime::now()`
@@ -548,7 +548,7 @@ fn a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued() 
             )
             .unwrap(),
         ))),
-        Arc::clone(&s.catalog),
+        Arc::clone(&s.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
         &path,
     )
     .unwrap();
@@ -883,6 +883,6 @@ fn the_three_appliers_take_exactly_the_frozen_commands_shape() {
 fn the_reaper_trait_is_the_path_under_test() {
     let _scope = ClusterScope::standalone();
     let s = store("trait_path");
-    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(Arc::clone(&s.catalog), Arc::clone(&s.store)));
+    let reaper: Arc<dyn Reaper> = Arc::new(TwoTierReaper::new(Arc::clone(&s.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&s.store)));
     assert!(reaper.reap_expired(LeaseDeadline::now_millis()).unwrap().is_empty());
 }

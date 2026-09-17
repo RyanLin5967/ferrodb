@@ -55,8 +55,8 @@ impl Db {
         bp.attach_wal(wal);
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
-        let reaper = Arc::new(TwoTierReaper::new(Arc::clone(&branches), Arc::clone(&store)));
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
+        let reaper = Arc::new(TwoTierReaper::new(Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store)));
         let runtime = Arc::new(
             AgentRuntime::with_storage(
                 Arc::clone(&branches) as Arc<dyn BranchCatalog>,

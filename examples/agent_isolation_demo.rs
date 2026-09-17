@@ -198,7 +198,7 @@ fn page_env(tag: &str) -> PageEnv {
     // otherwise both allocators hand out the same pages. Ask the bitmap, don't guess.
     let base = pool.disk_manager.high_water().expect("high water mark");
     let store = Arc::new(
-        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).expect("arena store"),
+        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena store"),
     );
     println!(
         "  page store ready: 4KB pages, arena extents of {} pages, arena floor at page {}",
@@ -309,7 +309,7 @@ root page id is the parent's. Measured with PageStore::live_page_count on a real
 fn criterion_8_lease_reaping(led: &mut Ledger) {
     criterion(8, "*** THE THESIS *** branches abandoned with NO client cooperation are reaped");
     let env = page_env("c8");
-    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog), Arc::clone(&env.store))
+    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&env.store))
         .with_links(Arc::new(CowPageLinks));
 
     // The baseline must NOT be an empty database. "Page count returns to baseline" is trivially
@@ -547,7 +547,7 @@ impl Db {
         );
         let base = bp.disk_manager.high_water().expect("high water") + 256;
         let store = Arc::new(
-            ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone(), base)
+            ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base)
                 .expect("arena"),
         );
         let runtime = Arc::new(
