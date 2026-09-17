@@ -1,0 +1,44 @@
+D1-catalog-table: TableBranchCatalog vs LogBranchCatalog, same harness, same workload.
+Recorded 2026-09-17. Instrument: examples/durable_fork, release build, one run per cell.
+RESIDENCY ARM: FERRODB_SKIP_REOPEN=1 throughout, so exactly ONE catalog is resident and the
+harness's own reopen-while-alive artifact (see bench/o1_residency_ab_64k.txt) is excluded.
+
+peak RSS, bytes            N=8000      N=16000     N=32000     N=64000
+  LogBranchCatalog        7634944     11534336    21331968    43237376
+  TableBranchCatalog      7340032      7651328     7897088     8192000
+
+  marginal RSS per branch, 8000 -> 64000:
+    log    (43237376 - 7634944) / 56000 = 636 B/branch   (rising: 488 -> 613 -> 685 per step)
+    table  ( 8192000 - 7340032) / 56000 =  15.2 B/branch
+
+on-disk bytes              N=8000      N=16000     N=32000     N=64000
+  LogBranchCatalog         544000      1088000     2176000     4352000     =  68 B/branch
+  TableBranchCatalog      1994752      3997696     7999488    16011264     = 250 B/branch
+
+total seconds              N=8000      N=16000     N=32000     N=64000
+  TableBranchCatalog        0.704        1.426       2.894       5.993
+
+REOPEN ARM (separate run, reopen enabled):
+  N       log_reopen_s   table_reopen_s
+  8000       0.002          0.000009
+  16000      0.004          0.000010
+
+UNINTERPRETED NOTES, and the caveats are not decoration:
+
+1. TOTAL TIME IS NOT COMPARABLE between the two arms and no ratio should be quoted from it. The
+   log catalog fsyncs every append; the table catalog writes through the buffer pool and is
+   flushed once at the end. Equalise durability before comparing seconds.
+2. DISK IS 3.7x LARGER and that is inherent, not a defect to fix later: each branch writes four
+   entries (core record, state, deadline, child) instead of one 68-byte log record, and a B+tree
+   carries page fill factor on top. Predicted ~136 B of entries at ~50% fill = ~270; measured 250.
+3. The residency marginal is no longer "one record resident per branch". 15.2 B/branch is page
+   table bookkeeping over a file that grew 4x; it is not a smaller version of the same term.
+4. 10^6 is NOT MEASURED. Extrapolating the marginals gives ~636 MB for the log and ~15 MB for the
+   table, and an extrapolation is not a measurement.
+5. AN EARLIER VERSION OF THIS CURVE WAS WRONG AND LOOKED BETTER. The first table-arm run reported
+   a perfectly flat 7.09/7.16/7.09/7.13 MB. It was flat because the process PANICKED a few
+   thousand forks in - `range end index 4100 out of range for slice of length 4096`, an internal
+   B+tree node overflowing its page - so the same startup cost was measured four times. The
+   pipeline's exit status came from the trailing grep, so nothing failed loudly. The harness loop
+   now REFUSES when a run produces no data line. The bug is fixed in 549b9a7 and is pre-existing:
+   it is reachable by any user table with enough rows.
