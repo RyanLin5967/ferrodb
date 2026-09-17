@@ -343,12 +343,10 @@ impl TableBranchCatalog {
         })
     }
 
-    /// Stage and wait, for the callers that are NOT holding the logical lock across a mutation.
-    /// Kept so `open`/migration paths read the same as before; it is exactly `stage` then `durable`.
-    fn commit(&self) -> Result<(), FerroError> {
-        let seq = self.stage()?;
-        self.durable(seq)
-    }
+    // `commit()` (stage + durable in one call) was DELETED once every caller had been migrated.
+    // It was the only remaining way to fsync while still holding `logical`, which is exactly the
+    // serialization group commit exists to remove -- so leaving it would have left a second, worse
+    // way to do the same thing, and the next method added would have reached for the shorter name.
 
     /// Write the current tree root into the header page, if it moved.
     ///
@@ -734,7 +732,11 @@ impl BranchCatalog for TableBranchCatalog {
         let _g = self.logical.lock().unwrap();
         let old = self.core(record.branch_id.id)?;
         self.write_record(record, old.as_ref())?;
-        self.commit()
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
@@ -756,7 +758,11 @@ impl BranchCatalog for TableBranchCatalog {
         let mut rec = self.hydrate(core)?;
         rec.root_page_id = root;
         self.write_record(&rec, Some(&old))?;
-        self.commit()
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
@@ -887,7 +893,13 @@ impl BranchCatalog for TableBranchCatalog {
         };
         if reusable {
             let _ = self.upsert(keys::free_id(id), Vec::new());
-            let _ = self.commit();
+            // Same as the others: release the lock before the fsync. Errors stay swallowed
+            // to match the log catalog's signature -- a failure here leaks an id slot,
+            // which is recoverable, while propagating would abort a reap midway.
+            if let Ok(seq) = self.stage() {
+                drop(_g);
+                let _ = self.durable(seq);
+            }
         }
     }
 
@@ -899,13 +911,21 @@ impl BranchCatalog for TableBranchCatalog {
     ) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
-        self.commit()
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
-        self.commit()?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)?;
         Ok(removed)
     }
 
@@ -919,7 +939,11 @@ impl BranchCatalog for TableBranchCatalog {
         let mut rec = self.hydrate(core)?;
         rec.lease_deadline = lease;
         self.write_record(&rec, Some(&old))?;
-        self.commit()
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
@@ -945,7 +969,11 @@ impl BranchCatalog for TableBranchCatalog {
         })?;
         env.charge(n)?;
         self.upsert(keys::envelope(branch.id), env.serialize())?;
-        self.commit()
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 }
 
