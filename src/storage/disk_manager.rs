@@ -27,7 +27,72 @@ pub struct DiskManager {
     /// page and each silently overwrites the other.
     ///
     /// Documented exclusivity is not exclusivity. This is the enforcement.
-    arena_floor: AtomicU32,
+    ///
+    /// **A single floor could represent exactly one region, and this allocator's own
+    /// `reserve_from` said so**: it refused a second reservation with "a second region at {base}
+    /// cannot be represented by a single floor". That refusal was correct and it was also a wall —
+    /// the branch catalog needs a page source of its own that does not depend on the branch
+    /// catalog, and there was nowhere to put it. So the floor became a table.
+    regions: Mutex<Vec<Region>>,
+}
+
+/// A half-open page range `[lo, hi)` owned by some allocator other than this one.
+///
+/// `hi == u32::MAX` means unbounded above, which is what the branch arena takes today. An
+/// unbounded region is the reason the ordinary allocator still cannot grow past it — see
+/// [`DiskManager::reserve_region`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Region {
+    /// `&'static str` rather than `String`: every region is named at a call site, and the error
+    /// paths below run while the bitmap lock is held, where an allocation is the wrong thing to do.
+    name: &'static str,
+    lo: u32,
+    hi: u32,
+}
+
+/// Advance `from` past any reserved region that would contain it **or the page after it**, since
+/// growth always takes two consecutive pages: the new bitmap page and the page it serves.
+///
+/// `Err(region)` means an unbounded region blocks the way and there is nothing above it to reach.
+///
+/// **A free function so it can be tested.** Inline in `allocate`, this logic only runs after
+/// BITS_PER_BITMAP (32736) pages have been handed out, so no reasonable test reached it - and a
+/// mutant that replaced the advance with `break` survived the whole suite, silently placing a
+/// bitmap page inside another store's region. Untestable-in-practice code is untested code.
+fn advance_past_regions(regions: &[Region], from: u32) -> Result<u32, Region> {
+    let mut at = from;
+    // BOUNDED, not `loop`. Each step clears at least one region from a disjoint sorted list, so
+    // `regions.len()` steps always suffice -- but that argument silently depends on `contains`
+    // being HALF-OPEN. A mutant widening it to `page <= self.hi` made `at = r.hi` land back
+    // inside the same region and the unbounded version spun forever, hanging the test rather
+    // than failing it. A hang in production is worse than a wrong answer that refuses, so the
+    // bound is structural here rather than an argument in a comment.
+    for _ in 0..=regions.len() {
+        match regions.iter().find(|r| r.contains(at) || r.contains(at.saturating_add(1))) {
+            None => return Ok(at),
+            Some(r) if r.hi == u32::MAX => return Err(*r),
+            Some(r) => at = r.hi,
+        }
+    }
+    // Unreachable while regions are disjoint and half-open. If it is ever reached the invariant
+    // is broken, and the safe answer is to refuse to grow rather than hand out a page that may
+    // belong to another store.
+    Err(regions
+        .iter()
+        .find(|r| r.contains(at) || r.contains(at.saturating_add(1)))
+        .copied()
+        .unwrap_or(Region { name: "unknown", lo: at, hi: at.saturating_add(1) }))
+}
+
+impl Region {
+    fn contains(&self, page: u32) -> bool {
+        page >= self.lo && page < self.hi
+    }
+    /// Half-open overlap. `lo < self.hi && self.lo < hi` is the whole test; writing it out because
+    /// getting it wrong by one produces regions that touch and are accepted as disjoint.
+    fn overlaps(&self, lo: u32, hi: u32) -> bool {
+        lo < self.hi && self.lo < hi
+    }
 }
 
 impl DiskManager{
@@ -70,7 +135,7 @@ impl DiskManager{
             next_page_id: AtomicU32::new(next_page_id),
             storage,
             bitmap_lock: Mutex::new(()),
-            arena_floor: AtomicU32::new(u32::MAX),
+            regions: Mutex::new(Vec::new()),
         })
     }
     
@@ -117,10 +182,11 @@ impl DiskManager{
         let _guard = self.bitmap_lock.lock().unwrap();
         // An arena page has no bit here. Clearing the bit at that index would free an unrelated
         // page belonging to this allocator.
-        if page_id >= self.arena_floor.load(Ordering::SeqCst) {
+        if let Some(r) = self.region_containing(page_id) {
             return Err(FerroError::Io(format!(
-                "page {} is inside the reserved arena region and is not this allocator's to free",
-                page_id
+                "page {} is inside the reserved '{}' region [{}, {}) and is not this allocator's \
+                 to free",
+                page_id, r.name, r.lo, r.hi
             )));
         }
         let mut current_bitmap_id = 0;
@@ -224,40 +290,82 @@ impl DiskManager{
     /// through. Nothing here enforces that, so two *concurrent* arena stores over one file remain
     /// unsafe.
     pub fn reserve_from(&self, base: u32) -> Result<(), FerroError> {
-        let _guard = self.bitmap_lock.lock().unwrap();
-        let current = self.arena_floor.load(Ordering::SeqCst);
-        if current == u32::MAX {
-            self.arena_floor.store(base, Ordering::SeqCst);
-            return Ok(());
-        }
-        if base == current {
-            // Reattaching to the same region. This is a restart, and the branch module's harness
-            // does it deliberately (`fresh_store()` passes `self.store.base_page()`).
-            return Ok(());
-        }
-        if base < current {
-            return Err(FerroError::Io(format!(
-                "page region [{}, inf) is already reserved; cannot lower the floor to {}",
-                current, base
-            )));
-        }
-        // base > current. The old code returned Ok here and recorded NOTHING, which is the worst
-        // of the three options: the caller is told its region is reserved while the first store's
-        // extent bump pointer has no upper bound and will walk straight into it. Recording it
-        // instead would be just as wrong — raising the floor puts the first store's own extents
-        // back into the bitmap's circulation. There is no correct single-floor answer for two
-        // distinct live regions, so refuse and say why.
-        Err(FerroError::Io(format!(
-            "page region [{}, inf) is already reserved by another store; a second region at {} \
-             cannot be represented by a single floor, and the existing store's extents are \
-             unbounded above",
-            current, base
-        )))
+        self.reserve_region("branch arena", base, u32::MAX)
     }
 
-    /// First page this allocator must not touch.
+    /// Reserve `[lo, hi)` for another allocator. Refuses any overlap with an existing region or
+    /// with a page this allocator has already handed out.
+    ///
+    /// Re-registering a region **identical** to an existing one is accepted: that is a restart, and
+    /// the branch module's harness does it deliberately (`fresh_store()` passes
+    /// `self.store.base_page()`).
+    ///
+    /// **Blind spot, stated deliberately and unchanged from the single-floor version.** This
+    /// separates regions from *this* allocator and from each other. It says nothing about two
+    /// stores sharing one region: a second store registered over the identical range is accepted,
+    /// and if both are live they will hand out the same pages. The branch harness relies on that to
+    /// simulate a restart, and it is safe there only because the first store is no longer written
+    /// through. Nothing here enforces that.
+    ///
+    /// **What this still does not fix.** An unbounded region (`hi == u32::MAX`) leaves the ordinary
+    /// allocator boxed in below it, which is the README's "table space is fixed at creation". The
+    /// table makes a bounded arena *representable*; it does not by itself make the arena bounded.
+    /// Claiming otherwise would be the overclaim this project keeps making — see `SCALE-DESIGN.md`
+    /// D1 addendum 2, which was corrected on exactly this point.
+    pub fn reserve_region(&self, name: &'static str, lo: u32, hi: u32) -> Result<(), FerroError> {
+        if lo >= hi {
+            return Err(FerroError::Io(format!(
+                "region '{name}' is empty or inverted: [{lo}, {hi})"
+            )));
+        }
+        let _guard = self.bitmap_lock.lock().unwrap();
+        let mut regions = self.regions.lock().unwrap();
+
+        if regions.iter().any(|r| r.lo == lo && r.hi == hi) {
+            return Ok(());
+        }
+        if let Some(clash) = regions.iter().find(|r| r.overlaps(lo, hi)) {
+            return Err(FerroError::Io(format!(
+                "region '{}' [{}, {}) overlaps the existing '{}' [{}, {}); regions must be \
+                 disjoint, and moving an existing one would put pages it already owns back into \
+                 circulation",
+                name, lo, hi, clash.name, clash.lo, clash.hi
+            )));
+        }
+        // NO high-water check here, deliberately, and it was tried. Refusing a region that starts
+        // below the high-water mark looks like "make the dangerous state unrepresentable", and it
+        // is the wrong layer for it: it makes `deallocate`'s own region guard UNREACHABLE. If no
+        // page can ever be both allocated by this allocator and inside a region, that guard is
+        // dead code — and three buffer-pool tests exist precisely to prove it is not
+        // (`a_refused_delete_leaves_the_page_intact_in_the_pool` and its siblings build exactly
+        // that state on purpose). Adding the check here broke all three, which is the tests doing
+        // their job.
+        //
+        // The layering that already exists is the right one: `ArenaPageStore::new` refuses a base
+        // below `high_water()` so production never constructs the overlap, and `deallocate`
+        // refuses the page anyway if something ever does. Defence in depth, not a single gate.
+        regions.push(Region { name, lo, hi });
+        regions.sort_unstable_by_key(|r| r.lo);
+        Ok(())
+    }
+
+    fn region_containing(&self, page: u32) -> Option<Region> {
+        self.regions.lock().unwrap().iter().find(|r| r.contains(page)).copied()
+    }
+
+    /// Every reserved region, lowest first. Diagnostics and tests.
+    pub fn reserved_regions(&self) -> Vec<(&'static str, u32, u32)> {
+        self.regions.lock().unwrap().iter().map(|r| (r.name, r.lo, r.hi)).collect()
+    }
+
+    /// First page this allocator must not touch, or `u32::MAX` when nothing is reserved.
+    ///
+    /// With a region table this is the **lowest** reserved page, not a description of everything
+    /// above it: pages between two bounded regions belong to this allocator and `allocate` hands
+    /// them out. Kept under its old name because its old meaning — "the first page that is not
+    /// mine" — is still exactly true, and every caller uses it for exactly that.
     pub fn arena_floor(&self) -> u32 {
-        self.arena_floor.load(Ordering::SeqCst)
+        self.regions.lock().unwrap().first().map(|r| r.lo).unwrap_or(u32::MAX)
     }
 
 
@@ -285,7 +393,9 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
     //first checks bitmap if there is a free page if not, then give it next_page_id and increment it
     pub fn allocate(&self) -> Result<u32, FerroError>{
         let _guard = self.bitmap_lock.lock().unwrap();
-        let floor = self.arena_floor.load(Ordering::SeqCst);
+        // Snapshot once. There are a handful of regions at most, and re-locking inside the bit
+        // loop would take the regions lock millions of times per scan.
+        let regions: Vec<Region> = self.regions.lock().unwrap().clone();
         let mut current_bitmap_id = 0;
         let mut global_offset = 0;
         loop {
@@ -297,13 +407,23 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
                         if page_bitmap[byte_index] & (1<<bit_index) == 0 {
                             let page_id: usize = (byte_index - 4) * 8 + bit_index;
                             let candidate = global_offset + page_id as u32;
-                            // Everything at or above the floor belongs to the arena store, whose
-                            // pages are not tracked here. Handing one out would alias it.
-                            if candidate >= floor {
-                                return Err(Self::arena_floor_exhausted(
-                                    "no free page below",
-                                    floor,
-                                ));
+                            // A reserved region's pages are not tracked in this bitmap, so their
+                            // bits read as free from page 0 and handing one out would alias a
+                            // page another store is already writing.
+                            //
+                            // SKIP rather than refuse. With one unbounded region the two are
+                            // identical, because everything above it is reserved — which is why
+                            // the single-floor version could get away with refusing. With a
+                            // BOUNDED region the pages above it are this allocator's, and
+                            // stopping at the first reserved page would strand every one of them.
+                            if let Some(r) = regions.iter().find(|r| r.contains(candidate)) {
+                                if r.hi == u32::MAX {
+                                    return Err(Self::arena_floor_exhausted(
+                                        "no free page below",
+                                        r.lo,
+                                    ));
+                                }
+                                continue;
                             }
                             page_bitmap[byte_index] |= 1 << bit_index;
                             self.write(current_bitmap_id, &page_bitmap)?;
@@ -324,13 +444,18 @@ fn arena_floor_exhausted(what: &str, floor: u32) -> FerroError {
             // at that moment, because the fast path above never advances it. Growing from that
             // counter therefore hands out pages the bitmap already owns, and the floor check based
             // on it is comparing the wrong number. Grow from the real mark instead.
-            let grow_base = self
+            // Two pages are about to be taken: the new bitmap page and the page it serves. BOTH
+            // must fall outside every reserved region. `advance_past_regions` is a free function
+            // precisely so this can be tested without first handing out 32736 pages.
+            let raw_base = self
                 .scan_bitmap_high_water()?
                 .max(self.next_page_id.load(Ordering::SeqCst));
-            // Two pages are about to be taken: the new bitmap page and the page it serves.
-            if grow_base.saturating_add(1) >= floor {
-                return Err(Self::arena_floor_exhausted("cannot grow the bitmap past", floor));
-            }
+            let grow_base = match advance_past_regions(&regions, raw_base) {
+                Ok(b) => b,
+                Err(r) => {
+                    return Err(Self::arena_floor_exhausted("cannot grow the bitmap past", r.lo));
+                }
+            };
             let new_bitmap_id = grow_base;
             let page_id = grow_base + 1;
             // Keep the counter monotonic and never behind what has actually been handed out.
@@ -377,7 +502,7 @@ mod tests {
     use tempfile::TempDir;
     use crate::storage::disk_manager::DiskManager;
     use std::sync::atomic::Ordering;
-    use super::{BITS_PER_BITMAP, PAGE_SIZE};
+    use super::{advance_past_regions, Region, BITS_PER_BITMAP, PAGE_SIZE};
     use std::fs::OpenOptions;
     #[test]
     pub fn test_rw() -> Result<(), Box<dyn std::error::Error>>{
@@ -574,5 +699,153 @@ mod tests {
         assert_eq!(page1, page4);
         Ok(())
     }
-}
 
+    fn fresh_dm(tag: &str) -> (DiskManager, TempDir) {
+        use std::fs::OpenOptions;
+        let temp_dir = TempDir::new().unwrap();
+        let f = OpenOptions::new().read(true).write(true).create(true)
+            .open(temp_dir.path().join(format!("{tag}.db"))).unwrap();
+        (DiskManager::new(f).unwrap(), temp_dir)
+    }
+
+    /// The thing a single floor could not represent, and said so in its own refusal message:
+    /// "a second region at {base} cannot be represented by a single floor".
+    #[test]
+    fn two_bounded_regions_coexist_which_a_single_floor_refused() {
+        let (dm, _d) = fresh_dm("two-regions");
+        dm.reserve_region("catalog", 300, 400).expect("first region");
+        dm.reserve_region("arena", 100, 200).expect("second, lower region");
+        assert_eq!(
+            dm.reserved_regions(),
+            vec![("arena", 100, 200), ("catalog", 300, 400)],
+            "regions must be kept sorted by lo, whatever order they were registered in"
+        );
+        assert_eq!(dm.arena_floor(), 100, "the floor is the LOWEST reserved page");
+    }
+
+    /// **The island property.** With one floor, the first reserved page ended the allocator's
+    /// world; every page above it was stranded. A bounded region is skipped instead.
+    #[test]
+    fn allocate_skips_a_bounded_region_and_keeps_handing_out_pages_above_it() {
+        let (dm, _d) = fresh_dm("island");
+        dm.reserve_region("catalog", 10, 20).expect("reserve");
+
+        let mut handed = Vec::new();
+        for _ in 0..24 {
+            handed.push(dm.allocate().expect("allocate must not stop at the region"));
+        }
+        for p in &handed {
+            assert!(
+                !(*p >= 10 && *p < 20),
+                "handed out page {p}, which is inside the reserved region [10, 20) - that page \
+                 belongs to another store and two writers now share it"
+            );
+        }
+        assert!(
+            handed.iter().any(|p| *p >= 20),
+            "no page above the region was ever handed out, so the region was treated as a floor \
+             and everything above it is stranded: {handed:?}"
+        );
+    }
+
+    /// An unbounded region has nothing above it to reach, so it must still stop the allocator -
+    /// and still explain that the knob will not help.
+    #[test]
+    fn an_unbounded_region_still_stops_the_allocator_and_names_the_knob() {
+        let (dm, _d) = fresh_dm("unbounded");
+        dm.reserve_region("branch arena", 12, u32::MAX).expect("reserve");
+        let mut err = None;
+        for _ in 0..64 {
+            if let Err(e) = dm.allocate() {
+                err = Some(e);
+                break;
+            }
+        }
+        let msg = format!("{}", err.expect("an unbounded region must eventually refuse"));
+        assert!(msg.contains("will NOT move it"), "lost the fixed-for-this-database sentence: {msg}");
+    }
+
+    #[test]
+    fn overlapping_regions_are_refused_and_the_message_names_both() {
+        let (dm, _d) = fresh_dm("overlap");
+        dm.reserve_region("catalog", 100, 200).expect("first");
+        let err = dm.reserve_region("arena", 150, 250).expect_err("an overlap must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("catalog"), "does not name the region already there: {msg}");
+        assert!(msg.contains("arena"), "does not name the region being refused: {msg}");
+        assert_eq!(dm.reserved_regions().len(), 1, "a refused reservation must not be recorded");
+
+        // Touching but disjoint is NOT an overlap. Getting this wrong by one is the classic error.
+        dm.reserve_region("adjacent", 200, 300).expect("[200,300) does not overlap [100,200)");
+    }
+
+    /// A restart re-registers the identical region. Refusing that would break every reopen.
+    #[test]
+    fn re_registering_an_identical_region_is_a_restart_not_an_error() {
+        let (dm, _d) = fresh_dm("restart");
+        dm.reserve_region("arena", 64, u32::MAX).expect("first");
+        dm.reserve_region("arena", 64, u32::MAX).expect("identical re-registration is a restart");
+        assert_eq!(dm.reserved_regions().len(), 1, "the restart duplicated the region");
+    }
+
+    /// Between two regions is this allocator's own space, so freeing there must work. Under a
+    /// single floor there was no "between".
+    #[test]
+    fn a_page_between_two_regions_belongs_to_this_allocator_and_can_be_freed() {
+        let (dm, _d) = fresh_dm("between");
+        dm.reserve_region("low", 4, 8).expect("low");
+        dm.reserve_region("high", 16, 32).expect("high");
+
+        let mut between = None;
+        for _ in 0..24 {
+            let p = dm.allocate().expect("allocate");
+            if p >= 8 && p < 16 {
+                between = Some(p);
+            }
+            assert!(!(p >= 4 && p < 8) && !(p >= 16 && p < 32), "handed out reserved page {p}");
+        }
+        let p = between.expect("no page was handed out between the two regions");
+        dm.deallocate(p).expect("a page between regions is this allocator's to free");
+
+        // ...while a page inside the HIGHER region is still refused, and the error names it.
+        let err = dm.deallocate(20).expect_err("page 20 is inside the 'high' region");
+        assert!(format!("{err}").contains("high"), "the refusal does not name which region: {err}");
+    }
+
+    /// Growth takes TWO consecutive pages, so a region containing either one blocks it. This is
+    /// the path that only runs after 32736 allocations; testing the pure function is how it gets
+    /// covered at all. A mutant replacing the advance with `break` survived the entire suite
+    /// before this existed.
+    #[test]
+    fn growth_advances_past_bounded_regions_and_stops_at_an_unbounded_one() {
+        let r = |name, lo, hi| Region { name, lo, hi };
+
+        assert_eq!(advance_past_regions(&[], 5), Ok(5), "no regions, no advance");
+
+        let one = [r("a", 10, 20)];
+        assert_eq!(advance_past_regions(&one, 5), Ok(5), "below the region, untouched");
+        assert_eq!(advance_past_regions(&one, 10), Ok(20), "inside the region, advanced past it");
+        assert_eq!(
+            advance_past_regions(&one, 9),
+            Ok(20),
+            "page 9 is free but page 10 is not, and growth needs BOTH - this is the off-by-one \
+             that puts a bitmap page inside another store's region"
+        );
+        assert_eq!(advance_past_regions(&one, 20), Ok(20), "at hi is outside, half-open");
+
+        // Two adjacent regions must be walked in one call, not one hop per call.
+        let two = [r("a", 10, 20), r("b", 20, 30)];
+        assert_eq!(advance_past_regions(&two, 12), Ok(30), "must clear BOTH regions");
+
+        let unbounded = [r("arena", 10, u32::MAX)];
+        assert_eq!(advance_past_regions(&unbounded, 5), Ok(5), "below it is still fine");
+        assert_eq!(
+            advance_past_regions(&unbounded, 12),
+            Err(r("arena", 10, u32::MAX)),
+            "nothing is above an unbounded region, so this must refuse rather than loop"
+        );
+        // A bounded region below an unbounded one: advancing past the first lands in the second.
+        let mixed = [r("cat", 10, 20), r("arena", 20, u32::MAX)];
+        assert_eq!(advance_past_regions(&mixed, 15), Err(r("arena", 20, u32::MAX)));
+    }
+}
