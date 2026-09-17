@@ -1052,6 +1052,29 @@ mod serial_section_profile {
             cat.upsert(keys::child(trunk_id, 999_999), 7u64.to_be_bytes().to_vec()).unwrap();
         });
 
+        // SAME-INSTRUMENT SUBTRACTION. Comparing the 1-thread per-fork number from one harness
+        // against the F_FULLFSYNC probe from another left ~0.014 ms for everything else, which
+        // contradicts the 0.115 ms the operations above cost. Two instruments on two files cannot
+        // be subtracted. These two are taken in THIS process, on THIS catalog's own file, so they
+        // can be.
+        let t_fork = timed(200, || {
+            std::hint::black_box(cat.fork(BranchId::TRUNK, lease).unwrap());
+        });
+        // ⛔ THE FLUSH MUST HAVE SOMETHING TO FLUSH. Timing flush_all+sync in a loop with no
+        // dirty pages gave 0.010 ms -- macOS short-circuits F_FULLFSYNC when the file has nothing
+        // pending -- and subtracting THAT from fork() attributed 3.32 ms to "the serial section",
+        // which is absurd on its face and disagreed with the 0.115 ms the operations actually cost.
+        // A flush is priced by dirtying a page first and then subtracting the dirtying.
+        let t_dirty_and_flush = timed(200, || {
+            cat.upsert(keys::child(trunk_id, 888_888), 1u64.to_be_bytes().to_vec()).unwrap();
+            cat.pool.flush_all().unwrap();
+            cat.pool.disk_manager.sync().unwrap();
+        });
+        let t_dirty_only = timed(200, || {
+            cat.upsert(keys::child(trunk_id, 888_888), 1u64.to_be_bytes().to_vec()).unwrap();
+        });
+        let t_flush = t_dirty_and_flush - t_dirty_only;
+
         let sum = t_core + t_env + t_free + t_write_record + t_childkey + t_header + t_publish;
         println!();
         println!("S8: where the serial section goes. {WARM} branches resident, {N} iters each.");
@@ -1070,7 +1093,16 @@ mod serial_section_profile {
         println!("  {:32}  {sum:8.5}", "SUM");
         println!("  {:32}  {t_upsert:8.5}   <- one upsert alone, for scale", "(upsert)");
         println!();
-        println!("Compare with the measured serial time per fork: ~0.22 ms (D8).");
+        println!();
+        println!("  uncontended fork() total        {t_fork:8.5} ms   (1 thread, includes its flush)");
+        println!("  flush_all + sync, page dirtied  {t_flush:8.5} ms   (same process, same file)");
+        println!("     (dirty+flush {t_dirty_and_flush:8.5} minus dirty-only {t_dirty_only:8.5})");
+        println!("  => serial section by subtraction {:8.5} ms", t_fork - t_flush);
+        println!("  => sum of the seven operations   {sum:8.5} ms");
+        println!("  If those two disagree, the operations above are NOT what fork actually does,");
+        println!("  or the profile perturbs the tree in a way the real path does not.");
+        println!();
+        println!("Compare with the EFFECTIVE serial time under 64-thread contention: ~0.22 ms (D8).");
         println!("If SUM is far below that, the cost is NOT this work -- it is lock handoff/convoy,");
         println!("and D8's options 1 and 4 are aimed at the wrong thing. That is the single most");
         println!("useful thing this measurement can say, so it is printed either way.");
