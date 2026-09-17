@@ -1,0 +1,23 @@
+durable branch-catalog scaling: N branches forked from TRUNK
+instrument: std::time::Instant + fs::metadata, release build, LogBranchCatalog::open (durable)
+date: 2026-09-17T16:49:46Z
+
+       N   first_us    last_us    total_s      log_bytes   reopen_s     live
+     500    4956.92    2979.75      1.977        1070000      0.003      501
+    1000    3539.25    3019.67      3.152        4140000      0.009     1001
+    2000    3675.21    2976.50      6.276       16280000      0.034     2001
+    4000    3663.29    3089.17     12.549       64560000      0.137     4001
+    8000    4478.71    2973.88     26.688      257120000      0.766     8001
+
+log bytes quadruple when N doubles (x3.87, x3.93, x3.97, x3.98) and so does reopen time.
+That is O(N^2), and the mechanism is not inferred: `LogBranchCatalog::fork` clones the parent
+record and appends it WHOLE, and `live_children: Vec<Epoch>` lives INSIDE that record - so the
+bytes written per fork grow with the number of children the parent already has.
+
+Extrapolated from the measured curve: 50k branches ~10GB of branch metadata, 1M ~4TB, with a
+reopen in hours. Not a tuning problem.
+
+Per-fork LATENCY is flat (~4-5ms, fsync-bound) and total time is LINEAR, so this is invisible to
+any benchmark that measures fork latency. examples/branch_scaling_bench.rs cannot see it at all:
+it uses LogBranchCatalog::in_memory, which never writes. Its x8.90 fork degradation at 50k is the
+in-memory clone cost only - the optimistic half of the picture.
