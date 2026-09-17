@@ -144,19 +144,38 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(())
     }
 
-    fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
-        Ok(self
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
+        let mut out: Vec<BranchRecord> = self
             .records
             .lock()
             .unwrap()
             .values()
-            .filter(|r| r.state == BranchState::Live)
+            .filter(|r| {
+                r.state == BranchState::Live
+                    && !r.branch_id.is_trunk()
+                    && r.lease_deadline.is_expired_at(now_millis)
+            })
             .cloned()
-            .collect())
+            .collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
     }
 
-    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
-        Ok(self.records.lock().unwrap().values().cloned().collect())
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        let mut out: Vec<BranchRecord> =
+            self.records.lock().unwrap().values().filter(|r| r.state == state).cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
+    }
+
+    /// Ordered, like the durable catalog's, so that a caller cannot come to depend on hash order
+    /// in tests and then meet a different order in production. The two implementations agreeing
+    /// about order is the only reason a test against this one says anything about that one.
+    fn scan(&self)
+        -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        let mut out: Vec<BranchRecord> = self.records.lock().unwrap().values().cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(Box::new(out.into_iter().map(Ok)))
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

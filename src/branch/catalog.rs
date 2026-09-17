@@ -263,23 +263,6 @@ impl LogBranchCatalog {
             .ok_or_else(|| BranchError::NotFound(BranchId::new(id, 0)).into())
     }
 
-    /// Every record, live or reaped, **in branch-id order**.
-    ///
-    /// Ordered so that a sweep over every record is reproducible at all: each reap this feeds
-    /// appends durable branch records and frees pages, and a `HashMap`'s order made that sequence
-    /// depend on nothing a test or a replay can pin.
-    ///
-    /// Id order is **not** the order a reap wants, and `reaper::resume_interrupted_reaps` re-sorts
-    /// deepest-first before acting — a parent resumed before its own child cannot release its id
-    /// slot. Ordering here is what makes *this* accessor deterministic; the reap key belongs to the
-    /// reaper, which states why at its sort.
-    pub fn all_records(&self) -> Vec<BranchRecord> {
-        let mut out: Vec<BranchRecord> =
-            self.state.read().unwrap().records.values().cloned().collect();
-        out.sort_unstable_by_key(|r| r.branch_id.id);
-        out
-    }
-
     /// Mark an id slot reusable. Refuses while the slot's record still lists live children,
     /// because that array is what decides the fate of pages parked under this branch's name.
     pub fn release_id(&self, id: u64) {
@@ -385,22 +368,55 @@ impl BranchCatalog for LogBranchCatalog {
         self.put(&rec)
     }
 
-    fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+    /// Still a walk, and deliberately so. This is the *log* catalog: its records live in a
+    /// `HashMap` with no index over deadlines, so O(N) is the best it can do and pretending
+    /// otherwise would be a lie in a signature. D2 narrowed the interface first precisely so this
+    /// body can later be replaced by a range descent without a single caller changing.
+    ///
+    /// Sorted because `reap_expired`'s own `sort_by_key` is stable, so whatever order arrives here
+    /// survives as its tie-break and reaches every record and page that reap makes durable.
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
         let st = self.state.read().unwrap();
-        // Same `HashMap` as `all_records`, and sorted for the same reason: the lease scan feeds
-        // this straight into `reap_expired`, whose `sort_by_key` is stable, so hash order survives
-        // as its tie-break and reaches every record and page that reap makes durable.
-        let mut out: Vec<BranchRecord> =
-            st.records.values().filter(|r| r.state == BranchState::Live).cloned().collect();
+        let mut out: Vec<BranchRecord> = st
+            .records
+            .values()
+            .filter(|r| {
+                r.state == BranchState::Live
+                    && !r.branch_id.is_trunk()
+                    && r.lease_deadline.is_expired_at(now_millis)
+            })
+            .cloned()
+            .collect();
         out.sort_unstable_by_key(|r| r.branch_id.id);
         Ok(out)
     }
 
-    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        let st = self.state.read().unwrap();
+        let mut out: Vec<BranchRecord> =
+            st.records.values().filter(|r| r.state == state).cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
+    }
+
+    /// Ordered by branch id so that a sweep over every record is reproducible at all: each reap
+    /// this feeds appends durable branch records and frees pages, and a `HashMap`'s order made
+    /// that sequence depend on nothing a test or a replay can pin.
+    ///
+    /// Id order is **not** the order a reap wants, and `reaper::resume_interrupted_reaps` re-sorts
+    /// deepest-first before acting — a parent resumed before its own child cannot release its id
+    /// slot. Ordering here is what makes the accessor deterministic; the reap key belongs to the
+    /// reaper, which states why at its sort.
+    ///
+    /// It buffers, which the trait's contract permits but does not want. The records are already
+    /// all resident in the `HashMap` this reads, so buffering costs a second copy and no more —
+    /// and removing the first copy is D1's job, not this method's.
+    fn scan(&self)
+        -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
         let st = self.state.read().unwrap();
         let mut out: Vec<BranchRecord> = st.records.values().cloned().collect();
         out.sort_unstable_by_key(|r| r.branch_id.id);
-        Ok(out)
+        Ok(Box::new(out.into_iter().map(Ok)))
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
@@ -795,30 +811,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `resume_interrupted_reaps` walks `all_records` and reaps in the order it arrives, and every
-    /// reap appends durable records and frees pages.
+    /// `resume_interrupted_reaps` walks `in_state` and reaps in the order it arrives, and every
+    /// reap appends durable records and frees pages — so every accessor that can feed a sweep has
+    /// to be ordered, not merely happen to be.
     #[test]
     fn every_record_sweep_comes_back_in_branch_id_order() {
         let c = cat();
         for _ in 0..16 {
             c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         }
-        // One reaped slot, so `all_records` and `live_branches` are not the same list.
+        // One reaped and one quarantined slot, so the three accessors are three different lists
+        // and a test that passed by returning the same list every time would fail here.
         let mut rec = c.get_raw(3).unwrap();
         rec.mark_reaped();
         c.put(&rec).unwrap();
+        let mut held = c.get_raw(5).unwrap();
+        held.state = BranchState::Quarantined;
+        c.put(&held).unwrap();
 
-        let sweeps: Vec<(&str, Vec<u64>)> = vec![
-            ("all_records", c.all_records().iter().map(|r| r.branch_id.id).collect()),
-            ("live_branches", c.live_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
-            ("all_branches", c.all_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
+        // 17 records: trunk plus 16 forks. Live is 15 of them (id 3 reaped, id 5 quarantined),
+        // and `expired_before` is 14 of those — it excludes trunk as well, which is the whole
+        // reason the exclusion lives inside the query rather than in each caller.
+        let sweeps: Vec<(&str, usize, Vec<u64>)> = vec![
+            ("scan", 17, c.scan().unwrap().map(|r| r.unwrap().branch_id.id).collect()),
+            ("in_state(Live)", 15,
+             c.in_state(BranchState::Live).unwrap().iter().map(|r| r.branch_id.id).collect()),
+            ("in_state(Quarantined)", 1,
+             c.in_state(BranchState::Quarantined).unwrap().iter().map(|r| r.branch_id.id).collect()),
+            ("expired_before", 14,
+             c.expired_before(u64::MAX).unwrap().iter().map(|r| r.branch_id.id).collect()),
         ];
-        for (name, ids) in sweeps {
-            assert_eq!(ids.len(), if name == "live_branches" { 16 } else { 17 }, "fixture: {name}");
+        for (name, want, ids) in sweeps {
+            assert_eq!(ids.len(), want, "fixture: {name} returned {ids:?}");
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             assert_eq!(ids, sorted, "{name} came back in hash order");
         }
+    }
+
+    /// The narrowed surface exists to make a selective question selective. These assert the
+    /// *selection*, which is the part a re-implementation over a B+tree must preserve exactly.
+    #[test]
+    fn expired_before_excludes_trunk_the_unexpired_and_the_not_live() {
+        let c = cat();
+        // Trunk's own lease must be EXPIRED for this fixture to test anything. Left at
+        // `TRUNK_LEASE` it is not expired at `now`, so the trunk assertion below passes whether
+        // or not the exclusion exists — and a mutant that deleted the exclusion survived exactly
+        // that way before this line was added. The exclusion is now the only thing keeping trunk
+        // out of the result.
+        let mut trunk = c.get(BranchId::TRUNK).unwrap();
+        trunk.lease_deadline = LeaseDeadline(1);
+        c.put(&trunk).unwrap();
+
+        let early = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let late = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        let reaping = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let mut r = c.get(reaping.branch_id).unwrap();
+        r.state = BranchState::Reaping;
+        c.put(&r).unwrap();
+
+        let ids: Vec<u64> =
+            c.expired_before(1_000).unwrap().iter().map(|r| r.branch_id.id).collect();
+        assert_eq!(ids, vec![early.branch_id.id], "expected only the expired Live non-trunk branch");
+        assert!(!ids.contains(&BranchId::TRUNK.id), "trunk must never be a reap candidate");
+        assert!(!ids.contains(&late.branch_id.id), "an unexpired lease is not a candidate");
+        assert!(!ids.contains(&reaping.branch_id.id), "a Reaping branch is not a fresh candidate");
+
+        // Boundary: `is_expired_at` is inclusive, so a deadline exactly at `now` is expired.
+        assert!(c.expired_before(100).unwrap().iter().any(|r| r.branch_id == early.branch_id));
+        assert!(c.expired_before(99).unwrap().is_empty(), "a lease one ms out is not expired");
     }
 
     #[test]

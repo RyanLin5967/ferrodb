@@ -1339,14 +1339,19 @@ impl PageStoreSnapshots {
     /// counters nor removes records the sender no longer has, so replaying a snapshot's records one
     /// by one into a live catalog would leave a follower minting branch ids that collide and
     /// holding branches the leader reaped.
-    fn branch_image(&self) -> Vec<u8> {
+    /// Returns `Result` since the narrowing in D2: a streaming scan can fail partway, and a
+    /// snapshot that silently shipped a *truncated* catalog would hand a follower a database
+    /// missing branches with no error anywhere — the fail-open this codebase keeps paying for.
+    fn branch_image(&self) -> Result<Vec<u8>, FerroError> {
+        use crate::branch::BranchCatalog;
         let mut out = Vec::new();
-        for r in self.branches.all_records() {
+        for r in self.branches.scan()? {
+            let r = r?;
             let bytes = r.serialize();
             out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
             out.extend_from_slice(&bytes);
         }
-        out
+        Ok(out)
     }
 
     fn trunk_root(&self) -> Result<u32, FerroError> {
@@ -1381,7 +1386,7 @@ impl SnapshotStore for PageStoreSnapshots {
             .map_err(|e| FerroError::Io(format!("read the captured page image: {e}")))?;
 
         let arena = self.arenas.state_bytes();
-        let branches = self.branch_image();
+        let branches = self.branch_image()?;
         let root = self.trunk_root()?;
 
         // **The window that makes the image consistent.** Read while the pin is still held, so a

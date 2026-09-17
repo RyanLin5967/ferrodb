@@ -62,16 +62,39 @@ pub trait BranchCatalog: Send + Sync {
     /// root pointer moves, a writing branch's pages are invisible to everyone (exit criterion 2).
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError>;
 
-    /// Every live branch, for the lease scan.
-    fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError>;
-
-    /// Every branch record the catalog still holds, whatever its state.
+    /// Branches whose lease has expired at or before `now_millis`: `Live`, not trunk, expired.
     ///
-    /// Distinct from [`Self::live_branches`], which filters to `Live` — so it cannot see a
-    /// quarantined branch, which is precisely the state someone asking this question is looking
-    /// for. No default implementation: falling back to `live_branches` would silently under-report
-    /// exactly the branches that matter here.
-    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError>;
+    /// **The result is output-sized, not database-sized, and that is the entire point.** This runs
+    /// every 30 seconds for the life of the process and the answer is almost always empty. It
+    /// replaced a call that cloned *every* record in the catalog so the caller could filter it —
+    /// unnoticeable at 10³ branches, fatal at 10⁶, and invisible to any measurement of `fork`.
+    /// An implementation that walks every record to answer this has not implemented it, it has
+    /// spelled it differently; see `SCALE-DESIGN.md` D2.
+    ///
+    /// Trunk is excluded here rather than left to the caller, because trunk holds a lease nobody
+    /// may act on and a caller that forgot the check would reap the root of the database.
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError>;
+
+    /// Every branch in `state`, in branch-id order. Output-sized, for the same reason.
+    ///
+    /// This answers the two questions that used to demand the whole catalog: which branches were
+    /// mid-reap when the process died, and which are being held for inspection. Trunk is **not**
+    /// filtered out — the two callers disagree about whether they want it, so each says.
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError>;
+
+    /// Every record the catalog holds, whatever its state, **streamed in branch-id order**.
+    ///
+    /// This one is genuinely O(N) and no index changes that: its callers are a full system view
+    /// and a full snapshot, and their answer *is* the whole catalog. What it must not do is
+    /// materialise a second copy of the database — hence an iterator rather than a `Vec`. And
+    /// hence "in branch-id order", which deletes the sort each caller performed afterwards.
+    ///
+    /// The `Result` is per item rather than only around the iterator because a streaming
+    /// implementation reads pages as it goes and can fail partway. An infallible item type would
+    /// force it to either swallow that or buffer the whole catalog first, and buffering the whole
+    /// catalog is the thing being removed.
+    fn scan(&self)
+        -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError>;
 
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;

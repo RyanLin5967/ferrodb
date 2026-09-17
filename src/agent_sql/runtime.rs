@@ -2027,13 +2027,13 @@ impl AgentRuntime {
 
     /// Every branch currently held for inspection.
     pub fn quarantined_branches(&self) -> Result<Vec<BranchId>, FerroError> {
-        // `all_branches`, not `live_branches`: the latter filters to `Live` and therefore can
-        // never return a quarantined branch, which is the only thing this function is looking for.
+        // Asks the catalog for the quarantined branches rather than for every branch it holds.
+        // The old shape could not have used `live_branches` — that filters to `Live` and so can
+        // never return a quarantined branch — but it paid for the whole catalog to find a handful.
         Ok(self
             .branches
-            .all_branches()?
+            .in_state(BranchState::Quarantined)?
             .into_iter()
-            .filter(|r| r.state == BranchState::Quarantined)
             .map(|r| r.branch_id)
             .collect())
     }

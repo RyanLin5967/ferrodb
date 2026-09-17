@@ -367,7 +367,7 @@ fn arena_state(db: &Path) -> ArenaState {
         live: store.live_page_count().expect("live page count"),
         reserved: store.reserved_page_count(),
         arenas: store.live_arenas(),
-        branches: branches.all_branches().expect("branch records"),
+        branches: branches.scan().expect("scan").collect::<Result<Vec<_>, _>>().expect("branch records"),
     }
 }
 

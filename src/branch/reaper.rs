@@ -94,9 +94,9 @@ impl TwoTierReaper {
     pub fn resume_interrupted_reaps(&self) -> Result<Vec<BranchId>, FerroError> {
         let mut interrupted: Vec<BranchRecord> = self
             .catalog
-            .all_records()
+            .in_state(BranchState::Reaping)?
             .into_iter()
-            .filter(|r| r.state == BranchState::Reaping && !r.branch_id.is_trunk())
+            .filter(|r| !r.branch_id.is_trunk())
             .collect();
         // Deepest first — the same key `reap_expired` uses, for the same reason plus one more.
         //
@@ -106,7 +106,7 @@ impl TwoTierReaper {
         // does not clear that array, so nothing ever calls it for that slot again. Walked
         // parent-first, the parent's slot is leaked for the lifetime of the database.
         //
-        // `all_records` is ordered by branch id and a parent's id is normally below its child's, so
+        // `in_state` is ordered by branch id and a parent's id is normally below its child's, so
         // unordered-by-depth here means *reliably* parent-first. Before this the hash order made it
         // a coin flip; the ordering that made the durable sweep reproducible made the losing side
         // of that flip certain, which is why the key belongs here rather than at the source.
@@ -255,12 +255,11 @@ impl Reaper for TwoTierReaper {
     }
 
     fn reap_expired(&self, now_millis: u64) -> Result<Vec<BranchId>, FerroError> {
-        let mut candidates: Vec<BranchRecord> = self
-            .catalog
-            .live_branches()?
-            .into_iter()
-            .filter(|r| !r.branch_id.is_trunk() && r.lease_deadline.is_expired_at(now_millis))
-            .collect();
+        // Asks for exactly the expired branches instead of cloning every record in the catalog
+        // and filtering here. The old shape ran every 30 seconds for the life of the process and
+        // its cost was O(N) whether or not anything had expired — fine at 10³ branches, fatal at
+        // 10⁶, and invisible to any measurement of `fork`. `SCALE-DESIGN.md` D2.
+        let mut candidates: Vec<BranchRecord> = self.catalog.expired_before(now_millis)?;
 
         // Deepest first: reaping a child removes its epoch from the parent's live-children array,
         // which is exactly what lets the parent's own reap take the fast path.

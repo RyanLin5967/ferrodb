@@ -1011,7 +1011,7 @@ fn a_fork_on_a_node_that_does_not_lead_is_refused_and_creates_nothing() {
     // the cluster never agreed on: it burns an id and an epoch, and it pins whatever arenas it is
     // charged until something reaps it. The leadership check therefore comes *before* the local
     // fork, not after it.
-    let records = _db.runtime.branches().all_branches().unwrap();
+    let records = _db.runtime.branches().scan().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(
         records.len(),
         1,

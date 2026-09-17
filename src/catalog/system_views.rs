@@ -355,11 +355,11 @@ fn state_name(s: BranchState) -> &'static str {
 }
 
 fn branches_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
-    // `all_branches`, not `live_branches`: a view whose job is to show what the branch engine holds
-    // must show a quarantined or reaping branch, and `live_branches` filters to `Live` so it can
-    // never return one. The `state` column is how a reader narrows it.
-    let mut records = runtime.branches().all_branches()?;
-    records.sort_by_key(|r| (r.branch_id.id, r.branch_id.generation));
+    // `scan`, which is every record whatever its state: a view whose job is to show what the
+    // branch engine holds must show a quarantined or reaping branch too, and the `state` column is
+    // how a reader narrows it. It arrives in branch-id order, which is what this used to sort into
+    // afterwards, so the sort is gone with the dump it replaced.
+    let records = runtime.branches().scan()?.collect::<Result<Vec<_>, FerroError>>()?;
     Ok(records
         .into_iter()
         .map(|r| {
@@ -390,8 +390,7 @@ fn runs_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
     // `seal` drops the moment a branch merges or is abandoned, so this view is about work in
     // flight. `ferro_row_authors` is the question that keeps answering afterwards, and saying so
     // here is the difference between an empty view and a lost one.
-    let mut records = runtime.branches().all_branches()?;
-    records.sort_by_key(|r| (r.branch_id.id, r.branch_id.generation));
+    let records = runtime.branches().scan()?.collect::<Result<Vec<_>, FerroError>>()?;
     let mut out = Vec::new();
     for rec in records {
         let Some(run) = runtime.run_of(rec.branch_id) else { continue };
