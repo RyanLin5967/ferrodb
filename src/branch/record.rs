@@ -54,6 +54,70 @@ pub struct BranchRecord {
 /// drift: both assert against it.
 pub const CORE_BYTES: usize = 51;
 
+/// A branch record as it is **stored**: the fixed-width core, with `arenas` empty and `envelope`
+/// `None` because both live in their own key spans and loading them costs a range scan.
+///
+/// ⛔ THIS TYPE EXISTS BECAUSE TWO BUGS SHIPPED THROUGH THE GAP IT CLOSES, and both were invisible
+/// to the tests that were looking at the code around them:
+///
+///  1. `set_root` / `renew_lease` / `scan` read a core record and wrote it back. `write_record`
+///     makes the arena span match the record it is handed, so the span was EMPTIED -- and the
+///     reaper frees precisely `record.arenas`, so those pages leaked permanently. The obvious
+///     assertion (`populated.reserved > baseline.reserved`) PASSED.
+///  2. `fork` read the parent as a core record, so its `envelope` was `None`, and `fork_child`
+///     does `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`. `None` maps to `None`,
+///     which is the UNGOVERNED default -- so a child of a governed branch came back ungoverned.
+///     **That is a capability escape, and it reached the remote before it was caught.**
+///
+/// Both are one defect: an incomplete value accepted where a complete one was required. Commenting
+/// "remember to hydrate" is validation, and validation is forgotten; this is the parse, and its
+/// result is carried in the type. (Alexis King, *Parse, don't validate*, 2019.)
+///
+/// **Deliberately absent, and each absence is load-bearing:** no `Deref`, no `AsRef<BranchRecord>`,
+/// no `pub` field, no `into_inner()`. Any one of them reopens the hole. There are no `arenas()` or
+/// `envelope()` accessors either -- those are exactly the two fields this value does not have, and
+/// an accessor returning an empty vec would be a lie with a type signature.
+///
+/// It also lives in **this** module rather than beside its only consumer in `table_catalog.rs`,
+/// because a newtype declared next to its consumer is honour-system: `.0` would be in scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreRecord(BranchRecord);
+
+impl CoreRecord {
+    /// The **only** way to a `BranchRecord`, and it demands the two fields the core is missing.
+    /// You cannot obtain the complete value without supplying what made it incomplete.
+    pub fn into_hydrated(
+        mut self,
+        arenas: Vec<ArenaId>,
+        envelope: Option<CapabilityEnvelope>,
+    ) -> BranchRecord {
+        self.0.arenas = arenas;
+        self.0.envelope = envelope;
+        self.0
+    }
+
+    pub fn branch_id(&self) -> BranchId {
+        self.0.branch_id
+    }
+    pub fn generation(&self) -> u32 {
+        self.0.generation
+    }
+    pub fn state(&self) -> BranchState {
+        self.0.state
+    }
+    pub fn lease_deadline(&self) -> LeaseDeadline {
+        self.0.lease_deadline
+    }
+    /// Safe on a core record: it reads `generation` and `state`, and neither is an unbounded field.
+    pub fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
+        self.0.check_readable(requested)
+    }
+    /// Re-encoding the core needs no unbounded field by definition, so this is exact.
+    pub fn serialize_core(&self) -> Vec<u8> {
+        self.0.serialize_core()
+    }
+}
+
 impl BranchRecord {
     /// The trunk record. Never reaped, no parent, depth 0.
     pub fn trunk(root_page_id: PageId, lease_deadline: LeaseDeadline) -> Self {
@@ -235,7 +299,10 @@ impl BranchRecord {
     /// that is deliberate: a caller that needs them asks the catalog, which answers from an index.
     /// Silently returning an empty `live_children` where the old record had a full one would be a
     /// wrong answer, so every caller of those fields was moved onto catalog queries first.
-    pub fn deserialize_core(bytes: &[u8]) -> Result<Self, BranchError> {
+    /// Decode the stored core. Returns a [`CoreRecord`], **not** a `BranchRecord`: the bytes on
+    /// disk do not contain `arenas` or `envelope`, so the value this produces is not a whole
+    /// record and must not be usable as one. See [`CoreRecord`].
+    pub fn deserialize_core(bytes: &[u8]) -> Result<CoreRecord, BranchError> {
         if bytes.len() != CORE_BYTES {
             return Err(BranchError::Corrupt(format!(
                 "core branch record must be exactly {CORE_BYTES} bytes, got {}",
@@ -248,7 +315,7 @@ impl BranchRecord {
         let generation = u32_at(12);
         let parent_id =
             if bytes[16] == 1 { Some(BranchId::new(u64_at(17), u32_at(25))) } else { None };
-        Ok(BranchRecord {
+        Ok(CoreRecord(BranchRecord {
             branch_id,
             generation,
             parent_id,
@@ -260,7 +327,7 @@ impl BranchRecord {
             arenas: Vec::new(),
             live_children: Vec::new(),
             envelope: None,
-        })
+        }))
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -1788,7 +1855,13 @@ mod core_record_tests {
 
         let bytes = rec.serialize_core();
         assert_eq!(bytes.len(), CORE_BYTES, "core record width drifted from the constant");
-        let back = BranchRecord::deserialize_core(&bytes).expect("round trip");
+        // Through `into_hydrated`, NOT through `.0`. The field is reachable here because this
+        // test shares the module, and using it would make the guard honour-system in exactly the
+        // place that is supposed to prove it is not. Passing the empty arenas and absent envelope
+        // explicitly is also the honest statement of what `serialize_core` drops.
+        let back = BranchRecord::deserialize_core(&bytes)
+            .expect("round trip")
+            .into_hydrated(Vec::new(), None);
 
         assert_eq!(back.branch_id, rec.branch_id);
         assert_eq!(back.generation, rec.generation);
@@ -1803,19 +1876,40 @@ mod core_record_tests {
         assert!(back.envelope.is_none());
     }
 
+    /// The guard itself, asserted rather than assumed: a `CoreRecord` must not be usable as a
+    /// whole record. This is a compile-time property, so the test that matters is the one in
+    /// `tools/` that tries it and expects rustc to refuse -- see `d5_core_record_has_no_bypass`.
+    /// What is checkable here is that the ONLY exit carries both missing fields through.
+    #[test]
+    fn d5_into_hydrated_is_the_only_exit_and_it_carries_both_fields() {
+        let mut rec = BranchRecord::trunk(1, LeaseDeadline(0));
+        rec.arenas = vec![ArenaId(7), ArenaId(9)];
+        let core = BranchRecord::deserialize_core(&rec.serialize_core()).unwrap();
+        // The core genuinely lost them...
+        let empty = core.clone().into_hydrated(Vec::new(), None);
+        assert!(empty.arenas.is_empty(), "core must not resurrect arenas it never stored");
+        // ...and the only way to a whole record is to supply them.
+        let whole = core.into_hydrated(vec![ArenaId(7), ArenaId(9)], None);
+        assert_eq!(whole.arenas, vec![ArenaId(7), ArenaId(9)]);
+    }
+
     /// Trunk has no parent, and the absent-parent tag must not be confused with parent id 0 —
     /// which is trunk's own id, so getting this wrong makes trunk its own parent.
     #[test]
     fn an_absent_parent_is_distinguishable_from_parent_zero() {
         let trunk = BranchRecord::trunk(1, LeaseDeadline(0));
         assert_eq!(trunk.parent_id, None, "fixture");
-        let back = BranchRecord::deserialize_core(&trunk.serialize_core()).unwrap();
+        let back = BranchRecord::deserialize_core(&trunk.serialize_core())
+            .unwrap()
+            .into_hydrated(Vec::new(), None);
         assert_eq!(back.parent_id, None, "absent parent came back as Some");
 
         let mut child = trunk.clone();
         child.branch_id = BranchId::new(5, 0);
         child.parent_id = Some(BranchId::TRUNK);
-        let back = BranchRecord::deserialize_core(&child.serialize_core()).unwrap();
+        let back = BranchRecord::deserialize_core(&child.serialize_core())
+            .unwrap()
+            .into_hydrated(Vec::new(), None);
         assert_eq!(back.parent_id, Some(BranchId::TRUNK), "parent 0 came back as absent");
     }
 

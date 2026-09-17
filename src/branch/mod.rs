@@ -30,7 +30,7 @@ pub mod table_catalog;
 pub use table_catalog::TableBranchCatalog;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
 pub use reaper::{PageLinks, TwoTierReaper};
-pub use record::{
+pub use record::{CoreRecord, 
     changed_columns, reclaimable, ArenaExtent, BranchRecord, CapabilityEnvelope,
     CapabilityRefusal, ColumnCapability, PendingFree, RowEffect, RowImage, TableCapability, Verb,
 };

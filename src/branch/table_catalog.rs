@@ -27,7 +27,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::branch::record::{BranchRecord, CapabilityEnvelope};
+use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
@@ -453,16 +453,18 @@ impl TableBranchCatalog {
     /// record that came back empty would delete every arena on the next write. `live_children` is
     /// deliberately left EMPTY — it is unbounded, and every caller was moved onto the indexed
     /// queries first so that nothing reads it.
-    fn hydrate(&self, mut rec: BranchRecord) -> Result<BranchRecord, FerroError> {
-        let (lo, hi) = keys::arenas_of(rec.branch_id.id);
+    fn hydrate(&self, core: CoreRecord) -> Result<BranchRecord, FerroError> {
+        let id = core.branch_id().id;
+        let mut arenas = Vec::new();
+        let (lo, hi) = keys::arenas_of(id);
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
             let (k, _) = entry?;
             if k.len() == 13 {
-                rec.arenas.push(ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap())));
+                arenas.push(ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap())));
             }
         }
-        rec.envelope = self.envelope_bytes(rec.branch_id.id)?;
-        Ok(rec)
+        // The only call to `into_hydrated` in the codebase, and it is handed BOTH missing fields.
+        Ok(core.into_hydrated(arenas, self.envelope_bytes(id)?))
     }
 
     fn envelope_bytes(&self, id: u64) -> Result<Option<CapabilityEnvelope>, FerroError> {
@@ -472,7 +474,7 @@ impl TableBranchCatalog {
         }
     }
 
-    fn core(&self, id: u64) -> Result<Option<BranchRecord>, FerroError> {
+    fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
         match self.tree.search(&keys::record(id))? {
             Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
             None => Ok(None),
@@ -483,20 +485,27 @@ impl TableBranchCatalog {
     /// from `old` first. The CHILD span is **not** touched here: children are inserted by `fork`
     /// and removed by `detach_child`, because `put` receives records whose `live_children` is
     /// empty by construction and diffing against that would delete every child.
+    /// `rec` must be WHOLE -- its arena span is rewritten to match it. `old` is deliberately a
+    /// [`CoreRecord`]: the only things ever read from it are the state and deadline index keys, and
+    /// typing it that way means a caller can pass the cheap read it already has without the
+    /// signature implying the expensive one would be safer.
     fn write_record(
         &self,
         rec: &BranchRecord,
-        old: Option<&BranchRecord>,
+        old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
         if let Some(prev) = old {
-            self.remove_if_present(&keys::state(prev.state.as_u8(), prev.branch_id.id))?;
-            if Self::in_deadline_index(prev) {
-                self.remove_if_present(&keys::deadline(prev.lease_deadline.0, prev.branch_id.id))?;
+            self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
+            if Self::in_deadline_index(prev.state(), prev.branch_id()) {
+                self.remove_if_present(&keys::deadline(
+                    prev.lease_deadline().0,
+                    prev.branch_id().id,
+                ))?;
             }
         }
         self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
         self.upsert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
-        if Self::in_deadline_index(rec) {
+        if Self::in_deadline_index(rec.state, rec.branch_id) {
             self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
         }
         match &rec.envelope {
@@ -554,7 +563,7 @@ impl TableBranchCatalog {
         }
         let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
         match self.core(child_id)? {
-            Some(rec) if rec.state != BranchState::Reaped => {
+            Some(rec) if rec.state() != BranchState::Reaped => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
             // Reaped, or gone entirely: a stale hint. Not a live child.
@@ -568,8 +577,10 @@ impl TableBranchCatalog {
     /// lease expired long ago; left in the index it would sit at the head of the range for ever and
     /// every 30-second reap scan would step over it before reaching anything real. That is an
     /// unbounded walk reintroduced into the hot path through the back door.
-    fn in_deadline_index(rec: &BranchRecord) -> bool {
-        rec.state == BranchState::Live && !rec.branch_id.is_trunk()
+    /// Takes the two fields it reads rather than a record, so it serves a `CoreRecord` and a whole
+    /// `BranchRecord` alike without either having to be converted to satisfy it.
+    fn in_deadline_index(state: BranchState, branch_id: BranchId) -> bool {
+        state == BranchState::Live && !branch_id.is_trunk()
     }
 
     /// Ids of every entry in a span whose key ends with an 8-byte branch id.
@@ -641,7 +652,7 @@ impl BranchCatalog for TableBranchCatalog {
         let (child_num, generation) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation).unwrap_or(0);
+                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
                 (id, slot_gen)
             }
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0),
@@ -686,9 +697,13 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // `LogBranchCatalog::set_root` reads through `get`, which returns a whole record. Two
         // implementations of one trait method must do the same thing.
-        let mut rec = self.hydrate(self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?)?;
-        rec.check_readable(branch)?;
-        let old = rec.clone();
+        // The core is read FIRST and kept as `old`: `write_record` only ever consults an old
+        // record for its state and deadline index keys, so cloning the hydrated record -- arenas
+        // and all -- to hand it over was copying a vector nobody read.
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        let old = core.clone();
+        let mut rec = self.hydrate(core)?;
         rec.root_page_id = root;
         self.write_record(&rec, Some(&old))?;
         self.commit()
@@ -702,7 +717,9 @@ impl BranchCatalog for TableBranchCatalog {
                 // The index holds only Live non-trunk branches, so this re-check is belt and
                 // braces against an index entry that outlived its record rather than a filter the
                 // query depends on.
-                if Self::in_deadline_index(&rec) && rec.lease_deadline.is_expired_at(now_millis) {
+                if Self::in_deadline_index(rec.state(), rec.branch_id())
+                    && rec.lease_deadline().is_expired_at(now_millis)
+                {
                     out.push(self.hydrate(rec)?);
                 }
             }
@@ -815,7 +832,7 @@ impl BranchCatalog for TableBranchCatalog {
         // signature on the log catalog, which returns nothing: a failure here leaks an id slot,
         // which is recoverable, while propagating it would abort a reap midway, which is not.
         let reusable = match (self.core(id), self.has_live_children(id)) {
-            (Ok(Some(rec)), Ok(false)) => rec.state == BranchState::Reaped,
+            (Ok(Some(rec)), Ok(false)) => rec.state() == BranchState::Reaped,
             _ => false,
         };
         if reusable {
@@ -846,9 +863,10 @@ impl BranchCatalog for TableBranchCatalog {
         let _g = self.logical.lock().unwrap();
         // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
         // back would delete the branch's.
-        let mut rec = self.hydrate(self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?)?;
-        rec.check_readable(branch)?;
-        let old = rec.clone();
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        let old = core.clone();
+        let mut rec = self.hydrate(core)?;
         rec.lease_deadline = lease;
         self.write_record(&rec, Some(&old))?;
         self.commit()
