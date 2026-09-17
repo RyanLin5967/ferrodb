@@ -44,3 +44,34 @@ WHAT THIS SETTLES, AND WHAT IT DOES NOT:
   empty tree measures the best case of every descent and understates all of them. 2,000 iterations
   per operation. This is a #[ignore]d test rather than production instrumentation, because a
   profiler compiled into the write path is overhead inside the loop it is measuring.
+
+=== ATTEMPTED SAME-INSTRUMENT SUBTRACTION, AND WHY IT DOES NOT WORK ===
+
+Two attempts, both discarded. Recorded because the failure mode is reusable.
+
+  ATTEMPT 1: time `flush_all + sync` in a loop.            -> 0.010 ms
+    Nothing was dirty, and macOS short-circuits F_FULLFSYNC when the file has nothing pending.
+    Subtracting it from fork() attributed 3.32 ms to "the serial section", which is absurd on its
+    face and contradicted the 0.115 ms the operations actually cost.
+
+  ATTEMPT 2: dirty one key, then flush, and subtract the dirtying. -> 3.230 ms
+    uncontended fork() 3.965 ms - 3.230 ms = 0.735 ms "serial section".
+    ⛔ THAT IS IMPOSSIBLE AND THE CONTRADICTION IS WHAT KILLS IT. At 64 threads the measured
+    throughput is 4382.7 forks/sec. A 0.735 ms serial section caps throughput at 1/0.735ms =
+    1360/sec. The number disagrees with a measurement already in hand by 3.2x, so it is wrong.
+
+  WHY: A FLUSH CANNOT BE PRICED INDEPENDENTLY OF THE DIRTY SET. `flush_all` writes every dirty
+  page; its cost is a function of how many there are. The probe dirties ONE key. A fork dirties the
+  record, state, deadline, child and header spans -- more pages, so a fork's own flush costs MORE
+  than 3.230 ms, and subtracting the probe's flush leaves a residue that is part flush, not serial
+  section. There is no constant "the flush" to subtract.
+
+  WHAT IS RELIABLE, THEREFORE:
+    - the seven operations at 0.1135-0.1148 ms across three runs -- directly measured, one
+      instrument, no subtraction;
+    - the EFFECTIVE serial time under 64-thread contention at ~0.228 ms -- derived from measured
+      throughput via the 1/serial_time model, which matched four independent runs within 0.15%.
+    Those two ARE comparable, and give the ~50% figure this file reports. The uncontended serial
+    section remains UNMEASURED, and the honest consequence is that the ~0.105 ms gap cannot yet be
+    attributed between convoy and work this profile does not cover. Do not let the two discarded
+    numbers above be quoted as if they were results.
