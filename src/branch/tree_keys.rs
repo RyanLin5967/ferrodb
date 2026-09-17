@@ -56,6 +56,13 @@ pub mod tag {
     /// page is a wall with no error message, so the unbounded field becomes a key span, where the
     /// only question anyone asks of it ("which arenas does this branch own?") is a range scan.
     pub const ARENA: u8 = 0x06;
+    /// `[0x07]` → the catalog header: `next_id` and the epoch counter.
+    ///
+    /// Inside the tree rather than on a page of its own, so that `open` is one descent and so that
+    /// a fork's id allocation commits in the same structure as the record it allocated. The only
+    /// value that must live outside the tree is the tree's own root page id, which the caller
+    /// persists — that is the irreducible bootstrap, and it is one `u32`.
+    pub const HEADER: u8 = 0x07;
     /// `[0x04][branch id]` → empty. Ids released by a reap and available for reuse.
     ///
     /// In the tree rather than in the header on purpose: a free-id *list* in a fixed header is
@@ -123,6 +130,11 @@ pub fn free_id(id: u64) -> Vec<u8> {
     k.push(tag::FREE_ID);
     k.extend_from_slice(&id.to_be_bytes());
     k
+}
+
+/// `[0x07]` — the single header key.
+pub fn header() -> Vec<u8> {
+    vec![tag::HEADER]
 }
 
 /// The half-open span `[lo, hi)` covering an entire tag group.

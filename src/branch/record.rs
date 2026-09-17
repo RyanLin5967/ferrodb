@@ -297,27 +297,7 @@ impl BranchRecord {
             None => b.push(0),
             Some(e) => {
                 b.push(1);
-                b.push(e.verbs);
-                b.extend_from_slice(&e.max_row_writes.to_be_bytes());
-                b.extend_from_slice(&e.row_writes.to_be_bytes());
-                b.extend_from_slice(&(e.tables.len() as u32).to_be_bytes());
-                for t in &e.tables {
-                    b.extend_from_slice(&t.table.to_be_bytes());
-                    b.extend_from_slice(&(t.columns.len() as u32).to_be_bytes());
-                    for c in &t.columns {
-                        b.extend_from_slice(&c.col.to_be_bytes());
-                        match c.floor {
-                            None => {
-                                b.push(0);
-                                b.extend_from_slice(&0i64.to_be_bytes());
-                            }
-                            Some(f) => {
-                                b.push(1);
-                                b.extend_from_slice(&f.to_be_bytes());
-                            }
-                        }
-                    }
-                }
+                b.extend_from_slice(&e.serialize());
             }
         }
         let crc = crc32(&b);
@@ -372,50 +352,7 @@ impl BranchRecord {
         } else {
             match c.u8()? {
                 0 => None,
-                1 => {
-                    let verbs = c.u8()?;
-                    let max_row_writes = c.u64()?;
-                    let row_writes = c.u64()?;
-                    let table_len = c.u32()? as usize;
-                    let mut tables = Vec::new();
-                    for _ in 0..table_len {
-                        let table = c.u32()?;
-                        let col_len = c.u32()? as usize;
-                        let mut columns = Vec::new();
-                        for _ in 0..col_len {
-                            let col = c.u32()?;
-                            // Anything but 0 or 1 is refused, not read as "no floor". A tag this
-                            // read does not understand turning a floored column into an unbounded
-                            // one is the one direction this type forbids: a bound it cannot
-                            // evaluate refuses, it does not wave the write past.
-                            let floor = match c.u8()? {
-                                0 => {
-                                    c.i64()?;
-                                    None
-                                }
-                                1 => Some(c.i64()?),
-                                other => {
-                                    return Err(BranchError::Corrupt(format!(
-                                        "unknown capability floor tag {other} on table {table} \
-                                         column {col}"
-                                    )))
-                                }
-                            };
-                            columns.push(ColumnCapability { col, floor });
-                        }
-                        tables.push((table, columns));
-                    }
-                    // Built through `allow`, which sorts and deduplicates, so an envelope read off
-                    // disk carries the same invariant as one built in process. Reconstructing the
-                    // struct raw here is what let a non-canonical record mis-resolve a table it
-                    // had actually been granted.
-                    let mut e = CapabilityEnvelope::new(verbs, max_row_writes);
-                    for (table, columns) in tables {
-                        e = e.allow(table, columns);
-                    }
-                    e.row_writes = row_writes;
-                    Some(e)
-                }
+                1 => Some(CapabilityEnvelope::deserialize_from(&mut c)?),
                 other => {
                     return Err(BranchError::Corrupt(format!(
                         "unknown capability envelope tag {other}"
@@ -872,6 +809,87 @@ impl CapabilityEnvelope {
     }
 
     /// Row-writes still available.
+    /// The envelope's bytes, **without** the presence tag that `BranchRecord` writes before them.
+    ///
+    /// Extracted from `BranchRecord::serialize` rather than written a second time: the table
+    /// catalog stores envelopes under their own key (`tree_keys::ENVELOPE`) because they are
+    /// variable-length and `envelope_of` is already a separate query, and two encoders for one
+    /// format drift the first time either is touched.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(self.verbs);
+        b.extend_from_slice(&self.max_row_writes.to_be_bytes());
+        b.extend_from_slice(&self.row_writes.to_be_bytes());
+        b.extend_from_slice(&(self.tables.len() as u32).to_be_bytes());
+        for t in &self.tables {
+            b.extend_from_slice(&t.table.to_be_bytes());
+            b.extend_from_slice(&(t.columns.len() as u32).to_be_bytes());
+            for c in &t.columns {
+                b.extend_from_slice(&c.col.to_be_bytes());
+                match c.floor {
+                    None => {
+                        b.push(0);
+                        b.extend_from_slice(&0i64.to_be_bytes());
+                    }
+                    Some(f) => {
+                        b.push(1);
+                        b.extend_from_slice(&f.to_be_bytes());
+                    }
+                }
+            }
+        }
+        b
+    }
+
+    /// Inverse of [`Self::serialize`], reading from a standalone buffer.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, BranchError> {
+        let mut c = Cursor::new(bytes);
+        Self::deserialize_from(&mut c)
+    }
+
+    fn deserialize_from(c: &mut Cursor<'_>) -> Result<Self, BranchError> {
+        let verbs = c.u8()?;
+        let max_row_writes = c.u64()?;
+        let row_writes = c.u64()?;
+        let table_len = c.u32()? as usize;
+        let mut tables = Vec::new();
+        for _ in 0..table_len {
+            let table = c.u32()?;
+            let col_len = c.u32()? as usize;
+            let mut columns = Vec::new();
+            for _ in 0..col_len {
+                let col = c.u32()?;
+                // Anything but 0 or 1 is refused, not read as "no floor". A tag this read does not
+                // understand turning a floored column into an unbounded one is the one direction
+                // this type forbids: a bound it cannot evaluate refuses, it does not wave the
+                // write past.
+                let floor = match c.u8()? {
+                    0 => {
+                        c.i64()?;
+                        None
+                    }
+                    1 => Some(c.i64()?),
+                    other => {
+                        return Err(BranchError::Corrupt(format!(
+                            "unknown capability floor tag {other} on table {table} column {col}"
+                        )))
+                    }
+                };
+                columns.push(ColumnCapability { col, floor });
+            }
+            tables.push((table, columns));
+        }
+        // Built through `allow`, which sorts and deduplicates, so an envelope read off disk carries
+        // the same invariant as one built in process. Reconstructing the struct raw is what let a
+        // non-canonical record mis-resolve a table it had actually been granted.
+        let mut e = CapabilityEnvelope::new(verbs, max_row_writes);
+        for (table, columns) in tables {
+            e = e.allow(table, columns);
+        }
+        e.row_writes = row_writes;
+        Ok(e)
+    }
+
     pub fn remaining(&self) -> u64 {
         self.max_row_writes.saturating_sub(self.row_writes)
     }

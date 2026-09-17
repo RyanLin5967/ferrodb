@@ -21,6 +21,14 @@ fn main() {
     // into a subtraction. See SCALE-DESIGN.md O1.
     eprintln!("O1 size_of::<BranchRecord>()={}", std::mem::size_of::<ferrodb::branch::BranchRecord>());
 
+    // FERRODB_CATALOG=table runs the identical fork loop against the system-table catalog.
+    // RSS and reopen are directly comparable; TOTAL TIME IS NOT, and the output says so: the log
+    // catalog fsyncs every append while the table catalog writes through the buffer pool. Equalise
+    // durability before comparing seconds.
+    if std::env::var("FERRODB_CATALOG").as_deref() == Ok("table") {
+        run_table(n, &dir);
+        return;
+    }
     let cat = Arc::new(LogBranchCatalog::open(&path, 1).expect("open catalog"));
     let lease = LeaseDeadline(u64::MAX);
 
@@ -53,4 +61,49 @@ fn main() {
 
     println!("{n}\t{first:.2}\t{last:.2}\t{total:.3}\t{bytes}\t{reopen:.3}\t{live}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same loop against `TableBranchCatalog`, so the two are measured by one harness rather than
+/// by two that could differ in something nobody noticed.
+fn run_table(n: usize, dir: &std::path::Path) {
+    use ferrodb::branch::table_catalog::TableBranchCatalog;
+    use ferrodb::buffer::buffer_pool::BufferPoolManager;
+    use ferrodb::storage::disk_manager::DiskManager;
+
+    let path = dir.join("branches-table.db");
+    let _ = std::fs::remove_file(&path);
+    let f = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+    let cat = TableBranchCatalog::create(Arc::clone(&pool), 1).expect("create catalog");
+    let lease = LeaseDeadline(u64::MAX);
+
+    let mut first = 0f64;
+    let mut last = 0f64;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let t = Instant::now();
+        cat.fork(BranchId::TRUNK, lease).expect("fork");
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        if i == 0 { first = us; }
+        if i + 1 == n { last = us; }
+    }
+    // Make the comparison honest about space: everything must be on disk before the file is
+    // measured, or the table catalog reports a smaller file merely because it is still buffered.
+    pool.flush_all().expect("flush");
+    let total = t0.elapsed().as_secs_f64();
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let root = cat.root_page_id();
+
+    let (reopen, live) = if std::env::var("FERRODB_SKIP_REOPEN").is_ok() {
+        (f64::NAN, cat.live_count().expect("live"))
+    } else {
+        let t = Instant::now();
+        let re = TableBranchCatalog::open(Arc::clone(&pool), root).expect("reopen");
+        let r = t.elapsed().as_secs_f64();
+        // `live_count` walks the Live state span, so it is NOT part of the reopen measurement -
+        // reopen is the header descent alone, which is the whole claim.
+        (r, re.live_count().expect("live"))
+    };
+    println!("{n}\t{first:.2}\t{last:.2}\t{total:.3}\t{bytes}\t{reopen:.6}\t{live}");
+    let _ = std::fs::remove_dir_all(dir);
 }
