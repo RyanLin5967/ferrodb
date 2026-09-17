@@ -25,6 +25,7 @@ pub mod types;
 
 pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
+pub mod tree_keys;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
 pub use reaper::{PageLinks, TwoTierReaper};
 pub use record::{
