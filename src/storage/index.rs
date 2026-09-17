@@ -194,18 +194,26 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             BPlusTreeInternalPage::<K>::deserialize(pf.data)?
         }; // lock dropped
 
+        // INSERT FIRST, THEN SPLIT - the same order `insert` uses for leaves, and a correctness
+        // fix rather than a tidy-up.
+        //
+        // This used to ask `is_full()` BEFORE inserting. That check reads
+        // `INTERNAL_HEADER_SIZE + keys + child_ptrs >= PAGE_SIZE`, i.e. "are the CURRENT contents
+        // already at capacity", while its own comment says "does adding one more entry exceed
+        // capacity?". So a node sitting at 4090 bytes reported not-full, took one more key plus a
+        // 4-byte child pointer, and `serialize` wrote past the end of the page:
+        //   `range end index 4100 out of range for slice of length 4096`.
+        // Reachable by any tree deep enough to fill an internal node, which is why small fixtures
+        // never saw it; it was found by driving 8000 branches through the branch catalog.
+        //
+        // Inserting first is safe because the node is an in-memory struct of `Vec`s at this point.
+        // Only `serialize` is bounded by the page, and nothing is serialized until after the split.
+        let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
+        parent_node.insert_key_child(index, mid_key, right_id);
+
         if parent_node.is_full() {
             let new_parent_id = self.buffer_pool.new_page()?;   // no lock held
-            let (up_key, mut new_parent) = parent_node.split(new_parent_id);
-
-            if mid_key >= up_key {
-                let index = new_parent.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
-                new_parent.insert_key_child(index, mid_key, right_id);
-            } else {
-                let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
-                parent_node.insert_key_child(index, mid_key, right_id);
-            }
-
+            let (up_key, new_parent) = parent_node.split(new_parent_id);
             {
                 let mut pf = self.buffer_pool.frames[frame_i].write().unwrap();
                 pf.data = parent_node.serialize()?;
@@ -219,8 +227,6 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             self.buffer_pool.unpin_page(parent_id, true);
             self.insert_into_parent(stack, parent_id, up_key, new_parent_id)?;
         } else {
-            let index = parent_node.key_arr.binary_search(&mid_key).unwrap_or_else(|i| i);
-            parent_node.insert_key_child(index, mid_key, right_id);
             {
                 let mut pf = self.buffer_pool.frames[frame_i].write().unwrap();
                 pf.data = parent_node.serialize()?;
@@ -490,5 +496,56 @@ mod tests {
             assert_eq!(*k, Value::Integer(expected_val));
             assert_eq!(*v, Value::Integer(expected_val * 10));
         }
+    }
+
+    /// **Regression: an internal node must split before it overflows its page.**
+    ///
+    /// `insert_into_parent` used to ask `is_full()` BEFORE inserting, but that check reads
+    /// "are the current contents already at capacity" while its own comment says "does adding one
+    /// more entry exceed capacity?". A node sitting just under 4096 bytes reported not-full, took
+    /// one more key plus a 4-byte child pointer, and `serialize` panicked with
+    /// `range end index 4100 out of range for slice of length 4096`.
+    ///
+    /// It needs a tree deep enough that an internal node fills, which is why every existing fixture
+    /// missed it: they use small `Value` keys and a few hundred rows. This uses wide byte keys so
+    /// the internal level fills in thousands of inserts rather than millions, and it asserts every
+    /// key is still readable afterwards - a split that loses a subtree is silent otherwise.
+    #[test]
+    fn internal_nodes_split_before_overflowing_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep.db");
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let tree = BPlusTreeManager::<Vec<u8>, Vec<u8>>::create(bp).unwrap();
+
+        // 60-byte keys: ~64 bytes on the page each, so an internal node reaches 4 KB in ~64 keys
+        // and the tree needs three levels within a few thousand entries.
+        let key = |i: u32| {
+            let mut k = i.to_be_bytes().to_vec();
+            k.resize(60, 0xAB);
+            k
+        };
+        const N: u32 = 6000;
+        for i in 0..N {
+            tree.insert(key(i), vec![i as u8; 8]).expect("insert must not overflow a page");
+        }
+        for i in 0..N {
+            assert_eq!(
+                tree.search(&key(i)).expect("search"),
+                Some(vec![i as u8; 8]),
+                "key {i} was lost - a split dropped a subtree"
+            );
+        }
+        // And the whole set must still come back in order from a scan.
+        let all: Vec<Vec<u8>> = tree
+            .range_scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .expect("scan")
+            .map(|e| e.expect("entry").0)
+            .collect();
+        assert_eq!(all.len(), N as usize, "scan lost entries the point lookups could still find");
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(all, sorted, "scan came back out of order");
     }
 }
