@@ -1,0 +1,29 @@
+O1-residual: where do the resident bytes per branch actually go?
+Recorded 2026-09-17. Instrument: /usr/bin/time -l on examples/durable_fork 64000, release build.
+Single run per arm. UNINTERPRETED BELOW THE NUMBERS.
+
+  size_of::<BranchRecord>() = 168 bytes
+
+  arm A -- the harness as the published curve measured it. It reopens the catalog while the
+  first one is STILL ALIVE, so peak RSS covers TWO full catalogs:
+    64000  first_us=4225.96  last_us=5078.33  total_s=273.797  log_bytes=4352000  reopen_s=0.030
+    maximum resident set size = 89997312   (90.0 MB)
+
+  arm B -- FERRODB_SKIP_REOPEN=1. Identical fork loop, ONE catalog resident:
+    64000  first_us=3955.33  last_us=4722.50  total_s=324.873  log_bytes=4352000  reopen_s=NaN
+    maximum resident set size = 43237376   (43.2 MB)
+
+  ratio A/B = 2.08
+
+CALIBRATION: arm A reproduces bench/durable_fork_curve_to_128k.tsv's 64k row (90128384 B) to
+within 0.15%, so the two runs are comparable and the instrument is stable across sessions.
+
+PRE-REGISTERED BEFORE THE RUN (stated in the session before B finished, so it could be wrong
+rather than fitted afterwards): B near 23 MB would mean the live HashMap table is the whole
+story; B near 46 MB would point at freed rehash tables retained by the allocator; B near 90 MB
+would mean the double-catalog hypothesis was wrong. B came back at 43.2 MB -- the middle band.
+
+NOT YET ESTABLISHED, and deliberately not claimed here: this is an AVERAGE over one N, which
+includes whatever fixed baseline the process carries. The MARGINAL cost per branch needs a
+second and third N in the same arm, and that is what extrapolates to 10^6. Do not quote
+43.2 MB / 64000 = 675 B/branch as the marginal; it is the average.
