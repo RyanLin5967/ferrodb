@@ -10,7 +10,7 @@ use crate::wal::txn::TxnManager;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
-use crate::branch::catalog::LogBranchCatalog;
+use crate::branch::TableBranchCatalog;
 use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseThread, RuntimeLock};
 use crate::branch::reaper::TwoTierReaper;
 use crate::branch::{BranchCatalog, Reaper};
@@ -82,10 +82,14 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // so an agent session's writes lived in a `BTreeMap` and the copy-on-write branch engine -
     // zero-copy fork, lease reaping, shadow paging - was reachable only from tests. The engine was
     // real and the binary did not use it.
-    let branches_path = format!("{db_path}.branches");
     let arena_path = format!("{db_path}.arena");
-    let branches = Arc::new(LogBranchCatalog::open(
-        Path::new(&branches_path),
+    // `default_for_database` rather than a path spelled out here, for the same reason
+    // `DurableEffectLog::default_for_database` is used below: the naming convention and the choice
+    // of implementation belong beside the format, and an entry point wiring a runtime should make
+    // no decision. It also owns the one-time conversion of a legacy `{db}.branches` log, which an
+    // entry point has no business knowing about.
+    let branches = Arc::new(TableBranchCatalog::default_for_database(
+        db_path,
         TRUNK_ROOT_PLACEHOLDER,
     )?);
 

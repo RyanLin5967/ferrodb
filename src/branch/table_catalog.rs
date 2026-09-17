@@ -174,6 +174,76 @@ impl TableBranchCatalog {
         }
     }
 
+    /// The catalog for a database, migrating a legacy `{db}.branches` log if one is present.
+    ///
+    /// Named after `DurableEffectLog::default_for_database`, and for the reason `cli.rs` gives
+    /// there: the naming convention and the choice of implementation belong beside the format, and
+    /// an entry point wiring a runtime should make no decision.
+    ///
+    /// **Crash safety comes from an atomic rename, not from a journal.** The migration writes
+    /// `{db}.branchcat.tmp` and renames it into place only once it is complete and flushed, so the
+    /// PRESENCE of `{db}.branchcat` means "finished". Migrating straight into the final name would
+    /// leave a half-built catalog that the next open would happily use.
+    ///
+    /// The legacy log is **renamed aside, never deleted**: a conversion that turns out to be wrong
+    /// is recoverable only if its source survives it, and renaming costs nothing.
+    pub fn default_for_database(db_path: &str, trunk_root: PageId) -> Result<Self, FerroError> {
+        use std::path::Path;
+        let cat_path = format!("{db_path}.branchcat");
+        let legacy_path = format!("{db_path}.branches");
+        let tmp_path = format!("{db_path}.branchcat.tmp");
+        let retired_path = format!("{db_path}.branches.pre-table");
+
+        let has = |p: &str| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false);
+
+        if has(&cat_path) {
+            // Finished, whatever else is lying around. If a crash landed between the two renames
+            // the legacy log is still here and is now stale; retire it rather than leave two
+            // catalogs where a later reader might pick the wrong one.
+            if has(&legacy_path) {
+                let _ = std::fs::rename(&legacy_path, &retired_path);
+            }
+            return Self::open_sidecar(Path::new(&cat_path), trunk_root);
+        }
+
+        if has(&legacy_path) {
+            // A previous attempt may have died partway; its tmp is garbage by construction.
+            let _ = std::fs::remove_file(&tmp_path);
+            {
+                let source = crate::branch::catalog::LogBranchCatalog::open(
+                    Path::new(&legacy_path),
+                    trunk_root,
+                )?;
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(&tmp_path)
+                    .map_err(|e| FerroError::Io(format!("create {tmp_path}: {e}")))?;
+                let pool = Arc::new(BufferPoolManager::new(Arc::new(
+                    crate::storage::disk_manager::DiskManager::new(file)?,
+                )));
+                let (cat, header) = Self::migrate_from(pool, &source, trunk_root)?;
+                if header != SIDECAR_HEADER_PAGE {
+                    return Err(FerroError::Branch(format!(
+                        "migrated catalog header landed on page {header}, not \
+                         {SIDECAR_HEADER_PAGE}; refusing to rename it into place"
+                    )));
+                }
+                // Everything must be on disk BEFORE the rename publishes it.
+                cat.pool.flush_all()?;
+            }
+            std::fs::rename(&tmp_path, &cat_path)
+                .map_err(|e| FerroError::Io(format!("publish {cat_path}: {e}")))?;
+            // Only now is the log redundant.
+            std::fs::rename(&legacy_path, &retired_path)
+                .map_err(|e| FerroError::Io(format!("retire {legacy_path}: {e}")))?;
+            return Self::open_sidecar(Path::new(&cat_path), trunk_root);
+        }
+
+        Self::open_sidecar(Path::new(&cat_path), trunk_root)
+    }
+
     /// Build a catalog from an existing one, record for record.
     ///
     /// Used to convert a `{db}.branches` log into `{db}.branchcat` on first open. It reads the
@@ -231,6 +301,23 @@ impl TableBranchCatalog {
         cat.write_header()?;
         cat.publish_root()?;
         Ok((cat, header))
+    }
+
+    /// Publish the root **and make everything this operation wrote durable.**
+    ///
+    /// The log catalog fsyncs every append, which is why forking is fsync-bound at ~270/sec. This
+    /// catalog writes through a buffer pool, and without this it is not durable at all: the first
+    /// version of the switchover created a database, wrote the header page into a frame, exited,
+    /// and the next open found `magic 0x00000000` because the page had never reached the disk.
+    /// Every branch the process created was gone.
+    ///
+    /// **That also means the earlier benchmark's "6x less total time" was partly the cost of not
+    /// being durable.** The bench artifact said time was not comparable between the two catalogs;
+    /// it is now comparable, and the honest number is measured rather than assumed.
+    fn commit(&self) -> Result<(), FerroError> {
+        self.publish_root()?;
+        self.pool.flush_all()?;
+        self.pool.disk_manager.sync()
     }
 
     /// Write the current tree root into the header page, if it moved.
@@ -562,8 +649,9 @@ impl BranchCatalog for TableBranchCatalog {
         self.tree
             .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
         self.write_header()?;
-        // Last, so the header page never names a root whose pages are not written yet.
-        self.publish_root()?;
+        // Last, so the header page never names a root whose pages are not written yet, and
+        // durable before the caller is told the fork happened.
+        self.commit()?;
         Ok(child)
     }
 
@@ -577,7 +665,7 @@ impl BranchCatalog for TableBranchCatalog {
         let _g = self.logical.lock().unwrap();
         let old = self.core(record.branch_id.id)?;
         self.write_record(record, old.as_ref())?;
-        self.publish_root()
+        self.commit()
     }
 
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
@@ -587,7 +675,7 @@ impl BranchCatalog for TableBranchCatalog {
         let old = rec.clone();
         rec.root_page_id = root;
         self.write_record(&rec, Some(&old))?;
-        self.publish_root()
+        self.commit()
     }
 
     fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
@@ -705,7 +793,7 @@ impl BranchCatalog for TableBranchCatalog {
         };
         if reusable {
             let _ = self.upsert(keys::free_id(id), Vec::new());
-            let _ = self.publish_root();
+            let _ = self.commit();
         }
     }
 
@@ -717,13 +805,13 @@ impl BranchCatalog for TableBranchCatalog {
     ) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
-        self.publish_root()
+        self.commit()
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
         let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
-        self.publish_root()?;
+        self.commit()?;
         Ok(removed)
     }
 
@@ -734,7 +822,7 @@ impl BranchCatalog for TableBranchCatalog {
         let old = rec.clone();
         rec.lease_deadline = lease;
         self.write_record(&rec, Some(&old))?;
-        self.publish_root()
+        self.commit()
     }
 
     fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
@@ -760,7 +848,7 @@ impl BranchCatalog for TableBranchCatalog {
         })?;
         env.charge(n)?;
         self.upsert(keys::envelope(branch.id), env.serialize())?;
-        self.publish_root()
+        self.commit()
     }
 }
 
@@ -1289,6 +1377,80 @@ mod tests {
         assert_eq!(sn.branch_id, dn.branch_id, "the next branch minted differs after migrating");
         assert_eq!(sn.fork_epoch, dn.fork_epoch, "the next fork epoch differs after migrating");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The open-or-migrate policy end to end, on real files.
+    #[test]
+    fn a_legacy_log_is_migrated_once_and_retired_not_deleted() {
+        use crate::branch::catalog::LogBranchCatalog;
+        let dir = std::env::temp_dir().join(format!("ferro-dfd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x");
+        let db_s = db.to_str().unwrap().to_string();
+
+        // A legacy log with a population.
+        let ids: Vec<u64> = {
+            let log = LogBranchCatalog::open(&dir.join("x.branches"), 1).unwrap();
+            (0..25).map(|_| log.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap().branch_id.id)
+                .collect()
+        };
+
+        let cat = TableBranchCatalog::default_for_database(&db_s, 1).unwrap();
+        assert_eq!(BranchCatalog::live_count(&cat), 26, "trunk plus twenty-five");
+        for id in &ids {
+            cat.get(BranchId::new(*id, 0)).expect("branch lost in migration");
+        }
+
+        assert!(dir.join("x.branchcat").exists(), "the tree catalog was not published");
+        assert!(!dir.join("x.branches").exists(), "the legacy log was left in place");
+        assert!(
+            dir.join("x.branches.pre-table").exists(),
+            "the legacy log was DELETED - a conversion that turns out wrong is only recoverable \
+             if its source survives it"
+        );
+        assert!(!dir.join("x.branchcat.tmp").exists(), "the staging file was left behind");
+        cat.pool.flush_all().unwrap();
+        drop(cat);
+
+        // Second open: uses the tree, does not migrate again, and does not lose anything.
+        let again = TableBranchCatalog::default_for_database(&db_s, 1).unwrap();
+        assert_eq!(BranchCatalog::live_count(&again), 26, "a second open lost branches");
+        for id in &ids {
+            again.get(BranchId::new(*id, 0)).expect("branch lost on reopen");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash between publishing the tree and retiring the log leaves BOTH files. The next open
+    /// must use the tree - it is complete by construction, since only a finished migration is ever
+    /// renamed into place - and retire the stale log rather than leave two catalogs around.
+    #[test]
+    fn an_interrupted_switchover_prefers_the_tree_and_retires_the_stale_log() {
+        use crate::branch::catalog::LogBranchCatalog;
+        let dir = std::env::temp_dir().join(format!("ferro-dfd-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("y");
+        let db_s = db.to_str().unwrap().to_string();
+
+        {
+            let log = LogBranchCatalog::open(&dir.join("y.branches"), 1).unwrap();
+            for _ in 0..5 {
+                log.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+            }
+        }
+        let cat = TableBranchCatalog::default_for_database(&db_s, 1).unwrap();
+        cat.pool.flush_all().unwrap();
+        drop(cat);
+        // Simulate the crash window: put the legacy log back alongside a finished tree.
+        std::fs::rename(dir.join("y.branches.pre-table"), dir.join("y.branches")).unwrap();
+
+        let again = TableBranchCatalog::default_for_database(&db_s, 1).unwrap();
+        assert_eq!(BranchCatalog::live_count(&again), 6, "the stale log was migrated a second time");
+        assert!(!dir.join("y.branches").exists(), "the stale log was left beside the tree");
+        assert!(dir.join("y.branches.pre-table").exists(), "the stale log was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

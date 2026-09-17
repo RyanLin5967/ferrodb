@@ -12,7 +12,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
-use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::TableBranchCatalog;
 use ferrodb::branch::lease_thread::{scan_interval_from_env, LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::{BranchCatalog, Reaper};
@@ -86,10 +86,9 @@ fn main() {
     // sit above what the catalog has already allocated, or the ordinary allocator and the arena hand
     // out the same page. The floor is persisted in the checkpoint, so a reopen reattaches to the
     // region it left rather than inventing a new one on top of live pages.
-    let branches_path = format!("{db}.branches");
     let arena_path = format!("{db}.arena");
     let branches = Arc::new(
-        LogBranchCatalog::open(Path::new(&branches_path), 1).expect("branch catalog"),
+        TableBranchCatalog::default_for_database(&db, 1).expect("branch catalog"),
     );
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
