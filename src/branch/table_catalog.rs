@@ -316,6 +316,40 @@ impl TableBranchCatalog {
         Ok(())
     }
 
+    /// Resolve one CHILD entry to the fork epoch of a child that is **still live**, or `None`.
+    ///
+    /// **A CHILD entry is a hint, not an answer.** `reap` marks a child `Reaped` and then removes
+    /// its entry, and a crash between those leaves the entry behind. `LogBranchCatalog` never had
+    /// this problem because it DERIVES the live set from each child's own record at replay; an
+    /// index cannot derive, so the child's record is consulted here instead. That keeps the
+    /// authority in the same place the log catalog kept it — *a live child's own record says so* —
+    /// while the lookup stays a descent rather than a scan.
+    ///
+    /// The same pattern, with the same reasoning, is already in this repo:
+    /// `index_fulltext::postings_for_token` returns "candidates, not answers" and makes the caller
+    /// re-check the row. It is also how a Postgres index scan treats a dead tuple.
+    ///
+    /// A stale entry is harmless BECAUSE of the ordering in `reap`: the entry can only outlive a
+    /// child that is already `Reaped`, never precede one that is still live. Reversing those two
+    /// writes would make a MISSING entry possible for a live child, which is the unsafe direction —
+    /// the parent would look childless and its pages would be freed underneath a branch that can
+    /// still read them.
+    fn live_child_at(&self, key: &[u8], value: &[u8]) -> Result<Option<Epoch>, FerroError> {
+        if value.len() != 8 {
+            // An entry written before the value carried an id. There is no id to resolve, so it
+            // cannot be verified; treat it as LIVE, which is the parking (safe) direction.
+            return Ok(keys::child_epoch_from_key(key).map(Epoch));
+        }
+        let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
+        match self.core(child_id)? {
+            Some(rec) if rec.state != BranchState::Reaped => {
+                Ok(keys::child_epoch_from_key(key).map(Epoch))
+            }
+            // Reaped, or gone entirely: a stale hint. Not a live child.
+            _ => Ok(None),
+        }
+    }
+
     /// Only `Live`, non-trunk branches are in the deadline index.
     ///
     /// A quarantined branch keeps its record for as long as an operator wants to look at it and its
@@ -387,7 +421,10 @@ impl BranchCatalog for TableBranchCatalog {
         self.write_record(&child, None)?;
         // The child's entry in its parent's live set. A child that exists but is not listed in its
         // parent is a GC correctness hole, which is why both happen under one logical lock.
-        self.tree.insert(keys::child(parent.id, fork_epoch.0), Vec::new())?;
+        // The VALUE is the child's branch id, so a reader can resolve the child and check
+        // whether it is still live. See `live_child_at` for why the entry is only a hint.
+        self.tree
+            .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
         self.write_header()?;
         // Last, so the header page never names a root whose pages are not written yet.
         self.publish_root()?;
@@ -463,10 +500,15 @@ impl BranchCatalog for TableBranchCatalog {
         // One descent: the CHILD key stores the complement of the fork epoch, so the newest child
         // is the FIRST key in the span. Ascending would put it last and reading it would mean
         // consuming every child trunk has.
-        match self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?.next().transpose()? {
-            Some((k, _)) => Ok(keys::child_epoch_from_key(&k).map(Epoch)),
-            None => Ok(None),
+        // Entries are newest-first, so the first LIVE one is the maximum. Stale entries are
+        // skipped rather than trusted; they are bounded by crashes and removed by the next reap.
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, v) = entry?;
+            if let Some(e) = self.live_child_at(&k, &v)? {
+                return Ok(Some(e));
+            }
         }
+        Ok(None)
     }
 
     fn live_child_in_epoch_range(
@@ -479,22 +521,24 @@ impl BranchCatalog for TableBranchCatalog {
             // An empty window pins nothing.
             return Ok(false);
         };
-        Ok(self
-            .tree
-            .range_scan(Bound::Included(klo), Bound::Included(khi))?
-            .next()
-            .transpose()?
-            .is_some())
+        for entry in self.tree.range_scan(Bound::Included(klo), Bound::Included(khi))? {
+            let (k, v) = entry?;
+            if self.live_child_at(&k, &v)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
         let (lo, hi) = keys::children_of(parent_id);
-        Ok(self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .next()
-            .transpose()?
-            .is_some())
+        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+            let (k, v) = entry?;
+            if self.live_child_at(&k, &v)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Counts the `Live` state span. Unlike the log catalog's, this is a scan of that span rather
@@ -527,6 +571,17 @@ impl BranchCatalog for TableBranchCatalog {
             let _ = self.upsert(keys::free_id(id), Vec::new());
             let _ = self.publish_root();
         }
+    }
+
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        child_id: u64,
+    ) -> Result<(), FerroError> {
+        let _g = self.logical.lock().unwrap();
+        self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
+        self.publish_root()
     }
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
@@ -749,6 +804,107 @@ mod tests {
             ),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The crash window between `mark_reaped` and `detach_child`.**
+    ///
+    /// `reap` marks the child reaped and then removes its CHILD entry. A crash in between leaves a
+    /// STALE entry: present, but naming a branch that is already `Reaped`. Every reader must
+    /// resolve it and ignore it, or the parent's pages stay pinned for ever by a branch that no
+    /// longer exists.
+    ///
+    /// The opposite window — entry removed while the child still reads Live — is the unsafe one,
+    /// and the ordering in `reap` is what rules it out. This test covers the half that ordering
+    /// leaves behind.
+    #[test]
+    fn a_stale_child_entry_against_a_reaped_child_is_resolved_and_ignored() {
+        let (c, p, _pool) = cat("stalechild");
+        let doomed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let survivor = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let t = BranchId::TRUNK.id;
+
+        // Precondition: both are live and the newest is the survivor.
+        assert_eq!(c.max_live_child(t).unwrap(), Some(survivor.fork_epoch));
+        assert!(c.live_child_in_epoch_range(t, doomed.fork_epoch, Epoch(doomed.fork_epoch.0 + 1)).unwrap());
+
+        // THE CRASH WINDOW: mark reaped, do NOT detach.
+        let mut rec = c.get(doomed.branch_id).unwrap();
+        rec.state = BranchState::Reaped;
+        c.put(&rec).unwrap();
+
+        // The entry is still there...
+        let (lo, hi) = keys::children_of(t);
+        let raw: Vec<_> = c
+            .tree
+            .range_scan(Bound::Included(lo), Bound::Excluded(hi))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(raw.len(), 2, "fixture: the stale entry must still be present");
+
+        // ...and every reader must see through it.
+        assert!(
+            !c.live_child_in_epoch_range(t, doomed.fork_epoch, Epoch(doomed.fork_epoch.0 + 1))
+                .unwrap(),
+            "a reaped child still pins its parent's pages - the entry was trusted, not resolved"
+        );
+        assert_eq!(
+            c.max_live_child(t).unwrap(),
+            Some(survivor.fork_epoch),
+            "max_live_child returned a reaped child's epoch"
+        );
+
+        // A LIVE child must still be seen - otherwise the resolver could just always say None and
+        // this whole test would pass while the reclamation rule freed everything.
+        assert!(
+            c.live_child_in_epoch_range(t, survivor.fork_epoch, Epoch(survivor.fork_epoch.0 + 1))
+                .unwrap(),
+            "a live child was ignored"
+        );
+        assert!(c.has_live_children(t).unwrap(), "trunk still has a live child");
+
+        // Reap the survivor too: now every entry is stale and the parent is genuinely childless.
+        let mut rec = c.get(survivor.branch_id).unwrap();
+        rec.state = BranchState::Reaped;
+        c.put(&rec).unwrap();
+        assert!(
+            !c.has_live_children(t).unwrap(),
+            "trunk reports live children when both are reaped - its pages would never be reclaimed"
+        );
+        assert_eq!(c.max_live_child(t).unwrap(), None);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// `attach_child` is what `collapse` uses to re-parent a branch onto trunk. It had NO test
+    /// against this catalog, and a mutant that made it a no-op survived the whole suite: a
+    /// re-parented branch would simply be absent from its new parent's live set, and that parent's
+    /// pages would look unreferenced by it.
+    #[test]
+    fn attach_child_puts_a_branch_into_a_parents_live_set_and_detach_takes_it_out() {
+        let (c, p, _pool) = cat("attach");
+        let child = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let t = BranchId::TRUNK.id;
+
+        assert!(c.detach_child(t, child.fork_epoch).unwrap(), "fixture: detach removed nothing");
+        assert!(!c.has_live_children(t).unwrap(), "fixture: trunk should now look childless");
+
+        // Re-attach at a NEW epoch, which is what collapse does.
+        let new_epoch = c.next_epoch();
+        c.attach_child(t, new_epoch, child.branch_id.id).unwrap();
+        assert!(c.has_live_children(t).unwrap(), "attach_child wrote nothing");
+        assert_eq!(c.max_live_child(t).unwrap(), Some(new_epoch), "attached child not the newest");
+        assert!(
+            c.live_child_in_epoch_range(t, new_epoch, Epoch(new_epoch.0 + 1)).unwrap(),
+            "the reclamation rule cannot see the re-parented child, so trunk's pages at that \
+             epoch would be freed underneath it"
+        );
+
+        // And the entry it wrote is still a HINT: reap the child and it stops counting.
+        let mut rec = c.get(child.branch_id).unwrap();
+        rec.state = BranchState::Reaped;
+        c.put(&rec).unwrap();
+        assert!(!c.has_live_children(t).unwrap(), "attach_child wrote an unverifiable entry");
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

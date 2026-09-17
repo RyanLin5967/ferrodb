@@ -241,10 +241,22 @@ impl Reaper for TwoTierReaper {
             freed += self.store.retire_arenas_by_rule(&rec, free_epoch)?;
         }
 
-        self.detach_from_parent(&rec)?;
-
+        // MARK REAPED FIRST, THEN DETACH. The reverse of what this used to do, and the order is
+        // load-bearing rather than cosmetic.
+        //
+        // `LogBranchCatalog` DERIVES a parent's live set from its children's own records at replay,
+        // so a crash between the two writes was harmless: the child still read Live, derivation
+        // re-added the epoch, and the pages were parked - its own comment calls that "the safe
+        // direction". A catalog that keeps children in an INDEX cannot derive, so the ordering has
+        // to supply the same guarantee.
+        //
+        // Detaching first would let a crash leave NO entry for a child that still reads Live: the
+        // parent looks childless and the interval rule frees pages that child can still read.
+        // Marking first makes the only possible inconsistency a STALE entry against an
+        // already-reaped child, which every reader resolves and ignores.
         rec.mark_reaped(); // state = Reaped, generation += 1, arenas cleared
         self.catalog.put(&rec)?;
+        self.detach_from_parent(&rec)?;
         self.catalog.release_id(rec.branch_id.id);
 
         // The parent's live-children array just shrank, so pages parked against it may have
@@ -347,11 +359,14 @@ impl Reaper for TwoTierReaper {
         // Detach from the old parent only after the copy succeeded.
         self.detach_from_parent(&rec)?;
 
-        let mut trunk = self.catalog.get_raw(BranchId::TRUNK.id)?;
-        trunk.add_live_child(new_fork_epoch);
-        self.catalog.put(&trunk)?;
+        // `attach_child`, not `get_raw`/`add_live_child`/`put`. The old shape mutated the parent's
+        // RECORD, which writes nothing at all against a catalog that keeps children in an index:
+        // the re-parented branch would be absent from trunk's live set and trunk's pages would look
+        // unreferenced by it. Same failure `detach_child` was introduced for, in the other
+        // direction.
+        self.catalog.attach_child(BranchId::TRUNK.id, new_fork_epoch, rec.branch_id.id)?;
 
-        rec.parent_id = Some(trunk.branch_id);
+        rec.parent_id = Some(BranchId::TRUNK);
         rec.fork_epoch = new_fork_epoch;
         rec.depth = 1;
         rec.root_page_id = new_root;
@@ -1233,5 +1248,105 @@ mod tests {
         h.catalog.set_root(b.branch_id, p1).unwrap();
         let err = reaper.collapse(b.branch_id).unwrap_err();
         assert!(err.to_string().contains("not a tree"), "got {}", err);
+    }
+
+    /// **The ordering inside `reap` is load-bearing for crash safety, and nothing enforced it.**
+    ///
+    /// `reap` must mark a child `Reaped` BEFORE removing its entry from the parent's live set.
+    /// `LogBranchCatalog` derives that set from the children's own records at replay, so the order
+    /// never mattered to it; a catalog that keeps children in an INDEX has no such recovery, and
+    /// the wrong order leaves a crash window where the entry is gone while the child still reads
+    /// Live - the parent looks childless and the interval rule frees pages that child can read.
+    ///
+    /// A comment saying so is wording. This reads the OUTCOME: the sequence of catalog calls the
+    /// reaper actually makes. A mutant swapping the two survived the entire suite before this.
+    #[test]
+    fn reap_marks_a_branch_reaped_before_detaching_it_from_its_parent() {
+        use std::sync::Mutex;
+
+        struct Recording {
+            inner: Arc<dyn BranchCatalog>,
+            log: Mutex<Vec<&'static str>>,
+        }
+        impl BranchCatalog for Recording {
+            fn next_epoch(&self) -> Epoch { self.inner.next_epoch() }
+            fn current_epoch(&self) -> Epoch { self.inner.current_epoch() }
+            fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+                self.inner.fork(p, l)
+            }
+            fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> { self.inner.get(b) }
+            fn put(&self, r: &BranchRecord) -> Result<(), FerroError> {
+                if r.state == BranchState::Reaped {
+                    self.log.lock().unwrap().push("mark_reaped");
+                }
+                self.inner.put(r)
+            }
+            fn set_root(&self, b: BranchId, r: crate::branch::types::PageId) -> Result<(), FerroError> {
+                self.inner.set_root(b, r)
+            }
+            fn expired_before(&self, n: u64) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.expired_before(n)
+            }
+            fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.in_state(s)
+            }
+            fn scan(&self)
+                -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+                self.inner.scan()
+            }
+            fn live_count(&self) -> usize { self.inner.live_count() }
+            fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> { self.inner.get_raw(id) }
+            fn release_id(&self, id: u64) { self.inner.release_id(id) }
+            fn max_live_child(&self, p: u64) -> Result<Option<Epoch>, FerroError> {
+                self.inner.max_live_child(p)
+            }
+            fn live_child_in_epoch_range(&self, p: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+                self.inner.live_child_in_epoch_range(p, lo, hi)
+            }
+            fn has_live_children(&self, p: u64) -> Result<bool, FerroError> {
+                self.inner.has_live_children(p)
+            }
+            fn attach_child(&self, p: u64, e: Epoch, c: u64) -> Result<(), FerroError> {
+                self.inner.attach_child(p, e, c)
+            }
+            fn detach_child(&self, p: u64, e: Epoch) -> Result<bool, FerroError> {
+                self.log.lock().unwrap().push("detach");
+                self.inner.detach_child(p, e)
+            }
+            fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+                self.inner.renew_lease(b, l)
+            }
+            fn envelope_of(&self, b: BranchId)
+                -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+                self.inner.envelope_of(b)
+            }
+            fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+                self.inner.charge_row_writes(b, n)
+            }
+        }
+
+        let h = Harness::new();
+        let child = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let rec = Arc::new(Recording {
+            inner: Arc::clone(&h.catalog),
+            log: Mutex::new(Vec::new()),
+        });
+        let reaper = TwoTierReaper::new(
+            Arc::clone(&rec) as Arc<dyn BranchCatalog>,
+            Arc::clone(&h.store),
+        );
+        reaper.reap(child.branch_id).expect("reap");
+
+        let log = rec.log.lock().unwrap().clone();
+        let mark = log.iter().position(|e| *e == "mark_reaped");
+        let detach = log.iter().position(|e| *e == "detach");
+        assert!(mark.is_some(), "reap never marked the branch reaped: {log:?}");
+        assert!(detach.is_some(), "reap never detached the branch from its parent: {log:?}");
+        assert!(
+            mark < detach,
+            "reap detached BEFORE marking reaped ({log:?}). A crash in that window leaves no \
+             entry for a child that still reads Live, so the parent looks childless and its \
+             pages are freed underneath a branch that can still read them."
+        );
     }
 }

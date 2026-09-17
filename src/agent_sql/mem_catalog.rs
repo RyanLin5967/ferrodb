@@ -220,6 +220,20 @@ impl BranchCatalog for MemBranchCatalog {
     /// here always mints a fresh id, and a free list nothing reads would be dead state.
     fn release_id(&self, _id: u64) {}
 
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        _child_id: u64,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(prec) = records.get_mut(&parent_id) else {
+            return Err(BranchError::NotFound(BranchId::new(parent_id, 0)).into());
+        };
+        prec.add_live_child(fork_epoch);
+        Ok(())
+    }
+
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let mut records = self.records.lock().unwrap();
         let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };

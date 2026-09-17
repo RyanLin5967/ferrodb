@@ -459,6 +459,19 @@ impl BranchCatalog for LogBranchCatalog {
         LogBranchCatalog::release_id(self, id)
     }
 
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        _child_id: u64,
+    ) -> Result<(), FerroError> {
+        // The live set lives inside the parent's record here, and `_child_id` is not needed: the
+        // set is re-derived from the children themselves at replay, so the epoch is enough.
+        let mut prec = self.get_raw(parent_id)?;
+        prec.add_live_child(fork_epoch);
+        self.put(&prec)
+    }
+
     /// The log catalog keeps the live set inside the record, so this is exactly what the reaper
     /// used to do inline.
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {

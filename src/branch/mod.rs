@@ -152,6 +152,24 @@ pub trait BranchCatalog: Send + Sync {
     /// never released.
     fn release_id(&self, id: u64);
 
+    /// Add one child to `parent_id`'s live set.
+    ///
+    /// The counterpart of [`Self::detach_child`], and it exists for the same reason: `collapse`
+    /// re-parents a branch with `trunk.add_live_child(epoch)` followed by `put(&trunk)`, which is a
+    /// RECORD mutation. A catalog that keeps children in an index does not write the child span
+    /// from `put` — it cannot, because the records it hands out carry an empty live set — so the
+    /// re-parented branch would never appear among trunk's children and trunk's pages would look
+    /// unreferenced by it.
+    ///
+    /// `child_id` is stored so a reader can resolve the child and check whether it is still live;
+    /// see the implementations for why an entry is a hint rather than an answer.
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        child_id: u64,
+    ) -> Result<(), FerroError>;
+
     /// Remove one child from `parent_id`'s live set. Returns whether anything was removed.
     ///
     /// **An explicit operation, not a record mutation followed by `put`.** The reaper used to do
