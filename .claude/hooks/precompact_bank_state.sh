@@ -51,12 +51,26 @@ PROSE_RC=${PIPESTATUS[0]:-9}
   timeout 10 sed -n '/^| revision/,/^$/p' "$A/SCALE-LOOP.md" 2>/dev/null | sed 's/^/  /'
   echo "  skill revision: $(grep -m1 '^# REVISION' "$HOME/.claude/skills/ferrodb-scale/SKILL.md" 2>/dev/null)"
   echo
-  echo "## ★ MEASUREMENTS — the committed artifacts. Numbers quoted from anywhere else are recalled."
+  echo "## ★ DESIGN DECISIONS — SCALE-DESIGN.md. A decision only in a commit message has no half-life."
+  echo "## Each carries FALSIFIERS. A pass that builds one without checking them has not built it."
+  timeout 20 grep -E '^## D[0-9]+|^### The decision|^### What would falsify|^\*\*Falsifier' "$A/SCALE-DESIGN.md" 2>/dev/null | head -16 | sed 's/^/  /'
+  echo
+  echo "## ★ WHAT IS STILL LINEAR — the bar here is O(log N), not 'faster'."
+  echo "## An O(N) walk that runs REPEATEDLY (per sweep, per fork, per statement) is a bug at 10^6"
+  echo "## even when it is fast today. reap_expired cloned every record every 30s and no measurement"
+  echo "## of fork latency would ever have shown it."
+  timeout 20 grep -rn 'all_records\|live_branches' "$R/src/branch/" 2>/dev/null | grep -v test | head -8 | sed 's/^/  /'
+  echo
+  echo "## ★ MEASUREMENTS — the committed artifacts. A number from anywhere else is recalled, not measured."
   for f in "$R"/bench/*.txt; do
     [ -f "$f" ] || continue
     echo "  --- $(basename "$f") ---"
     timeout 10 grep -E '^ *[0-9]+ \||x[0-9.]+|O\(N' "$f" 2>/dev/null | head -8 | sed 's/^/    /'
   done
+  echo
+  echo "## ★ LITTLE-JUMP CHECK — last 8 commits. Constant, or shape? Two constants means stop and"
+  echo "## fix the structure underneath them instead of taking the next row."
+  timeout 20 git -C "$R" log --oneline -8 2>/dev/null | sed 's/^/  /'
   echo
   echo "## RUNNING RIGHT NOW  (a suite or agent invisible to the next session is lost work)"
   echo "  suites/builds:"
@@ -77,5 +91,5 @@ if [ "${PROSE_RC:-9}" != "0" ]; then
   echo "⛔ PreCompact: the PROSE extractor REFUSED (rc=${PROSE_RC:-9}). No dated handoff was written."
   echo "⛔ Write the judgement half BY HAND THIS TURN — the automatic half is gone."
 fi
-echo "PreCompact: banked machine state to COMPACTION_STATE_AUTO.md; the extractable prose half (Ryan verbatim, last tool calls, agents dispatched) is in COMPACTION_HANDOFF_<date>_AUTO.md. STILL YOURS, because it cannot be extracted: which measurements are TRUSTED vs taken under contention; which claims were corrected and must not be repeated (this session corrected several — 'no database records reads', 'nobody gives you the reviewer', 'generational arenas are an insight'); the live cron id and what it runs; and any design decision made in conversation but not yet written to SCALE-DESIGN.md. A handoff carrying only method lets the next session run the machinery perfectly while repeating a claim that was already killed."
+echo "PreCompact: banked machine state to COMPACTION_STATE_AUTO.md; the extractable prose half (Ryan verbatim, last tool calls, agents) is in COMPACTION_HANDOFF_<date>_AUTO.md. STILL YOURS, because none of it is extractable: (1) WHICH MEASUREMENTS ARE TRUSTED — a number taken while several suites or agents were running cannot be told from a regression, and this session has taken some under contention; (2) WHICH CLAIMS ARE ALREADY DEAD — do not resurrect 'no database records what was read' (provenance is a 20-year field), 'nobody gives you the reviewer' (lakeFS pre-merge hooks), 'git for data is novel' (Dolt), or 'generational branch arenas are an insight' (it is batching plus a sizing fix); (3) WHETHER THE LAST FEW COMMITS CHANGED CONSTANTS OR SHAPES — if constants, the next pass must fix the structure, not take the next row; (4) any design decided in conversation but not yet in SCALE-DESIGN.md. A handoff that carries only method lets the next session run the machinery perfectly while repeating a claim that was already killed."
 exit 0
