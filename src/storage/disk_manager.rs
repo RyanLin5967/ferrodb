@@ -325,11 +325,16 @@ impl DiskManager{
             return Ok(());
         }
         if let Some(clash) = regions.iter().find(|r| r.overlaps(lo, hi)) {
+            // The phrase "already reserved" is load-bearing, not decoration:
+            // `integration_arena_exclusivity::a_second_lower_arena_region_is_refused` asserts on
+            // it, and it caught this message losing the phrase when the single floor became a
+            // table. The behaviour was right and the wording had drifted; the test was correct to
+            // fail, so the message changed rather than the assertion.
             return Err(FerroError::Io(format!(
-                "region '{}' [{}, {}) overlaps the existing '{}' [{}, {}); regions must be \
-                 disjoint, and moving an existing one would put pages it already owns back into \
-                 circulation",
-                name, lo, hi, clash.name, clash.lo, clash.hi
+                "page region [{}, {}) is already reserved by '{}'; the region '{}' [{}, {}) \
+                 overlaps it, and regions must be disjoint - moving an existing one would put \
+                 pages it already owns back into circulation",
+                clash.lo, clash.hi, clash.name, name, lo, hi
             )));
         }
         // NO high-water check here, deliberately, and it was tried. Refusing a region that starts
