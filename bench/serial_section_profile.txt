@@ -1,77 +1,38 @@
 S8: where the serial section goes. 20000 branches resident, 2000 iters each.
   operation                         ms/op     share
-  core(parent)            lookup   0.00505     4.4%
-  envelope_bytes(parent)  lookup   0.00683     6.0%
-  FREE_ID first-key       scan     0.00676     5.9%
-  write_record (3 upserts)         0.05752    50.3%
-  child-key insert (1 upsert)      0.02222    19.4%
-  write_header (1 upsert)          0.01597    14.0%
+  core(parent)            lookup   0.00533     4.8%
+  envelope_bytes(parent)  lookup   0.00693     6.3%
+  FREE_ID first-key       scan     0.00715     6.5%
+  write_record (3 upserts)         0.06316    57.3%
+  child-key tree.insert (no del)   0.01003     9.1%
+  write_header (1 upsert)          0.01756    15.9%
   publish_root                     0.00000     0.0%
-  SUM                                0.11435
-  (upsert)                           0.01223   <- one upsert alone, for scale
+  SUM                                0.11017
+  (upsert)                           0.01344   <- one upsert alone, for scale
 
-Compare with the measured serial time per fork: ~0.22 ms (D8).
-If SUM is far below that, the cost is NOT this work -- it is lock handoff/convoy,
-and D8's options 1 and 4 are aimed at the wrong thing. That is the single most
-useful thing this measurement can say, so it is printed either way.
+CORRECTED RUN. The previous version of this file priced the child key as an `upsert` at 0.0228 ms /
+19.8%. `fork` calls `self.tree.insert` for that key directly, with no delete, so the row measured an
+operation fork does not perform. Restated rather than carried forward:
 
-WHAT THIS SETTLES, AND WHAT IT DOES NOT:
+  SUM 0.1148 -> 0.11017 ms.  Against the ~0.228 ms effective serial time under 64-thread
+  contention, the seven operations are 48.3%, not "~50%". The old figure was an OVERESTIMATE.
 
-  SUM of the seven operations = 0.1146 ms.  Measured serial time per fork = ~0.22 ms (D8).
-  So this work is about 52% of the serial section. ~0.105 ms per fork is NOT accounted for here.
+⭐ THE COMPARISON THAT PRICES D10, AND IT IS APPLES TO APPLES -- same key space, same tree, same run:
+      child key via upsert       0.02280 ms   (delete-then-insert)
+      child key via tree.insert  0.01003 ms   (insert only)
+      => THE WASTED DELETE IS 0.01277 ms, 56% OF AN UPSERT.
+  On the fork path with a freshly minted id, the record, state, deadline and envelope keys are all
+  provably new, so all four of those deletes are guaranteed misses. write_record's three upserts
+  cost 0.06316 ms; at 56% that is ~0.035 ms recoverable, which against a 0.228 ms serial section is
+  ~15% of fork throughput by D8's throughput = 1/serial_time. Larger than the ~11% first estimated,
+  and the estimate is now a measurement of the delete rather than a guess at "roughly half".
 
-  D8's falsifier said: "If the seven operations sum to FAR LESS than 0.22 ms, the cost is not the
-  tree work -- it is lock handoff/convoy, and D8's options 1 and 4 are aimed at the wrong thing."
-  The answer is neither extreme, so BOTH are live: there is ~0.115 ms of real tree work to attack,
-  AND ~0.105 ms that this profile does not explain. Candidates for the remainder, none measured
-  yet, so none of them is a finding: mutex acquire/release and convoy under 64 threads, the buffer
-  pool's own latching, the CommitGroup mutex taken by stage(), and a freshly allocated Vec<u8> for
-  every key built on the path. Naming them is not measuring them.
+⭐ IN-REPO PRECEDENT, WHICH IS ALSO THE SAFETY ARGUMENT: fork ALREADY uses tree.insert for the child
+  key, eight lines above the code D10 changes. Somebody already reasoned that a fresh child key
+  cannot exist and wrote the cheap call. D10 extends the identical reasoning to four more keys that
+  are new for the identical reason.
 
-  WRITES DOMINATE THE PART THAT IS EXPLAINED. Five upserts (3 in write_record, 1 child key,
-  1 header) = 0.094 ms = 82% of the 0.115. The three read lookups together are 0.020 ms. `upsert`
-  is DELETE-THEN-INSERT -- BPlusTreeManager::insert does not replace -- so each is two tree
-  operations, and the fork path performs ten of them.
-
-  THE CHEAPEST REAL TARGET IS write_header: 0.0158 ms, 13.8% of the tree work and ~7% of the whole
-  serial section, spent every single fork to persist next_id and epoch -- BOTH OF WHICH ARE ALSO
-  LIVE ATOMICS IN MEMORY. It is not needed for correctness on the fork path if the same values can
-  be re-derived at open, which looks possible in one descent each (the greatest RECORD key gives
-  next_id; the greatest CHILD key gives the epoch). That is a design question, not a measurement,
-  and it belongs in SCALE-DESIGN before any code.
-
-  INSTRUMENT NOTE. Taken with 20,000 branches resident so descents have real depth; a profile on an
-  empty tree measures the best case of every descent and understates all of them. 2,000 iterations
-  per operation. This is a #[ignore]d test rather than production instrumentation, because a
-  profiler compiled into the write path is overhead inside the loop it is measuring.
-
-=== ATTEMPTED SAME-INSTRUMENT SUBTRACTION, AND WHY IT DOES NOT WORK ===
-
-Two attempts, both discarded. Recorded because the failure mode is reusable.
-
-  ATTEMPT 1: time `flush_all + sync` in a loop.            -> 0.010 ms
-    Nothing was dirty, and macOS short-circuits F_FULLFSYNC when the file has nothing pending.
-    Subtracting it from fork() attributed 3.32 ms to "the serial section", which is absurd on its
-    face and contradicted the 0.115 ms the operations actually cost.
-
-  ATTEMPT 2: dirty one key, then flush, and subtract the dirtying. -> 3.230 ms
-    uncontended fork() 3.965 ms - 3.230 ms = 0.735 ms "serial section".
-    ⛔ THAT IS IMPOSSIBLE AND THE CONTRADICTION IS WHAT KILLS IT. At 64 threads the measured
-    throughput is 4382.7 forks/sec. A 0.735 ms serial section caps throughput at 1/0.735ms =
-    1360/sec. The number disagrees with a measurement already in hand by 3.2x, so it is wrong.
-
-  WHY: A FLUSH CANNOT BE PRICED INDEPENDENTLY OF THE DIRTY SET. `flush_all` writes every dirty
-  page; its cost is a function of how many there are. The probe dirties ONE key. A fork dirties the
-  record, state, deadline, child and header spans -- more pages, so a fork's own flush costs MORE
-  than 3.230 ms, and subtracting the probe's flush leaves a residue that is part flush, not serial
-  section. There is no constant "the flush" to subtract.
-
-  WHAT IS RELIABLE, THEREFORE:
-    - the seven operations at 0.1135-0.1148 ms across three runs -- directly measured, one
-      instrument, no subtraction;
-    - the EFFECTIVE serial time under 64-thread contention at ~0.228 ms -- derived from measured
-      throughput via the 1/serial_time model, which matched four independent runs within 0.15%.
-    Those two ARE comparable, and give the ~50% figure this file reports. The uncontended serial
-    section remains UNMEASURED, and the honest consequence is that the ~0.105 ms gap cannot yet be
-    attributed between convoy and work this profile does not cover. Do not let the two discarded
-    numbers above be quoted as if they were results.
+THE SUBTRACTION STILL FAILS, AS EXPECTED. 4.093 - 3.612 = 0.480 ms "serial section", against a hard
+bound of 0.228 ms from measured throughput. The harness prints its own warning for this. A flush
+cannot be priced independently of the dirty set; the probe dirties one key, a fork dirties five
+spans. The line is kept in the output precisely so nobody quotes it.

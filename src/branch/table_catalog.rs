@@ -705,13 +705,13 @@ impl BranchCatalog for TableBranchCatalog {
                 lease,
             )?;
 
-        self.write_record(&child, None)?;
-        // The child's entry in its parent's live set. A child that exists but is not listed in its
+            self.write_record(&child, None)?;
+            // The child's entry in its parent's live set. A child that exists but is not listed in its
         // parent is a GC correctness hole, which is why both happen under one logical lock.
         // The VALUE is the child's branch id, so a reader can resolve the child and check
         // whether it is still live. See `live_child_at` for why the entry is only a hint.
-        self.tree
-            .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
+            self.tree
+                .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
             self.write_header()?;
             // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
             // point necessarily covers this fork.
@@ -1048,8 +1048,18 @@ mod serial_section_profile {
         let t_write_record = timed(N, || {
             cat.write_record(&child, None).unwrap();
         });
+        // ⛔ `tree.insert`, NOT `upsert`. The first version of this profiler measured an upsert
+        // here and reported 0.0228 ms / 19.8% for the child key -- but `fork` calls
+        // `self.tree.insert` directly for it, with no delete. The row was pricing an operation
+        // fork does not perform, and overstated it by a whole wasted descent. Measuring the
+        // convenient call instead of the real one is the same error as benchmarking the wrong
+        // catalog, which this project already has on record.
+        let mut childk = 0u64;
         let t_childkey = timed(N, || {
-            cat.upsert(keys::child(trunk_id, 999_999), 7u64.to_be_bytes().to_vec()).unwrap();
+            childk += 1;
+            cat.tree
+                .insert(keys::child(trunk_id, 900_000 + childk), 7u64.to_be_bytes().to_vec())
+                .unwrap();
         });
 
         // SAME-INSTRUMENT SUBTRACTION. Comparing the 1-thread per-fork number from one harness
@@ -1084,7 +1094,7 @@ mod serial_section_profile {
             ("envelope_bytes(parent)  lookup", t_env),
             ("FREE_ID first-key       scan  ", t_free),
             ("write_record (3 upserts)      ", t_write_record),
-            ("child-key insert (1 upsert)   ", t_childkey),
+            ("child-key tree.insert (no del)", t_childkey),
             ("write_header (1 upsert)       ", t_header),
             ("publish_root                  ", t_publish),
         ] {
