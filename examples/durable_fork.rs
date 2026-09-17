@@ -16,6 +16,11 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("branches.log");
 
+    // O1 PROBE. Peak RSS was ~1417 B per ADDITIONAL branch at 128k, against a 68-byte on-disk
+    // record. Printing the struct's own size turns "where does the memory go" from an argument
+    // into a subtraction. See SCALE-DESIGN.md O1.
+    eprintln!("O1 size_of::<BranchRecord>()={}", std::mem::size_of::<ferrodb::branch::BranchRecord>());
+
     let cat = Arc::new(LogBranchCatalog::open(&path, 1).expect("open catalog"));
     let lease = LeaseDeadline(u64::MAX);
 
@@ -32,10 +37,19 @@ fn main() {
     let total = t0.elapsed().as_secs_f64();
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-    let t = Instant::now();
-    let reopened = LogBranchCatalog::open(&path, 1).expect("reopen");
-    let reopen = t.elapsed().as_secs_f64();
-    let live = reopened.live_count();
+    // The reopen happens while `cat` is STILL ALIVE, so an external peak-RSS reading covers TWO
+    // full catalogs, not one. That is a measurement artifact of this harness, not a property of
+    // the catalog, and it has to be separable or the residency number means nothing.
+    // FERRODB_SKIP_REOPEN=1 runs the identical fork loop with one catalog resident.
+    let (reopen, live) = if std::env::var("FERRODB_SKIP_REOPEN").is_ok() {
+        (f64::NAN, cat.live_count())
+    } else {
+        let t = Instant::now();
+        let reopened = LogBranchCatalog::open(&path, 1).expect("reopen");
+        let r = t.elapsed().as_secs_f64();
+        let l = reopened.live_count();
+        (r, l)
+    };
 
     println!("{n}\t{first:.2}\t{last:.2}\t{total:.3}\t{bytes}\t{reopen:.3}\t{live}");
     let _ = std::fs::remove_dir_all(&dir);
