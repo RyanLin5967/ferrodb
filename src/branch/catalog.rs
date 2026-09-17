@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use crate::branch::record::{BranchRecord, CapabilityEnvelope};
+use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
@@ -375,9 +375,12 @@ impl BranchCatalog for LogBranchCatalog {
     ///
     /// Sorted because `reap_expired`'s own `sort_by_key` is stable, so whatever order arrives here
     /// survives as its tie-break and reaches every record and page that reap makes durable.
-    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
         let st = self.state.read().unwrap();
-        let mut out: Vec<BranchRecord> = st
+        // This catalog holds whole records resident, so narrowing costs nothing here — but the
+        // TRAIT must promise core-only, or the table catalog is forced to hydrate every answer
+        // row to satisfy it. That is D2's lesson: the shape lives in the trait.
+        let mut out: Vec<CoreRecord> = st
             .records
             .values()
             .filter(|r| {
@@ -385,9 +388,9 @@ impl BranchCatalog for LogBranchCatalog {
                     && !r.branch_id.is_trunk()
                     && r.lease_deadline.is_expired_at(now_millis)
             })
-            .cloned()
+            .map(CoreRecord::narrow)
             .collect();
-        out.sort_unstable_by_key(|r| r.branch_id.id);
+        out.sort_unstable_by_key(|r| r.branch_id().id);
         Ok(out)
     }
 
@@ -903,7 +906,7 @@ mod tests {
             ("in_state(Quarantined)", 1,
              c.in_state(BranchState::Quarantined).unwrap().iter().map(|r| r.branch_id.id).collect()),
             ("expired_before", 14,
-             c.expired_before(u64::MAX).unwrap().iter().map(|r| r.branch_id.id).collect()),
+             c.expired_before(u64::MAX).unwrap().iter().map(|r| r.branch_id().id).collect()),
         ];
         for (name, want, ids) in sweeps {
             assert_eq!(ids.len(), want, "fixture: {name} returned {ids:?}");
@@ -979,14 +982,14 @@ mod tests {
         c.put(&r).unwrap();
 
         let ids: Vec<u64> =
-            c.expired_before(1_000).unwrap().iter().map(|r| r.branch_id.id).collect();
+            c.expired_before(1_000).unwrap().iter().map(|r| r.branch_id().id).collect();
         assert_eq!(ids, vec![early.branch_id.id], "expected only the expired Live non-trunk branch");
         assert!(!ids.contains(&BranchId::TRUNK.id), "trunk must never be a reap candidate");
         assert!(!ids.contains(&late.branch_id.id), "an unexpired lease is not a candidate");
         assert!(!ids.contains(&reaping.branch_id.id), "a Reaping branch is not a fresh candidate");
 
         // Boundary: `is_expired_at` is inclusive, so a deadline exactly at `now` is expired.
-        assert!(c.expired_before(100).unwrap().iter().any(|r| r.branch_id == early.branch_id));
+        assert!(c.expired_before(100).unwrap().iter().any(|r| r.branch_id() == early.branch_id));
         assert!(c.expired_before(99).unwrap().is_empty(), "a lease one ms out is not expired");
     }
 

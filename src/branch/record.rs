@@ -96,6 +96,19 @@ impl CoreRecord {
         self.0
     }
 
+    /// Narrow a whole record to its core. **Safe by direction**: this can only REMOVE information
+    /// (`arenas`, `live_children`, `envelope`), never fabricate it, so it cannot manufacture the
+    /// "looks whole but is not" value `CoreRecord` exists to make unrepresentable. It is here for
+    /// the catalogs that hold whole records in memory (`LogBranchCatalog`, `MemBranchCatalog`) and
+    /// must satisfy a trait method whose answer is core-only.
+    pub fn narrow(rec: &BranchRecord) -> CoreRecord {
+        let mut core = rec.clone();
+        core.arenas = Vec::new();
+        core.live_children = Vec::new();
+        core.envelope = None;
+        CoreRecord(core)
+    }
+
     pub fn branch_id(&self) -> BranchId {
         self.0.branch_id
     }
@@ -110,6 +123,9 @@ impl CoreRecord {
     }
     pub fn depth(&self) -> u8 {
         self.0.depth
+    }
+    pub fn fork_epoch(&self) -> Epoch {
+        self.0.fork_epoch
     }
     pub fn root_page_id(&self) -> PageId {
         self.0.root_page_id

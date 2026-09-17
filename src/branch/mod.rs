@@ -77,7 +77,16 @@ pub trait BranchCatalog: Send + Sync {
     ///
     /// Trunk is excluded here rather than left to the caller, because trunk holds a lease nobody
     /// may act on and a caller that forgot the check would reap the root of the database.
-    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError>;
+    /// Branches whose lease expired at or before `now_millis`.
+    ///
+    /// **Returns CORE records, not whole ones.** The only consumer is the reaper, which reads
+    /// `branch_id`, `depth` and `fork_epoch` — all core — and never touches `arenas` or `envelope`.
+    /// Returning whole records forced the table catalog to `hydrate` EVERY ANSWER ROW: an arena
+    /// range-scan plus an envelope lookup, both discarded. Measured at **24.3 us per answer row**
+    /// against ~5 us for a core descent (`bench/s13_calibration_smoke.txt`). This is `SCALE-DESIGN`
+    /// D2 — *the linear scan is in the TRAIT, not the implementation* — recurring at ANSWER scale,
+    /// where an answer can be 10^6 rows during a mass expiry.
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError>;
 
     /// Every branch in `state`, in branch-id order. Output-sized, for the same reason.
     ///

@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
-use crate::branch::record::{reclaimable, BranchRecord};
+use crate::branch::record::{CoreRecord, reclaimable, BranchRecord};
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::page_header::PageType;
@@ -270,16 +270,21 @@ impl Reaper for TwoTierReaper {
         // and filtering here. The old shape ran every 30 seconds for the life of the process and
         // its cost was O(N) whether or not anything had expired — fine at 10³ branches, fatal at
         // 10⁶, and invisible to any measurement of `fork`. `SCALE-DESIGN.md` D2.
-        let mut candidates: Vec<BranchRecord> = self.catalog.expired_before(now_millis)?;
+        // CORE records, not whole ones. The three fields used below are all core, and hydrating
+        // each answer row cost an arena range-scan plus an envelope lookup that were discarded --
+        // 24.3 us/row measured. See SCALE-DESIGN D11.
+        let mut candidates: Vec<CoreRecord> = self.catalog.expired_before(now_millis)?;
 
         // Deepest first: reaping a child removes its epoch from the parent's live-children array,
         // which is exactly what lets the parent's own reap take the fast path.
-        candidates.sort_by(|a, b| b.depth.cmp(&a.depth).then(b.fork_epoch.cmp(&a.fork_epoch)));
+        candidates.sort_by(|a, b| {
+            b.depth().cmp(&a.depth()).then(b.fork_epoch().cmp(&a.fork_epoch()))
+        });
 
         let mut reaped = Vec::with_capacity(candidates.len());
         for rec in candidates {
-            match self.reap(rec.branch_id) {
-                Ok(_) => reaped.push(rec.branch_id),
+            match self.reap(rec.branch_id()) {
+                Ok(_) => reaped.push(rec.branch_id()),
                 // A branch already reaped as a side effect of this same scan is not an error.
                 Err(FerroError::Branch(_)) => {}
                 Err(e) => return Err(e),
@@ -1284,7 +1289,7 @@ mod tests {
             fn set_root(&self, b: BranchId, r: crate::branch::types::PageId) -> Result<(), FerroError> {
                 self.inner.set_root(b, r)
             }
-            fn expired_before(&self, n: u64) -> Result<Vec<BranchRecord>, FerroError> {
+            fn expired_before(&self, n: u64) -> Result<Vec<CoreRecord>, FerroError> {
                 self.inner.expired_before(n)
             }
             fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {

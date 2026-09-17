@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::branch::record::CoreRecord;
 use crate::branch::record::BranchRecord;
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
@@ -144,8 +145,8 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(())
     }
 
-    fn expired_before(&self, now_millis: u64) -> Result<Vec<BranchRecord>, FerroError> {
-        let mut out: Vec<BranchRecord> = self
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        let mut out: Vec<CoreRecord> = self
             .records
             .lock()
             .unwrap()
@@ -155,9 +156,9 @@ impl BranchCatalog for MemBranchCatalog {
                     && !r.branch_id.is_trunk()
                     && r.lease_deadline.is_expired_at(now_millis)
             })
-            .cloned()
+            .map(CoreRecord::narrow)
             .collect();
-        out.sort_unstable_by_key(|r| r.branch_id.id);
+        out.sort_unstable_by_key(|r| r.branch_id().id);
         Ok(out)
     }
 
