@@ -174,6 +174,65 @@ impl TableBranchCatalog {
         }
     }
 
+    /// Build a catalog from an existing one, record for record.
+    ///
+    /// Used to convert a `{db}.branches` log into `{db}.branchcat` on first open. It reads the
+    /// source through the **trait**, so it is not specific to `LogBranchCatalog` and the
+    /// equivalence test can drive it with either.
+    ///
+    /// Child entries are rebuilt from the children themselves — every non-`Reaped` record that
+    /// names a parent contributes one — which is exactly how `LogBranchCatalog::index` derives the
+    /// live set at replay. Rebuilding from the PARENT's `live_children` array instead would copy a
+    /// representation rather than re-derive the truth, and would carry across any staleness the
+    /// source happened to hold.
+    pub fn migrate_from(
+        pool: Arc<BufferPoolManager>,
+        source: &dyn BranchCatalog,
+        trunk_root: PageId,
+    ) -> Result<(Self, u32), FerroError> {
+        let (cat, header) = Self::create_with_header(pool, trunk_root)?;
+
+        // Records first: `attach_child` and `release_id` both RESOLVE a child's record, so they
+        // cannot run before the records exist.
+        let mut max_id = 0u64;
+        let mut reaped: Vec<u64> = Vec::new();
+        let mut children: Vec<(u64, Epoch, u64)> = Vec::new();
+        for rec in source.scan()? {
+            let rec = rec?;
+            // `scan` yields core records; the unbounded fields come from the source's own `get`,
+            // which is where arenas and the envelope live.
+            let full = source.get_raw(rec.branch_id.id).unwrap_or(rec);
+            max_id = max_id.max(full.branch_id.id);
+            if full.state == BranchState::Reaped {
+                reaped.push(full.branch_id.id);
+            }
+            if full.state != BranchState::Reaped {
+                if let Some(p) = full.parent_id {
+                    children.push((p.id, full.fork_epoch, full.branch_id.id));
+                }
+            }
+            let old = cat.core(full.branch_id.id)?;
+            cat.write_record(&full, old.as_ref())?;
+        }
+        for (parent, epoch, child) in children {
+            cat.attach_child(parent, epoch, child)?;
+        }
+
+        // Counters, matching what `LogBranchCatalog::open` derives: the next id is one past the
+        // highest, and the epoch counter holds the LAST epoch issued (see `next_epoch`).
+        cat.next_id.store(max_id + 1, Ordering::SeqCst);
+        cat.epoch.store(source.current_epoch().0, Ordering::SeqCst);
+
+        // Free ids last: `release_id` refuses while a slot still has live children, so it has to
+        // see the child entries that were just attached.
+        for id in reaped {
+            cat.release_id(id);
+        }
+        cat.write_header()?;
+        cat.publish_root()?;
+        Ok((cat, header))
+    }
+
     /// Write the current tree root into the header page, if it moved.
     ///
     /// Called after every mutation. The comparison is an atomic load, so the common case — no root
@@ -1081,6 +1140,155 @@ mod tests {
             assert_eq!(t.branch_id.id, l.branch_id.id, "step {step}: different ids minted");
         }
         let _ = std::fs::remove_file(p);
+    }
+
+    /// **The migration falsifier: equivalence of ANSWERS, not of representation.**
+    ///
+    /// A record-level `assert_eq!` fails for a CORRECT migration, because `live_children` is
+    /// populated by the log catalog and deliberately empty here — the field stopped being the
+    /// authority in D2b. So this compares every field EXCEPT that one, and compares the three
+    /// live-child QUERIES separately, which is where the information now lives. Comparing the
+    /// field would assert a representation was preserved; a migration that dropped every child
+    /// entry passes that if both sides return empty arrays, and fails this immediately.
+    ///
+    /// The population has to reach every case or the comparison is vacuous over what it misses.
+    #[test]
+    fn a_migrated_catalog_answers_every_query_the_way_its_source_does() {
+        use crate::branch::catalog::LogBranchCatalog;
+        use crate::branch::record::CapabilityEnvelope;
+
+        let src = LogBranchCatalog::in_memory(9);
+
+        // -- a parent with several live children
+        let kids: Vec<_> =
+            (0..4).map(|_| src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap()).collect();
+        // -- a parent whose only child gets reaped
+        let lone_parent = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let doomed = src.fork(lone_parent.branch_id, LeaseDeadline(5_000)).unwrap();
+        // -- a quarantined branch
+        let held = src.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        // -- a branch with arenas and a spent envelope
+        let rich = src.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+
+        let mut r = src.get(rich.branch_id).unwrap();
+        r.arenas = vec![ArenaId(3), ArenaId(11)];
+        r.envelope = Some(CapabilityEnvelope::new(0b111, 1000));
+        src.put(&r).unwrap();
+        src.charge_row_writes(rich.branch_id, 37).unwrap();
+
+        let mut h = src.get(held.branch_id).unwrap();
+        h.state = BranchState::Quarantined;
+        src.put(&h).unwrap();
+
+        // -- a reaped branch, and its parent detached, so a slot is recyclable
+        let mut d = src.get(doomed.branch_id).unwrap();
+        src.detach_child(lone_parent.branch_id.id, d.fork_epoch).unwrap();
+        d.mark_reaped();
+        src.put(&d).unwrap();
+        src.release_id(d.branch_id.id);
+        // -- and recycle it, so a slot carries a non-zero generation
+        let recycled = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        assert_ne!(recycled.branch_id.generation, 0, "fixture: no recycled slot was produced");
+
+        // -- and leave a slot STILL FREE at migration time. Without this the free list is empty
+        // when the migration runs, so a migration that skipped recycling entirely was
+        // indistinguishable from a correct one - a mutant proved exactly that. Having a recycled
+        // slot is not the same as having a free one.
+        let spare = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let mut sp = src.get(spare.branch_id).unwrap();
+        src.detach_child(BranchId::TRUNK.id, sp.fork_epoch).unwrap();
+        sp.mark_reaped();
+        src.put(&sp).unwrap();
+        src.release_id(sp.branch_id.id);
+
+        // ---- migrate -------------------------------------------------------------------------
+        let path = std::env::temp_dir().join(format!("ferro-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let f = OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
+        let (dst, _hdr) = TableBranchCatalog::migrate_from(pool, &src, 9).unwrap();
+
+        // ---- scan: same ids, same order ------------------------------------------------------
+        let sids: Vec<u64> = src.scan().unwrap().map(|r| r.unwrap().branch_id.id).collect();
+        let dids: Vec<u64> = dst.scan().unwrap().map(|r| r.unwrap().branch_id.id).collect();
+        assert_eq!(sids, dids, "scan disagrees");
+        assert!(sids.len() >= 8, "fixture too small to be meaningful: {}", sids.len());
+
+        // ---- every record field EXCEPT live_children -----------------------------------------
+        for id in &sids {
+            let a = src.get_raw(*id).unwrap();
+            let b = dst.get_raw(*id).unwrap();
+            assert_eq!(a.branch_id, b.branch_id, "branch_id for {id}");
+            assert_eq!(a.generation, b.generation, "generation for {id}");
+            assert_eq!(a.parent_id, b.parent_id, "parent_id for {id}");
+            assert_eq!(a.fork_epoch, b.fork_epoch, "fork_epoch for {id}");
+            assert_eq!(a.root_page_id, b.root_page_id, "root_page_id for {id}");
+            assert_eq!(a.lease_deadline, b.lease_deadline, "lease_deadline for {id}");
+            assert_eq!(a.state, b.state, "state for {id}");
+            assert_eq!(a.depth, b.depth, "depth for {id}");
+            assert_eq!(a.arenas, b.arenas, "arenas for {id}");
+            assert_eq!(a.envelope, b.envelope, "envelope for {id} - a dropped envelope un-governs it");
+        }
+
+        // ---- the three live-child queries, which is where live_children now lives -------------
+        for id in &sids {
+            assert_eq!(src.max_live_child(*id).unwrap(), dst.max_live_child(*id).unwrap(),
+                       "max_live_child for {id}");
+            assert_eq!(src.has_live_children(*id).unwrap(), dst.has_live_children(*id).unwrap(),
+                       "has_live_children for {id}");
+            // Windows that include and exclude each child, plus the whole range.
+            for k in &kids {
+                let lo = k.fork_epoch;
+                let hi = Epoch(k.fork_epoch.0 + 1);
+                assert_eq!(
+                    src.live_child_in_epoch_range(*id, lo, hi).unwrap(),
+                    dst.live_child_in_epoch_range(*id, lo, hi).unwrap(),
+                    "live_child_in_epoch_range({id}, {lo:?}, {hi:?})"
+                );
+            }
+            assert_eq!(
+                src.live_child_in_epoch_range(*id, Epoch(0), Epoch(u64::MAX)).unwrap(),
+                dst.live_child_in_epoch_range(*id, Epoch(0), Epoch(u64::MAX)).unwrap(),
+                "live_child_in_epoch_range over everything, for {id}"
+            );
+        }
+
+        // ---- the remaining queries ------------------------------------------------------------
+        for st in [BranchState::Live, BranchState::Reaping, BranchState::Reaped,
+                   BranchState::Quarantined] {
+            let a: Vec<u64> =
+                src.in_state(st).unwrap().iter().map(|r| r.branch_id.id).collect();
+            let b: Vec<u64> =
+                dst.in_state(st).unwrap().iter().map(|r| r.branch_id.id).collect();
+            assert_eq!(a, b, "in_state({st:?})");
+        }
+        for now in [0u64, 99, 100, 101, 4_999, 5_000, 5_001, u64::MAX] {
+            let a: Vec<u64> =
+                src.expired_before(now).unwrap().iter().map(|r| r.branch_id.id).collect();
+            let b: Vec<u64> =
+                dst.expired_before(now).unwrap().iter().map(|r| r.branch_id.id).collect();
+            assert_eq!(a, b, "expired_before({now})");
+        }
+        for id in &sids {
+            let bid = BranchId::new(*id, src.get_raw(*id).unwrap().branch_id.generation);
+            assert_eq!(src.envelope_of(bid).ok(), dst.envelope_of(bid).ok(), "envelope_of {id}");
+        }
+        // Through the TRAIT on both sides: the inherent `TableBranchCatalog::live_count` returns
+        // a Result and the trait method returns usize, and Rust picks the inherent one for a
+        // concrete type. Comparing the trait's answers is the point.
+        assert_eq!(
+            BranchCatalog::live_count(&src),
+            BranchCatalog::live_count(&dst),
+            "live_count"
+        );
+        assert_eq!(src.current_epoch(), dst.current_epoch(), "current_epoch");
+
+        // ---- and the next id minted must agree, or a migration reuses a live slot -------------
+        let sn = src.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let dn = dst.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        assert_eq!(sn.branch_id, dn.branch_id, "the next branch minted differs after migrating");
+        assert_eq!(sn.fork_epoch, dn.fork_epoch, "the next fork epoch differs after migrating");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
