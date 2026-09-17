@@ -368,7 +368,6 @@ impl Reaper for TwoTierReaper {
 
 #[cfg(test)]
 mod tests {
-    use crate::branch::catalog::LogBranchCatalog;
     use super::*;
     use crate::branch::arena::harness::Harness;
     use crate::branch::types::{ArenaId, LeaseDeadline, ARENA_EXTENT_PAGES};
