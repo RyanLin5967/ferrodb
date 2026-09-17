@@ -203,6 +203,12 @@ impl BranchCatalog for MemBranchCatalog {
             .unwrap_or(false))
     }
 
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };
+        Ok(prec.remove_live_child(fork_epoch))
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut records = self.records.lock().unwrap();
         let mut rec = Self::lookup(&records, branch)?;

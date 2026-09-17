@@ -124,6 +124,17 @@ pub trait BranchCatalog: Send + Sync {
     /// Does this id slot have any live children at all? Replaces `rec.live_children.is_empty()`.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError>;
 
+    /// Remove one child from `parent_id`'s live set. Returns whether anything was removed.
+    ///
+    /// **An explicit operation, not a record mutation followed by `put`.** The reaper used to do
+    /// `get_raw(parent)`, `remove_live_child(epoch)`, `put(&parent)` — which works only while the
+    /// live set travels inside the record. A catalog that keeps children in an index returns
+    /// records with an empty set, so `remove_live_child` would report "nothing to do", the write
+    /// would be skipped, and the index entry would survive its branch **for ever**: the parent's
+    /// pages would then be pinned by a child that no longer exists and could never be reclaimed.
+    /// Silent, permanent, and invisible to every existing test. Hence a method with a return value.
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError>;
+
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;
 

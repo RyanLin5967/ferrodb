@@ -128,10 +128,10 @@ impl TwoTierReaper {
     /// a `drain_pending`.
     fn detach_from_parent(&self, rec: &BranchRecord) -> Result<(), FerroError> {
         let Some(parent) = rec.parent_id else { return Ok(()) };
-        let Ok(mut prec) = self.catalog.get_raw(parent.id) else { return Ok(()) };
-        if prec.remove_live_child(rec.fork_epoch) {
-            self.catalog.put(&prec)?;
-        }
+        // One call rather than get/mutate/put. The old shape silently did nothing against any
+        // catalog that keeps the live set in an index instead of inside the record - see
+        // `BranchCatalog::detach_child`.
+        self.catalog.detach_child(parent.id, rec.fork_epoch)?;
         Ok(())
     }
 

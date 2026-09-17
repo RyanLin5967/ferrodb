@@ -50,6 +50,10 @@ pub struct BranchRecord {
     pub envelope: Option<CapabilityEnvelope>,
 }
 
+/// Exact width of [`BranchRecord::serialize_core`]. Named so the encoder and the decoder cannot
+/// drift: both assert against it.
+pub const CORE_BYTES: usize = 51;
+
 impl BranchRecord {
     /// The trunk record. Never reaped, no parent, depth 0.
     pub fn trunk(root_page_id: PageId, lease_deadline: LeaseDeadline) -> Self {
@@ -189,6 +193,75 @@ impl BranchRecord {
     // What a version byte WOULD buy is the ability to change the meaning of bytes already written.
     // Appending a field does not do that, so paying for it here would have been a migration for a
     // problem that does not exist.
+
+    /// Bytes of the **core** record: everything that is not unbounded.
+    ///
+    /// The table catalog stores this, and keeps `arenas`, `live_children` and `envelope` in their
+    /// own key spans. Not a space optimisation — a correctness one. A B+tree leaf holds about 2 KB
+    /// of entries in total, and all three of those fields are unbounded: trunk's `live_children` at
+    /// 10⁶ branches is 8 MB, and a branch that has written ~230 MB owns ~900 arena ids. A record
+    /// that can outgrow a page is a wall with no error message.
+    ///
+    /// Fixed 51 bytes, no length prefixes, because every field is fixed-width. `CORE_BYTES` is
+    /// asserted on the way back in, so a short or long buffer is a refusal rather than a record
+    /// deserialized out of the next one's bytes.
+    pub fn serialize_core(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(CORE_BYTES);
+        b.extend_from_slice(&self.branch_id.id.to_be_bytes());
+        b.extend_from_slice(&self.branch_id.generation.to_be_bytes());
+        b.extend_from_slice(&self.generation.to_be_bytes());
+        match self.parent_id {
+            Some(p) => {
+                b.push(1);
+                b.extend_from_slice(&p.id.to_be_bytes());
+                b.extend_from_slice(&p.generation.to_be_bytes());
+            }
+            None => {
+                b.push(0);
+                b.extend_from_slice(&0u64.to_be_bytes());
+                b.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+        b.extend_from_slice(&self.fork_epoch.0.to_be_bytes());
+        b.extend_from_slice(&self.root_page_id.to_be_bytes());
+        b.extend_from_slice(&self.lease_deadline.0.to_be_bytes());
+        b.push(self.state.as_u8());
+        b.push(self.depth);
+        debug_assert_eq!(b.len(), CORE_BYTES);
+        b
+    }
+
+    /// Inverse of [`Self::serialize_core`]. The three unbounded fields come back **empty**, and
+    /// that is deliberate: a caller that needs them asks the catalog, which answers from an index.
+    /// Silently returning an empty `live_children` where the old record had a full one would be a
+    /// wrong answer, so every caller of those fields was moved onto catalog queries first.
+    pub fn deserialize_core(bytes: &[u8]) -> Result<Self, BranchError> {
+        if bytes.len() != CORE_BYTES {
+            return Err(BranchError::Corrupt(format!(
+                "core branch record must be exactly {CORE_BYTES} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let u64_at = |i: usize| u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
+        let u32_at = |i: usize| u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap());
+        let branch_id = BranchId::new(u64_at(0), u32_at(8));
+        let generation = u32_at(12);
+        let parent_id =
+            if bytes[16] == 1 { Some(BranchId::new(u64_at(17), u32_at(25))) } else { None };
+        Ok(BranchRecord {
+            branch_id,
+            generation,
+            parent_id,
+            fork_epoch: Epoch(u64_at(29)),
+            root_page_id: u32_at(37),
+            lease_deadline: LeaseDeadline(u64_at(41)),
+            state: BranchState::from_u8(bytes[49])?,
+            depth: bytes[50],
+            arenas: Vec::new(),
+            live_children: Vec::new(),
+            envelope: None,
+        })
+    }
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::with_capacity(64 + self.arenas.len() * 4 + self.live_children.len() * 8);
@@ -1672,5 +1745,74 @@ mod tests {
             vec![ColumnCapability::floored(1, 0), ColumnCapability::open(1), ColumnCapability::floored(1, 5)],
         );
         assert_eq!(cap.columns(), &[ColumnCapability::floored(1, 5)]);
+    }
+}
+#[cfg(test)]
+mod core_record_tests {
+    use super::*;
+
+    /// Every field must survive the round trip. A silently dropped field here is a branch that
+    /// comes back pointing at the wrong root page or with the wrong lease.
+    #[test]
+    fn the_core_record_round_trips_every_field_it_carries() {
+        let mut rec = BranchRecord::trunk(7, LeaseDeadline(1234));
+        rec.branch_id = BranchId::new(42, 3);
+        rec.generation = 9;
+        rec.parent_id = Some(BranchId::new(41, 2));
+        rec.fork_epoch = Epoch(555);
+        rec.root_page_id = 777;
+        rec.lease_deadline = LeaseDeadline(u64::MAX - 1);
+        rec.state = BranchState::Quarantined;
+        rec.depth = 11;
+        // The unbounded fields are deliberately NOT carried; they live in key spans.
+        rec.arenas = vec![ArenaId(1), ArenaId(2)];
+        rec.live_children = vec![Epoch(3), Epoch(4)];
+
+        let bytes = rec.serialize_core();
+        assert_eq!(bytes.len(), CORE_BYTES, "core record width drifted from the constant");
+        let back = BranchRecord::deserialize_core(&bytes).expect("round trip");
+
+        assert_eq!(back.branch_id, rec.branch_id);
+        assert_eq!(back.generation, rec.generation);
+        assert_eq!(back.parent_id, rec.parent_id);
+        assert_eq!(back.fork_epoch, rec.fork_epoch);
+        assert_eq!(back.root_page_id, rec.root_page_id);
+        assert_eq!(back.lease_deadline, rec.lease_deadline);
+        assert_eq!(back.state, rec.state);
+        assert_eq!(back.depth, rec.depth);
+        assert!(back.arenas.is_empty(), "arenas must come back empty, not stale");
+        assert!(back.live_children.is_empty(), "live_children must come back empty, not stale");
+        assert!(back.envelope.is_none());
+    }
+
+    /// Trunk has no parent, and the absent-parent tag must not be confused with parent id 0 —
+    /// which is trunk's own id, so getting this wrong makes trunk its own parent.
+    #[test]
+    fn an_absent_parent_is_distinguishable_from_parent_zero() {
+        let trunk = BranchRecord::trunk(1, LeaseDeadline(0));
+        assert_eq!(trunk.parent_id, None, "fixture");
+        let back = BranchRecord::deserialize_core(&trunk.serialize_core()).unwrap();
+        assert_eq!(back.parent_id, None, "absent parent came back as Some");
+
+        let mut child = trunk.clone();
+        child.branch_id = BranchId::new(5, 0);
+        child.parent_id = Some(BranchId::TRUNK);
+        let back = BranchRecord::deserialize_core(&child.serialize_core()).unwrap();
+        assert_eq!(back.parent_id, Some(BranchId::TRUNK), "parent 0 came back as absent");
+    }
+
+    /// A buffer of the wrong length must refuse rather than read into whatever follows it.
+    #[test]
+    fn a_wrong_length_core_record_is_refused() {
+        let rec = BranchRecord::trunk(1, LeaseDeadline(0));
+        let bytes = rec.serialize_core();
+        assert!(BranchRecord::deserialize_core(&bytes[..CORE_BYTES - 1]).is_err(), "short accepted");
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(BranchRecord::deserialize_core(&long).is_err(), "long accepted");
+        // An unknown state tag is corruption, not a default.
+        let mut bad = bytes.clone();
+        bad[49] = 200;
+        assert!(BranchRecord::deserialize_core(&bad).is_err(), "unknown state tag accepted");
     }
 }

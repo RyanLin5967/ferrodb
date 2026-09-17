@@ -445,6 +445,17 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(st.records.get(&parent_id).map(|r| !r.live_children.is_empty()).unwrap_or(false))
     }
 
+    /// The log catalog keeps the live set inside the record, so this is exactly what the reaper
+    /// used to do inline.
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        let Ok(mut prec) = self.get_raw(parent_id) else { return Ok(false) };
+        if prec.remove_live_child(fork_epoch) {
+            self.put(&prec)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let mut rec = self.get(branch)?;
         rec.lease_deadline = lease;

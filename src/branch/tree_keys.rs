@@ -91,13 +91,30 @@ pub fn state(state_tag: u8, id: u64) -> Vec<u8> {
     k
 }
 
-/// `[0x03][parent][fork epoch]`
+/// `[0x03][parent][u64::MAX - fork epoch]` — **the epoch is stored complemented.**
+///
+/// So the span is ordered newest-child-first and `max_live_child` is the FIRST key, reachable in
+/// one descent. Ascending would put the maximum last, and reading it would mean consuming the whole
+/// span — O(N) for trunk, which is the parent of everything and the exact cost being removed.
+///
+/// This is the standard descending-index trick, how any forward-only B+tree serves `ORDER BY x
+/// DESC`. It costs nothing because no caller iterates children in ascending order: the three that
+/// exist want the maximum, a range-emptiness test, and a non-empty test.
 pub fn child(parent_id: u64, fork_epoch: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(17);
     k.push(tag::CHILD);
     k.extend_from_slice(&parent_id.to_be_bytes());
-    k.extend_from_slice(&fork_epoch.to_be_bytes());
+    k.extend_from_slice(&(u64::MAX - fork_epoch).to_be_bytes());
     k
+}
+
+/// Recover the fork epoch from a `CHILD` key's trailing eight bytes.
+pub fn child_epoch_from_key(key: &[u8]) -> Option<u64> {
+    if key.len() != 17 || key[0] != tag::CHILD {
+        return None;
+    }
+    let c = u64::from_be_bytes(key[9..17].try_into().ok()?);
+    Some(u64::MAX - c)
 }
 
 /// `[0x04][id]`
@@ -171,8 +188,23 @@ pub fn children_of(parent_id: u64) -> (Vec<u8>, Vec<u8>) {
 /// This is the reclamation rule itself: a page born at epoch `b` and freed at epoch `f` is
 /// reclaimable exactly when no live child forked in `[b, f)`. Asking the tree directly means the
 /// rule stops depending on an array held inside the parent's record.
-pub fn children_in_epoch_range(parent_id: u64, lo_epoch: u64, hi_epoch: u64) -> (Vec<u8>, Vec<u8>) {
-    (child(parent_id, lo_epoch), child(parent_id, hi_epoch))
+/// Returns an **inclusive** `[lo_key, hi_key]` pair, because complement turns a half-open epoch
+/// window into a closed key window and the alternative arithmetic overflows: epochs `[lo, hi)`
+/// are keys `[MAX-hi+1, MAX-lo]`, and computing `MAX-lo+1` for an exclusive upper bound overflows
+/// whenever `lo == 0` — which is trunk's own fork epoch, so it is the common case, not an edge one.
+///
+/// An empty or inverted window (`lo >= hi`) returns `None`: there is no key range to scan, and
+/// synthesising one would make a reversed pair that silently matches everything.
+pub fn children_in_epoch_range(
+    parent_id: u64,
+    lo_epoch: u64,
+    hi_epoch: u64,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if lo_epoch >= hi_epoch {
+        return None;
+    }
+    // hi >= 1 here, so `MAX - hi + 1` cannot overflow.
+    Some((child(parent_id, hi_epoch - 1), child(parent_id, lo_epoch)))
 }
 
 /// `[0x05][id]`
@@ -246,6 +278,14 @@ mod tests {
                     a.cmp(&b),
                     "child keys disagree with parent order at {a} vs {b}"
                 );
+                // **Descending in the epoch**: a LATER fork must sort EARLIER, so the newest live
+                // child is the first key in the span and `max_live_child` is one descent.
+                assert_eq!(
+                    child(7, a).cmp(&child(7, b)),
+                    b.cmp(&a),
+                    "child keys are not descending in the fork epoch at {a} vs {b}"
+                );
+                assert_eq!(child_epoch_from_key(&child(7, a)), Some(a), "epoch does not round-trip");
             }
         }
     }
@@ -353,9 +393,19 @@ mod tests {
         );
         assert!(!(state(0, 0) >= lo && state(0, 0) < hi), "must not reach into the next group");
 
-        // The reclamation rule's own query: half-open on the epoch, matching `[birth, freed)`.
-        let (lo, hi) = children_in_epoch_range(5, 10, 20);
-        assert!(child(5, 10) >= lo && child(5, 10) < hi, "the birth epoch is inside");
-        assert!(!(child(5, 20) < hi), "the freed epoch is NOT inside — the rule is half-open");
+        // The reclamation rule's own query. Complemented keys make this a CLOSED key range over a
+        // HALF-OPEN epoch window, so the assertions are on epochs, not on key comparisons.
+        let (lo, hi) = children_in_epoch_range(5, 10, 20).expect("non-empty window");
+        assert!(child(5, 10) >= lo && child(5, 10) <= hi, "the birth epoch is inside");
+        assert!(child(5, 19) >= lo && child(5, 19) <= hi, "the last epoch before freed is inside");
+        assert!(!(child(5, 20) >= lo), "the freed epoch is NOT inside — the window is half-open");
+        assert!(!(child(5, 9) <= hi), "an epoch before birth is outside");
+        assert!(children_in_epoch_range(5, 10, 10).is_none(), "an empty window has no key range");
+        assert!(children_in_epoch_range(5, 20, 10).is_none(), "an inverted window has no key range");
+        // The case that overflows if the upper bound is computed exclusively. Trunk forks at 0.
+        let (lo, hi) = children_in_epoch_range(5, 0, 3).expect("window from epoch zero");
+        assert!(child(5, 0) >= lo && child(5, 0) <= hi, "epoch 0 must be inside [0, 3)");
+        assert!(child(5, 2) >= lo && child(5, 2) <= hi);
+        assert!(!(child(5, 3) >= lo), "epoch 3 is outside [0, 3)");
     }
 }
