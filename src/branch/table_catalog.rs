@@ -212,7 +212,10 @@ impl TableBranchCatalog {
             tree,
             logical: Mutex::new(()),
             next_id: AtomicU64::new(1),
-            epoch: AtomicU64::new(1),
+            // 0, not 1: a fresh `LogBranchCatalog` derives `max_epoch` from trunk's fork epoch,
+            // which is 0, and seeds its counter with exactly that. Seeding 1 here would make the
+            // first epoch this catalog hands out differ from the first the log hands out.
+            epoch: AtomicU64::new(0),
             pool,
             header_page: std::sync::atomic::AtomicU32::new(0),
             published_root: std::sync::atomic::AtomicU32::new(0),
@@ -444,8 +447,19 @@ impl TableBranchCatalog {
 }
 
 impl BranchCatalog for TableBranchCatalog {
+    /// POST-increment, matching `LogBranchCatalog::next_epoch` exactly.
+    ///
+    /// This returned the PRE-increment value until the migration work forced the question. The
+    /// sequence of epochs handed out was identical either way, which is why every test passed -
+    /// but `current_epoch()` meant "the NEXT epoch to issue" here and "the LAST epoch issued"
+    /// there. Two implementations of one trait method meaning different things, invisible because
+    /// the only assertion on it was an inequality that holds under both.
+    ///
+    /// It would have surfaced in the worst possible place: a migration whose job is to carry the
+    /// counter across. Picking the wrong reading either reuses an epoch - which for this catalog is
+    /// a duplicate CHILD **key**, not merely a duplicate array entry - or silently skips one.
     fn next_epoch(&self) -> Epoch {
-        Epoch(self.epoch.fetch_add(1, Ordering::SeqCst))
+        Epoch(self.epoch.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
     fn current_epoch(&self) -> Epoch {
@@ -1024,6 +1038,49 @@ mod tests {
             c.pool.flush_all().unwrap();
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Two implementations of one trait must mean the same thing by it.**
+    ///
+    /// `next_epoch` hands out the same SEQUENCE under either pre- or post-increment, so a test
+    /// that only checks the forks succeed cannot tell them apart. What differs is
+    /// `current_epoch()`: "the last epoch issued" versus "the next one to issue". The existing
+    /// assertion elsewhere is `current_epoch() >= fork_epoch`, which holds under both readings —
+    /// exactly the kind of check that lets a divergence live.
+    ///
+    /// This runs the same operations against the log catalog and the table catalog and compares at
+    /// EVERY step, not at the end.
+    #[test]
+    fn the_two_catalogs_agree_about_what_current_epoch_means() {
+        use crate::branch::catalog::LogBranchCatalog;
+
+        let (table, p, _pool) = cat("epochsem");
+        let log = LogBranchCatalog::in_memory(1);
+
+        assert_eq!(
+            table.current_epoch(),
+            log.current_epoch(),
+            "a fresh catalog disagrees about the starting epoch"
+        );
+
+        for step in 0..12 {
+            let t = table.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            let l = log.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+            assert_eq!(
+                t.fork_epoch, l.fork_epoch,
+                "step {step}: the two catalogs handed out different fork epochs"
+            );
+            assert_eq!(
+                table.current_epoch(),
+                log.current_epoch(),
+                "step {step}: current_epoch diverged - one means the last epoch issued and the \
+                 other means the next one, which makes 'carry the counter' ambiguous for any \
+                 migration between them"
+            );
+            // And the ids must match too, for the same reason.
+            assert_eq!(t.branch_id.id, l.branch_id.id, "step {step}: different ids minted");
+        }
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]
