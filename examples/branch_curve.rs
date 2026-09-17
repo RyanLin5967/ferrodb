@@ -62,10 +62,25 @@ fn main() {
     let cat = Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("open catalog"));
     let lease = LeaseDeadline(u64::MAX);
 
+    // S13 CALIBRATION FIXTURE. 500 branches with a DISTINCT short deadline, seeded once. Every
+    // other branch takes LeaseDeadline(MAX), so `expired_before(SEED_D - 1)` answers ZERO and
+    // `expired_before(SEED_D + 1)` answers exactly 500, at EVERY N.
+    //
+    // That pair is the whole point: the reaper's claim is that its cost tracks the ANSWER, not N.
+    // A single arm cannot show that -- a number that is flat might mean "proportional to the
+    // answer" or might mean "the instrument cannot see anything". Two arms over the same function
+    // at the same N, differing only in answer size, distinguish them. The repo's own scaling bench
+    // already refuses to report flatness unless a 20x larger tree moves the number; same discipline.
+    const SEED_D: u64 = 1_000_000;
+    const SEED_N: usize = 500;
+    for _ in 0..SEED_N {
+        cat.fork(BranchId::TRUNK, LeaseDeadline(SEED_D)).expect("seed fork");
+    }
+
     println!("S12: the curve to 10^6 branches. ONE catalog, forked cumulatively. {threads} threads.");
     println!("Predictions were recorded before this run: artie-research/S12-PREDICTIONS.md");
     println!();
-    println!("         N   seg forks/sec   per-fork ms   fsyncs   f/fsync   cat MB   B/branch   peak RSS MB   reopen ms   live_count ms");
+    println!("         N   seg forks/sec   per-fork ms   fsyncs   f/fsync   cat MB   B/branch   peak RSS MB   reopen ms   live_count ms   read us   reap(0) us   reap(500) us");
 
     let mut done = 0usize;
     let mut prev_syncs = 0u64;
@@ -103,6 +118,31 @@ fn main() {
         let live_ms = t.elapsed().as_secs_f64() * 1000.0;
         assert!(live >= done, "live_count {live} < forks issued {done}");
 
+        // S13: a READ. The standing claim is "reads flat to 50k branches (x1.00)"; 10^6 is 20x
+        // beyond where that was ever tested. get_raw is a descent plus hydrate.
+        let mut reads: Vec<f64> = Vec::with_capacity(200);
+        let mut probe = 1u64;
+        for _ in 0..200 {
+            probe = probe.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let id = 1 + (probe >> 33) % (done as u64).max(1);
+            let t = Instant::now();
+            let _ = std::hint::black_box(cat.get_raw(id));
+            reads.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        reads.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let read_us = reads[reads.len() / 2];
+
+        // S13: the reaper, as a CALIBRATED PAIR. Same function, same N, different answer size.
+        let t = Instant::now();
+        let none = cat.expired_before(SEED_D - 1).expect("reap none");
+        let reap0_us = t.elapsed().as_secs_f64() * 1e6;
+        assert!(none.is_empty(), "expired_before(SEED_D-1) returned {} rows", none.len());
+
+        let t = Instant::now();
+        let some = cat.expired_before(SEED_D + 1).expect("reap some");
+        let reap500_us = t.elapsed().as_secs_f64() * 1e6;
+        assert_eq!(some.len(), SEED_N, "the 500-branch fixture did not come back whole");
+
         // Reopen from disk. The O(1) claim is that this does not grow with N.
         let root = cat.root_page_id();
         let t = Instant::now();
@@ -111,7 +151,7 @@ fn main() {
         drop(re);
 
         println!(
-            "  {:>8}   {:>12.1}   {:>11.4}   {:>6}   {:>7.1}   {:>6.1}   {:>8.1}   {:>11.1}   {:>9.4}   {:>12.3}",
+            "  {:>8}   {:>12.1}   {:>11.4}   {:>6}   {:>7.1}   {:>6.1}   {:>8.1}   {:>11.1}   {:>9.4}   {:>12.3}   {:>7.2}   {:>10.1}   {:>12.1}",
             done,
             actually as f64 / secs,
             secs * 1000.0 / actually as f64,
@@ -122,10 +162,18 @@ fn main() {
             peak_rss_bytes() as f64 / 1e6,
             reopen_ms,
             live_ms,
+            read_us,
+            reap0_us,
+            reap500_us,
         );
     }
     println!();
     println!("seg forks/sec is for THAT SEGMENT only, so a knee shows as a drop between rows rather");
     println!("than being averaged away across the whole run.");
+    println!();
+    println!("reap(0) and reap(500) are the SAME function at the SAME N, differing only in how many");
+    println!("rows the answer contains. If BOTH are flat in N, the reaper's cost tracks the answer");
+    println!("and not the catalog -- which is the claim. If reap(0) grows with N, the claim is false.");
+    println!("If reap(500) ~= reap(0), the instrument cannot see answer size and proves nothing.");
     let _ = std::fs::remove_dir_all(&dir);
 }
