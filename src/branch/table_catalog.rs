@@ -515,6 +515,48 @@ impl TableBranchCatalog {
     /// from `old` first. The CHILD span is **not** touched here: children are inserted by `fork`
     /// and removed by `detach_child`, because `put` receives records whose `live_children` is
     /// empty by construction and diffing against that would delete every child.
+    /// `write_record` for a branch whose keys are **provably new**, which on the fork path means a
+    /// freshly minted id.
+    ///
+    /// `upsert` is delete-then-insert, because `BPlusTreeManager::insert` does not replace. For a
+    /// key that cannot exist, the delete is a **guaranteed miss: a full B+tree descent whose only
+    /// possible outcome is `KeyNotFound`**. Measured on the child key, same key space and same run:
+    /// `upsert` 0.02280 ms against `tree.insert` 0.01003 ms, so **the wasted delete is 56% of an
+    /// upsert** (`bench/serial_section_profile.txt`). This also skips the arena-span `range_scan`
+    /// that `write_record` performs to reconcile arenas, which for a brand-new child can only ever
+    /// find an empty span.
+    ///
+    /// SAFETY OF "PROVABLY NEW", checked rather than assumed: no path anywhere deletes a `RECORD`
+    /// key -- the only operations on `keys::record` are insert, search and upsert -- so a reaped
+    /// branch's record SURVIVES with `state = Reaped`, and a **recycled** id's keys DO exist. This
+    /// must therefore be called only for an id taken from `next_id`, never one taken from
+    /// `FREE_ID`. `fork` knows which it chose because it chose.
+    ///
+    /// The precedent is eight lines away: `fork` already calls `self.tree.insert` directly for the
+    /// child key, on exactly this reasoning. This extends it to the four keys that are new for the
+    /// identical reason.
+    fn write_record_new(&self, rec: &BranchRecord) -> Result<(), FerroError> {
+        // A real assert, not debug_assert. A record carrying arenas would have them silently
+        // dropped here, and "silently dropped arenas" is precisely the defect that leaked pages
+        // permanently once already (6e28372) while the obvious assertion passed. One `is_empty()`
+        // is nanoseconds; a repeat of that bug is not.
+        assert!(
+            rec.arenas.is_empty(),
+            "write_record_new was handed a record with {} arenas; it does not reconcile the arena \
+             span, so they would be silently dropped. Use write_record.",
+            rec.arenas.len()
+        );
+        self.tree.insert(keys::record(rec.branch_id.id), rec.serialize_core())?;
+        self.tree.insert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
+        if Self::in_deadline_index(rec.state, rec.branch_id) {
+            self.tree.insert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+        }
+        if let Some(e) = &rec.envelope {
+            self.tree.insert(keys::envelope(rec.branch_id.id), e.serialize())?;
+        }
+        Ok(())
+    }
+
     /// `rec` must be WHOLE -- its arena span is rewritten to match it. `old` is deliberately a
     /// [`CoreRecord`]: the only things ever read from it are the state and deadline index keys, and
     /// typing it that way means a caller can pass the cheap read it already has without the
@@ -688,13 +730,16 @@ impl BranchCatalog for TableBranchCatalog {
             .transpose()?
             .and_then(|(k, _)| keys::free_id_from_key(&k));
 
-        let (child_num, generation) = match recycled {
+        // `reused` decides which writer runs below, and it is the whole safety condition for
+        // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
+        // deadline keys, so its keys are NOT new.
+        let (child_num, generation, reused) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
                 let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
-                (id, slot_gen)
+                (id, slot_gen, true)
             }
-            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0),
+            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
         };
         let child_id = BranchId::new(child_num, generation);
             let child = BranchRecord::fork_child_from_core(
@@ -705,7 +750,11 @@ impl BranchCatalog for TableBranchCatalog {
                 lease,
             )?;
 
-            self.write_record(&child, None)?;
+            if reused {
+                self.write_record(&child, None)?;
+            } else {
+                self.write_record_new(&child)?;
+            }
             // The child's entry in its parent's live set. A child that exists but is not listed in its
         // parent is a GC correctness hole, which is why both happen under one logical lock.
         // The VALUE is the child's branch id, so a reader can resolve the child and check
