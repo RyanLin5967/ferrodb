@@ -18,10 +18,18 @@ on-disk bytes              N=8000      N=16000     N=32000     N=64000
 total seconds              N=8000      N=16000     N=32000     N=64000
   TableBranchCatalog        0.704        1.426       2.894       5.993
 
-REOPEN ARM (separate run, reopen enabled):
+REOPEN ARM (separate run, reopen enabled) -- COMPLETE:
   N       log_reopen_s   table_reopen_s
   8000       0.002          0.000009
   16000      0.004          0.000010
+  32000      0.011          0.000007
+  64000      0.030          0.000008
+
+  log ratios per doubling: 2.00, 2.75, 2.73 -- LINEAR AT BEST, and the last two steps are above
+  2.0, so it is drifting super-linear. That is `open` replaying every operation ever written,
+  which includes records for branches that have since been reaped.
+  table ratios: 1.11, 0.70, 1.14 -- flat within noise. `open` reads one header key: one descent.
+  At 64000 the gap is 3750x, and it widens with N because one side is O(N) and the other is O(1).
 
 UNINTERPRETED NOTES, and the caveats are not decoration:
 
