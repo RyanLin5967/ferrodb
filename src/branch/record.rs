@@ -108,6 +108,12 @@ impl CoreRecord {
     pub fn lease_deadline(&self) -> LeaseDeadline {
         self.0.lease_deadline
     }
+    pub fn depth(&self) -> u8 {
+        self.0.depth
+    }
+    pub fn root_page_id(&self) -> PageId {
+        self.0.root_page_id
+    }
     /// Safe on a core record: it reads `generation` and `state`, and neither is an unbounded field.
     pub fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
         self.0.check_readable(requested)
@@ -144,20 +150,75 @@ impl BranchRecord {
         fork_epoch: Epoch,
         lease_deadline: LeaseDeadline,
     ) -> Result<Self, BranchError> {
-        if parent.state != BranchState::Live {
-            return Err(BranchError::NotWritable(parent.branch_id));
+        Self::fork_child_parts(
+            parent.branch_id,
+            parent.state,
+            parent.depth,
+            parent.root_page_id,
+            parent.envelope.as_ref(),
+            child_id,
+            fork_epoch,
+            lease_deadline,
+        )
+    }
+
+    /// Fork from a parent read as a [`CoreRecord`] plus its envelope, with **no arena scan**.
+    ///
+    /// `fork_child` takes a whole `BranchRecord`, and the only way to obtain one is `hydrate`,
+    /// which range-scans the parent's entire arena span. `fork_child` never reads `arenas`, so
+    /// every fork was paying for a vector it discarded — measured at ~42 ns per arena of the
+    /// parent, x0.72 throughput at 2000 arenas (`bench/fork_parent_arena_scan.txt`). The type
+    /// system pushed toward that scan, so the fix is this signature rather than a warning comment.
+    ///
+    /// It takes the envelope SEPARATELY rather than accepting a `BranchRecord` with empty `arenas`,
+    /// which would tunnel under the guarantee `CoreRecord` exists to provide.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fork_child_from_core(
+        parent: &CoreRecord,
+        parent_envelope: Option<&CapabilityEnvelope>,
+        child_id: BranchId,
+        fork_epoch: Epoch,
+        lease_deadline: LeaseDeadline,
+    ) -> Result<Self, BranchError> {
+        Self::fork_child_parts(
+            parent.branch_id(),
+            parent.state(),
+            parent.depth(),
+            parent.root_page_id(),
+            parent_envelope,
+            child_id,
+            fork_epoch,
+            lease_deadline,
+        )
+    }
+
+    /// The single body both entry points share, so the two can never drift — and drift here is a
+    /// capability bug, since the envelope rule lives in it.
+    #[allow(clippy::too_many_arguments)]
+    fn fork_child_parts(
+        parent_branch_id: BranchId,
+        parent_state: BranchState,
+        parent_depth: u8,
+        parent_root_page_id: PageId,
+        parent_envelope: Option<&CapabilityEnvelope>,
+        child_id: BranchId,
+        fork_epoch: Epoch,
+        lease_deadline: LeaseDeadline,
+    ) -> Result<Self, BranchError> {
+        if parent_state != BranchState::Live {
+            return Err(BranchError::NotWritable(parent_branch_id));
         }
-        let depth = parent.depth + 1;
+        let depth = parent_depth + 1;
         if depth > MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch: parent.branch_id, depth });
+            return Err(BranchError::DepthExceeded { branch: parent_branch_id, depth });
         }
         Ok(BranchRecord {
             branch_id: child_id,
             generation: child_id.generation,
-            parent_id: Some(parent.branch_id),
+            parent_id: Some(parent_branch_id),
             fork_epoch,
             // The whole fork: the child's root IS the parent's root.
-            root_page_id: parent.root_page_id,
+            root_page_id: parent_root_page_id,
             lease_deadline,
             state: BranchState::Live,
             arenas: Vec::new(),
@@ -168,7 +229,7 @@ impl BranchRecord {
             // agent session in this system runs on a forked child. The child's budget is the
             // parent's REMAINING budget, so forking cannot mint row-writes the parent had already
             // used. See `CapabilityEnvelope::inherited` for the residual limit that leaves.
-            envelope: parent.envelope.as_ref().map(CapabilityEnvelope::inherited),
+            envelope: parent_envelope.map(CapabilityEnvelope::inherited),
         })
     }
 

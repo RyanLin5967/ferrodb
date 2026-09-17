@@ -672,7 +672,12 @@ impl BranchCatalog for TableBranchCatalog {
         // That is exactly why reading a parent through it here was wrong.
         let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
         parent_core.check_readable(parent)?;
-        let parent_rec = self.hydrate(parent_core)?;
+        // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
+        // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the parent,
+        // x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope is still
+        // loaded, and that is not optional: a parent read without it hands the child `None`, which
+        // is the UNGOVERNED default and was a shipped capability escape (339e405).
+        let parent_envelope = self.envelope_bytes(parent.id)?;
 
         // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
         // generation comes from the slot's history, never from zero — a reused id whose generation
@@ -694,7 +699,13 @@ impl BranchCatalog for TableBranchCatalog {
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0),
         };
         let child_id = BranchId::new(child_num, generation);
-        let child = BranchRecord::fork_child(&parent_rec, child_id, fork_epoch, lease)?;
+            let child = BranchRecord::fork_child_from_core(
+                &parent_core,
+                parent_envelope.as_ref(),
+                child_id,
+                fork_epoch,
+                lease,
+            )?;
 
         self.write_record(&child, None)?;
         // The child's entry in its parent's live set. A child that exists but is not listed in its
