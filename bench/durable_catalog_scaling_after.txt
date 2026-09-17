@@ -1,0 +1,29 @@
+durable branch-catalog scaling: N branches forked from TRUNK — AFTER the S1 fix
+instrument: std::time::Instant + fs::metadata, release build, LogBranchCatalog::open (durable)
+date: 2026-09-17T16:59:18Z
+
+       N   first_us    last_us    total_s      log_bytes   reopen_s     live
+     500    8092.00    3086.17      1.629          34000      0.000      501
+    1000    3711.00    5124.17      3.126          68000      0.000     1001
+    2000    4620.25    2972.62      6.400         136000      0.001     2001
+    4000    3370.38    4021.83     13.282         272000      0.001     4001
+    8000    3830.92    3087.38     26.814         544000      0.002     8001
+
+BEFORE (same harness, same machine, bench/durable_catalog_scaling.txt):
+   500 -> 1,070,000 bytes | 1000 -> 4,140,000 | 2000 -> 16,280,000 | 4000 -> 64,560,000 | 8000 -> 257,120,000
+   ratios x3.87 x3.93 x3.97 x3.98 per doubling = O(N^2); reopen 0.002 -> 0.766s
+
+AFTER: bytes DOUBLE when N doubles, so the log is O(N). 68 bytes per branch.
+   8000 branches: 257,120,000 -> 544,000 bytes, a 473x reduction; reopen 0.766s -> 0.002s.
+   Extrapolated at 10^6 branches: ~4TB -> ~68MB.
+
+The fix is not a smaller record. `live_children` is no longer STORED at all - it is derived at
+replay from the children that name the parent, so `fork` appends the child alone. The array was
+always redundant: a child record already carries `parent_id` and `fork_epoch`.
+
+It also closes the correctness hole it used to trade against. `fork` wrote child and parent under
+one fsync because a child durable without its parent's entry is a page nobody knows to park.
+Derived, the child record IS the parent's entry, so the two cannot disagree.
+
+Per-fork latency is unchanged (~3-4ms, fsync-bound) - as before, this wall was never visible in a
+latency measurement.
