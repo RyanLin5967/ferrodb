@@ -138,6 +138,61 @@ impl LogBranchCatalog {
             records.insert(r.branch_id.id, r);
         }
 
+        // **`live_children` is DERIVED here, not read from the parent's serialised record.**
+        //
+        // It used to be stored, which meant `fork` had to rewrite the whole parent record on every
+        // fork so the new epoch reached disk — and `live_children` grows with the number of
+        // children, so bytes-per-fork grew with the children the parent already had. Measured
+        // before this change (`bench/durable_catalog_scaling.txt`): the catalog log QUADRUPLED on
+        // every doubling of branch count — 1.07MB at 500 branches, 257MB at 8,000 — and reopen time
+        // with it. That is O(N^2) in a structure whose whole purpose is to make forking cheap.
+        //
+        // The array was always redundant: a child record already carries `parent_id` and
+        // `fork_epoch`, so the parent's live children are exactly the live records that name it.
+        // Deriving costs one pass over records that were being read anyway.
+        //
+        // **It also closes a correctness hole rather than trading against one.** `fork` wrote child
+        // and parent under a single fsync precisely because a child durable without its parent's
+        // entry would be a page nobody knows to park. Derived, the child record *is* the parent's
+        // entry — the two cannot disagree because there is only one of them.
+        //
+        // A reaped child is not live, and `detach_from_parent` runs BEFORE `mark_reaped`, so a
+        // crash between the two leaves a parent whose stored array had already lost the epoch while
+        // the child still reads Live. Derivation re-adds it, which PARKS the pages until the
+        // resumed reap finishes — the safe direction. The unsafe direction, dropping a child that
+        // is still live, cannot happen: a live child's own record says so.
+        let mut derived: HashMap<u64, Vec<Epoch>> = HashMap::new();
+        for r in records.values() {
+            if r.state == BranchState::Reaped {
+                continue;
+            }
+            if let Some(p) = r.parent_id {
+                derived.entry(p.id).or_default().push(r.fork_epoch);
+            }
+        }
+        for (id, mut kids) in derived {
+            // Sorted ascending: `reclaimable` runs a range-emptiness query over this array and
+            // `add_live_child` maintains the same order, so a derived array that arrived in hash
+            // order would answer differently from a stored one.
+            kids.sort_unstable();
+            if let Some(rec) = records.get_mut(&id) {
+                rec.live_children = kids;
+            }
+        }
+        // A parent that now has no live children must end up with an EMPTY array, not the stale one
+        // its last serialised copy held — `release_id` refuses to recycle a slot while the array is
+        // non-empty, so a leftover entry would strand the id for ever.
+        let has_kids: std::collections::HashSet<u64> = records
+            .values()
+            .filter(|r| r.state != BranchState::Reaped)
+            .filter_map(|r| r.parent_id.map(|p| p.id))
+            .collect();
+        for (id, rec) in records.iter_mut() {
+            if !has_kids.contains(id) {
+                rec.live_children.clear();
+            }
+        }
+
         let mut max_id = 0u64;
         let mut max_epoch = 0u64;
         let mut free_ids = Vec::new();
@@ -300,7 +355,11 @@ impl BranchCatalog for LogBranchCatalog {
 
         // One durable write covering both halves. A child that exists but is not listed in its
         // parent is a GC correctness hole, so the two records share a single fsync.
-        self.append(&[&child, &new_parent])?;
+        // **Only the child is appended.** The parent's `live_children` is derived at replay from
+        // the children that name it (see `index`), so rewriting the parent here would write bytes
+        // that replay ignores — and those bytes are what made the log O(N^2). The in-memory parent
+        // is still updated below, because live readers use it without replaying.
+        self.append(&[&child])?;
 
         st.records.insert(parent.id, new_parent);
         st.records.insert(child_num, child.clone());
@@ -397,7 +456,134 @@ mod tests {
         LogBranchCatalog::in_memory(1)
     }
 
+        /// **A parent whose stored array still lists a child that is Reaped comes back EMPTY.**
+    ///
+    /// The derivation only visits parents that HAVE live children, so a parent that has none is
+    /// never written by that loop and would keep whatever its last serialised copy held. That is
+    /// reachable: `detach_from_parent` runs before `mark_reaped`, so a crash between them — or a
+    /// `put` that never landed — leaves exactly this shape on disk.
+    ///
+    /// It matters because `release_id` refuses to recycle a slot while `live_children` is
+    /// non-empty. A stale entry for a child that no longer exists strands that id permanently, and
+    /// `reclaimable` keeps parking pages against a fork epoch nothing can ever reach.
+    ///
+    /// Written after a mutant that deleted the `clear()` survived the test above.
     #[test]
+    fn a_parent_listing_only_reaped_children_comes_back_with_an_empty_array() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("branches.log");
+
+        {
+            let c = LogBranchCatalog::open(&path, 1).unwrap();
+            let child = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+            // The parent's stored copy still lists the child — this is what a crash between
+            // `detach_from_parent` and `mark_reaped` leaves behind.
+            let mut trunk = c.get_raw(0).unwrap();
+            assert_eq!(trunk.live_children, vec![child.fork_epoch]);
+            c.put(&trunk).unwrap();
+            let mut crec = c.get_raw(child.branch_id.id).unwrap();
+            crec.mark_reaped();
+            c.put(&crec).unwrap();
+            trunk = c.get_raw(0).unwrap();
+            assert_eq!(
+                trunk.live_children,
+                vec![child.fork_epoch],
+                "precondition: the stored parent must still list the now-reaped child"
+            );
+        }
+
+        let reopened = LogBranchCatalog::open(&path, 1).unwrap();
+        assert!(
+            reopened.get(BranchId::TRUNK).unwrap().live_children.is_empty(),
+            "trunk came back listing a child that is Reaped; release_id will refuse that slot for \
+             ever and reclaimable will park pages against an epoch nothing can reach"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`live_children` survives a reopen even though `fork` never writes the parent.**
+    ///
+    /// S1: the array used to be stored inside the parent record, so every fork rewrote the whole
+    /// parent and the log grew O(N^2) — 257MB at 8,000 branches, measured in
+    /// `bench/durable_catalog_scaling.txt`. It is now derived at replay from the children that name
+    /// the parent, and `fork` appends the child alone.
+    ///
+    /// This pins the derivation against a real file, because the in-memory path cannot fail the way
+    /// replay can: the live catalog keeps the array `add_live_child` built, so a broken derivation
+    /// is invisible until something reopens. Reaped children must be excluded, and a parent that
+    /// loses its last live child must end up with an EMPTY array — `release_id` refuses to recycle
+    /// a slot while the array is non-empty, so a stale entry strands the id for ever.
+    #[test]
+    fn live_children_is_derived_at_replay_and_excludes_reaped_children() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-derive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("branches.log");
+
+        let (kept, gone) = {
+            let c = LogBranchCatalog::open(&path, 1).unwrap();
+            // ENOUGH children that hash order is reliably not ascending. With two, a derived
+            // array left in `HashMap` order passes by luck — measured: dropping the sort survived
+            // this test until the count went up.
+            let kids: Vec<_> = (0..24)
+                .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap())
+                .collect();
+            let (a, b, d) = (kids[0].clone(), kids[11].clone(), kids[23].clone());
+            assert_eq!(
+                c.get(BranchId::TRUNK).unwrap().live_children.len(),
+                24,
+                "in-memory array is built by add_live_child and is not what this test is about"
+            );
+            // Reap the middle one the way the reaper does: detach, then mark reaped.
+            let mut brec = c.get_raw(b.branch_id.id).unwrap();
+            let mut trunk = c.get_raw(0).unwrap();
+            trunk.remove_live_child(brec.fork_epoch);
+            c.put(&trunk).unwrap();
+            brec.mark_reaped();
+            c.put(&brec).unwrap();
+            let mut expect: Vec<_> =
+                kids.iter().filter(|k| k.fork_epoch != b.fork_epoch).map(|k| k.fork_epoch).collect();
+            expect.sort_unstable();
+            let _ = (&a, &d);
+            (expect, b.fork_epoch)
+        };
+
+        let reopened = LogBranchCatalog::open(&path, 1).unwrap();
+        let trunk = reopened.get(BranchId::TRUNK).unwrap();
+        assert_eq!(
+            trunk.live_children, kept,
+            "after a reopen trunk should list exactly its LIVE children, ascending — a fork whose \
+             parent was never rewritten still has to reach the array, and a reaped child must not"
+        );
+        assert!(
+            !trunk.live_children.contains(&gone),
+            "a reaped child is still listed as live, so pages it could see will never be freed"
+        );
+        // ASCENDING, asserted separately from the contents. `reclaimable` answers the liveness
+        // question with `partition_point` over this array, so an array holding the right epochs in
+        // the wrong order returns a wrong answer while every membership check still passes — which
+        // is exactly how a mutant that deleted the sort survived the first version of this test.
+        assert!(
+            trunk.live_children.windows(2).all(|w| w[0] <= w[1]),
+            "derived live_children is not ascending, so the range-emptiness query that decides \
+             whether a page is reclaimable will answer on an unsorted array: {:?}",
+            trunk.live_children
+        );
+
+        // A childless branch must come back with an EMPTY array, not the stale one its last
+        // serialised copy held.
+        let leaf = reopened
+            .get_raw(reopened.get(BranchId::TRUNK).unwrap().live_children.len() as u64)
+            .map(|r| r.live_children.clone())
+            .unwrap_or_default();
+        assert!(leaf.is_empty(), "a branch with no children came back with a non-empty array: {leaf:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+#[test]
     fn fork_records_the_child_in_the_parent_atomically() {
         let c = cat();
         let child = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
