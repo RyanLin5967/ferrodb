@@ -1,0 +1,15 @@
+D7: does fork's scan of the PARENT's arena span cost anything? (before the fix)
+Recorded 2026-09-17T18:07:03-0400. release, 64 threads, N=2000, one run per cell.
+columns: threads forks seconds forks/sec per-fork-ms fsyncs forks/fsync
+  parent_arenas=0        64      1984      0.457      4339.5      0.230      135        14.7
+  parent_arenas=200        64      1984      0.504      3937.3      0.254      138        14.4
+  parent_arenas=2000        64      1984      0.644      3080.8      0.325      165        12.0
+
+Linear in the parent's arena count: per-fork 0.213 -> 0.297 ms across 0 -> 2000 arenas,
+about 42 ns per arena, and throughput x0.72. fork_child never reads parent.arenas -- the
+whole scan is discarded. The most-forked parent in an agent workload is the longest-lived
+one, which is the one holding the most arenas, so the cost grows exactly where it hurts.
+
+NOTE THE INSTRUMENT. At parent_arenas=0 the span is EMPTY and the scan is one descent, so
+the pre-existing harness could not see this defect at all and a fix would have measured as
+noise. FERRODB_PARENT_ARENAS exists to make the blind spot visible.

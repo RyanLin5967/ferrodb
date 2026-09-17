@@ -40,6 +40,21 @@ fn open_catalog(dir: &std::path::Path, tag: &str) -> Arc<TableBranchCatalog> {
     Arc::new(TableBranchCatalog::open_sidecar(&path, 1).expect("open catalog"))
 }
 
+/// Give the parent `n` arenas, so the arena span `fork` scans is not empty.
+///
+/// ⛔ WITHOUT THIS THE HARNESS IS BLIND TO D7. `fork` range-scans the parent's arena span on every
+/// fork and throws the result away, but a trunk that never writes owns ZERO arenas, so the scan is
+/// one empty descent and costs nothing measurable. A fix benchmarked only against that would move
+/// no number and could still be written up as a win. This repo has already been caught by exactly
+/// that shape once: `branch_scaling_bench` used an in-memory catalog and so could not see an O(N^2)
+/// durable cost at all.
+fn give_parent_arenas(cat: &TableBranchCatalog, n: u32) {
+    use ferrodb::branch::types::ArenaId;
+    let mut trunk = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
+    trunk.arenas = (1..=n).map(ArenaId).collect();
+    cat.put(&trunk).expect("give trunk arenas");
+}
+
 fn main() {
     let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let threads: Vec<usize> = std::env::args()
@@ -49,16 +64,26 @@ fn main() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
+    // FERRODB_PARENT_ARENAS=k makes the parent own k arenas before the run, which is the only way
+    // this harness can see the cost of the scan `fork` performs over that span.
+    let parent_arenas: u32 = std::env::var("FERRODB_PARENT_ARENAS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
     let dir = std::env::temp_dir().join(format!("ferrodb-forkconc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    println!("D6: fork throughput vs concurrency. N={n} forks per arm, TableBranchCatalog, release.");
+    println!("D6/D7: fork throughput vs concurrency. N={n} forks per arm, TableBranchCatalog, release.");
+    println!("parent arenas = {parent_arenas} (FERRODB_PARENT_ARENAS; 0 means the scan span is EMPTY");
+    println!("and this harness CANNOT see D7 -- see give_parent_arenas).");
     println!("Recorded {}. One run per cell.", chrono_ish());
     println!();
     println!("  threads   forks     seconds    forks/sec   per-fork ms   fsyncs  forks/fsync");
 
     for &t in &threads {
         let cat = open_catalog(&dir, &format!("t{t}"));
+        if parent_arenas > 0 {
+            give_parent_arenas(&cat, parent_arenas);
+        }
         let lease = LeaseDeadline(u64::MAX);
         let per = n / t.max(1);
         let total = per * t;
