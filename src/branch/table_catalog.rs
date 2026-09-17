@@ -616,8 +616,16 @@ impl BranchCatalog for TableBranchCatalog {
         let fork_epoch = self.next_epoch();
         let _g = self.logical.lock().unwrap();
 
-        let parent_rec = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
-        parent_rec.check_readable(parent)?;
+        // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
+        // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
+        // its envelope hands the child `None` - which is the UNGOVERNED default. The child of a
+        // governed branch would then be free to write anything: a capability escape.
+        //
+        // `core()` deliberately leaves the envelope empty because it lives in its own key span.
+        // That is exactly why reading a parent through it here was wrong.
+        let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
+        parent_core.check_readable(parent)?;
+        let parent_rec = self.hydrate(parent_core)?;
 
         // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
         // generation comes from the slot's history, never from zero — a reused id whose generation
@@ -1525,6 +1533,33 @@ mod tests {
             .find(|r| r.branch_id.id == child.branch_id.id)
             .expect("branch missing from scan");
         assert_eq!(scanned.arenas, vec![ArenaId(7), ArenaId(9)], "scan dropped the arenas");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// **A child must inherit its parent's capability envelope.** `fork_child` does
+    /// `parent.envelope.as_ref().map(inherited)`, so a parent record read WITHOUT its envelope
+    /// hands every child `None` - which is the ungoverned default. That is a capability escape:
+    /// an agent forks a branch off a governed one and the child may write anything.
+    #[test]
+    fn a_child_inherits_its_parents_capability_envelope() {
+        use crate::branch::record::CapabilityEnvelope;
+        let (c, p, _pool) = cat("inherit");
+
+        let parent = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+        let mut rec = c.get(parent.branch_id).unwrap();
+        rec.envelope = Some(CapabilityEnvelope::new(0b001, 500));
+        c.put(&rec).unwrap();
+        assert!(c.envelope_of(parent.branch_id).unwrap().is_some(), "fixture: parent is governed");
+
+        let child = c.fork(parent.branch_id, LeaseDeadline(5_000)).unwrap();
+        assert!(
+            child.envelope.is_some(),
+            "the child of a GOVERNED branch came back ungoverned - a capability escape"
+        );
+        assert!(
+            c.envelope_of(child.branch_id).unwrap().is_some(),
+            "the child's inherited envelope was not persisted"
+        );
         let _ = std::fs::remove_file(p);
     }
 
