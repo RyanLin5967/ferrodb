@@ -71,3 +71,5 @@ target
 .claude/hooks/.handoff_read.*
 .claude/hooks/.last_precompact_payload.json
 COMPACTION_HANDOFF_*.md
+.claude/hooks/.handoff_gate.log
+.claude/hooks/.sessionstart_full.txt.stale

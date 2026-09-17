@@ -11,6 +11,15 @@
 #
 # Never fails the session: every command is bounded and errors are swallowed.
 set -u
+# ⛔ 2026-09-17. Every git-derived field in COMPACTION_STATE_AUTO.md banked BLANK -- branch, HEAD,
+# ahead-of-origin, uncommitted, and artie-research's HEAD -- and the file said nothing about it.
+# `/usr/bin/git` on this machine is an Xcode shim and the command-line-tools licence has never been
+# accepted, so in the hook's stripped environment it writes a licence notice to stderr (swallowed by
+# the `2>/dev/null` on every call) and NOTHING to stdout. An interactive shell has homebrew ahead of
+# /usr/bin, so it works by hand and fails only where it matters. toolpath.sh probes for binaries
+# that actually RUN; the blank-field check below is the backstop, because the standing rule is that
+# a run which collected nothing has not passed -- and this one collected nothing, quietly, for hours.
+. "${CLAUDE_PROJECT_DIR:-/Users/idide/projects/ferrodb}/.claude/hooks/toolpath.sh" 2>/dev/null || true
 R=/Users/idide/projects/ferrodb
 A=/Users/idide/wt/artie-research
 OUT=$R/COMPACTION_STATE_AUTO.md
@@ -137,5 +146,26 @@ if [ "${PROSE_RC:-9}" != "0" ]; then
   echo "⛔ PreCompact: the PROSE extractor REFUSED (rc=${PROSE_RC:-9}). No dated handoff was written."
   echo "⛔ Write the judgement half BY HAND THIS TURN — the automatic half is gone."
 fi
+# THE BLANK-FIELD BACKSTOP. Named fields, not a generic emptiness test: a denylist of things that
+# went wrong before would not have caught this one either.
+MISSING=""
+grep -q '^  branch: .' "$OUT" || MISSING="$MISSING branch"
+grep -q '^  ahead of origin/main: .' "$OUT" || MISSING="$MISSING ahead-of-origin"
+grep -qE '^  [0-9a-f]{7,} ' "$OUT" || MISSING="$MISSING HEAD-log"
+if [ -n "$MISSING" ]; then
+  BANNER="$(mktemp)"
+  {
+    echo "# ⛔⛔ THIS BANK IS INCOMPLETE. Fields that collected NOTHING:$MISSING"
+    echo "# A blank field here is NOT 'nothing to report' -- it is an instrument failure. The known"
+    echo "# cause is git resolving to the Xcode shim with the licence unaccepted (see toolpath.sh);"
+    echo "# it writes the licence notice to stderr and nothing to stdout, and every call site here"
+    echo "# swallows stderr. DO NOT trust any git-derived line below. Re-derive from the live repo."
+    echo "# Diagnose:  env -i HOME=\$HOME PATH=/usr/bin:/bin git -C $R branch --show-current"
+    echo
+    cat "$OUT"
+  } > "$BANNER" && mv -f "$BANNER" "$OUT"
+  echo "⛔ PreCompact: banked state is INCOMPLETE -- collected nothing for:$MISSING"
+fi
+
 echo "PreCompact: banked machine state to COMPACTION_STATE_AUTO.md; the extractable prose half (Ryan verbatim, last tool calls, agents) is in COMPACTION_HANDOFF_<date>_AUTO.md. STILL YOURS, because none of it is extractable: (1) WHICH MEASUREMENTS ARE TRUSTED — a number taken while several suites or agents were running cannot be told from a regression, and this session has taken some under contention; (2) WHICH CLAIMS ARE ALREADY DEAD — do not resurrect 'no database records what was read' (provenance is a 20-year field), 'nobody gives you the reviewer' (lakeFS pre-merge hooks), 'git for data is novel' (Dolt), or 'generational branch arenas are an insight' (it is batching plus a sizing fix); (3) WHETHER THE LAST FEW COMMITS CHANGED CONSTANTS OR SHAPES — if constants, the next pass must fix the structure, not take the next row; (4) any design decided in conversation but not yet in SCALE-DESIGN.md. A handoff that carries only method lets the next session run the machinery perfectly while repeating a claim that was already killed."
 exit 0
