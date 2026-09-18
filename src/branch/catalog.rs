@@ -483,10 +483,24 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(())
     }
 
+    /// **D45.** Read, publish and append **under the write lock**, for the reason `add_arena`
+    /// already states two methods below: this catalog keeps the whole record together, so a
+    /// read-modify-write done *around* the lock writes back every field the caller never named.
+    ///
+    /// The version this replaces was `get` (read lock, released) then `put` (write lock), and a
+    /// `renew_lease` landing in the gap put back the `root_page_id` it had read before this
+    /// publish. Measured, `tests/d45_log_catalog_rmw.rs`: 4000 published roots against 4000
+    /// concurrent renewals left the record at root **3917**, so 83 shadow-paging commit points
+    /// were silently undone and the pages they published became invisible.
+    ///
+    /// It cannot call `self.put` — that takes this same lock and it is not reentrant.
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
-        let mut rec = self.get(branch)?;
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
         rec.root_page_id = root;
-        self.put(&rec)
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
     }
 
     /// Still a walk, and deliberately so. This is the *log* catalog: its records live in a
@@ -634,10 +648,19 @@ impl BranchCatalog for LogBranchCatalog {
         self.append(&[&snapshot])
     }
 
+    /// **D45, and the more serious of the pair.** Same defect, same fix — but the field is the
+    /// keepalive, so losing a write here is not a lost update, it is a **live branch being
+    /// reaped**: the deadline stays at its pre-renewal value and `reap_expired` reclaims a branch
+    /// whose holder believes its lease is running. That is D29's failure reached without
+    /// `collapse` being involved at all — D29 recorded it as a property of the collapse copy, and
+    /// it is equally a property of the renewal itself.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
-        let mut rec = self.get(branch)?;
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
         rec.lease_deadline = lease;
-        self.put(&rec)
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
     }
 
     fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
