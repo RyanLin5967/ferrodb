@@ -431,3 +431,52 @@ its own numbers.
   and the cells that were measured survive. The probe spacing is a parameter for the same reason —
   a sweep too short to see at 50 µs is a fact about the instrument, and the answer is to change the
   instrument and say so, not to quote the blind cell as fast.
+
+## Addendum 4 — re-measured on the merged base, and the number moved
+
+This record's headline was measured against a base 25 commits behind `agent-isolation`, and D27 had
+since replaced `Workspace`'s data fields with a persistent ordered map — the structure
+`forget_reaped_branches` walks. Caught by team-lead with `git merge-base --is-ancestor`, which is
+the check that works: the log *looked* merged, because `5c8583a` reads "Merge commit ... into
+W4-review-followups", but that merged this lane's own sub-branch rather than the base.
+
+**The post-merge pair supersedes every earlier number in this file.** Both arms built from the
+merged base, so all 25 upstream commits are in both and only this lane's change differs. `gone = 64`,
+so phase 3 is reachable — a `gone = 0` fixture measures phase 1 only.
+
+| S | before (med) | after (med) | factor |
+|---|---|---|---|
+| 10 000 | 2.85 ms | 0.152 ms | 18.8× |
+| 100 000 | **96.3 ms** | **0.347 ms** | **278×** |
+
+The distributions do not overlap at either S: at 10⁵ the worst `after` (0.425 ms) is below the best
+`before` (79.3 ms). Controls on the same binary: negative (idle) flat at 450 ns, positive
+(`run_activity`) still 20.9 ms — separating from idle by ~46 000×, so the instrument is not blind.
+
+**Both arms moved, and the pre-merge pair (129.0 ms → 0.68 ms, 189×) is superseded rather than
+corrected.** The `before` arm got *faster* under D27 (129 → 96 ms) and the `after` arm got faster
+too (681 → 347 µs). A number measured against a base that no longer exists is not a number about
+the code being shipped.
+
+### What the merge broke, and what held
+
+Nothing in the index moved, and that was a prediction rather than luck: `txn_refs_of` reads only
+`ws.txn` and `ws.inherited`, neither of which D27 touches, and `State::workspaces` is still a
+`BTreeMap`. The two doors survived — the only raw `workspaces.insert`/`remove` in the file are still
+inside them, so D27's rewritten `begin_session_as` still maintains the index. That was the specific
+hazard and it was checked, not assumed.
+
+What did break was this lane's *tests*: the unit fixture built a `Workspace` by hand with the old
+field types, and D33 added `BranchCatalog::add_arena`, which the test catalog decorator did not
+implement.
+
+**That second one inverts an earlier ruling in this record.** Addendum 2 records a review finding —
+"`w4_sweep_slot_recycle.rs` does not compile, missing `add_arena`" — as WRONG, and it was: no such
+method existed at this lane's base. It was right about the tree the lane was landing on and wrong
+about the tree the lane was on. A false positive and a true positive are the same text here; only
+the base differs, which is the same lesson as the headline.
+
+**And it failed silently.** `w4_sweep_slot_recycle` printed no `test result` line at all, because a
+target that does not compile prints none — so a loop grepping for `^test result` skipped it, and the
+absence read as a pass. Zero collected is not a pass; the blank had to be chased rather than
+scrolled past.
