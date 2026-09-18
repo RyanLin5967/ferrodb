@@ -1,0 +1,14 @@
+S15 phase 3: where the per-statement `BEGIN AGENT SESSION` cost lives, at N branches.
+Single-threaded, 120 reps each, the three layers INTERLEAVED so device drift hits all three.
+Sessions are abandoned as they are taken, so `State::workspaces` stays at ~1 and cannot
+be what is being measured. `syncs` is catalog fsyncs issued across the whole rep block.
+
+        N       raw ms        rt ms      stmt ms    rt-raw ms   stmt-rt ms   syncs/op
+     9984        7.038        7.273        7.250        0.236       -0.023       1.67
+    99968        5.011        5.151        5.306        0.139        0.155       1.67
+  1000000       10.488       10.735       11.760        0.247        1.025       1.67
+
+`rt - raw` is what the RUNTIME adds over the catalog: interning the run, building the
+Workspace, the name and the capture. `stmt - rt` is scanner + parser + binder + dispatch.
+If `raw` carries the whole rise, the per-statement cost is the catalog's and the device's,
+and nothing above the catalog scales with branch count.

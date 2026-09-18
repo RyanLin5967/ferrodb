@@ -1,0 +1,20 @@
+S15 phase 2: N agent sessions opened through the RUNTIME, all held open.
+
+**Which function, exactly.** The bulk loop calls `AgentRuntime::begin_session_as` — the
+body `BEGIN AGENT SESSION` reaches through `run_agent_stmt`, NOT the catalog's `fork`.
+It is called directly rather than through the scanner because the statement path needs
+`&mut Catalog` and so cannot be driven from 64 threads, and a SEQUENTIAL loop is a
+measurement of this device's fsync (~13 ms/fork, so 10^6 would be ~4 hours) rather than
+of the runtime. The `stmt ms` column re-measures the WHOLE statement through the parser
+at each checkpoint, so the gap the shortcut opens is reported rather than assumed.
+
+Every one of these interns a run and installs a Workspace, a name and a capture in
+`AgentRuntime::State`, none of which is dropped while the session is open.
+
+        N   seg sess/sec      stmt ms     RSS MB    B/session   resolve us    forget ms  activity ms
+     9984         2071.5        4.223       46.3         3518          8.9       288.27         6.78
+    99968         3263.0        7.010      285.1         2740         11.9      3401.73       105.53
+  1000000         2816.4       18.322     2682.9         2672          7.2     39330.80      1090.32
+
+B/session is MARGINAL RSS over the whole run divided by N, so it carries the catalog's
+own growth too (266 B/branch, bench/curve_to_1e6.txt). Subtract that for the runtime's share.
