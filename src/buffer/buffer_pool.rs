@@ -111,6 +111,12 @@
 //! a constant-factor win lands harder at 1 thread than at 16. That is the signature of a curve
 //! contention-bound by something else. **BP-Wrapper here is a constant, not a shape.**
 //!
+//! ⛔ **THE SENTENCE ABOVE IS RETRACTED — 2026-09-18, see the 2x2 below.** The measurement it
+//! rests on is sound; the inference is not. That STUB arm deleted `touch` **with the page table
+//! still on the hit path**, so it could not have shown a policy win even if one existed. It is
+//! left standing rather than deleted because the next reader will otherwise re-derive it from the
+//! same real numbers.
+//!
 //! What actually holds the slope was in this file the whole time. The resident hit loop is
 //! `fetch_page` + `unpin_page`, and between them each iteration takes `page_table.read()` twice,
 //! `frames[i].read()` twice, and two atomic RMWs on the pin counter -- **four RwLock read
@@ -119,13 +125,54 @@
 //! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
 //! five, which is why removing it bought 33% and nothing else.
 //!
-//! The candidate that measures as a shape change is therefore **taking the page table off the hit
-//! path** -- resolving `page_id -> frame` through a lock-free direct-mapped mirror in both
-//! `fetch_page` and `unpin_page`, keeping the frame latch and the pin, so it is correct rather
-//! than a ceiling: **x0.936 across the same sweep, the curve rising monotonically from 2 to 16
-//! threads, ~15x against BASE at 16 threads.** Quote the SLOPE and not that multiplier to more
-//! than two significant figures: the medians are over 3 reps with a BASE spread of 18.1M-23.6M at
-//! one thread under loadavg 16-33. What reproduces in every rep is the sign of the slope.
+//! # ⛔ TWO SERIALISED WALLS, AND EVERY EARLIER SINGLE-ARM READING OF THEM WAS WRONG
+//!
+//! A paragraph here once named **taking the page table off the hit path** as "the candidate that
+//! measures as a shape change", on the strength of a gate arm reporting x0.936. **Both that claim
+//! and the BP-Wrapper claim above are retracted, and they fall to the same confound.**
+//! `bench/d35_c1_factorial.txt` (branch `ferrodb-D35-C1-pagetable`, `c0d07d2`) settles it by
+//! running all four cells instead of arguing -- same harness, same parameters, interleaved,
+//! 3 reps, per-rep slopes agreeing to within 0.01. Throughput at 16 threads relative to 1:
+//!
+//! | | `touch` KEPT | `touch` DELETED |
+//! |---|---|---|
+//! | **no mirror** | BASE x0.107 | STUB x0.095 |
+//! | **mirror** | C1 x0.125 | **C1STUB x0.581**, rising monotonically 2T->16T |
+//!
+//! Three cells collapse; only the fourth rises. **`touch` and the page table are two serialising
+//! points IN SERIES**, so removing either alone leaves the other binding. That is why STUB came
+//! out marginally worse than BASE, and why the gate's C1 arm looked like a shape change: it was
+//! built ON TOP OF its STUB arm, so it had BOTH removed and credited one cause with a two-cause
+//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.7M.
+//!
+//! ⭐ **The transferable form, which is worth more than the instance: an arm that removes one of
+//! two SERIALISED walls measures the OTHER wall, not the one it removed. Two "no effect" results
+//! in series are not evidence that neither is a wall.**
+//!
+//! **So neither half is a shape change alone.** A page-table mirror that RETAINS `touch` -- the
+//! only version that can ship -- is x0.125 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
+//! the same order as the constant BP-Wrapper was rejected for being. It is **not** in this tree
+//! for that reason; it is on `ferrodb-D35-C1-pagetable` at `c0d07d2`, certified green, waiting to
+//! be built into the pair.
+//!
+//! **The candidate is the PAIR** -- the page table off the hit path **plus** a batched,
+//! ARC-preserving `touch` -- and it is judged against a **x0.581 ceiling, not against zero**. A
+//! scheme landing at x0.20 has recovered a sixth of the available headroom and is a MICRO wearing
+//! a shape change's clothes. See `SCALE-DESIGN.md` D44 for the pre-registered falsifiers.
+//!
+//! ⛔ **`C1STUB` is a scaffold and can never ship.** Deleting `touch` degrades ARC's recency, and
+//! that is measured, not assumed: `bench/d35_c1_evictiontrace.txt` shows the eviction sequence
+//! changes outright, 7899 -> 7896 evictions in a different order. Reproduce it with
+//! `examples/d35_eviction_trace.rs`, which is in this tree.
+//!
+//! ⚠ **And if the pair cannot clear x0.5, the diagnosis in this comment is wrong** -- the wall is
+//! then the four `RwLock` read acquisitions plus two atomic RMWs per hit named above, and the
+//! answer is a different data structure, not a lock fix.
+//!
+//! Quote the SLOPE, never a multiplier to more than two significant figures: medians are over
+//! 3 reps with a BASE spread of 18.1M-23.6M at one thread under loadavg 16-33, and the two reps of
+//! `s22_bufpool_before_after.txt` disagree 40% on multipliers under fleet load. What reproduces in
+//! every rep is the sign of the slope.
 //!
 //! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
 //! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror sized for a
