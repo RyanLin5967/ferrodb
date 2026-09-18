@@ -1,0 +1,28 @@
+# W4 statement-lock sweep. os=macos window=3s op_period=2ms
+# prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)
+# probe_* = one unrelated statement's lock acquisition, NANOSECONDS
+# stall_mean = mean of the op_n largest probe samples: one acquisition blocks per op,
+#           so this averages the population that waited. THE HEADLINE NUMBER.
+# op_*    = the arm's own operation, wall, NANOSECONDS (sweep wall is dominated by
+#           phase 2, which holds NO lock -- it is not the blocking number)
+       S     arm   probe_n      p50       p999  stall_mean   probe_max    op_n     op_mean      op_max
+# S=10: opened 10 sessions in 0 ms
+      10    idle     44392       41        584         398       29291    1272        1589      112417
+      10   sweep     44448       41        834         523       33250    1273        3997       34833
+      10   activ     44299       41       5375         674       28125    1284        4069       48083
+# S=100: opened 100 sessions in 0 ms
+     100    idle     44584       41        417         286       27334    1277        1658       51583
+     100   sweep     43871       42      20875        2801       84500    1274       18228       99250
+     100   activ     43685       42      33417        4991       99083    1273       25429      117583
+# S=1000: opened 1000 sessions in 0 ms
+    1000    idle     44635       41        459         274       15583    1282        1399       79917
+    1000   sweep     43603       41     125459       53046      307500    1293      138070      411208
+    1000   activ     42239       41     200959      117926      380875    1294      186266      451208
+# S=10000: opened 10000 sessions in 23 ms
+   10000    idle     44129       41        458         293       14208    1275        1900       90333
+   10000   sweep     23220       42    1284625     1005064     1479333    1421     1570279     2865291
+   10000   activ      9762       42    1978208     1601217     2126250    1466     1923248     2479500
+# S=100000: opened 100000 sessions in 2110 ms
+  100000    idle     41908       42        500         356       13750    1258        3297      135542
+  100000   sweep     21460       42   14179375    13850622    15541375     112    26819055    34294333
+  100000   activ      5663       42   25543208    21412263    67265792     123    24578145    44355333
