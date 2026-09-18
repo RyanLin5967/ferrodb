@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
-use crate::branch::record::{CoreRecord, reclaimable, BranchRecord};
+use crate::branch::record::{CoreRecord, BranchRecord};
 use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::page_header::PageType;
@@ -258,7 +258,16 @@ impl Reaper for TwoTierReaper {
         let free_epoch = self.catalog.next_epoch();
         let mut freed = 0u32;
 
-        if rec.is_childless_leaf() {
+        // **D18 — ASK THE CATALOG, NEVER THE RECORD.** This used to read
+        // `rec.is_childless_leaf()`, i.e. `rec.live_children.is_empty()`.
+        //
+        // `BranchRecord::deserialize_core` sets `live_children: Vec::new()` (record.rs) and
+        // `hydrate` never refills it -- it restores arenas and the envelope, and its own comment
+        // calls those "BOTH missing fields", which is wrong by one. So on the SHIPPED
+        // `TableBranchCatalog` the field is ALWAYS empty, the guard was ALWAYS true, and every
+        // reap took the wholesale-free fast path with no sharing analysis at all -- freeing pages
+        // a live child could still read. Reproduced in `tests/d18_fastpath_asks_the_catalog.rs`.
+        if !self.catalog.has_live_children(rec.branch_id.id)? {
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
             // it can see a page born inside its own extents.
             for arena in rec.arenas.iter().copied() {
@@ -338,7 +347,17 @@ impl Reaper for TwoTierReaper {
             let mut moved = false;
             for pf in entries {
                 let pinned = match self.catalog.get_raw(pf.owner.id) {
-                    Ok(rec) => !reclaimable(&rec.live_children, pf.birth_epoch, pf.free_epoch),
+                    // **D18, second site.** This read `rec.live_children` too, and on the table
+                    // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
+                    // TRUE, so `pinned` was always false and EVERY parked page was released. The
+                    // slow path above parks exactly the pages a live child can see, and this
+                    // handed them straight back. Ask the index instead, which is the same
+                    // predicate asked of a structure that can actually answer it.
+                    Ok(_) => self.catalog.live_child_in_epoch_range(
+                        pf.owner.id,
+                        pf.birth_epoch,
+                        pf.free_epoch,
+                    )?,
                     // No record at all: nothing can be forked off it, so nothing can see the page.
                     Err(_) => false,
                 };
@@ -572,7 +591,7 @@ mod tests {
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         let arena = h.store.arena_for(b.branch_id).unwrap();
         write_pages(&h, b.branch_id, 11);
-        assert!(h.catalog.get(b.branch_id).unwrap().is_childless_leaf());
+        assert!(!h.catalog.has_live_children(b.branch_id.id).unwrap());
 
         assert_eq!(reaper.reap(b.branch_id).unwrap(), 11);
         assert_eq!(h.store.arena_owner(arena), None, "the extent went back whole");
@@ -673,7 +692,7 @@ mod tests {
         // Born BEFORE the child forks, so the child can see them and the interval rule parks them.
         write_pages(&h, parent.branch_id, 4);
         let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
-        assert!(!h.catalog.get(parent.branch_id).unwrap().is_childless_leaf());
+        assert!(h.catalog.has_live_children(parent.branch_id.id).unwrap());
 
         reaper.reap(parent.branch_id).unwrap();
         let parked = h.store.pending_len();

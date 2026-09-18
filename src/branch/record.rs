@@ -267,20 +267,21 @@ impl BranchRecord {
         }
     }
 
-    /// A childless leaf takes the reaper's fast path: free its arenas wholesale, no sharing
-    /// analysis at all. This is the overwhelming majority of abandoned agent branches.
-    pub fn is_childless_leaf(&self) -> bool {
-        self.live_children.is_empty()
-    }
+    // `is_childless_leaf()` REMOVED (D18). It read `self.live_children`, which
+    // `deserialize_core` leaves empty and `hydrate` never refills, so on the shipped
+    // `TableBranchCatalog` it answered "childless" for every branch and the reaper freed pages a
+    // live child could still read. The question is now asked of the catalog
+    // (`BranchCatalog::has_live_children`), which is the only thing that can answer it.
+    // Deleted rather than documented: a comment does not stop the next caller.
 
     /// **The reclamation rule.** Page `p` is reclaimable iff no live child of this branch has
     /// `fork_epoch` in `[birth, freed)`.
     ///
     /// Correctness: a child forked at epoch `e` sees pages live at `e`; `p` was live over
     /// `[birth, freed)`; so `p` is visible to that child iff `e` falls in that interval.
-    pub fn page_reclaimable(&self, birth: Epoch, freed: Epoch) -> bool {
-        reclaimable(&self.live_children, birth, freed)
-    }
+    // `page_reclaimable()` REMOVED (D18). Same trap, and it had NO production callers -- it was
+    // a loaded gun left on the table. `BranchCatalog::live_child_in_epoch_range` is the live
+    // version of this question.
 
     /// Ordinary reads/writes reject anything not `Live`, and reject a stale generation outright.
     pub fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
