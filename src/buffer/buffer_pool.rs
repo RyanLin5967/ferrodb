@@ -139,20 +139,32 @@
 //!
 //! The paragraph this replaced predicted the slope would change sign. **It does not.** A C1 that
 //! RETAINS `touch` — the only C1 that can ship — leaves the curve collapsing exactly as before.
-//! `bench/d35_c1_pagetable.txt`, RESIDENT arm, medians over 3 interleaved reps: BASE **x0.107**
-//! at 16 threads relative to 1, C1 **x0.125**. The design entry's own falsifier was "the 16T/1T
-//! ratio does not clear x0.5 on a merge-ready implementation", and x0.125 does not clear it.
-//! What C1 buys is a **constant of roughly 1.2-1.5x**, which is the same order as the constant
-//! the entry rejected BP-Wrapper for being.
+//! `bench/d35_c1_pagetable.txt`, RESIDENT arm, medians over 4 reps: BASE **x0.110** at 16 threads
+//! relative to 1, C1 **x0.123**. The design entry's own falsifier was "the 16T/1T ratio does not
+//! clear x0.5 on a merge-ready implementation", and x0.123 does not clear it. What C1 buys is a
+//! **constant of roughly 1.2-1.5x**, which is the same order as the constant the entry rejected
+//! BP-Wrapper for being.
 //!
-//! **Why the gate saw x0.936 and this sees x0.125**, measured rather than argued —
+//! **Why the gate saw x0.936 and this sees x0.123**, measured rather than argued —
 //! `bench/d35_c1_factorial.txt` runs all four cells of {mirror} x {`touch`}, same harness, same
-//! parameters, interleaved, 3 reps, and the per-rep slopes agree to within 0.01:
+//! parameters, 4 reps, and the per-rep slopes agree to within 0.01:
 //!
 //! | | `touch` KEPT | `touch` DELETED |
 //! |---|---|---|
-//! | **no mirror** | BASE x0.107 | STUB x0.095 |
-//! | **mirror** | C1 x0.125 | C1STUB **x0.581**, rising monotonically 2T->16T |
+//! | **no mirror** | BASE x0.111 | STUB x0.080 |
+//! | **mirror** | C1 x0.121 | C1STUB **x0.579**, rising monotonically 2T->16T |
+//!
+//! ⚠ **Both files ROTATE the arm order, and that is load-bearing rather than tidy.** The first
+//! versions of both ran a FIXED arm order while this shared machine's load drifted monotonically
+//! upward, which leaves a systematic POSITION bias: the arm that always ran last always ran at
+//! the highest load. Interleaving cancels only a bias that is constant in time. Both now rotate
+//! (a Latin square over the four arms; alternation for the two), and both print 1-thread
+//! throughput by position as a check — flat to within 1% in the factorial, against a real 16%
+//! position effect visible in the two-arm run, which is the drift being cancelled rather than
+//! wished away. The superseded runs are kept and banded:
+//! `bench/d35_c1_factorial_SUPERSEDED_rising_load.txt` and
+//! `bench/d35_c1_pagetable_SUPERSEDED_fixed_order.txt`. Their cell ORDERING was the same, so the
+//! conclusion did not move -- but that is a result of the re-run, not a reason to have skipped it.
 //!
 //! **`touch` and the page table are two serialising points IN SERIES.** Removing either one alone
 //! leaves the other binding, which is why STUB alone was marginally WORSE than BASE and why C1
@@ -166,7 +178,7 @@
 //! "a constant".** The entry above rejected it on the STUB measurement, which was taken with the
 //! page table still in the way — a correct reading of a measurement that could not see past the
 //! other wall. That verdict needs re-taking against THIS file, and `bench/d35_c1_factorial.txt`'s
-//! C1STUB row is the upper bound it has to be judged against: x0.581, not x1.
+//! C1STUB row is the upper bound it has to be judged against: x0.579, not x1.
 //!
 //! C1 stays because it is a prerequisite and not because it is the win. Deleting `touch` without
 //! it is *worse* than doing nothing, and `touch` cannot simply be deleted — it degrades ARC's
