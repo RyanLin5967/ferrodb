@@ -1,0 +1,17 @@
+adv_f5_probe                               test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+adv_f6_dropped_capture                     test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+d15_concurrent_fork_and_reap               test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.67s
+d16_transitive_visibility                  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+d18_reaper_asks_the_catalog                test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+d33_add_arena_must_be_durable              test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+d19_leak_is_a_race                         test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 128.25s
+d40_reserved_pages_return_to_baseline      test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 49.55s
+guard_precondition_probe                   test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+integration_cluster_agents                 test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+integration_cow_branch                     test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+integration_cluster_grants                 test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+integration_server_reaps                   test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s
+integration_simulate                       test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+integration_zero_copy_fork                 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+w4_sweep_slot_recycle                      test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+w4_forget_branches                         test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

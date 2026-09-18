@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/d19_leak_is_a_race.rs (target/debug/deps/d19_leak_is_a_race-118ee95556f7c6d4)
+
+running 1 test
+[table-1t] threads=1 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+test the_control_that_says_race_or_logic has been running for over 60 seconds
+[table-8t] threads=8 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+[log-8t] threads=8 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+[table-16t] threads=16 total=2000 reaped=2000 baseline=0 after=0 LEAK=0
+[table-32t] threads=32 total=2016 reaped=2016 baseline=0 after=0 LEAK=0
+TABLE 1t=0 8t=0 16t=0 32t=0  LOG 8t=0
+test the_control_that_says_race_or_logic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 198.16s
+
+real 198.38
+user 17.23
+sys 3.87
+EXIT=0

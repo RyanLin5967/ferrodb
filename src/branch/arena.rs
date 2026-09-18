@@ -474,6 +474,10 @@ impl ArenaPageStore {
     }
 
     /// The branch that owns `arena`, or `None` if the extent has been freed.
+    ///
+    /// **D40.** This is how `reaper::sweep_touched_extents` asks about a handful of named arenas
+    /// instead of walking [`Self::live_arenas`]. `None` is the ordinary answer for an arena the
+    /// reaper's fast path already freed wholesale, not an error.
     pub fn arena_owner(&self, arena: ArenaId) -> Option<BranchId> {
         self.state.lock().unwrap().extents.get(&arena).map(|e| e.owner)
     }
