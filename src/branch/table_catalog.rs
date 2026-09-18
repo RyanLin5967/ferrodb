@@ -1008,6 +1008,36 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(removed)
     }
 
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // **D20.** No read-modify-write at all: `hydrate` DERIVES `arenas` from exactly these
+        // ARENA keys, so owning an arena is one key. The racy shape this replaces was
+        // `get_raw` (unlocked) -> push -> `put` (locked) in `ArenaPageStore::alloc_arena`, where
+        // the unlocked read could traverse a tree another thread was splitting and come back with
+        // the wrong arena list -- which was then written back as truth.
+        //
+        // Under `logical` so it cannot interleave with the multi-key writers (`put`, `fork`,
+        // `attach_child`), all of which also rewrite this span.
+        //
+        // **D33.** The first version of this wrote the key and returned. Every other mutating
+        // method here ends `let seq = self.stage()?; drop(_g); self.durable(seq)`, and skipping it
+        // cost two things, not one. The ARENA key was never fsynced -- and `stage()` is the ONLY
+        // caller of `publish_root()` (:331-333), so an `upsert` that happened to split the tree's
+        // root left the header page naming the OLD root, after which a reopen came back on a
+        // perfectly valid B+tree of an older state. Measured: 0 of 64 arenas survived a reopen.
+        //
+        // The generation check is the same story: `get_mut`-by-id alone let a STALE handle whose
+        // slot had been recycled attach an arena to the slot's new occupant.
+        let _g = self.logical.lock().unwrap();
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it

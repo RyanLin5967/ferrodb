@@ -1,0 +1,49 @@
+D24 -- the D15 concurrency test was green and COULD NOT FIRE. Raw output, 2026-09-17.
+Machine: darwin 25.6.0. cargo test --test d15_concurrent_fork_and_reap -- --nocapture
+
+== ROUND 0: the test as originally drafted (siblings off trunk, reap_expired(u64::MAX/2)) ==
+[log] survivors=360 corrupted=0
+[table] survivors=360 corrupted=0
+test result: ok. 2 passed; 0 failed; finished in 1.77s
+
+  Two defects, either of which alone makes that zero meaningless:
+  (a) reap_expired(u64::MAX / 2) expires EVERY lease, survivors' 600 s ones included. Every
+      branch the test existed to protect was reaped, then skipped by its own `state != Live`
+      guard. It printed survivors=360 (CREATED), never how many it CHECKED.
+  (b) victim and survivor were SIBLINGS off trunk. Arenas are per branch, so a sibling's reap
+      can never free a page this branch reads. The topology could not produce the corruption.
+
+== ROUND 0 FIRE-CHECK: mutant on the D18 guard, reaper.rs:270 ==
+  `if !self.catalog.has_live_children(rec.branch_id.id)?` -> `if true`
+[log] survivors=360 checked=360 corrupted=0
+[table] survivors=360 checked=360 corrupted=0
+test result: ok. 2 passed; 0 failed; finished in 20.18s
+  >> THE MUTANT SURVIVED. A guard whose mutant survives is not a guard.
+
+== ROUND 1: real clock + checked counter, siblings still ==
+  reap_expired(LeaseDeadline::now_millis()); assert checked >= 90% of survivors
+[log] survivors=360 checked=360 corrupted=0     <- now checking a real set, still can't fire
+
+== ROUND 2: victim becomes the survivor's PARENT ==
+  First attempt forked the victim with LeaseDeadline(0) and lost the race with the sweeper:
+    survivor fork: Branch("branch b5@g0 has been reaped (id slot is now at generation 1)")
+    survivor fork: Branch("branch b12@g0 is being reaped")
+    ... 6 writer threads dead, rc=101
+  Fixed by forking the victim with a LONG lease, writing the payload page, forking the child,
+  and only THEN `renew_lease(victim, LeaseDeadline(0))`. The parent must survive long enough to
+  BECOME a parent; expiry is what the test is about, not birth.
+
+== ROUND 2, REAL CODE ==
+[log] survivors=360 checked=360 corrupted=0
+[table] survivors=360 checked=360 corrupted=0
+test result: ok. 2 passed; 0 failed; finished in 22.36s
+
+== ROUND 2 FIRE-CHECK: the same mutant, reaper.rs:270 -> `if true` ==
+[log] survivors=360 checked=360 corrupted=97
+[table] survivors=360 checked=360 corrupted=135
+test result: FAILED. 0 passed; 2 failed; finished in 5.18s
+  >> THE MUTANT DIES. 97/360 and 135/360. Restored; `git diff --stat src/branch/reaper.rs` empty.
+
+VERDICT: the reclamation rule holds under a concurrent sweeper on BOTH catalogs -- and that
+statement is now worth something, because the instrument that produced it has been shown to
+fire. It was worth nothing three rounds ago while printing the same zero.

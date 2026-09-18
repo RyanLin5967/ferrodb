@@ -392,7 +392,7 @@ const _: () = assert!(
 
 /// How deeply a [`GuardExpr`] may nest, on the way in and on the way out.
 ///
-/// **Measured, not chosen.** `scratchpad/guard-depth-measurement.md` records the run: encoding,
+/// **Measured, not chosen.** `bench/evidence/guard-depth-measurement.md` records the run: encoding,
 /// fsyncing and replaying a guard through this store round-trips at depth 512 and **aborts the
 /// process with a stack overflow at 768** in a debug build on a libtest thread. The pre-existing
 /// guard operations abort in the same neighbourhood — `Guard::clone`, `Guard::check`,

@@ -1,0 +1,82 @@
+=== D23 fire-check: break the latch protocol, watch the test fail, restore ===
+HEAD: 40e6fcd (fix(D23): release the parent read latch as soon as the leaf latch is held)
+tree: HEAD + this commit's lock-order guard, live scanner, and tracked-accessor migration
+date: 2026-09-18T03:24:01Z
+cmd:  cargo test --test integration_btree_concurrency -- --test-threads=1
+guard: source checksum a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14 verified identical after the run (see the tail of this file).
+
+=== VERDICT SUMMARY — read this before quoting any line below ===
+
+  BREAK A  leaf write latch released mid read-modify-write  ->  FIRES   (3 of 4 arms)
+  BREAK B  parent read latch released before the window     ->  FIRES   (2 of 4 arms: 16, 32)
+  BREAK C  range scanner walks the chain with no read latch ->  SURVIVES
+
+ONE mutant survives, and it is a deliberate, reported negative — not an oversight.
+
+WHY BREAK C IS KEPT ANYWAY. The scanner's per-leaf page latch is NOT load-bearing today, and
+the signal is not vacuous: the live scanner completes 49-158 full concurrent scans per round
+(214/319/290 at 32 threads in the independent run cited below) with live_scan_misses 0 and
+live_scan_disorder 0. Two properties hold without it:
+  - `frame.data` is assigned wholesale under the frame WRITE lock while readers take the READ
+    lock, so a 4096-byte page read is already atomic; no scanner can see a half-written leaf.
+  - a split writes the NEW leaf before writing the old one, and writing the old one is what
+    publishes `next -> new_page_id`, so the chain never points at an unwritten page.
+The latch is retained as defence in depth against that publish ordering being reversed. It is
+documented as unproven at its definition in src/storage/range_scan.rs. Calling it load-bearing
+would be false, and an earlier version of that doc comment did exactly that; it is retracted.
+
+WHY BREAK B'S RESULT CHANGED. Against the test as it stood at de980e2, BREAK B did NOT fire, and
+the code comment claiming it had been fire-checked was unearned. The full range scan ran AFTER
+join(), so it was single-threaded. Adding a scanner that runs DURING the writes is what made the
+parent latch's failure observable. The guard did not change; the instrument did.
+
+INDEPENDENT CORROBORATION (not my run, not verified by me): D23-btree-latch-2 reports the same
+three verdicts from a separate worktree —
+/Users/idide/wt/ferrodb-S20-firecheck/bench/d23_fire_check_isolated.txt, branch S20-firecheck,
+commit 8d8a0f9. It agrees A fires at 8/16/32, B fires at 16 and 32 but NOT at 8, and C does not
+fire. My own B result (16 and 32) matches. Cited as a second run, not folded into mine.
+
+RE-RUN FROM SCRATCH. An earlier pass of this file measured a tree that a SECOND AGENT was
+concurrently editing - commit 40e6fcd landed on this branch mid-run and changed
+latch_leaf_for_write. Those numbers are discarded rather than quoted; everything below is
+against the tree as it now stands.
+
+--- BASELINE (as it stands) ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.63s
+
+applied BREAK A
+--- BREAK A: fast-path leaf latch released mid read-modify-write (the original defect) ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... FAILED
+threads=16 dirty_rounds=3/3
+threads=32 dirty_rounds=3/3
+threads=8 dirty_rounds=3/3
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.74s
+
+applied BREAK B
+--- BREAK B: parent read latch released BEFORE the leaf is write-latched ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... ok
+threads=16 dirty_rounds=3/3
+threads=32 dirty_rounds=2/3
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.25s
+
+applied BREAK C
+--- BREAK C: range scanner walks the leaf chain with no read latch ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+--- RESTORED ---
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.42s
+source checksum before=a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14 after=a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14  MATCH

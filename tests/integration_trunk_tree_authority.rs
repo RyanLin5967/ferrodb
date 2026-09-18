@@ -127,8 +127,20 @@ fn an_agent_write_lives_on_branch_pages_and_reaches_the_heap_only_on_merge() {
     d.sql("INSERT INTO inv VALUES (2, 20);");
 
     let branch = d.session.agent.as_ref().expect("no agent session").branch;
-    let on_branch = d.runtime.scan_rows(branch, "inv").expect("scan the branch");
-    let on_trunk = d.runtime.scan_rows(BranchId::TRUNK, "inv").expect("scan trunk");
+    // `scan_rows` streams, so this test says out loud that it wants the whole table. The
+    // assertions below are unchanged: they are still about a `Vec` of rows.
+    let on_branch: Vec<_> = d
+        .runtime
+        .scan_rows(branch, "inv")
+        .expect("scan the branch")
+        .collect::<Result<_, _>>()
+        .expect("scan the branch");
+    let on_trunk: Vec<_> = d
+        .runtime
+        .scan_rows(BranchId::TRUNK, "inv")
+        .expect("scan trunk")
+        .collect::<Result<_, _>>()
+        .expect("scan trunk");
 
     // The write is on a page, in the branch's tree. This is the whole claim: not "the row is
     // hidden", which a hashmap does too, but "the row is on a shadowed page".
@@ -164,7 +176,12 @@ fn trunk_rows_live_in_the_heap_not_in_trunks_page_tree() {
     let rows = d.query("SELECT * FROM inv;");
     assert_eq!(rows.len(), 2, "fixture: the heap did not take the rows: {rows:?}");
     assert!(
-        d.runtime.scan_rows(BranchId::TRUNK, "inv").expect("scan trunk").is_empty(),
+        d.runtime
+            .scan_rows(BranchId::TRUNK, "inv")
+            .expect("scan trunk")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scan trunk")
+            .is_empty(),
         "trunk's page tree holds rows. That is a change of design: trunk is heap-backed and the \
          copy-on-write tree carries branch writes, which is what lets a fork be O(1)."
     );

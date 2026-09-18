@@ -108,9 +108,11 @@ use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
 use crate::wal::log::WalManager;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
+use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
@@ -162,6 +164,25 @@ pub struct BufferPoolManager {
     /// Where the next free-frame scan starts. A hint, never trusted: the scan re-checks every frame
     /// under its own write lock, so a stale hint costs a step and cannot hand out a taken frame.
     free_hint: AtomicUsize,
+
+    /// **Page latches, and they are ABOVE this struct's own locks in the order.**
+    ///
+    /// They live here rather than on `BPlusTreeManager` because a manager is opened per statement
+    /// — `planner::plan::open_table` builds a fresh one on every INSERT — so latch state held by a
+    /// manager would be private to one statement and exclude nothing. The buffer pool is the only
+    /// thing two concurrent users of the same tree share.
+    ///
+    /// **Nothing in this file may take one.** The order is
+    /// `page_latch -> in_transit -> arc_cache -> page_table -> frame`, and taking a page latch from
+    /// underneath any of those would invert it. See `src/storage/page_latch.rs`.
+    ///
+    /// D23 gave the reason as "`fetch_page` holds `arc_cache` across frame locks", and S22 made
+    /// that false — the cache is now consulted and released, and nothing pool-wide is held across
+    /// the read syscall. The ORDER survived the change; that particular justification for it did
+    /// not, and `page_latch.rs` says so itself: the contract this layer needs is only that the pool
+    /// never reaches UP for a page latch. Crabbing calls downward, and a downward call cannot close
+    /// a cycle unless the callee calls back up.
+    pub page_latches: PageLatches,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
@@ -175,6 +196,36 @@ const MAX_BUFFER_POOL_PAGES: usize = 1024;
 /// that returns an error naming the invariant it could not satisfy.
 const FETCH_ATTEMPTS: usize = 128;
 
+/// A frame lock guard that also records, for its whole lifetime, that this thread is holding a
+/// buffer-pool lock.
+///
+/// This exists so the lock-order assertion in `src/storage/page_latch.rs` can SEE a frame lock.
+/// `self.frames[i].read()` is invisible to it; `self.frame_read(i)` is not. The two modules that
+/// take page latches — `src/storage/index.rs` and `src/storage/range_scan.rs` — must go through
+/// here, because they are the only ones that can produce the `frame -> page latch` inversion.
+/// Everywhere else may keep indexing `frames` directly: those modules take no page latch, and
+/// `tests/lock_order_allowlist.rs` fails if that ever stops being true.
+///
+/// Derefs to `Frame`, so it is a drop-in for the guard it wraps.
+pub struct FrameGuard<G> {
+    // Declared first so the frame lock is released BEFORE the pool section closes.
+    guard: G,
+    _pool: PoolSection,
+}
+
+impl<G: Deref<Target = Frame>> Deref for FrameGuard<G> {
+    type Target = Frame;
+    fn deref(&self) -> &Frame {
+        &self.guard
+    }
+}
+
+impl<G: DerefMut<Target = Frame>> DerefMut for FrameGuard<G> {
+    fn deref_mut(&mut self) -> &mut Frame {
+        &mut self.guard
+    }
+}
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
@@ -187,7 +238,20 @@ impl BufferPoolManager {
             in_transit: Mutex::new(HashSet::new()),
             transit_done: Condvar::new(),
             free_hint: AtomicUsize::new(0),
+            page_latches: PageLatches::new(),
         }
+    }
+
+    /// Read-lock a frame, tracked for lock ordering. See [`FrameGuard`].
+    pub fn frame_read(&self, frame_i: usize) -> FrameGuard<RwLockReadGuard<'_, Frame>> {
+        let _pool = enter_pool();
+        FrameGuard { guard: self.frames[frame_i].read().unwrap(), _pool }
+    }
+
+    /// Write-lock a frame, tracked for lock ordering. See [`FrameGuard`].
+    pub fn frame_write(&self, frame_i: usize) -> FrameGuard<RwLockWriteGuard<'_, Frame>> {
+        let _pool = enter_pool();
+        FrameGuard { guard: self.frames[frame_i].write().unwrap(), _pool }
     }
 
     /// Return the frame holding `page_id`, faulting it in if it is not resident, and pin it.
@@ -197,6 +261,10 @@ impl BufferPoolManager {
     /// right to fault this one page in, do the IO holding nothing, and publish. A thread whose page
     /// someone else is already reading waits on that page rather than on the pool.
     pub fn fetch_page(&self, page_id: u32) -> Result<usize, FerroError>{
+        // Lock-order: this method takes the pool's locks, so page latches are forbidden from
+        // here down. The thread-local depth counter is re-entrant, so the nested `enter_pool` in
+        // `new_page -> fetch_page` is fine. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         for _attempt in 0..FETCH_ATTEMPTS {
             // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
             if let Some(frame_i) = self.try_pin_resident(page_id) {
@@ -204,6 +272,7 @@ impl BufferPoolManager {
                 // evict next, and holding it here is what used to serialise even pure cache hits.
                 self.arc_cache.lock().unwrap().touch(page_id);
                 return Ok(frame_i);
+
             }
 
             // ---- 2. Claim the right to fault it in, or wait for whoever already holds it. ----
@@ -260,6 +329,12 @@ impl BufferPoolManager {
     /// frame's write lock to relabel it. One of the two wins; the loser sees a label it did not
     /// expect and retries.
     fn try_pin_resident(&self, page_id: u32) -> Option<usize> {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
         let frame = self.frames[frame_i].read().unwrap();
         if frame.page_id != Some(page_id) {
@@ -276,6 +351,12 @@ impl BufferPoolManager {
     /// safe answer**. This used to index the table with `[]` and panic the process on exactly that
     /// case; under the old pool-wide lock it was unreachable, and without one it is ordinary.
     fn is_pinned(&self, page_id: u32) -> bool {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let Some(frame_i) = self.page_table.read().unwrap().get(&page_id).copied() else {
             return true;
         };
@@ -288,6 +369,12 @@ impl BufferPoolManager {
     /// and the caller should re-decide — never an error, because a stale verdict is the expected
     /// cost of not holding the cache lock across the IO.
     fn fault_in(&self, page_id: u32) -> Result<Option<usize>, FerroError> {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // The verdict. `arc_cache` is held for this and dropped before any syscall.
         let verdict = {
             let mut cache = self.arc_cache.lock().unwrap();
@@ -376,6 +463,12 @@ impl BufferPoolManager {
     /// both take it — the original bug here probed under a read lock and re-acquired a write lock,
     /// and both threads wrote a different page into the same frame.
     fn claim_free_frame(&self, incoming: u32) -> Option<usize> {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let n = self.frames.len();
         let start = self.free_hint.load(Ordering::Relaxed) % n;
         for step in 0..n {
@@ -397,6 +490,12 @@ impl BufferPoolManager {
     /// `page_id = None` is what makes a frame free, and the data is zeroed so a free frame never
     /// holds a readable copy of a page nothing points at.
     fn release_frame(&self, frame_i: usize) {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let mut frame = self.frames[frame_i].write().unwrap();
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
@@ -425,6 +524,12 @@ impl BufferPoolManager {
     /// concurrent `fetch_page(victim)` would miss, read the stale copy from disk, and the dirty
     /// bytes still sitting in this frame would go to disk afterwards or not at all.
     fn evict_into(&self, victim: u32, incoming: u32) -> Result<Evicted, FerroError> {
+        // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
+        // only from `fetch_page`, which already opens a section -- the marker is here anyway
+        // because the depth counter is re-entrant, so it costs nothing, and because a guard that
+        // depends on the CALLER having opened it stops holding the moment someone adds a caller.
+        // See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // A candidate, not an answer: the frame latch below decides whether it is still true.
         let Some(frame_i) = self.page_table.read().unwrap().get(&victim).copied() else {
             // `delete_page` or `free_page` removed the victim between the verdict and here.
@@ -472,6 +577,9 @@ impl BufferPoolManager {
 
     // decrement pin count, if page was modified, add dirty flag
     pub fn unpin_page(&self, page_id: u32, is_dirty: bool) {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let pt = self.page_table.read().unwrap();
         let frame_i = pt[&page_id];
         drop(pt);
@@ -487,6 +595,9 @@ impl BufferPoolManager {
 
     // allocate new page on disk using disk manager, load into a frame, return page id
     pub fn new_page(&self) -> Result<u32, FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let page_id = self.disk_manager.allocate()?;
         self.disk_manager.write(page_id, &[0u8; PAGE_SIZE])?;
         self.fetch_page(page_id)?;
@@ -496,6 +607,9 @@ impl BufferPoolManager {
 
     // writes a dirty page to disk
     pub fn flush_page(&self, page_id: u32) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // The read lock is held across the frame access on purpose. Reassigning a frame requires
         // the WRITE lock, so holding this one makes "which frame holds this page" stable for the
         // duration of the flush. Dropping it first left a window in which the frame could be
@@ -524,6 +638,9 @@ impl BufferPoolManager {
 
     // write all dirty pages to disk
     pub fn flush_all(&self) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let pt = self.page_table.read().unwrap();
 
         // **Ascending page id, not HashMap order, and the sort is load-bearing.**
@@ -561,6 +678,9 @@ impl BufferPoolManager {
 
     // remove from buffer pool, deallocate on disk
     pub fn delete_page(&self, page_id: u32) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let mut pt = self.page_table.write().unwrap();
         
         let frame_i = match pt.get(&page_id){
@@ -596,6 +716,9 @@ impl BufferPoolManager {
     }
 
     pub fn free_page(&self, page_id: u32) -> Result<(), FerroError> {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let mut pt = self.page_table.write().unwrap();
         let resident = match pt.get(&page_id) {
             Some(&frame_i) => {
@@ -638,6 +761,9 @@ impl BufferPoolManager {
     /// another database's bytes with no error anywhere. The caller's answer to a refusal is to
     /// stop its readers, not to retry.
     pub fn invalidate_all(&self) -> Result<(), FerroError> {
+        // Lock-order: this method takes the pool's locks, so page latches are forbidden from
+        // here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // **`arc_cache` BEFORE `page_table`,** which is the module's order: `in_transit ->
         // arc_cache -> page_table -> frame`. Taking them the other way round here — which the
         // first version of this function did — is a lock inversion against the one path every read

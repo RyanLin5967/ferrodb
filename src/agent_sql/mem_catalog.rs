@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use crate::branch::record::CoreRecord;
 use crate::branch::record::BranchRecord;
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -239,6 +239,20 @@ impl BranchCatalog for MemBranchCatalog {
         let mut records = self.records.lock().unwrap();
         let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };
         Ok(prec.remove_live_child(fork_epoch))
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // **D33.** `get_mut`-by-id ignored `branch.generation` and returned Ok for a branch that
+        // does not exist, so a stale handle attached its arena to the slot's new occupant and a
+        // missing id dropped it silently -- with `alloc_arena` reporting success either way.
+        // Every other method in this impl goes through `lookup`, which checks both.
+        let mut records = self.records.lock().unwrap();
+        Self::lookup(&records, branch)?;
+        let rec = records.get_mut(&branch.id).expect("lookup just proved it is there");
+        if !rec.arenas.contains(&arena) {
+            rec.arenas.push(arena);
+        }
+        Ok(())
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

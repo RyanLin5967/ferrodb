@@ -1,0 +1,8 @@
+# S23 cow range-scan memory, BEFORE any change
+# instrument: tracking global allocator (peak live bytes between resets)
+# row = (Integer, Varchar(16)); key = 12 bytes; buffer pool = 1024 frames (4 MiB)
+
+     rows   scan_heap_B    scan_MiB  table_heap_B   table_MiB     first10_B  first10_MiB       B/row    rss_MiB
+    10000       1166824        1.11       1906482        1.82       1166824        1.11       116.7        8.3
+   100000      10178492        9.71      17491506       16.68      10092164        9.62       101.8       33.4
+  1000000      88453224       84.36     162331698      154.81      88332564       84.24        88.5      216.3
