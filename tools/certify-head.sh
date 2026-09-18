@@ -30,6 +30,18 @@ WANT=${2:-HEAD}
 command -v git >/dev/null || die "no \`git\` on PATH; cannot resolve any commit."
 git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository."
 
+# A run that classified its own wall-clock expiry as INCONCLUSIVE (D42) is not a verdict in either
+# direction, so it cannot certify a head. verify-suite.sh writes this file INSTEAD of SUMMARY.txt
+# and clears any stale copy at the start of every run, so its presence always describes the most
+# recent run into this directory. Checked before the summary hunt because a directory holding both
+# files is the ambiguous case, and the conservative reading of it is the only safe one.
+if [ -f "$DIR/INCONCLUSIVE.txt" ]; then
+    die "'$DIR' holds INCONCLUSIVE.txt — the suite there was starved, not green.
+$(sed 's/^/  /' "$DIR/INCONCLUSIVE.txt" | head -12)
+  Re-run the suite on a quieter machine. A starved run is not evidence in either direction, and
+  certifying one would launder the machine's load into a claim about the code."
+fi
+
 # --- find the persisted verdict -------------------------------------------------------------
 # Accept either SUMMARY.txt (written by verify-suite.sh) or RUNNER.txt (written by a wrapper that
 # captured its stdout). Collect every line carrying a head= field, from every candidate file.

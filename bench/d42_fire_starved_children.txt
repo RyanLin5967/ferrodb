@@ -1,0 +1,61 @@
+D42 falsifier 1 (decisive arm) — starve the NODES, leave the test thread scheduled
+  when          : 2026-09-18T15:45:45Z
+  head          : 2ba1ff7, 3 dirty file(s)
+  tree          : /Users/idide/wt/ferrodb-ferrodb-D42-inconclusive
+  method        : SIGSTOP every node for 60s once all three have said READY
+  budget        : ELECTION_BUDGET is 45s, so the hold outlasts one full budget
+  predicted     : child CPU ~0 per node-wall-s — a stopped process consumes none. The
+                  threshold 0.00043 is itself 10% of the measured running rate 0.0043.
+  loadavg       : 36.69 55.73 208.03
+
+---------------- cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (383226021) panicked at tests/integration_consensus_failover.rs:600:31:
+FERRODB-VERDICT: INCONCLUSIVE — waiting for a first leader ran out of budget, but this run did not get the machine, so the expiry is not evidence about the cluster.
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.51s of the 45s budget
+    self-schedule : 1887 of 2251 nominal 10ms polls = 0.8384  (starved below 0.085)  HEALTHY
+    max stall     : 76ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.00 cpu-s over 22.51s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+    verdict       : INCONCLUSIVE — the node child processes were starved, so this expiry says nothing about
+                    the cluster. Re-run it on a quieter machine; do NOT record this as a failure.
+transcript:
+
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.38s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+
+keeper log (anti-vacuity: this run means nothing if nothing was actually stopped):
+   15:45:45 saw 3 node(s): 86957,87044,87045; waiting for all three to LISTEN
+   15:45:45 3 of 3 listening after 50ms — READY has been published
+   15:45:45 STOPPED 3 pid(s): 86957 87044 87045 
+
+ok: the starved-children run earned INCONCLUSIVE — the classifier fired
+ok: self-scheduling read HEALTHY — signal C fired ALONE, covering B's known blind spot
+       window        : the last 22.51s of the 45s budget
+       self-schedule : 1887 of 2251 nominal 10ms polls = 0.8384  (starved below 0.085)  HEALTHY
+       max stall     : 76ms between consecutive polls  (informational; not a verdict input)
+       child CPU     : 0.00 cpu-s over 22.51s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+       verdict       : INCONCLUSIVE — the node child processes were starved, so this expiry says nothing about
+
+FALSIFIER 1 PASSED
+EXIT=0

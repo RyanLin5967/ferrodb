@@ -1,0 +1,100 @@
+injected: a second node is killed, so no quorum can form
+D42 falsifier 2 — a genuinely broken cluster must earn FAILED, not INCONCLUSIVE
+  when          : 2026-09-18T15:43:18Z
+  tree          : /Users/idide/wt/ferrodb-D42-firecheck-throwaway
+  head          : 2ba1ff7 + the injection above (uncommitted, deliberate)
+  loadavg before: 42.09 64.10 238.60
+
+---------------- cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+D42-FALSIFIER-2: killed n2 as well; 1 of 3 alive, quorum unreachable
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (382961574) panicked at tests/integration_consensus_failover.rs:634:13:
+timed out after 45s waiting for a new leader after the kill.
+transcript:
+  n1: ROLE PreCandidate 0
+  n1: ROLE Candidate 1
+  n3: ROLE Follower 1
+  n1: ROLE Leader 1
+  n2: ROLE Follower 1
+  n1: APPLIED 1 2
+  n1: APPLIED 2 3
+  n1: APPLIED 3 4
+  n1: APPLIED 4 5
+  n1: APPLIED 5 6
+  n1: APPLIED 6 7
+  n1: APPLIED 7 8
+  n2: APPLIED 1 2
+  n1: APPLIED 8 9
+  n1: APPLIED 9 10
+  n1: APPLIED 10 11
+  n1: APPLIED 11 12
+  n1: APPLIED 12 13
+  n1: APPLIED 13 14
+  n1: APPLIED 14 15
+  n1: APPLIED 15 16
+  n1: APPLIED 16 17
+  n1: APPLIED 17 18
+  n1: APPLIED 18 19
+  n1: APPLIED 19 20
+  n1: APPLIED 20 21
+  n1: APPLIED 21 22
+  n1: APPLIED 22 23
+  n2: APPLIED 2 3
+  n3: APPLIED 1 2
+  n3: APPLIED 2 3
+  n3: APPLIED 3 4
+  n3: APPLIED 4 5
+  n3: APPLIED 5 6
+  n3: APPLIED 6 7
+  n3: APPLIED 7 8
+  n3: APPLIED 8 9
+  n3: APPLIED 9 10
+  n3: APPLIED 10 11
+  n3: APPLIED 11 12
+  n3: APPLIED 12 13
+  n3: APPLIED 13 14
+  n3: APPLIED 14 15
+  n3: APPLIED 15 16
+  n3: APPLIED 16 17
+  n3: APPLIED 17 18
+  n3: ROLE PreCandidate 1
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.50s of the 45s budget
+    self-schedule : 1882 of 2250 nominal 10ms polls = 0.8364  (starved below 0.085)  HEALTHY
+    max stall     : 29ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.17 cpu-s over 22.50s across 1 live node(s) = 0.00755 per node-wall-s  (starved below 0.00043)  HEALTHY
+    verdict       : FAILED — both signals say this process and its nodes got the machine,
+                    so the expiry belongs to the cluster, not the scheduler.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 47.54s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+  loadavg after : 55.27 64.20 228.68
+
+ok: the broken cluster produced the ORIGINAL timeout panic, unchanged
+ok: the classifier explicitly recorded FAILED
+       window        : the last 22.50s of the 45s budget
+       self-schedule : 1882 of 2250 nominal 10ms polls = 0.8364  (starved below 0.085)  HEALTHY
+       max stall     : 29ms between consecutive polls  (informational; not a verdict input)
+       child CPU     : 0.17 cpu-s over 22.50s across 1 live node(s) = 0.00755 per node-wall-s  (starved below 0.00043)  HEALTHY
+
+FALSIFIER 2 PASSED — a broken cluster still reports FAILED, at 45s, as it did before D42.
+EXIT=0

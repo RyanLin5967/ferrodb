@@ -1,0 +1,255 @@
+########## D42 — every arm, one lock, one machine state ##########
+  when    : 2026-09-18T15:58:53Z
+  head    : 7e48a39  bench(D42): force the last two detectors to fire — the channel, and CLASSIFIER-BROKEN
+  dirty   : 1 file(s)
+  loadavg : 26.84 26.08 96.81
+  lock    : held for the whole batch
+
+
+################ ARM: 1. happy path x3 (must pass, must print nothing new) ################
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.73s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.92s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.99s
+ARM OK: 1. happy path x3 (must pass, must print nothing new)
+
+################ ARM: 2. falsifier 1 — starve the nodes (must be INCONCLUSIVE) ################
+note: running under an outer suite-lock holder (D42_NOLOCK=1)
+D42 falsifier 1 (decisive arm) — starve the NODES, leave the test thread scheduled
+  when          : 2026-09-18T15:59:23Z
+  head          : 7e48a39, 1 dirty file(s)
+  tree          : /Users/idide/wt/ferrodb-ferrodb-D42-inconclusive
+  method        : SIGSTOP every node for 60s once all three have said READY
+  budget        : ELECTION_BUDGET is 45s, so the hold outlasts one full budget
+  predicted     : child CPU ~0 per node-wall-s — a stopped process consumes none. The
+                  threshold 0.00043 is itself 10% of the measured running rate 0.0043.
+  loadavg       : 29.27 26.72 94.59
+
+---------------- cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (384052651) panicked at tests/integration_consensus_failover.rs:614:31:
+FERRODB-VERDICT: INCONCLUSIVE — waiting for a first leader ran out of budget, but this run did not get the machine, so the expiry is not evidence about the cluster.
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.51s of the 45s budget
+    self-schedule : 1864 of 2251 nominal 10ms polls = 0.8281  (starved below 0.085)  HEALTHY
+    max stall     : 83ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.00 cpu-s over 22.51s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+    verdict       : INCONCLUSIVE — the node child processes were starved, so this expiry says nothing about
+                    the cluster. Re-run it on a quieter machine; do NOT record this as a failure.
+transcript:
+
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.34s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+
+keeper log (anti-vacuity: this run means nothing if nothing was actually stopped):
+   15:59:23 saw 3 node(s): 686,796,798; waiting for all three to LISTEN
+   15:59:23 3 of 3 listening after 50ms — READY has been published
+   15:59:24 STOPPED 3 pid(s): 686 796 798 
+
+ok: the starved-children run earned INCONCLUSIVE — the classifier fired
+ok: self-scheduling read HEALTHY — signal C fired ALONE, covering B's known blind spot
+       window        : the last 22.51s of the 45s budget
+       self-schedule : 1864 of 2251 nominal 10ms polls = 0.8281  (starved below 0.085)  HEALTHY
+       max stall     : 83ms between consecutive polls  (informational; not a verdict input)
+       child CPU     : 0.00 cpu-s over 22.51s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+       verdict       : INCONCLUSIVE — the node child processes were starved, so this expiry says nothing about
+
+FALSIFIER 1 PASSED
+ARM OK: 2. falsifier 1 — starve the nodes (must be INCONCLUSIVE)
+
+################ ARM: 3. falsifier 1 BREAK_PS (must be CLASSIFIER-BROKEN) ################
+note: running under an outer suite-lock holder (D42_NOLOCK=1)
+D42 falsifier 1 (decisive arm) — starve the NODES, leave the test thread scheduled
+  when          : 2026-09-18T16:00:09Z
+  head          : 7e48a39, 1 dirty file(s)
+  tree          : /Users/idide/wt/ferrodb-ferrodb-D42-inconclusive
+  method        : SIGSTOP every node for 60s once all three have said READY
+  BREAK_PS      : a deliberately failing `ps` is first on PATH; the REQUIRED outcome\n                  is CLASSIFIER-BROKEN, i.e. a refusal, not a verdict
+  budget        : ELECTION_BUDGET is 45s, so the hold outlasts one full budget
+  predicted     : child CPU ~0 per node-wall-s — a stopped process consumes none. The
+                  threshold 0.00043 is itself 10% of the measured running rate 0.0043.
+  loadavg       : 29.56 27.02 91.19
+
+---------------- cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (384107509) panicked at tests/integration_consensus_failover.rs:619:35:
+FERRODB-VERDICT: CLASSIFIER-BROKEN — waiting for a first leader ran out of budget and the load classifier could not measure whether that was starvation. A run it cannot classify is not a pass and not a failure.
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.50s of the 45s budget
+    self-schedule : 1862 of 2250 nominal 10ms polls = 0.8276  (starved below 0.085)  HEALTHY
+    max stall     : 195ms between consecutive polls  (informational; not a verdict input)
+
+    verdict       : CLASSIFIER-BROKEN — `ps -o pid=,time= -p 18569,18714,18715` reported none of the 3 node process(es) (exit Some(1)). The instrument failed here, not the cluster, so this run is not a verdict in either direction.
+transcript:
+
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.30s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+
+keeper log (anti-vacuity: this run means nothing if nothing was actually stopped):
+   16:00:09 saw 3 node(s): 18569,18714,18715; waiting for all three to LISTEN
+   16:00:09 3 of 3 listening after 50ms — READY has been published
+   16:00:09 STOPPED 3 pid(s): 18569 18714 18715 
+
+ok: a broken `ps` earned CLASSIFIER-BROKEN — the third state fires
+       window        : the last 22.50s of the 45s budget
+       self-schedule : 1862 of 2250 nominal 10ms polls = 0.8276  (starved below 0.085)  HEALTHY
+       max stall     : 195ms between consecutive polls  (informational; not a verdict input)
+       verdict       : CLASSIFIER-BROKEN — `ps -o pid=,time= -p 18569,18714,18715` reported none of the 3 node process(es) (exit Some(1)). The instrument failed here, not the cluster, so this run is not a verdict in either direction.
+
+FALSIFIER 1 PASSED
+ARM OK: 3. falsifier 1 BREAK_PS (must be CLASSIFIER-BROKEN)
+
+################ ARM: 4. falsifier 2 — broken cluster (must be FAILED) ################
+injected: a second node is killed, so no quorum can form
+note: running under an outer suite-lock holder (D42_NOLOCK=1)
+D42 falsifier 2 — a genuinely broken cluster must earn FAILED, not INCONCLUSIVE
+  when          : 2026-09-18T16:01:14Z
+  tree          : /Users/idide/wt/ferrodb-D42-broken-throwaway2
+  head          : 7e48a39 + the injection above (uncommitted, deliberate)
+  loadavg before: 31.97 27.85 86.76
+
+---------------- cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+D42-FALSIFIER-2: killed n2 as well; 1 of 3 alive, quorum unreachable
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (384168182) panicked at tests/integration_consensus_failover.rs:648:13:
+timed out after 45s waiting for a new leader after the kill.
+transcript:
+  n1: ROLE PreCandidate 0
+  n1: ROLE Candidate 1
+  n2: ROLE Follower 1
+  n1: ROLE Leader 1
+  n3: ROLE Follower 1
+  n1: APPLIED 1 2
+  n1: APPLIED 2 3
+  n1: APPLIED 3 4
+  n1: APPLIED 4 5
+  n1: APPLIED 5 6
+  n1: APPLIED 6 7
+  n1: APPLIED 7 8
+  n1: APPLIED 8 9
+  n1: APPLIED 9 10
+  n1: APPLIED 10 11
+  n1: APPLIED 11 12
+  n1: APPLIED 12 13
+  n2: APPLIED 1 2
+  n3: APPLIED 1 2
+  n3: APPLIED 2 3
+  n3: APPLIED 3 4
+  n3: APPLIED 4 5
+  n3: APPLIED 5 6
+  n3: APPLIED 6 7
+  n3: APPLIED 7 8
+  n3: APPLIED 8 9
+  n3: APPLIED 9 10
+  n3: APPLIED 10 11
+  n3: APPLIED 11 12
+  n3: APPLIED 12 13
+  n3: ROLE PreCandidate 1
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.50s of the 45s budget
+    self-schedule : 1880 of 2250 nominal 10ms polls = 0.8355  (starved below 0.085)  HEALTHY
+    max stall     : 25ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.22 cpu-s over 22.50s across 1 live node(s) = 0.00978 per node-wall-s  (starved below 0.00043)  HEALTHY
+    verdict       : FAILED — both signals say this process and its nodes got the machine,
+                    so the expiry belongs to the cluster, not the scheduler.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.54s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+  loadavg after : 35.33 29.48 84.00
+
+ok: the broken cluster produced the ORIGINAL timeout panic, unchanged
+ok: the classifier recorded a TWO-SIGNAL FAILED
+       window        : the last 22.50s of the 45s budget
+       self-schedule : 1880 of 2250 nominal 10ms polls = 0.8355  (starved below 0.085)  HEALTHY
+       max stall     : 25ms between consecutive polls  (informational; not a verdict input)
+       child CPU     : 0.22 cpu-s over 22.50s across 1 live node(s) = 0.00978 per node-wall-s  (starved below 0.00043)  HEALTHY
+
+FALSIFIER 2 PASSED — a broken cluster still reports FAILED, at 45s, as it did before D42.
+ARM OK: 4. falsifier 2 — broken cluster (must be FAILED)
+
+################ ARM: 5. verify-suite selftest (marker drift + landing guard) ################
+== part 1: the old trap shape (anti-vacuity) ==
+ok:   old shape resumed past the signal (bug reproduced)
+ok:   old shape deleted the lock and carried on (bug reproduced)
+ok:   old shape still running after SIGTERM (bug reproduced)
+
+== part 2: tools/verify-suite.sh under SIGTERM ==
+ok:   verifier holds its lock (86601 selftest-term 2026-09-18T16:02:09Z)
+ok:   children in flight before the signal: 87337 87338 87339 87341 87344 87345 87352 87354 87355 87358 87359 87361 87362 87363 87365 87368 87369 87372 86966 86961 
+exit status 143, 1s after the signal
+ok:   exited 143 (aborted-by-signal refusal)
+ok:   printed a refusal: selftest-term: REFUSING — aborted by SIGTERM after 3s. A suite cut short is not a count.
+ok:   printed no total
+ok:   suite lock released
+ok:   no descendant survived the abort
+
+== part 3: the D42 INCONCLUSIVE channel ==
+ok:   marker 'FERRODB-VERDICT: INCONCLUSIVE' present in both verify-suite.sh and tests/integration_consensus_failover.rs
+ok:   marker 'FERRODB-VERDICT: CLASSIFIER-BROKEN' present in both verify-suite.sh and tests/integration_consensus_failover.rs
+ok:   certify-head accepts an honest green directory (anti-vacuity for the check below)
+ok:   certify-head refuses a directory holding INCONCLUSIVE.txt
+
+SELFTEST PASSED — all three parts behaved as documented
+ARM OK: 5. verify-suite selftest (marker drift + landing guard)
+
+########## RESULT ##########
+ALL D42 ARMS PASSED at 7e48a39
+EXIT=0

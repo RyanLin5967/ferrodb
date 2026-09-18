@@ -1,0 +1,48 @@
+queued behind a running suite (2531 D44-batchsize 2026-09-18T13:37:53Z)
+D42 load sweep — which shape moves the signals below their thresholds?
+  when   : 2026-09-18T13:55:12Z
+  head   : ddbc601
+  cpus   : 18
+  window : 45s per shape
+  thresholds: self-schedule < 0.085 STARVED, child CPU < 0.00043 STARVED
+
+================ shape: baseline (cpu=0 io=0 nice=0) ================
+  loadavg during: 720.58 534.81 345.97
+  leader elected  : n3 after 0.74s
+  iterations      : 2761 of 4500 nominal = 0.6136
+  max stall       : 160.7ms between consecutive polls
+  TOTAL           : 0.570 cpu-s over 50.98s wall across 3 nodes
+  FLOOR           : 0.0037 cpu-s per node-wall-s
+
+================ shape: cpu-14x (cpu=252 io=0 nice=0) ================
+  loadavg during: 1.90 810.83 472.44
+  leader elected  : n2 after 2.33s
+  iterations      : 2643 of 4500 nominal = 0.5873
+  max stall       : 131.0ms between consecutive polls
+  TOTAL           : 0.560 cpu-s over 48.55s wall across 3 nodes
+  FLOOR           : 0.0038 cpu-s per node-wall-s
+
+================ shape: cpu-14x + io-64 (cpu=252 io=64 nice=0) ================
+  loadavg during: 967.41 115.45 615.47
+  leader elected  : n2 after 5.01s
+  iterations      : 2473 of 4500 nominal = 0.5496
+  max stall       : 130.9ms between consecutive polls
+  TOTAL           : 0.490 cpu-s over 53.54s wall across 3 nodes
+  FLOOR           : 0.0031 cpu-s per node-wall-s
+
+================ shape: nice20 + cpu-14x (cpu=252 io=0 nice=20) ================
+  loadavg during: 711.83 737.64 798.60
+  leader elected  : n3 after 6.90s
+  iterations      : 1511 of 4500 nominal = 0.3358
+  max stall       : 468.5ms between consecutive polls
+  TOTAL           : 0.340 cpu-s over 54.95s wall across 3 nodes
+  FLOOR           : 0.0021 cpu-s per node-wall-s
+
+================ shape: nice20 + cpu-28x (cpu=504 io=0 nice=20) ================
+  loadavg during: 906.48 167.48 298.36
+REFUSING — no leader within 45s; there is no healthy floor to measure.
+
+================ shape: nice20 + cpu-28x+io-64 (cpu=504 io=64 nice=20) ================
+  loadavg during: 794.34 903.94 445.27
+REFUSING — no leader within 45s; there is no healthy floor to measure.
+

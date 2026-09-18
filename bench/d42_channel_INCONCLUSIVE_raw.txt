@@ -1,0 +1,10 @@
+d42-channel: INCONCLUSIVE at 2026-09-18T15:58:14Z — head=2ba1ff7 log=/Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813/suite-d42-channel.log
+FERRODB-VERDICT: INCONCLUSIVE — waiting for a first leader ran out of budget, but this run did not get the machine, so the expiry is not evidence about the cluster.
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.51s of the 45s budget
+    self-schedule : 1886 of 2251 nominal 10ms polls = 0.8379  (starved below 0.085)  HEALTHY
+    max stall     : 76ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.00 cpu-s over 22.51s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+    verdict       : INCONCLUSIVE — the node child processes were starved, so this expiry says nothing about
+                    the cluster. Re-run it on a quieter machine; do NOT record this as a failure.
+transcript:

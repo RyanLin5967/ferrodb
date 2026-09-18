@@ -1,0 +1,18 @@
+D42 healthy-floor probe — idle 3-node cluster, leader settled
+  binary          : /Users/idide/wt/ferrodb-ferrodb-D42-inconclusive/target/debug/examples/consensus_node
+  leader elected  : n1 after 0.47s
+  window          : 45.21s wall
+  loadavg (1/5/15): 13.50 / 11.98 / 9.20
+
+  -- signal B: this thread's own scheduling, 10ms poll loop --
+  iterations      : 3820 of 4500 nominal = 0.8489
+  max stall       : 23.5ms between consecutive polls
+  a decade below  : 0.0849
+
+  -- signal C: the node child processes' CPU --
+  n1 pid 39393  cpu delta 0.230s = 0.0051 cpu-s per wall-s
+  n2 pid 39396  cpu delta 0.180s = 0.0040 cpu-s per wall-s
+  n3 pid 39397  cpu delta 0.170s = 0.0038 cpu-s per wall-s
+  TOTAL           : 0.580 cpu-s over 45.21s wall across 3 nodes
+  FLOOR           : 0.0043 cpu-s per node-wall-s
+  a decade below  : 0.00043
