@@ -3400,8 +3400,15 @@ impl AgentRuntime {
             //
             // Releasing between chunks means the map can change under us, and both directions are
             // fine: a workspace opened behind the cursor is not reap-eligible (it was just forked)
-            // and a workspace removed is one this sweep no longer has to remove. Nothing is missed
-            // permanently — this is a reconciliation that runs again.
+            // and a workspace removed is one this sweep no longer has to remove.
+            //
+            // What a branch reaped after its own chunk's phase 2 waits for is the NEXT sweep, and
+            // that is a real dependency rather than a free guarantee. This used to say "nothing is
+            // missed permanently"; it is stronger than the call sites support. `scan_once` runs
+            // the reconciliation only on its ERROR arm, and `simulate.rs` only when a simulation
+            // starts, so a workspace missed here waits for one of those rather than for a timer.
+            // Reaching the gap at all takes a second reaper running concurrently with this walk,
+            // which is why it is a note and not a defect.
             let (chunk, last_seen, examined) = {
                 let state = self.state.lock().unwrap();
                 let mut chunk: Vec<(u64, BranchId)> = Vec::with_capacity(FORGET_CHUNK);
@@ -4272,6 +4279,14 @@ fn forget_one_branch(state: &mut State, id: u64, bid: BranchId) -> bool {
         None => false,
     };
     if !still_ours {
+        // The slot was recycled under us: the workspace, the name and the quarantine reason all
+        // belong to the LIVE branch now and none of them may be touched. The escrow claim is the
+        // exception and must still go. It is keyed by the whole `BranchId` (see `Pool::claimed`),
+        // so releasing names the dead generation and only the dead generation — the reborn
+        // branch's own claims are a different key and are untouched. Skipping it outright left a
+        // reaped branch holding pool headroom with nothing alive that could ever give it back,
+        // which is exactly the resource-stranding the ABANDON arm of `seal` releases to prevent.
+        state.escrow.release(bid);
         return false;
     }
     // Reaped without client cooperation, so nothing this branch buffered was published BY IT: the

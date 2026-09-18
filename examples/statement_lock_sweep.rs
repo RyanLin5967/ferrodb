@@ -176,18 +176,26 @@ fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples
         let stop = Arc::new(AtomicBool::new(false));
         let probe_rt = Arc::clone(&rt);
         let probe_stop = Arc::clone(&stop);
+        // One clock shared by the prober and the sweep, so a sample can be placed in time
+        // relative to the sweep rather than merely counted.
+        let base = Instant::now();
         let prober = std::thread::spawn(move || {
-            let mut out: Vec<u64> = Vec::with_capacity(1 << 14);
+            // (offset from `base` when the acquisition STARTED, how long it took), nanoseconds.
+            let mut out: Vec<(u64, u64)> = Vec::with_capacity(1 << 14);
             while !probe_stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
                 let _ = probe_rt.quarantine_reason(BranchId::TRUNK);
-                out.push(t0.elapsed().as_nanos() as u64);
+                out.push((
+                    t0.duration_since(base).as_nanos() as u64,
+                    t0.elapsed().as_nanos() as u64,
+                ));
                 std::thread::sleep(Duration::from_micros(50));
             }
             out
         });
         std::thread::sleep(Duration::from_millis(20));
 
+        let sweep_start = Instant::now().duration_since(base).as_nanos() as u64;
         let t0 = Instant::now();
         // `recon` is the full reconciliation -- the backstop, O(open sessions). `fast` is
         // `forget_branches(&reaped)`, which is what `scan_once` calls on every successful tick
@@ -195,10 +203,33 @@ fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples
         let dropped =
             if targeted { rt.forget_branches(&reaped) } else { rt.forget_reaped_branches() };
         walls.push(t0.elapsed().as_nanos() as u64);
+        let sweep_end = Instant::now().duration_since(base).as_nanos() as u64;
         assert_eq!(dropped, g, "fixture reaped {g} branches, sweep forgot {dropped}");
 
         stop.store(true, Ordering::Relaxed);
-        stalls.push(Samples::of(prober.join().unwrap()).max());
+        // **Only acquisitions that overlap the sweep count.** Taking the max over the prober's
+        // whole lifetime attributed to the sweep anything that happened during the 20 ms warm-up
+        // above -- when NOTHING held the lock -- or in the tail after it finished. That is not a
+        // hypothetical contamination: the idle control in table 1 reaches tens of milliseconds on
+        // this machine with the fleet running, which is the same magnitude as the whole AFTER
+        // column. An acquisition overlaps if it started before the sweep ended and had not yet
+        // returned when the sweep began.
+        let samples = prober.join().unwrap();
+        let overlapping: Vec<u64> = samples
+            .iter()
+            .filter(|(off, dur)| off + dur > sweep_start && *off < sweep_end)
+            .map(|(_, dur)| *dur)
+            .collect();
+        // Zero overlapping samples is a fact about the run, not a zero stall: a sweep shorter than
+        // the 50 us probe interval can finish between two acquisitions. Refusing is the only
+        // honest reading -- reporting 0 would say "never blocked" about something never observed.
+        assert!(
+            !overlapping.is_empty(),
+            "no probe acquisition overlapped the sweep (sweep {} ns, {} samples); the prober              cannot see a sweep this short -- lower the probe interval or raise S",
+            sweep_end - sweep_start,
+            samples.len()
+        );
+        stalls.push(Samples::of(overlapping).max());
         drop(sessions);
     }
     (Samples::of(stalls), Samples::of(walls))

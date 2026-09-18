@@ -27,6 +27,9 @@ use ferrodb::branch::types::{BranchId, BranchState, Epoch, LeaseDeadline, PageId
 use ferrodb::agent_sql::runtime::BranchResolver;
 use ferrodb::branch::{BranchCatalog, LogBranchCatalog};
 use ferrodb::error::FerroError;
+use ferrodb::tel::ids::{ColId, RowId};
+
+const QTY: ColId = ColId(1);
 
 /// A catalog that forks one replacement session the first time the sweep asks about a branch the
 /// catalog no longer has — i.e. exactly inside phase 2's lock-free window.
@@ -64,6 +67,10 @@ impl BranchCatalog for ForkInTheWindow {
             // This lands between phase 2 and phase 3 with the state lock free, which is where a
             // real client's `BEGIN` lands when the lease thread is sweeping.
             let sess = rt.begin_session("racer", Some("in-the-window"), BranchId::TRUNK).unwrap();
+            // The reborn branch takes a claim of its own INSIDE the window. Releasing the dead
+            // branch's escrow must not touch this one -- that is what keying the ledger by the
+            // whole `BranchId` buys, and asserting only the release would not notice if it did.
+            rt.claim_escrow(sess.branch, "inventory", RowId(1), QTY, 3).expect("racer claims");
             *self.forked.lock().unwrap() = Some(sess);
         }
         answer
@@ -157,6 +164,12 @@ fn a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight() {
     let slot = doomed.branch.id;
     assert_eq!(doomed.branch.generation, 0, "a fresh slot starts at generation 0");
 
+    // A pool with the doomed branch holding part of it. A reaped branch that never gives its
+    // claim back strands that headroom for everyone else, for the life of the process.
+    rt.open_escrow("inventory", RowId(1), QTY, 20).unwrap();
+    rt.claim_escrow(doomed.branch, "inventory", RowId(1), QTY, 12).unwrap();
+    assert_eq!(rt.unclaimed_escrow("inventory", RowId(1), QTY), Some(8));
+
     // Reap it behind the runtime's back and hand the slot back to the allocator, exactly as the
     // lease reaper does with no client cooperation at all.
     let mut rec = rt.branches().get(doomed.branch).unwrap();
@@ -186,6 +199,22 @@ fn a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight() {
         rt.resolve_branch(&format!("b_{slot}")).ok(),
         Some(racer.branch),
         "b_{slot} must name the live branch, not be unbound by the sweep"
+    );
+
+    // **The dead branch's claim went back to the pool, and the reborn branch's did not.** The
+    // sweep refuses to remove the live workspace, and the first version of that refusal skipped
+    // the escrow release along with everything else -- leaving 12 units held by a branch that no
+    // longer exists and that nothing alive could ever release. 20 - 3 = 17: the doomed branch's 12
+    // returned, the racer's own 3 (claimed inside the window) untouched.
+    assert_eq!(
+        rt.unclaimed_escrow("inventory", RowId(1), QTY),
+        Some(17),
+        "dead branch's 12 units must return to the pool and the racer's 3 must not"
+    );
+    assert_eq!(
+        rt.remaining_escrow(racer.branch, "inventory", RowId(1), QTY),
+        Some(3),
+        "the reborn branch must keep its own claim"
     );
 
     // And the sweep did not quietly remove something else instead. The slot now belongs to the
