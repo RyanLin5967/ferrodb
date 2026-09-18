@@ -1,152 +1,70 @@
 #!/usr/bin/env bash
-# bench/d42_load_sweep.sh — what load shape actually starves this test?
+# bench/d42_load_sweep.sh — ⛔ GUTTED ON PURPOSE. THIS SCRIPT IS A RECORD, NOT A TOOL.
 #
-# WHY THIS EXISTS, AND IT IS A CORRECTION TO THE FALSIFIER'S OWN PREMISE. D42 pre-registered
-# "run the target under deliberate oversubscription (14x) and require INCONCLUSIVE". Run
-# (bench/d42_fire_starved.txt, head ddbc601): 252 pure-CPU spinners on 18 cores took the machine to
-# loadavg 137 and the test PASSED in 4.76 s — barely slower than its 3.9-5.6 s unloaded. No wait
-# expired, so the classifier never ran at all.
+# It swept six machine-wide load shapes (up to NCPU x 28 = 504 CPU burners plus 128 fsync loops) to
+# find which one starves `integration_consensus_failover.rs`. It is gutted for the same reason as
+# `bench/d42_fire_starved.sh`, which shares its burner shape: that shape froze this shared machine
+# twice and locked its owner out three times in one day. `bench/` is not a cargo target, so removing
+# the body is inert for the suite.
 #
-# That is not a failed detector. It is a failed REPRODUCTION: the precondition the falsifier needs —
-# a 45 s budget actually expiring — never happened. macOS's timeshare scheduler demotes pure CPU
-# spinners and keeps mostly-sleeping interactive processes responsive, which is exactly what it is
-# built to do. A 10 ms sleeper asks for so little that it gets it.
+# ── THE FINDING, WHICH IS THE MOST USEFUL THING D42 PRODUCED ───────────────────────────────────
 #
-# So this sweep measures BOTH of D42's signals directly under a range of shapes, instead of guessing
-# which one reproduces. It runs the same probe as bench/d42_childcpu_probe.py, so every number is
-# comparable to the quiet-machine floor the thresholds were calibrated from.
+# Raw data in `bench/d42_load_sweep.txt`. Both of D42's signals, measured by the same probe that
+# calibrated their thresholds (`bench/d42_childcpu_probe.py`), across rising load:
 #
-# THE `nice` SHAPES ARE THE POINT, and they are not a cheat. The classifier's claim is precisely
-# "this process, or its children, did not get the CPU". `nice -n 20` against a loaded machine
-# produces exactly that state, and it aims the break at the window the guard covers instead of
-# hoping ambient load wanders into it. The `cpu`/`io` shapes stay in the sweep because what they
-# show — that both signals are FLAT from loadavg 269 to 829 — is the finding that sent this row
-# looking for a different lever.
+#   shape                     loadavg   self-schedule   child CPU/node-wall-s
+#   baseline                    720        0.6136             0.0037
+#   cpu-14x                     810        0.5873             0.0038
+#   io-64                       575        0.7582             0.0047
+#   cpu-14x + io-64             777        0.5496             0.0031
+#   nice20 + cpu-14x            737        0.3358             0.0021
+#   nice20 + cpu-28x            906        REFUSED — no leader elected within 45 s
+#   nice20 + cpu-28x + io-64    903        REFUSED — no leader elected within 45 s
 #
-# Reading it: a shape that drives `self-schedule` below 0.085 or `child CPU` below 0.00043 is a
-# shape under which the classifier WOULD say INCONCLUSIVE. That is the shape falsifier 1 needs.
+# Two things follow, and both corrected the design entry:
 #
-# It holds the machine-wide suite lock throughout, because these shapes would wreck a concurrent
-# suite's timings — the very confusion this row exists to end. Memory pressure is deliberately NOT
-# one of the shapes: this box is shared with an agent fleet, and inducing swap to win an argument
-# would risk OOM-killing someone else's multi-hour run.
-set -uo pipefail
-export PATH="$HOME/.cargo/bin:$PATH"
-cd "$(dirname "$0")/.." || exit 1
-
-NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-WINDOW=${WINDOW:-45}
-LOCK=/tmp/ferrodb-suite.lock
-IOTMP=$(mktemp -d)
-
-# ⛔ KILL BY TAG, NEVER BY RECORDED PID. A previous version recorded each `timeout` wrapper's pid
-# and killed those pids in cleanup. With 504 spawns plus cargo plus a `pgrep` fork per entry, this
-# box churns through pids fast enough that a RECORDED pid can be REUSED by an unrelated process
-# before cleanup runs — and on a machine shared with an agent fleet, that means `kill -9` aimed at
-# somebody else's work. It was observed killing this script's own shell (exit 137). Every burner
-# therefore carries a unique tag in its command line, and cleanup matches on that: a tag cannot be
-# reused, so it can only ever match burners this run started.
-BURN_TAG="d42burn-$$"
-
-stop_load() {
-    pkill -9 -f "$BURN_TAG" 2>/dev/null
-    return 0
-}
-cleanup() {
-    stop_load
-    rm -rf "$IOTMP"
-    [ "${held:-0}" = 1 ] && rm -rf "$LOCK"
-    return 0
-}
-trap cleanup EXIT INT TERM
-
-# ⛔ THE BURNER SHAPE BELOW IS NOT A STYLE CHOICE — IT IS A FIX FOR A MEASURED INCIDENT.
+#   1. **Ambient CPU load is not a lever on this machine.** Both signals stay nearly flat from
+#      loadavg 269 to 829 — self-scheduling falls only 0.78 -> 0.55, nowhere near its 0.085
+#      threshold. macOS's timeshare scheduler demotes pure spinners and keeps a mostly-sleeping
+#      process responsive. The pre-registered "14x oversubscription" falsifier therefore cannot
+#      reach its own precondition: no wait ever expires, so the classifier never runs.
 #
-# An earlier version of this script left **317 orphaned processes at ppid=1**, still running 1.5
-# hours after their parent died, at loadavg 282. It froze this shared box TWICE and starved every
-# other project on it, while looking like "the machine is slow". Three compounding defects, in the
-# order that matters:
+#   2. ⭐ **Past a certain load the arm is worse than useless.** At cpu-28x no leader is elected at
+#      all, so there is no healthy floor to calibrate against and the probe REFUSES in both
+#      directions. Starving EVERYTHING fires both signals at once, which proves nothing about their
+#      composition — and composition was the one property the two-signal design needed shown. The
+#      arm would have "passed" while testing the wrong thing.
 #
-#   1. the burner body was `while :` / `while True` — UNBOUNDED, so an abandoned one never stops;
-#   2. cleanup did `kill -9 "$!"`, and `$!` is the **`timeout` WRAPPER's** pid. Killing `timeout`
-#      does NOT kill the `sh`/`python3` it spawned — the grandchild survives, reparents to init,
-#      and now has nothing enforcing its bound at all. The cleanup CREATED the orphans;
-#   3. `disown` detached them explicitly, defeating even SIGHUP.
+# ⇒ The falsifier that works is `bench/d42_fire_starved_children.sh`: SIGSTOP the consensus_node
+#   CHILD processes, leave the test thread scheduled. Targeted, no machine-wide load, nothing to
+#   clean up, and it isolates signal C firing ALONE while B stays healthy — the exact blind spot
+#   the design named.
 #
-# Fix (1) is the load-bearing one: **a self-terminating burner needs no parent, no `timeout` and no
-# trap.** Each burner below carries its own wall-clock deadline and exits on its own, so an orphan
-# is bounded by construction. `timeout` and the trap are kept as belt-and-braces, and cleanup now
-# kills the wrapper's DESCENDANTS rather than just the wrapper. `disown` is gone.
-start_cpu() {
-    local n=$1
-    for _ in $(seq "$n"); do
-        timeout 300 sh -c ': '"$BURN_TAG"'
-            end=$(( $(date +%s) + 300 ))
-            while [ "$(date +%s)" -lt "$end" ]; do
-                i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
-            done' >/dev/null 2>&1 &
-    done
-}
-# Write-and-fsync in a tight loop. This is the half pure-CPU load does not have, and the half the
-# nodes are exposed to: every Persist in the consensus driver fsyncs before it acknowledges.
-start_io() {
-    local n=$1 i
-    for i in $(seq "$n"); do
-        timeout 300 python3 -c "
-import os,sys,time
-f=os.open(sys.argv[1], os.O_CREAT|os.O_WRONLY, 0o600)
-b=b'x'*65536
-end=time.time()+300          # self-terminating: an orphan of this stops on its own
-while time.time() < end:
-    os.pwrite(f,b,0); os.fsync(f)
-" "$IOTMP/io$i" "$BURN_TAG" >/dev/null 2>&1 &
-    done
-}
+# ── WHY NOT JUST FIX THE BURNERS ───────────────────────────────────────────────────────────────
+#
+# Because the fix has a hole that opens under exactly the conditions this script creates. A
+# "self-terminating" burner tests its deadline only BETWEEN passes of a non-interruptible inner
+# loop, and that pass gets slower as the box gets more contended — so the overshoot is worst
+# precisely when the bound matters. Measured by another session: burners at 05:15 elapsed against a
+# 240 s deadline. And a SIGSTOPped burner never reaches its deadline check at all, so suspending
+# them is not a safe way to park them either.
+#
+# If anything like this is ever rebuilt: inner loop of 2000, not 200000, so the deadline check
+# fires often enough to mean something; kill by a unique TAG in the command line, never by a
+# recorded pid; and fire-check the cleanup by killing the PARENT and confirming nothing is left at
+# ppid=1 — `bench/d42_fire_orphans.sh` does exactly that.
+#
+# Full account: `bench/d42_DECISION.md` §4b and §10.
 
-held=0; w=0
-while ! mkdir "$LOCK" 2>/dev/null; do
-    o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
-    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
-    [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
-    [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
-    sleep 15; w=$((w+15))
-done
-printf '%s %s %s\n' "$$" "d42-load-sweep" "$(date -u +%FT%TZ)" > "$LOCK/owner"
-held=1
+cat >&2 <<'EOS'
+REFUSING — bench/d42_load_sweep.sh has been gutted deliberately and will not run.
 
-cargo build --examples >/dev/null 2>&1 || { echo "REFUSING — cargo build --examples failed"; exit 1; }
+It generated machine-wide CPU and fsync load. That shape froze this shared box twice and
+locked its owner out three times. Its finding is already recorded in bench/d42_load_sweep.txt
+and bench/d42_DECISION.md §4b, and re-running it would add nothing.
 
-echo "D42 load sweep — which shape moves the signals below their thresholds?"
-echo "  when   : $(date -u +%FT%TZ)"
-echo "  head   : $(git log -1 --format=%h)"
-echo "  cpus   : $NCPU"
-echo "  window : ${WINDOW}s per shape"
-echo "  thresholds: self-schedule < 0.085 STARVED, child CPU < 0.00043 STARVED"
-echo ""
-
-shape() {
-    local name=$1 cpu=$2 io=$3 nice=$4
-    echo "================ shape: $name (cpu=$cpu io=$io nice=$nice) ================"
-    start_cpu "$cpu"
-    start_io "$io"
-    [ $((cpu + io)) -gt 0 ] && sleep 20
-    echo "  loadavg during: $(uptime | sed 's/.*load averages*: //')"
-    if [ "$nice" = 0 ]; then
-        timeout 300 python3 bench/d42_childcpu_probe.py "$WINDOW" 2>&1 \
-            | grep -E "iterations|max stall|FLOOR|TOTAL|leader elected|REFUSING"
-    else
-        timeout 300 nice -n "$nice" python3 bench/d42_childcpu_probe.py "$WINDOW" 2>&1 \
-            | grep -E "iterations|max stall|FLOOR|TOTAL|leader elected|REFUSING"
-    fi
-    stop_load
-    echo ""
-    sleep 5
-}
-
-#      name                    cpu              io   nice
-shape "baseline"               0                0    0
-shape "cpu-14x"                $((NCPU * 14))   0    0
-shape "cpu-14x + io-64"        $((NCPU * 14))   64   0
-shape "nice20 + cpu-14x"       $((NCPU * 14))   0    20
-shape "nice20 + cpu-28x"       $((NCPU * 28))   0    20
-shape "nice20 + cpu-28x+io-64" $((NCPU * 28))   64   20
+bench/d42_childcpu_probe.py still works and is the calibration instrument; it spawns a
+3-node cluster and nothing else. bench/d42_fire_starved_children.sh is the falsifier that
+actually fires, using SIGSTOP on named pids rather than machine-wide load.
+EOS
+exit 4

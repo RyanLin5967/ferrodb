@@ -54,14 +54,25 @@ echo "  head   : $(git log -1 --format=%h)"
 echo "  shape  : $N burners, self-terminating after ${BOUND}s, tagged $TAG"
 echo ""
 
-# The burner, in exactly the shape the real harnesses now use: a wall-clock deadline computed
-# inside the burner itself, checked between bounded bursts of pure arithmetic.
+# The burner: a wall-clock deadline computed inside the burner itself, checked between bursts of
+# pure arithmetic.
+#
+# ⚠ THE INNER BURST IS 2000, NOT 200000, AND THAT IS THE WHOLE CORRECTNESS ARGUMENT. A
+# "self-terminating" burner is only bounded to within ONE INNER PASS, because the inner loop is not
+# interruptible and the deadline is only tested between passes. That pass gets slower as the box
+# gets more contended — which is the thing a load harness is itself creating — so the overshoot is
+# worst exactly when the bound matters. Measured by another session on a 200000-iteration burst:
+# burners at **05:15 elapsed against a 240 s deadline**. At 2000 the check fires ~100x more often,
+# so the overshoot stays a rounding error even under heavy load.
+#
+# ⚠ KNOWN HOLE, stated rather than discovered later: a SIGSTOPped burner never reaches its deadline
+# check at all, so suspending these is NOT a safe way to park them. They must be resumed or killed.
 cat > "/tmp/$TAG.sh" <<EOS
 #!/bin/sh
 # $TAG
 end=\$(( \$(date +%s) + $BOUND ))
 while [ "\$(date +%s)" -lt "\$end" ]; do
-    i=0; while [ "\$i" -lt 200000 ]; do i=\$((i+1)); done
+    i=0; while [ "\$i" -lt 2000 ]; do i=\$((i+1)); done
 done
 EOS
 chmod +x "/tmp/$TAG.sh"
