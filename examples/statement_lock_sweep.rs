@@ -83,6 +83,10 @@ struct Arm {
     probe: Samples,
     /// Per-call wall times of the arm's own operation, nanoseconds.
     op: Samples,
+    /// How many of this arm's iterations took LONGER than `period`, so no sleep happened and the
+    /// loop ran that iteration back-to-back with the next. See the overrun guard in [`arm`]: past
+    /// a small fraction this stops being the design the doc comment above describes.
+    overran: usize,
 }
 
 /// Run `op` once every `period` for `window`, while a prober thread takes the state lock every
@@ -99,6 +103,21 @@ struct Arm {
 /// the holder, and a starved holder produces a reassuring flat line for the wrong reason. The
 /// `activity` arm is what catches that if it ever happens — it uses this identical protocol, so a
 /// protocol that cannot see a stall cannot see that one either.
+///
+/// ⛔ **CORRECTED 2026-09-18: this loop ABANDONED the period silently, and it did so exactly where
+/// the numbers matter.** The sleep is `period.checked_sub(t0.elapsed())`, which is `None` when the
+/// op outran the period — and `if let Some(rest)` then simply does not sleep. So once `op` is
+/// slower than `period` the loop becomes **back-to-back**, which is the ~100% duty cycle the
+/// paragraph above says *"makes the S-to-S comparison measure the harness"*. Nothing reported the
+/// switch. It is worst at large S, because that is where the op is slow: at S ≥ 10⁴ a
+/// `forget_reaped_branches` that W4 measured in **seconds** cannot fit a millisecond period, so the
+/// large-S end of every table was taken in the mode this design explicitly rejects, while the
+/// header still described the periodic one.
+///
+/// ⇒ **The fix is NOT to sleep anyway** — that would silently change the duty cycle instead of
+/// silently changing the protocol, which is no better. Overruns are now COUNTED, reported per arm,
+/// and **refused** past `MAX_OVERRUN_FRACTION`: a run whose stated premise is false is not a result
+/// to be caveated. The operator's remedy is a larger `op_period_ms`, and the refusal says so.
 fn arm(rt: &Arc<AgentRuntime>, window: Duration, period: Duration, mut op: impl FnMut()) -> Arm {
     let stop = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicU64::new(0));
@@ -127,17 +146,22 @@ fn arm(rt: &Arc<AgentRuntime>, window: Duration, period: Duration, mut op: impl 
 
     let deadline = Instant::now() + window;
     let mut walls: Vec<u64> = Vec::new();
+    let mut overran = 0usize;
     while Instant::now() < deadline {
         let t0 = Instant::now();
         op();
         walls.push(t0.elapsed().as_nanos() as u64);
-        // Sleep the remainder of the period, if the op did not already outrun it.
-        if let Some(rest) = period.checked_sub(t0.elapsed()) {
-            std::thread::sleep(rest);
+        // Sleep the remainder of the period. `checked_sub` is `None` exactly when the op outran
+        // the period — that iteration therefore ran back-to-back with the next, and it is COUNTED
+        // rather than passed over, because the doc comment above makes the periodic duty cycle a
+        // load-bearing part of what the numbers mean.
+        match period.checked_sub(t0.elapsed()) {
+            Some(rest) => std::thread::sleep(rest),
+            None => overran += 1,
         }
     }
     stop.store(true, Ordering::Relaxed);
-    Arm { probe: Samples::of(prober.join().unwrap()), op: Samples::of(walls) }
+    Arm { probe: Samples::of(prober.join().unwrap()), op: Samples::of(walls), overran }
 }
 
 /// A runtime holding `s` open sessions, and the handles that keep them open.
@@ -265,9 +289,42 @@ fn mean(s: &Samples) -> u64 {
     }
 }
 
+/// Past this fraction of iterations outrunning the period, the arm was NOT running the protocol
+/// its doc comment describes and the S-to-S comparison measures the harness. 5% is a judgement:
+/// it is loose enough that one slow iteration in a short window does not abort a run, and tight
+/// enough that the back-to-back regime cannot hide in it.
+const MAX_OVERRUN_FRACTION: f64 = 0.05;
+
+/// Refuse a run whose periodic premise has stopped holding, naming the remedy. Refused BEFORE the
+/// table is printed rather than footnoted after it, for the same reason the disjointness guard in
+/// `bufpool_fault_concurrency.rs` refuses: a run whose stated premise is false is not a result to
+/// be caveated.
+fn check_overrun(s: usize, name: &str, a: &Arm) {
+    let n = a.op.n();
+    if n == 0 {
+        return;
+    }
+    let frac = a.overran as f64 / n as f64;
+    if frac > MAX_OVERRUN_FRACTION {
+        eprintln!(
+            "\nPERIOD OVERRUN: S={s} arm={name}: {} of {n} iterations ({:.1}%) took LONGER than the \
+             op period, so those ran BACK-TO-BACK and the holder's duty cycle was not the one this \
+             harness is built on. Back to back, probe_max reads a queue behind many holds rather \
+             than the length of one, and the duty cycle then varies with S by itself — which makes \
+             the S-to-S comparison a measurement of the harness. Raise op_period_ms above the \
+             observed op wall time (max {} ns for this arm) and re-run.",
+            a.overran,
+            frac * 100.0,
+            a.op.max(),
+        );
+        std::process::exit(2);
+    }
+}
+
 fn row(s: usize, name: &str, a: &Arm) {
+    check_overrun(s, name, a);
     println!(
-        "{:>8} {:>7} {:>9} {:>8} {:>10} {:>11} {:>11} {:>7} {:>11} {:>11}",
+        "{:>8} {:>7} {:>9} {:>8} {:>10} {:>11} {:>11} {:>7} {:>11} {:>11} {:>8}",
         s,
         name,
         a.probe.n(),
@@ -278,6 +335,7 @@ fn row(s: usize, name: &str, a: &Arm) {
         a.op.n(),
         mean(&a.op),
         a.op.max(),
+        a.overran,
     );
 }
 
@@ -316,10 +374,15 @@ fn main() {
     println!("#           so this averages the population that waited. THE HEADLINE NUMBER.");
     println!("# op_*    = the arm's own operation, wall, NANOSECONDS (sweep wall is dominated by");
     println!("#           phase 2, which holds NO lock -- it is not the blocking number)");
+    println!("# overran = iterations whose op took LONGER than the period, so no sleep happened and");
+    println!("#           that iteration ran BACK-TO-BACK. Must be small: past 5% the run REFUSES,");
+    println!("#           because back to back the duty cycle varies with S by itself and the");
+    println!("#           S-to-S comparison then measures the harness. Before 2026-09-18 this was");
+    println!("#           neither counted nor reported, and at S>=10^4 it was the normal case.");
     println!(
-        "{:>8} {:>7} {:>9} {:>8} {:>10} {:>11} {:>11} {:>7} {:>11} {:>11}",
+        "{:>8} {:>7} {:>9} {:>8} {:>10} {:>11} {:>11} {:>7} {:>11} {:>11} {:>8}",
         "S", "arm", "probe_n", "p50", "p999", "stall_mean", "probe_max", "op_n", "op_mean",
-        "op_max"
+        "op_max", "overran"
     );
 
     println!("#");
