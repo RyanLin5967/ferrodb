@@ -282,7 +282,7 @@ struct State {
     /// `workspaces.values().any(..)` while holding the one Mutex every statement takes, once per
     /// branch being forgotten — O(forgotten × open sessions) under the per-statement lock. With
     /// 10⁵ open sessions and 64 branches reaped, an unrelated statement waited **134 ms at the
-    /// median** for the sweep to finish (`artie-research/W4/statement-lock-BEFORE.txt`, table 2).
+    /// median** for the sweep to finish (`bench/w4/statement-lock-BEFORE.txt`, table 2).
     /// A count keyed by txn answers the same question in O(log n) and is maintained at the two
     /// places a workspace enters and leaves the map.
     ///
@@ -426,7 +426,7 @@ pub struct RunActivity {
 /// each acquisition is another chance to be descheduled while still holding it — so shrinking the
 /// chunk makes the worst case WORSE, which is the opposite of the obvious guess. Measured at 10⁵
 /// open sessions, round-robin across chunk sizes over 9 rounds, worst stall observed for an
-/// unrelated statement (`artie-research/W4/forget-chunk-selection.txt`):
+/// unrelated statement (`bench/w4/forget-chunk-selection.txt`):
 ///
 /// ```text
 ///   chunk     median        worst
@@ -3498,7 +3498,7 @@ impl AgentRuntime {
     /// branches instead is O(branches actually reaped), which is what a tick costs when nothing has
     /// gone wrong.
     ///
-    /// Measured in `artie-research/W4/statement-lock-FASTPATH.txt`: the reconciliation's wall time
+    /// Measured in `bench/w4/statement-lock-FASTPATH.txt`: the reconciliation's wall time
     /// rises 91x across 100x open sessions (269 us -> 24.5 ms at 10⁵) while this call shows no
     /// trend. A larger figure for the same walk is reported on branch S15-runtime-at-1e6 (commit
     /// 0ac1931, `bench/runtime_at_1e6.txt`, W4) — not in this worktree, and NOT reproduced here.

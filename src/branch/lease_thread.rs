@@ -426,7 +426,7 @@ fn scan_once(
                 // timer stopped every statement in the database for the length of that walk. The
                 // list is right here; searching for what we were already handed was the whole cost.
                 //
-                // Measured in `artie-research/W4/statement-lock-FASTPATH.txt`: the reconciliation's
+                // Measured in `bench/w4/statement-lock-FASTPATH.txt`: the reconciliation's
                 // wall time — which is what this lock is held for — rises 91x across 100x open
                 // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
                 // O(reaped). A larger figure for the same walk is reported on branch
