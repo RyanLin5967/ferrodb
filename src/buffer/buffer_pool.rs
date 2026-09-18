@@ -26,6 +26,7 @@ use crate::wal::log::WalManager;
 use std::sync::RwLock;
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
+use crate::storage::page_latch::PageLatches;
 
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
@@ -40,6 +41,17 @@ pub struct BufferPoolManager {
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
     pub wal: OnceLock<Arc<WalManager>>,
+    /// **Page latches, and they are ABOVE this struct's own locks in the order.**
+    ///
+    /// They live here rather than on `BPlusTreeManager` because a manager is opened per statement
+    /// — `planner::plan::open_table` builds a fresh one on every INSERT — so latch state held by a
+    /// manager would be private to one statement and exclude nothing. The buffer pool is the only
+    /// thing two concurrent users of the same tree share.
+    ///
+    /// Nothing in this file may take one: `fetch_page` holds `arc_cache` across frame locks, so
+    /// the order is `page_latch -> arc_cache -> page_table -> frame` and taking a page latch from
+    /// underneath would invert it. See `src/storage/page_latch.rs`.
+    pub page_latches: PageLatches,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
@@ -47,7 +59,7 @@ const MAX_BUFFER_POOL_PAGES: usize = 1024;
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
-        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new()}
+        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new(), page_latches: PageLatches::new()}
     }
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin

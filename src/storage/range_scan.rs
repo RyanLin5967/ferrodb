@@ -12,7 +12,15 @@ pub struct RangeScanner<K, V> {
 }
 
 impl<K: Ord + Clone + BTreeSerialize, V: Clone + BTreeSerialize> RangeScanner<K, V> {
+    /// Copy one leaf out **under its page read latch**.
+    ///
+    /// Without the latch this walked the `next` chain straight through a concurrent split: D23
+    /// measured a full scan returning 1649 of 2200 entries at 8 threads. The latch is released
+    /// when this returns — the scan is not a repeatable read — but no page is read while a writer
+    /// is part-way through rewriting it, and `src/storage/index.rs` writes a new leaf before
+    /// publishing the `next` pointer to it, so this never arrives at an unwritten page.
     pub fn load_leaf(&self, page_id: u32) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
+        let _latch = self.buffer_pool.page_latches.read(page_id);
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let node = {
             let frame = self.buffer_pool.frames[frame_i].read().unwrap();
