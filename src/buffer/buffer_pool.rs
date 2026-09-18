@@ -58,6 +58,24 @@ pub struct Frame {
     pub dirty_flag: AtomicBool,
 }
 
+/// What happened when the pool tried to take a replacement victim's frame.
+///
+/// The distinction between the last two is load-bearing and was missing at first. The replacement
+/// policy removes a victim from its resident lists at the moment it names it, so when the pool
+/// cannot take that victim it has to say WHY: a victim that is still resident must be put back
+/// (`Declined`), and a victim that has genuinely gone must not be (`Gone`) — reinstating that one
+/// would leave the policy believing a page is resident when no frame holds it.
+enum Evicted {
+    /// The frame is taken, relabelled for the incoming page, and pinned once.
+    Took(usize),
+    /// The victim is still resident and still that page; it was pinned or re-dirtied in the
+    /// write-back window. The policy must keep counting it.
+    Declined,
+    /// The victim is no longer resident under that id at all — deleted, or its frame already
+    /// reused. The policy is right to have dropped it.
+    Gone,
+}
+
 pub struct BufferPoolManager {
     pub frames: Vec<RwLock<Frame>>,
     pub page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
@@ -233,13 +251,37 @@ impl BufferPoolManager {
                     return Err(FerroError::NotEnoughSpace);
                 }
             },
-            ArcResult::MissEvict(victim) => match self.evict_into(victim, page_id)? {
-                Some(i) => i,
-                None => {
-                    let _ = self.arc_cache.lock().unwrap().remove(page_id);
-                    return Ok(None);
+            ArcResult::MissEvict(victim) => {
+                // Both the abandon paths and the error path must hand the victim back to the
+                // policy, or it stops counting a page that is still in the pool and that page's
+                // frame is never reclaimable again.
+                let outcome = self.evict_into(victim, page_id);
+                let give_back = |declined: bool| {
+                    let mut cache = self.arc_cache.lock().unwrap();
+                    if declined {
+                        cache.reinstate(victim);
+                    }
+                    // The incoming page was moved into the resident lists by `request` and is not
+                    // going to arrive, so that claim comes off too.
+                    let _ = cache.remove(page_id);
+                };
+                match outcome {
+                    Ok(Evicted::Took(i)) => i,
+                    Ok(Evicted::Declined) => {
+                        give_back(true);
+                        return Ok(None);
+                    }
+                    Ok(Evicted::Gone) => {
+                        give_back(false);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        // The write-back failed, so the victim is untouched and still resident.
+                        give_back(true);
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
 
         // The read. **Nothing pool-wide is held here, and neither is the frame latch**: the frame
@@ -313,11 +355,11 @@ impl BufferPoolManager {
     /// the tempting one — drop the mapping, then flush at leisure — and it silently loses writes: a
     /// concurrent `fetch_page(victim)` would miss, read the stale copy from disk, and the dirty
     /// bytes still sitting in this frame would go to disk afterwards or not at all.
-    fn evict_into(&self, victim: u32, incoming: u32) -> Result<Option<usize>, FerroError> {
+    fn evict_into(&self, victim: u32, incoming: u32) -> Result<Evicted, FerroError> {
         // A candidate, not an answer: the frame latch below decides whether it is still true.
         let Some(frame_i) = self.page_table.read().unwrap().get(&victim).copied() else {
             // `delete_page` or `free_page` removed the victim between the verdict and here.
-            return Ok(None);
+            return Ok(Evicted::Gone);
         };
 
         // Write-back under the victim's OWN latch. A read lock is what keeps `data` stable -- a
@@ -326,8 +368,11 @@ impl BufferPoolManager {
         // else.
         {
             let frame = self.frames[frame_i].read().unwrap();
-            if frame.page_id != Some(victim) || frame.pin_counter.load(Ordering::Relaxed) > 0 {
-                return Ok(None);
+            if frame.page_id != Some(victim) {
+                return Ok(Evicted::Gone);
+            }
+            if frame.pin_counter.load(Ordering::Relaxed) > 0 {
+                return Ok(Evicted::Declined);
             }
             if frame.dirty_flag.load(Ordering::Relaxed) {
                 self.wal_gate(&frame.data)?;
@@ -341,17 +386,19 @@ impl BufferPoolManager {
         // the pin because that whole cycle can complete and leave the count back at zero.
         let mut pt = self.page_table.write().unwrap();
         let mut frame = self.frames[frame_i].write().unwrap();
-        if frame.page_id != Some(victim)
-            || frame.pin_counter.load(Ordering::Relaxed) > 0
+        if frame.page_id != Some(victim) {
+            return Ok(Evicted::Gone);
+        }
+        if frame.pin_counter.load(Ordering::Relaxed) > 0
             || frame.dirty_flag.load(Ordering::Relaxed)
         {
-            return Ok(None);
+            return Ok(Evicted::Declined);
         }
         pt.remove(&victim);
         frame.page_id = Some(incoming);
         frame.pin_counter = AtomicU16::new(1);
         frame.dirty_flag = AtomicBool::new(false);
-        Ok(Some(frame_i))
+        Ok(Evicted::Took(frame_i))
     }
 
     // decrement pin count, if page was modified, add dirty flag

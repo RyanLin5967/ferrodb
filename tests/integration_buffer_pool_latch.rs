@@ -480,3 +480,145 @@ fn a_dirty_victim_is_on_disk_before_it_stops_being_resident() {
         lost.load(Ordering::Relaxed)
     );
 }
+
+/// **The replacement policy must still account for every resident page after a churn.**
+///
+/// `ArcCache::request` chooses a victim by REMOVING it from the resident lists (`check_unpinned`)
+/// and filing it under a ghost list. Under the pool-wide lock that was safe, because the victim
+/// could not change between the verdict and the eviction. Without it, `evict_into` can decline the
+/// victim — it got pinned, or re-dirtied during the write-back — and the page then stays in the
+/// pool while the policy has stopped counting it as resident.
+///
+/// A page in that state is never chosen as a victim again, so its frame is gone for the life of the
+/// process. This compares what the page table holds against what the policy believes is resident.
+#[test]
+fn every_resident_page_is_still_tracked_by_the_replacement_policy() {
+    const PAGES: u32 = 1600;
+    let (bp, st, ids) = pool(PAGES);
+
+    // Dirty everything, so evictions must write back and the write-back window is wide. That
+    // window is where a victim gets re-pinned and the eviction is declined.
+    for &id in &ids {
+        let idx = bp.fetch_page(id).unwrap();
+        bp.frames[idx].write().unwrap().data[8] = 0xE7;
+        bp.unpin_page(id, true);
+    }
+    st.set_write_delay(Duration::from_micros(200));
+
+    let refused = Arc::new(AtomicU64::new(0));
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let bp = Arc::clone(&bp);
+            let ids = ids.clone();
+            let refused = Arc::clone(&refused);
+            s.spawn(move || {
+                for k in 0..500 {
+                    let id = ids[((k * 7919) + t * 131) % ids.len()];
+                    match bp.fetch_page(id) {
+                        Ok(idx) => {
+                            let _ = bp.frames[idx].read().unwrap().data[8];
+                            bp.unpin_page(id, true);
+                        }
+                        Err(_) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let resident = bp.page_table.read().unwrap().len();
+    let tracked = {
+        let c = bp.arc_cache.lock().unwrap();
+        c.t1.len() + c.t2.len()
+    };
+    let refusals = refused.load(Ordering::Relaxed);
+
+    assert_eq!(
+        resident, tracked,
+        "{resident} pages are resident but the replacement policy tracks only {tracked} of them. \
+         {} frames can never be reclaimed. ({refusals} fetches were refused outright.)",
+        resident.saturating_sub(tracked)
+    );
+}
+
+/// The same question as above, but with the declined eviction **forced** instead of hoped for.
+///
+/// The churn version of this test passes, and on its own that means nothing: it never establishes
+/// that `evict_into` ever declined a victim, so it cannot distinguish "no leak" from "the path
+/// never ran". Here the decline is constructed. A fault is parked inside its victim's write-back,
+/// every resident page is dirtied while it is parked, and the fault therefore finds its victim
+/// dirty again when it resumes and gives it up.
+#[test]
+fn a_declined_eviction_leaves_the_victim_tracked_as_resident() {
+    let (bp, st, ids) = pool(FRAMES as u32 + 1);
+
+    let resident_before: Vec<u32> = bp.page_table.read().unwrap().keys().copied().collect();
+    assert_eq!(resident_before.len(), FRAMES, "precondition: the pool must be full");
+    for &id in &resident_before {
+        let idx = bp.fetch_page(id).unwrap();
+        bp.frames[idx].write().unwrap().data[8] = 0xE7;
+        bp.unpin_page(id, true);
+    }
+    let absent = *ids.iter().find(|id| !resident_before.contains(id)).unwrap();
+
+    // Park the fault inside its victim's write-back.
+    st.arm_writes();
+    let faulting = {
+        let bp = Arc::clone(&bp);
+        std::thread::spawn(move || bp.fetch_page(absent))
+    };
+    assert!(
+        st.wait_for_parked_reader(Duration::from_secs(10)),
+        "no write-back reached the gate; the decline was never set up"
+    );
+
+    // WHICH page is being evicted? `ArcCache::request` chose it by REMOVING it from the resident
+    // lists, so right now it is the one page that the page table holds and the policy does not.
+    // That set difference is both how the victim is identified and the first half of the bug.
+    let victim = {
+        let pt = bp.page_table.read().unwrap();
+        let c = bp.arc_cache.lock().unwrap();
+        let untracked: Vec<u32> = pt
+            .keys()
+            .copied()
+            .filter(|id| !c.t1.map.contains_key(id) && !c.t2.map.contains_key(id))
+            .collect();
+        assert_eq!(
+            untracked.len(),
+            1,
+            "expected exactly one resident-but-untracked page (the victim), found {untracked:?}"
+        );
+        untracked[0]
+    };
+
+    // PIN it and keep the pin. Dirtying it again would not work: the write-back holds the frame's
+    // READ latch, so the bytes cannot change underneath it, and `evict_into` clears the dirty flag
+    // after the write lands -- correctly, since the bytes it wrote are still the frame's bytes. A
+    // PIN is the condition that genuinely makes the eviction unsafe to complete.
+    let pinned_idx = bp.fetch_page(victim).expect("the victim is resident, so this is a hit");
+
+    st.release();
+    let _ = faulting.join().unwrap();
+
+    // The eviction must have been declined: the page is pinned, so it cannot have been reused.
+    assert_eq!(
+        bp.frames[pinned_idx].read().unwrap().page_id,
+        Some(victim),
+        "the pinned victim was evicted anyway"
+    );
+    bp.unpin_page(victim, false);
+
+    let resident = bp.page_table.read().unwrap().len();
+    let tracked = {
+        let c = bp.arc_cache.lock().unwrap();
+        c.t1.len() + c.t2.len()
+    };
+    assert_eq!(
+        resident, tracked,
+        "after a declined eviction, {resident} pages are resident but the policy tracks {tracked}. \
+         The declined victim was removed from the resident lists by `request` and never put back, \
+         so its frame can never be reclaimed."
+    );
+}
