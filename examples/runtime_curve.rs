@@ -529,11 +529,37 @@ fn fork_phase() {
     println!("S15 phase 3: where the per-statement `BEGIN AGENT SESSION` cost lives, at N branches.");
     println!("Single-threaded, {reps} reps each, the three layers INTERLEAVED so device drift hits all three.");
     println!("Sessions are abandoned as they are taken, so `State::workspaces` stays at ~1 and cannot");
-    println!("be what is being measured. `syncs` is catalog fsyncs issued across the whole rep block.");
+    println!("be what is being measured.");
+    println!("#");
+    println!("# ⛔ TWO ATTRIBUTION DEFECTS, CORRECTED/DISCLOSED 2026-09-18. Both were found by audit,");
+    println!("# not by the numbers looking wrong, which is the point: an attribution defect produces");
+    println!("# a plausible number in the wrong column and nothing in the output contradicts it.");
+    println!("#");
+    println!("# (1) FIXED. The syncs column was printed as `syncs/op` over a denominator of reps*3,");
+    println!("#     while the rep block performs FIVE catalog-mutating operations per rep, not three:");
+    println!("#     cat.fork, begin_session, runtime.abandon, the BEGIN AGENT SESSION statement, and");
+    println!("#     ABANDON BRANCH. The untimed work's fsyncs were being divided among the three TIMED");
+    println!("#     ops. ⭐ MEASURED, not estimated, at N=20 reps=2: each timed op issues exactly 1.00");
+    println!("#     fsync while the whole block issues 7.00, so the old `syncs/op` printed 7/3 = 2.33");
+    println!("#     where the true per-op figure is 1.00 — an inflation of 2.33x, and a column that");
+    println!("#     said `per op` while measuring per-block. Fsyncs are now sampled around each timed");
+    println!("#     region individually, so sync_raw/sync_rt/sync_stmt are REAL per-op attributions,");
+    println!("#     and sync_blk is the whole-block total per rep that the old column approximated.");
+    println!("#     ⚠ Any previously recorded `syncs/op` figure is that inflated quantity.");
+    println!("#");
+    println!("# (2) DISCLOSED, NOT CHANGED. The three arms run in a FIXED within-rep order (raw, then");
+    println!("#     rt, then stmt) and the order never rotates, so `rt-raw` and `stmt-rt` carry a");
+    println!("#     within-rep position effect with the same sign in every rep -- which averaging");
+    println!("#     cannot remove (the same defect the D28 A/B driver had). And `raw` is the one arm");
+    println!("#     that never abandons what it forked, so it leaves one live branch per rep that the");
+    println!("#     other two do not. Not silently altered: changing either would change the workload,");
+    println!("#     and then old and new artifacts would stop comparing. Read the two DIFFERENCE");
+    println!("#     columns as upper bounds on the layer cost, not as the layer cost.");
     println!();
     println!(
-        "{:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
-        "N", "raw ms", "rt ms", "stmt ms", "rt-raw ms", "stmt-rt ms", "syncs/op",
+        "{:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>9} {:>9} {:>9} {:>9}",
+        "N", "raw ms", "rt ms", "stmt ms", "rt-raw ms", "stmt-rt ms",
+        "sync_raw", "sync_rt", "sync_stmt", "sync_blk",
     );
 
     let lease = LeaseDeadline(u64::MAX);
@@ -561,24 +587,34 @@ fn fork_phase() {
 
         let syncs_before = db.cat.syncs_issued();
         let (mut raw, mut rt, mut stmt) = (0f64, 0f64, 0f64);
+        // Fsyncs attributed PER TIMED OP, by sampling the counter around each timed region rather
+        // than dividing a whole-block total by an op count that never matched the block. See
+        // defect (1) in the header above.
+        let (mut s_raw, mut s_rt, mut s_stmt) = (0u64, 0u64, 0u64);
         for _ in 0..reps {
+            let c = db.cat.syncs_issued();
             let t = Instant::now();
             db.cat.fork(BranchId::TRUNK, lease).expect("fork");
             raw += t.elapsed().as_secs_f64();
+            s_raw += db.cat.syncs_issued() - c;
 
             seq += 1;
+            let c = db.cat.syncs_issued();
             let t = Instant::now();
             let s = db.runtime.begin_session("a", Some(&format!("rt_{seq}")), BranchId::TRUNK)
                 .expect("begin_session");
             rt += t.elapsed().as_secs_f64();
+            s_rt += db.cat.syncs_issued() - c;
             db.runtime.abandon(s.branch).expect("abandon");
 
             seq += 1;
             let mut sess = db.session();
             let sql = format!("BEGIN AGENT SESSION AS 'a' RUN 'st_{seq}';");
+            let c = db.cat.syncs_issued();
             let t = Instant::now();
             db.ok(&sql, &mut sess);
             stmt += t.elapsed().as_secs_f64();
+            s_stmt += db.cat.syncs_issued() - c;
             let b = sess.agent.as_ref().unwrap().branch_name.clone();
             db.ok(&format!("ABANDON BRANCH {b};"), &mut sess);
         }
@@ -590,14 +626,17 @@ fn fork_phase() {
             stmt * 1000.0 / reps as f64,
         );
         println!(
-            "{:>9} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>10.2}",
+            "{:>9} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
             done,
             raw,
             rt,
             stmt,
             rt - raw,
             stmt - rt,
-            syncs as f64 / (reps * 3) as f64,
+            s_raw as f64 / reps as f64,
+            s_rt as f64 / reps as f64,
+            s_stmt as f64 / reps as f64,
+            syncs as f64 / reps as f64,
         );
         use std::io::Write;
         let _ = std::io::stdout().flush();
