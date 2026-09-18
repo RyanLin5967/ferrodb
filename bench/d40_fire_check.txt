@@ -1,14 +1,3 @@
-KILLED       M1 collector is a no-op
-             kills  the_crash_orphan_collector_fires_on_state_the_narrowed_sweep_cannot_see
-             kills  a_crash_orphaned_extent_is_collected_when_the_store_is_reopened
-             kills  the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence
-KILLED       M2 collector ignores whether the owner is gone
-             kills  the_orphan_collector_refuses_a_live_owner_and_refuses_a_non_empty_extent
-KILLED       M3 collector ignores whether the extent is empty
-             kills  the_orphan_collector_refuses_a_live_owner_and_refuses_a_non_empty_extent
-KILLED       M4 open/recovery no longer collects orphans
-             kills  a_crash_orphaned_extent_is_collected_when_the_store_is_reopened
-KILLED       M5 cadence gate removed (collector runs every tick)
              kills  the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence
 KILLED       M6 reap stops seeding the sweep with its own arenas
              kills  the_narrowed_sweep_leaves_the_global_scan_nothing_to_find
@@ -17,16 +6,19 @@ KILLED       M8 the narrowed sweep never runs at all
              kills  the_narrowed_sweep_leaves_the_global_scan_nothing_to_find
              kills  a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back
              kills  slow_path_pins_pages_a_live_child_can_still_see_then_releases_them
+KILLED       M9 the narrowed sweep is the global scan again (pre-D40 call graph)
+             kills  reaping_n_branches_costs_no_catalog_descent_per_branch
 KILLED       M7 drain stops recording the arenas it released into
              kills  the_narrowed_sweep_leaves_the_global_scan_nothing_to_find
 
 ==== D40 FIRE-CHECK SUMMARY ====
-KILLED       M1 collector is a no-op  (tests that failed: 3)
+KILLED       M1 collector is a no-op  (tests that failed: 4)
 KILLED       M2 collector ignores whether the owner is gone  (tests that failed: 1)
 KILLED       M3 collector ignores whether the extent is empty  (tests that failed: 4)
 KILLED       M4 open/recovery no longer collects orphans  (tests that failed: 1)
 KILLED       M5 cadence gate removed (collector runs every tick)  (tests that failed: 1)
 KILLED       M6 reap stops seeding the sweep with its own arenas  (tests that failed: 2)
 KILLED       M8 the narrowed sweep never runs at all  (tests that failed: 3)
+KILLED       M9 the narrowed sweep is the global scan again (pre-D40 call graph)  (tests that failed: 2)
 KILLED       M7 drain stops recording the arenas it released into  (tests that failed: 2)
 RESULT: ALL MUTATIONS KILLED

@@ -11,7 +11,7 @@ Restore is `git checkout <SHA> --`, never `git checkout --`: the latter restores
 import subprocess, sys, os
 
 REPO = "/Users/idide/wt/ferrodb-d40-reaper-quadratic"
-SHA = "cf1f913"
+SHA = "4ae32a8"
 REAPER = os.path.join(REPO, "src/branch/reaper.rs")
 
 # (name, file, old, new, tests that MUST fail)
@@ -56,6 +56,11 @@ MUTATIONS = [
       "a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back",
       "slow_path_pins_pages_a_live_child_can_still_see_then_releases_them"]),
 
+    ("M9 the narrowed sweep is the global scan again (pre-D40 call graph)", REAPER,
+     "        self.sweep_touched_extents(&touched)?;",
+     "        let _ = &touched;\n        self.collect_orphaned_extents()?;",
+     ["reaping_n_branches_costs_no_catalog_descent_per_branch"]),
+
     ("M7 drain stops recording the arenas it released into", REAPER,
      "                    touched.insert(pf.arena_id);",
      "                    // mutated: not recorded",
@@ -68,7 +73,9 @@ def run(cmd, **kw):
 
 
 def tree_is_clean():
-    return run("git diff HEAD --stat").stdout.strip() == ""
+    # Scoped to the files this script mutates. Whole-tree would also trip on an edit to this
+    # script itself, which says nothing about whether the mutation was restored.
+    return run("git diff HEAD --stat -- src/").stdout.strip() == ""
 
 
 def restore():
