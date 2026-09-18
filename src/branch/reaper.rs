@@ -178,12 +178,25 @@ impl TwoTierReaper {
         Ok(())
     }
 
-    /// Post-order copy of the page graph rooted at `page` into `arena`, stamping every copy with
-    /// `epoch` and repointing parents at their new children.
+    /// Post-order copy of the page graph rooted at `page` into `branch`'s own extents, stamping
+    /// every copy with `epoch` and repointing parents at their new children.
+    ///
+    /// **D13b — the arena is asked for PER PAGE, never captured once.** This took a single
+    /// `ArenaId` and handed it to every `alloc_in_arena`, which is the one call in the store that
+    /// deliberately refuses to grow an extent: its error says "ask `arena_for` for a fresh extent"
+    /// and nothing here ever did. A tree larger than `ARENA_EXTENT_PAGES` (256 pages, ~1MB)
+    /// therefore could not be collapsed at all -- and since `collapse` is the only escape from
+    /// `MAX_BRANCH_DEPTH`, the ninth fork of any database over ~1MiB was a dead end.
+    ///
+    /// `arena_for` is what every other page allocator in the engine already uses (`cow_page`, all
+    /// four B+tree split paths): it returns the branch's current extent while it has room and
+    /// claims a fresh one when it does not, recording each fresh one against the branch inside
+    /// `alloc_arena`'s atomic `add_arena`. That last part is why `collapse` must RE-READ the
+    /// record before its final write; see there.
     fn deep_copy(
         &self,
         page: PageId,
-        arena: crate::branch::types::ArenaId,
+        branch: BranchId,
         epoch: Epoch,
         links: &dyn PageLinks,
         seen: &mut HashSet<PageId>,
@@ -213,10 +226,11 @@ impl TwoTierReaper {
         let children = links.child_pages(page_type, &data)?;
         let mut rewrites = Vec::with_capacity(children.len());
         for child in children {
-            let new_child = self.deep_copy(child, arena, epoch, links, seen, budget)?;
+            let new_child = self.deep_copy(child, branch, epoch, links, seen, budget)?;
             rewrites.push((child, new_child));
         }
 
+        let arena = self.store.arena_for(branch)?;
         let new_id = self.store.alloc_in_arena(arena, page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
@@ -390,18 +404,21 @@ impl Reaper for TwoTierReaper {
             .into());
         };
 
-        let mut rec = self.catalog.get(branch)?; // generation-guarded: never collapse a stale id
+        let rec = self.catalog.get(branch)?; // generation-guarded: never collapse a stale id
         if rec.branch_id.is_trunk() {
             return Err(BranchError::NotWritable(branch).into());
         }
 
         let new_fork_epoch = self.catalog.next_epoch();
-        let arena = self.store.alloc_arena(branch)?;
+        // One fresh extent to start in, so the materialised tree is physically clustered and does
+        // not begin halfway through whatever the branch was last writing. `deep_copy` asks
+        // `arena_for` from here on, which rolls over into further fresh extents as it fills them.
+        self.store.alloc_arena(branch)?;
         let mut seen = HashSet::new();
         let mut budget = MAX_COLLAPSE_PAGES;
         let new_root = self.deep_copy(
             rec.root_page_id,
-            arena,
+            branch,
             new_fork_epoch,
             &*links,
             &mut seen,
@@ -418,13 +435,26 @@ impl Reaper for TwoTierReaper {
         // direction.
         self.catalog.attach_child(BranchId::TRUNK.id, new_fork_epoch, rec.branch_id.id)?;
 
+        // RE-READ before the final write, do not write back the snapshot taken above.
+        //
+        // The copy may have claimed SEVERAL extents, each recorded against this branch inside
+        // `alloc_arena`'s atomic `add_arena`. Writing back `rec` as it stood before the copy would
+        // drop every one of them from `record.arenas` -- and the reaper frees exactly
+        // `record.arenas`, so those extents could never be reclaimed by anything. That is D20's
+        // read-modify-write, arriving through `collapse` instead of through `alloc_arena`.
+        //
+        // `put` is still a whole-record write because `parent_id`, `depth` and `fork_epoch` have
+        // no narrower setter and must move together with the root. The re-read narrows the window
+        // to the four lines below rather than to the whole page copy.
+        //
+        // Measured by mutation: restore the pre-copy snapshot here and
+        // `collapse_rolls_over_extents_for_a_tree_larger_than_one` leaves 664 of 664 copied pages
+        // still allocated after the branch is reaped -- leaked for the life of the file.
+        let mut rec = self.catalog.get(branch)?;
         rec.parent_id = Some(BranchId::TRUNK);
         rec.fork_epoch = new_fork_epoch;
         rec.depth = 1;
         rec.root_page_id = new_root;
-        if !rec.arenas.contains(&arena) {
-            rec.arenas.push(arena);
-        }
         self.catalog.put(&rec)?;
 
         // The old ancestors just lost a child, so their parked pages may now be free.
