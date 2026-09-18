@@ -19,7 +19,12 @@ import re
 import subprocess
 import sys
 
-ROOT = pathlib.Path(os.environ.get("S22_ROOT", "/Users/idide/wt/ferrodb-S22-verify"))
+# Default to the worktree this script lives in, NOT a hard-coded path: these were
+# written in a private worktree and a baked-in absolute path would silently mutate or
+# benchmark somebody else's tree.
+ROOT = pathlib.Path(os.environ.get("S22_ROOT") or subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"], cwd=pathlib.Path(__file__).resolve().parent,
+    capture_output=True, text=True, check=True).stdout.strip())
 SRC = ROOT / "src/buffer/buffer_pool.rs"
 TEST_TARGET = "integration_buffer_pool_concurrency"
 ROUNDS = 3
