@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::record::{CoreRecord, BranchRecord};
-use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, PageId};
+use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::page_header::PageType;
 use crate::cow::{PageStore, PAGE_HEADER_SIZE};
@@ -192,9 +192,9 @@ impl TwoTierReaper {
     /// same rollover the ordinary write path uses (`ArenaPageStore::cow_page`), not a second
     /// mechanism.
     ///
-    /// `used` collects every extent allocated into, because [`TwoTierReaper::reap`] frees exactly
-    /// `BranchRecord::arenas`: an extent the rollover claimed but nobody recorded is charged to
-    /// the branch durably and never freed, leaking for the lifetime of the database.
+    /// Nothing is collected for the caller: `alloc_arena` already records each extent it claims
+    /// against the branch, so the extents are durable as they are taken. What the caller must not
+    /// then do is write a pre-copy snapshot of the arena list back over them — see `collapse`.
     fn deep_copy(
         &self,
         page: PageId,
@@ -202,7 +202,6 @@ impl TwoTierReaper {
         epoch: Epoch,
         links: &dyn PageLinks,
         seen: &mut HashSet<PageId>,
-        used: &mut Vec<ArenaId>,
         budget: &mut usize,
     ) -> Result<PageId, FerroError> {
         if *budget == 0 {
@@ -229,16 +228,13 @@ impl TwoTierReaper {
         let children = links.child_pages(page_type, &data)?;
         let mut rewrites = Vec::with_capacity(children.len());
         for child in children {
-            let new_child = self.deep_copy(child, branch, epoch, links, seen, used, budget)?;
+            let new_child = self.deep_copy(child, branch, epoch, links, seen, budget)?;
             rewrites.push((child, new_child));
         }
 
         // Asked per page, not once: this is the point at which the current extent may have just
         // filled up, and `arena_for` answers with a fresh one when it has.
         let arena = self.store.arena_for(branch)?;
-        if !used.contains(&arena) {
-            used.push(arena);
-        }
         let new_id = self.store.alloc_in_arena(arena, page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
@@ -420,7 +416,7 @@ impl Reaper for TwoTierReaper {
         let new_fork_epoch = self.catalog.next_epoch();
         // A fresh extent to start in, so the materialised tree does not begin halfway through a
         // partly-filled one. `deep_copy` rolls on from here through `arena_for` as it fills.
-        let mut used = vec![self.store.alloc_arena(branch)?];
+        self.store.alloc_arena(branch)?;
         let mut seen = HashSet::new();
         let mut budget = MAX_COLLAPSE_PAGES;
         let new_root = self.deep_copy(
@@ -429,7 +425,6 @@ impl Reaper for TwoTierReaper {
             new_fork_epoch,
             &*links,
             &mut seen,
-            &mut used,
             &mut budget,
         )?;
 
@@ -447,15 +442,14 @@ impl Reaper for TwoTierReaper {
         rec.fork_epoch = new_fork_epoch;
         rec.depth = 1;
         rec.root_page_id = new_root;
-        // EVERY extent the copy touched, not just the first. `rec` was read before the copy began,
-        // so it predates all of them, and this `put` is the write that lands — `alloc_arena`
-        // records each claim durably as it goes, and a `put` of this stale snapshot would erase
-        // exactly the ones the rollover added.
-        for a in used {
-            if !rec.arenas.contains(&a) {
-                rec.arenas.push(a);
-            }
-        }
+        // **Re-read the arena list; never write the pre-copy snapshot back.** `rec` was read
+        // before the copy began, and the copy claims extents as it rolls over — each one recorded
+        // against the branch by `alloc_arena` as it is taken. Putting this record's own stale
+        // `arenas` back would erase exactly those, and `reap` frees exactly `record.arenas`, so
+        // the erased extents would be charged to the branch durably and never freed: a silent
+        // leak for the lifetime of the database. Re-reading also picks up an extent claimed by
+        // any other path, which an accumulator local to the copy could not see.
+        rec.arenas = self.catalog.get_raw(rec.branch_id.id)?.arenas;
         self.catalog.put(&rec)?;
 
         // The old ancestors just lost a child, so their parked pages may now be free.
