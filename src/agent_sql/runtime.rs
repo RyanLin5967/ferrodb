@@ -288,9 +288,9 @@ struct State {
     /// the only doors into `workspaces` for exactly that reason: an insert or a remove that went
     /// straight to the map would leave this under- or over-counted, and an under-count makes
     /// `capture_is_protected` answer "nothing needs this" about a capture a live task is standing
-    /// on — which is the F6 data loss, reached by a new door. A `debug_assert` in
-    /// `capture_is_protected` re-derives the answer by brute force on every call, so the whole
-    /// test suite is a differential test of this index against the scan it replaced.
+    /// on — which is the F6 data loss, reached by a new door. [`State::audit_txn_refs`] re-derives
+    /// the whole index by brute force at both doors in debug builds, so every fork and every seal
+    /// in the test suite is a differential test of this index against the scan it replaced.
     txn_refs: BTreeMap<u64, u32>,
     policy: PolicyTable,
 }
@@ -302,13 +302,55 @@ impl State {
         for t in txn_refs_of(&ws) {
             *self.txn_refs.entry(t).or_insert(0) += 1;
         }
-        // An id slot is recycled after a reap, so an insert CAN land on an occupied key. Dropping
-        // the old value's references here is what keeps the index balanced on that path; letting
-        // `BTreeMap::insert` silently discard it would strand them forever.
+        // An id slot is recycled after a reap, so an insert CAN land on an occupied key, and
+        // `BTreeMap::insert` hands back the workspace it displaced. That workspace's branch is
+        // dead by construction — nothing else could be occupying its slot — so everything the reap
+        // path releases has to be released here too. Dropping only the `txn_refs` and letting the
+        // capture go was exactly that leak: one permanently unreferenced `captures` entry per
+        // recycled slot, because `forget_captures_unless_published` is the only site that calls
+        // `captures.remove` and this path did not reach it. That is the unbounded growth
+        // `forget_reaped_branches` exists to prevent, arriving through a second door.
         if let Some(old) = self.workspaces.insert(id, ws) {
             self.drop_txn_refs(&old);
+            forget_captures_unless_published(self, &old);
         }
+        self.audit_txn_refs();
     }
+
+    /// Re-derive `txn_refs` by brute force and compare. Debug builds only.
+    ///
+    /// **This is what makes "the suite checks the index" true rather than nearly true.** The
+    /// `debug_assert` inside `capture_is_protected` was carrying that claim alone, and it is
+    /// reached from exactly one non-test caller — `forget_captures_unless_published`, which runs on
+    /// the abandon and reap arms and nowhere else. A fork or a published merge never reaches it. So
+    /// a desync introduced when a workspace was INSERTED stayed invisible until some later abandon
+    /// happened to ask about that particular txn, and a suite full of forks and merges proved
+    /// nothing about it.
+    ///
+    /// That matters beyond this file: the one hard constraint on anything that rewrites the fork
+    /// path is that `workspaces` has exactly two doors, because they maintain this index, and a
+    /// rewrite going straight to `BTreeMap::insert` desyncs it until `capture_is_protected` starts
+    /// answering "nothing needs this" about a capture a live task is standing on — the F6 data
+    /// loss. Auditing at both doors is what turns that constraint from advice into a failing test.
+    #[cfg(debug_assertions)]
+    fn audit_txn_refs(&self) {
+        let mut want: BTreeMap<u64, u32> = BTreeMap::new();
+        for ws in self.workspaces.values() {
+            for t in txn_refs_of(ws) {
+                *want.entry(t).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(self.txn_refs, want, "txn_refs disagrees with a scan of workspaces");
+    }
+
+    /// Release builds pay nothing, which is the only reason this can sit on two hot doors: the
+    /// audit is O(open sessions), so it makes a debug fixture that forks N sessions O(N²). The
+    /// largest fork loop anywhere in `tests/` is ~200, and `cargo test --lib` is unchanged at
+    /// 63 s with it live, so the cost is not paid today — but a future debug test forking tens of
+    /// thousands of sessions would feel it, and should use a release build or a fixture helper
+    /// rather than weakening this.
+    #[cfg(not(debug_assertions))]
+    fn audit_txn_refs(&self) {}
 
     /// Remove a workspace, releasing the txn references it held.
     ///
@@ -318,6 +360,7 @@ impl State {
     fn remove_workspace(&mut self, id: &u64) -> Option<Workspace> {
         let ws = self.workspaces.remove(id)?;
         self.drop_txn_refs(&ws);
+        self.audit_txn_refs();
         Some(ws)
     }
 
@@ -4246,9 +4289,12 @@ fn forget_one_branch(state: &mut State, id: u64, bid: BranchId) -> bool {
 ///
 /// The second half reads [`State::txn_refs`] rather than scanning `workspaces`. The scan was
 /// O(open sessions) and ran under the per-statement lock once per branch being forgotten; see that
-/// field for the measurement. The `debug_assert` re-derives the answer the slow way on every call,
-/// so every test in this repository that forks, merges, abandons or reaps is checking the index
-/// against the scan it replaced.
+/// field for the measurement.
+///
+/// The `debug_assert` re-derives THIS ONE answer the slow way — but it only runs where this
+/// predicate does, which is the abandon and reap arms and nowhere else: a fork or a published merge
+/// never reaches here. Coverage of the insert path comes from [`State::audit_txn_refs`], not from
+/// this line. Saying otherwise was an overstatement this comment used to make.
 fn capture_is_protected(state: &State, txn: TxnId) -> bool {
     let indexed = state.txn_refs.contains_key(&txn.0);
     debug_assert_eq!(
@@ -4856,6 +4902,54 @@ mod tests {
         // premise of a published row.
         st.txn_refs.remove(&100);
         capture_is_protected(&st, TxnId(100));
+    }
+
+    /// **The audit has to be able to FAIL at a door**, and a passing suite does not show that it
+    /// can. `capture_is_protected`'s assertion only runs on the abandon and reap arms, so it is
+    /// this one that covers a desync introduced on the fork path — which is the constraint any
+    /// rewrite of `begin_session` is held to. Here is an input that makes it fire.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "txn_refs disagrees with a scan")]
+    fn the_door_audit_fires_on_a_desynchronised_index() {
+        let mut st = State::default();
+        st.insert_workspace(7, ws("b_7", 100, &[]));
+        st.insert_workspace(8, ws("b_8", 101, &[100]));
+        // An OVER-count: a reference to a txn no workspace holds. That is the direction a rewrite
+        // going straight to `BTreeMap::insert` produces, and the one the audit alone can see — an
+        // under-count is caught earlier and more loudly by `drop_txn_refs`, which refuses to
+        // decrement below zero (proven by this test's first draft, which tripped that instead).
+        st.txn_refs.insert(999, 1);
+        st.remove_workspace(&8);
+    }
+
+    /// The capture of a workspace displaced by a RECYCLED SLOT is dropped, not stranded.
+    ///
+    /// `BTreeMap::insert` hands back the old value and nothing else was releasing it, so each
+    /// recycled slot leaked one `captures` entry forever — the unbounded growth this module exists
+    /// to prevent, through a door that is not the sweep.
+    #[test]
+    fn a_recycled_slot_does_not_strand_the_displaced_workspaces_capture() {
+        let mut st = State::default();
+        st.insert_workspace(7, ws("b_7", 100, &[]));
+        st.captures.insert(100, TxnCapture::new(TxnId(100), ProvId::NONE, BranchId::new(7, 0)));
+
+        // Slot 7 comes back at a new generation with a new txn, displacing the old workspace.
+        st.insert_workspace(7, ws("b_7", 200, &[]));
+        assert!(
+            !st.captures.contains_key(&100),
+            "the displaced workspace's capture was stranded: {:?}",
+            st.captures.keys().collect::<Vec<_>>()
+        );
+
+        // And a capture that IS still needed survives the same path: `published_txns` is the
+        // protection `forget_captures_unless_published` consults, so this proves the displacement
+        // uses that rule rather than deleting unconditionally.
+        st.captures.insert(300, TxnCapture::new(TxnId(300), ProvId::NONE, BranchId::new(9, 0)));
+        st.published_txns.insert(300);
+        st.insert_workspace(9, ws("b_9", 300, &[]));
+        st.insert_workspace(9, ws("b_9", 301, &[]));
+        assert!(st.captures.contains_key(&300), "a PUBLISHED capture must survive the displacement");
     }
 
     fn applied_at(seq: u64) -> AppliedOp {

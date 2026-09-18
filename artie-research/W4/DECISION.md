@@ -245,3 +245,58 @@ the error path it still runs inside the server's statement lock. That path is ra
 exactly one that may then also stall. Bounding it properly means either moving the sweep outside
 `with_lock` — which opens a window where a statement can touch a workspace whose branch is already
 reaped — or teaching the reaper to report what it freed before it failed. Neither was measured here.
+
+## Addendum 2 — closing two holes the review found in the index itself
+
+A fresh-context review of the diff produced six findings. One was wrong (it reported
+`tests/w4_sweep_slot_recycle.rs` as not compiling, on the strength of a trait method `add_arena`
+that does not exist in `BranchCatalog` — the reviewer said it had not run cargo, and the test
+compiles and passes). Four were real. Two of those are the ones below; they are in the index this
+record introduced, so they are its debt to pay.
+
+**1. `insert_workspace` stranded the displaced workspace's capture.** A recycled id slot makes
+`BTreeMap::insert` land on an occupied key and hand back the workspace it displaced. That
+workspace's branch is dead by construction — nothing else could be in its slot — and the code
+dropped its `txn_refs` but never its `state.captures` entry, because `captures.remove` is reached
+only through `forget_captures_unless_published` and this path did not call it. One permanently
+unreferenced capture per recycled slot: the unbounded growth `forget_reaped_branches` exists to
+prevent, arriving through a door that is not the sweep. It now calls
+`forget_captures_unless_published`, so the *published* rule applies here exactly as it does on the
+reap path — asserted in both directions by
+`a_recycled_slot_does_not_strand_the_displaced_workspaces_capture`.
+
+**2. The claim that the suite checks the index was overstated, and is now made true.** This record
+and the `txn_refs` doc comment both said the `debug_assert` in `capture_is_protected` re-derives the
+answer on every call, "so the whole test suite is a differential test of this index". It is not.
+`capture_is_protected` has exactly one non-test caller — `forget_captures_unless_published` — which
+runs on the abandon and reap arms and nowhere else; a fork or a published merge never reaches it. So
+a desync introduced when a workspace was **inserted** stayed invisible until some later abandon
+happened to ask about that particular txn.
+
+That mattered beyond this file: the hard constraint being handed to D27 — that `workspaces` has
+exactly two doors because they maintain this index, and a rewrite calling `BTreeMap::insert`
+directly desyncs it into the F6 data loss — was resting on a guard that would not have caught it.
+
+`State::audit_txn_refs` now re-derives the **whole** index by brute force and compares, in debug
+builds only, called from both doors. Every fork and every seal in every debug test run now checks
+it, which is what the constraint needs to be real rather than advice. `cargo test --lib` is
+1279 passed / 0 failed with it live.
+
+Both detectors are proven to fire rather than assumed to:
+`the_door_audit_fires_on_a_desynchronised_index` desyncs the index **upward** (a reference to a txn
+no workspace holds) and the audit catches it at a door. The downward direction is caught earlier and
+more loudly by `drop_txn_refs`, which refuses to decrement below zero — discovered by that test's
+first draft tripping it instead, which is recorded in the test rather than tidied away.
+
+### Corrections to this record's own earlier claims
+
+- "Two things measured and deliberately NOT fixed", item 2, said workspace lookups are
+  generation-blind and left it. The **escrow half of that is now fixed** (`82b4eb0`): `Pool::claimed`
+  and `Pool::spent` are keyed by the whole `BranchId`. What remains open is the `workspaces` map
+  itself — `blind_writes` and every other `state.workspaces.get(&branch.id)` still answers a stale
+  `BranchId` about the slot's new occupant.
+- The 189x headline earlier in this record is a claim about `Mutex<State>` and nothing else. The
+  addendum above is right that the server's per-statement lock is the outer `RuntimeLock`, held
+  across the entire sweep including phase 2, and that chunking `State` does not touch it. The
+  harness measures `AgentRuntime` directly with no `RuntimeLock` at all, so it was never measuring
+  that lock. Both numbers are real; neither is the other.
