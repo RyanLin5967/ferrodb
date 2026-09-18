@@ -638,7 +638,26 @@ impl TableBranchCatalog {
             Some(rec) if rec.state() != BranchState::Reaped => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
-            // Reaped, or gone entirely: a stale hint. Not a live child.
+            // **D16 — a reaped branch that still has live children is a PIN, not a stale hint.**
+            //
+            // Without this, pruning an INTERIOR branch loses its whole subtree: the grandparent
+            // consults only its DIRECT children, the reaped interior node resolves to "not live",
+            // and the grandparent reads as childless while a live grandchild still reaches its
+            // pages through the root it inherited. Reproduced in
+            // `tests/s18_transitive_visibility.rs`; MCTS prunes interior nodes, so this is the
+            // workload BranchBench names, not a corner case.
+            //
+            // The epoch reported is THIS entry's -- the reaped node's own fork epoch -- and that
+            // is the semantically correct one: a grandchild's root is the interior node's root at
+            // fork time, which is the grandparent's root at *that* epoch.
+            //
+            // Recursion is bounded by branch depth (`MAX_BRANCH_DEPTH = 8`, types.rs), not by the
+            // number of branches, so this stays O(1) in N and is NOT the global reachability walk
+            // that `mod.rs:13` forbids.
+            Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
+                Ok(keys::child_epoch_from_key(key).map(Epoch))
+            }
+            // Reaped with nothing under it, or gone entirely: a stale hint. Not a live child.
             _ => Ok(None),
         }
     }

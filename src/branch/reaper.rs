@@ -126,11 +126,39 @@ impl TwoTierReaper {
     /// event that can make a parked page reclaimable, which is why `reap` always follows it with
     /// a `drain_pending`.
     fn detach_from_parent(&self, rec: &BranchRecord) -> Result<(), FerroError> {
+        // **D16 — DO NOT DETACH A BRANCH THAT STILL HAS LIVE CHILDREN.**
+        //
+        // Its entry under its own parent is the ONLY thing linking that subtree to the
+        // grandparent, because the reclamation rule is stated over DIRECT children
+        // (`record.rs::page_reclaimable`, `mod.rs::live_child_in_epoch_range`) -- which is what
+        // keeps it O(1) per parent instead of the global reachability question `mod.rs:13`
+        // forbids. Detaching here made the grandparent read as childless while a live grandchild
+        // still reached its pages, and the grandparent's pages were then freed underneath it.
+        //
+        // Reproduced single-threaded and deterministically in `tests/s18_transitive_visibility.rs`.
+        // This is the operation MCTS performs -- pruning an interior node -- so a flat fanout
+        // never exercises it, which is why every benchmark here missed it.
+        if self.catalog.has_live_children(rec.branch_id.id)? {
+            return Ok(());
+        }
         let Some(parent) = rec.parent_id else { return Ok(()) };
         // One call rather than get/mutate/put. The old shape silently did nothing against any
         // catalog that keeps the live set in an index instead of inside the record - see
         // `BranchCatalog::detach_child`.
         self.catalog.detach_child(parent.id, rec.fork_epoch)?;
+
+        // CASCADE. The parent may itself be a reaped branch that was pinned open only by the
+        // child just removed. Without this the pin is permanent: the grandparent would keep
+        // seeing a live child for ever and its pages could never be reclaimed -- trading a
+        // correctness bug for an unbounded space leak, which is not a trade worth making.
+        //
+        // Terminates because each step moves strictly up the parent chain, whose length is capped
+        // at `MAX_BRANCH_DEPTH`.
+        if let Ok(prec) = self.catalog.get_raw(parent.id) {
+            if prec.state == BranchState::Reaped {
+                self.detach_from_parent(&prec)?;
+            }
+        }
         Ok(())
     }
 
