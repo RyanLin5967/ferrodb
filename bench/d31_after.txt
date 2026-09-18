@@ -3,10 +3,10 @@ ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
 Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
 
          N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
-       496       233.8       2.0        2.0           4104             4104            339          496
-      1000       215.4       4.1        4.1           4100             4100            332         1000
-      2000       197.5       8.2        8.2           4098             4098            330         2000
-      4000       139.5      16.4       16.4           4097             4097            330         4000
+       496       467.2       2.0        3.0           4104             6053            347          496
+      1000       585.0       4.1        5.1           4100             5100            332         1000
+      2000       174.9       8.2        8.2           4098             4123            330         2000
+      4000       382.7      16.4       16.6           4097             4158            330         4000
 
 DID NOT stop early within the budget: N = 4000, 4097 bytes/branch.
 
