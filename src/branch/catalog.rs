@@ -28,7 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
-use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::types::{
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -298,6 +300,28 @@ impl LogBranchCatalog {
             .filter(|r| r.state == BranchState::Live)
             .count()
     }
+
+    /// Durably replace a whole record. **Inherent and private — D41 removed this from
+    /// `BranchCatalog`.**
+    ///
+    /// It survives here for two jobs, neither of which is a catalog operation:
+    ///
+    /// 1. The multi-field trait methods below that this implementation still expresses as a
+    ///    read-modify-write over the resident record (`set_root`, `renew_lease`, `attach_child`,
+    ///    `detach_child`). They are unchanged by D41 and exposed to the same window they always
+    ///    were; the D41 entry scopes them out explicitly as "internal, and not the hazard".
+    /// 2. The format and replay tests in this file, which have to write records the engine would
+    ///    never produce on purpose — a parent still listing a reaped child, a torn tail, a slot
+    ///    whose generation has to be forced.
+    ///
+    /// Private so that no `dyn BranchCatalog` holder, and nothing outside this module, can reach
+    /// it. That is the whole of D41: the whole-record write is an implementation detail of one
+    /// catalog, not something a caller may ask any catalog for.
+    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
+        self.append(&[record])?;
+        self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
+        Ok(())
+    }
 }
 
 impl BranchCatalog for LogBranchCatalog {
@@ -356,9 +380,106 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(rec.clone())
     }
 
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        self.append(&[record])?;
-        self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        // **D41 — under the write lock, appending while it is held.** Exactly the shape
+        // `add_arena` and `charge_row_writes` take here, and for exactly their reason: this
+        // catalog rebuilds every record by replaying its log, last-append-wins, so two mutators
+        // that copy under the lock and append after releasing it can append out of order and the
+        // earlier-appended-but-later-mutated record wins. The append has to be inside.
+        //
+        // ⚠ **That means an fsync with `state.write()` held, and it is the cost the D41 design
+        // entry flagged as this option's one falsifier.** It is not new: `add_arena` already
+        // accepts it here, stating that "correctness is not tradeable for it" — this is the
+        // test-oracle catalog, `TableBranchCatalog` is what production opens, and there the
+        // logical lock is released before the fsync so this pays nothing. Recorded rather than
+        // worked around.
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        let depth = st
+            .records
+            .get(&parent.id)
+            .ok_or(BranchError::NotFound(parent))?
+            .depth
+            .saturating_add(1);
+        if depth > MAX_BRANCH_DEPTH {
+            return Err(BranchError::DepthExceeded { branch, depth }.into());
+        }
+        let mut rec = rec.clone();
+        rec.parent_id = Some(parent);
+        rec.fork_epoch = fork_epoch;
+        rec.depth = depth;
+        rec.root_page_id = root;
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec.clone());
+        Ok(rec)
+    }
+
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        // The comparison and the write under one lock. Split across a `get`/`put` the narrowing
+        // was checked against a snapshot, so a second restriction could reinstate an envelope a
+        // first one had already narrowed away.
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        let mut rec = rec.clone();
+        rec.restrict(envelope)?;
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec);
+        Ok(())
+    }
+
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
+        // second half of every reap, and `check_readable` refuses `Reaping` outright.
+        if rec.generation != branch.generation {
+            return Err(BranchError::Reaped {
+                requested: branch,
+                current_generation: rec.generation,
+            }
+            .into());
+        }
+        if rec.state != expect {
+            return Err(BranchError::UnexpectedState {
+                branch,
+                expected: expect,
+                actual: rec.state,
+            }
+            .into());
+        }
+        if expect == to {
+            // Idempotent, and no log entry for a write that changes nothing — the same rule
+            // `add_arena` applies. It also keeps a second `set_state(.., Reaped)` from bumping the
+            // generation twice.
+            return Ok(());
+        }
+        let mut rec = rec.clone();
+        if to == BranchState::Reaped {
+            // The full meaning of the state: generation bumped so the old handle is a hard error,
+            // arenas cleared because the reaper has already returned them.
+            rec.mark_reaped();
+        } else {
+            rec.state = to;
+        }
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec);
         Ok(())
     }
 

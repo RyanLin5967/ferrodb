@@ -85,8 +85,29 @@ impl BranchCatalog for ForkInTheWindow {
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
         self.inner.fork(parent, lease)
     }
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        self.inner.put(record)
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        self.inner.reparent(branch, parent, fork_epoch, root)
+    }
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: ferrodb::branch::record::CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        self.inner.restrict_envelope(branch, envelope)
+    }
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        self.inner.set_state(branch, expect, to)
     }
     fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
         self.inner.set_root(branch, root)
@@ -178,9 +199,10 @@ fn a_session_that_recycled_a_reaped_slot_survives_a_sweep_already_in_flight() {
 
     // Reap it behind the runtime's back and hand the slot back to the allocator, exactly as the
     // lease reaper does with no client cooperation at all.
-    let mut rec = rt.branches().get(doomed.branch).unwrap();
-    rec.mark_reaped();
-    rt.branches().put(&rec).unwrap();
+    let rec = rt.branches().get(doomed.branch).unwrap();
+    rt.branches()
+        .set_state(doomed.branch, rec.state, BranchState::Reaped)
+        .unwrap();
     rt.branches().release_id(slot);
     assert!(rt.branches().get(doomed.branch).is_err(), "the doomed branch is gone from the catalog");
 

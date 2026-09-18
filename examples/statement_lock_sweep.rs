@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::agent_sql::session::AgentSession;
-use ferrodb::branch::types::BranchId;
+use ferrodb::branch::types::{BranchId, BranchState};
 
 /// Sorted latency samples, in nanoseconds.
 struct Samples(Vec<u64>);
@@ -174,9 +174,10 @@ fn oneshot(
         // Reap `g` branches behind the runtime's back -- exactly what the lease reaper does, and
         // the reason `forget_reaped_branches` exists at all: nothing tells the runtime.
         for sess in sessions.iter().take(g) {
-            let mut rec = rt.branches().get(sess.branch).expect("live record");
-            rec.mark_reaped();
-            rt.branches().put(&rec).expect("put reaped record");
+            let rec = rt.branches().get(sess.branch).expect("live record");
+            rt.branches()
+                .set_state(sess.branch, rec.state, BranchState::Reaped)
+                .expect("mark the record reaped");
         }
         // Exactly what `reap_expired` hands `scan_once`, for the targeted arm to be given.
         let reaped: Vec<BranchId> = sessions.iter().take(g).map(|sess| sess.branch).collect();

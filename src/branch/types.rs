@@ -307,6 +307,11 @@ pub enum BranchError {
     Reaped { requested: BranchId, current_generation: u32 },
     /// The branch is mid-reap and cannot accept reads or writes.
     Reaping(BranchId),
+    /// A [`crate::branch::BranchCatalog::set_state`] transition was refused: the branch is not in
+    /// the state its caller read. **D41.** The transition is published from a state that no longer
+    /// holds, so applying it would undo whatever moved the branch — lifting a quarantine that was
+    /// already lifted, or re-marking a branch somebody else is reaping.
+    UnexpectedState { branch: BranchId, expected: BranchState, actual: BranchState },
     /// The lease expired; the branch is eligible for non-cooperative reaping.
     LeaseExpired { branch: BranchId, deadline: LeaseDeadline, now_millis: u64 },
     /// Forking here would exceed `MAX_BRANCH_DEPTH`; collapse first.
@@ -329,6 +334,12 @@ impl Display for BranchError {
                 requested, current_generation
             ),
             BranchError::Reaping(b) => write!(f, "branch {} is being reaped", b),
+            BranchError::UnexpectedState { branch, expected, actual } => write!(
+                f,
+                "branch {} is {:?}, not {:?}: the state transition was computed against a record \
+                 that has since moved",
+                branch, actual, expected
+            ),
             BranchError::LeaseExpired { branch, deadline, now_millis } => write!(
                 f,
                 "lease on branch {} expired at {} (now {})",

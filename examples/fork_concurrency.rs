@@ -48,11 +48,15 @@ fn open_catalog(dir: &std::path::Path, tag: &str) -> Arc<TableBranchCatalog> {
 /// no number and could still be written up as a win. This repo has already been caught by exactly
 /// that shape once: `branch_scaling_bench` used an in-memory catalog and so could not see an O(N^2)
 /// durable cost at all.
+/// **D41 — one `add_arena` per extent, not a whole-record `put`.** This function was the eighth
+/// `put` caller and the worst of them: it assigned `record.arenas` wholesale and wrote the record
+/// back, round-tripping through the core record the very field D20 moved OUT of it and into its own
+/// key span. `add_arena` is the operation that owns an arena; owning `n` of them is `n` of it.
 fn give_parent_arenas(cat: &TableBranchCatalog, n: u32) {
     use ferrodb::branch::types::ArenaId;
-    let mut trunk = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
-    trunk.arenas = (1..=n).map(ArenaId).collect();
-    cat.put(&trunk).expect("give trunk arenas");
+    for a in 1..=n {
+        cat.add_arena(BranchId::TRUNK, ArenaId(a)).expect("give trunk an arena");
+    }
 }
 
 fn main() {

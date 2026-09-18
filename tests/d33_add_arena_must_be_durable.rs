@@ -19,7 +19,6 @@
 //! set out to remove, moved from a race to a crash.
 //!
 //! Both arms reopen FROM DISK, which is the only thing that can see this.
-use std::sync::Arc;
 
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::table_catalog::TableBranchCatalog;
@@ -95,9 +94,10 @@ fn add_arena_refuses_a_stale_generation() {
 
     let first = cat.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
     let stale = first.branch_id;
-    let mut raw = cat.get_raw(stale.id).unwrap();
-    raw.mark_reaped(); // state = Reaped, generation += 1
-    cat.put(&raw).unwrap();
+    let raw = cat.get_raw(stale.id).unwrap();
+    // state = Reaped, generation += 1, arenas cleared — all three are what `Reaped` MEANS, and
+    // `set_state` is where that meaning lives now (D41).
+    cat.set_state(stale, raw.state, ferrodb::branch::types::BranchState::Reaped).unwrap();
     cat.release_id(stale.id);
 
     let reused = cat.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();

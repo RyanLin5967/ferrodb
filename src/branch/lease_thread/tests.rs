@@ -202,9 +202,8 @@ fn start_finishes_a_reap_a_crash_interrupted_before_any_scan_runs() {
     let peak = f.h.store.live_page_count().unwrap();
     assert!(peak > baseline, "the branch must really have allocated pages");
 
-    let mut rec: BranchRecord = f.h.catalog.get_raw(interrupted.id).unwrap();
-    rec.state = BranchState::Reaping;
-    f.h.catalog.put(&rec).unwrap();
+    let rec: BranchRecord = f.h.catalog.get_raw(interrupted.id).unwrap();
+    f.h.catalog.set_state(rec.branch_id, rec.state, BranchState::Reaping).unwrap();
 
     let lease = LeaseThread::start(
         Arc::clone(&f.reaper),
