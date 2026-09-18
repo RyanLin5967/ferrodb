@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::reaper::TwoTierReaper;
-use ferrodb::branch::types::{BranchId, LeaseDeadline};
+use ferrodb::branch::types::{BranchId, LeaseDeadline, ARENA_EXTENT_PAGES};
 use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cow::{CowPageLinks, CowTree, PageStore};
@@ -164,4 +164,99 @@ fn collapse_still_refuses_when_no_walker_is_supplied() {
     let b = e.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
     let err = reaper.collapse(b.branch_id).unwrap_err();
     assert!(err.to_string().contains("refusing to re-parent"), "got {}", err);
+}
+
+/// D13b: a branch whose tree is larger than **one arena extent** must still collapse.
+///
+/// `collapse` claims a single extent up front and threads that one `ArenaId` through every
+/// `deep_copy` recursion, and `alloc_in_arena` refuses when an extent is full rather than rolling
+/// over — its own message says "ask arena_for for a fresh extent", and nothing did. So collapse
+/// worked only for trees below `ARENA_EXTENT_PAGES` pages and died on anything larger, which is
+/// the size a real agent branch is. The 400-key tree in the test above is 21 pages; that is why
+/// every existing collapse test missed this.
+///
+/// The size is stated as a condition rather than a key count so it stays true if the leaf format
+/// changes and a fixed count stops exceeding an extent.
+#[test]
+fn collapse_survives_a_tree_larger_than_one_arena_extent() {
+    let e = env("bigcollapse");
+    let tree = CowTree::new(Arc::clone(&e.store) as Arc<dyn PageStore>);
+    let reaper = TwoTierReaper::new(
+        Arc::clone(&e.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
+        Arc::clone(&e.store),
+    )
+    .with_links(Arc::new(CowPageLinks));
+
+    let ep = e.catalog.next_epoch();
+    let mut root = tree.create(BranchId::TRUNK, ep).unwrap();
+    let mut n: u32 = 0;
+    while tree.walk_pages(root).unwrap().len() <= ARENA_EXTENT_PAGES as usize {
+        for _ in 0..500 {
+            root = tree.insert(root, BranchId::TRUNK, ep, &key(n), &val(n)).unwrap();
+            n += 1;
+        }
+        assert!(n < 200_000, "tree stopped growing at {} keys", n);
+    }
+    let pages = tree.walk_pages(root).unwrap().len();
+    assert!(
+        pages > ARENA_EXTENT_PAGES as usize,
+        "tree is {} pages, which does not exceed one {}-page extent",
+        pages,
+        ARENA_EXTENT_PAGES
+    );
+    e.catalog.set_root(BranchId::TRUNK, root).unwrap();
+
+    let b = e.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+    // The branch writes one of its own keys, so its visible state is not merely the trunk's.
+    let ep2 = e.catalog.next_epoch();
+    let new_root = tree.insert(b.root_page_id, b.branch_id, ep2, &key(7), b"mine").unwrap();
+    e.catalog.set_root(b.branch_id, new_root).unwrap();
+
+    let collapsed = reaper
+        .collapse(b.branch_id)
+        .unwrap_or_else(|err| panic!("collapse of a {}-page tree failed: {}", pages, err));
+
+    assert_eq!(collapsed.depth, 1, "collapse did not reset depth");
+    assert_ne!(collapsed.root_page_id, new_root, "collapse did not materialise a new root");
+
+    // Every key survives the copy, across every extent it spilled into.
+    for i in 0..n {
+        let want = if i == 7 { b"mine".to_vec() } else { val(i) };
+        assert_eq!(
+            tree.get(collapsed.root_page_id, &key(i)).unwrap(),
+            Some(want),
+            "key {} lost or corrupted by a collapse that spanned extents",
+            i
+        );
+    }
+
+    let old: std::collections::HashSet<_> =
+        tree.walk_pages(new_root).unwrap().into_iter().collect();
+    let new: std::collections::HashSet<_> =
+        tree.walk_pages(collapsed.root_page_id).unwrap().into_iter().collect();
+    assert!(new.is_disjoint(&old), "collapsed tree still shares pages with its source");
+    assert_eq!(new.len(), old.len(), "collapsed tree has a different shape");
+
+    // **Every extent the copy used must be charged to the branch.** `reap` frees exactly
+    // `record.arenas`, so an extent the rollover claimed but never recorded is leaked for the
+    // lifetime of the database — a silent space leak that no assertion above would notice.
+    let owned: std::collections::HashSet<_> = collapsed.arenas.iter().copied().collect();
+    let mut spanned = std::collections::HashSet::new();
+    for p in &new {
+        spanned.insert(e.store.read_page(*p).unwrap().header().unwrap().arena_id);
+    }
+    assert!(
+        spanned.len() > 1,
+        "the materialised tree sits in {} extent(s); it never spilled, so rollover was not exercised",
+        spanned.len()
+    );
+    for a in &spanned {
+        assert!(
+            owned.contains(a),
+            "extent {} holds materialised pages but is not in the branch's arena list {:?}: reap \
+             would leak it",
+            a,
+            collapsed.arenas
+        );
+    }
 }

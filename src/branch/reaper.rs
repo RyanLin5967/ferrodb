@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::record::{CoreRecord, BranchRecord};
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::page_header::PageType;
 use crate::cow::{PageStore, PAGE_HEADER_SIZE};
@@ -178,15 +178,28 @@ impl TwoTierReaper {
         Ok(())
     }
 
-    /// Post-order copy of the page graph rooted at `page` into `arena`, stamping every copy with
-    /// `epoch` and repointing parents at their new children.
+    /// Post-order copy of the page graph rooted at `page` into `branch`'s own extents, stamping
+    /// every copy with `epoch` and repointing parents at their new children.
+    ///
+    /// **Allocates through `arena_for`, one extent at a time, rather than threading a single
+    /// `ArenaId` down the recursion.** An extent is `ARENA_EXTENT_PAGES` pages (256, ~1 MB) and a
+    /// branch's tree is routinely larger: pinned to one extent this refused at page 257 with
+    /// `alloc_in_arena`'s own "ask arena_for for a fresh extent", so `collapse` — the only way
+    /// past `MAX_BRANCH_DEPTH` — worked on toy trees and failed on real ones. `arena_for` is the
+    /// same rollover the ordinary write path uses (`ArenaPageStore::cow_page`), not a second
+    /// mechanism.
+    ///
+    /// `used` collects every extent allocated into, because [`TwoTierReaper::reap`] frees exactly
+    /// `BranchRecord::arenas`: an extent the rollover claimed but nobody recorded is charged to
+    /// the branch durably and never freed, leaking for the lifetime of the database.
     fn deep_copy(
         &self,
         page: PageId,
-        arena: crate::branch::types::ArenaId,
+        branch: BranchId,
         epoch: Epoch,
         links: &dyn PageLinks,
         seen: &mut HashSet<PageId>,
+        used: &mut Vec<ArenaId>,
         budget: &mut usize,
     ) -> Result<PageId, FerroError> {
         if *budget == 0 {
@@ -213,10 +226,16 @@ impl TwoTierReaper {
         let children = links.child_pages(page_type, &data)?;
         let mut rewrites = Vec::with_capacity(children.len());
         for child in children {
-            let new_child = self.deep_copy(child, arena, epoch, links, seen, budget)?;
+            let new_child = self.deep_copy(child, branch, epoch, links, seen, used, budget)?;
             rewrites.push((child, new_child));
         }
 
+        // Asked per page, not once: this is the point at which the current extent may have just
+        // filled up, and `arena_for` answers with a fresh one when it has.
+        let arena = self.store.arena_for(branch)?;
+        if !used.contains(&arena) {
+            used.push(arena);
+        }
         let new_id = self.store.alloc_in_arena(arena, page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
@@ -396,15 +415,18 @@ impl Reaper for TwoTierReaper {
         }
 
         let new_fork_epoch = self.catalog.next_epoch();
-        let arena = self.store.alloc_arena(branch)?;
+        // A fresh extent to start in, so the materialised tree does not begin halfway through a
+        // partly-filled one. `deep_copy` rolls on from here through `arena_for` as it fills.
+        let mut used = vec![self.store.alloc_arena(branch)?];
         let mut seen = HashSet::new();
         let mut budget = MAX_COLLAPSE_PAGES;
         let new_root = self.deep_copy(
             rec.root_page_id,
-            arena,
+            branch,
             new_fork_epoch,
             &*links,
             &mut seen,
+            &mut used,
             &mut budget,
         )?;
 
@@ -422,8 +444,14 @@ impl Reaper for TwoTierReaper {
         rec.fork_epoch = new_fork_epoch;
         rec.depth = 1;
         rec.root_page_id = new_root;
-        if !rec.arenas.contains(&arena) {
-            rec.arenas.push(arena);
+        // EVERY extent the copy touched, not just the first. `rec` was read before the copy began,
+        // so it predates all of them, and this `put` is the write that lands — `alloc_arena`
+        // records each claim durably as it goes, and a `put` of this stale snapshot would erase
+        // exactly the ones the rollover added.
+        for a in used {
+            if !rec.arenas.contains(&a) {
+                rec.arenas.push(a);
+            }
         }
         self.catalog.put(&rec)?;
 
