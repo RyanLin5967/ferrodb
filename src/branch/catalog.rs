@@ -317,6 +317,22 @@ impl LogBranchCatalog {
     /// Private so that no `dyn BranchCatalog` holder, and nothing outside this module, can reach
     /// it. That is the whole of D41: the whole-record write is an implementation detail of one
     /// catalog, not something a caller may ask any catalog for.
+    /// **`#[cfg(test)]` since D45, and that is a RESULT rather than a tidy-up.**
+    ///
+    /// D41 removed `put` from the `BranchCatalog` trait, and this inherent one survived because
+    /// four methods here still needed it. D45 converted the last of them — `set_root`,
+    /// `renew_lease`, `attach_child`, `detach_child` — to do their read-modify-write under
+    /// `state.write()`, which left this with **no non-test caller at all**. CI builds with
+    /// `-D dead_code` and said so.
+    ///
+    /// Gated rather than deleted because the replay tests below genuinely need a whole-record
+    /// writer: they construct records the engine would never produce on purpose, which is the
+    /// point of a format test. Gated rather than `#[allow(dead_code)]` because the gate is the
+    /// stronger statement — `tests/` compiles against the library WITHOUT `cfg(test)`, so this is
+    /// what stops an integration test reaching for a whole-record write instead of naming the
+    /// field it means. Same gate and same reason as `TableBranchCatalog::put`
+    /// (`table_catalog.rs:715`); this file is now consistent with it.
+    #[cfg(test)]
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         self.append(&[record])?;
         self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
