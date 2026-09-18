@@ -16,10 +16,19 @@ cur = None
 for line in open(path):
     m = re.match(r"===== rep (\d+) \| (\w+) \| (.*?) =====", line)
     if m:
-        cur = {"rep": int(m.group(1)), "arm": m.group(2), "label": m.group(3), "rows": [], "exit": None}
+        cur = {"rep": int(m.group(1)), "arm": m.group(2), "label": m.group(3), "rows": [],
+               "exit": None, "pos": None, "la_in": None, "la_out": None}
         blocks.append(cur)
         continue
     if cur is None:
+        continue
+    m = re.match(r"^# position in rep: (\d+)", line)
+    if m:
+        cur["pos"] = int(m.group(1))
+        continue
+    m = re.match(r"^# loadavg at (launch|finish): ([\d.]+)", line)
+    if m:
+        cur["la_in" if m.group(1) == "launch" else "la_out"] = float(m.group(2))
         continue
     if line.startswith("HARNESS_EXIT="):
         cur["exit"] = line.strip().split("=")[1]
@@ -95,3 +104,29 @@ for label in labels:
                 per_rep.append(sixteen[0] / one[0])
         print(f"  per-rep {tcounts[-1]}T/{tcounts[0]}T {arm:<5}" +
               "".join(f"{v:>10.3f}x" for v in per_rep))
+
+    # ── Was the load drifting, and did the rotation cancel it? ────────────────────────────────
+    #
+    # A fixed arm order under a monotonic drift becomes a systematic POSITION bias -- which is how
+    # the first run of this factorial was wrong. Two diagnostics, printed rather than assumed:
+    #   1. the loadavg range across the run, so drift is visible at all;
+    #   2. 1-thread throughput by POSITION, pooled over arms. Under a Latin square each position
+    #      holds each arm once, so a position effect here is drift and not the arms.
+    las = [b["la_in"] for b in blocks if b["label"] == label and b["la_in"] is not None]
+    if las:
+        print(f"  loadavg at launch: min {min(las):.2f} max {max(las):.2f} "
+              f"first {las[0]:.2f} last {las[-1]:.2f}")
+    positions = sorted({b["pos"] for b in blocks if b["label"] == label and b["pos"]})
+    if positions:
+        print("  1T throughput by POSITION (pooled over arms; a Latin square should flatten this):")
+        for pos in positions:
+            vals = [r["per_s"] for b in blocks if b["label"] == label and b["pos"] == pos
+                    for r in b["rows"] if r["threads"] == tcounts[0]]
+            arms_at = sorted({b["arm"] for b in blocks if b["label"] == label and b["pos"] == pos})
+            if vals:
+                print(f"    pos {pos}: median {median(vals):>15,.0f}  (arms: {','.join(arms_at)})")
+        if len({len({b['arm'] for b in blocks if b['label'] == label and b['pos'] == p})
+                for p in positions}) == 1 and len(positions) == len(arms):
+            print("    -> every position held every arm: the square is balanced")
+        else:
+            print("    -> UNBALANCED: positions do not each hold every arm, so drift is NOT cancelled")

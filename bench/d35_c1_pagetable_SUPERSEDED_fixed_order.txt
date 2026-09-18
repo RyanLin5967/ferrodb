@@ -1,0 +1,353 @@
+# ============================================================================================
+# ⛔ SUPERSEDED. KEPT, NOT DELETED. DO NOT QUOTE THE ABSOLUTE NUMBERS BELOW.
+#
+# Same defect as bench/d35_c1_factorial_SUPERSEDED_rising_load.txt: the arm order was FIXED
+# (BASE then C1 in every rep) while the machine's load drifted monotonically upward, so C1 sat
+# at the higher load in every rep. Interleaving cancels a bias that is constant in time; against
+# a DRIFT it leaves a systematic POSITION bias.
+#
+# Direction: this one biases AGAINST C1, the arm being argued for.
+#
+# SUPERSEDED BY bench/d35_c1_pagetable.txt, which ALTERNATES the arm order over 4 reps so each
+# arm runs first twice and second twice, records loadavg at block finish as well as launch, and
+# refuses to start while a live pid holds /tmp/ferrodb-suite.lock.
+#
+# Everything below this line is the original artifact, unedited.
+# ============================================================================================
+
+# D35 C1: page table off the hit path -- BASE vs C1, interleaved
+# generated 2026-09-18T08:02:18-04:00
+# host: 18 cores, load average at start: 6.94 7.44 6.14
+# BASE = c56127f (unmodified)
+# C1   = 8bf34ad (lock-free tagged page-table mirror in fetch_page AND unpin_page)
+# Everything else, harness included, is byte-identical between the two binaries.
+#
+# The criterion is the SIGN OF THE SLOPE, not the multiplier.
+#
+# NOTE ON LOAD: this machine is shared with other agents. Arms are interleaved so both
+# sides see whatever load there is; the ABSOLUTE numbers are depressed by it.
+
+===== rep 1 | BASE | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 6.94 7.44 6.14
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.022	600000	27071281	0	0.000	0	0
+2	0.283	1200000	4238119	0	0.000	0	0
+4	0.732	2400000	3278457	0	0.000	0	0
+8	2.256	4800000	2127348	0	0.000	0	0
+16	3.382	9600000	2838186	0	0.000	0	0
+
+# calibration: 1 thread measured 27071281 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 27071281 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	27071281		x1.00		x1.00
+# 2	4238119		x0.16		x2.00
+# 4	3278457		x0.12		x4.00
+# 8	2127348		x0.08		x8.00
+# 16	2838186		x0.10		x16.00
+HARNESS_EXIT=0
+
+===== rep 1 | C1 | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 7.42 7.53 6.18
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.020	600000	29943981	0	0.000	0	0
+2	0.166	1200000	7209508	0	0.000	0	0
+4	0.594	2400000	4040182	0	0.000	0	0
+8	1.977	4800000	2428502	0	0.000	0	0
+16	1.944	9600000	4938357	0	0.000	0	0
+
+# calibration: 1 thread measured 29943981 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 29943981 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	29943981		x1.00		x1.00
+# 2	7209508		x0.24		x2.00
+# 4	4040182		x0.13		x4.00
+# 8	2428502		x0.08		x8.00
+# 16	4938357		x0.16		x16.00
+HARNESS_EXIT=0
+
+===== rep 2 | BASE | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 7.39 7.52 6.18
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.026	600000	22852137	0	0.000	0	0
+2	0.290	1200000	4132899	0	0.000	0	0
+4	0.712	2400000	3372107	0	0.000	0	0
+8	2.325	4800000	2064715	0	0.000	0	0
+16	3.370	9600000	2848708	0	0.000	0	0
+
+# calibration: 1 thread measured 22852137 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 22852137 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	22852137		x1.00		x1.00
+# 2	4132899		x0.18		x2.00
+# 4	3372107		x0.15		x4.00
+# 8	2064715		x0.09		x8.00
+# 16	2848708		x0.12		x16.00
+HARNESS_EXIT=0
+
+===== rep 2 | C1 | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 9.07 7.87 6.32
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.017	600000	35169302	0	0.000	0	0
+2	0.194	1200000	6190486	0	0.000	0	0
+4	0.620	2400000	3871378	0	0.000	0	0
+8	2.081	4800000	2306667	0	0.000	0	0
+16	2.301	9600000	4172918	0	0.000	0	0
+
+# calibration: 1 thread measured 35169302 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 35169302 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	35169302		x1.00		x1.00
+# 2	6190486		x0.18		x2.00
+# 4	3871378		x0.11		x4.00
+# 8	2306667		x0.07		x8.00
+# 16	4172918		x0.12		x16.00
+HARNESS_EXIT=0
+
+===== rep 3 | BASE | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 9.78 8.04 6.39
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.026	600000	23304930	0	0.000	0	0
+2	0.285	1200000	4204704	0	0.000	0	0
+4	0.700	2400000	3428109	0	0.000	0	0
+8	2.366	4800000	2028658	0	0.000	0	0
+16	3.255	9600000	2948884	0	0.000	0	0
+
+# calibration: 1 thread measured 23304930 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 23304930 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	23304930		x1.00		x1.00
+# 2	4204704		x0.18		x2.00
+# 4	3428109		x0.15		x4.00
+# 8	2028658		x0.09		x8.00
+# 16	2948884		x0.13		x16.00
+HARNESS_EXIT=0
+
+===== rep 3 | C1 | RESIDENT (every fetch is a cache HIT) =====
+# loadavg at launch: 11.32 8.39 6.52
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=200000 repeats=3
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.020	600000	30641101	0	0.000	0	0
+2	0.162	1200000	7422292	0	0.000	0	0
+4	0.680	2400000	3527480	0	0.000	0	0
+8	1.981	4800000	2423408	0	0.000	0	0
+16	2.282	9600000	4207118	0	0.000	0	0
+
+# calibration: 1 thread measured 30641101 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 30641101 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	30641101		x1.00		x1.00
+# 2	7422292		x0.24		x2.00
+# 4	3527480		x0.12		x4.00
+# 8	2423408		x0.08		x8.00
+# 16	4207118		x0.14		x16.00
+HARNESS_EXIT=0
+
+===== rep 1 | BASE | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 11.29 8.43 6.54
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.379	500	1319	500	1.000	0	0
+2	0.375	1000	2667	1000	1.000	0	0
+4	0.376	2000	5318	2000	1.000	0	0
+8	0.377	4000	10616	4000	1.000	0	0
+16	0.375	8000	21340	8000	1.000	0	0
+
+# calibration: 1 thread measured 1319 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1319 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1319		x1.00		x1.00
+# 2	2667		x2.02		x2.00
+# 4	5318		x4.03		x4.00
+# 8	10616		x8.05		x8.00
+# 16	21340		x16.17		x16.00
+HARNESS_EXIT=0
+
+===== rep 1 | C1 | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 11.29 8.43 6.54
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.376	500	1328	500	1.000	0	0
+2	0.378	1000	2645	1000	1.000	0	0
+4	0.377	2000	5310	2000	1.000	0	0
+8	0.373	4000	10710	4000	1.000	0	0
+16	0.375	8000	21362	8000	1.000	0	0
+
+# calibration: 1 thread measured 1328 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1328 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1328		x1.00		x1.00
+# 2	2645		x1.99		x2.00
+# 4	5310		x4.00		x4.00
+# 8	10710		x8.06		x8.00
+# 16	21362		x16.08		x16.00
+HARNESS_EXIT=0
+
+===== rep 2 | BASE | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 10.55 8.32 6.52
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.378	500	1322	500	1.000	0	0
+2	0.377	1000	2651	1000	1.000	0	0
+4	0.374	2000	5343	2000	1.000	0	0
+8	0.375	4000	10665	4000	1.000	0	0
+16	0.375	8000	21322	8000	1.000	0	0
+
+# calibration: 1 thread measured 1322 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1322 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1322		x1.00		x1.00
+# 2	2651		x2.01		x2.00
+# 4	5343		x4.04		x4.00
+# 8	10665		x8.07		x8.00
+# 16	21322		x16.13		x16.00
+HARNESS_EXIT=0
+
+===== rep 2 | C1 | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 10.55 8.32 6.52
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.377	500	1328	500	1.000	0	0
+2	0.375	1000	2664	1000	1.000	0	0
+4	0.376	2000	5313	2000	1.000	0	0
+8	0.376	4000	10635	4000	1.000	0	0
+16	0.375	8000	21336	8000	1.000	0	0
+
+# calibration: 1 thread measured 1328 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1328 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1328		x1.00		x1.00
+# 2	2664		x2.01		x2.00
+# 4	5313		x4.00		x4.00
+# 8	10635		x8.01		x8.00
+# 16	21336		x16.07		x16.00
+HARNESS_EXIT=0
+
+===== rep 3 | BASE | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 9.78 8.20 6.48
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.377	500	1327	500	1.000	0	0
+2	0.381	1000	2623	1000	1.000	0	0
+4	0.478	2000	4181	2000	1.000	0	0
+8	0.376	4000	10645	4000	1.000	0	0
+16	0.377	8000	21237	8000	1.000	0	0
+
+# calibration: 1 thread measured 1327 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1327 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1327		x1.00		x1.00
+# 2	2623		x1.98		x2.00
+# 4	4181		x3.15		x4.00
+# 8	10645		x8.02		x8.00
+# 16	21237		x16.01		x16.00
+HARNESS_EXIT=0
+
+===== rep 3 | C1 | OVERSUBSCRIBED, MODELLED IO 500us per read =====
+# loadavg at launch: 9.78 8.20 6.48
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.377	500	1325	500	1.000	0	0
+2	0.377	1000	2656	1000	1.000	0	0
+4	0.370	2000	5404	2000	1.000	0	0
+8	0.374	4000	10686	4000	1.000	0	0
+16	0.374	8000	21373	8000	1.000	0	0
+
+# calibration: 1 thread measured 1325 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1325 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1325		x1.00		x1.00
+# 2	2656		x2.00		x2.00
+# 4	5404		x4.08		x4.00
+# 8	10686		x8.07		x8.00
+# 16	21373		x16.14		x16.00
+HARNESS_EXIT=0
+

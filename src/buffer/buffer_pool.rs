@@ -136,27 +136,41 @@
 //!
 //! | | `touch` KEPT | `touch` DELETED |
 //! |---|---|---|
-//! | **no mirror** | BASE x0.107 | STUB x0.095 |
-//! | **mirror** | C1 x0.125 | **C1STUB x0.581**, rising monotonically 2T->16T |
+//! | **no mirror** | BASE x0.111 | STUB x0.080 |
+//! | **mirror** | C1 x0.121 | **C1STUB x0.579**, rising monotonically 2T->16T |
+//!
+//! ⭐ **Those are the ROTATED numbers, and the rotation is load-bearing — WAITING FOR A QUIET
+//! MACHINE WOULD NOT HAVE BEEN ENOUGH.** The first run of this factorial interleaved arms but kept
+//! their ORDER fixed, and loadavg drifted monotonically upward across it, so `C1STUB` sat at the
+//! highest load in every rep: a systematic POSITION bias, not noise. **Interleaving cancels only a
+//! bias that is constant in TIME; on this machine drift is the normal case.** The re-run rotates
+//! the four arms through a Latin square so each occupies each position exactly once, and the
+//! summariser now prints 1T throughput BY POSITION as the check — 38.4M / 38.8M / 38.6M / 38.6M,
+//! flat to within 1%. Load still rose 3.72 -> 13.14 DURING the re-run, with the suite lock free and
+//! no `cargo` on the process table, which is the proof that quiet was never the fix.
+//! Superseded raw data is kept, not deleted: `bench/d35_c1_factorial_SUPERSEDED_rising_load.txt`
+//! (biased against C1STUB) and `bench/d35_c1_pagetable_SUPERSEDED_fixed_order.txt` (against C1).
+//! Every cell moved by at most 0.015 and the ordering is identical — which is a RESULT of the
+//! re-run, not a reason it could have been skipped.
 //!
 //! Three cells collapse; only the fourth rises. **`touch` and the page table are two serialising
 //! points IN SERIES**, so removing either alone leaves the other binding. That is why STUB came
 //! out marginally worse than BASE, and why the gate's C1 arm looked like a shape change: it was
 //! built ON TOP OF its STUB arm, so it had BOTH removed and credited one cause with a two-cause
-//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.7M.
+//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.9M.
 //!
 //! ⭐ **The transferable form, which is worth more than the instance: an arm that removes one of
 //! two SERIALISED walls measures the OTHER wall, not the one it removed. Two "no effect" results
 //! in series are not evidence that neither is a wall.**
 //!
 //! **So neither half is a shape change alone.** A page-table mirror that RETAINS `touch` -- the
-//! only version that can ship -- is x0.125 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
+//! only version that can ship -- is x0.121 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
 //! the same order as the constant BP-Wrapper was rejected for being. It is **not** in this tree
 //! for that reason; it is on `ferrodb-D35-C1-pagetable` at `c0d07d2`, certified green, waiting to
 //! be built into the pair.
 //!
 //! **The candidate is the PAIR** -- the page table off the hit path **plus** a batched,
-//! ARC-preserving `touch` -- and it is judged against a **x0.581 ceiling, not against zero**. A
+//! ARC-preserving `touch` -- and it is judged against a **x0.579 ceiling, not against zero**. A
 //! scheme landing at x0.20 has recovered a sixth of the available headroom and is a MICRO wearing
 //! a shape change's clothes. See `SCALE-DESIGN.md` D44 for the pre-registered falsifiers.
 //!
