@@ -1599,13 +1599,36 @@ mod tests {
         );
     }
 
-    /// **Known-open: `collapse`'s final `put` is still a whole-record write.**
+    /// **Known-open, ledger row D29: `collapse`'s final `put` is still a whole-record write.**
     ///
     /// D13b narrowed the window — `collapse` re-reads the record immediately before writing it,
     /// instead of writing back the snapshot it took before copying the whole tree — but it did not
     /// close it, because `parent_id`, `depth` and `fork_epoch` have no narrower setter and must
     /// move together with the new root. Anything that mutates the record between that re-read and
     /// that `put` is silently discarded.
+    ///
+    /// **WHICH DIRECTION D13b AND D31 MOVED THE WINDOW, because the D29 fix needs to know what it
+    /// is aiming at.** Both NARROWED it; neither widened it.
+    ///
+    /// * D13b: before it, `collapse` took its snapshot ABOVE `deep_copy` and wrote it back after,
+    ///   so the window was the whole page copy — unbounded in the size of the tree. It is now the
+    ///   four field assignments below the re-read.
+    /// * D31 (geometric extents): the extra `alloc_arena`/`add_arena` round-trips a collapse now
+    ///   makes all happen DURING the copy, i.e. above the re-read and outside the window. What
+    ///   D31 does change is the COST of removing the re-read: a collapse now claims several
+    ///   extents instead of one, so writing back a pre-copy snapshot would drop all of them from
+    ///   `record.arenas` and leak the lot. Mutant D in the D13b fire-check measured exactly that —
+    ///   664 of 664 copied pages unreclaimable after the branch was reaped.
+    ///
+    /// **Why `reap` has the same shape and is safe, which is the clue to the cheap fix.** `reap`
+    /// publishes `Reaping` durably BEFORE it frees anything, and `check_readable` rejects that
+    /// state — so nothing can land in its window, because every writer is already refused.
+    /// `renew_lease` goes through `check_readable` on both catalogs, so a `collapse` that
+    /// published such a marker would make the keepalive below REFUSE rather than be silently lost.
+    /// By inspection, not measured, and not free either: `reap` marks branches that are dying,
+    /// while `collapse` runs on a LIVE branch, so making it briefly unreadable is a real
+    /// behaviour change and not a drop-in swap. Recorded as a lead worth costing, not a
+    /// recommendation.
     ///
     /// This drives the smallest of those: a lease renewal. The wrapper below renews the lease to
     /// `u64::MAX` at the exact instant of collapse's re-read, which is what a live client's
