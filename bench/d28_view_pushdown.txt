@@ -32,6 +32,13 @@ Measured:
   W1  ferro_branches WHERE branch_id = 1, at 10^6:  22170.73 ms -> 0.13 ms
   W2  ferro_runs, at 10^6:                          22654.23 ms -> 0.05 ms
 
+The SHAPE is the result, not the ratio. Before, br_1row grew about 10x per 10x of N --
+185.09 -> 1919.30 -> 22170.73 -- which is the signature of a cost proportional to the
+CATALOG rather than to the answer. After, it is flat at sub-millisecond across a 100x
+change in N: 0.09 -> 0.37 -> 0.13. Flat and non-monotonic, because at that scale each cell
+is a single sub-millisecond sample and the ordering between them is noise. A ratio can be
+bought with a constant factor; a curve that stops rising cannot.
+
 
 REPRODUCING S15 FIRST, WHICH IS WHY THE "BEFORE" TABLE IS HERE AT ALL
 
@@ -50,9 +57,13 @@ source and is what the fix removes.
 
 WHAT DID NOT CHANGE, AND WHY THAT IS THE POINT
 
-br_all -- `SELECT * FROM ferro_branches` with NO WHERE -- is the control. Same view, same
-generator, identical code path before and after: a query that asks for every row must
-still build every row, and it does. 21.6 s -> 23.6 s at 10^6.
+br_all -- `SELECT * FROM ferro_branches` with NO WHERE -- is the control, deliberately,
+and it being unchanged is the intended result rather than a miss. Same view, same
+generator, identical code path before and after. A query with no predicate yields
+`ViewHint::All`, the hint narrows nothing, and the generator does exactly what it did
+before: a query that asks for every row must still build every row. 21.6 s -> 23.6 s at
+10^6. If this column HAD improved, the hint would be dropping rows somebody asked for, and
+the drift test would be the thing that failed.
 
 That control also sets the NOISE FLOOR, and it is not small. These runs were taken on a
 machine carrying a concurrent agent fleet at load average 20-23. Re-running the AFTER
@@ -64,12 +75,29 @@ table above -- a 45% swing on an unchanged code path, single sample, same binary
 
 live_cnt is S15's calibration control, there to prove the harness can SEE an O(N) cost.
 It reads 51.459 ms at 10^5 in the AFTER table against 6.098 ms in the BEFORE table, which
-looks like an 8x regression on a path D28 does not touch. It is not one. Re-running the
-same AFTER binary at the same N gave 7.434 ms. It was one bad sample -- these cells are
-unrepped. Checked rather than explained away: the first hypothesis written down was that
-the preceding queries used to warm the buffer pool with every record page and no longer
-do, and that hypothesis is WRONG, because it predicts a reproducible slowdown and the
-re-run shows none.
+looks like an 8x regression on a path D28 does not touch.
+
+** CORRECTION. This paragraph first said "it was one bad sample -- these cells are
+unrepped", on the strength of a single re-run that gave 7.434 ms. That was one sample
+being used to explain away another sample, which is not evidence, and it was wrong to
+state it as settled. Replaced by a measured distribution: bench/d28_live_count.txt and
+examples/live_count_reps.rs. **
+
+What the distribution says, at 10^5 over 10000 independent single draws: median 6.339 ms,
+p99 9.775 ms, max 32.176 ms. So `live_count` IS heavy-tailed in a single draw -- 5x the
+median within 10^4 draws -- and the BEFORE cell (6.098 ms) is an ordinary median draw.
+51.459 ms was not itself reproduced; the longest draw seen is 32.176 ms at load average
+12-14, against the 20-23 the D28 runs were taken at. That leaves 51 ms consistent with
+this distribution under higher load, which is an inference and is labelled as one.
+
+The part that is NOT an inference is that D28 cannot have caused it: `live_count` has zero
+production call sites -- see the S20 census in bench/d28_live_count.txt -- so nothing this
+change touches can reach it.
+
+A separate hypothesis was written down first and killed: that the queries which used to
+precede live_count warmed the buffer pool with every record page and no longer do. It
+predicts a reproducible slowdown; the re-run shows none. Recorded because a plausible
+untested mechanism is exactly the kind that survives into a ledger.
 
 
 WHAT THE FIX IS

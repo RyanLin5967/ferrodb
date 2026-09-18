@@ -1,0 +1,123 @@
+S20 / D28: what the `live_cnt` cell in bench/d28_after.txt actually was.
+
+Instrument: examples/live_count_reps.rs. Durable TableBranchCatalog on a real file, the
+same inherent `TableBranchCatalog::live_count` that runtime_curve times.
+
+
+THE QUESTION
+
+runtime_curve's `live_cnt` column is S15's calibration control and is taken ONCE per
+checkpoint, unrepped. Across D28's before/after runs it moved:
+
+    N=10^5:   6.098 ms  ->  51.459 ms    (8.4x)
+    N=10^6:  53.929 ms  ->  78.825 ms    (1.5x)
+
+D28 does not touch that path -- see the S20 verdict at the bottom, zero production call
+sites -- so either the source proof is wrong, or a single draw of `live_count` has a tail
+long enough to produce 51 ms. The second is a claim about a DISTRIBUTION and one sample
+cannot report one.
+
+
+A CORRECTION, LOGGED WHERE THE CLAIM WAS MADE
+
+An earlier version of bench/d28_view_pushdown.txt said, of the 51.459 ms cell:
+
+    "It was one bad sample -- these cells are unrepped."
+
+That was asserted on the strength of ONE re-run that gave 7.434 ms. One sample cannot
+establish that another sample was a tail, and this file was opened to replace the
+assertion with a measurement. The first measurement then APPEARED TO REFUTE IT:
+
+    N=10^5, 200 single draws:
+      cold 5.471   repped mean 4.999
+      min 4.339   median 5.158   p95 6.758   p99 7.041   max 7.344   max/median 1.4x
+
+A maximum of 7.3 ms over 200 draws puts 51.459 ms seven times outside anything observed.
+On that evidence "one bad sample" was NOT supported, and the honest state of the question
+at that point was: unexplained.
+
+200 draws is about one second of sampling, which is a very small window in which to catch
+a rare event. Widening it to 10000 draws (~1 minute) changes the answer:
+
+    N=10^5, 10000 single draws:
+      cold 8.016   repped mean 7.153
+      min 4.087   median 6.339   p95 9.064   p99 9.775   max 32.176   max/median 5.1x
+
+The tail is real and it is long: 99% of draws are under 10 ms and one in ten thousand
+reaches 32 ms. The distribution is heavy-tailed, not merely noisy, and the p99 does not
+predict the max.
+
+    N=10^6, 2000 single draws:
+      -- see bench/d28_live_count_1e6.txt --
+
+
+WHAT THIS DOES AND DOES NOT ESTABLISH
+
+Establishes:
+  * `live_count` at 10^5 costs ~5-6 ms median, ~10 ms p99, on this catalog. The BEFORE
+    cell (6.098 ms) is an ordinary median draw.
+  * Its single-draw distribution is heavy-tailed, reaching 5x the median within 10^4 draws.
+  * D28 cannot have changed it: zero production call sites (S20 verdict below).
+
+Does NOT establish:
+  * A 51.459 ms draw was never observed here. The longest seen is 32.176 ms, at load
+    average 12-14; the D28 runs were taken at load 20-23 with a concurrent agent fleet,
+    and the tail is the part of a distribution that load moves first. So 51 ms is
+    CONSISTENT with this distribution extended to higher load, and that last step is an
+    inference, not a measurement.
+
+Deliberately not done: re-running the probe under artificial load would likely close the
+gap, and it would also corrupt the measurements of every other agent on this machine.
+Not worth it for a cell that is a control rather than a result.
+
+
+WHY IT DOES NOT GATE D28
+
+`live_cnt` is a control column, not a deliverable. The deliverable columns moved five
+orders of magnitude (22170.73 ms -> 0.13 ms), the control that shares the CHANGED code
+path -- `br_all`, same view, same generator, no WHERE -- is unchanged, and `live_count`
+has no call site D28 can reach. A control whose single-sample tail is 5x its median is a
+reason to rep the control, which is a note for the harness, not a regression in the change.
+
+
+S20 VERDICT: exit criterion (b), and D28 did not earn it
+
+The row's two exits are (a) a maintained O(1) counter, or (b) a documented proof that no
+per-statement path can reach `live_count`. It is (b), and it held BEFORE D28 as well --
+this change did not remove the last caller, because there was never one in the engine.
+Recorded that way round so the row does not credit D28 with something it did not do.
+
+Complete census, all 26 occurrences of `live_count` in src/:
+
+  DEFINITIONS AND TRAIT PLUMBING (7)
+    src/branch/mod.rs:169                 trait declaration
+    src/branch/catalog.rs:292             inherent, LogBranchCatalog
+    src/branch/catalog.rs:451-452         trait impl -> delegates to the inherent
+    src/branch/table_catalog.rs:698-699   doc + inherent, TableBranchCatalog
+    src/branch/table_catalog.rs:977       trait impl -> delegates to the inherent
+    src/agent_sql/mem_catalog.rs:207      trait impl
+
+  TEST-ONLY (19), every one inside a `#[cfg(test)]` module
+    src/branch/catalog.rs:776, 1025                   (cfg(test) begins line 545)
+    src/branch/reaper.rs:513, 533, 1403               (cfg(test) begins line 439)
+    src/branch/table_catalog.rs:1307 .. 1880          (cfg(test) begins line 1099)
+
+  PRODUCTION CALLERS: none.
+
+So transitivity is vacuous: no statement path can reach `live_count` because NOTHING in
+the shipped library calls it at all. Checked directly for the paths that matter --
+
+    grep -rn "live_count" src/catalog/ src/execution/ src/agent_sql/runtime.rs \
+                          src/pgwire/ src/planner/ src/binder/
+    -> no matches
+
+-- which covers every route the executor takes to serve a system view: the five
+generators, `run_select`, the binder, the planner and the wire.
+
+Cargo.toml declares no `[[bin]]` and there is no src/bin, so the shipped surface is the
+library. The four callers outside it are examples/benchmarks -- branch_curve,
+durable_fork, runtime_curve, agent_isolation_demo -- none of which is a statement path.
+
+A counter would therefore make an O(N) walk fast that nothing on a statement path
+performs. It is unnecessary rather than merely unbuilt, which is the better outcome and
+the reason none was built.

@@ -6,7 +6,7 @@
 //! through the engine's own `Filter`. Its header says why: reuse gets "the engine's comparison and
 //! evaluation semantics, not a second implementation of them that can drift". At 10⁶ branches
 //! `SELECT * FROM ferro_branches WHERE branch_id = 1` therefore built 10⁶ rows to return one, and
-//! took **22.2 s** doing it on this machine (`scratchpad/d28_before.txt`; S15 measured 31.5 s on
+//! took **22.2 s** doing it on this machine (`bench/d28_before.txt`; S15 measured 31.5 s on
 //! theirs).
 //!
 //! [`ViewHint`] narrows what the *generator* builds without letting it decide what a row means.
