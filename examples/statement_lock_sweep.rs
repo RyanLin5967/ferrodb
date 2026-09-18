@@ -8,7 +8,14 @@
 //! branches). Those are different numbers and this harness reports both, because quoting the wall
 //! time as the stall is the error this measurement exists to avoid.
 //!
-//!   statement_lock_sweep [S,comma,separated] [window_ms] [op_period_ms]
+//!   statement_lock_sweep [S,comma,separated] [window_ms] [op_period_ms] [gone] [reps]
+//!
+//! TWO tables, because the sweep has two lock-held phases and they are exercised by different
+//! fixtures. Table 1 is the steady state — nothing is reap-eligible, so only phase 1 (the walk
+//! over `workspaces`) runs. Table 2 is the case that actually happens when the lease reaper fires:
+//! `gone` of the S branches have been reaped in the catalog, so phase 3 runs too. Phase 3 calls
+//! `capture_is_protected`, which scans **every** workspace per removed branch, so it is O(gone x S)
+//! under the lock — measuring only table 1 would report the smaller, calmer number and miss it.
 //!
 //! Three arms per S, all driven by one prober thread that does nothing but take the lock and let
 //! go (`quarantine_reason` against an empty map — the cheapest public call that acquires it),
@@ -30,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
+use ferrodb::agent_sql::session::AgentSession;
 use ferrodb::branch::types::BranchId;
 
 /// Sorted latency samples, in nanoseconds.
@@ -132,6 +140,64 @@ fn arm(rt: &Arc<AgentRuntime>, window: Duration, period: Duration, mut op: impl 
     Arm { probe: Samples::of(prober.join().unwrap()), op: Samples::of(walls) }
 }
 
+/// A runtime holding `s` open sessions, and the handles that keep them open.
+fn fixture(s: usize) -> (Arc<AgentRuntime>, Vec<AgentSession>) {
+    let rt = Arc::new(AgentRuntime::new());
+    let sessions: Vec<AgentSession> = (0..s)
+        .map(|i| rt.begin_session("prober", Some(&format!("r{i}")), BranchId::TRUNK).expect("fork"))
+        .collect();
+    let live = rt.run_activity().len();
+    assert_eq!(live, s, "wanted {s} open sessions, runtime holds {live}");
+    (rt, sessions)
+}
+
+/// ONE sweep against a fresh fixture in which `g` branches really have been reaped, timed by the
+/// same prober.
+///
+/// Phase 3 is self-consuming: a sweep removes the branches it found, so a second sweep against one
+/// fixture has `gone = 0` and measures nothing. The periodic arm cannot be used here at all, and
+/// rebuilding the fixture is the only honest way to take more than one sample. Each rep
+/// contributes the prober's largest stall while that single sweep ran.
+fn oneshot(s: usize, g: usize, reps: usize) -> (Samples, Samples) {
+    let mut stalls: Vec<u64> = Vec::with_capacity(reps);
+    let mut walls: Vec<u64> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let (rt, sessions) = fixture(s);
+        // Reap `g` branches behind the runtime's back -- exactly what the lease reaper does, and
+        // the reason `forget_reaped_branches` exists at all: nothing tells the runtime.
+        for sess in sessions.iter().take(g) {
+            let mut rec = rt.branches().get(sess.branch).expect("live record");
+            rec.mark_reaped();
+            rt.branches().put(&rec).expect("put reaped record");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe_rt = Arc::clone(&rt);
+        let probe_stop = Arc::clone(&stop);
+        let prober = std::thread::spawn(move || {
+            let mut out: Vec<u64> = Vec::with_capacity(1 << 14);
+            while !probe_stop.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
+                let _ = probe_rt.quarantine_reason(BranchId::TRUNK);
+                out.push(t0.elapsed().as_nanos() as u64);
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            out
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        let t0 = Instant::now();
+        let dropped = rt.forget_reaped_branches();
+        walls.push(t0.elapsed().as_nanos() as u64);
+        assert_eq!(dropped, g, "fixture reaped {g} branches, sweep forgot {dropped}");
+
+        stop.store(true, Ordering::Relaxed);
+        stalls.push(Samples::of(prober.join().unwrap()).max());
+        drop(sessions);
+    }
+    (Samples::of(stalls), Samples::of(walls))
+}
+
 fn mean(s: &Samples) -> u64 {
     if s.0.is_empty() {
         0
@@ -169,12 +235,16 @@ fn main() {
     let period = Duration::from_millis(
         std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2),
     );
+    let gone: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let reps: usize = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(7);
 
     println!(
-        "# W4 statement-lock sweep. os={} window={:?} op_period={:?}",
+        "# W4 statement-lock sweep. os={} window={:?} op_period={:?} gone={} reps={}",
         std::env::consts::OS,
         window,
-        period
+        period,
+        gone,
+        reps
     );
     println!("# prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)");
     println!("# probe_* = one unrelated statement's lock acquisition, NANOSECONDS");
@@ -188,20 +258,12 @@ fn main() {
         "op_max"
     );
 
+    println!("#");
+    println!("# TABLE 1 -- steady state: nothing is reap-eligible, so only PHASE 1 runs.");
     for &s in &sweep {
-        let rt = Arc::new(AgentRuntime::new());
         let t_open = Instant::now();
-        // Held for the life of the arm: this makes "S OPEN sessions" true by construction rather
-        // than by an assumption about what dropping an `AgentSession` does.
-        let sessions: Vec<_> = (0..s)
-            .map(|i| {
-                rt.begin_session("prober", Some(&format!("r{i}")), BranchId::TRUNK).expect("fork")
-            })
-            .collect();
-        let open_ms = t_open.elapsed().as_millis();
-        let live = rt.run_activity().len();
-        assert_eq!(live, s, "wanted {s} open sessions, runtime holds {live}");
-        eprintln!("# S={s}: opened {live} sessions in {open_ms} ms");
+        let (rt, sessions) = fixture(s);
+        eprintln!("# T1 S={s}: opened {s} sessions in {} ms", t_open.elapsed().as_millis());
 
         // ARM 1 (under test) first, so it sees the coldest caches: the arm most likely to be
         // flattered by warm state should not be the one that gets it.
@@ -225,5 +287,30 @@ fn main() {
         row(s, "sweep", &a_sweep);
         row(s, "activ", &a_act);
         drop(sessions);
+    }
+
+    println!("#");
+    println!("# TABLE 2 -- a reap really happened: {gone} of the S branches are gone from the");
+    println!("# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, {reps} fixtures;");
+    println!("# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.");
+    println!(
+        "{:>8} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12}",
+        "S", "gone", "reps", "stall_med", "stall_max", "wall_med", "wall_max"
+    );
+    for &s in &sweep {
+        let g = gone.min(s);
+        let t0 = Instant::now();
+        let (stalls, walls) = oneshot(s, g, reps);
+        eprintln!("# T2 S={s} g={g}: {reps} fixtures in {} ms", t0.elapsed().as_millis());
+        println!(
+            "{:>8} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12}",
+            s,
+            g,
+            reps,
+            stalls.pct(0.50),
+            stalls.max(),
+            walls.pct(0.50),
+            walls.max(),
+        );
     }
 }
