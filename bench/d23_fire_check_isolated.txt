@@ -1,0 +1,89 @@
+=== D23 fire-check, ISOLATED worktree ===
+worktree: /Users/idide/wt/ferrodb-S20-firecheck  (branch S20-firecheck, base de980e2)
+date:     2026-09-18T03:12:42Z
+WHY ISOLATED: a fire-check must deliberately break the code. Doing that in
+  the shared S20 worktree already poisoned one measurement (a second agent
+  recorded integration_btree_concurrency as FAILING while my index.rs was
+  broken on purpose). Breaking happens here instead; the shared tree is
+  never left in a broken state.
+
+--- exact inputs (sha256) ---
+f0931ff1cbbccc1870baf9f6cdff90d9ffc04277d9c91a2320f8b0b97c50a96a src/storage/index.rs
+c9ca03e8e54098447925f7515c82994679320d6e9e62d81a88a21956c375c790 src/storage/page_latch.rs
+f8aeb55d8bf799c71723580cc992fa829d465cc67aff75ab3b7a897dbf5976d8 src/storage/range_scan.rs
+2619cc726abd2d0ae4292ec2e27459a308db42aeaaa126d285d35aa22644c5d8 src/buffer/buffer_pool.rs
+b0c774ce2ab8b7787cb78f6214a6d05d071c5e2a8ca8d882a4ebbf0235668c88 tests/integration_btree_concurrency.rs
+
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-S20-firecheck)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.37s
+--- BASELINE ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.78s
+
+--- BREAK A: leaf write latch released mid read-modify-write (the original defect) ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... FAILED
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.24s
+
+--- B-CONTROL: yield_now() inside the window, parent read latch HELD across it ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.69s
+
+--- B-BROKEN: identical + same yield, parent read latch RELEASED BEFORE the window ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... ok
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.78s
+
+--- BREAK C: RangeScanner reads each leaf with NO page read latch ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.37s
+
+--- RESTORED ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.51s
+
+inputs unchanged after run: f0931ff1cbbccc1870baf9f6cdff90d9ffc04277d9c91a2320f8b0b97c50a96a f8aeb55d8bf799c71723580cc992fa829d465cc67aff75ab3b7a897dbf5976d8 
+
+=== VERDICT ===
+BREAK A  FIRES  (8/16/32 fail, 1-thread control passes)
+         The fast-path leaf write latch is load-bearing. Removing it reproduces
+         the original lost-insert defect exactly.
+BREAK B  FIRES  (16 and 32 fail; 8 passes)
+         B-CONTROL and B-BROKEN are the same code with the same yield_now() in
+         the same place; the ONLY difference is whether drop(parent) sits before
+         or after the leaf write latch is acquired. Control clean, broken dirty.
+         The parent read latch is load-bearing, and its window is exactly
+         [release leaf read latch, acquire leaf write latch].
+         It did not fire at 8 threads: the window is small and needs enough
+         concurrent splitters to hit. Reported as measured, not rounded up.
+BREAK C  DOES NOT FIRE, and the signal is NOT vacuous.
+         live_scans = 214/319/290 completed concurrent full scans per round at
+         32 threads, against 32 concurrent writers, with the scanner taking no
+         page latch: live_scan_misses 0, live_scan_disorder 0.
+         So RangeScanner's per-leaf page read latch is NOT load-bearing today,
+         for two reasons that are both already true without it:
+           1. `frame.data` is assigned wholesale under the frame RwLock, so a
+              page read under the frame read lock is already atomic. There is
+              no torn page for the page latch to prevent.
+           2. `insert_into_latched_leaf` writes the NEW leaf before writing the
+              old one, and writing the old leaf is what publishes
+              `next -> new_page_id`. The chain never points at an unwritten page.
+         Keeping the latch is still defensible as defence-in-depth against (2)
+         being reordered back, but it must NOT be described as load-bearing: it
+         is an unproven guard and the code should say so.
