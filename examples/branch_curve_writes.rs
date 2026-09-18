@@ -33,7 +33,49 @@ use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cow::page_header::PageType;
 use ferrodb::cow::{stamp_checksum, PageStore, PAGE_HEADER_SIZE};
-use ferrodb::storage::disk_manager::DiskManager;
+use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
+
+/// Say which of the two worlds this number came from, and NAME THE HYPOTHESIS.
+///
+/// **This function exists because the line it replaces read backwards after the fix landed.**
+/// The old text was *"If that is far below 1048576 B, the first-page amplification is NOT binding
+/// here and D31 should be CLOSED rather than built"*. That reading holds only while geometric
+/// extent growth is ABSENT: then a run that completes the budget really does falsify D31. Once the
+/// growth rule is BUILT, the same branch prints for the opposite reason — the run completes
+/// *because the fix worked* — so an unconditioned verdict tells its reader to close the row at the
+/// exact moment the row succeeded, and a reader with no context believes the line rather than
+/// inferring the inversion.
+///
+/// A conditional verdict has to name the hypothesis it is conditioned on. The two reference values
+/// below are what distinguishes the cases, so both are printed in every outcome, including the one
+/// where neither fits.
+fn verdict(bytes_per_branch: f64) {
+    /// One page: what a branch's first page costs when extents grow geometrically from one.
+    const GROWN: f64 = PAGE_SIZE as f64;
+    /// One whole extent: what it cost when every extent was `ARENA_EXTENT_PAGES` long.
+    const FLAT: f64 = (ARENA_EXTENT_PAGES as usize * PAGE_SIZE) as f64;
+    /// "Within a small factor of". Generous on purpose — the catalog, the trunk's own pages and
+    /// the partially filled last extent all land in the gap, and the two references are 256x
+    /// apart, so nothing can be near both.
+    const NEAR: f64 = 8.0;
+
+    println!();
+    println!("  reference: one page = {GROWN:.0} B  ·  one full extent = {FLAT:.0} B  ({}x apart)",
+             ARENA_EXTENT_PAGES);
+    if bytes_per_branch <= GROWN * NEAR {
+        println!("VERDICT — AMPLIFICATION GONE. {bytes_per_branch:.0} B/branch is within {NEAR:.0}x of a");
+        println!("single page, so a branch's first page costs about a page. This is the tree WITH");
+        println!("geometric extent growth (D31) built; without it this number is ~{FLAT:.0}.");
+    } else if bytes_per_branch >= FLAT / NEAR {
+        println!("VERDICT — AMPLIFICATION PRESENT. {bytes_per_branch:.0} B/branch is within {NEAR:.0}x of a");
+        println!("whole extent, so every branch pays {ARENA_EXTENT_PAGES} pages for its first one. This is the");
+        println!("tree WITHOUT geometric extent growth, and it is what D31 exists to remove.");
+    } else {
+        println!("VERDICT — AMBIGUOUS. {bytes_per_branch:.0} B/branch sits between the two references above,");
+        println!("near neither. Do NOT read this as either result: say which tree it was taken on,");
+        println!("and look at `pages live` and the allocated-blocks column before concluding.");
+    }
+}
 
 fn main() {
     let checkpoints: Vec<usize> = std::env::args()
@@ -146,18 +188,16 @@ fn main() {
             println!("Extrapolated (ARITHMETIC, NOT MEASURED) to the objective:");
             println!("  10^6 branches x {:.0} B = {:.2} TB of data file.", per_branch,
                      per_branch * 1e6 / 1e12);
-            println!("D31 CONFIRMED as the binding wall on the ACTUAL objective: the 10^6 result in");
             println!("bench/curve_to_1e6.txt was reached fork-only, on the one workload that does not");
             println!("pay this. Fix is geometric extent growth (SCALE-DESIGN D31 option 1), NOT");
             println!("lowering ARENA_EXTENT_PAGES -- reclamation is per-extent on purpose.");
+            verdict(per_branch);
         }
         None => {
             let data = std::fs::metadata(&main_path).map(|m| m.len()).unwrap_or(0);
             println!("DID NOT stop early within the budget: N = {done}, {:.0} bytes/branch.",
                      data as f64 / done.max(1) as f64);
-            println!("If that is far below {} B, the first-page amplification is NOT binding here",
-                     ARENA_EXTENT_PAGES * 4096);
-            println!("and D31 should be CLOSED rather than built -- which is what its own falsifier asks.");
+            verdict(data as f64 / done.max(1) as f64);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
