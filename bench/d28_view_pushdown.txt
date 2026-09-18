@@ -1,0 +1,149 @@
+D28: predicate pushdown into the system-view generators, as a conservative HINT.
+
+Instrument: examples/runtime_curve.rs, phase `query`, taken verbatim from S15
+(ferrodb-S15-runtime-at-1e6, 0ac1931) and NOT modified. Both runs below are that
+same file, same checkpoints, same thread count:
+
+    ./target/release/examples/runtime_curve query 10000,100000,1000000 64
+
+Every timing is mean-of-reps through `execution::executor::run` -- the path the CLI
+and pgserver both take. System-view rows use view_reps=1 at N>=50000, so each of the
+br_* / runs / activity / quaran cells at 10^5 and 10^6 is a SINGLE sample.
+
+  br_1row = SELECT generation, state FROM ferro_branches WHERE branch_id = 1;  -- 1 row
+  br_all  = SELECT * FROM ferro_branches;                                      -- every row
+  runs    = SELECT * FROM ferro_runs;                                          -- ~1 row
+
+
+BEFORE (HEAD 6a99906, no hint)
+        N   BEGIN ms  INSERT ms  SELECT ms    ASOF ms   br_1row ms    br_all ms      runs ms  activity ms    quaran ms  live_cnt ms     RSS MB
+     9984    18.9439     0.0456     0.0338     0.0377       185.09       189.39       182.68       0.0159       0.0118        0.396       31.4
+    99968    33.5502     0.0430     0.0321     0.0316      1919.30      1907.48      1858.38       0.0351       0.0933        6.098      150.8
+  1000000    12.8180     0.0342     0.0149     0.0161     22170.73     21556.55     22654.23       0.0288       0.0583       53.929     1220.2
+
+AFTER (this branch)
+        N   BEGIN ms  INSERT ms  SELECT ms    ASOF ms   br_1row ms    br_all ms      runs ms  activity ms    quaran ms  live_cnt ms     RSS MB
+     9984    26.9339     0.0582     0.0360     0.0804         0.09       216.90         0.04       0.0169       0.0196        0.738       26.4
+    99968    22.8425     0.0453     0.0306     0.0308         0.37      1831.07         0.16       0.0284       0.0205       51.459      123.0
+  1000000    15.7270     0.0357     0.0154     0.0174         0.13     23624.71         0.05       0.0146       0.0164       78.825     1076.6
+
+
+Measured:
+  W1  ferro_branches WHERE branch_id = 1, at 10^6:  22170.73 ms -> 0.13 ms
+  W2  ferro_runs, at 10^6:                          22654.23 ms -> 0.05 ms
+
+
+REPRODUCING S15 FIRST, WHICH IS WHY THE "BEFORE" TABLE IS HERE AT ALL
+
+S15 measured W1 at 31.5 s and W2 at 44.1 s. Those are S15's numbers on S15's machine and
+a wall nobody has re-measured is a guess, so the first thing this pass did was run their
+harness against an unmodified tree. It reproduces: 22.2 s and 22.7 s, same shape, same
+order of magnitude, ~0.7x throughout (at 10^4 this machine gives 185 ms against their
+215 ms, at 10^5 1919 ms against their 2864 ms). The wall is real. The absolute numbers
+below are this machine's, not S15's, and the two sets should not be mixed.
+
+W2 reproduces lower than S15's relative to W1 (22.7 s here vs 44.1 s there, against a W1
+that only fell from 31.5 to 22.2). Not explained. It does not change what W2 was -- a
+full catalog scan plus one runtime Mutex acquisition per branch -- which is visible in the
+source and is what the fix removes.
+
+
+WHAT DID NOT CHANGE, AND WHY THAT IS THE POINT
+
+br_all -- `SELECT * FROM ferro_branches` with NO WHERE -- is the control. Same view, same
+generator, identical code path before and after: a query that asks for every row must
+still build every row, and it does. 21.6 s -> 23.6 s at 10^6.
+
+That control also sets the NOISE FLOOR, and it is not small. These runs were taken on a
+machine carrying a concurrent agent fleet at load average 20-23. Re-running the AFTER
+build at N=10^5 immediately afterwards gave br_all 2654 ms against the 1831 ms in the
+table above -- a 45% swing on an unchanged code path, single sample, same binary. So:
+
+  * anything under about 2x in these columns is not a result, it is load;
+  * W1 and W2 moved by ~10^5 x, which no amount of load accounts for.
+
+live_cnt is S15's calibration control, there to prove the harness can SEE an O(N) cost.
+It reads 51.459 ms at 10^5 in the AFTER table against 6.098 ms in the BEFORE table, which
+looks like an 8x regression on a path D28 does not touch. It is not one. Re-running the
+same AFTER binary at the same N gave 7.434 ms. It was one bad sample -- these cells are
+unrepped. Checked rather than explained away: the first hypothesis written down was that
+the preceding queries used to warm the buffer pool with every record page and no longer
+do, and that hypothesis is WRONG, because it predicts a reproducible slowdown and the
+re-run shows none.
+
+
+WHAT THE FIX IS
+
+Pushdown as a conservative HINT, never the authority (SCALE-DESIGN D28, option 2).
+
+`materialise` receives a `ViewHint` it is free to ignore. A hint can only ever ask the
+generator for MORE rows than the query needs, never fewer -- `Filter` still runs over
+everything the generator produces and remains the only thing that decides what a row
+means. So the failure mode of a bug in the hint is a slow query, not a wrong one. This is
+the SARGable / recheck split: Postgres separates an index CONDITION from a RECHECK
+qualifier for exactly this reason, and the index condition is allowed to be lossy in
+exactly one direction. Nothing here is novel.
+
+  ferro_branches   `scan_ids(lo, hi)` on the branch catalog. `RECORD` keys are
+                   [0x00][id big-endian] and the tree compares keys as byte strings, so a
+                   contiguous id range is one range descent. O(catalog) -> O(matching + log N).
+
+  ferro_runs       TWO changes, because pushdown alone does not fix W2. Its 10^6 Mutex
+                   acquisitions were one per BRANCH, so an unselective query brings every
+                   one of them straight back. See below.
+
+  ferro_row_authors  The hint narrows the TABLE NAME list, so `WHERE table_name = 'x'`
+                   stops calling `authors_of` on every other table's provenance span.
+
+  ferro_quarantine, ferro_run_activity  DECLINE the hint, deliberately. Each already
+                   generates rows in proportion to its own answer rather than to the
+                   catalog (0.016 ms and 0.015 ms at 10^6). Narrowing them would be a
+                   retain over a list already as short as the result.
+
+
+W2's SECOND HALF: THE PER-ROW LOCK ACQUISITIONS
+
+`runs_rows` scanned every branch record and called `run_of` per record. `run_of` takes the
+runtime's single Mutex -- the same one every INSERT, visible_rows and resolve_branch takes
+-- so reading a diagnostic view acquired it 10^6 times to return one row. Predicate
+pushdown removes those acquisitions only by not generating the rows, so a genuinely
+unselective `SELECT * FROM ferro_runs` would bring all 10^6 back.
+
+Fixed by changing the ROW SOURCE rather than by filtering it. `ferro_runs` has a row
+exactly where a workspace exists, so the workspace map IS the relation; branch records
+were being enumerated to discover a subset of it. `AgentRuntime::live_runs` takes the lock
+ONCE and returns that map. Records are still read for `generation`, but only over the span
+the live runs occupy, in one scan, merged by id.
+
+  acquisitions: O(branches) -> 1, whatever the predicate selects.
+  rows built:   O(branches) -> O(open sessions).
+
+Stated rather than hidden: live sessions scattered to both ends of the id space widen that
+record span back to the whole catalog. That is exactly the scan this replaces and never
+more than it, and the acquisition count stays at 1 regardless.
+
+Also stated: this makes `ferro_runs` MORE consistent, not less. It used to read the
+workspace map 10^6 times, each read seeing a possibly different world. It now reads it once.
+
+
+THE TEST, WHICH WAS WRITTEN AS THE FIRST STEP AND NOT THE LAST
+
+tests/integration_view_pushdown.rs, 8 tests, run against BOTH branch catalogs
+(LogBranchCatalog, where `scan_ids` is the trait's default filtered scan, and
+TableBranchCatalog, where it is a range descent -- two implementations that must agree).
+
+The drift test runs every view query twice, once through `run_select` and once through
+`run_select_unhinted`, and asserts identical results. `run_select_unhinted` exists for
+that comparison and nothing else calls it.
+
+Both halves were FORCED TO FIRE before being believed:
+
+  * `ViewHint::for_select` stubbed to return `ViewHint::All` -- the hint switched off.
+    3 of the 8 tests go red; the drift test stays GREEN, which is correct and is why the
+    drift test alone would not have been enough.
+
+  * `id_hint` stubbed to return `lo + 1` -- a hint that loses exactly one row, the only
+    failure mode this design claims to make impossible. The drift test goes RED on
+    `SELECT generation, state FROM ferro_branches WHERE branch_id = 3`.
+
+Neither test catches the other's case, which is why there are two.

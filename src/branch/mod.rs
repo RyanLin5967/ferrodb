@@ -109,6 +109,32 @@ pub trait BranchCatalog: Send + Sync {
     fn scan(&self)
         -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError>;
 
+    /// [`Self::scan`] restricted to the **inclusive** branch-id range `[lo, hi]`, same order.
+    ///
+    /// A narrowing the caller may ask for and an implementation may decline: the **default
+    /// implementation filters a full scan**, which returns exactly the right records and is not one
+    /// instruction faster. That is deliberate. It means adding this method broke no implementation
+    /// and, more importantly, that a caller cannot tell a narrowing catalog from a non-narrowing one
+    /// by its answer — only by its clock. An implementation whose records are already keyed by
+    /// branch id (`tree_keys::tag::RECORD` is `[0x00][id big-endian]`, so byte order *is* id order)
+    /// overrides it with a range descent and turns O(catalog) into O(matching + log N).
+    ///
+    /// `lo > hi` is an empty range and yields nothing. It is reachable rather than hypothetical:
+    /// `branch_id >= 9 AND branch_id <= 3` intersects to exactly that, and the honest answer to it
+    /// is no rows, not every row.
+    fn scan_ids(
+        &self,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        Ok(Box::new(self.scan()?.filter(move |r| match r {
+            Ok(rec) => rec.branch_id.id >= lo && rec.branch_id.id <= hi,
+            // An error is never filtered out. Dropping it here would turn a partway read failure
+            // into a short result that looks like a narrow one.
+            Err(_) => true,
+        })))
+    }
+
     /// The **latest** fork epoch among this id slot's live children, or `None` if it has none.
     ///
     /// Generation-blind, like `LogBranchCatalog::get_raw`, and takes a raw `u64` to say so: the

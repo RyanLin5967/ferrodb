@@ -16,13 +16,20 @@
 //!
 //! # A view is a snapshot per source, not one snapshot across sources
 //!
-//! Stated because the alternative is for a reader to assume otherwise. Four of the five views read
-//! more than one source through separate lock acquisitions — `ferro_runs` takes an `all_branches`
-//! snapshot and then asks `run_of` per branch, `ferro_row_authors` asks `authors_of` per table,
-//! `ferro_quarantine` takes the held set and then a reason per branch — so a `MERGE` landing mid-scan
-//! can leave a row out that was live when the scan began, or show one table's newly published rows
-//! while another table's from the same merge are missing. `ferro_run_activity` is the one view built
-//! from a single acquisition.
+//! Stated because the alternative is for a reader to assume otherwise. Three of the five views read
+//! more than one source through separate lock acquisitions — `ferro_row_authors` asks `authors_of`
+//! per table, `ferro_quarantine` takes the held set and then a reason per branch, and `ferro_runs`
+//! takes its live-run snapshot and then reads branch records — so a `MERGE` landing mid-scan can
+//! leave a row out that was live when the scan began, or show one table's newly published rows while
+//! another table's from the same merge are missing. `ferro_run_activity` is built from a single
+//! acquisition.
+//!
+//! **`ferro_runs` used to be the worst of these and is now the mildest** (D28). It took an
+//! `all_branches` snapshot and then asked `run_of` PER BRANCH, so at 10⁶ branches it acquired the
+//! runtime's one `Mutex` 10⁶ times, each acquisition seeing a possibly different world. It now takes
+//! [`AgentRuntime::live_runs`] once and reads records over the span those runs occupy — strictly
+//! fewer acquisitions and a strictly more consistent answer, which is the unusual case of the fast
+//! version also being the more honest one.
 //!
 //! Holding one lock across all of it is not the fix: the runtime's `Mutex` and the branch catalog's
 //! `RwLock` are currently only ever nested in one order, and widening a view's critical section is how
@@ -48,6 +55,18 @@
 //! branch_id = 3` gets the engine's comparison and evaluation semantics, not a second
 //! implementation of them that can drift.
 //!
+//! # What a [`ViewHint`] changes about that, and what it deliberately does not
+//!
+//! Materialise-then-filter costs O(source) per statement whatever the predicate selects, so at 10⁶
+//! branches `SELECT * FROM ferro_branches WHERE branch_id = 1` built a million rows to return one
+//! and took 22.2 s doing it — 0.13 ms after (`bench/d28_view_pushdown.txt`). D28 lets the generator
+//! be told, in a
+//! vocabulary that cannot express a wrong answer, which rows are worth building — and nothing else.
+//! `Filter` still runs, unchanged, over whatever the generator hands back, and remains the only
+//! thing that decides what a row means. A hint can only ever ask for MORE rows than the query needs,
+//! never fewer, so the paragraph above still holds: there is no second implementation of comparison
+//! semantics here, because a hint is not a comparison. See [`ViewHint`].
+//!
 //! # Real columns on the wire
 //!
 //! The output columns come from [`LogicalPlan::output_schema`], which is why this module builds a
@@ -57,8 +76,10 @@
 //! not a typed result a client can consume, so the schema is threaded from the plan to the wire
 //! and [`Outcome::Table`](crate::execution::executor::Outcome::Table) is the shape that carries it.
 
+use std::collections::BTreeSet;
+
 use crate::agent_sql::runtime::AgentRuntime;
-use crate::binder::binder::{Binder, BoundColumn, Scope};
+use crate::binder::binder::{Binder, BoundColumn, BoundExpr, Scope};
 use crate::branch::types::BranchState;
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::{Column, DataType, Value};
@@ -68,6 +89,7 @@ use crate::execution::executor::Executor;
 use crate::execution::filter::Filter;
 use crate::execution::projection::Projection;
 use crate::parser::parser::Stmt;
+use crate::parser::scanner::TokenType;
 use crate::planner::logical_plan::LogicalPlan;
 use crate::storage::heap_file_manager::RecordId;
 
@@ -322,13 +344,268 @@ impl SystemView {
         catalog: &Catalog,
         runtime: &AgentRuntime,
     ) -> Result<Vec<Vec<Value>>, FerroError> {
+        self.materialise_hinted(catalog, runtime, &ViewHint::All)
+    }
+
+    /// The same rows, generated under a [`ViewHint`] the generator is free to ignore.
+    ///
+    /// The hint can only ever make this produce a **superset** of what the query needs. It is never
+    /// asked, and is not able, to decide what a row means: [`Filter`] runs over whatever comes back
+    /// and stays the sole authority. See [`ViewHint`] for why that asymmetry is the whole design.
+    pub fn materialise_hinted(
+        &self,
+        catalog: &Catalog,
+        runtime: &AgentRuntime,
+        hint: &ViewHint,
+    ) -> Result<Vec<Vec<Value>>, FerroError> {
         match self {
-            SystemView::Branches => branches_rows(runtime),
-            SystemView::Runs => runs_rows(runtime),
-            SystemView::RowAuthors => row_author_rows(catalog, runtime),
+            SystemView::Branches => branches_rows(runtime, hint),
+            SystemView::Runs => runs_rows(runtime, hint),
+            SystemView::RowAuthors => row_author_rows(catalog, runtime, hint),
+            // **These two decline the hint, and that is a decision rather than an omission.** Each
+            // already generates rows in proportion to its own ANSWER rather than to the catalog:
+            // `quarantined_branches` reads the `Quarantined` state span, and `run_activity` walks
+            // the workspace map under one lock. Narrowing them would be a `retain` over a list that
+            // is already as short as the result, which buys nothing and adds a second place for the
+            // hint to be wrong. Measured at 10⁶ branches (`bench/d28_view_pushdown.txt`): 0.058 ms
+            // and 0.029 ms, against 22.2 s for `ferro_branches`.
             SystemView::Quarantine => quarantine_rows(runtime),
             SystemView::RunActivity => run_activity_rows(runtime),
         }
+    }
+
+    /// The one column of this view a hint can narrow on: the column whose order the generator's
+    /// source is already keyed by, so a range over it is a range over the source.
+    ///
+    /// Answered by NAME against [`Self::columns`] rather than by a hardcoded index, so reordering a
+    /// view's columns cannot silently point the hint at a different column — which would narrow on
+    /// the wrong values and lose rows, the one failure this design otherwise makes impossible.
+    fn key_column(&self) -> Option<(usize, KeyKind)> {
+        let (name, kind) = match self {
+            SystemView::Branches | SystemView::Runs => ("branch_id", KeyKind::BranchId),
+            SystemView::RowAuthors => ("table_name", KeyKind::TableName),
+            // Declining the hint, as `materialise_hinted` explains.
+            SystemView::Quarantine | SystemView::RunActivity => return None,
+        };
+        self.columns().iter().position(|c| c.name == name).map(|i| (i, kind))
+    }
+}
+
+/// Which lattice a view's key column narrows in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// A `u64` branch id, presented as `BIGINT`. Narrows to an inclusive interval.
+    BranchId,
+    /// A table name. Narrows to a set of names.
+    TableName,
+}
+
+/// A conservative narrowing of the rows a view has to generate — **a hint, never the authority.**
+///
+/// # The asymmetry this type exists to enforce
+///
+/// This module's header says the reuse of [`Filter`] and [`Projection`] "is the point": a view gets
+/// the engine's comparison semantics rather than a second implementation of them that can drift.
+/// That is correct and this does not undo it. What it does is let the *generator* be told, in a
+/// vocabulary too small to express a wrong answer, that it need not build rows nobody asked for.
+///
+/// Every variant means **"generate at least these"**, never "these are the answer". A generator may
+/// return more rows than a hint permits — including all of them, which is what
+/// [`ViewHint::All`] and every unrecognised predicate produce — and the result is identical, only
+/// slower. A generator may never return fewer. `Filter` then runs over whatever arrived and decides
+/// what a row means, exactly as before.
+///
+/// So the failure mode of a bug in here is a slow query, not a wrong one. The failure mode of
+/// pushing the predicate itself into the generator — the option this replaces — is a wrong one.
+///
+/// # Prior art, named rather than reinvented
+///
+/// This is the SARGable / recheck split: Postgres separates an index *condition*, which chooses
+/// which heap tuples to fetch, from a *recheck* qualifier that is evaluated on every tuple fetched.
+/// The index condition is allowed to be lossy in exactly one direction. Nothing here is novel and
+/// it should not be presented as if it were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewHint {
+    /// Generate everything. The hint that obliges nothing, and therefore the only one that is
+    /// always safe — which is why it is what every predicate this cannot read falls back to.
+    All,
+    /// Generate **at least** every row whose `branch_id` lies in `[lo, hi]`, inclusive.
+    ///
+    /// `lo > hi` is an empty range and is reachable: `branch_id >= 9 AND branch_id <= 3`.
+    BranchIds { lo: u64, hi: u64 },
+    /// Generate **at least** every row whose `table_name` appears in this set.
+    Tables(BTreeSet<String>),
+}
+
+impl ViewHint {
+    /// What this statement lets a generator skip, read off the **bound** predicate.
+    ///
+    /// Bound rather than parsed, so a column is a resolved offset and a literal has already been
+    /// through the binder — this never has to guess what a name refers to.
+    ///
+    /// Returns [`ViewHint::All`] for anything it does not fully understand, which is most things.
+    /// That is the intended behaviour and not a gap to be closed later: the set of predicates worth
+    /// recognising is small (an equality or a range on the view's own key), and every predicate
+    /// outside it must cost one full generation rather than a guess.
+    pub fn for_select(view: SystemView, stmt: &Stmt, catalog: &Catalog) -> Result<Self, FerroError> {
+        let Stmt::Select { from, where_clause, .. } = stmt else { return Ok(ViewHint::All) };
+        let Some(w) = where_clause else { return Ok(ViewHint::All) };
+        let qualifier = from.alias.clone().unwrap_or_else(|| view.name().to_string());
+        let mut scope = Scope::new();
+        scope.add_table(&qualifier, &view.schema())?;
+        let bound = Binder::new(catalog).bind_expr(w.clone(), &scope)?;
+        Ok(ViewHint::from_bound(view, &bound))
+    }
+
+    /// The same, off a predicate that is **already bound** against the view's own schema.
+    ///
+    /// The one place a hint is derived. `run_select` reaches it with the predicate it bound for the
+    /// `Filter`; [`Self::for_select`] reaches it by binding one itself. Two entry points, one
+    /// extraction, so there is no second reading of a predicate to drift from the first.
+    pub fn from_bound(view: SystemView, predicate: &BoundExpr) -> Self {
+        let Some((key, kind)) = view.key_column() else { return ViewHint::All };
+        match kind {
+            KeyKind::BranchId => id_hint(predicate, key),
+            KeyKind::TableName => match name_constraint(predicate, key) {
+                Some(names) => ViewHint::Tables(names),
+                None => ViewHint::All,
+            },
+        }
+    }
+
+    /// Is `id` inside this hint's branch-id range? `true` for every hint that does not constrain
+    /// branch ids, because a hint that says nothing excludes nothing.
+    fn admits_id(&self, id: u64) -> bool {
+        match self {
+            ViewHint::BranchIds { lo, hi } => id >= *lo && id <= *hi,
+            _ => true,
+        }
+    }
+}
+
+/// The inclusive branch-id range every row satisfying `expr` must lie in.
+///
+/// # Why the arithmetic happens in `i64` and not in `u64`
+///
+/// The rows carry `Value::BigInt(id as i64)`, so the engine compares a branch id **as a signed
+/// 64-bit number**. An id above `i64::MAX` therefore compares as negative, and `branch_id <= 20`
+/// matches it. Extracting `[0, 20]` in the `u64` domain would drop that row: a SUBSET, which is the
+/// one thing this type is not allowed to produce.
+///
+/// So the bounds are gathered in the domain the comparison actually happens in, and converted once,
+/// at the end, only when the result is genuinely one contiguous span of ids — which is exactly when
+/// the lower bound is non-negative. A predicate whose lower bound is negative wraps around the
+/// `u64` range in two pieces and is declined (`All`). `branch_id = 3`, `branch_id >= 10 AND
+/// branch_id <= 20` and every other shape a reader would type narrow normally.
+fn id_hint(expr: &BoundExpr, key: usize) -> ViewHint {
+    let (lo, hi) = signed_bounds(expr, key);
+    if lo < 0 {
+        return ViewHint::All;
+    }
+    if hi < lo {
+        // Empty, and honestly so: no id satisfies it.
+        return ViewHint::BranchIds { lo: 1, hi: 0 };
+    }
+    ViewHint::BranchIds { lo: lo as u64, hi: hi as u64 }
+}
+
+/// Bounds on the key column in the signed domain. `(i64::MIN, i64::MAX)` constrains nothing, and is
+/// what every expression this cannot read returns.
+fn signed_bounds(expr: &BoundExpr, key: usize) -> (i64, i64) {
+    const ANY: (i64, i64) = (i64::MIN, i64::MAX);
+    let BoundExpr::BinaryOp { left, operator, right } = expr else { return ANY };
+    match operator {
+        // A row satisfying both sides satisfies each, so it lies in the intersection.
+        TokenType::And => {
+            let (a, b) = signed_bounds(left, key);
+            let (c, d) = signed_bounds(right, key);
+            (a.max(c), b.min(d))
+        }
+        // The union of two intervals is not an interval, and this vocabulary has only intervals.
+        // Widening to everything is the answer that cannot be wrong.
+        TokenType::Or => ANY,
+        _ => comparison_bounds(left, *operator, right, key).unwrap_or(ANY),
+    }
+}
+
+/// `col OP literal` or `literal OP col`, as bounds — or `None` for anything else.
+fn comparison_bounds(
+    left: &BoundExpr,
+    op: TokenType,
+    right: &BoundExpr,
+    key: usize,
+) -> Option<(i64, i64)> {
+    let (v, op) = match (left, right) {
+        (BoundExpr::Column(i), BoundExpr::Literal(v)) if *i == key => (v, op),
+        // `3 < branch_id` means the same as `branch_id > 3`. Reading only one order would make the
+        // hint depend on how the query was typed.
+        (BoundExpr::Literal(v), BoundExpr::Column(i)) if *i == key => (v, mirror(op)),
+        _ => return None,
+    };
+    let n = match v {
+        Value::Integer(i) => *i as i64,
+        Value::BigInt(i) => *i,
+        // Every other literal type is declined rather than converted. A `Decimal("3.0")` or a
+        // `Varchar("3")` may well compare equal to a branch id under the engine's own coercion
+        // rules, and it is not this function's job to hold a second copy of those rules — that is
+        // the drift the whole module refuses. Declining costs one full generation and cannot be
+        // wrong.
+        _ => return None,
+    };
+    Some(match op {
+        TokenType::Equal => (n, n),
+        // `n == i64::MAX` has no representable successor, so there is nothing to narrow to; `ANY`
+        // via `None` is correct and a wrapped bound would not be.
+        TokenType::Greater => (n.checked_add(1)?, i64::MAX),
+        TokenType::GreaterEqual => (n, i64::MAX),
+        TokenType::Less => (i64::MIN, n.checked_sub(1)?),
+        TokenType::LessEqual => (i64::MIN, n),
+        // `!=` excludes one value out of a range, which is not an interval. Declined.
+        _ => return None,
+    })
+}
+
+/// The same comparison with its operands swapped.
+fn mirror(op: TokenType) -> TokenType {
+    match op {
+        TokenType::Greater => TokenType::Less,
+        TokenType::GreaterEqual => TokenType::LessEqual,
+        TokenType::Less => TokenType::Greater,
+        TokenType::LessEqual => TokenType::GreaterEqual,
+        // `=` and `!=` are symmetric; anything else is declined upstream anyway.
+        other => other,
+    }
+}
+
+/// The set of table names every row satisfying `expr` must have, or `None` for "any name".
+///
+/// Unlike the id lattice this one is a SET, so `OR` is expressible here and is taken: a union of
+/// two name sets is a name set, where a union of two id intervals is not an interval.
+fn name_constraint(expr: &BoundExpr, key: usize) -> Option<BTreeSet<String>> {
+    let BoundExpr::BinaryOp { left, operator, right } = expr else { return None };
+    match operator {
+        TokenType::And => match (name_constraint(left, key), name_constraint(right, key)) {
+            (Some(a), Some(b)) => Some(a.intersection(&b).cloned().collect()),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
+        TokenType::Or => {
+            // An unconstrained side means "any name", and a union with "any name" is "any name".
+            let (a, b) = (name_constraint(left, key)?, name_constraint(right, key)?);
+            Some(a.union(&b).cloned().collect())
+        }
+        TokenType::Equal => {
+            let name = match (&**left, &**right) {
+                (BoundExpr::Column(i), BoundExpr::Literal(Value::Varchar(s))) if *i == key => s,
+                (BoundExpr::Literal(Value::Varchar(s)), BoundExpr::Column(i)) if *i == key => s,
+                _ => return None,
+            };
+            Some([name.clone()].into_iter().collect())
+        }
+        // No ordering hint on names: the generator's source is a name-sorted list, so a range would
+        // be expressible, but the engine's `Varchar` collation is the authority on what `<` means
+        // between two names and this would be a second copy of it.
+        _ => None,
     }
 }
 
@@ -354,12 +631,23 @@ fn state_name(s: BranchState) -> &'static str {
     }
 }
 
-fn branches_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
+fn branches_rows(runtime: &AgentRuntime, hint: &ViewHint) -> Result<Vec<Vec<Value>>, FerroError> {
     // `scan`, which is every record whatever its state: a view whose job is to show what the
     // branch engine holds must show a quarantined or reaping branch too, and the `state` column is
     // how a reader narrows it. It arrives in branch-id order, which is what this used to sort into
     // afterwards, so the sort is gone with the dump it replaced.
-    let records = runtime.branches().scan()?.collect::<Result<Vec<_>, FerroError>>()?;
+    //
+    // `scan_ids` is the same scan with the hint's bounds on it. The two arms produce the same rows
+    // for the same database — the narrow one simply does not build the records `Filter` is about to
+    // discard. Measured at 10⁶ branches (`bench/d28_view_pushdown.txt`): `WHERE branch_id = 1` was
+    // 22170.73 ms of record hydration to return one row, and is 0.13 ms. `SELECT *` with no `WHERE`
+    // is unchanged at ~22 s, which is the control — a query that asks for every row must build
+    // every row.
+    let scan = match hint {
+        ViewHint::BranchIds { lo, hi } => runtime.branches().scan_ids(*lo, *hi)?,
+        _ => runtime.branches().scan()?,
+    };
+    let records = scan.collect::<Result<Vec<_>, FerroError>>()?;
     Ok(records
         .into_iter()
         .map(|r| {
@@ -385,15 +673,50 @@ fn branches_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> 
         .collect())
 }
 
-fn runs_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
+fn runs_rows(runtime: &AgentRuntime, hint: &ViewHint) -> Result<Vec<Vec<Value>>, FerroError> {
     // One row per branch that has a live run behind it. `run_of` answers from the workspace, which
     // `seal` drops the moment a branch merges or is abandoned, so this view is about work in
     // flight. `ferro_row_authors` is the question that keeps answering afterwards, and saying so
     // here is the difference between an empty view and a lost one.
-    let records = runtime.branches().scan()?.collect::<Result<Vec<_>, FerroError>>()?;
-    let mut out = Vec::new();
+    //
+    // **The relation is the workspace map, and this now reads it that way round.** It used to scan
+    // every branch record and ask `run_of` per record — 10⁶ acquisitions of the runtime's single
+    // `Mutex`, the one every `INSERT` also takes, to return one row (W2: 22654.23 ms at 10⁶ here,
+    // 44.1 s as S15 measured it; `bench/d28_view_pushdown.txt`). That is not a cost predicate
+    // pushdown removes: an unselective query brings every acquisition back. It is 0.05 ms now.
+    // `live_runs` takes the lock **once** and hands back the rows' actual source, so the count is
+    // bounded by open sessions rather than by branches ever forked.
+    //
+    // The records are still the authority for `generation`, so they are still read — but only over
+    // the span the live runs occupy, in one scan, merged by id. Both sides are in ascending id
+    // order, `live_runs` by `BTreeMap` and the scan by key. **Stated rather than hidden:** live
+    // sessions scattered to both ends of the id space widen that span back to the whole catalog,
+    // which is exactly the scan this replaces and never more than it.
+    let mut live = runtime.live_runs();
+    live.retain(|(id, _)| hint.admits_id(*id));
+    let (Some((first, _)), Some((last, _))) = (live.first(), live.last()) else {
+        // No live run, so no row — and no reason to touch the catalog at all.
+        return Ok(Vec::new());
+    };
+    let records = runtime
+        .branches()
+        .scan_ids(*first, *last)?
+        .collect::<Result<Vec<_>, FerroError>>()?;
+
+    let mut out = Vec::with_capacity(live.len());
+    let mut at = 0usize;
     for rec in records {
-        let Some(run) = runtime.run_of(rec.branch_id) else { continue };
+        // Both sides ascend, so the cursor only ever moves forward.
+        while at < live.len() && live[at].0 < rec.branch_id.id {
+            at += 1;
+        }
+        if at >= live.len() {
+            break;
+        }
+        if live[at].0 != rec.branch_id.id {
+            continue;
+        }
+        let run = &live[at].1;
         out.push(vec![
             Value::BigInt(rec.branch_id.id as i64),
             Value::Integer(rec.branch_id.generation as i32),
@@ -416,12 +739,23 @@ fn runs_rows(runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
     Ok(out)
 }
 
-fn row_author_rows(catalog: &Catalog, runtime: &AgentRuntime) -> Result<Vec<Vec<Value>>, FerroError> {
+fn row_author_rows(
+    catalog: &Catalog,
+    runtime: &AgentRuntime,
+    hint: &ViewHint,
+) -> Result<Vec<Vec<Value>>, FerroError> {
     // `Catalog::tables` is a `HashMap`, so the table order it yields varies run to run. Sorted, and
     // sorted by name before the per-table lookup rather than after, so a table with no attributed
     // rows costs nothing and the result is grouped the way a reader expects.
     let mut names: Vec<&str> = catalog.tables.keys().map(|s| s.as_str()).collect();
     names.sort_unstable();
+    // The narrowing that matters here is not the row count but the number of `authors_of` calls:
+    // each one walks a whole table's provenance span, so `WHERE table_name = 'orders'` used to read
+    // every other table's provenance in order to throw it away. A name the hint carries that is not
+    // a table simply matches nothing, which is the same answer the filter would reach.
+    if let ViewHint::Tables(want) = hint {
+        names.retain(|n| want.contains(*n));
+    }
     let mut out = Vec::new();
     for table in names {
         let mut authored = runtime.authors_of(table);
@@ -543,23 +877,6 @@ fn join_refusal(view: SystemView) -> FerroError {
     ))
 }
 
-/// Run one `SELECT` against a system view.
-///
-/// Binds the query's projection and `WHERE` against the view's declared schema, builds the logical
-/// plan so its [`output_schema`](LogicalPlan::output_schema) is what names the result's columns, and
-/// evaluates through the engine's own [`Filter`] and [`Projection`].
-///
-/// # Refusals
-///
-/// Both are refusals rather than best-effort answers, because the alternative in each case is to
-/// answer a different question than the one asked and not say so:
-///
-/// * `AS OF BRANCH b` — a system view is not branch-relative. Its rows describe the branch engine
-///   itself, so there is no "as this branch saw it" state to read; answering from the current state
-///   under an `AS OF` qualifier would report the present as the past.
-/// * a join — a view has no `TableEntry`, so the optimizer cannot lower a scan of it, and the join
-///   operators are reached only through `lower`. Refusing names the limit; ignoring the join clause
-///   would silently return the left side alone.
 /// The columns a `SELECT` on this view will produce, **without running it**.
 ///
 /// pgwire's extended protocol lets a client `Describe` a statement before it `Execute`s it, so the
@@ -597,11 +914,69 @@ pub fn describe_select(
     Ok(output)
 }
 
+/// Run one `SELECT` against a system view.
+///
+/// Binds the query's projection and `WHERE` against the view's declared schema, builds the logical
+/// plan so its [`output_schema`](LogicalPlan::output_schema) is what names the result's columns, and
+/// evaluates through the engine's own [`Filter`] and [`Projection`].
+///
+/// **Doc block restored here by D28, from above `describe_select` where it had come to sit.** It
+/// describes this function — `describe_select` announces columns and refuses nothing — and while it
+/// was attached to the wrong item `run_select` had no documentation at all and the `# Refusals`
+/// section below read as a claim about `Describe`.
+///
+/// # Refusals
+///
+/// Both are refusals rather than best-effort answers, because the alternative in each case is to
+/// answer a different question than the one asked and not say so:
+///
+/// * `AS OF BRANCH b` — a system view is not branch-relative. Its rows describe the branch engine
+///   itself, so there is no "as this branch saw it" state to read; answering from the current state
+///   under an `AS OF` qualifier would report the present as the past.
+/// * a join — a view has no `TableEntry`, so the optimizer cannot lower a scan of it, and the join
+///   operators are reached only through `lower`. Refusing names the limit; ignoring the join clause
+///   would silently return the left side alone.
 pub fn run_select(
     view: SystemView,
     stmt: &Stmt,
     catalog: &Catalog,
     runtime: &AgentRuntime,
+) -> Result<NamedRows, FerroError> {
+    select_with(view, stmt, catalog, runtime, Pushdown::On)
+}
+
+/// The same query with the generator hint **withheld**, so every view is materialised whole.
+///
+/// This exists for one reason and it is worth stating rather than leaving to be inferred: it is the
+/// other half of the drift test. A hint that can only widen what the generator produces is only
+/// *provably* harmless if some test runs the same statement both ways and compares the answers, and
+/// there is no way to run it the other way without a way to ask for it.
+///
+/// It is not a fallback, a toggle or a recovery path. Nothing in the engine calls it, and a
+/// disagreement between this and [`run_select`] is a bug in the hint rather than a reason to
+/// prefer this.
+pub fn run_select_unhinted(
+    view: SystemView,
+    stmt: &Stmt,
+    catalog: &Catalog,
+    runtime: &AgentRuntime,
+) -> Result<NamedRows, FerroError> {
+    select_with(view, stmt, catalog, runtime, Pushdown::Off)
+}
+
+/// Whether [`select_with`] is allowed to read a hint off the predicate it just bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pushdown {
+    On,
+    Off,
+}
+
+fn select_with(
+    view: SystemView,
+    stmt: &Stmt,
+    catalog: &Catalog,
+    runtime: &AgentRuntime,
+    pushdown: Pushdown,
 ) -> Result<NamedRows, FerroError> {
     let Stmt::Select { from, columns, where_clause, joins } = stmt else {
         return Err(FerroError::Bind(format!(
@@ -639,6 +1014,14 @@ pub fn run_select(
         }
         None => None,
     };
+    // Read off the predicate **this function already bound**, rather than binding the `WHERE`
+    // clause a second time for the hint's benefit. `ViewHint::for_select` binds and then calls the
+    // same `from_bound`, so the two entry points cannot extract different hints from one statement.
+    let hint = match (pushdown, &predicate) {
+        (Pushdown::On, Some(p)) => ViewHint::from_bound(view, p),
+        _ => ViewHint::All,
+    };
+
     let (exprs, output) = binder.bind_projection(columns.clone(), &scope)?;
     logical = LogicalPlan::Projection { input: Box::new(logical), exprs: exprs.clone(), output };
 
@@ -646,7 +1029,8 @@ pub fn run_select(
     // ferro_quarantine` advertises one column named `reason` and not all four.
     let schema = logical.output_schema();
 
-    let mut root: Box<dyn Executor> = Box::new(MaterialisedRows::new(view.materialise(catalog, runtime)?));
+    let mut root: Box<dyn Executor> =
+        Box::new(MaterialisedRows::new(view.materialise_hinted(catalog, runtime, &hint)?));
     if let Some(pred) = predicate {
         root = Box::new(Filter { child: root, predicate: pred });
     }
