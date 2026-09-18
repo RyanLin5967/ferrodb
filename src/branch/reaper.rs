@@ -138,6 +138,7 @@ impl TwoTierReaper {
     /// allocated page any more. Freeing them is what returns the *reserved* page count to
     /// baseline rather than merely stopping its growth.
     fn sweep_empty_extents(&self) -> Result<(), FerroError> {
+        if std::env::var("S18_NO_SWEEP").is_ok() { return Ok(()); } // S18 ATTRIBUTION PROBE
         for (arena, owner) in self.store.live_arenas() {
             let owner_gone = match self.catalog.get_raw(owner.id) {
                 Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
@@ -230,7 +231,7 @@ impl Reaper for TwoTierReaper {
         let free_epoch = self.catalog.next_epoch();
         let mut freed = 0u32;
 
-        if rec.is_childless_leaf() {
+        if !self.catalog.has_live_children(rec.branch_id.id)? { // S18 PROBE
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
             // it can see a page born inside its own extents.
             for arena in rec.arenas.iter().copied() {
@@ -309,11 +310,12 @@ impl Reaper for TwoTierReaper {
             let mut still_pinned = Vec::new();
             let mut moved = false;
             for pf in entries {
-                let pinned = match self.catalog.get_raw(pf.owner.id) {
-                    Ok(rec) => !reclaimable(&rec.live_children, pf.birth_epoch, pf.free_epoch),
-                    // No record at all: nothing can be forked off it, so nothing can see the page.
-                    Err(_) => false,
-                };
+                // S18 PROBE: same predicate, asked of the INDEX instead of the record's array.
+                let pinned = self.catalog.live_child_in_epoch_range(
+                    pf.owner.id,
+                    pf.birth_epoch,
+                    pf.free_epoch,
+                )?;
                 if pinned {
                     still_pinned.push(pf);
                 } else {

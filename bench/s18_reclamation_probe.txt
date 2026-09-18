@@ -1,0 +1,52 @@
+S18 reclamation probe -- raw measurements, 2026-09-17, Darwin 25.6.0, ferrodb @ 25141aa
+Instrument: tests/probe_reclamation_topology.rs in this worktree, cargo test (debug).
+UNREVIEWED PROBE BRANCH. src/branch/reaper.rs here carries three probe-only edits (labelled
+"S18 PROBE" / "S18 ATTRIBUTION PROBE"); do not merge them.
+
+--- FIRE-CHECK 1/2: live_children is never populated by TableBranchCatalog -----------------
+Unpatched reaper, production catalog:
+  PROBE1 freed=6 pending=0 live_before=6 live_after=0 pages=6
+  PROBE2 get_raw.live_children.len()=0 indexed_says_live_children=true
+The same shape against LogBranchCatalog (src/branch/reaper.rs:706 
+a_pinned_page_is_not_released_while_the_child_lives) asserts freed=0, pending=6.
+After swapping reaper.rs:238 is_childless_leaf() -> catalog.has_live_children() and
+reaper.rs:312 reclaimable(&rec.live_children,..) -> catalog.live_child_in_epoch_range():
+  PROBE1 passes.
+
+--- FIRE-CHECK 3: the rule is depth-1 -----------------------------------------------------
+With the two patches above in place (so the interval rule is actually reachable):
+  PROBE3 gp_pages=5 parked_after_gp=5 pending_after_mid=0 grand_live=true
+  grand.root_page_id == gp_pages[0]   (asserted, passed)
+Reaping the MIDDLE branch released all five grandparent pages, including the one the still-live
+grandchild is rooted on. release_page pushes onto state.recycled[arena] and alloc_in_arena pops
+recycled first, so the next allocation in that arena re-issues the grandchild's root page.
+
+--- FIRE-CHECK 4: collapse's size ceiling -------------------------------------------------
+  COLLAPSE leaves=64  pages=65  -> ok
+  COLLAPSE leaves=200 pages=201 -> ok
+  COLLAPSE leaves=255 pages=256 -> ok
+  COLLAPSE leaves=256 pages=257 -> REFUSED: arena a3 is exhausted (256 pages)
+  COLLAPSE leaves=300 pages=301 -> REFUSED: arena a3 is exhausted (256 pages)
+  COLLAPSE leaves=600 pages=601 -> REFUSED: arena a4 is exhausted (256 pages)
+Exact wall: 256 pages = ARENA_EXTENT_PAGES = 1 MiB. MAX_COLLAPSE_PAGES (65536) is unreachable.
+
+--- MEASUREMENT: lease-expiry storm, N branches expiring together -------------------------
+Each branch = 1 arena, 2 pages, childless leaf of trunk.
+  sweep ON                                    sweep OFF (S18_NO_SWEEP=1)
+  n=64   total 2841.478 ms  44398.1 us/br     total  2532.262 ms  39566.6 us/br
+  n=128  total 6219.198 ms  48587.5 us/br     total  5225.561 ms  40824.7 us/br
+  n=256  total 15038.495 ms 58744.1 us/br     total 11254.528 ms  43963.0 us/br
+  n=512  total 43825.927 ms 85597.5 us/br     total 30185.616 ms  58956.3 us/br
+  n=1024 total 111109.202 ms 108505.1 us/br   total 60761.193 ms  59337.1 us/br
+Sweep share of per-branch cost: 4.8 ms at n=64 -> 49.2 ms at n=1024 (10.2x for 16x N).
+Fitted: per-branch = 44.4 ms + ~67 us * N  (residuals <=15% except n=512).
+Per (reap x live arena): 48-58 us, i.e. one sweep_empty_extents get_raw hydration.
+Residual with the sweep off still rises 39.6 -> 59.3 ms/branch (1.50x over 16x N): UNATTRIBUTED.
+
+--- MEASUREMENT: per-page reclamation cost, and the NEGATIVE result -----------------------
+  FASTPATH pages=64  total 38.358 ms   SLOWPATH pages=64  total 35.672 ms pending=64
+  FASTPATH pages=128 total 40.454 ms   SLOWPATH pages=128 total 29.784 ms pending=128
+  FASTPATH pages=256 total 34.543 ms   SLOWPATH pages=256 total 40.860 ms pending=256
+Flat in page count on BOTH paths, and the slow path is not measurably dearer than the fast one.
+The per-page interval query is invisible under the ~35 ms durable-catalog floor of one reap.
+No structural limit found in the per-page cost of the rule itself at this scale.
