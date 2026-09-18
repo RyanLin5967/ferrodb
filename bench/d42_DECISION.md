@@ -208,25 +208,45 @@ gone" would also pass for burners that never started:
 | A — anti-vacuity | orphans at ppid=1 must EXIST after the kills | **8** |
 | B — the fix | none alive after their own deadline | **0** |
 
-### A FOURTH defect, found by fixing the first three: never kill by recorded pid
+### ⛔ RETRACTION — I attributed an exit 137 to pid reuse, and that was an inference I asserted as a measurement
 
-The first fix replaced `kill -9 "$!"` with `_kill_tree`, which walks `pgrep -P` from each **recorded
-wrapper pid**. Re-running it exited **137 — SIGKILL — having killed its own shell.**
+**What I recorded:** that replacing `kill -9 "$!"` with a `_kill_tree` walking `pgrep -P` from each
+recorded wrapper pid "made the script exit 137: it SIGKILLed its own shell", caused by pid reuse.
 
-The cause is pid reuse. Spawning 504 burners, plus cargo, plus a `pgrep` fork per cleanup entry,
-churns through pids fast enough that **a pid recorded at spawn time can belong to an unrelated
-process by the time cleanup runs.** On a box shared with an agent fleet that is a `kill -9` aimed at
-somebody else's work, and the only reason it was noticed here is that it happened to hit this
-script's own shell rather than silently killing a neighbour.
+**What I actually had:** an exit status of 137 and a plausible mechanism. I did not establish the
+link. The team lead reports killing that exact run at 12:25, with the box at loadavg 523 and another
+session's monitor suspending 843 burners. **That is a simpler explanation of the same observation and
+it is better supported than mine** — an external SIGKILL produces exit 137 directly, whereas my
+account needed a recorded pid to have been reused inside the cleanup window, which I never showed.
 
-⇒ **Kill by a unique TAG in the command line, never by a recorded pid.** Each burner now carries
-`d42burn-$$` in its argv and cleanup is `pkill -9 -f "$BURN_TAG"`. A tag cannot be reused, so it can
-only ever match burners this run started. The recorded-pid arrays are gone from both harnesses.
+⇒ **The causal claim is withdrawn.** Exit 137 is attributed to the external kill. It is logged here
+because the wrong version is in the body of commit `f830ae4` and in this file's earlier revision, and
+a retraction has to sit where the claim sat.
 
-This is worth stating generally: **a recorded pid is a stale handle the moment the process exits,
-and every "clean up what I spawned" loop written against one is a latent kill of an innocent
-process.** It is the same class as the `ps -e` overriding `-p` trap — a cleanup that looks scoped
-and is not.
+**What survives, on general grounds rather than as a measurement from this incident:** killing by
+recorded pid is still the wrong shape, because **a recorded pid is a stale handle the moment that
+process exits**, so a "clean up what I spawned" loop written against one is a latent kill of an
+innocent process on a shared box. The harnesses therefore tag each burner with `d42burn-$$` in its
+argv and clean up with `pkill -9 -f "$BURN_TAG"`; a tag cannot be reused, a pid can. That change is
+retained as a correct precaution — it is simply **not** evidenced by the 137.
+
+### A FOURTH defect, this one measured, and it is against the fix itself
+
+**A self-terminating burner is only bounded to within ONE INNER PASS, and that term grows with the
+contention the harness itself creates.** The deadline is tested only between passes of a
+non-interruptible inner loop, so the overshoot is worst exactly when the bound matters. Measured by
+another session on a 200000-iteration burst: **burners at 05:15 elapsed against a 240 s deadline.**
+
+⇒ The inner burst must be small — 2000, not 200000 — so the deadline check fires often enough to
+mean something. `bench/d42_fire_orphans.sh` is corrected to 2000 and re-run (8 orphans created, 0
+surviving).
+
+⚠ And a consequence worth stating because it makes "just suspend them" unsafe: **a SIGSTOPped burner
+never reaches its own deadline check at all.** Suspended burners cannot self-terminate; they must be
+resumed or killed.
+
+⇒ Because that hole opens under precisely the conditions a load harness creates, both machine-wide
+load generators in this row are now **gutted rather than fixed** (§10a).
 
 ⚠ **This is also a caution about the project rule that produced the whole incident.** "Oversubscribe
 14x to force a guard that won't fire" is sound for an IN-PROCESS race window, which is what it was
@@ -234,3 +254,27 @@ measured on. It is the instruction most likely to spawn exactly these orphans, a
 does not even work for starving a process on this machine. Prefer SIGSTOP aimed at named pids; if
 external load really is needed, the burner must be self-terminating before anything else about it is
 considered.
+
+## 10a. Both machine-wide load generators are GUTTED, not fixed
+
+`bench/d42_fire_starved.sh` and `bench/d42_load_sweep.sh` have had their bodies removed. Each now
+refuses with `exit 4` and carries its finding in its header. The files are kept rather than deleted
+so the next person does not reinvent the shape.
+
+The reasoning is not that they were unfixable in principle, but that fixing them buys nothing:
+
+* **Their results are already recorded**, in `d42_fire_starved.txt` and `d42_load_sweep.txt`, and
+  both are NEGATIVE results that do not need reproducing.
+* **Re-running them cannot yield a verdict.** At cpu-28x the cluster elects no leader at all, so
+  there is no healthy floor and the arm refuses in both directions. Starving everything fires both
+  signals at once, which proves nothing about their composition — and composition is the one thing
+  the two-signal design needed demonstrated.
+* **The falsifier that works does not need them.** `d42_fire_starved_children.sh` SIGSTOPs named
+  child pids and generates no machine-wide load at all.
+* **The remaining hole is in the fix, not the usage** (the inner-pass bound above), and it opens
+  under exactly the load these scripts create.
+
+Against: this removes a tool someone might want. That is why the headers keep the full finding, the
+measured tables, and the instructions for rebuilding one correctly if it is ever genuinely needed.
+Making the dangerous state unrepresentable beats documenting it, on a box whose owner was locked out
+three times in one day.

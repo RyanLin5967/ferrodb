@@ -1,10 +1,10 @@
 D42 orphan fire-check — a burner must not be able to outlive its parent
-  when   : 2026-09-18T16:17:46Z
-  head   : 2045e97
-  shape  : 8 burners, self-terminating after 20s, tagged d42-orphan-firecheck-91927
+  when   : 2026-09-18T16:43:42Z
+  head   : f830ae4
+  shape  : 8 burners, self-terminating after 20s, tagged d42-orphan-firecheck-94294
 
-  spawned: 17 process(es) matching the tag
-bench/d42_fire_orphans.sh: line 89: 91947 Killed: 9               "/tmp/$TAG-parent.sh" > /dev/null 2>&1
+  spawned: 22 process(es) matching the tag
+bench/d42_fire_orphans.sh: line 100: 94359 Killed: 9               "/tmp/$TAG-parent.sh" > /dev/null 2>&1
 
   A. anti-vacuity — orphans at ppid=1 right after the kills: 8
      ok: the incident state was really reproduced, so direction B means something

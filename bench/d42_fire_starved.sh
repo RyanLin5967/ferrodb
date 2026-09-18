@@ -1,137 +1,73 @@
 #!/usr/bin/env bash
-# bench/d42_fire_starved.sh — D42 falsifier 1 of 2: the classifier MUST fire.
+# bench/d42_fire_starved.sh — ⛔ GUTTED ON PURPOSE. THIS SCRIPT IS A RECORD, NOT A TOOL.
 #
-# A detector that has never been made to fire is not a clean result. This one drives
-# `integration_consensus_failover.rs` under deliberate starvation and requires the verdict
-# INCONCLUSIVE, with both signals' measured values recorded in the artifact.
+# It used to generate machine-wide CPU load (NCPU x 28 = 504 burners on this box) to try to force
+# D42's classifier to fire. **It froze this shared machine twice and locked its owner out three
+# times in one day.** The body has been removed rather than the file, so the next person does not
+# reinvent the same shape. `bench/` is not a cargo target, so removing it is inert for the suite.
 #
-# ⚠ THE PRE-REGISTERED SHAPE DID NOT WORK, AND THE AMENDMENT IS RECORDED RATHER THAN QUIETLY MADE.
-# D42 pre-registered "14x oversubscription". Measured at head ddbc601 (bench/d42_fire_starved.txt
-# run 1): 252 pure-CPU spinners on 18 cores reached loadavg 137 and the test PASSED in 4.76 s. The
-# load sweep (bench/d42_load_sweep.txt) then measured both signals across six shapes and found them
-# nearly FLAT from loadavg 269 to 829 — self-scheduling only fell 0.78 -> 0.68. macOS's timeshare
-# scheduler demotes pure CPU spinners and keeps a 10 ms sleeper responsive, which is what it is for.
-# A process asking for 0.4 % of a core gets it no matter how many spinners are queued.
+# ── WHAT IT MEASURED, WHICH IS WHY THE FILE SURVIVES ───────────────────────────────────────────
 #
-# So the precondition the falsifier needs — a 45 s budget actually EXPIRING — was never reached, and
-# 14x is not a lever on this machine. The sweep found the shape that is: `nice -n 20` against 28x
-# oversubscription, under which the cluster could not elect a leader within 45 s at all.
+# The pre-registered falsifier for D42 was "force INCONCLUSIVE under 14x oversubscription". That
+# instrument does not work, and proving so is this script's entire contribution:
 #
-# ⛔ THAT IS AN AMENDMENT TO THE FALSIFIER'S LOAD SHAPE, NOT TO ITS EXIT CRITERION. The requirement
-# is unchanged and unweakened: a starved run must earn INCONCLUSIVE, and bench/d42_fire_broken.sh
-# must independently show that a genuinely broken cluster still earns FAILED. `nice` is not a cheat:
-# the classifier's claim is exactly "this process, or its children, did not get the CPU", and `nice`
-# aims the break at that window instead of hoping ambient load wanders into it. The test binary and
-# the consensus_node children both inherit the niceness, so BOTH signals are exposed.
+#   * 252 spinners (14x), loadavg 137          -> test PASSED in 4.76 s
+#   * `nice -n 20` + 504 spinners (28x), lg 254 -> test PASSED in 8.02 s
+#   * six shapes swept (bench/d42_load_sweep.txt), loadavg 269 -> 829: both signals nearly FLAT,
+#     self-scheduling falling only 0.78 -> 0.55
 #
-# It holds the machine-wide suite lock: oversubscribing this box while another agent's suite runs
-# would wreck their numbers, which is the very confusion this row exists to end.
-set -uo pipefail
-export PATH="$HOME/.cargo/bin:$PATH"
-cd "$(dirname "$0")/.." || exit 1
-
-NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-FACTOR=${FACTOR:-28}
-NICE=${NICE:-20}
-N=$((NCPU * FACTOR))
-SPIN_BOUND=${SPIN_BOUND:-900}
-TEST_BOUND=${TEST_BOUND:-900}
-LOCK=/tmp/ferrodb-suite.lock
-
-# ⛔ KILL BY TAG, NEVER BY RECORDED PID. A previous version recorded each `timeout` wrapper's pid
-# and killed those pids in cleanup. With 504 spawns plus cargo plus a `pgrep` fork per entry, this
-# box churns through pids fast enough that a RECORDED pid can be REUSED by an unrelated process
-# before cleanup runs — and on a machine shared with an agent fleet, that means `kill -9` aimed at
-# somebody else's work. It was observed killing this script's own shell (exit 137). Every burner
-# therefore carries a unique tag in its command line, and cleanup matches on that: a tag cannot be
-# reused, so it can only ever match burners this run started.
-BURN_TAG="d42burn-$$"
-
-cleanup() {
-    pkill -9 -f "$BURN_TAG" 2>/dev/null
-    [ "${held:-0}" = 1 ] && rm -rf "$LOCK"
-    return 0
-}
-trap cleanup EXIT INT TERM
-
-# Build BEFORE the load goes on, or the measurement is of rustc, not of the test.
-cargo build --examples >/dev/null 2>&1 || { echo "REFUSING — cargo build --examples failed"; exit 1; }
-cargo test --no-run --test integration_consensus_failover >/dev/null 2>&1 \
-    || { echo "REFUSING — the test target does not build"; exit 1; }
-
-held=0; w=0
-while ! mkdir "$LOCK" 2>/dev/null; do
-    o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
-    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
-    [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
-    [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
-    sleep 15; w=$((w+15))
-done
-printf '%s %s %s\n' "$$" "d42-fire-starved" "$(date -u +%FT%TZ)" > "$LOCK/owner"
-held=1
-
-echo "D42 falsifier 1 — the classifier must fire when the run is starved"
-echo "  when            : $(date -u +%FT%TZ)"
-echo "  head            : $(git log -1 --format=%h), $(git status --short | wc -l | tr -d ' ') dirty file(s)"
-echo "  cpus            : $NCPU"
-echo "  shape           : nice -n $NICE, ${FACTOR}x oversubscription = $N pure-CPU spinners"
-echo "  loadavg before  : $(uptime | sed 's/.*load averages*: //')"
-
-# ⛔ THE BURNER SHAPE BELOW IS NOT A STYLE CHOICE — IT IS A FIX FOR A MEASURED INCIDENT.
+# macOS's timeshare scheduler demotes pure CPU spinners and keeps a mostly-sleeping process
+# responsive. A process asking for 0.4 % of a core keeps getting it however many spinners queue
+# behind it. So the precondition the falsifier needs — a 45 s budget actually EXPIRING — was never
+# reached and the classifier never ran at all.
 #
-# An earlier version of this script left **317 orphaned processes at ppid=1**, still running 1.5
-# hours after their parent died, at loadavg 282. It froze this shared box TWICE and starved every
-# other project on it, while looking like "the machine is slow". Three compounding defects, in the
-# order that matters:
+# ⭐ AND AT HIGHER LOAD THE ARM IS WORSE THAN USELESS: at cpu-28x the sweep cannot elect a leader
+# within 45 s, so there is no healthy floor to calibrate against and the arm REFUSES in both
+# directions. It would have "passed" while testing the wrong thing — starving EVERYTHING fires both
+# signals at once and therefore proves nothing about their composition, which is the one property
+# the two-signal design needed demonstrated.
 #
-#   1. the burner body was `while :` / `while True` — UNBOUNDED, so an abandoned one never stops;
-#   2. cleanup did `kill -9 "$!"`, and `$!` is the **`timeout` WRAPPER's** pid. Killing `timeout`
-#      does NOT kill the `sh`/`python3` it spawned — the grandchild survives, reparents to init,
-#      and now has nothing enforcing its bound at all. The cleanup CREATED the orphans;
-#   3. `disown` detached them explicitly, defeating even SIGHUP.
+# ⇒ SUPERSEDED BY `bench/d42_fire_starved_children.sh`, which SIGSTOPs the consensus_node CHILD
+#   processes and leaves the test thread scheduled. That is strictly better: targeted, no
+#   machine-wide load, nothing to clean up, and it isolates signal C firing ALONE — the exact blind
+#   spot the design named. It produced the INCONCLUSIVE half of the falsifier.
 #
-# Fix (1) is the load-bearing one: **a self-terminating burner needs no parent, no `timeout` and no
-# trap.** Each burner below carries its own wall-clock deadline and exits on its own, so an orphan
-# is bounded by construction. `timeout` and the trap are kept as belt-and-braces, and cleanup now
-# kills the wrapper's DESCENDANTS rather than just the wrapper. `disown` is gone.
-for _ in $(seq "$N"); do
-    timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
-        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
-        while [ "$(date +%s)" -lt "$end" ]; do
-            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
-        done' >/dev/null 2>&1 &
-done
-sleep 20
-echo "  loadavg loaded  : $(uptime | sed 's/.*load averages*: //')"
-echo ""
-echo "---------------- nice -n $NICE cargo test --test integration_consensus_failover ----------------"
-OUT=$(timeout "$TEST_BOUND" nice -n "$NICE" cargo test --test integration_consensus_failover 2>&1)
-rc=$?
-echo "$OUT"
-echo "---------------- exit $rc ----------------"
-echo "  loadavg after   : $(uptime | sed 's/.*load averages*: //')"
-echo ""
+# ── WHY THE BODY IS GONE RATHER THAN FIXED ─────────────────────────────────────────────────────
+#
+# Four defects were found in it, and the fourth is the reason "fixed" is not a state this shape can
+# reach cheaply:
+#
+#   1. the burner body was `while :` — UNBOUNDED, so an abandoned one never stops;
+#   2. cleanup killed `$!`, the `timeout` WRAPPER's pid. Killing `timeout` does not kill the `sh`
+#      it spawned; the grandchild survives, reparents to init, and nothing enforces its bound. The
+#      cleanup created the orphans it existed to prevent. Result: 317 orphans at ppid=1, 1.5 hours
+#      old, loadavg 282;
+#   3. `disown` detached them, defeating even SIGHUP;
+#   4. ⭐ **A SELF-TERMINATING BURNER IS ONLY BOUNDED TO WITHIN ONE INNER PASS, AND THAT TERM GROWS
+#      WITH THE CONTENTION THE HARNESS ITSELF CREATES.** The deadline is tested BETWEEN passes of a
+#      non-interruptible inner loop, so the overshoot is worst exactly when the bound matters.
+#      Measured by another session: burners at **05:15 elapsed against a 240 s deadline**. A
+#      SIGSTOPped burner is worse still — it never reaches its own deadline check at all, so
+#      suspending them is not a safe way to park them either.
+#
+# If anything like this is ever built again: the inner loop must be SMALL (2000 iterations, not
+# 200000) so the deadline check fires often enough to mean something; kill by a unique TAG in the
+# command line rather than by a recorded pid; and fire-check the cleanup by killing the PARENT and
+# confirming nothing sits at ppid=1 (`bench/d42_fire_orphans.sh` does this).
+#
+# The full account is in `bench/d42_DECISION.md` §10. The raw negative result this script produced
+# is preserved in `bench/d42_fire_starved.txt`.
 
-# ── the verdict on the verdict ──────────────────────────────────────────────────────────────────
-fails=0
-if grep -qF 'FERRODB-VERDICT: INCONCLUSIVE' <<<"$OUT"; then
-    echo "ok: the starved run earned INCONCLUSIVE — the classifier fired"
-elif grep -qF 'FERRODB-VERDICT: CLASSIFIER-BROKEN' <<<"$OUT"; then
-    echo "⛔ the classifier could not measure; it refused rather than guessing, but this run does"
-    echo "   not demonstrate that it FIRES. Fix the instrument and re-run."
-    fails=$((fails+1))
-elif grep -q 'timed out after 45s' <<<"$OUT"; then
-    echo "⛔ FALSIFIER 1 FAILED — the wait expired and the classifier still called it FAILED."
-    echo "   The signals did not separate starvation from failure at these thresholds."
-    fails=$((fails+1))
-else
-    echo "⛔ FALSIFIER 1 DID NOT REACH ITS PRECONDITION — no wait expired, so there was no verdict"
-    echo "   to classify. Raise FACTOR or NICE; this run proves nothing in either direction."
-    fails=$((fails+1))
-fi
-grep -E 'verdict       :|self-schedule|child CPU|max stall|window        :' <<<"$OUT" | sed 's/^/   /'
+cat >&2 <<'EOS'
+REFUSING — bench/d42_fire_starved.sh has been gutted deliberately and will not run.
 
-echo ""
-if [ "$fails" -eq 0 ]; then echo "FALSIFIER 1 PASSED"; exit 0; fi
-echo "FALSIFIER 1 FAILED — $fails check(s) did not hold."
-exit 1
+It generated machine-wide CPU load, froze this shared box twice, and locked its owner out
+three times. Its finding is already recorded in bench/d42_fire_starved.txt and
+bench/d42_DECISION.md, and re-running it would add nothing: at 28x oversubscription the
+cluster cannot elect a leader at all, so the arm cannot yield a verdict in either direction.
+
+Use bench/d42_fire_starved_children.sh instead. It SIGSTOPs the node child processes and
+leaves the test thread scheduled — targeted, no machine-wide load, and it is what actually
+produced the INCONCLUSIVE half of the falsifier.
+EOS
+exit 4
