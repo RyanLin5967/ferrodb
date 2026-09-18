@@ -1,0 +1,126 @@
+D28 10^6 A/B -- FIRE CHECK of the driver's and the summariser's refusals.
+generated 2026-09-18T09:25:04-04:00
+
+A detector that found nothing is not a clean result until it has been forced to fire.
+Every refusal below was made to fire on purpose, and the last case is the NEGATIVE CONTROL:
+with sane inputs nothing refuses and a real table is printed. Without that, a script that
+refused everything would look identical to one that guards correctly.
+
+==== DRIVER GUARDS =============================================================
+
+-- quiet guard: fired FOR REAL, unplanned, when a certification suite started --
+   REFUSING: a suite is running and holds /tmp/ferrodb-suite.lock (36008 cert-42485d8 ...)
+   exit 3. Not a planted case: this is the guard catching a real second suite.
+
+-- identical-binary guard (the fake-null trap the 10^5 run named) --
+   REFUSING: both arms are the same binary (956ada8ccefed1c5af8ebad2de89d05905eaf5e4f8e8f219fa8a9d8e9029fcf3).
+     cargo returned one artifact twice; the A/B would report 1.00x, a fake null.
+   exit 2
+
+-- disk floor guard (SUITE_LOCK pointed away so the quiet guard cannot mask it) --
+   REFUSING: only 35714660KiB free on /tmp/d28_1e6, floor is 999999999999KiB.
+     A 10^6 round costs tens of minutes and dies at the END when the volume fills,
+     so the precondition is guarded rather than discovered. Free space and re-run.
+   exit 4
+
+-- NEGATIVE CONTROL: sane floor, no lock, N=200 -- it must NOT refuse --
+   4 DATA rows emitted; arm A br_1row 0.02/0.03 ms, arm B 5.54/5.08 ms (212x),
+   br_all 4.89-5.49 ms in BOTH arms. The switch is live even at N=200.
+
+==== SUMMARISER REFUSALS =======================================================
+
+-- zero.txt --
+   data rows=0  void/failed blocks=0
+   REFUSING: zero data rows parsed. That is a broken run, not an empty result.
+   exit 1
+
+-- switch.txt --
+   data rows=4  void/failed blocks=0
+   
+   REFUSING: VOID-SWITCH -- arm B does not look unhinted.
+     arm B br_1row median 0.051 ms, arm A 0.050 ms, ratio 1.04x
+     A B-arm in the same order as A means the Pushdown::Off scaffold did not reach the
+     binary and BOTH arms ran the shipped path. That reports ~1.00x, which is
+     indistinguishable from an honest null. Not a result.
+   exit 2
+
+-- unbal.txt --
+   data rows=4  void/failed blocks=0
+   N as the HARNESS reports it: 999,936 (branches actually forked, not the argument)
+   
+   column          unhinted (B)        hinted (A)           B/A
+   br_1row        21,750.000 ms          0.051 ms    426,470.6x
+   br_all          1,402.500 ms      1,402.500 ms          1.0x   <- control, flat BY DESIGN
+   runs           20,750.000 ms          0.035 ms    601,449.3x
+   live_cnt            5.550 ms          5.450 ms          1.0x   <- S20 column
+   
+     raw, sorted:
+       br_1row   A [0.05, 0.052]
+       br_1row   B [21500.0, 22000.0]
+       br_all    A [1400.0, 1405.0]
+       br_all    B [1395.0, 1410.0]
+       runs      A [0.034, 0.035]
+       runs      B [20500.0, 21000.0]
+       live_cnt  A [5.4, 5.5]
+       live_cnt  B [5.5, 5.6]
+   
+     CONTROL SPREAD: br_all across BOTH arms 1,395.0 - 1,410.0 ms (1.01x on an identical code path).
+     Any column moving less than that is load, not the hint.
+   
+     loadavg at launch: min 5.00 max 5.00 first 5.00 last 5.00
+     loadavg at finish: min 5.10 max 5.10 first 5.10 last 5.10
+     block wall time: min 600s max 600s total 600s
+     br_all by POSITION (pooled over arms; the rotation should flatten this):
+       pos 1: median      1,402.5 ms  (arms: A)
+       pos 2: median      1,402.5 ms  (arms: B)
+       -> UNBALANCED: positions do not each hold every arm, so a monotonic load drift is
+          NOT cancelled and the per-arm medians carry a position bias. Re-run whole reps.
+   exit 3
+
+-- mixedn.txt --
+   data rows=4  void/failed blocks=0
+   REFUSING: rows disagree about N: [99968.0, 999936.0]. One file, one scale.
+   exit 1
+
+-- good.txt --
+   data rows=4  void/failed blocks=0
+   N as the HARNESS reports it: 999,936 (branches actually forked, not the argument)
+   
+   column          unhinted (B)        hinted (A)           B/A
+   br_1row        21,750.000 ms          0.051 ms    426,470.6x
+   br_all          1,407.500 ms      1,397.500 ms          1.0x   <- control, flat BY DESIGN
+   runs           20,750.000 ms          0.035 ms    601,449.3x
+   live_cnt            5.500 ms          5.500 ms          1.0x   <- S20 column
+   
+     raw, sorted:
+       br_1row   A [0.05, 0.052]
+       br_1row   B [21500.0, 22000.0]
+       br_all    A [1395.0, 1400.0]
+       br_all    B [1405.0, 1410.0]
+       runs      A [0.034, 0.035]
+       runs      B [20500.0, 21000.0]
+       live_cnt  A [5.5, 5.5]
+       live_cnt  B [5.4, 5.6]
+   
+     CONTROL SPREAD: br_all across BOTH arms 1,395.0 - 1,410.0 ms (1.01x on an identical code path).
+     Any column moving less than that is load, not the hint.
+   
+     loadavg at launch: min 5.00 max 5.00 first 5.00 last 5.00
+     loadavg at finish: min 5.10 max 5.10 first 5.10 last 5.10
+     block wall time: min 600s max 600s total 600s
+     br_all by POSITION (pooled over arms; the rotation should flatten this):
+       pos 1: median      1,402.5 ms  (arms: A,B)
+       pos 2: median      1,402.5 ms  (arms: A,B)
+       -> every position held every arm: the square is balanced
+   exit 0
+
+==== WHAT THIS FIRE CHECK CHANGED =============================================
+
+It found a real defect in the summariser rather than confirming it. The first version
+required arm B to exceed an ABSOLUTE 1000 ms as well as beating arm A by 100x. Run at
+N=200 during the negative control, that refused a run whose switch was demonstrably live
+at 212x -- the absolute term is a 10^6 number and made the reduction wrong at every other
+scale. The ratio alone separates the cases (identical code paths cannot differ 100x; the
+10^5 pair measured the control's own spread at 2.4x under load), and 'did this measure the
+N it claims' is now read from the harness's own first column instead, which is the
+question the absolute term was badly approximating.

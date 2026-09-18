@@ -14,8 +14,13 @@ Three refusals, each reading an OUTCOME rather than a word:
   2. SWITCH NOT LIVE. If arm B is not orders of magnitude slower than arm A on br_1row, the
      `Pushdown::Off` scaffold did not take and both arms ran the same code. That reports 1.00x,
      which reads exactly like an honest null -- the failure mode the 10^5 run named when it hashed
-     its two binaries. The floor is a sanity prior from the merge that landed D28 (22170.73 ms
-     unhinted at 10^6), NOT an expected value for this run's answer.
+     its two binaries. The test is the RATIO and nothing else. An earlier version also required
+     arm B to exceed an absolute 1000 ms, which is a 10^6 number: a fire-check at N=200 refused a
+     run whose switch was demonstrably live at 212x, so the absolute term made the reduction wrong
+     at every N but one. Identical code paths cannot differ 100x -- the 10^5 pair measured the
+     control's own spread at 2.4x under load -- so the ratio alone separates the cases.
+  2b. WRONG N. "Did this measure what I asked for" is read from the harness's own first column
+     rather than from the N passed to the driver, and every row must agree on it.
   3. UNBALANCED ROTATION. If every position did not hold every arm, a monotonic load drift is not
      cancelled and the per-arm medians carry a position bias. Saying so is the point of rotating.
 """
@@ -64,16 +69,24 @@ med = {a: {c: median([r[c] for r in rows if r["arm"] == a and c in r]) for c in 
 
 # ── 2. did the scaffold actually take? ────────────────────────────────────────────────────────
 ratio_1row = med["B"]["br_1row"] / med["A"]["br_1row"] if med["A"]["br_1row"] else float("inf")
-if ratio_1row < 100 or med["B"]["br_1row"] < 1000:
+if ratio_1row < 100:
     print()
     print("REFUSING: VOID-SWITCH -- arm B does not look unhinted.")
     print(f"  arm B br_1row median {med['B']['br_1row']:.3f} ms, arm A {med['A']['br_1row']:.3f} ms,"
           f" ratio {ratio_1row:.2f}x")
-    print("  Unhinted at 10^6 materialises every branch row to return one; the merge that landed")
-    print("  D28 measured that at 22170.73 ms. A B-arm in the same order as A means the")
-    print("  Pushdown::Off patch did not reach the binary and BOTH arms ran the shipped path.")
-    print("  That reports ~1.00x, which is indistinguishable from an honest null. Not a result.")
+    print("  A B-arm in the same order as A means the Pushdown::Off scaffold did not reach the")
+    print("  binary and BOTH arms ran the shipped path. That reports ~1.00x, which is")
+    print("  indistinguishable from an honest null. Not a result.")
     sys.exit(2)
+
+# ── 2b. did this measure the N it claims? ─────────────────────────────────────────────────────
+ns = {r["n"] for r in rows if "n" in r}
+if not ns:
+    sys.exit("REFUSING: no row carries the N the harness reported, so the scale is unverified.")
+if len(ns) > 1:
+    sys.exit(f"REFUSING: rows disagree about N: {sorted(ns)}. One file, one scale.")
+n_measured = int(next(iter(ns)))
+print(f"N as the HARNESS reports it: {n_measured:,} (branches actually forked, not the argument)")
 
 print()
 print(f"{'column':<10}{'unhinted (B)':>18}{'hinted (A)':>18}{'B/A':>14}")

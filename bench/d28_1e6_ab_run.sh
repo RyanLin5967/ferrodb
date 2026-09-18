@@ -186,8 +186,8 @@ run_arm() {
 
   # N BEGIN INSERT SELECT ASOF br_1row br_all runs activity quaran live_cnt RSS
   echo "$line" | awk -v r="$rep" -v p="$pos" -v a="$arm" -v l="$(loadavg)" \
-    '{printf "DATA rep=%d pos=%d arm=%s br_1row=%s br_all=%s runs=%s live_cnt=%s rss=%s load=%s\n",
-              r, p, a, $6, $7, $8, $11, $12, l}' >> "$OUT"
+    '{printf "DATA rep=%d pos=%d arm=%s n=%s br_1row=%s br_all=%s runs=%s live_cnt=%s rss=%s load=%s\n",
+              r, p, a, $1, $6, $7, $8, $11, $12, l}' >> "$OUT"
   echo >> "$OUT"
   sync
   rm -f "$err"
