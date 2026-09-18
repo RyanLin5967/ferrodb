@@ -1,0 +1,28 @@
+=== D23 regression sweep, isolated worktree ===
+date: 2026-09-18T03:16:40Z
+sha:  8d8a0f97d33925f17660e3760052915681098d3c
+each target bounded by timeout 900; a HANG is the regression a latch change causes
+
+warning: `ferrodb` (test "adv_f6_dropped_capture") generated 1 warning
+warning: `ferrodb` (lib test) generated 1 warning (run `cargo fix --lib -p ferrodb --tests` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.07s
+
+--- cargo test --lib ---
+test result: ok. 1283 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 51.64s
+d18_reaper_asks_the_catalog                test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s 
+integration_alter_column                   test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.22s 
+integration_blind_writes                   test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s 
+integration_branch_pages                   test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s 
+integration_buffer_pool_concurrency        test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s 
+integration_cdc_feed                       test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s 
+integration_cow_branch                     test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s 
+integration_flush_concurrency              test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s 
+integration_fulltext_retrieval             test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.85s 
+integration_index_debt                     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.32s 
+integration_secondary_index_debt           test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s 
+integration_sql_on_durable_branches        test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s 
+integration_txn_concurrency                test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.16s 
+provenance_scan_cascade                    test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s 
+lock_order_allowlist                       test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s 
+lock_order_runtime                         test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s 
+integration_btree_concurrency              test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s 
