@@ -1,0 +1,25 @@
+# S22 FINAL MEASUREMENT — tip 1010944, agent-isolation merged, suite certified
+# BEFORE = this tip with agent-isolation's buffer_pool.rs. AFTER = with S22's. Interleaved.
+# Binaries cmp'd non-identical before use.
+# run at 2026-09-18T10:45:15Z, loadavg 8.50 8.76 10.48
+# Load is low enough this time that the RESIDENT arm is also reportable.
+
+=== FAULT ARM (modelled IO 500us/read, working set 8x the pool) ===
+pass threads  before   after    speedup
+1    1        1310     1327     x1.01
+1    2        1323     2668     x2.02
+1    4        1323     5318     x4.02
+1    8        1314     10651    x8.11
+1    16       1325     21522    x16.24
+2    1        1316     1321     x1.00
+2    2        1318     2645     x2.01
+2    4        1317     5299     x4.02
+2    8        1312     10521    x8.02
+2    16       1319     20379    x15.45
+
+=== RESIDENT ARM (working set fits the pool; every fetch a HIT, no IO) ===
+threads  before     after      ratio
+1        16206032   17522787   x1.08
+8        1666552    1951824    x1.17
+
+# loadavg at end: 9.42 8.93 10.48
