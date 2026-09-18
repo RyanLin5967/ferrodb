@@ -190,16 +190,32 @@
 //! `bench/d44_batchsize.txt`, RESIDENT arm, 8 reps, arm order rotated as a Latin square, taken
 //! holding the machine-wide suite lock:
 //!
+//! ⚠ Those runs were taken on a harness that capped them, and the table below is the re-take.
+//! `examples/bufpool_fault_concurrency.rs` used to increment ONE shared `AtomicUsize` per fetch
+//! *inside its timed window* — the same construct this file is being measured for. Every arm
+//! carried it, so it cancelled in comparisons and surfaced only as a ceiling. Fixed in `ec0c53c`;
+//! `bench/d44_harness_counter.txt` is the A/B that proved it was a ceiling and nothing else
+//! (BASE's slope x0.144 → x0.147, unmoved; the ceiling arm x0.740 → x2.630).
+//!
+//! `bench/d44_corrected.txt`, all four arms on the fixed harness, 8 reps, rotated, under the lock:
+//!
 //! | arm | 16T/1T | 16T absolute | vs BASE at 16T |
 //! |---|---|---|---|
-//! | BASE | x0.138 | 2.45M | 1.0x |
-//! | PAIR, `TOUCH_BATCH` = 64 | x0.384 | 7.86M | 3.2x |
-//! | **PAIR, `TOUCH_BATCH` = 512** | **x0.838** | **22.6M** | **9.3x** |
-//! | `touch` deleted outright (unshippable ceiling) | x0.676 | 44.7M | 18.3x |
+//! | BASE | x0.203 | 3.16M | 1.0x |
+//! | C1 (mirror only) | x0.198 | 4.53M | 1.4x |
+//! | **PAIR (mirror + batched `touch`)** | **x1.024** | **22.3M** | **7.1x** |
+//! | `touch` deleted outright (unshippable ceiling) | x3.187 | 163.0M | 51.5x |
 //!
-//! **The curve rises monotonically from 2 threads** — 9.8M, 11.9M, 20.9M, 22.6M — where BASE's
-//! goes 5.4M, 2.8M, 2.3M, 2.4M. D44's pre-registered bar was 16T/1T ≥ x0.5 with `touch` retained;
-//! x0.838 clears it, and every one of the eight reps is ≥ x0.80.
+//! **The sign changes.** The pair's throughput at 16 threads EQUALS its throughput at one, and the
+//! curve rises monotonically from 2 threads — 11.3M, 15.9M, 20.6M, 22.3M — where BASE goes 8.4M,
+//! 5.2M, 4.0M, 3.2M. All eight reps ≥ x0.83.
+//!
+//! ⛔ **Judged against the real ceiling it recovers 28% of the slope headroom, and 14% of the
+//! ceiling's absolute 16-thread throughput.** An earlier version of this comment said 51%, which
+//! was arithmetic against the instrument's ceiling rather than the design's; it is withdrawn.
+//! Roughly three quarters of the headroom is still on the table. The obvious suspect is the
+//! batching machinery's own per-hit cost — one uncontended shard mutex plus a `Vec` push that the
+//! ceiling arm does not pay — and that is a hypothesis, **not** a measurement.
 //!
 //! ⭐ **The first batch size tried was eight times too small, and that is the substance rather
 //! than a tuning note.** At 64 the PAIR measured x0.384 and did NOT clear the bar. The run above
@@ -210,10 +226,10 @@
 //! in.** Anyone re-deriving "BP-Wrapper is a constant" from a single small batch size is repeating
 //! the mistake this lane has now made twice, in two different places.
 //!
-//! **Judged against the ceiling and not against zero**, which is the honest framing: the PAIR
-//! reaches 51% of the absolute 16-thread throughput of deleting the policy entirely, and beats it
-//! on the *ratio* only because its 1-thread number is lower. The remaining 2x is the price of
-//! keeping ARC exactly, which is the price this lane decided to pay.
+//! **Judged against the ceiling and not against zero**, which is the honest framing and the one
+//! that moved most when the instrument was fixed: on the capped harness the pair looked like half
+//! the ceiling; it is actually a seventh of it. Keeping ARC exactly is worth paying for, but the
+//! size of what it costs was misstated until `bench/d44_corrected.txt`.
 //!
 //! **Hit rate is untouched, as an equality**: the eviction trace is byte-identical to BASE at both
 //! batch sizes, sha256 and all. See [`TOUCH_BATCH`] for why no batch size can make ARC's decisions
@@ -351,6 +367,11 @@ const MIRROR_SLOTS_PER_FRAME: usize = 8;
 /// | `TOUCH_BATCH` = 64 | x0.384 | 7.86M | 3.2x |
 /// | **`TOUCH_BATCH` = 512** | **x0.838** | **22.6M** | **9.3x** |
 /// | `touch` deleted outright (unshippable ceiling) | x0.676 | 44.7M | 18.3x |
+///
+/// ⚠ Those are CAPPED-harness figures (see the module doc's D44 section). They are kept because
+/// the comparison BETWEEN batch sizes is what this constant rests on and the cap applied equally
+/// to both arms. The absolute numbers and the ceiling are superseded by `bench/d44_corrected.txt`,
+/// and 512 has not been re-swept against 64 on the fixed harness.
 ///
 /// That run was built to decide between two explanations of why 64 fell short of D44's
 /// pre-registered x0.5 bar: either the residual cost was the *work* done under the policy lock —
