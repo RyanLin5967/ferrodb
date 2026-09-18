@@ -45,9 +45,9 @@
 //!    it. A change that makes this faster by serving the wrong page is not a faster buffer pool, and
 //!    this harness fails rather than reports it.
 //!
-//!   cargo run --release --example bufpool_fault_concurrency -- [FETCHES_PER_THREAD] [T,T,T] [DELAY_US]
+//!   cargo run --release --example bufpool_fault_concurrency -- [FETCHES_PER_THREAD] [T,T,T] [DELAY_US] [REPEATS]
 //!   cargo run --release --example bufpool_fault_concurrency -- 500 1,2,4,8,16 500
-//!   cargo run --release --example bufpool_fault_concurrency -- --real 2000 1,2,4,8,16
+//!   cargo run --release --example bufpool_fault_concurrency -- --real 4000 1,2,4,8,16 0 40
 
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -211,6 +211,7 @@ fn sweep_point(
     ids: &[u32],
     threads: usize,
     per_thread: usize,
+    repeats: usize,
     read_counter: &AtomicU64,
 ) -> Run {
     let refused = Arc::new(AtomicUsize::new(0));
@@ -227,37 +228,48 @@ fn sweep_point(
     // `invalidate_all` drops every frame WITHOUT writing back, which is safe here precisely because
     // this harness only ever unpins clean (`unpin_page(id, false)`); it would be data loss in a
     // workload that dirtied pages.
-    bp.invalidate_all().expect("cold pool between points: nothing should be pinned here");
-
     let reads_before = read_counter.load(Ordering::Relaxed);
-    let start = Instant::now();
-    std::thread::scope(|s| {
-        for t in 0..threads {
-            let bp = Arc::clone(bp);
-            let refused = Arc::clone(&refused);
-            let wrong = Arc::clone(&wrong);
-            let done = Arc::clone(&done);
-            // Disjoint, contiguous-in-stride slice per thread, and a stride that is coprime with
-            // PAGES so a thread sweeps the whole space rather than a short cycle.
-            s.spawn(move || {
-                for k in 0..per_thread {
-                    let slot = (t + k * threads) % ids.len();
-                    let id = ids[(slot * 4099) % ids.len()];
-                    let Ok(idx) = bp.fetch_page(id) else {
-                        refused.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    };
-                    let got = read_stamp(&bp.frames[idx].read().unwrap().data);
-                    bp.unpin_page(id, false);
-                    if got != id {
-                        wrong.fetch_add(1, Ordering::Relaxed);
+    let mut elapsed = Duration::ZERO;
+
+    // `repeats` exists to lengthen the measured window, not to change the workload. The real-file
+    // mode serves reads from the OS page cache in about a microsecond, so a single pass takes a few
+    // MILLISECONDS -- far too short to quote on a machine that is also running other work. Each
+    // repeat is timed separately and summed, and the pool is dropped cold in between, so every
+    // fetch in every repeat is still a genuine fault. The MISS GUARD checks that rather than
+    // trusting this comment.
+    for _ in 0..repeats {
+        bp.invalidate_all().expect("cold pool between repeats: nothing should be pinned here");
+
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let bp = Arc::clone(bp);
+                let refused = Arc::clone(&refused);
+                let wrong = Arc::clone(&wrong);
+                let done = Arc::clone(&done);
+                // Disjoint per thread: thread `t` takes every `threads`-th slot. Two threads
+                // wanting the SAME page is a different question, and mixing it in here would leave
+                // the result ambiguous about which effect it had measured.
+                s.spawn(move || {
+                    for k in 0..per_thread {
+                        let slot = (t + k * threads) % ids.len();
+                        let id = ids[(slot * 4099) % ids.len()];
+                        let Ok(idx) = bp.fetch_page(id) else {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        let got = read_stamp(&bp.frames[idx].read().unwrap().data);
+                        bp.unpin_page(id, false);
+                        if got != id {
+                            wrong.fetch_add(1, Ordering::Relaxed);
+                        }
+                        done.fetch_add(1, Ordering::Relaxed);
                     }
-                    done.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
-    });
-    let elapsed = start.elapsed();
+                });
+            }
+        });
+        elapsed += start.elapsed();
+    }
 
     Run {
         threads,
@@ -283,9 +295,10 @@ fn main() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     let delay = Duration::from_micros(pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(500));
+    let repeats: usize = pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
 
     println!("# S22 buffer pool fault concurrency");
-    println!("# pages={PAGES} pool_frames=1024 fetches_per_thread={per_thread}");
+    println!("# pages={PAGES} pool_frames=1024 fetches_per_thread={per_thread} repeats={repeats}");
     println!(
         "# mode={}",
         if real { "real file (warm OS page cache)".to_string() } else { format!("modelled IO, {} us per read", delay.as_micros()) }
@@ -340,7 +353,7 @@ fn main() {
 
     let mut results: Vec<Run> = Vec::new();
     for &t in &thread_counts {
-        let r = sweep_point(&bp, &ids, t, per_thread, inst.reads());
+        let r = sweep_point(&bp, &ids, t, per_thread, repeats, inst.reads());
         let per_s = r.fetches as f64 / r.elapsed.as_secs_f64();
         let rpf = if r.fetches > 0 { r.reads as f64 / r.fetches as f64 } else { 0.0 };
         println!(

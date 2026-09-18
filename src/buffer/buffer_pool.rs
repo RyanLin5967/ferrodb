@@ -1,24 +1,48 @@
-                // The page table write lock is held across the WHOLE miss path, and that
-                // serialization is the fix. The original code did check-then-act across several
-                // independent locks — probe the frame under a read lock, drop it, re-acquire a
-                // write lock; consult the page table, drop it, then act — so two threads missing
-                // at the same time could interleave and one thread's page ended up in a frame the
-                // other had already claimed, or in an orphaned frame the table never pointed at.
-                // Either way the write was silently lost: 10 of 12 runs of
-                // `concurrent_writers_each_read_back_only_their_own_row` before, 0 of 15 after.
-                //
-                // Attribution was checked rather than assumed, and the first answer was wrong.
-                // Reinstating the frame-scan window alone did NOT bring the bug back, and neither
-                // did removing the duplicate-load guard alone — because both variants still held
-                // this lock for the whole path. It is the single held lock that matters, not
-                // either individual check.
-                //
-                // Lock order is page table -> frame throughout the file, so holding it here does
-                // not invert against `unpin_page`, `flush_page`, or the hit path.
+//! The buffer pool.
+//!
+//! # No pool-wide lock is held across IO, and that is the whole design
+//!
+//! D18/D19 closed a set of real lost-write and wrong-bytes races by making `fetch_page` hold ONE
+//! lock — first the page table's write lock, then `arc_cache` — across the entire miss path. That
+//! was correct and it was a wall: the lock was held across `DiskManager::read`, so every page miss
+//! serialised every other thread in the process for the duration of a read syscall. Measured at 500
+//! microseconds of modelled IO per read, aggregate fault throughput went from 1574/s at one thread
+//! to 1409/s at sixteen — *negative* scaling, because the threads were queueing on the mutex and
+//! paying its cache-line traffic for the privilege. `bench/s22_bufpool_fault_before.txt`.
+//!
+//! The races those fixes closed are all of one shape: **a decision made under one lock, acted on
+//! after it was released.** Holding the lock longer is one answer. The answer here is the standard
+//! one, which is to keep the critical sections short and *verify the decision at the point of use*:
+//!
+//! * **The frame latch is the arbiter.** A page table lookup only ever produces a *candidate* frame.
+//!   Every path re-checks `frame.page_id` under that frame's own `RwLock` before pinning it or
+//!   reusing it. Two threads racing for one frame are serialised by that frame's lock and the loser
+//!   sees a label it did not expect and retries. This is what replaces the pool-wide lock.
+//! * **An in-transit marker, so faulters on the SAME page wait on THAT page.** [`BufferPoolManager::in_transit`]
+//!   holds the pages with IO in flight. A thread that wants a page someone else is already reading
+//!   waits on [`BufferPoolManager::transit_done`] instead of loading it a second time — which is the
+//!   race that orphaned a frame and lost every write to it.
+//! * **The replacement policy is consulted, not held.** `arc_cache` is taken for the verdict and
+//!   dropped before any syscall. A verdict can therefore go stale, and every consumer of one treats
+//!   it as a hint that must be re-verified at the frame latch.
+//!
+//! # Lock order
+//!
+//! `in_transit` -> `arc_cache` -> `page_table` -> `frame`. Every acquisition in this file respects
+//! it, and so do `branch::arena::evict` and `wal::recovery`, which take the page table and then a
+//! frame. Nothing acquires a pool-wide lock while holding a frame latch.
+//!
+//! # What IS still held across IO, on purpose
+//!
+//! A dirty victim's write-back runs while that victim's **frame latch** is held. That is the point
+//! rather than a leftover: it blocks threads touching that one frame and nobody else. The
+//! write-back also happens *before* the victim leaves the page table — see
+//! [`BufferPoolManager::evict_into`] — because the other order lets a concurrent fetch of the victim
+//! miss, read the stale copy from disk, and lose the dirty bytes still sitting in the frame.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, atomic::AtomicU16};
-use std::collections::HashMap;
+use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
+use std::collections::{HashMap, HashSet};
 use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
@@ -40,167 +64,294 @@ pub struct BufferPoolManager {
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
     pub wal: OnceLock<Arc<WalManager>>,
+
+    /// Pages with IO in flight: being read in, or being written back out of a frame.
+    ///
+    /// **This is what stops two threads loading one page into two frames.** That race orphaned a
+    /// frame — the page table resolved the page to the other one — and every write that landed in
+    /// the orphan was silently lost. The old code prevented it by holding a pool-wide lock across
+    /// the whole miss path; this prevents it by making the second thread wait on *this page*, which
+    /// leaves every thread faulting a different page free to proceed.
+    ///
+    /// A page is in this set for the whole of its fault, INCLUDING the error paths — see
+    /// `fetch_page`, where the removal is unconditional. A page left here by a failed load would
+    /// hang every later fetch of it forever.
+    in_transit: Mutex<HashSet<u32>>,
+    /// Signalled whenever a page leaves [`BufferPoolManager::in_transit`].
+    transit_done: Condvar,
+
+    /// Where the next free-frame scan starts. A hint, never trusted: the scan re-checks every frame
+    /// under its own write lock, so a stale hint costs a step and cannot hand out a taken frame.
+    free_hint: AtomicUsize,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
 
+/// How many times `fetch_page` will re-verify before giving up.
+///
+/// Every retry in `fetch_page` follows a *verified* change of state — a frame relabelled under its
+/// latch, a page that arrived while this thread was looking elsewhere, a victim that was pinned out
+/// from under the policy — so each one follows real progress by some thread. The bound exists so
+/// that a bug cannot express itself as a hang: a wedged buffer pool is harder to diagnose than one
+/// that returns an error naming the invariant it could not satisfy.
+const FETCH_ATTEMPTS: usize = 128;
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
-        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new()}
+        BufferPoolManager {
+            frames,
+            page_table: RwLock::new(HashMap::new()),
+            disk_manager,
+            arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)),
+            wal: OnceLock::new(),
+            in_transit: Mutex::new(HashSet::new()),
+            transit_done: Condvar::new(),
+            free_hint: AtomicUsize::new(0),
+        }
     }
 
-    // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
+    /// Return the frame holding `page_id`, faulting it in if it is not resident, and pin it.
+    ///
+    /// **No pool-wide lock is held across the disk read.** The module comment gives the reasoning;
+    /// the shape is: try to pin what is already resident, and if that fails claim the exclusive
+    /// right to fault this one page in, do the IO holding nothing, and publish. A thread whose page
+    /// someone else is already reading waits on that page rather than on the pool.
     pub fn fetch_page(&self, page_id: u32) -> Result<usize, FerroError>{
-        // The cache's verdict and the action taken on it must be one atomic step.
-        //
-        // This lock used to be taken just for `request` and released immediately, so the verdict
-        // was already stale by the time the page table was consulted: another thread could evict
-        // the page this call was told was a Hit, or evict the very victim it was handed. Both then
-        // indexed a HashMap with `[]` on a key that had gone, which PANICS the process —
-        // `no entry found for key` at the hit path and at the eviction path, reproducibly, under
-        // 8 threads with more pages than frames.
-        //
-        // Holding it across the whole of `fetch_page` makes the decision and the mutation
-        // inseparable. Lock order is arc_cache -> page_table -> frame, and nothing else in this
-        // file takes arc_cache, so there is nothing to invert against.
-        //
-        // This serialises fetches. That is a real cost and it is the right trade here: the
-        // alternative on offer is a buffer pool that crashes, and a faster wrong answer is not a
-        // better one. Narrowing it later means giving the cache and the table a single lock, not
-        // taking this one for less time.
-        let mut cache = self.arc_cache.lock().unwrap();
-        let result = cache.request(page_id, &|id| {
-            let pt = self.page_table.read().unwrap();
-            let frame_i = pt[&id];
-            let frame = self.frames[frame_i].read().unwrap();
-            frame.pin_counter.load(Ordering::Relaxed) > 0
-        });
-
-        match result {
-            ArcResult::Hit => { // page was already cached
-                // `.get()`, not `[]`. The cache saying "resident" and the page table disagreeing
-                // is a contradiction, and indexing on it PANICS the process — reproduced by
-                // reading a page that does not exist twice, because the failed first load left the
-                // page in the cache. The load paths below now undo their cache entry on failure,
-                // so this should be unreachable; it reports rather than crashes if it ever is,
-                // because a panic in a buffer pool takes down everything holding a page.
-                let frame_i = match self.page_table.read().unwrap().get(&page_id) {
-                    Some(&i) => i,
-                    None => {
-                        let _ = cache.remove(page_id);
-                        return Err(FerroError::Io(format!(
-                            "buffer pool inconsistency: the replacement cache says page {page_id} \
-                             is resident but the page table has no frame for it. The cache \
-                             entry has been dropped; retry the fetch."
-                        )));
-                    }
-                };
-                let frame = self.frames[frame_i].read().unwrap();
-                frame.pin_counter.fetch_add(1, Ordering::Relaxed);
-                return Ok(frame_i)
+        for _attempt in 0..FETCH_ATTEMPTS {
+            // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
+            if let Some(frame_i) = self.try_pin_resident(page_id) {
+                // Policy only, and deliberately *after* the pin: the cache is a hint about what to
+                // evict next, and holding it here is what used to serialise even pure cache hits.
+                self.arc_cache.lock().unwrap().touch(page_id);
+                return Ok(frame_i);
             }
-            ArcResult::MissEvict(evicted_id) => { // page not cached and pool is full (victim eviction)
-                // The victim can be removed by `delete_page`/`free_page` between the cache
-                // choosing it and this lookup, so `pt[&evicted_id]` would panic on a key that has
-                // gone. Treat a departed victim as a miss with a free frame instead of crashing.
-                let frame_i = match self.page_table.read().unwrap().get(&evicted_id) {
-                    Some(&i) => i,
-                    None => {
-                        // `request` already moved `page_id` into the cache. Leaving it there while
-                        // returning an error makes the cache claim a page is resident that was
-                        // never loaded, and the NEXT fetch of it takes the Hit path above.
-                        let _ = cache.remove(page_id);
-                        return Err(FerroError::NotEnoughSpace);
-                    }
-                };
 
-                if let Err(e) = self.flush_page(evicted_id) {
-                    let _ = cache.remove(page_id);
-                    return Err(e);
-                }
-                let new_page_data = match self.disk_manager.read(page_id) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // The commonest way to get here is asking for a page past the end of the
-                        // file, which is exactly what probing for a page's existence does.
-                        let _ = cache.remove(page_id);
-                        return Err(e);
-                    }
-                };
-                let mut frame = self.frames[frame_i].write().unwrap();
-                frame.data = new_page_data;
-                frame.page_id = Some(page_id);
-                frame.pin_counter = AtomicU16::new(1);
-                frame.dirty_flag = AtomicBool::new(false);
-                drop(frame);
-
-                let mut pt = self.page_table.write().unwrap();
-                pt.remove(&evicted_id);
-                pt.insert(page_id, frame_i);
-                return Ok(frame_i)
+            // ---- 2. Claim the right to fault it in, or wait for whoever already holds it. ----
+            let mut transit = self.in_transit.lock().unwrap();
+            if transit.contains(&page_id) {
+                // Someone is reading exactly this page. Wait on THIS page; a thread faulting any
+                // other page is not blocked by this and never touches this lock for long.
+                // The guard comes back from `wait` and is dropped here, which is what releases the
+                // transit lock before this thread loops round to re-read the page table.
+                let _woken = self.transit_done.wait(transit).unwrap();
+                continue;
             }
-            ArcResult::MissNoEvict => { // page not cached, pool not full
-                let data = match self.disk_manager.read(page_id) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // Undo the cache's claim before surfacing the error. Without this, reading
-                        // a page that does not exist TWICE panicked the process: the first call
-                        // left page_id in the cache, the second got Hit, and the page table had no
-                        // frame for it.
-                        let _ = cache.remove(page_id);
-                        return Err(e);
-                    }
-                };
-
-                // The page table lock is held across the whole claim, and that is the fix rather
-                // than a tidy-up. Two races lived here and both silently LOST WRITES:
-                //
-                // 1. The free-frame scan probed under a READ lock, dropped it, then re-acquired a
-                //    WRITE lock. Two threads could both see frame `i` free, and both write a
-                //    different page into it — the second overwriting the first, while the page
-                //    table pointed a page at a frame holding someone else's data.
-                //
-                // 2. Two threads missing on the SAME page each loaded it into a different frame.
-                //    One frame is orphaned, and every write that lands there is lost when the
-                //    table resolves the page to the other frame.
-                //
-                // Holding one lock for check-and-claim closes both: a concurrent inserter is
-                // observed under the same lock that would have to publish it.
-                let mut pt = self.page_table.write().unwrap();
-
-                // Someone may have loaded it while this thread was reading from disk.
-                if let Some(&existing) = pt.get(&page_id) {
-                    let frame = self.frames[existing].read().unwrap();
-                    frame.pin_counter.fetch_add(1, Ordering::Relaxed);
-                    return Ok(existing);
-                }
-
-                for i in 0..self.frames.len() {
-                    let mut frame = self.frames[i].write().unwrap();
-                    // Claimed under the write lock, so a second thread reaching this frame sees
-                    // it taken instead of racing for it.
-                    if frame.page_id.is_none() {
-                        frame.data = data;
-                        frame.page_id = Some(page_id);
-                        frame.pin_counter = AtomicU16::new(1);
-                        frame.dirty_flag = AtomicBool::new(false);
-                        pt.insert(page_id, i);
-                        return Ok(i);
-                    }
-                }
-                // Reachable when every frame filled up between the cache's verdict and this scan,
-                // which is a real outcome under concurrency rather than an impossible one.
-                drop(pt);
-                let _ = cache.remove(page_id);
-                Err(FerroError::NotEnoughSpace)
+            // Re-check residency under the transit lock. Between step 1 and here a loader can have
+            // published and left the set, and without this check this thread would load a page that
+            // is already resident into a second frame — the orphaned-frame lost write.
+            if self.page_table.read().unwrap().contains_key(&page_id) {
+                drop(transit);
+                continue;
             }
-            ArcResult::PoolFull => { // page not cached, pool is full, everything is pinned
-                return Err(FerroError::NotEnoughSpace)
+            transit.insert(page_id);
+            drop(transit);
+
+            // ---- 3. The fault itself. The only IO in the pool that is not under a frame latch. --
+            let outcome = self.fault_in(page_id);
+
+            // ---- 4. Leave the transit set and wake the waiters. UNCONDITIONAL. ----
+            // A page left in the set by a failed load would hang every later fetch of it, which is
+            // a worse failure than the one that put it there.
+            {
+                let mut transit = self.in_transit.lock().unwrap();
+                transit.remove(&page_id);
+            }
+            self.transit_done.notify_all();
+
+            match outcome {
+                Ok(Some(frame_i)) => return Ok(frame_i),
+                Ok(None) => continue, // a verified change of state; re-decide from the top
+                Err(e) => return Err(e),
             }
         }
-        // `cache` is deliberately still alive at every return above: dropping it earlier is what
-        // reintroduces the stale-verdict window.
+        Err(FerroError::Internal(format!(
+            "buffer pool: {FETCH_ATTEMPTS} verified retries for page {page_id} without resolving \
+             it. Each retry follows a real state change, so this means the pool is thrashing \
+             rather than that it is wedged."
+        )))
+    }
+
+    /// Pin `page_id` if it is resident **and the frame still holds it**.
+    ///
+    /// The page table lookup on its own is not enough, and this is the single most important line
+    /// in the change that removed the pool-wide lock: the frame a lookup names can be handed to
+    /// another page between the lookup and the pin. Re-checking `frame.page_id` under that frame's
+    /// own lock makes the pin and the check one step against the evictor, which takes the same
+    /// frame's write lock to relabel it. One of the two wins; the loser sees a label it did not
+    /// expect and retries.
+    fn try_pin_resident(&self, page_id: u32) -> Option<usize> {
+        let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
+        let frame = self.frames[frame_i].read().unwrap();
+        if frame.page_id != Some(page_id) {
+            return None;
+        }
+        frame.pin_counter.fetch_add(1, Ordering::Relaxed);
+        Some(frame_i)
+    }
+
+    /// Is `page_id` pinned? The predicate the replacement policy uses to skip a victim.
+    ///
+    /// A page the table cannot resolve is one being faulted in right now, or one the cache and the
+    /// table briefly disagree about. It has no frame to reclaim, so **"not evictable" is the only
+    /// safe answer**. This used to index the table with `[]` and panic the process on exactly that
+    /// case; under the old pool-wide lock it was unreachable, and without one it is ordinary.
+    fn is_pinned(&self, page_id: u32) -> bool {
+        let Some(frame_i) = self.page_table.read().unwrap().get(&page_id).copied() else {
+            return true;
+        };
+        self.frames[frame_i].read().unwrap().pin_counter.load(Ordering::Relaxed) > 0
+    }
+
+    /// Load `page_id` into a frame and publish it. The caller holds the transit claim for it.
+    ///
+    /// `Ok(Some(i))` published and pinned once. `Ok(None)` the world changed under a stale verdict
+    /// and the caller should re-decide — never an error, because a stale verdict is the expected
+    /// cost of not holding the cache lock across the IO.
+    fn fault_in(&self, page_id: u32) -> Result<Option<usize>, FerroError> {
+        // The verdict. `arc_cache` is held for this and dropped before any syscall.
+        let verdict = {
+            let mut cache = self.arc_cache.lock().unwrap();
+            cache.request(page_id, &|id| self.is_pinned(id))
+        };
+
+        let frame_i = match verdict {
+            ArcResult::Hit => {
+                // The cache says resident; step 1 and step 2 both just established it is not, and
+                // step 2 held the transit lock while checking, so no loader can have published
+                // since. The cache is carrying a false claim -- drop it and re-decide rather than
+                // trusting either side.
+                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                return Ok(None);
+            }
+            ArcResult::PoolFull => return Err(FerroError::NotEnoughSpace),
+            ArcResult::MissNoEvict => match self.claim_free_frame(page_id) {
+                Some(i) => i,
+                None => {
+                    // Every frame filled between the verdict and the scan. Real under concurrency.
+                    let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                    return Err(FerroError::NotEnoughSpace);
+                }
+            },
+            ArcResult::MissEvict(victim) => match self.evict_into(victim, page_id)? {
+                Some(i) => i,
+                None => {
+                    let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                    return Ok(None);
+                }
+            },
+        };
+
+        // The read. **Nothing pool-wide is held here, and neither is the frame latch**: the frame
+        // is already labelled `page_id` and pinned, so no scan will claim it and no evictor will
+        // take it. This is the syscall that used to serialise the whole process.
+        let data = match self.disk_manager.read(page_id) {
+            Ok(d) => d,
+            Err(e) => {
+                // The commonest way to get here is asking for a page past the end of the file,
+                // which is exactly what probing whether a page exists does. Undo both halves of the
+                // claim: the frame, and the cache's belief that this page is now resident. Leaving
+                // the latter is what made a second probe of an absent page panic.
+                self.release_frame(frame_i);
+                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                return Err(e);
+            }
+        };
+
+        // Bytes first, mapping second. A reader that reached this frame through the page table must
+        // never find the label already updated and the bytes not yet — that is serving another
+        // page's contents, which is the one failure a storage engine cannot apologise for.
+        self.frames[frame_i].write().unwrap().data = data;
+        self.page_table.write().unwrap().insert(page_id, frame_i);
+        Ok(Some(frame_i))
+    }
+
+    /// Take an unused frame and label it for `incoming`.
+    ///
+    /// **The claim is the write lock plus the label.** Checking `page_id.is_none()` and setting it
+    /// happen under one acquisition of that frame's lock, so two threads scanning at once cannot
+    /// both take it — the original bug here probed under a read lock and re-acquired a write lock,
+    /// and both threads wrote a different page into the same frame.
+    fn claim_free_frame(&self, incoming: u32) -> Option<usize> {
+        let n = self.frames.len();
+        let start = self.free_hint.load(Ordering::Relaxed) % n;
+        for step in 0..n {
+            let i = (start + step) % n;
+            let mut frame = self.frames[i].write().unwrap();
+            if frame.page_id.is_none() {
+                frame.page_id = Some(incoming);
+                frame.pin_counter = AtomicU16::new(1);
+                frame.dirty_flag = AtomicBool::new(false);
+                self.free_hint.store((i + 1) % n, Ordering::Relaxed);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Give up the frame claimed for a load that failed.
+    ///
+    /// `page_id = None` is what makes a frame free, and the data is zeroed so a free frame never
+    /// holds a readable copy of a page nothing points at.
+    fn release_frame(&self, frame_i: usize) {
+        let mut frame = self.frames[frame_i].write().unwrap();
+        frame.page_id = None;
+        frame.data = [0u8; PAGE_SIZE];
+        frame.pin_counter = AtomicU16::new(0);
+        frame.dirty_flag = AtomicBool::new(false);
+    }
+
+    /// Evict `victim` and hand its frame to `incoming`, labelled and pinned.
+    ///
+    /// `Ok(None)` means the victim changed under the policy's stale verdict — it was pinned, it was
+    /// re-dirtied, or it is no longer in that frame at all. All three are ordinary under
+    /// concurrency and all three mean "pick another victim", never "force it".
+    ///
+    /// # The ordering that matters
+    ///
+    /// The write-back happens **while the victim is still in the page table**. The other order is
+    /// the tempting one — drop the mapping, then flush at leisure — and it silently loses writes: a
+    /// concurrent `fetch_page(victim)` would miss, read the stale copy from disk, and the dirty
+    /// bytes still sitting in this frame would go to disk afterwards or not at all.
+    fn evict_into(&self, victim: u32, incoming: u32) -> Result<Option<usize>, FerroError> {
+        // A candidate, not an answer: the frame latch below decides whether it is still true.
+        let Some(frame_i) = self.page_table.read().unwrap().get(&victim).copied() else {
+            // `delete_page` or `free_page` removed the victim between the verdict and here.
+            return Ok(None);
+        };
+
+        // Write-back under the victim's OWN latch. A read lock is what keeps `data` stable -- a
+        // writer needs the write lock -- and it is the same lock discipline `flush_page` uses. IO
+        // under a per-frame latch is the design: it blocks threads touching this frame and nobody
+        // else.
+        {
+            let frame = self.frames[frame_i].read().unwrap();
+            if frame.page_id != Some(victim) || frame.pin_counter.load(Ordering::Relaxed) > 0 {
+                return Ok(None);
+            }
+            if frame.dirty_flag.load(Ordering::Relaxed) {
+                self.wal_gate(&frame.data)?;
+                self.disk_manager.write(victim, &frame.data)?;
+                frame.dirty_flag.store(false, Ordering::Relaxed);
+            }
+        }
+
+        // Re-verify and take it. The latch was released across the write-back, so the victim may
+        // have been fetched, dirtied and unpinned again in between; `dirty` is checked as well as
+        // the pin because that whole cycle can complete and leave the count back at zero.
+        let mut pt = self.page_table.write().unwrap();
+        let mut frame = self.frames[frame_i].write().unwrap();
+        if frame.page_id != Some(victim)
+            || frame.pin_counter.load(Ordering::Relaxed) > 0
+            || frame.dirty_flag.load(Ordering::Relaxed)
+        {
+            return Ok(None);
+        }
+        pt.remove(&victim);
+        frame.page_id = Some(incoming);
+        frame.pin_counter = AtomicU16::new(1);
+        frame.dirty_flag = AtomicBool::new(false);
+        Ok(Some(frame_i))
     }
 
     // decrement pin count, if page was modified, add dirty flag
@@ -380,6 +531,17 @@ impl BufferPoolManager {
         // `delete_page` and `free_page` avoid it by dropping the table lock before touching the
         // cache; this takes the same two locks in the same order as `fetch_page` instead, because
         // it has to hold both across the whole sweep.
+        // **`in_transit` first, and it is held for the whole sweep.** A page being faulted in owns
+        // no frame yet between the policy's verdict and its claim, so the pin scan below cannot see
+        // it — and that thread would publish a page of the OLD database into the table after this
+        // function had reported everything dropped. Refusing while any fault is in flight is what
+        // makes "refuses whole rather than in part" true against a concurrent fetch, and holding it
+        // for the duration is what stops a new fault starting mid-sweep.
+        let transit = self.in_transit.lock().unwrap();
+        if !transit.is_empty() {
+            return Err(FerroError::PagePinned);
+        }
+
         let mut cache = self.arc_cache.lock().unwrap();
         let mut pt = self.page_table.write().unwrap();
 
