@@ -1,0 +1,102 @@
+D6 option 2: the durability point moves from `fork` to the branch's FIRST WRITE.
+Harness: examples/lazy_fork.rs (throughput + fsyncs), examples/fork_residency.rs (memory).
+Recorded 2026-09-17, release build, N=640 branches per cell, three alternating runs, MEDIANS.
+
+⛔ HOW TO READ THIS, BEFORE THE NUMBERS.
+
+  This machine was running three other coding agents throughout, and the load moved between
+  sessions by more than a factor of two. TWO alternating A/B sessions were taken, and the BEFORE
+  side of the same arm read 107.3 forks/sec in the first and 222.1 in the second -- while the AFTER
+  side read 383,357 and 311,360, i.e. the same to within the noise. THE RATIO THEREFORE MOVES WITH
+  MACHINE LOAD, because its numerator is disk-bound and its denominator is not. The table below is
+  the SECOND session, taken against the final code; the ratios from the first were larger
+  (x3573 / x418 / x90 on the speculative arm) and are not quoted as the result.
+
+  What does NOT move with load is the fsync column, and that is why it is here: a change that made
+  forks fast by dropping durability would be indistinguishable from this one on every time column
+  and unmistakable on that one.
+
+  Method: BEFORE built from `git archive HEAD` into a clean tree, so no untracked file of the new
+  work sat on its import path. Both binaries run alternately, BEFORE AFTER BEFORE AFTER BEFORE
+  AFTER, in one shell. No ratio here crosses a session.
+
+THROUGHPUT (median of 3, branches/sec)
+
+  arm            threads      BEFORE       AFTER     ratio     fsyncs BEFORE -> AFTER
+  speculative          1        222.1    311359.8    x1402        640 -> 0
+  speculative          8        885.7    216335.0     x244        162 -> 0
+  speculative         64       3830.4    157711.6      x41         37 -> 0
+  fork+write           1         73.0       219.7    x3.01       1280 -> 640
+  fork+write           8        435.5       846.4    x1.94        320 -> 166
+  fork+write          64       2577.5      2552.3    x0.99         61 -> 59
+  fork+reap            1         32.8    137202.9    x4183       3200 -> 0
+  fork+reap            8        197.6     63563.3     x322        769 -> 0
+  fork+reap           64       1323.1     43633.1      x33        106 -> 0
+
+  speculative = fork and abandon.        The case the change exists for.
+  fork+write  = fork, then publish a root. The durable path, which MUST NOT regress.
+  fork+reap   = fork, then reap through the real TwoTierReaper. The whole speculative lifecycle.
+
+WHAT THE NUMBERS SAY, WRITTEN AFTER THEM
+
+  1. A SPECULATIVE FORK IS A COMPLEXITY-CLASS CHANGE, not a constant. It went from six B+tree
+     mutations plus one fsync to one in-memory insert and ZERO disk operations. The AFTER side is
+     flat at ~136k-226k/sec across 1, 8 and 64 threads -- bounded by the catalog's logical mutex,
+     not by anything on disk -- which is why the ratio falls as threads rise: the BEFORE side is
+     getting better, not the AFTER side worse.
+
+  2. THE DEFERRED WORK ARRIVES AND COSTS LESS, WHICH IS THE CLAIM THAT MATTERS. `fork+write` is the
+     same branch doing the same work, only later; if this were a shell game it would show up here
+     as a wash or worse. x3.01 and x1.94 at 1 and 8 threads, and the mechanism is exact rather than
+     statistical: fsyncs per branch fall from 2 to 1 (1280 -> 640 at one thread). A fork used to
+     buy a private fsync and the first write bought another; now the fork's keys ride the write's.
+
+  3. AND AT 64 THREADS THE DURABLE PATH GAINS NOTHING: x0.99, 61 fsyncs -> 59. Reported because it
+     is the honest shape of the result, and the mechanism is clear: group commit had ALREADY shared
+     those fsyncs down to 61 for 640 branches, so removing the fork's ticket removes tickets, not
+     syncs -- the leader still syncs at a rate the device sets. There was nothing left to save.
+
+  4. THE FULL SPECULATIVE LIFECYCLE COSTS THE DISK NOTHING. fork+reap: 3200 fsyncs -> 0. Not fewer:
+     zero, at every thread count. 640 branches created and destroyed through the real reaper, and
+     the catalog file does not change by one byte.
+
+     ⚠ THE FIRST VERSION OF THIS CHANGE MEASURED 400 fsyncs FOR 400 fork+reap CYCLES -- no win at
+     all on the workload it exists for -- while the throughput columns alone read as a huge success.
+     `detach_child` was issuing a durable no-op: the child's index entry had already gone with the
+     stage, so it removed nothing and fsynced anyway. Found only because the harness prints fsyncs.
+     That is the entire argument for printing them.
+
+THE COST COLUMN: a pending fork is resident instead of durable (examples/fork_residency.rs, RSS
+from `ps`, so it counts the pool and allocator slack too -- which is why the SLOPE is the answer
+and not any single absolute).
+
+  branches pending   RSS delta        bytes/branch
+            50,000   47,988,736            959.8
+           200,000  190,349,312            951.7
+           400,000  379,764,736            949.4     <- flat: a real per-branch cost, not startup
+
+  So ~950 resident bytes per fork that has not written yet, against the ~266 durable bytes per
+  branch the eager path wrote (3,000 eager forks grew the catalog file by 798,720 bytes). This is a
+  real trade, and it is the one `LogBranchCatalog` was deleted for making badly (~685 resident
+  bytes per branch, D1) -- so it owes a bound, and it has one:
+
+  RELEASED ON REAP, measured:
+    100,000 complete fork+reap cycles    RSS delta   442,368 bytes total  = 4.4 bytes/branch
+    400,000 complete fork+reap cycles    RSS delta   409,600 bytes total  = 1.0 byte/branch
+    (a CONSTANT, not a slope -- the retired-generation map and the free-id pool do not grow)
+    catalog file across all of it: 12,288 bytes, unchanged.
+
+  Residency is therefore bounded by LIVE branches that have not written, not by branches ever
+  forked. That is the working set D1 asked for, and a never-written branch is exactly what the
+  lease reaper takes first.
+
+WHAT WOULD FALSIFY THIS ENTRY
+
+  - A workload where most forks DO write. Then every fork pays the materialisation and the only
+    saving is the second fsync (x1.94-x3.01 at low concurrency, x0.99 at 64 threads).
+  - A process that forks faster than it reaps. Residency is bounded by live unwritten branches, so
+    a leak in the reaper becomes a memory leak here where it used to be a disk leak.
+  - A crash consumer that needs an acknowledged fork to survive without writing. There is none in
+    the repo, and the premise check in D6 says why there cannot be one: the loss is observably
+    identical to a reap a moment later. `tests/integration_fork_lazy_durability.rs` pins the
+    permitted loss; `tests/integration_fork_kill9.rs` pins what must still survive.

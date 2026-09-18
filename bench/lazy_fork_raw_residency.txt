@@ -1,0 +1,14 @@
+BEFORE speculative  n=3000     rss_before=    6160384  rss_after=    3194880  delta=   -2965504  bytes/branch=  -988.5  catalog_file=798720
+AFTER  speculative  n=3000     rss_before=    6176768  rss_after=    9388032  delta=    3211264  bytes/branch=  1070.4  catalog_file=12288
+BEFORE speculative  n=3000     rss_before=    6160384  rss_after=    3473408  delta=   -2686976  bytes/branch=  -895.7  catalog_file=798720
+AFTER  speculative  n=3000     rss_before=    6193152  rss_after=    9338880  delta=    3145728  bytes/branch=  1048.6  catalog_file=12288
+--- slope of the pending structure, after only ---
+AFTER  speculative  n=50000    rss_before=    6193152  rss_after=   54181888  delta=   47988736  bytes/branch=   959.8  catalog_file=12288
+AFTER  speculative  n=200000   rss_before=    6193152  rss_after=  196542464  delta=  190349312  bytes/branch=   951.7  catalog_file=12288
+AFTER  speculative  n=400000   rss_before=    6193152  rss_after=  385957888  delta=  379764736  bytes/branch=   949.4  catalog_file=12288
+fork-reap    n=100000   rss_before=   10502144  rss_after=   10944512  delta=     442368  bytes/branch=     4.4  catalog_file=12288
+fork-reap    n=400000   rss_before=   10502144  rss_after=   10911744  delta=     409600  bytes/branch=     1.0  catalog_file=12288
+
+--- fork+reap: is the pending memory RELEASED? (the bound on the trade) ---
+fork-reap    n=100000   rss_before=   10502144  rss_after=   10944512  delta=     442368  bytes/branch=     4.4  catalog_file=12288
+fork-reap    n=400000   rss_before=   10502144  rss_after=   10911744  delta=     409600  bytes/branch=     1.0  catalog_file=12288

@@ -1,0 +1,32 @@
+Fire-check of the lazy-durability guards. Each mutant applied to a clean tree, the named test
+run, the tree restored. A guard nobody has watched fire is a guard nobody knows is connected.
+Recorded 2026-09-17. Driver: the eight mutants listed below, one at a time.
+
+Note on M3: its first patch text stopped matching after `put` was restructured, and the driver
+reported PATCH DID NOT APPLY -- fire-check INVALID rather than counting it as a kill. A mutation
+harness that silently applies nothing reports a perfect score, so refusing is the whole design.
+
+  M1 fork materialises itself (the eager behaviour restored)   -> killed
+  M2 materialise only the writer, not its pending ancestors    -> killed
+  M3 a reap of a pending branch materialises, does not discard -> killed
+  M4 discarding a pending branch does not retire its generation-> killed
+  M5 a recycled FREE_ID slot is claimed without a tombstone     -> killed
+  M6 stage() no longer refreshes the header high-water          -> killed
+  M7 materialising buys its own fsync instead of sharing one    -> killed
+  M8 a put that moves the root no longer counts as a first write-> killed
+
+  restored tree: 8 passed; 0 failed
+
+Each mutant produced 'test result: FAILED. 0 passed; 1 failed' on exactly the test named
+beside it in src/branch/table_catalog.rs mod lazy_durability, where the mutation is written
+out above each test so the check can be repeated.
+
+⛔ THE NINTH FIRE-CHECK IS THE IMPORTANT ONE AND IT WAS NOT A MUTANT.
+tests/integration_fork_lazy_durability.rs was written FIRST and run against the unmodified
+pre-change code. It failed, naming the defect it exists to catch:
+
+  the catalog file GREW by 131072 bytes across 512 forks that wrote nothing
+    left: 143360   right: 12288
+
+That is the falsifier D6 option 2 names -- a kill -9 between fork and first write must leave
+nothing -- observed failing before the feature existed and passing after it.
