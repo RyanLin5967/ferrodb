@@ -50,7 +50,7 @@
 //!   cargo run --release --example bufpool_fault_concurrency -- --real 4000 1,2,4,8,16 0 40
 
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -215,9 +215,6 @@ fn sweep_point(
     read_counter: &AtomicU64,
     resident: bool,
 ) -> Run {
-    let refused = Arc::new(AtomicUsize::new(0));
-    let wrong = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicUsize::new(0));
 
     // **Cold pool at every point, and this line is load-bearing.** Without it the first draft of
     // this harness reported 3146 faults/s at 4 threads -- a x1.91 "speedup" that was nothing of the
@@ -276,6 +273,8 @@ fn sweep_point(
     }
     let reads_before = read_counter.load(Ordering::Relaxed);
     let mut elapsed = Duration::ZERO;
+    // Accumulated ACROSS repeats, outside every timed window.
+    let (mut total_done, mut total_refused, mut total_wrong) = (0usize, 0usize, 0usize);
 
     // `repeats` exists to lengthen the measured window, not to change the workload. The real-file
     // mode serves reads from the OS page cache in about a microsecond, so a single pass takes a few
@@ -289,42 +288,67 @@ fn sweep_point(
         }
 
         let start = Instant::now();
-        std::thread::scope(|s| {
-            for t in 0..threads {
-                let bp = Arc::clone(bp);
-                let refused = Arc::clone(&refused);
-                let wrong = Arc::clone(&wrong);
-                let done = Arc::clone(&done);
-                // Disjoint per thread: thread `t` takes every `threads`-th slot. Two threads
-                // wanting the SAME page is a different question, and mixing it in here would leave
-                // the result ambiguous about which effect it had measured.
-                s.spawn(move || {
-                    for k in 0..per_thread {
-                        let slot = (t + k * threads) % ids.len();
-                        let id = ids[(slot * 4099) % ids.len()];
-                        let Ok(idx) = bp.fetch_page(id) else {
-                            refused.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-                        let got = read_stamp(&bp.frames[idx].read().unwrap().data);
-                        bp.unpin_page(id, false);
-                        if got != id {
-                            wrong.fetch_add(1, Ordering::Relaxed);
+        // ⛔ **NOTHING SHARED IS WRITTEN INSIDE THIS LOOP, AND THAT IS THE POINT.**
+        //
+        // Until 2026-09-18 this counted completed fetches into ONE `Arc<AtomicUsize>` with a
+        // `fetch_add` per iteration, inside the timed window. That is a contended read-modify-write
+        // on a single cache line about 9.6 MILLION times per 16-thread point -- which is exactly
+        // the construct the buffer pool is being measured for. The harness contained the thing
+        // under test, and because every arm carried it, it cancelled in every comparison and could
+        // only ever show up as a CEILING that no arm could beat.
+        //
+        // Each thread now RETURNS its own counts and they are summed after the last one has
+        // finished. That is better than the obvious fix of per-thread `#[repr(align(64))]` slots:
+        // a thread's local is in a register or on its own stack, so there is no shared line to
+        // contend on at all, rather than one that has been padded apart. The totals, and therefore
+        // the MISS/HIT and STAMP guards, are arithmetically identical to what the atomics produced.
+        let (fetched, refused_n, wrong_n) = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let bp = Arc::clone(bp);
+                    // Disjoint per thread: thread `t` takes every `threads`-th slot. Two threads
+                    // wanting the SAME page is a different question, and mixing it in here would
+                    // leave the result ambiguous about which effect it had measured.
+                    s.spawn(move || {
+                        let (mut done, mut refused, mut wrong) = (0usize, 0usize, 0usize);
+                        for k in 0..per_thread {
+                            let slot = (t + k * threads) % ids.len();
+                            let id = ids[(slot * 4099) % ids.len()];
+                            let Ok(idx) = bp.fetch_page(id) else {
+                                refused += 1;
+                                continue;
+                            };
+                            let got = read_stamp(&bp.frames[idx].read().unwrap().data);
+                            bp.unpin_page(id, false);
+                            if got != id {
+                                wrong += 1;
+                            }
+                            done += 1;
                         }
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
+                        (done, refused, wrong)
+                    })
+                })
+                .collect();
+            // Joining happens after every thread has finished either way -- the scope would join
+            // them at its closing brace -- so folding here adds one pass over `threads` tuples to
+            // the window and nothing to the per-operation cost.
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker thread panicked"))
+                .fold((0usize, 0usize, 0usize), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
         });
         elapsed += start.elapsed();
+        total_done += fetched;
+        total_refused += refused_n;
+        total_wrong += wrong_n;
     }
 
     Run {
         threads,
         elapsed,
-        fetches: done.load(Ordering::Relaxed),
-        refused: refused.load(Ordering::Relaxed),
-        wrong: wrong.load(Ordering::Relaxed),
+        fetches: total_done,
+        refused: total_refused,
+        wrong: total_wrong,
         reads: read_counter.load(Ordering::Relaxed) - reads_before,
     }
 }

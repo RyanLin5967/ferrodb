@@ -17,7 +17,8 @@ for line in open(path):
     m = re.match(r"===== rep (\d+) \| (\w+) \| (.*?) =====", line)
     if m:
         cur = {"rep": int(m.group(1)), "arm": m.group(2), "label": m.group(3), "rows": [],
-               "exit": None, "pos": None, "la_in": None, "la_out": None}
+               "exit": None, "pos": None, "la_in": None, "la_out": None,
+               "builders_in": None}
         blocks.append(cur)
         continue
     if cur is None:
@@ -25,6 +26,10 @@ for line in open(path):
     m = re.match(r"^# position in rep: (\d+)", line)
     if m:
         cur["pos"] = int(m.group(1))
+        continue
+    m = re.match(r"^# builders at launch: (\d+)", line)
+    if m:
+        cur["builders_in"] = int(m.group(1))
         continue
     m = re.match(r"^# loadavg at (launch|finish): ([\d.]+)", line)
     if m:
@@ -125,8 +130,19 @@ for label in labels:
             arms_at = sorted({b["arm"] for b in blocks if b["label"] == label and b["pos"] == pos})
             if vals:
                 print(f"    pos {pos}: median {median(vals):>15,.0f}  (arms: {','.join(arms_at)})")
-        if len({len({b['arm'] for b in blocks if b['label'] == label and b['pos'] == p})
-                for p in positions}) == 1 and len(positions) == len(arms):
+        # Balanced means each POSITION held EVERY arm, which needs reps to be a multiple of the
+        # arm count. A truncated run passes a weaker check trivially -- with one rep each position
+        # holds exactly one arm -- so the test is on the count of DISTINCT arms per position.
+        per_pos = {p: {b["arm"] for b in blocks if b["label"] == label and b["pos"] == p}
+                   for p in positions}
+        if all(len(v) == len(arms) for v in per_pos.values()) and len(positions) == len(arms):
             print("    -> every position held every arm: the square is balanced")
         else:
-            print("    -> UNBALANCED: positions do not each hold every arm, so drift is NOT cancelled")
+            worst = min(len(v) for v in per_pos.values())
+            print(f"    -> UNBALANCED: some position held only {worst} of {len(arms)} arms, so "
+                  f"drift is NOT cancelled. Needs reps to be a multiple of {len(arms)}.")
+    # Contamination, recorded rather than assumed absent.
+    bl = [b["builders_in"] for b in blocks if b["label"] == label and b.get("builders_in") is not None]
+    if bl:
+        print(f"  cargo/rustc at block launch: min {min(bl)} max {max(bl)} "
+              f"blocks_with_builders {sum(1 for x in bl if x > 0)}/{len(bl)}")

@@ -22,11 +22,17 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PT = os.path.join(ROOT, "src/buffer/page_table.rs")
 BP = os.path.join(ROOT, "src/buffer/buffer_pool.rs")
+TQ = os.path.join(ROOT, "src/buffer/touch_queue.rs")
+
+# The committed BASE eviction sequence. ARC is not modified by either half of D44, so this must
+# come back byte-identical from every unmutated build -- an EQUALITY gate, not a tolerance.
+TRACE_REF = os.path.join(ROOT, "bench/d35_c1_evictiontrace_c1.txt")
 
 # The suites that are supposed to cover the mirror. `--lib` carries PageTable's own unit tests.
 SUITES = [
     ["cargo", "test", "--lib", "buffer::"],
     ["cargo", "test", "--test", "integration_buffer_pool_mirror"],
+    ["cargo", "test", "--test", "integration_buffer_pool_touch_batching"],
     ["cargo", "test", "--test", "integration_buffer_pool_latch"],
     ["cargo", "test", "--test", "integration_buffer_pool_concurrency"],
 ]
@@ -109,6 +115,79 @@ MUTATIONS = [
         """        let _ = pack(page_id, frame_i);
         prev""",
     ),
+    # ── D44: the batched hit-path policy update ───────────────────────────────────────────────
+    (
+        # A shard that fills hands its batch back to be applied. Dropping it silently discards
+        # recency information -- ARC would think the hottest pages were cold, and NO throughput
+        # benchmark could see it. This is the failure the eviction-trace gate exists for.
+        "T1-record-drops-a-full-batch",
+        TQ,
+        "FIRED",
+        """        if pending.len() >= self.batch {
+            // Swap in a fresh buffer rather than draining into the caller's, so the shard lock is
+            // held for a pointer swap and not for a copy.
+            return Some(std::mem::replace(&mut *pending, Vec::with_capacity(self.batch)));
+        }
+        None""",
+        """        if pending.len() >= self.batch {
+            pending.clear();
+            return None;
+        }
+        None""",
+    ),
+    (
+        # The whole correctness argument for batching. Without the drain, ARC decides what to evict
+        # from a recency order that is missing every hit since the last miss.
+        "T2-arc_locked-does-not-drain",
+        BP,
+        "FIRED",
+        """        let mut pending = Vec::new();
+        self.touch_queue.drain_into(&mut pending);
+        for page_id in pending {""",
+        """        let pending: Vec<u32> = Vec::new();
+        for page_id in pending {""",
+    ),
+    (
+        # The hit path throwing away the batch its own shard handed back.
+        "T3-hit-path-ignores-the-returned-batch",
+        BP,
+        "FIRED",
+        """                if let Some(batch) = self.touch_queue.record(page_id) {
+                    // `arc_locked` has already drained what was pending when it took the lock;
+                    // this batch left the shard before that, so it is applied after, which is the
+                    // order the hits happened in.
+                    let mut cache = self.arc_locked();
+                    for id in batch {
+                        cache.touch(id);
+                    }
+                }""",
+        """                let _ = self.touch_queue.record(page_id);""",
+    ),
+    (
+        # A drain that copies instead of taking. Every update is then applied again on the next
+        # drain: a `touch` ARC never earned, moving a page to the front of T2 for a reference that
+        # did not happen.
+        "T4-drain-does-not-empty-the-shard",
+        TQ,
+        "FIRED",
+        """            let mut pending = shard.pending.lock().unwrap();
+            out.append(&mut pending);""",
+        """            let pending = shard.pending.lock().unwrap();
+            out.extend_from_slice(&pending);""",
+    ),
+    (
+        # ⭐ THE SECOND CONTROL, and it tests a CLAIM rather than just the detector. The batch size
+        # is documented as unable to affect ARC's DECISIONS at all, because every decision is
+        # preceded by a full drain, so no decision can ever observe a backlog. If that is true,
+        # a 64-FOLD change -- 512 down to 8 -- must leave both the suites and the eviction trace
+        # untouched. If this FIRES, the claim is false and the batch size is a policy knob in
+        # disguise, which would make 512 unshippable however fast it is.
+        "CONTROL-batch-size-must-not-change-behaviour",
+        BP,
+        "SILENT",
+        """const TOUCH_BATCH: usize = 512;""",
+        """const TOUCH_BATCH: usize = 8;""",
+    ),
     (
         # THE CONTROL, and the gate is void without it: a detector that fires on everything is not
         # a detector. This mutates the SAME LINE as M2 -- `lookup`'s load -- to a STRONGER memory
@@ -133,7 +212,36 @@ def run(cmd, timeout=1800):
 
 
 def restore():
-    subprocess.run(["git", "checkout", "HEAD", "--", PT, BP], cwd=ROOT, check=True)
+    subprocess.run(["git", "checkout", "HEAD", "--", PT, BP, TQ], cwd=ROOT, check=True)
+
+
+def sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+def check_trace():
+    """Replay the fixed eviction trace and compare it to the committed BASE sequence.
+
+    This is the gate the suites cannot be: a batching scheme that quietly reorders ARC's evictions
+    breaks nothing a unit test asserts and no throughput benchmark can see it. Returns MATCH,
+    DIFFERS, or BUILD-FAILED.
+    """
+    rc, out, _ = run(["cargo", "build", "--release", "--example", "d35_eviction_trace"])
+    if rc != 0:
+        return "BUILD-FAILED", None
+    binp = os.path.join(ROOT, "target/release/examples/d35_eviction_trace")
+    tmp = os.path.join(ROOT, "target", "firecheck_trace.txt")
+    with open(tmp, "wb") as f:
+        pr = subprocess.run([binp], cwd=ROOT, stdout=f, stderr=subprocess.DEVNULL, timeout=900)
+    if pr.returncode != 0:
+        return "TRACE-ABORTED", None
+    got = sha256(tmp)
+    want = sha256(TRACE_REF)
+    return ("MATCH" if got == want else "DIFFERS"), got
 
 
 def apply(path, old, new):
@@ -178,6 +286,10 @@ def main():
             print(f"  rep{rep} {' '.join(cmd[1:])}: rc={rc} {' | '.join(line)} ({secs:.1f}s)")
             if rc != 0:
                 baseline_ok = False
+    tv, tsha = check_trace()
+    print(f"  BASELINE eviction trace: {tv} (sha256 {tsha})")
+    if tv != "MATCH":
+        baseline_ok = False
     print(f"  BASELINE = {'GREEN' if baseline_ok else 'RED -- every verdict below is worthless'}")
     print()
     if not baseline_ok:
@@ -203,6 +315,13 @@ def main():
             for f in failed[:6]:
                 print(f"      {f.strip()}")
             if rc != 0:
+                fired = True
+        if compiled:
+            tv, tsha = check_trace()
+            print(f"  eviction trace: {tv}" + (f" (sha256 {tsha})" if tsha else ""))
+            if tv == "BUILD-FAILED":
+                compiled = False
+            elif tv != "MATCH":
                 fired = True
         if not compiled:
             verdict = "DID-NOT-COMPILE"
