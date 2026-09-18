@@ -59,6 +59,36 @@ if [ -z "$base_code" ]; then
   exit 0
 fi
 
+# Could the base's code diff change BEHAVIOUR at all? A comment-only diff cannot -- with one
+# Rust-specific exception that makes the naive form of this check wrong: a `///` doc comment may
+# contain a ```-fenced DOCTEST, which cargo compiles and runs. So a fence marker anywhere in the
+# changed lines disqualifies the claim, and the script says so rather than quietly allowing.
+rust_code=$(printf '%s\n' "$base_code" | grep -E '\.rs$' || true)
+other_code=$(printf '%s\n' "$base_code" | grep -vE '\.rs$' || true)
+diff_body=$(git -C "$wt" diff -U0 "$mb" "$b" -- $(printf '%s ' $rust_code) 2>/dev/null)
+changed=$(printf '%s\n' "$diff_body" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)')
+noncomment=$(printf '%s\n' "$changed" | sed -E 's/^[+-]//' | grep -vE '^[[:space:]]*(//|$)' | grep -c . )
+fences=$(printf '%s\n' "$changed" | grep -c '```')
+# Report the breakdown either way -- a blunt verdict over a mixed diff is what made v1 useless.
+echo "  base moved under: $(printf '%s\n' "$rust_code" | grep -c .) Rust file(s), $(printf '%s\n' "$other_code" | grep -c .) other code file(s)"
+if [ "${noncomment:-1}" -eq 0 ] && [ "${fences:-1}" -eq 0 ]; then
+  if [ -z "$other_code" ]; then
+    echo "COVERED-COMMENTS-ONLY: every changed line in every changed Rust file is a comment,"
+    echo "  and nothing else under code moved, so behaviour cannot have changed."
+    printf '%s\n' "$rust_code" | sed 's/^/    /' | head -12
+    exit 0
+  fi
+  echo "  NOTE: the Rust changes are COMMENT-ONLY, so compiled behaviour cannot have changed."
+  echo "  What moved that is not Rust -- judge these yourself, a build or verification script CAN"
+  echo "  change what a suite measures even though it compiles nothing:"
+  printf '%s\n' "$other_code" | sed 's/^/      /' | head -12
+fi
+if [ "${noncomment:-1}" -eq 0 ] && [ "${fences:-0}" -ne 0 ]; then
+  echo "NOTE: the base's code diff is comment-only, BUT it touches a \`\`\` fence -- a Rust doc"
+  echo "  comment can carry a DOCTEST that cargo compiles and runs, so comment-only does not imply"
+  echo "  behaviour-free here. Treating it as STALE-GREEN. Settle it with: cargo test --doc"
+fi
+
 overlap=$(comm -12 <(printf '%s\n' "$base_code") <(printf '%s\n' "$head_code"))
 echo "STALE-GREEN: the base moved under code this branch has not seen."
 echo "  code files changed on $base since the fork point: $(printf '%s\n' "$base_code" | grep -c .)"

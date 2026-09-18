@@ -1,0 +1,79 @@
+# W4 BEFORE/AFTER, interleaved. THE HEADLINE MEASUREMENT.
+#
+# Two binaries built from the same harness source: `before` from commit d7e45cc's
+# src/agent_sql/runtime.rs, `after` from this branch. Run ROUND-ROBIN -- before then after, at each
+# S, nine times -- so a noisy interval on this machine (the agent fleet was running throughout)
+# lands on both arms instead of one. The blocked design that preceded this produced an ordering
+# that did not reproduce; that is why the arms are interleaved.
+#
+# Fixture: S open agent sessions, 64 of them reaped in the catalog behind the runtime's back, then
+# ONE forget_reaped_branches(). The number is the largest wait an unrelated concurrent statement
+# (AgentRuntime::quarantine_reason, which takes the state lock and reads an empty map) suffered
+# while that sweep ran. Nanoseconds.
+#
+#       S   before_med    after_med   factor |   before_max    after_max   factor
+#    1000       168000        94958     1.8x |       583542       230875     2.5x
+#   10000      4280292       214667    19.9x |      5260625      1064083     4.9x
+#  100000    129031750       681667   189.3x |    187449125     12279375    15.3x
+#
+# The before column at S=100000 is 111-187 ms across all nine rounds -- tight, which is what a
+# structural cost looks like. The after column is 0.32-12.3 ms, and its spread is NOT the lock:
+# this machine's idle control reached 13 ms during the same period with nothing holding the lock
+# at all, so at 10^5 the remaining after-numbers are at or below the floor this machine can
+# resolve. The claim that survives is the before column, which is far above that floor.
+#
+# arm	S	round	stall_ns	wall_ns
+before	1000	1	583542	846834
+before	10000	1	4320792	7216333
+before	100000	1	187449125	273208709
+after	1000	1	230875	292625
+after	10000	1	214667	2058625
+after	100000	1	2651333	27641750
+before	1000	2	184041	467917
+before	10000	2	4280292	7124250
+before	100000	2	129069791	159931334
+after	1000	2	76625	261292
+after	10000	2	161083	2276167
+after	100000	2	681667	26912625
+before	1000	3	155333	435041
+before	10000	3	4684459	7622000
+before	100000	3	129031750	160861417
+after	1000	3	60291	255458
+after	10000	3	224834	2094334
+after	100000	3	12279375	37448916
+before	1000	4	175041	518542
+before	10000	4	5260625	7546250
+before	100000	4	122793375	155604333
+after	1000	4	119750	253417
+after	10000	4	1064083	2147875
+after	100000	4	1182916	24717416
+before	1000	5	152542	432250
+before	10000	5	4401875	7272625
+before	100000	5	120412709	154205625
+after	1000	5	54708	241125
+after	10000	5	419333	2572250
+after	100000	5	10588959	34808667
+before	1000	6	198208	507625
+before	10000	6	3748500	6792042
+before	100000	6	134506917	167201208
+after	1000	6	73667	224500
+after	10000	6	251250	2336416
+after	100000	6	329833	23440125
+before	1000	7	136750	393250
+before	10000	7	2706250	5269458
+before	100000	7	111052333	141439000
+after	1000	7	119500	223000
+after	10000	7	185333	2274375
+after	100000	7	320792	23210666
+before	1000	8	150458	451833
+before	10000	8	3795416	6425084
+before	100000	8	147258750	178882042
+after	1000	8	94958	384584
+after	10000	8	140167	2064042
+after	100000	8	640708	22088667
+before	1000	9	168000	450167
+before	10000	9	3553708	6069875
+before	100000	9	126457209	157052917
+after	1000	9	108542	318333
+after	10000	9	154750	1870833
+after	100000	9	567583	25098125
