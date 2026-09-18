@@ -323,3 +323,65 @@ first draft tripping it instead, which is recorded in the test rather than tidie
   no trend. S15's figure is still named, with its branch and commit, as **motivation and not
   evidence**. Nothing in this work's argument depended on it: the direction of the fix follows from
   the wall column's slope, which was measured on this machine in this tree.
+
+## Addendum 3 — the last three review findings, and a number this record had wrong
+
+Closing out the same fresh-context review. Six findings: one wrong, five real. Addendum 2 took two
+of them; these are the rest.
+
+**The instrument was crediting the sweep with its own warm-up, and it moved a number in this
+record.** `oneshot` took the prober's maximum over the whole thread lifetime — which includes the
+20 ms warm-up before the sweep starts and the tail after it ends, intervals where nothing holds the
+lock at all. This record already noted that the idle control on this machine reaches tens of
+milliseconds with the fleet running, the same magnitude as the entire AFTER column, so the
+contamination was not hypothetical; the record simply did not connect the two. Samples are now
+filtered to those that **overlap** the sweep, and a run where none overlap **refuses** rather than
+reporting 0 — a sweep shorter than the 50 µs probe interval has not been measured as fast, it has
+not been measured.
+
+Re-measured at S=10⁵ (`statement-lock-AFTER-corrected-window.txt`): the median is unchanged and the
+tail falls 6× — 682 µs → 608 µs median, 12 279 µs → 2 022 µs max. So the AFTER column's outliers
+were noise, exactly as the review said, and the "at or below the floor this machine can resolve"
+hedge earlier in this record was covering for a fixable instrument rather than a real limit.
+
+**Corrected headline, S=10⁵, 64 reaped, worse of two runs:**
+
+| | before | after | factor |
+|---|---|---|---|
+| median stall | 129.0 ms | 0.61 ms | **212×** |
+| max stall | 187.4 ms | 2.02 ms | **93×** |
+
+The BEFORE column is unaffected — 111–187 ms across nine rounds dwarfs a ~20 ms noise floor. Two
+independent AFTER runs are kept in the artifact because they disagree by ~2× on a loaded machine;
+the worse one is what is quoted here. The FASTPATH table in addendum 1 was produced by the same
+uncorrected instrument, so its `stall` maxima are inflated the same way. Its `wall` column — which
+that addendum correctly identifies as the one that matters for the server's statement lock — is
+unaffected, and so is its conclusion.
+
+**The skip path stranded the dead branch's escrow.** When phase 3 finds the slot recycled it
+refuses to remove the live branch's workspace, and it was skipping `escrow.release` along with
+everything else. The dead branch's claim then sat in the pool with nothing alive that could ever
+give it back — the resource-stranding the ABANDON arm of `seal` exists to prevent, and the mirror
+image of the bug the re-validation fixed. It releases now, and it is only correct to do so *because*
+the ledger is keyed by the whole `BranchId` (`82b4eb0`): the release names the dead generation and
+leaves the reborn branch's own claims, a different key, alone. `w4_sweep_slot_recycle` now claims 12
+of a 20-unit pool for the doomed branch and 3 for the racer inside the window, and asserts 17
+unclaimed afterwards; with the release deleted it reports 5, naming the stranded units.
+
+**"Nothing is missed permanently" was stronger than the call sites support** — the reconciliation
+runs on `scan_once`'s error arm or when a simulation starts, not on a timer. Reworded in place.
+
+**The finding that was wrong**, recorded so it is not re-raised: the review reported
+`tests/w4_sweep_slot_recycle.rs` as failing to compile for want of a `BranchCatalog::add_arena`
+implementation. There is no such method on the trait, and the test compiles and passes. The reviewer
+said it had not run cargo. Checking beat believing it, which is the same rule this record applies to
+its own numbers.
+
+### Still open after all of this
+
+- `run_activity` remains an O(open sessions) hold on the same lock and remains this measurement's
+  positive control. Unchanged from the note above: fixing it needs a replacement control in the same
+  commit.
+- `workspaces` lookups are still generation-blind. The escrow half is fixed; the map is not.
+- The reconciliation's own wall time is still O(open sessions) on the error path, inside the
+  server's statement lock. Addendum 1's closing note stands.
