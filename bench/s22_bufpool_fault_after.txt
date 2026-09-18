@@ -1,0 +1,51 @@
+# S22 AFTER — per-frame latch + in-transit marker; no pool-wide lock across the disk read
+# code: commit 50f53f5   harness: same binary as the BEFORE file next to this one
+# run at 2026-09-18T02:54:21Z, loadavg: 16.20 19.06 15.42
+
+===== MODELLED IO, 500us per read =====
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.316	500	1582	500	1.000	0	0
+2	0.316	1000	3162	1000	1.000	0	0
+4	0.316	2000	6330	2000	1.000	0	0
+8	0.316	4000	12674	4000	1.000	0	0
+16	0.316	8000	25324	8000	1.000	0	0
+
+# calibration: 1 thread measured 1582 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1582 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1582		x1.00		x1.00
+# 2	3162		x2.00		x2.00
+# 4	6330		x4.00		x4.00
+# 8	12674		x8.01		x8.00
+# 16	25324		x16.00		x16.00
+HARNESS_EXIT=0
+
+===== REAL FILE, warm OS page cache, 40 repeats =====
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=4000 repeats=40
+# mode=real file (warm OS page cache)
+# host: 18 cores
+# file: /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/ferro-s22-39911/bufpool.db
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.178	160000	899737	160000	1.000	0	0
+2	0.504	320000	635285	320000	1.000	0	0
+4	1.328	640000	481827	640000	1.000	0	0
+8	2.992	1280000	427778	1280000	1.000	0	0
+16	6.965	2560000	367576	2559857	1.000	0	0
+
+# serialised bound = 899737 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	899737		x1.00		x1.00
+# 2	635285		x0.71		x2.00
+# 4	481827		x0.54		x4.00
+# 8	427778		x0.48		x8.00
+# 16	367576		x0.41		x16.00
+HARNESS_EXIT=0

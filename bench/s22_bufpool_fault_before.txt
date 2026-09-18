@@ -1,52 +1,51 @@
-# S22 BEFORE — base commit cb12805
-# fetch_page takes arc_cache Mutex at buffer_pool.rs:72 and holds it to every return,
-# including across DiskManager::read at :122 and :144 and flush_page at :118.
-# run at 2026-09-18T02:46:53Z, loadavg: 11.96 12.94 10.33
+# S22 BEFORE — base commit cb12805, fetch_page holds arc_cache across DiskManager::read
+# code: buffer_pool.rs as at 093eda5   harness: SAME binary/params as the AFTER file next to this one
+# run at 2026-09-18T02:55:03Z, loadavg: 19.78 19.63 15.81
 
 ===== MODELLED IO, 500us per read =====
 # S22 buffer pool fault concurrency
-# pages=8192 pool_frames=1024 fetches_per_thread=500
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
 # mode=modelled IO, 500 us per read
 # host: 18 cores
 
 threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
-1	0.318	500	1574	500	1.000	0	0
-2	0.636	1000	1573	1000	1.000	0	0
-4	1.322	2000	1513	2000	1.000	0	0
-8	2.766	4000	1446	4000	1.000	0	0
-16	5.677	8000	1409	8000	1.000	0	0
+1	0.319	500	1566	500	1.000	0	0
+2	0.638	1000	1567	1000	1.000	0	0
+4	1.282	2000	1559	2000	1.000	0	0
+8	2.625	4000	1524	4000	1.000	0	0
+16	5.141	8000	1556	8000	1.000	0	0
 
-# calibration: 1 thread measured 1574 faults/s, 1/delay = 2000 faults/s
+# calibration: 1 thread measured 1566 faults/s, 1/delay = 2000 faults/s
 # (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
 
-# serialised bound = 1574 faults/s at every thread count
+# serialised bound = 1566 faults/s at every thread count
 # threads	measured	vs_1_thread	perfect_scaling
-# 1	1574		x1.00		x1.00
-# 2	1573		x1.00		x2.00
-# 4	1513		x0.96		x4.00
-# 8	1446		x0.92		x8.00
-# 16	1409		x0.90		x16.00
+# 1	1566		x1.00		x1.00
+# 2	1567		x1.00		x2.00
+# 4	1559		x1.00		x4.00
+# 8	1524		x0.97		x8.00
+# 16	1556		x0.99		x16.00
 HARNESS_EXIT=0
 
-===== REAL FILE, warm OS page cache =====
+===== REAL FILE, warm OS page cache, 40 repeats =====
 # S22 buffer pool fault concurrency
-# pages=8192 pool_frames=1024 fetches_per_thread=4000
+# pages=8192 pool_frames=1024 fetches_per_thread=4000 repeats=40
 # mode=real file (warm OS page cache)
 # host: 18 cores
-# file: /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/ferro-s22-29220/bufpool.db
+# file: /var/folders/55/_g661x791l7bpjqd0qrjzxlh0000gn/T/ferro-s22-51390/bufpool.db
 
 threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
-1	0.009	4000	424366	4000	1.000	0	0
-2	0.020	8000	406915	8000	1.000	0	0
-4	0.071	16000	226944	16000	1.000	0	0
-8	0.094	32000	340748	31995	1.000	0	0
-16	0.290	64000	220451	63995	1.000	0	0
+1	0.310	160000	515504	160000	1.000	0	0
+2	0.725	320000	441445	320000	1.000	0	0
+4	2.241	640000	285547	640000	1.000	0	0
+8	5.507	1280000	232437	1279990	1.000	0	0
+16	11.588	2560000	220921	2559901	1.000	0	0
 
-# serialised bound = 424366 faults/s at every thread count
+# serialised bound = 515504 faults/s at every thread count
 # threads	measured	vs_1_thread	perfect_scaling
-# 1	424366		x1.00		x1.00
-# 2	406915		x0.96		x2.00
-# 4	226944		x0.53		x4.00
-# 8	340748		x0.80		x8.00
-# 16	220451		x0.52		x16.00
+# 1	515504		x1.00		x1.00
+# 2	441445		x0.86		x2.00
+# 4	285547		x0.55		x4.00
+# 8	232437		x0.45		x8.00
+# 16	220921		x0.43		x16.00
 HARNESS_EXIT=0

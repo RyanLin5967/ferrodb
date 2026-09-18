@@ -213,6 +213,7 @@ fn sweep_point(
     per_thread: usize,
     repeats: usize,
     read_counter: &AtomicU64,
+    resident: bool,
 ) -> Run {
     let refused = Arc::new(AtomicUsize::new(0));
     let wrong = Arc::new(AtomicUsize::new(0));
@@ -228,6 +229,24 @@ fn sweep_point(
     // `invalidate_all` drops every frame WITHOUT writing back, which is safe here precisely because
     // this harness only ever unpins clean (`unpin_page(id, false)`); it would be data loss in a
     // workload that dirtied pages.
+    // **Warm or cold, decided once, before anything is counted.**
+    //
+    // The RESIDENT arm exists because the two arms fail for different reasons and a fix for one
+    // need not be a fix for the other. The fault arm measures the miss path, where the cost is a
+    // read syscall made under a lock. This arm measures the HIT path, where no IO happens at all
+    // and the only thing a fetch can contend on is the pool's own bookkeeping. A change that takes
+    // IO out from under the global lock moves the first curve and need not move this one.
+    //
+    // Warming happens before `reads_before` is sampled, so the reads that fill the pool are not
+    // charged to the measurement and the HIT GUARD in `main` sees the steady state rather than the
+    // fill.
+    if resident {
+        for &id in ids {
+            if bp.fetch_page(id).is_ok() {
+                bp.unpin_page(id, false);
+            }
+        }
+    }
     let reads_before = read_counter.load(Ordering::Relaxed);
     let mut elapsed = Duration::ZERO;
 
@@ -238,7 +257,9 @@ fn sweep_point(
     // fetch in every repeat is still a genuine fault. The MISS GUARD checks that rather than
     // trusting this comment.
     for _ in 0..repeats {
-        bp.invalidate_all().expect("cold pool between repeats: nothing should be pinned here");
+        if !resident {
+            bp.invalidate_all().expect("cold pool between repeats: nothing should be pinned here");
+        }
 
         let start = Instant::now();
         std::thread::scope(|s| {
@@ -284,6 +305,8 @@ fn sweep_point(
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let real = args.iter().any(|a| a == "--real");
+    // The working set fits the pool, so every fetch is a HIT and the miss path is never taken.
+    let resident = args.iter().any(|a| a == "--resident");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
 
     let per_thread: usize = pos.first().and_then(|s| s.parse().ok()).unwrap_or(500);
@@ -297,8 +320,22 @@ fn main() {
     let delay = Duration::from_micros(pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(500));
     let repeats: usize = pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
 
+    // A working set that FITS in the 1024 frames, so the pool never evicts and never reads.
+    const RESIDENT_PAGES: usize = 512;
+
     println!("# S22 buffer pool fault concurrency");
-    println!("# pages={PAGES} pool_frames=1024 fetches_per_thread={per_thread} repeats={repeats}");
+    println!(
+        "# pages={} pool_frames=1024 fetches_per_thread={per_thread} repeats={repeats}",
+        if resident { RESIDENT_PAGES as u32 } else { PAGES }
+    );
+    println!(
+        "# arm={}",
+        if resident {
+            "RESIDENT (working set fits the pool; every fetch is a cache HIT)"
+        } else {
+            "OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)"
+        }
+    );
     println!(
         "# mode={}",
         if real { "real file (warm OS page cache)".to_string() } else { format!("modelled IO, {} us per read", delay.as_micros()) }
@@ -351,9 +388,11 @@ fn main() {
     println!();
     println!("threads\twall_s\tfetches\tfaults_per_s\treads\treads_per_fetch\trefused\twrong");
 
+    let working_set: &[u32] = if resident { &ids[..RESIDENT_PAGES.min(ids.len())] } else { &ids };
+
     let mut results: Vec<Run> = Vec::new();
     for &t in &thread_counts {
-        let r = sweep_point(&bp, &ids, t, per_thread, repeats, inst.reads());
+        let r = sweep_point(&bp, working_set, t, per_thread, repeats, inst.reads(), resident);
         let per_s = r.fetches as f64 / r.elapsed.as_secs_f64();
         let rpf = if r.fetches > 0 { r.reads as f64 / r.fetches as f64 } else { 0.0 };
         println!(
@@ -384,7 +423,21 @@ fn main() {
     // residency bug this guard already caught back in.
     for r in &results {
         let rpf = r.reads as f64 / r.fetches.max(1) as f64;
-        if rpf < 0.98 {
+        if resident {
+            // HIT GUARD, the mirror image. This arm claims to measure the hit path, and it only
+            // does so while the pool is actually serving these fetches from memory. If the working
+            // set has started missing — an eviction bug, or a pool smaller than it says — the
+            // number is about page faults again and the arm is measuring the other thing.
+            if rpf > 0.02 {
+                eprintln!(
+                    "\nHIT GUARD FAILED at {} threads: {:.3} reads per fetch. The resident arm is \
+                     supposed to fit in the pool and never reach storage, so this number is about \
+                     page faults rather than about cache hits.",
+                    r.threads, rpf
+                );
+                failed = true;
+            }
+        } else if rpf < 0.98 {
             eprintln!(
                 "\nMISS GUARD FAILED at {} threads: {:.3} reads per fetch. The working set is \
                  being served from the pool, so most of these fetches never reached storage and \
