@@ -5,19 +5,21 @@
 # file is run 3 times against it. The row records which tests failed and how often.
 #
 # 'NOT CAUGHT' is a real result and is reported as one: it means that guard has no test.
-# control: 7 tests, all green on unmutated code.
+# control: 8 tests, all green on unmutated code.
 
 M1	NOT CAUGHT
 	mutation: try_pin_resident: trust the page table, drop the frame-label re-check before pinning
 
-M2b	CAUGHT (flaky — race-dependent)
+M2b	CAUGHT (deterministic)
 	mutation: evict_into: drop BOTH frame-latch pin checks, keep the policy's is_pinned filter
-	failed 1/3: a_pinned_page_is_never_evicted_however_hard_the_pool_churns
-	failed 2/3: every_frame_agrees_with_the_page_table_about_which_page_it_holds
-	failed 1/3: the_page_table_never_maps_two_pages_to_one_frame
+	failed 3/3: a_fetch_never_returns_a_frame_labelled_with_a_different_page
+	failed 2/3: a_pinned_page_is_never_evicted_however_hard_the_pool_churns
+	failed 1/3: concurrent_fetches_never_return_another_pages_bytes
+	failed 1/3: every_frame_agrees_with_the_page_table_about_which_page_it_holds
 
 M2c	CAUGHT (deterministic)
 	mutation: M2b PLUS is_pinned always false: the policy stops skipping pinned pages too
+	failed 3/3: a_fetch_never_returns_a_frame_labelled_with_a_different_page
 	failed 3/3: a_pinned_page_is_never_evicted_however_hard_the_pool_churns
 	failed 3/3: concurrent_fetches_never_return_another_pages_bytes
 	failed 3/3: every_frame_agrees_with_the_page_table_about_which_page_it_holds
@@ -25,10 +27,10 @@ M2c	CAUGHT (deterministic)
 
 M3	CAUGHT (deterministic)
 	mutation: fetch_page: never wait on in_transit, so two threads fault the same page at once
+	failed 2/3: a_fetch_never_returns_a_frame_labelled_with_a_different_page
 	failed 3/3: a_pinned_page_is_never_evicted_however_hard_the_pool_churns
 	failed 3/3: concurrent_fetches_of_one_cold_page_read_it_once_into_one_frame
-	failed 1/3: the_page_table_never_maps_two_pages_to_one_frame
 
 M4	CAUGHT (flaky — race-dependent)
 	mutation: fault_in: publish the page-table mapping BEFORE the bytes land in the frame
-	failed 1/3: concurrent_fetches_of_one_cold_page_read_it_once_into_one_frame
+	failed 2/3: a_fetch_never_returns_a_frame_labelled_with_a_different_page

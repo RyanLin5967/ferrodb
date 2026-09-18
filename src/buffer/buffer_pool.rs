@@ -522,15 +522,22 @@ impl BufferPoolManager {
     /// another database's bytes with no error anywhere. The caller's answer to a refusal is to
     /// stop its readers, not to retry.
     pub fn invalidate_all(&self) -> Result<(), FerroError> {
-        // **`arc_cache` BEFORE `page_table`.** `fetch_page` holds the cache across the whole of its
-        // work and takes the page table inside it, and its comment states the order as
-        // `arc_cache -> page_table -> frame`. Taking them the other way round here — which the
+        // **`arc_cache` BEFORE `page_table`,** which is the module's order: `in_transit ->
+        // arc_cache -> page_table -> frame`. Taking them the other way round here — which the
         // first version of this function did — is a lock inversion against the one path every read
-        // in the database goes through, and the two deadlock: `fetch_page` holding the cache and
-        // blocking on the table, this holding the table and blocking on the cache.
-        // `delete_page` and `free_page` avoid it by dropping the table lock before touching the
-        // cache; this takes the same two locks in the same order as `fetch_page` instead, because
-        // it has to hold both across the whole sweep.
+        // in the database goes through, and the two deadlock: a thread holding the cache and
+        // blocking on the table, this holding the table and blocking on the cache. `fault_in`
+        // still takes the cache and then the table underneath it, inside `is_pinned`, so the
+        // inversion is live and not historical.
+        //
+        // This paragraph used to say "`fetch_page` holds the cache across the whole of its work",
+        // which was true of the pool this function was written against and stopped being true when
+        // that lock came off the IO path. The ORDER survived the change; the reason given for it
+        // had not, and a stale reason is worse than none because it reads as current.
+        //
+        // `delete_page` and `free_page` avoid the question by dropping the table lock before
+        // touching the cache; this takes both in the module's order instead, because it has to
+        // hold them across the whole sweep.
         // **`in_transit` first, and it is held for the whole sweep.** A page being faulted in owns
         // no frame yet between the policy's verdict and its claim, so the pin scan below cannot see
         // it — and that thread would publish a page of the OLD database into the table after this
