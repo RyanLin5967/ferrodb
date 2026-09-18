@@ -22,6 +22,7 @@
 //! with it. It stops at the budget and SAYS SO, naming the N it reached. "Stopped early on space" is
 //! the result, not a failure of the run — and if it does NOT stop early, that kills D31, which is
 //! the outcome D31's own falsifier asks for.
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -64,7 +65,10 @@ fn main() {
              ARENA_EXTENT_PAGES * 4);
     println!("Budget: {budget_gb} GB. The run REFUSES to exceed it rather than fill the disk.");
     println!();
-    println!("         N   forks/sec   data MB   data B/branch   cat MB   cat B/branch   pages live");
+    // Two space columns on purpose. `data MB` is FILE LENGTH; `alloc MB` is blocks*512, what the
+    // filesystem actually gave out. A reservation scheme can inflate length far past allocation, and
+    // quoting only length would overstate the wall. Both are reported so neither can be cherry-picked.
+    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live");
 
     let mut done = 0usize;
     let mut stopped_early: Option<(usize, u64)> = None;
@@ -105,15 +109,18 @@ fn main() {
         let secs = t0.elapsed().as_secs_f64();
         done += actually;
 
-        let data = std::fs::metadata(&main_path).map(|m| m.len()).unwrap_or(0);
+        let md = std::fs::metadata(&main_path).ok();
+        let data = md.as_ref().map(|m| m.len()).unwrap_or(0);
+        let alloc = md.as_ref().map(|m| m.blocks() * 512).unwrap_or(0);
         let cbytes = std::fs::metadata(&cat_path).map(|m| m.len()).unwrap_or(0);
         println!(
-            "  {:>8}   {:>9.1}   {:>7.1}   {:>13.0}   {:>6.1}   {:>12.0}   {:>10}",
+            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}",
             done,
             actually as f64 / secs,
             data as f64 / 1e6,
+            alloc as f64 / 1e6,
             data as f64 / done as f64,
-            cbytes as f64 / 1e6,
+            alloc as f64 / done as f64,
             cbytes as f64 / done as f64,
             store.live_page_count().unwrap_or(0),
         );
@@ -127,7 +134,13 @@ fn main() {
     println!();
     match stopped_early {
         Some((n, bytes)) => {
+            let alloc_b = std::fs::metadata(&main_path).map(|m| m.blocks() * 512).unwrap_or(0);
+            let alloc_per = alloc_b as f64 / n as f64;
             let per_branch = bytes as f64 / n as f64;
+            println!("Allocated (blocks*512) rather than merely addressed: {:.0} B/branch, {:.2} GB total.",
+                     alloc_per, alloc_b as f64 / 1e9);
+            println!("  -> 10^6 branches x {:.0} allocated B = {:.2} TB actually on disk.",
+                     alloc_per, alloc_per * 1e6 / 1e12);
             println!("STOPPED EARLY ON SPACE at N = {n}, data file {:.2} GB ({:.0} bytes/branch).",
                      bytes as f64 / 1e9, per_branch);
             println!("Extrapolated (ARITHMETIC, NOT MEASURED) to the objective:");
