@@ -240,11 +240,38 @@ fn sweep_point(
     // Warming happens before `reads_before` is sampled, so the reads that fill the pool are not
     // charged to the measurement and the HIT GUARD in `main` sees the steady state rather than the
     // fill.
+    // Warming is a LOOP WITH A CHECK, not a single pass, because a single pass does not work and
+    // the first version of this arm shipped believing it did. Measured: at the first sweep point
+    // one pass left 511 of the 512 pages still absent, the timed window faulted them in, and the
+    // HIT GUARD failed the run -- which is exactly what that guard is for. Subsequent points were
+    // clean, so a warm-up that "looked fine" at points 2..n would have hidden a broken point 1.
+    //
+    // Re-fetching until the page table actually holds the working set makes residency a checked
+    // fact rather than an assumption, and `passes` is reported so a change that makes warming
+    // harder shows up as a number rather than as a mysteriously slow first point.
+    let mut passes = 0usize;
     if resident {
-        for &id in ids {
-            if bp.fetch_page(id).is_ok() {
-                bp.unpin_page(id, false);
+        for attempt in 1..=16 {
+            for &id in ids {
+                if bp.fetch_page(id).is_ok() {
+                    bp.unpin_page(id, false);
+                }
             }
+            passes = attempt;
+            let pt = bp.page_table.read().unwrap();
+            if ids.iter().all(|id| pt.contains_key(id)) {
+                break;
+            }
+        }
+        let pt = bp.page_table.read().unwrap();
+        let missing = ids.iter().filter(|id| !pt.contains_key(id)).count();
+        drop(pt);
+        if missing > 0 {
+            eprintln!(
+                "# WARNING: {missing} of {} pages still not resident after {passes} warm passes; \
+                 the HIT GUARD below will fail this point.",
+                ids.len()
+            );
         }
     }
     let reads_before = read_counter.load(Ordering::Relaxed);
