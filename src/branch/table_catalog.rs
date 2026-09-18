@@ -1008,6 +1008,19 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(removed)
     }
 
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // **D20.** No read-modify-write at all: `hydrate` DERIVES `arenas` from exactly these
+        // ARENA keys, so owning an arena is one key. The racy shape this replaces was
+        // `get_raw` (unlocked) -> push -> `put` (locked) in `ArenaPageStore::alloc_arena`, where
+        // the unlocked read could traverse a tree another thread was splitting and come back with
+        // the wrong arena list -- which was then written back as truth.
+        //
+        // Under `logical` so it cannot interleave with the multi-key writers (`put`, `fork`,
+        // `attach_child`), all of which also rewrite this span.
+        let _g = self.logical.lock().unwrap();
+        self.upsert(keys::arena(branch.id, arena.0), Vec::new())
+    }
+
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
         // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -484,6 +484,18 @@ impl BranchCatalog for LogBranchCatalog {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // This catalog keeps the arena list inside the record, so the read-modify-write is real
+        // and must be done under the write lock rather than around it. See D20.
+        let mut st = self.state.write().unwrap();
+        if let Some(rec) = st.records.get_mut(&branch.id) {
+            if !rec.arenas.contains(&arena) {
+                rec.arenas.push(arena);
+            }
+        }
+        Ok(())
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
