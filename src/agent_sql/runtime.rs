@@ -3394,32 +3394,9 @@ impl AgentRuntime {
             if !gone.is_empty() {
                 let mut state = self.state.lock().unwrap();
                 for (id, bid) in &gone {
-                    // **Re-validate, because phase 2 ran with the lock released.** The catalog
-                    // releases a reaped branch's id SLOT for reuse and bumps the generation, and
-                    // both `workspaces` and `names` are keyed by the slot alone — a new session
-                    // forking into slot 5 takes the same `b_5` name and the same map key. Acting
-                    // on phase 2's answer without re-reading would then delete a LIVE agent's
-                    // workspace, release its escrow and unbind its name, for a branch the catalog
-                    // had never been asked about. The generation is what tells the two apart, so
-                    // the check is against the whole `BranchId` and not its id half.
-                    let still_ours = match state.workspaces.get(id) {
-                        Some(ws) => state.names.get(&ws.name) == Some(bid),
-                        None => false,
-                    };
-                    if !still_ours {
-                        continue;
+                    if forget_one_branch(&mut state, *id, *bid) {
+                        forgotten += 1;
                     }
-                    // Reaped without client cooperation, so nothing this branch buffered was
-                    // published BY IT: the same reasoning as the ABANDON arm of `seal`, and
-                    // reached by a different door. A descendant may still have published what this
-                    // branch staged, so the same helper decides -- the reaper is the door the
-                    // fixture reaches this through with no client cooperation at all.
-                    let Some(ws) = state.remove_workspace(id) else { continue };
-                    forget_captures_unless_published(&mut state, &ws);
-                    state.names.remove(&ws.name);
-                    state.escrow.release(*bid);
-                    state.quarantine_reasons.remove(id);
-                    forgotten += 1;
                 }
             }
 
@@ -3435,6 +3412,51 @@ impl AgentRuntime {
                 None => return forgotten,
             }
         }
+    }
+
+    /// Forget exactly the branches a reaper says it took, rather than re-deriving the set by
+    /// walking every open session. Returns how many were dropped.
+    ///
+    /// **Why this exists next to [`AgentRuntime::forget_reaped_branches`], which already does
+    /// this.** The reconciliation answers "which of my workspaces has the catalog lost?", and the
+    /// only way to answer that is to ask about all of them: O(open sessions), of which the catalog
+    /// half is the expensive part. But `scan_once` already holds the exact answer — `reap_expired`
+    /// hands it the list — and then throws it away and pays for the search anyway. That search ran
+    /// inside the pgwire server's per-statement lock (`src/branch/lease_thread.rs`), so a timer
+    /// stopped the whole database for as long as the walk took: 39.3 s at 10⁶ open sessions,
+    /// measured in `bench/runtime_at_1e6.txt` (W4). Asking about `reaped.len()` branches instead
+    /// is O(branches actually reaped), which is what a tick costs when nothing has gone wrong.
+    ///
+    /// **This is a fast path and NOT a replacement.** `reap_expired` can reap several branches and
+    /// then return `Err`, discarding the ids it had already accumulated
+    /// (`src/branch/reaper.rs`, the `Err(e) => return Err(e)` arm, and `sweep_empty_extents`
+    /// after it) — so a caller that only ever forgets what it is told about would leak exactly the
+    /// branches reaped before a failure. The reconciliation is what covers that, and the lease
+    /// thread still runs it on precisely that path.
+    ///
+    /// Each branch is confirmed gone from the catalog before anything is dropped, so passing a
+    /// live branch here does nothing rather than deleting a working agent's session.
+    pub fn forget_branches(&self, reaped: &[BranchId]) -> usize {
+        let mut forgotten = 0usize;
+        // Chunked for the same reason the reconciliation is: `reaped` is unbounded in principle
+        // (a simulation can expire thousands of candidate branches at once), and a lock hold that
+        // is O(that) is the same wall this work exists to remove, reached by the other door.
+        for slice in reaped.chunks(FORGET_CHUNK) {
+            // The catalog, with the state lock NOT held -- the same order rule as phase 2 of the
+            // reconciliation, for the same reason.
+            let gone: Vec<BranchId> =
+                slice.iter().copied().filter(|bid| self.branches.get(*bid).is_err()).collect();
+            if gone.is_empty() {
+                continue;
+            }
+            let mut state = self.state.lock().unwrap();
+            for bid in gone {
+                if forget_one_branch(&mut state, bid.id, bid) {
+                    forgotten += 1;
+                }
+            }
+        }
+        forgotten
     }
 
     /// Drop a branch and everything buffered on it.
@@ -4185,6 +4207,39 @@ fn forget_captures_unless_published(state: &mut State, ws: &Workspace) {
         }
         state.captures.remove(&txn.0);
     }
+}
+
+/// Drop one branch's in-memory state, if the runtime still holds exactly that branch. `true` when
+/// something was dropped. The caller holds the state lock.
+///
+/// **Re-validates before touching anything, because the catalog was asked with the lock released.**
+/// The catalog releases a reaped branch's id SLOT for reuse and bumps the generation, while both
+/// `workspaces` and `names` are keyed by the slot alone — a new session forking into slot 5 takes
+/// the same `b_5` name and the same map key. Acting on a stale answer would then delete a LIVE
+/// agent's workspace, release its escrow and unbind its name, for a branch the catalog had never
+/// been asked about. The generation is what tells the two apart, so the check is against the whole
+/// `BranchId` and not its id half.
+///
+/// Shared by the reconciliation and by [`AgentRuntime::forget_branches`] so that the fast path
+/// cannot drift from the backstop: the two differ in which branches they consider, and in nothing
+/// else.
+fn forget_one_branch(state: &mut State, id: u64, bid: BranchId) -> bool {
+    let still_ours = match state.workspaces.get(&id) {
+        Some(ws) => state.names.get(&ws.name) == Some(&bid),
+        None => false,
+    };
+    if !still_ours {
+        return false;
+    }
+    // Reaped without client cooperation, so nothing this branch buffered was published BY IT: the
+    // same reasoning as the ABANDON arm of `seal`, and reached by a different door. A descendant
+    // may still have published what this branch staged, so the same helper decides.
+    let Some(ws) = state.remove_workspace(&id) else { return false };
+    forget_captures_unless_published(state, &ws);
+    state.names.remove(&ws.name);
+    state.escrow.release(bid);
+    state.quarantine_reasons.remove(&id);
+    true
 }
 
 /// Is anything still relying on `txn`'s capture -- a publish that happened, or one that still could?
