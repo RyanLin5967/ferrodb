@@ -1,0 +1,20 @@
+# W4 FORGET_CHUNK selection. S=100000 open sessions, 64 reaped, one sweep per sample.
+# Round-robin ACROSS chunk sizes, 9 rounds: a blocked design gave a noisy interval to one
+# arm only and produced an ordering that did not reproduce. Nanoseconds, prober's max stall.
+# Machine had the agent fleet running throughout; that is what the outliers are.
+
+round         64        256       1024       4096
+    1   17644375     315250     459208    1268916
+    2     445083     144125     419250    1125958
+    3    4109208     364291     462250     899500
+    4     274708     148792     574083     845167
+    5     246625     169584     489209    1133250
+    6     120834    2907750     452625    1080083
+    7    2039709     134625     490750    1281333
+    8    1005458     280333     431541     974500
+    9     757417     430542     482291     911083
+
+ stat         64        256       1024       4096
+  med     757417     280333     462250    1080083
+  max   17644375    2907750     574083    1281333
+  min     120834     134625     419250     845167

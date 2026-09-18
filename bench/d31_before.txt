@@ -1,0 +1,13 @@
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
+       496       168.8     519.1      364.5        1046478           734852            347          496
+      1000        82.5    1047.5     1060.1        1047536          1060119            332         1000
+      2000        87.5    2096.1     2092.0        1048056          1045975            328         2000
+      4000        91.7    4193.3     4178.7        1048316          1044664            330         4000
+
+DID NOT stop early within the budget: N = 4000, 1048316 bytes/branch.
+If that is far below 1048576 B, the first-page amplification is NOT binding here
+and D31 should be CLOSED rather than built -- which is what its own falsifier asks.

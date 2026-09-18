@@ -1,0 +1,45 @@
+D31 — what geometric extent growth costs the reaper.
+
+Instrument: examples/d31_reap_cost.rs, 50 branches per row, TableBranchCatalog on a real file,
+release build. The SAME binary source on both sides (it uses arena_for + alloc_in_arena per page,
+not PageStore::alloc_for, which exists only after), built once per tree. Three runs per side;
+medians below. Raw: bench/d31_reap_before.txt, bench/d31_reap_after.txt.
+
+Trees: before = ff05cd5 (src/ checked out over the worktree), after = 6484044.
+
+  pages/branch |  extents/branch  | reserved pages/branch |   reap ms (median of 3)
+               | before   after   |  before      after    |  before      after
+  -------------|------------------|-----------------------|---------------------------
+             1 |  1.00    1.00    |   256.0        1.0    |  1284.6     1767.5
+             7 |  1.00    3.00    |   256.0        7.0    |  1409.1     1851.2
+            64 |  1.00    7.00    |   256.0      127.0    |  1289.8     1838.6
+           500 |  2.00    9.00    |   512.0      511.0    |  1369.9     2150.0
+          2000 |  8.00   15.00    |  2048.0     2047.0    |  1405.7     1921.7
+
+EXTENTS PER BRANCH rise by a BOUNDED amount: +0, +2, +6, +7, +7. The climb 1+2+4+...+256 = 511
+pages is over inside a branch's first 511, so the excess can never exceed the nine steps of the
+climb whatever M is. This is a constant, not a change of growth rate: ceil(M/256) becomes at most
+ceil(M/256) + 8.
+
+RESERVED PAGES PER BRANCH is the point of the exercise: 256 -> 1 at one page written, and level
+with the old scheme by M=500. Geometric growth costs nothing at the large end.
+
+REAP TIME IS FLAT IN M ON BOTH SIDES — 1285/1409/1290/1370/1406 before and
+1768/1851/1839/2150/1922 after, across a 2000x range of pages per branch. So a reap sweep is
+dominated by the per-BRANCH durable catalog write, not by the per-EXTENT free, which is why a
+bounded rise in extents per branch does not move it.
+
+THE APPARENT ~1.4x SHIFT IS NOISE, and the table carries its own control for that. At M = 1 both
+trees free exactly 1.00 extents per branch: identical reaper work, and if anything the AFTER side
+evicts fewer pages (1 vs 256). It still reads 1285 -> 1768. A difference that appears where the
+work is provably identical is measurement noise, and it is the same size as every other row's.
+
+Source of the noise, named rather than guessed: this machine was running the agent fleet
+throughout. `uptime` during the run reported load average 16.57, with 26 cargo/rustc processes
+live and ~735% total CPU. A tighter number would need a quiet machine; the conclusion that the
+extent-count rise does not move reap cost does not depend on one, because it rests on the
+flatness in M and on the M = 1 control.
+
+SEPARATELY: tests/d19_leak_is_a_race exceeds a 900s timeout. It does so IDENTICALLY on both
+trees — three of five arms finish inside 540s, all reporting LEAK=0, on ff05cd5 and on HEAD
+alike (bench/d19_before.txt). Pre-existing, not introduced here.

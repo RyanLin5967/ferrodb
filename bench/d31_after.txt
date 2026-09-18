@@ -1,0 +1,16 @@
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
+       496       467.2       2.0        3.0           4104             6053            347          496
+      1000       585.0       4.1        5.1           4100             5100            332         1000
+      2000       174.9       8.2        8.2           4098             4123            330         2000
+      4000       382.7      16.4       16.6           4097             4158            330         4000
+
+DID NOT stop early within the budget: N = 4000, 4097 bytes/branch.
+
+  reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+VERDICT — AMPLIFICATION GONE. 4097 B/branch is within 8x of a
+single page, so a branch's first page costs about a page. This is the tree WITH
+geometric extent growth (D31) built; without it this number is ~1048576.

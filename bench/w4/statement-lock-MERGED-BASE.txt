@@ -1,0 +1,76 @@
+# W4 BEFORE/AFTER, RE-MEASURED ON THE MERGED BASE (after agent-isolation, incl. D27 + D33).
+#
+# WHY THIS FILE EXISTS. statement-lock-BEFORE-AFTER.txt was measured against a base 25 commits
+# behind agent-isolation. D27 then replaced Workspace's data fields with a persistent ordered map,
+# and forget_reaped_branches walks exactly that structure -- so the old pair was a number about a
+# tree nobody is shipping. Caught by team-lead with `git merge-base --is-ancestor`.
+#
+# BOTH ARMS ARE BUILT FROM THE MERGED BASE. The `before` binary is the merged tree with ONLY this
+# lane's two changes reverted -- the chunked sweep and the txn_refs index -- so all 25 upstream
+# commits are present in both arms and the only difference is the change being measured. The first
+# attempt at that produced a `before` binary byte-identical to `after`, because the splice removed
+# `forget_branches` and the build failed while cargo left the previous artifact in place; it was
+# caught with `cmp` and discarded. Both binaries are verified to differ before any number below.
+#
+# PHASE 3 IS REACHABLE, which is the point: gone=64 of S, so capture_is_protected runs per removed
+# branch. A gone=0 fixture measures phase 1 only and reports the smaller, calmer number.
+#
+# Interleaved round-robin, before then after, 9 rounds each. `recon` arm = forget_reaped_branches.
+# Largest wait an unrelated statement suffered during ONE sweep, nanoseconds.
+#
+#       S    n   before_med    after_med    factor |   before_max    after_max
+#   10000    9      2852500       152000     18.8x |      3910459       326375
+#  100000    9     96318834       346875    277.7x |    147604542       424875
+#
+# THE DISTRIBUTIONS DO NOT OVERLAP at either S -- the worst `after` is below the best `before`:
+#   S=10000   before 1.81-3.91 ms   after 0.086-0.326 ms
+#   S=100000  before 79.3-147.6 ms  after 0.287-0.425 ms
+#
+# THE NUMBER MOVED, and both arms moved: pre-merge was 129.0 ms -> 0.68 ms (189x), post-merge is
+# 96.3 ms -> 0.347 ms (278x). The before arm got FASTER under D27 (129 -> 96 ms) and the after arm
+# got faster too (681 -> 347 us). The post-merge pair is the real result; the pre-merge pair is
+# superseded, not corrected.
+#
+# CONTROLS, same binary, same machine, S=100000 (stall_mean, nanoseconds):
+#   idle   450        negative control -- nothing takes the lock. Flat, as before the merge.
+#   sweep  339517     under test
+#   activ  20906963   positive control -- run_activity, an O(sessions) hold this lane does not
+#                     touch. Still separates from idle by ~46000x, so the instrument is not blind.
+#
+# arm	S	round	blind	stall_med_ns	wall_med_ns
+before	10000	1	0	2556500	4815250
+before	100000	1	0	118927750	155694542
+after	10000	1	0	218250	2617250
+after	100000	1	0	288541	21985083
+before	10000	2	0	3510792	6229875
+before	100000	2	0	147604542	191315834
+after	10000	2	0	326375	2622084
+after	100000	2	0	424875	26086250
+before	10000	3	0	3910459	7156000
+before	100000	3	0	122916834	161523833
+after	10000	3	0	238833	2355042
+after	100000	3	0	400000	25082708
+before	10000	4	0	3203375	6218583
+before	100000	4	0	133331333	170938917
+after	10000	4	0	180000	2364291
+after	100000	4	0	287250	22445375
+before	10000	5	0	3204459	6549917
+before	100000	5	0	96318834	124418208
+after	10000	5	0	148250	1833375
+after	100000	5	0	307875	20454792
+before	10000	6	0	2432083	4806875
+before	100000	6	0	81670125	107592875
+after	10000	6	0	142666	1828250
+after	100000	6	0	347250	19700875
+before	10000	7	0	2852500	5299083
+before	100000	7	0	94872833	122369292
+after	10000	7	0	86458	1624750
+after	100000	7	0	331875	18499417
+before	10000	8	0	1871583	3845750
+before	100000	8	0	87534541	119158458
+after	10000	8	0	119292	1744625
+after	100000	8	0	346875	19143917
+before	10000	9	0	1814583	3746291
+before	100000	9	0	79267709	105673209
+after	10000	9	0	152000	1659792
+after	100000	9	0	387250	22530166
