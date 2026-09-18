@@ -1350,6 +1350,177 @@ mod tests {
         assert!(err.to_string().contains("not a tree"), "got {}", err);
     }
 
+    /// **D13b — `collapse` must roll over extents, or it cannot collapse a real database.**
+    ///
+    /// `collapse` allocated ONE arena and threaded that single id through every `deep_copy`.
+    /// `alloc_in_arena` deliberately refuses to grow an extent — its own error says "ask
+    /// `arena_for` for a fresh extent" — so the copy died the moment the materialised tree
+    /// crossed `ARENA_EXTENT_PAGES` (256 pages, ~1MB at 4KB pages).
+    ///
+    /// That is not a corner: `collapse` is the ONLY escape from `MAX_BRANCH_DEPTH`, so the ninth
+    /// fork of any database over ~1MiB was a dead end — the fork is refused, and the one operation
+    /// that clears the refusal cannot run. Every existing collapse test copies a 1–3 page tree,
+    /// which is why the whole suite stayed green through it.
+    ///
+    /// The tree below is bigger than TWO extents on purpose, so a fix that rolls over exactly once
+    /// does not pass either. And the record's arena list is checked by OUTCOME — the branch is
+    /// reaped and the reserved count must return to baseline — because the reaper frees exactly
+    /// `record.arenas`: a rollover that allocates extents the record never learns about trades an
+    /// exhaustion error for a permanent space leak (D20, in the other direction).
+    #[test]
+    fn collapse_rolls_over_extents_for_a_tree_larger_than_one() {
+        const FANOUT: usize = 3;
+        const LEAVES_PER: usize = 220;
+        // 1 root + 3 internal + 660 leaves = 664 pages = 2.6 extents.
+        const TREE_PAGES: u32 = (1 + FANOUT + FANOUT * LEAVES_PER) as u32;
+        const EXTENTS: usize =
+            ((TREE_PAGES + ARENA_EXTENT_PAGES - 1) / ARENA_EXTENT_PAGES) as usize;
+
+        let h = Harness::new_with($table);
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_links(Arc::new(ToyLinks));
+
+        let baseline_live = h.store.live_page_count().unwrap();
+        let baseline_reserved = h.store.reserved_page_count();
+
+        // A chain sitting exactly where the depth guard leaves one.
+        let mut cur = BranchId::TRUNK;
+        for _ in 0..crate::branch::types::MAX_BRANCH_DEPTH {
+            cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
+        }
+        assert!(
+            h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).is_err(),
+            "the chain is not at the ceiling, so collapse is not the only way forward"
+        );
+
+        // Build its tree. Note `arena_for` per page rather than one captured `alloc_arena` id:
+        // the store could ALREADY roll over, and a normal writer gets it for free. Collapse was
+        // the one caller that did not ask.
+        let epoch = h.catalog.next_epoch();
+        let mut leaves_all: Vec<PageId> = Vec::with_capacity(FANOUT * LEAVES_PER);
+        let mut internals: Vec<PageId> = Vec::with_capacity(FANOUT);
+        for _ in 0..FANOUT {
+            let mut leaves = Vec::with_capacity(LEAVES_PER);
+            for _ in 0..LEAVES_PER {
+                let arena = h.store.arena_for(cur).unwrap();
+                let p = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+                let handle = h.store.read_page(p).unwrap();
+                let mut f = handle.write();
+                f.data[PAGE_HEADER_SIZE + 32] = (leaves_all.len() % 256) as u8;
+                stamp_checksum(&mut f.data);
+                drop(f);
+                leaves.push(p);
+                leaves_all.push(p);
+            }
+            let arena = h.store.arena_for(cur).unwrap();
+            let node = h.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch).unwrap();
+            let handle = h.store.read_page(node).unwrap();
+            let mut f = handle.write();
+            ToyLinks::write(&mut f.data, &leaves);
+            stamp_checksum(&mut f.data);
+            drop(f);
+            internals.push(node);
+        }
+        let arena = h.store.arena_for(cur).unwrap();
+        let root = h.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch).unwrap();
+        {
+            let handle = h.store.read_page(root).unwrap();
+            let mut f = handle.write();
+            ToyLinks::write(&mut f.data, &internals);
+            stamp_checksum(&mut f.data);
+        }
+        h.catalog.set_root(cur, root).unwrap();
+
+        assert!(
+            TREE_PAGES > 2 * ARENA_EXTENT_PAGES,
+            "a tree that fits in two extents does not test rollover"
+        );
+        assert_eq!(
+            h.store.live_page_count().unwrap(),
+            baseline_live + TREE_PAGES,
+            "the tree was not built"
+        );
+
+        let collapsed = reaper
+            .collapse(cur)
+            .expect("collapse must materialise a tree larger than one extent");
+
+        assert_eq!(collapsed.depth, 1);
+        assert_eq!(collapsed.parent_id, Some(BranchId::TRUNK));
+        assert_eq!(
+            h.store.live_page_count().unwrap(),
+            baseline_live + 2 * TREE_PAGES,
+            "every reachable page must be copied exactly once"
+        );
+
+        // Walk the materialised tree: right shape, right payloads, no original id reused, and
+        // spread across as many extents as it needs.
+        let originals: HashSet<PageId> =
+            leaves_all.iter().chain(internals.iter()).copied().chain([root]).collect();
+        let mut copy_arenas: HashSet<ArenaId> = HashSet::new();
+        let mut tags: Vec<u8> = Vec::with_capacity(FANOUT * LEAVES_PER);
+        let mut copied = 0u32;
+        let mut stack = vec![collapsed.root_page_id];
+        while let Some(p) = stack.pop() {
+            assert!(
+                !originals.contains(&p),
+                "collapse aliased original page {p} instead of copying it"
+            );
+            let (page_type, arena_id, data) = {
+                let handle = h.store.read_page(p).unwrap();
+                let hd = handle.header().unwrap();
+                (hd.page_type, hd.arena_id, handle.read().data)
+            };
+            copy_arenas.insert(arena_id);
+            copied += 1;
+            let kids = ToyLinks.child_pages(page_type, &data).expect("toy links decode");
+            if kids.is_empty() {
+                tags.push(data[PAGE_HEADER_SIZE + 32]);
+            }
+            stack.extend(kids);
+        }
+        assert_eq!(copied, TREE_PAGES, "the materialised tree is the wrong size");
+        tags.sort_unstable();
+        let mut want: Vec<u8> = (0..FANOUT * LEAVES_PER).map(|i| (i % 256) as u8).collect();
+        want.sort_unstable();
+        assert_eq!(tags, want, "the copied leaves lost their payloads");
+
+        assert_eq!(
+            copy_arenas.len(),
+            EXTENTS,
+            "a {TREE_PAGES}-page copy landed in {} extent(s) of {ARENA_EXTENT_PAGES}; \
+             collapse did not roll over",
+            copy_arenas.len()
+        );
+        for a in &copy_arenas {
+            assert!(
+                collapsed.arenas.contains(a),
+                "arena {a} holds copied pages but is absent from the record. The reaper frees \
+                 exactly `record.arenas`, so this extent could never be reclaimed."
+            );
+        }
+        assert_eq!(
+            h.store.reserved_page_count(),
+            baseline_reserved + 2 * EXTENTS as u32 * ARENA_EXTENT_PAGES,
+            "the original tree and its copy should hold {} extents between them",
+            2 * EXTENTS
+        );
+
+        // THE OUTCOME, not the field. The reaper frees exactly `record.arenas`; if collapse
+        // forgot a rolled-over extent, the space never comes back.
+        reaper.reap(cur).expect("reap the collapsed branch");
+        assert_eq!(
+            h.store.live_page_count().unwrap(),
+            baseline_live,
+            "pages survived the reap: collapse allocated extents the record does not list"
+        );
+        assert_eq!(
+            h.store.reserved_page_count(),
+            baseline_reserved,
+            "extents survived the reap: collapse allocated extents the record does not list"
+        );
+    }
+
     /// **The ordering inside `reap` is load-bearing for crash safety, and nothing enforced it.**
     ///
     /// `reap` must mark a child `Reaped` BEFORE removing its entry from the parent's live set.
