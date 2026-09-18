@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# tools/verify-suite-selftest.sh — fire-check the SIGTERM abort in verify-suite.sh.
+# tools/verify-suite-selftest.sh — fire-check verify-suite.sh's refusals.
+#
+# Part 1 and part 2 cover the SIGTERM abort (note 7 in verify-suite.sh); part 3 covers the D42
+# INCONCLUSIVE channel (note 6) and the landing guard that reads it. Part 3 is described where it
+# begins; the SIGTERM halves are described here because they came first.
 #
 # Note 7 in verify-suite.sh claims a signal aborts the run, takes its children with it, and refuses
 # to print a number. That claim is worth exactly what a run of this file says: a guard nobody has
@@ -17,7 +21,7 @@
 # It never touches the real /tmp/ferrodb-suite.lock: SUITE_LOCK is redirected into a temp dir, so
 # this is safe to run while nothing else is, and it will not steal a live suite's lock.
 #
-# Usage: tools/verify-suite-selftest.sh     exit 0 = both halves behaved as documented.
+# Usage: tools/verify-suite-selftest.sh     exit 0 = every part behaved as documented.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -106,6 +110,50 @@ for p in $kids; do alive "$p" && surv="$surv $p"; done
                || ok "no descendant survived the abort"
 for p in $surv; do kill -9 "$p" 2>/dev/null; done
 
+# ── part 3: the D42 INCONCLUSIVE channel ────────────────────────────────────────────────────────
+#
+# Note 6 in verify-suite.sh routes a starved test's own verdict into the refusal channel, and
+# certify-head.sh refuses to land such a run. Two ways that rots, and both are checked here:
+#
+#   3a  DRIFT. The marker strings live in a Rust source file AND, by necessity, as literals in a
+#       shell script that cannot read a Rust constant. If either side is renamed alone, the grep
+#       silently matches nothing for ever and every starved run goes back to being reported as a
+#       red — a guard that has quietly stopped existing while still appearing in the file.
+#   3b  THE LANDING GUARD, in BOTH directions. A refusal that fires on everything is worse than
+#       none, so certify-head.sh must refuse an INCONCLUSIVE directory AND still certify an honest
+#       green one. Checking only the first half would pass for a guard that refuses unconditionally.
 note ""
-if [ "$fails" -eq 0 ]; then note "SELFTEST PASSED — both halves behaved as note 7 documents"; exit 0; fi
+note "== part 3: the D42 INCONCLUSIVE channel =="
+RS=tests/integration_consensus_failover.rs
+for lit in 'FERRODB-VERDICT: INCONCLUSIVE' 'FERRODB-VERDICT: CLASSIFIER-BROKEN'; do
+    in_sh=$(grep -cF "$lit" tools/verify-suite.sh)
+    in_rs=$(grep -cF "$lit" "$RS")
+    if [ "$in_sh" -gt 0 ] && [ "$in_rs" -gt 0 ]; then
+        ok "marker '$lit' present in both verify-suite.sh and $RS"
+    else
+        bad "marker '$lit' is in verify-suite.sh $in_sh time(s) and $RS $in_rs time(s) — the two \
+copies have drifted, so the grep matches a string nothing emits"
+    fi
+done
+
+CH=$TD/certify
+mkdir -p "$CH"
+HEAD_SHORT=$(git log -1 --format=%h 2>/dev/null)
+printf 'selftest: mode=whole rc=0 passed=1 failed=0 build_errors=0 head=%s log=/dev/null\nselftest: go rc=0 passed=1 failed=0 log=/dev/null\n' \
+    "$HEAD_SHORT" > "$CH/SUMMARY.txt"
+if bash tools/certify-head.sh "$CH" HEAD >/dev/null 2>&1; then
+    ok "certify-head accepts an honest green directory (anti-vacuity for the check below)"
+else
+    bad "certify-head REFUSED a green directory naming HEAD — it refuses unconditionally, so the \
+next check proves nothing"
+fi
+printf 'selftest: INCONCLUSIVE — FERRODB-VERDICT: INCONCLUSIVE (fixture)\n' > "$CH/INCONCLUSIVE.txt"
+if bash tools/certify-head.sh "$CH" HEAD >/dev/null 2>&1; then
+    bad "certify-head CERTIFIED a directory holding INCONCLUSIVE.txt — a starved run can be landed"
+else
+    ok "certify-head refuses a directory holding INCONCLUSIVE.txt"
+fi
+
+note ""
+if [ "$fails" -eq 0 ]; then note "SELFTEST PASSED — all three parts behaved as documented"; exit 0; fi
 note "SELFTEST FAILED — $fails check(s) did not hold"; exit 1

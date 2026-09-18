@@ -1,0 +1,22 @@
+== part 1: the old trap shape (anti-vacuity) ==
+ok:   old shape resumed past the signal (bug reproduced)
+ok:   old shape deleted the lock and carried on (bug reproduced)
+ok:   old shape still running after SIGTERM (bug reproduced)
+
+== part 2: tools/verify-suite.sh under SIGTERM ==
+ok:   verifier holds its lock (24410 selftest-term 2026-09-18T13:17:52Z)
+ok:   children in flight before the signal: 24714 24713 
+exit status 143, 0s after the signal
+ok:   exited 143 (aborted-by-signal refusal)
+ok:   printed a refusal: selftest-term: REFUSING — aborted by SIGTERM after 1s. A suite cut short is not a count.
+ok:   printed no total
+ok:   suite lock released
+ok:   no descendant survived the abort
+
+== part 3: the D42 INCONCLUSIVE channel ==
+ok:   marker 'FERRODB-VERDICT: INCONCLUSIVE' present in both verify-suite.sh and tests/integration_consensus_failover.rs
+ok:   marker 'FERRODB-VERDICT: CLASSIFIER-BROKEN' present in both verify-suite.sh and tests/integration_consensus_failover.rs
+ok:   certify-head accepts an honest green directory (anti-vacuity for the check below)
+ok:   certify-head refuses a directory holding INCONCLUSIVE.txt
+
+SELFTEST PASSED — all three parts behaved as documented
