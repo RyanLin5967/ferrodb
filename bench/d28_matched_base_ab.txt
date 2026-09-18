@@ -1,0 +1,115 @@
+D28: matched-base, interleaved A/B for the system-view generator hint.
+
+Base: agent-isolation ecbbf74 (D13b/D31 lane landed).  Arm A tip: D28-view-pushdown.
+Instrument: examples/runtime_curve.rs, phase `query`, byte-identical in both arms.
+
+
+WHY THIS FILE REPLACES THE EARLIER NUMBERS
+
+bench/d28_view_pushdown.txt reports 22170.73 ms -> 0.13 ms at 10^6. That pair is NOT a
+matched A/B: the "before" was taken on the pre-merge tree and the "after" after merging,
+and the base moved underneath in between -- `br_all`, an unchanged code path, went
+23.6 s -> 14.4 s on its own, which is D27/W4/D23 landing, not D28. An A/B whose two arms
+came from different bases is not a measurement, however large the ratio.
+
+So both arms here are built from ONE base, and that is checked mechanically rather than
+assumed:
+
+    git diff --name-only agent-isolation HEAD -- src/
+      src/agent_sql/runtime.rs
+      src/branch/mod.rs
+      src/branch/table_catalog.rs
+      src/catalog/system_views.rs
+
+Exactly the four D28 files and nothing else, so `agent-isolation` IS "this tip with the
+pushdown reverted". The base was chased twice during this work (f000160 -> c75d06e ->
+ecbbf74); building arm B from the base rather than from an older checkout is what makes
+that chase stop mattering.
+
+The two binaries were compared before any number was quoted:
+
+    047974f1e21796f65e3b96a917d934115550cdf2cb80cedd86a252f589a2395d  armA_withD28
+    9910ecaa063b46c82546142ee40ce2b49de015f3cd5ad5ca4d824945b9883fe9  armB_noD28
+
+If those had matched, cargo would have handed back the same artifact twice and the A/B
+would have reported 1.00x -- a fake null that reads exactly like an honest one.
+
+Rounds are INTERLEAVED A/B/A/B rather than all-A-then-all-B, because load on this machine
+drifts by a factor of two over tens of minutes; interleaving makes it hit both arms in the
+same proportion instead of being confounded with the arm.
+
+
+RESULT -- N = 99968, four clean paired rounds
+
+  metric           arm B (no D28)           arm A (D28)             B/A
+  br_1row          1354.205 ms              0.050 ms         27,084.1x
+  runs             1360.360 ms              0.035 ms         38,867.4x
+  br_all           1366.650 ms           1431.585 ms              1.0x   <- control
+  live_cnt            5.504 ms              5.790 ms              1.0x   <- S20 column
+
+  raw, sorted:
+    br_1row   A [0.04, 0.04, 0.06, 0.06]
+    br_1row   B [1263.2, 1323.01, 1385.4, 1616.06]
+    runs      A [0.03, 0.03, 0.04, 0.04]
+    runs      B [1275.04, 1356.29, 1364.43, 1533.57]
+    br_all    A [1175.41, 1397.78, 1465.39, 2829.67]
+    br_all    B [1281.06, 1326.29, 1407.01, 2123.63]
+    live_cnt  A [5.173, 5.786, 5.793, 7.92]
+    live_cnt  B [5.028, 5.081, 5.926, 6.224]
+
+  br_1row = SELECT generation, state FROM ferro_branches WHERE branch_id = 1;   -- 1 row
+  br_all  = SELECT * FROM ferro_branches;                                       -- every row
+  runs    = SELECT * FROM ferro_runs;                                           -- ~1 row
+
+
+THE TWO COLUMNS THAT DID NOT MOVE ARE THE POINT
+
+br_all is the CONTROL and being flat is the intended result, not a miss. It is the same
+view through the same generator, but with no predicate, so it yields `ViewHint::All`, the
+hint narrows nothing, and a query that asks for every row still builds every row. Had this
+column improved, the hint would be dropping rows somebody asked for -- and the drift test,
+not this benchmark, is what would have caught it.
+
+It also sets the noise floor, which is not small: A's spread is 1175-2830 ms and B's is
+1281-2124 ms on identical code paths, taken under load average 14-20 from a concurrent
+agent fleet. Anything under about 2x here is load. br_1row and runs moved ~10^4 x.
+
+live_cnt is ledger row S20's `live_count`, and this settles a question that was open
+against D28. An earlier pair of runs had it at 6.098 -> 51.459 ms and it read as an 8.4x
+regression. Matched-base and interleaved it is 5.504 vs 5.790 ms with fully overlapping
+ranges. D28 does not touch that path -- see the census in bench/d28_live_count.txt, zero
+production call sites -- and now the measurement says so too, rather than only the source.
+
+
+WHAT IS NOT HERE
+
+The 10^6 headline is NOT in this file. Three attempts at it were abandoned rather than
+reported:
+
+  * one measured against f000160, a base that no longer existed by the time it finished;
+  * one was contaminated when I started a second 10^6 run alongside it -- my liveness check
+    grepped for "runtime_curve" while the arm binaries are named "armA_withD28", so an
+    ACTIVE run looked idle twice. A contended run still prints a number;
+  * one died with the volume at 786 MiB.
+
+Round 5 of the run above died for that last reason, on both arms, and is excluded. It is
+VOID, not red -- and it exposed a blind spot in the driver that classifies these:
+
+  ** The ENOSPC classifier greps the arm's stderr for "No space left" / "os error 28". A
+     full disk is precisely the condition under which that text CANNOT BE WRITTEN. Round 5A
+     left an EMPTY .err file and round 5B left none at all, so the grep matched nothing and
+     the rounds were labelled NO-ROW-EMITTED rather than VOID-ENOSPC. The guard reads
+     WORDING; it should read the OUTCOME -- free space sampled at the end of the round --
+     which is the one signal a full disk cannot suppress. **
+
+The 10^5 result above is unaffected: its four paired rounds each emitted a complete row.
+
+
+REPRODUCING
+
+  git diff --name-only agent-isolation HEAD -- src/     # must list only the 4 D28 files
+  cargo build --release --example runtime_curve         # arm A
+  git archive agent-isolation | tar -x -C <dir>         # arm B, same base
+  cp examples/runtime_curve.rs <dir>/examples/          # identical harness in both arms
+  cmp armA armB                                         # MUST differ
+  # then alternate: armA query 100000 64; armB query 100000 64; repeat

@@ -1,0 +1,13 @@
+# interleaved A/B, N=100000, 5 rounds per arm
+# round arm  br_1row_ms  br_all_ms  runs_ms  live_cnt_ms  loadavg
+1 A         0.06      1465.39         0.04        5.786   18.51
+1 B      1385.40      2123.63      1533.57        5.081   17.21
+2 A         0.04      1175.41         0.03        5.173   16.69
+2 B      1323.01      1281.06      1275.04        5.028   19.91
+3 A         0.04      1397.78         0.03        5.793   18.53
+3 B      1263.20      1407.01      1356.29        6.224   15.97
+4 A         0.06      2829.67         0.04        7.920   14.07
+4 B      1616.06      1326.29      1364.43        5.926   14.87
+5 A NO-ROW-EMITTED -- run failed or was killed; NOT a datapoint (see /tmp/d28ab3/round_5A.err)
+5 B NO-ROW-EMITTED -- run failed or was killed; NOT a datapoint (see /tmp/d28ab3/round_5B.err)
+# done
