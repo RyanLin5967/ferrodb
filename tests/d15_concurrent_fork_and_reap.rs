@@ -6,11 +6,16 @@
 //! has joined, so the reaper never runs against a moving catalog -- which is precisely the window
 //! D15 is about.
 //!
-//! Shape: SURVIVOR branches take a long lease and write a known payload; VICTIM branches take an
-//! already-expired lease and exist only to give the reaper constant work. A reaper thread sweeps
-//! throughout. At the end every survivor must still read its own payload back. A freed page is
-//! recycled, so a survivor whose page was reclaimed underneath it reads back something else --
-//! that is the corruption this asserts against, not a leak.
+//! Shape: a VICTIM takes an already-expired lease and writes a known payload; a SURVIVOR then
+//! forks FROM THAT VICTIM with a long lease, so the payload page is inside the survivor's
+//! visibility window. A reaper thread sweeps throughout, and the victim is always reapable. At the
+//! end every survivor must still read its parent's payload back. A freed page is recycled, so a
+//! survivor whose page was reclaimed underneath it reads back something else -- that is the
+//! corruption this asserts against, not a leak.
+//!
+//! The parent/child topology is load-bearing and was got WRONG first: with victim and survivor as
+//! SIBLINGS off trunk, breaking the reclamation guard on purpose still left the test green at
+//! 360/360, because arenas are per branch and a sibling's reap can never free this branch's pages.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use ferrodb::branch::arena::ArenaPageStore;
@@ -51,7 +56,12 @@ fn storm(table: bool, tag: &str) {
         let r = &reaper;
         s.spawn(move || {
             while !rstop.load(Ordering::Relaxed) {
-                let _ = r.reap_expired(u64::MAX / 2);
+                // The CLUSTER'S clock, not u64::MAX/2. That sentinel expires EVERY lease,
+                // including the survivors' 600 s ones -- so every survivor was reaped and then
+                // skipped by the `state != Live` guard below, and the assertion ran on an
+                // almost-empty set while reporting "corrupted=0". Victims take LeaseDeadline(0)
+                // and are expired against any real clock; survivors are not.
+                let _ = r.reap_expired(LeaseDeadline::now_millis());
                 let _ = r.drain_pending();
             }
         });
@@ -63,18 +73,25 @@ fn storm(table: bool, tag: &str) {
             hs.push(s.spawn(move || {
                 let mut mine = Vec::new();
                 for i in 0..PER {
-                    // A victim: already expired, so the concurrent reaper has real work to do.
-                    if let Ok(v) = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)) {
-                        if let Ok(a) = store.arena_for(v.branch_id) {
-                            let ep = catalog.next_epoch();
-                            let _ = store.alloc_in_arena(a, PageType::BTreeLeaf, ep);
-                        }
-                    }
-                    // A survivor: long lease, known payload, must still be readable at the end.
-                    let b = catalog
+                    // VICTIM -> SURVIVOR, a PARENT and its CHILD. The first version of this test
+                    // forked both from TRUNK as siblings, and a sibling's reap can never free a
+                    // page this branch reads -- arenas are per branch. Fire-checked: breaking the
+                    // reclamation guard on purpose left that version GREEN at 360/360, which is
+                    // the definition of a detector that cannot fire.
+                    //
+                    // The page that matters is written by the VICTIM, BEFORE the survivor forks,
+                    // so the survivor inherits it and the reclamation rule is the only thing
+                    // standing between the reaper and live data.
+                    // The victim starts with a LONG lease. Forking it as already-expired
+                    // raced the sweeper and lost: the reaper took it before the survivor could
+                    // fork off it, and every writer died on
+                    // `branch bN@g0 has been reaped (id slot is now at generation 1)`.
+                    // The branch must exist long enough to become a PARENT; only then is it
+                    // expired, which is the state this test is about.
+                    let victim = catalog
                         .fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000))
-                        .expect("survivor fork");
-                    let arena = store.arena_for(b.branch_id).expect("arena");
+                        .expect("victim fork");
+                    let arena = store.arena_for(victim.branch_id).expect("arena");
                     let ep = catalog.next_epoch();
                     let p = store.alloc_in_arena(arena, PageType::BTreeLeaf, ep).expect("alloc");
                     let payload = (t * 31 + i) as u8 | 0x80;
@@ -84,6 +101,18 @@ fn storm(table: bool, tag: &str) {
                         f.data[PAGE_HEADER_SIZE] = payload;
                         stamp_checksum(&mut f.data);
                     }
+                    // The survivor forks AFTER the page exists, so the page is inside its
+                    // visibility window and the rule must pin it for as long as this child lives.
+                    let b = catalog
+                        .fork(victim.branch_id, LeaseDeadline::from_now(600_000))
+                        .expect("survivor fork");
+                    // NOW expire the parent. From this instant the sweeper may reap it at any
+                    // point, including mid-fork of the NEXT iteration -- which is the concurrent
+                    // window D15 is about. The reclamation rule is the only thing that keeps
+                    // page `p` alive, and this child is the live child it must see.
+                    catalog
+                        .renew_lease(victim.branch_id, LeaseDeadline(0))
+                        .expect("expire the victim");
                     mine.push((b.branch_id, p, payload));
                 }
                 mine
@@ -96,12 +125,14 @@ fn storm(table: bool, tag: &str) {
     });
 
     let mut lost = Vec::new();
+    let mut checked = 0usize;
     for (b, p, payload) in &survivors {
         // Only branches the catalog still calls Live are entitled to their pages.
         let Ok(rec) = catalog.get(*b) else { continue };
         if rec.state != ferrodb::branch::types::BranchState::Live {
             continue;
         }
+        checked += 1;
         match store.read_page(*p) {
             Ok(h) => {
                 let got = h.read().data[PAGE_HEADER_SIZE];
@@ -113,7 +144,15 @@ fn storm(table: bool, tag: &str) {
         }
     }
     let _ = std::fs::remove_file(&path);
-    println!("[{tag}] survivors={} corrupted={}", survivors.len(), lost.len());
+    println!("[{tag}] survivors={} checked={checked} corrupted={}", survivors.len(), lost.len());
+    // A run that collected nothing has not passed. Without this the test reports "corrupted=0"
+    // when the reaper has removed every branch it was supposed to protect.
+    assert!(
+        checked >= survivors.len() * 9 / 10,
+        "only {checked} of {} survivors were still Live to be checked -- the reaper is eating the \
+         branches this test exists to protect, so `corrupted=0` says nothing",
+        survivors.len()
+    );
     assert!(
         lost.is_empty(),
         "A LIVE BRANCH LOST DATA WHILE THE REAPER RAN CONCURRENTLY -- {} of {} survivors. \
