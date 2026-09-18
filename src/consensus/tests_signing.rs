@@ -2,7 +2,7 @@
 //! has been seen to **fail** against a deliberate defect in the rule it names.
 //!
 //! The mutant table — which defect, which test killed it, and what each printed — is in
-//! `scratchpad/F7-signing.md`. A rule with no mutant is a rule nobody has shown matters, and a test
+//! `bench/evidence/F7-signing.md`. A rule with no mutant is a rule nobody has shown matters, and a test
 //! nobody has seen fail is not evidence.
 //!
 //! # Where the expected values come from
@@ -633,7 +633,7 @@ fn a_key_whose_directory_is_gone_is_refused() {
     // while loading a 0600 key from a 0777 directory produced **46,895 successful loads** of a key
     // the rule refuses. The branch is reachable; a deterministic test for it is what is missing,
     // not the reachability. `signing.rs` now refuses there, and the reversal is logged in
-    // `scratchpad/F7-signing.md` beside the original claim.
+    // `bench/evidence/F7-signing.md` beside the original claim.
     let outer = tempfile::tempdir().unwrap();
     let inner = outer.path().join("gone");
     std::fs::create_dir(&inner).unwrap();

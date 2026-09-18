@@ -1,0 +1,51 @@
+tools/staleness.sh -- FIRE-CHECK, 2026-09-18T04:31:31Z
+Every verdict forced to fire on purpose, and the refusal path forced to refuse.
+
+########## 1: STALE-GREEN with overlap (S22 vs D23 -- both edit BufferPoolManager)
+branch S22-bufpool-latch vs agent-isolation: 25 behind, 11 ahead
+STALE-GREEN: the base moved under code this branch has not seen.
+  code files changed on agent-isolation since the fork point: 33
+  ** BOTH SIDES EDIT THESE -- this is where an unmeasured interaction lives:
+      src/buffer/buffer_pool.rs
+  tests present on agent-isolation but NOT on this branch:
+      tests/d15_concurrent_fork_and_reap.rs
+      tests/d19_leak_is_a_race.rs
+      tests/d27_fork_shares_without_leaking.rs
+      tests/d33_add_arena_must_be_durable.rs
+      tests/integration_btree_concurrency.rs
+      tests/lock_order_allowlist.rs
+      tests/lock_order_runtime.rs
+rc=1
+
+########## 2: COVERED (S21 has merged agent-isolation)
+branch S21-statement-lock vs agent-isolation: 0 behind, 15 ahead
+COVERED
+rc=0
+
+########## 3: COVERED-NO-CODE (base ahead by one bench-only commit, 786707a)
+branch a9bfc84 vs 786707a: 1 behind, 0 ahead
+COVERED-NO-CODE: the base moved 1 commit(s), none touching code.
+    bench/d23_btree_concurrency_after.txt
+    bench/d23_fire_check.txt
+rc=0
+
+########## 3b: NEGATIVE CONTROL -- same shape, code commit (18dd11f). Must NOT say COVERED.
+branch 6cd159e vs 18dd11f: 7 behind, 0 ahead
+STALE-GREEN: the base moved under code this branch has not seen.
+  code files changed on 18dd11f since the fork point: 9
+  (no file is edited by both sides -- lower risk, but still re-run: a lock-order
+   inversion does not fail loudly, it hangs rarely under load, and it can be created
+   by two files that never appear in the same diff.)
+  tests present on 18dd11f but NOT on this branch:
+      tests/integration_btree_concurrency.rs
+      tests/lock_order_allowlist.rs
+      tests/lock_order_runtime.rs
+rc=1
+
+########## 4: UNKNOWN must REFUSE (non-zero), never fall through to allow
+UNKNOWN: not a directory: /nonexistent-dir
+rc=2
+UNKNOWN: cannot resolve base 'no-such-ref-xyz' in .
+rc=2
+UNKNOWN: not a git tree: /tmp
+rc=2
