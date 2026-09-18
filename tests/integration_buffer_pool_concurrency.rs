@@ -504,3 +504,148 @@ fn concurrent_fetches_of_one_cold_page_read_it_once_into_one_frame() {
         }
     }
 }
+
+/// One run of the relabel hunt. Returns `(checked, wrong_label, wrong_bytes, first_detail)`.
+///
+/// Shared by the two tests below so that the only difference between them is the pressure they
+/// apply, and a reader can see that the assertions really are identical.
+///
+/// `ws_len` bounds the working set. It is deliberately just ABOVE the pool's 1024 frames, and the
+/// walk is SEQUENTIAL: the race needs one thread to read the page table for page P in the same
+/// instant another evicts P, victims come off the replacement policy's cold end, and a sequential
+/// scan over a working set larger than the pool is the classic way to collide with them on
+/// purpose. A strided walk over all 1600 pages was tried first and never reproduced anything.
+fn relabel_hunt(
+    tag: &str,
+    threads: usize,
+    fetches: usize,
+    ws_len: usize,
+) -> (usize, usize, usize, Option<String>) {
+    let (_d, bp, ids) = pool(tag);
+    let ws: Vec<u32> = ids[..ws_len.min(ids.len())].to_vec();
+
+    let wrong_label = Arc::new(AtomicUsize::new(0));
+    let wrong_bytes = Arc::new(AtomicUsize::new(0));
+    let checked = Arc::new(AtomicUsize::new(0));
+    let first: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let (bp, ws) = (Arc::clone(&bp), ws.clone());
+            let (wrong_label, wrong_bytes, checked, first) = (
+                Arc::clone(&wrong_label),
+                Arc::clone(&wrong_bytes),
+                Arc::clone(&checked),
+                Arc::clone(&first),
+            );
+            s.spawn(move || {
+                for k in 0..fetches {
+                    let id = ws[(k + t * 13) % ws.len()];
+                    let Ok(idx) = bp.fetch_page(id) else { continue };
+                    {
+                        let f = bp.frames[idx].read().unwrap();
+                        let label = f.page_id;
+                        let stamp = read_stamp(&f.data);
+                        checked.fetch_add(1, Ordering::Relaxed);
+                        if label != Some(id) {
+                            wrong_label.fetch_add(1, Ordering::Relaxed);
+                            let mut g = first.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(format!(
+                                    "fetch_page({id}) returned frame {idx}, which is labelled \
+                                     {label:?} and contains page {stamp}"
+                                ));
+                            }
+                        }
+                        if stamp != id {
+                            wrong_bytes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    bp.unpin_page(id, false);
+                }
+            });
+        }
+    });
+
+    let detail = first.lock().unwrap().clone();
+    (
+        checked.load(Ordering::Relaxed),
+        wrong_label.load(Ordering::Relaxed),
+        wrong_bytes.load(Ordering::Relaxed),
+        detail,
+    )
+}
+
+fn assert_no_relabelled_frame(
+    (n, bad_label, bad_bytes, detail): (usize, usize, usize, Option<String>),
+    attempted: usize,
+) {
+    // ANTI-VACUITY: a run the pool refused most of would report zero mismatches having tested
+    // almost nothing.
+    assert!(
+        n > attempted / 2,
+        "only {n} of {attempted} fetches completed; the pool refused most of them and this \
+         proves little"
+    );
+    assert!(
+        bad_label == 0 && bad_bytes == 0,
+        "of {n} fetches, {bad_label} returned a frame labelled with another page and {bad_bytes} \
+         returned another page's bytes. First: {}",
+        detail.unwrap_or_else(|| "<none recorded>".into())
+    );
+}
+
+/// **INVARIANT 3: a fetch never returns a frame that holds a different page.**
+///
+/// `fetch_page` hands back a frame index. If that frame does not hold the page that was asked
+/// for, the caller reads another page's bytes while believing otherwise — the failure a storage
+/// engine cannot apologise for.
+///
+/// This is the general, cheap form: 32 threads over a working set 1.17x the pool. Per
+/// `bench/s22_firecheck.txt` it is the strongest single detector in this file, catching the
+/// removal of either frame-latch pin check (3 of 3), the loss of the `in_transit` dedup (2 of 3),
+/// and the publish-mapping-before-bytes reordering (2 of 3).
+#[test]
+fn a_fetch_never_returns_a_frame_labelled_with_a_different_page() {
+    const THREADS: usize = 32;
+    const FETCHES: usize = 3000;
+    assert_no_relabelled_frame(
+        relabel_hunt("relabel", THREADS, FETCHES, 1200),
+        THREADS * FETCHES,
+    );
+}
+
+/// The same invariant under **deliberate oversubscription**, and the only thing in this suite that
+/// catches M1.
+///
+/// # Why this exists as a separate test, and why it is honest about being weak
+///
+/// M1 is the mutation that deletes the `frame.page_id != Some(page_id)` re-check from
+/// `try_pin_resident`. The fire-check found NOTHING in this file caught it, including the
+/// 32-thread test above, 6 runs out of 6. That is worth understanding rather than papering over,
+/// because the reason is a real property of the design:
+///
+///   * `try_pin_resident` reads the page table, drops it, then takes the frame latch and pins.
+///   * `evict_into` takes the page-table WRITE lock first, then the frame write lock, and then
+///     re-checks the pin count and refuses if it is non-zero.
+///
+/// So a fetching thread that wins the page-table read and then reaches the frame latch promptly
+/// gets its pin in first, and the evictor's own pin check refuses the eviction. The deleted
+/// re-check only decides the outcome when the fetching thread is DESCHEDULED in the gap between
+/// the lookup and the latch. At 32 threads on 18 cores that essentially never happens.
+///
+/// At 256 threads it does. **Measured: with M1 applied, this failed 1 run in 6; with the guard
+/// present, 0 runs in 6.** A one-in-six detector is weak and is kept anyway, because the
+/// alternative for a load-bearing guard is no detector at all, and because it can only fail on
+/// broken code — the assertion is a correctness invariant, not a timing threshold.
+///
+/// The threads are the point, not the throughput: 256 on 18 cores is oversubscription on purpose.
+#[test]
+fn an_oversubscribed_pool_never_hands_back_a_relabelled_frame() {
+    const THREADS: usize = 256;
+    const FETCHES: usize = 800;
+    assert_no_relabelled_frame(
+        relabel_hunt("relabel-oversub", THREADS, FETCHES, 1200),
+        THREADS * FETCHES,
+    );
+}
