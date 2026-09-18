@@ -1,0 +1,94 @@
+# D28 at N=100000: system-view generator hint ON (arm A) vs OFF (arm B), matched binary base
+# generated 2026-09-18T11:40:35-04:00
+# tip: 190785f   bench(D28): a free suite lock is not a quiet box — add the load guard 
+# host: 18 cores; loadavg at start: 30.08 83.79 280.71
+# suite lock at start: none held
+# free at start: 88025492 KiB on /tmp/d28_1e6
+# load ceiling: 36 on 18 cores
+#
+# arm A = hinted   (Pushdown::On,  as it ships)   956ada8ccefed1c5af8ebad2de89d05905eaf5e4f8e8f219fa8a9d8e9029fcf3
+# arm B = unhinted (Pushdown::Off, SCAFFOLD)      6efbf5550e2775c01646d546f580fa66278338155d0a5bf487200075a003c039
+# harness: examples/runtime_curve.rs phase 'query', identical source in both arms;
+#          the arms differ by exactly one line in src/catalog/system_views.rs.
+#
+# ARM ORDER ROTATES A B / B A. Interleaving alone cancels only a bias constant in time,
+# and this box drifts (D35: 3.72 -> 13.14 within one run). The summariser prints br_all
+# by POSITION as the check the rotation worked; br_all is unchanged in both arms.
+
+===== rep 1 | arm A | N=100000 =====
+# position in rep: 1 of 2
+# loadavg at launch: 30.08 83.79 280.71
+# free at launch: 88024544 KiB
+# started: 2026-09-18T11:40:36-04:00
+# loadavg at finish: 26.88 77.88 271.74
+# free at finish: 84967044 KiB
+# wall: 32 s
+HARNESS_EXIT=0
+DATA rep=1 pos=1 arm=A n=99968 br_1row=0.06 br_all=1445.13 runs=0.04 live_cnt=5.628 rss=124.4 load=26.88
+
+===== rep 1 | arm B | N=100000 =====
+# position in rep: 2 of 2
+# loadavg at launch: 26.88 77.88 271.74
+# free at launch: 84917228 KiB
+# started: 2026-09-18T11:41:08-04:00
+# loadavg at finish: 24.91 71.72 261.68
+# free at finish: 84577004 KiB
+# wall: 34 s
+HARNESS_EXIT=0
+DATA rep=1 pos=2 arm=B n=99968 br_1row=1571.22 br_all=1685.11 runs=0.10 live_cnt=9.904 rss=100.0 load=24.91
+
+===== rep 2 | arm B | N=100000 =====
+# position in rep: 1 of 2
+# loadavg at launch: 24.91 71.72 261.68
+# free at launch: 84958512 KiB
+# started: 2026-09-18T11:41:43-04:00
+# loadavg at finish: 29.73 67.64 252.53
+# free at finish: 87094688 KiB
+# wall: 33 s
+HARNESS_EXIT=0
+DATA rep=2 pos=1 arm=B n=99968 br_1row=1408.44 br_all=1333.92 runs=0.08 live_cnt=5.973 rss=101.8 load=29.73
+
+===== rep 2 | arm A | N=100000 =====
+# position in rep: 2 of 2
+# loadavg at launch: 29.73 67.64 252.53
+# free at launch: 87298436 KiB
+# started: 2026-09-18T11:42:17-04:00
+# loadavg at finish: 36.77 65.04 244.13
+# free at finish: 87155384 KiB
+# wall: 34 s
+HARNESS_EXIT=0
+DATA rep=2 pos=2 arm=A n=99968 br_1row=0.06 br_all=2153.46 runs=0.04 live_cnt=6.579 rss=126.1 load=36.77
+
+# done 2026-09-18T11:42:52-04:00
+
+==== SUMMARY (bench/d28_1e6_summarise.py, on the file above) ====
+data rows=4  void/failed blocks=0
+N as the HARNESS reports it: 99,968 (branches actually forked, not the argument)
+
+column          unhinted (B)        hinted (A)           B/A
+br_1row         1,489.830 ms          0.060 ms     24,830.5x
+br_all          1,509.515 ms      1,799.295 ms          0.8x   <- control, flat BY DESIGN
+runs                0.090 ms          0.040 ms          2.2x
+live_cnt            7.938 ms          6.104 ms          1.3x   <- S20 column
+
+  raw, sorted:
+    br_1row   A [0.06, 0.06]
+    br_1row   B [1408.44, 1571.22]
+    br_all    A [1445.13, 2153.46]
+    br_all    B [1333.92, 1685.11]
+    runs      A [0.04, 0.04]
+    runs      B [0.08, 0.1]
+    live_cnt  A [5.628, 6.579]
+    live_cnt  B [5.973, 9.904]
+
+  CONTROL SPREAD: br_all across BOTH arms 1,333.9 - 2,153.5 ms (1.61x on an identical code path).
+  Any column moving less than that is load, not the hint.
+
+  loadavg at launch: min 24.91 max 30.08 first 30.08 last 29.73
+  loadavg at finish: min 24.91 max 36.77 first 26.88 last 36.77
+  block wall time: min 32s max 34s total 133s
+  br_all by POSITION (pooled over arms; the rotation should flatten this):
+    pos 1: median      1,389.5 ms  (arms: A,B)
+    pos 2: median      1,919.3 ms  (arms: A,B)
+    -> every position held every arm: the square is balanced
+SUMMARY_EXIT=0
