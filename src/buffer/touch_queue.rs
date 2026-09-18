@@ -89,12 +89,18 @@ impl TouchQueue {
     /// A queue with at least `min_shards` shards (rounded up to a power of two, because the index
     /// is a mask) and a batch size of `batch`.
     ///
-    /// **`batch` is the knob that trades lock traffic against staleness.** It is the factor by
-    /// which policy-lock acquisitions on the hit path are reduced — one per `batch` hits instead
-    /// of one per hit — and it is also how far ARC's recency order can lag reality under
-    /// concurrency, bounded by `batch * threads` updates. It cannot affect single-threaded
-    /// behaviour at all, because the drain-before-decide rule makes the applied sequence identical
-    /// whatever the batch size is.
+    /// **`batch` is the factor by which policy-lock acquisitions on the hit path are reduced** —
+    /// one per `batch` hits instead of one per hit. Measured to matter a great deal:
+    /// `bench/d44_batchsize.txt` puts 16T/1T at x0.384 with 64 and x0.838 with 512.
+    ///
+    /// It is tempting to call it a trade against staleness, and the first version of this comment
+    /// did. That is wrong, and the reason is worth stating because the number `batch * threads`
+    /// looks alarming next to a 1024-frame pool: **a backlog is only ever observable by an ARC
+    /// decision, and no decision can see one.** `BufferPoolManager::arc_locked` drains every shard
+    /// as part of acquiring the cache, and it is the only way to reach the cache, so `request`
+    /// always runs against a fully up-to-date recency order at any batch size. What a larger batch
+    /// really costs is one longer critical section — `batch` updates applied under the lock
+    /// instead of `batch/8` — which is a latency-variance trade and not a policy one.
     pub fn new(min_shards: usize, batch: usize) -> Self {
         assert!(batch > 0, "a batch size of zero would never flush");
         let n = min_shards.max(1).next_power_of_two();

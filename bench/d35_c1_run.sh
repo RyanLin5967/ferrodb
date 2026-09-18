@@ -46,6 +46,12 @@ for b in "$BASE_BIN" "$C1_BIN"; do
   [ -x "$b" ] || { echo "REFUSING: $b is not an executable" >&2; exit 2; }
 done
 
+# TWO conditions, because each one alone has been measured to miss the other. The suite lock
+# catches a per-target run BETWEEN targets, when it is a bash script with no cargo child at all.
+# The process table catches a build or a bench that never takes the lock -- which is how
+# bench/d44_pair_CONTAMINATED.txt got taken: lock free, three rustc processes running, load rising
+# 12 -> 24 during the run. Matching on the EXECUTABLE (ps -eo comm) and never on the command line,
+# because `pgrep -f cargo` matches anything that merely spells it, this script included.
 quiet_or_refuse() {
   if [ -d "$SUITE_LOCK" ]; then
     local owner pid
@@ -54,8 +60,18 @@ quiet_or_refuse() {
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       echo "REFUSING: a suite is running and holds $SUITE_LOCK ($owner)." >&2
       echo "  Numbers taken beside a compiling, linking, TCP-binding test suite are not quotable." >&2
+      echo "  Wait for it, then re-run. Do not bypass this by deleting the lock." >&2
       exit 3
     fi
+    echo "# note: $SUITE_LOCK is present but its pid is dead (stale): $owner" >&2
+  fi
+  local builders
+  builders=$(ps -eo comm | grep -cE '^(.*/)?(cargo|rustc)$')
+  if [ "$builders" -gt 0 ]; then
+    echo "REFUSING: $builders cargo/rustc process(es) are running." >&2
+    echo "  A compile alongside the sweep depresses the 1-thread point hardest, and 16T/1T is" >&2
+    echo "  most sensitive exactly there. Wait for them, then re-run." >&2
+    exit 3
   fi
 }
 quiet_or_refuse

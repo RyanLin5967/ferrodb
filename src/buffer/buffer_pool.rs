@@ -177,12 +177,47 @@
 //! **So `arc_cache` on the hit path is now the binding constraint, and BP-Wrapper is no longer
 //! "a constant".** The entry above rejected it on the STUB measurement, which was taken with the
 //! page table still in the way — a correct reading of a measurement that could not see past the
-//! other wall. That verdict needs re-taking against THIS file, and `bench/d35_c1_factorial.txt`'s
-//! C1STUB row is the upper bound it has to be judged against: x0.579, not x1.
+//! other wall. That verdict was re-taken against THIS file, and it is D44 below.
 //!
-//! C1 stays because it is a prerequisite and not because it is the win. Deleting `touch` without
-//! it is *worse* than doing nothing, and `touch` cannot simply be deleted — it degrades ARC's
-//! recency, which `bench/d35_c1_evictiontrace.txt` shows outright: the eviction sequence changes.
+//! C1 is a prerequisite and not the win. Deleting `touch` without it is *worse* than doing
+//! nothing, and `touch` cannot simply be deleted — it degrades ARC's recency, which
+//! `bench/d35_c1_evictiontrace.txt` shows outright: the eviction sequence changes.
+//!
+//! # D44 — the PAIR, and the slope finally changes sign
+//!
+//! Both walls off the hit path at once: the page table through the mirror, and the policy update
+//! through a per-thread batch (BP-Wrapper, [`crate::buffer::touch_queue`]) that keeps `touch`.
+//! `bench/d44_batchsize.txt`, RESIDENT arm, 8 reps, arm order rotated as a Latin square, taken
+//! holding the machine-wide suite lock:
+//!
+//! | arm | 16T/1T | 16T absolute | vs BASE at 16T |
+//! |---|---|---|---|
+//! | BASE | x0.138 | 2.45M | 1.0x |
+//! | PAIR, `TOUCH_BATCH` = 64 | x0.384 | 7.86M | 3.2x |
+//! | **PAIR, `TOUCH_BATCH` = 512** | **x0.838** | **22.6M** | **9.3x** |
+//! | `touch` deleted outright (unshippable ceiling) | x0.676 | 44.7M | 18.3x |
+//!
+//! **The curve rises monotonically from 2 threads** — 9.8M, 11.9M, 20.9M, 22.6M — where BASE's
+//! goes 5.4M, 2.8M, 2.3M, 2.4M. D44's pre-registered bar was 16T/1T ≥ x0.5 with `touch` retained;
+//! x0.838 clears it, and every one of the eight reps is ≥ x0.80.
+//!
+//! ⭐ **The first batch size tried was eight times too small, and that is the substance rather
+//! than a tuning note.** At 64 the PAIR measured x0.384 and did NOT clear the bar. The run above
+//! exists to decide between two readings of that: either the residual cost is the *work* done
+//! under the policy lock — batching reduces how OFTEN the lock is taken, never how long it is
+//! HELD, so the serialised fraction would be unchanged — or it is acquisition overhead and the
+//! batch was simply too small. **The measurement chose the second, against the hypothesis going
+//! in.** Anyone re-deriving "BP-Wrapper is a constant" from a single small batch size is repeating
+//! the mistake this lane has now made twice, in two different places.
+//!
+//! **Judged against the ceiling and not against zero**, which is the honest framing: the PAIR
+//! reaches 51% of the absolute 16-thread throughput of deleting the policy entirely, and beats it
+//! on the *ratio* only because its 1-thread number is lower. The remaining 2x is the price of
+//! keeping ARC exactly, which is the price this lane decided to pay.
+//!
+//! **Hit rate is untouched, as an equality**: the eviction trace is byte-identical to BASE at both
+//! batch sizes, sha256 and all. See [`TOUCH_BATCH`] for why no batch size can make ARC's decisions
+//! staler — every decision is preceded by a full drain, so a backlog is never observable by one.
 //!
 //! # Hit rate: an equality assertion, and it holds
 //!
@@ -302,15 +337,45 @@ const MIRROR_SLOTS_PER_FRAME: usize = 8;
 
 /// How many cache hits one thread accumulates before it must apply them to the replacement policy.
 ///
-/// This is the factor by which the hit path's policy-lock acquisitions are reduced: one per
-/// `TOUCH_BATCH` hits rather than one per hit. It is also the bound on how stale ARC's recency
-/// order can be under concurrency — at most `TOUCH_BATCH * threads` updates in flight — and it
-/// cannot affect single-threaded behaviour at all, because [`BufferPoolManager::arc_locked`]
-/// drains before any decision whatever the batch size.
+/// The factor by which the hit path's policy-lock acquisitions are reduced: one per `TOUCH_BATCH`
+/// hits rather than one per hit.
 ///
-/// 64 against a 1024-frame pool: a backlog that is a small fraction of the pool cannot reorder
-/// much of it, and two thirds of a percent of the hits pay for a lock instead of all of them.
-const TOUCH_BATCH: usize = 64;
+/// # 512 is measured, and the first value tried was eight times too small
+///
+/// `bench/d44_batchsize.txt`, RESIDENT arm, 8 reps, arm order rotated as a Latin square, taken
+/// while holding the machine-wide suite lock. Throughput at 16 threads relative to 1:
+///
+/// | arm | 16T/1T | 16T absolute | vs BASE |
+/// |---|---|---|---|
+/// | BASE (no mirror, eager `touch`) | x0.138 | 2.45M | 1.0x |
+/// | `TOUCH_BATCH` = 64 | x0.384 | 7.86M | 3.2x |
+/// | **`TOUCH_BATCH` = 512** | **x0.838** | **22.6M** | **9.3x** |
+/// | `touch` deleted outright (unshippable ceiling) | x0.676 | 44.7M | 18.3x |
+///
+/// That run was built to decide between two explanations of why 64 fell short of D44's
+/// pre-registered x0.5 bar: either the residual cost was the *work* done under the policy lock —
+/// in which case raising the batch changes nothing, because BP-Wrapper reduces how OFTEN the lock
+/// is taken and not how long it is HELD — or it was acquisition overhead, in which case the batch
+/// was simply too small. **The measurement chose the second**, and the first was the hypothesis
+/// going in.
+///
+/// # Why a large batch does not make ARC's decisions any staler
+///
+/// The obvious objection is that `TOUCH_BATCH * threads` updates in flight against a 1024-frame
+/// pool leaves the recency order badly stale. It does not, and the reason is the
+/// drain-before-decide rule rather than the size of the number: **every ARC decision is preceded
+/// by a full drain of every shard**, because the only way to reach the cache is
+/// [`BufferPoolManager::arc_locked`], which drains as part of acquiring. `request` — the sole
+/// decision — therefore always runs against a cache that has just been brought fully up to date,
+/// at any batch size. A backlog is only ever observable by a decision, and no decision can see one.
+///
+/// What a larger batch does cost is the length of one critical section: a thread that fills its
+/// shard applies 512 updates under the lock instead of 64, so the lock is held longer and less
+/// often. That is a latency-variance trade, not a policy one.
+///
+/// **Unmeasured, and stated rather than assumed:** the knee between 64 and 512 — the two points
+/// that were measured — and anything above 512.
+const TOUCH_BATCH: usize = 512;
 
 /// How many times `fetch_page` will re-verify before giving up.
 ///
