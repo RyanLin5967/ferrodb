@@ -204,6 +204,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
 use crate::buffer::page_table::PageTable;
+use crate::buffer::touch_queue::TouchQueue;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 
 pub struct Frame {
@@ -239,6 +240,14 @@ pub struct BufferPoolManager {
     pub page_table: PageTable,
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
+
+    /// Hit-path policy updates that have not reached [`BufferPoolManager::arc_cache`] yet.
+    ///
+    /// **Never read this directly and never take `arc_cache` directly.** Go through
+    /// [`BufferPoolManager::arc_locked`], which drains this into the cache as part of acquiring
+    /// it — that is what keeps a batched `touch` from changing which page ARC evicts. See
+    /// [`crate::buffer::touch_queue`].
+    pub touch_queue: TouchQueue,
     pub wal: OnceLock<Arc<WalManager>>,
 
     /// Pages with IO in flight: being read in, or being written back out of a frame.
@@ -291,6 +300,18 @@ const MAX_BUFFER_POOL_PAGES: usize = 1024;
 /// knob, not a correctness one.
 const MIRROR_SLOTS_PER_FRAME: usize = 8;
 
+/// How many cache hits one thread accumulates before it must apply them to the replacement policy.
+///
+/// This is the factor by which the hit path's policy-lock acquisitions are reduced: one per
+/// `TOUCH_BATCH` hits rather than one per hit. It is also the bound on how stale ARC's recency
+/// order can be under concurrency — at most `TOUCH_BATCH * threads` updates in flight — and it
+/// cannot affect single-threaded behaviour at all, because [`BufferPoolManager::arc_locked`]
+/// drains before any decision whatever the batch size.
+///
+/// 64 against a 1024-frame pool: a backlog that is a small fraction of the pool cannot reorder
+/// much of it, and two thirds of a percent of the hits pay for a lock instead of all of them.
+const TOUCH_BATCH: usize = 64;
+
 /// How many times `fetch_page` will re-verify before giving up.
 ///
 /// Every retry in `fetch_page` follows a *verified* change of state — a frame relabelled under its
@@ -317,6 +338,30 @@ pub struct FrameGuard<G> {
     _pool: PoolSection,
 }
 
+/// A guard over the replacement policy that also records, for its whole lifetime, that this thread
+/// is holding a buffer-pool lock — the same job [`FrameGuard`] does for a frame.
+///
+/// Only [`BufferPoolManager::arc_locked`] can produce one, so holding this is proof the pending
+/// hit-path updates have already been applied.
+pub struct ArcGuard<'a> {
+    // Declared first so the cache lock is released BEFORE the pool section closes.
+    guard: std::sync::MutexGuard<'a, ArcCache>,
+    _pool: PoolSection,
+}
+
+impl Deref for ArcGuard<'_> {
+    type Target = ArcCache;
+    fn deref(&self) -> &ArcCache {
+        &self.guard
+    }
+}
+
+impl DerefMut for ArcGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ArcCache {
+        &mut self.guard
+    }
+}
+
 impl<G: Deref<Target = Frame>> Deref for FrameGuard<G> {
     type Target = Frame;
     fn deref(&self) -> &Frame {
@@ -338,12 +383,47 @@ impl BufferPoolManager {
             page_table: PageTable::new(MAX_BUFFER_POOL_PAGES * MIRROR_SLOTS_PER_FRAME),
             disk_manager,
             arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)),
+            touch_queue: TouchQueue::new(
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) * 4,
+                TOUCH_BATCH,
+            ),
             wal: OnceLock::new(),
             in_transit: Mutex::new(HashSet::new()),
             transit_done: Condvar::new(),
             free_hint: AtomicUsize::new(0),
             page_latches: PageLatches::new(),
         }
+    }
+
+    /// Lock the replacement policy, **applying every pending hit first**.
+    ///
+    /// This is the only way this file reaches `arc_cache`, and that is the whole correctness
+    /// argument for batching the hit path. A cache hit no longer calls `touch` directly; it
+    /// appends to [`BufferPoolManager::touch_queue`] and returns. Those updates have to land
+    /// before ARC is asked anything, or a delayed `touch` could change which page it picks as a
+    /// victim — which would make this a policy change wearing a concurrency fix's clothes, the
+    /// exact thing D35 rejected "replace ARC with CLOCK" for being.
+    ///
+    /// Draining *as part of acquiring* is what makes that structural rather than a rule to
+    /// remember: there is no path to the cache that skips it. Single-threaded, ARC therefore sees
+    /// the identical sequence of operations it saw unbatched, which is why
+    /// `bench/d35_c1_evictiontrace.txt` can assert byte-identical output rather than a tolerance.
+    ///
+    /// Lock order: `arc_cache -> touch shard`. The drain takes shard locks while holding the
+    /// policy lock. The hit path takes a shard lock alone and never reaches for the policy lock
+    /// while holding one — see [`crate::buffer::touch_queue::TouchQueue::record`].
+    pub fn arc_locked(&self) -> ArcGuard<'_> {
+        let _pool = enter_pool();
+        let mut guard = self.arc_cache.lock().unwrap();
+        let mut pending = Vec::new();
+        self.touch_queue.drain_into(&mut pending);
+        for page_id in pending {
+            // `touch` is a no-op for a page that is no longer resident, which is the right answer
+            // for an update that was overtaken by an eviction: the hit happened, the page has
+            // since gone, and there is nothing left to promote.
+            guard.touch(page_id);
+        }
+        ArcGuard { guard, _pool }
     }
 
     /// Read-lock a frame, tracked for lock ordering. See [`FrameGuard`].
@@ -374,7 +454,20 @@ impl BufferPoolManager {
             if let Some(frame_i) = self.try_pin_resident(page_id) {
                 // Policy only, and deliberately *after* the pin: the cache is a hint about what to
                 // evict next, and holding it here is what used to serialise even pure cache hits.
-                self.arc_cache.lock().unwrap().touch(page_id);
+                //
+                // D44: this no longer takes the policy lock. It appends to a per-thread shard and
+                // returns, and the backlog is applied by whoever next acquires the cache -- see
+                // `arc_locked` and `crate::buffer::touch_queue`. Only the thread that FILLS its
+                // shard pays for the lock, one hit in TOUCH_BATCH.
+                if let Some(batch) = self.touch_queue.record(page_id) {
+                    // `arc_locked` has already drained what was pending when it took the lock;
+                    // this batch left the shard before that, so it is applied after, which is the
+                    // order the hits happened in.
+                    let mut cache = self.arc_locked();
+                    for id in batch {
+                        cache.touch(id);
+                    }
+                }
                 return Ok(frame_i);
 
             }
@@ -510,7 +603,7 @@ impl BufferPoolManager {
         let _pool = enter_pool();
         // The verdict. `arc_cache` is held for this and dropped before any syscall.
         let verdict = {
-            let mut cache = self.arc_cache.lock().unwrap();
+            let mut cache = self.arc_locked();
             cache.request(page_id, &|id| self.is_pinned(id))
         };
 
@@ -520,7 +613,7 @@ impl BufferPoolManager {
                 // step 2 held the transit lock while checking, so no loader can have published
                 // since. The cache is carrying a false claim -- drop it and re-decide rather than
                 // trusting either side.
-                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                let _ = self.arc_locked().remove(page_id);
                 return Ok(None);
             }
             ArcResult::PoolFull => return Err(FerroError::NotEnoughSpace),
@@ -528,7 +621,7 @@ impl BufferPoolManager {
                 Some(i) => i,
                 None => {
                     // Every frame filled between the verdict and the scan. Real under concurrency.
-                    let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                    let _ = self.arc_locked().remove(page_id);
                     return Err(FerroError::NotEnoughSpace);
                 }
             },
@@ -538,7 +631,7 @@ impl BufferPoolManager {
                 // frame is never reclaimable again.
                 let outcome = self.evict_into(victim, page_id);
                 let give_back = |declined: bool| {
-                    let mut cache = self.arc_cache.lock().unwrap();
+                    let mut cache = self.arc_locked();
                     if declined {
                         cache.reinstate(victim);
                     }
@@ -576,7 +669,7 @@ impl BufferPoolManager {
                 // claim: the frame, and the cache's belief that this page is now resident. Leaving
                 // the latter is what made a second probe of an absent page panic.
                 self.release_frame(frame_i);
-                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                let _ = self.arc_locked().remove(page_id);
                 return Err(e);
             }
         };
@@ -909,7 +1002,7 @@ impl BufferPoolManager {
         frame.dirty_flag = AtomicBool::new(false);
         drop(frame);
 
-        self.arc_cache.lock().unwrap().remove(page_id)?;
+        self.arc_locked().remove(page_id)?;
         Ok(())
     }
 
@@ -941,7 +1034,7 @@ impl BufferPoolManager {
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
-            self.arc_cache.lock().unwrap().remove(page_id)?;
+            self.arc_locked().remove(page_id)?;
         }
         Ok(())
     }
@@ -989,7 +1082,7 @@ impl BufferPoolManager {
             return Err(FerroError::PagePinned);
         }
 
-        let mut cache = self.arc_cache.lock().unwrap();
+        let mut cache = self.arc_locked();
         let mut pt = self.page_table.write().unwrap();
 
         // Every frame is checked before any is touched: a partial invalidation leaves the pool
