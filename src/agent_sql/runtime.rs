@@ -3473,9 +3473,14 @@ impl AgentRuntime {
     /// half is the expensive part. But `scan_once` already holds the exact answer — `reap_expired`
     /// hands it the list — and then throws it away and pays for the search anyway. That search ran
     /// inside the pgwire server's per-statement lock (`src/branch/lease_thread.rs`), so a timer
-    /// stopped the whole database for as long as the walk took: 39.3 s at 10⁶ open sessions,
-    /// measured in `bench/runtime_at_1e6.txt` (W4). Asking about `reaped.len()` branches instead
-    /// is O(branches actually reaped), which is what a tick costs when nothing has gone wrong.
+    /// stopped the whole database for as long as the walk took. Asking about `reaped.len()`
+    /// branches instead is O(branches actually reaped), which is what a tick costs when nothing has
+    /// gone wrong.
+    ///
+    /// Measured in `artie-research/W4/statement-lock-FASTPATH.txt`: the reconciliation's wall time
+    /// rises 91x across 100x open sessions (269 us -> 24.5 ms at 10⁵) while this call shows no
+    /// trend. A larger figure for the same walk is reported on branch S15-runtime-at-1e6 (commit
+    /// 0ac1931, `bench/runtime_at_1e6.txt`, W4) — not in this worktree, and NOT reproduced here.
     ///
     /// **This is a fast path and NOT a replacement.** `reap_expired` can reap several branches and
     /// then return `Err`, discarding the ids it had already accumulated

@@ -176,6 +176,12 @@ That is what S15's 39.3 s at 10⁶ open sessions is made of (`bench/runtime_at_1
 is the number the brief asked about: *"39.3 s HOLDING the server's per-statement lock"*. The
 chunk-and-index change fixes the 129 ms → 0.68 ms `State` stall and leaves that untouched.
 
+> **⚠ That citation does not resolve — see "Corrections to this record's own earlier claims" at the
+> end.** `bench/runtime_at_1e6.txt` is on branch `S15-runtime-at-1e6` and is not in this worktree,
+> the number was not reproduced here, and three different versions of the row are in circulation.
+> The paragraph is left as written; the evidence this section actually rests on is
+> `statement-lock-FASTPATH.txt`, in this directory.
+
 ### What was done about it
 
 `scan_once` stops re-deriving a list it was already handed. `reap_expired` returns exactly the
@@ -300,3 +306,20 @@ first draft tripping it instead, which is recorded in the test rather than tidie
   across the entire sweep including phase 2, and that chunking `State` does not touch it. The
   harness measures `AgentRuntime` directly with no `RuntimeLock` at all, so it was never measuring
   that lock. Both numbers are real; neither is the other.
+
+- **The "39.3 s at 10⁶ open sessions" citation was unpinnable and is now labelled as such.** The
+  addendum above, and two code comments that quoted it, cited `bench/runtime_at_1e6.txt`. That file
+  is on branch `S15-runtime-at-1e6` (commit `0ac1931`) and **does not exist in this worktree**, so
+  every reader of those comments was sent to a path they could not open. Worse, three different
+  versions of that row are in circulation — the ledger's "at 10⁶ branches", which team-lead's brief
+  says is wrong; S15's own "at 10⁶ open sessions"; and the brief's bare "39.3 s" — and **none of
+  them was measured here.** At roughly 1 KB of `Workspace` per session, 10⁶ *open sessions* is a
+  large amount of resident state to have actually held, which is a reason to doubt the row rather
+  than to repeat it.
+
+  The comments in `lease_thread.rs` and `runtime.rs::forget_branches` now rest on
+  `statement-lock-FASTPATH.txt`, which is in this directory and which I ran: the reconciliation's
+  wall time rises 91× across 100× open sessions (269 µs → 24.5 ms at 10⁵) while the fast path shows
+  no trend. S15's figure is still named, with its branch and commit, as **motivation and not
+  evidence**. Nothing in this work's argument depended on it: the direction of the fix follows from
+  the wall column's slope, which was measured on this machine in this tree.
