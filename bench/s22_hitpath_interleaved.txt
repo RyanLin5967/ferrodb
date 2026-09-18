@@ -1,0 +1,13 @@
+# S22 INTERLEAVED A/B — the hit path, measured alternately to cancel machine-load drift.
+# The sequential runs disagreed with load 19.1 vs 27.6 on an 18-core box shared with the
+# agent fleet; a CPU-bound microbenchmark cannot survive that, so this alternates instead.
+# run at 2026-09-18T04:08:22Z, loadavg: 25.66 24.39 22.66
+
+rep1 threads=1  before=14752347  after=17053868
+rep1 threads=8  before=2354996  after=2219517
+rep2 threads=1  before=14595321  after=16397615
+rep2 threads=8  before=2112428  after=2497348
+rep3 threads=1  before=14212031  after=18305695
+rep3 threads=8  before=2143626  after=2320570
+
+# loadavg at end: 26.22 24.53 22.73
