@@ -21,12 +21,13 @@
 //! stale-reader bug, which LMDB answers only with a manual `mdb_reader_check`; client cooperation
 //! is not a viable contract, so it is not part of this one.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::branch::arena::ArenaPageStore;
 use crate::branch::record::{CoreRecord, BranchRecord};
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, PageId};
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::page_header::PageType;
 use crate::cow::{PageStore, PAGE_HEADER_SIZE};
@@ -62,15 +63,37 @@ pub trait PageLinks: Send + Sync {
 /// Guard against a cyclic or pathologically deep page graph during collapse.
 const MAX_COLLAPSE_PAGES: usize = 1 << 16;
 
+/// How rarely the crash-orphan collector may run off the background lease tick.
+///
+/// **D40.** [`TwoTierReaper::collect_orphaned_extents`] is a global O(live_arenas) scan with one
+/// catalog descent per arena, so it must not run on every tick any more than it may run once per
+/// reaped branch. Its *producer* is a crash, which is why the complete answer is at open
+/// ([`TwoTierReaper::resume_interrupted_reaps`]); this cadence exists only to mop up the residue
+/// of an in-process error path — a drain that released pages and then failed before its narrowed
+/// sweep could free the emptied extent. Sixty seconds is twice the lease thread's own scan
+/// interval, which is the shortest cadence that is not "every tick".
+const ORPHAN_SWEEP_INTERVAL_MS: u64 = 60_000;
+
+/// Sentinel for "the orphan collector has never run on this reaper", so the first background tick
+/// always collects rather than waiting out an interval measured from the epoch.
+const ORPHAN_SWEEP_NEVER: u64 = u64::MAX;
+
 pub struct TwoTierReaper {
     catalog: Arc<dyn BranchCatalog>,
     store: Arc<ArenaPageStore>,
     links: Option<Arc<dyn PageLinks>>,
+    /// Cluster-time stamp of the last crash-orphan collection, or [`ORPHAN_SWEEP_NEVER`].
+    last_orphan_sweep_ms: AtomicU64,
 }
 
 impl TwoTierReaper {
     pub fn new(catalog: Arc<dyn BranchCatalog>, store: Arc<ArenaPageStore>) -> Self {
-        TwoTierReaper { catalog, store, links: None }
+        TwoTierReaper {
+            catalog,
+            store,
+            links: None,
+            last_orphan_sweep_ms: AtomicU64::new(ORPHAN_SWEEP_NEVER),
+        }
     }
 
     /// Supply the page-layout walker that `collapse` needs.
@@ -119,6 +142,21 @@ impl TwoTierReaper {
             self.reap(b)?;
             done.push(b);
         }
+
+        // **D40 — this is where the crash-orphan collector belongs.**
+        //
+        // A crash is the only producer of an extent charged to a branch that no longer exists at
+        // that generation, and this is the one moment that can be sure it has seen all of them:
+        // the durable image has just been loaded, every interrupted reap above has finished, and
+        // nothing has run since. Resuming a `Reaping` record does not cover it — the record whose
+        // extent leaked is the one already marked `Reaped`, which `in_state(Reaping)` cannot see
+        // and which nothing else will ever name again. Freeing it here is what returns the
+        // reserved page count to baseline after a crash (`arena.rs`, `free_arena`'s note on the
+        // durable map; exit criterion 8 is stated in reserved pages).
+        //
+        // O(live_arenas) once per open, against O(branches x live_arenas) per lease scan before
+        // D40.
+        self.collect_orphaned_extents()?;
         Ok(done)
     }
 
@@ -165,20 +203,165 @@ impl TwoTierReaper {
         Ok(())
     }
 
-    /// Extents whose owning branch no longer exists at that generation and which hold no
-    /// allocated page any more. Freeing them is what returns the *reserved* page count to
-    /// baseline rather than merely stopping its growth.
-    fn sweep_empty_extents(&self) -> Result<(), FerroError> {
-        for (arena, owner) in self.store.live_arenas() {
-            let owner_gone = match self.catalog.get_raw(owner.id) {
-                Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
-                Err(_) => true,
-            };
-            if owner_gone && self.store.extent_is_empty(arena) {
+    /// Is `arena` an extent whose owning branch no longer exists at that generation and which
+    /// holds no allocated page any more?
+    ///
+    /// One catalog descent. Both the narrowed sweep and the orphan collector ask exactly this
+    /// question; the only thing that ever differed between them is **which arenas it is asked
+    /// about**, and stating it once is what keeps them from drifting apart.
+    fn extent_is_collectable(&self, arena: ArenaId, owner: BranchId) -> bool {
+        let owner_gone = match self.catalog.get_raw(owner.id) {
+            Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
+            Err(_) => true,
+        };
+        owner_gone && self.store.extent_is_empty(arena)
+    }
+
+    /// Free the extents that **this drain just emptied**. Freeing them is what returns the
+    /// *reserved* page count to baseline rather than merely stopping its growth.
+    ///
+    /// **D40 — THE CALLER ALREADY KNOWS WHICH ARENAS COULD HAVE CHANGED; DO NOT RE-DERIVE IT.**
+    ///
+    /// This used to be a global scan over `store.live_arenas()`, asking the catalog `get_raw`
+    /// about every live arena in the database — one full B+tree descent apiece. It was called
+    /// from `drain_pending`, and `reap` calls `drain_pending`, and `reap_expired` calls `reap`
+    /// **per expired branch**: a global O(N) scan nested in a per-item loop, i.e.
+    /// O(branches x live_arenas). Measured with `sample`(1) against a running
+    /// `tests/d19_leak_is_a_race.rs`: 2,291 of 2,291 samples on
+    /// `reap_expired -> reap -> drain_pending -> sweep_empty_extents -> get_raw -> BPlusTreeManager::search`.
+    /// d19's 2,016-branch arm is ~2.03M descents, which is why that test has looked like a hang
+    /// for this project's whole life. `SCALE-DESIGN.md` D40; the same wall S19/D18 removed on the
+    /// *deadline* side of this reaper, left standing on the arena side.
+    ///
+    /// The fix is not to make the question faster but to stop asking it of arenas nothing
+    /// touched. `drain_pending` holds `pf.arena_id` for every page it released, and `reap` holds
+    /// `rec.arenas` for the branch it just retired; an arena neither touched cannot have become
+    /// empty during this call. **O(touched), and no new durable structure to keep consistent.**
+    ///
+    /// What this deliberately does NOT cover is an extent orphaned by a **crash** — a different
+    /// producer, whose collector is [`Self::collect_orphaned_extents`], and which belongs at open
+    /// rather than on the reap path.
+    ///
+    /// `BTreeSet`, not `HashSet`: the freeing order reaches durable state. `free_arena` pushes
+    /// each freed extent's start page onto `free_extents` under its size class and
+    /// `ArenaSpaceManager::reserve` pops that stack, so hash order would lay two runs of one
+    /// workload out differently — the same reason `ArenaPageStore::live_arenas` sorts.
+    fn sweep_touched_extents(&self, touched: &BTreeSet<ArenaId>) -> Result<(), FerroError> {
+        for arena in touched.iter().copied() {
+            // Re-read the owner from the store rather than trusting the `PendingFree` entry's:
+            // `free_arena` may already have removed the extent, in which case there is nothing to
+            // collect and `owner_of` says so.
+            let Some(owner) = self.store.arena_owner(arena) else { continue };
+            if self.extent_is_collectable(arena, owner) {
                 self.store.free_arena(arena)?;
             }
         }
         Ok(())
+    }
+
+    /// Collect extents orphaned by a **crash**: the owner record is gone or regenerated while the
+    /// extent is still charged to it (`arena.rs`, `free_arena`'s durability note). Returns the
+    /// number of extents freed.
+    ///
+    /// **D40 — this is RECOVERY work, and it runs where recovery runs.** It is the global
+    /// O(live_arenas) scan the narrowed sweep replaced, kept because the job is real and nothing
+    /// else does it: a crash between `mark_reaped` and `free_arena` leaves a durable extent
+    /// charged to a branch that no longer exists, and no in-process caller holds its id to pass
+    /// to [`Self::sweep_touched_extents`]. But a crash is its only producer, so the complete
+    /// answer is needed exactly once per open — [`Self::resume_interrupted_reaps`] — plus the
+    /// bounded cadence in [`Self::collect_orphans_if_due`] for the residue of an in-process error
+    /// path (a drain that released pages and then failed before its narrowed sweep ran).
+    ///
+    /// It has no business running once per reaped branch, and "make it faster" — memoizing
+    /// `get_raw` across the scan — was rejected in D40 for shrinking a constant while leaving
+    /// O(branches x arenas) intact, and for caching *liveness*, the one value that must not go
+    /// stale.
+    pub fn collect_orphaned_extents(&self) -> Result<u32, FerroError> {
+        let mut freed = 0u32;
+        for (arena, owner) in self.store.live_arenas() {
+            if self.extent_is_collectable(arena, owner) {
+                self.store.free_arena(arena)?;
+                freed += 1;
+            }
+        }
+        Ok(freed)
+    }
+
+    /// Run [`Self::collect_orphaned_extents`] if at least [`ORPHAN_SWEEP_INTERVAL_MS`] of cluster
+    /// time has passed since it last ran, and never more often than that.
+    ///
+    /// `now_millis` is the cluster's time as the lease thread read it, not a local clock — the
+    /// same reading `reap_expired` is deciding expiry on, so the cadence cannot disagree with the
+    /// reaping it rides on. A reading that goes backwards (a new leader with a lower tick) parks
+    /// the next collection rather than firing a burst of them; it is a mop-up pass, and delaying
+    /// one leaks nothing that open will not collect.
+    fn collect_orphans_if_due(&self, now_millis: u64) -> Result<u32, FerroError> {
+        let last = self.last_orphan_sweep_ms.load(Ordering::SeqCst);
+        if last != ORPHAN_SWEEP_NEVER && now_millis.saturating_sub(last) < ORPHAN_SWEEP_INTERVAL_MS
+        {
+            return Ok(0);
+        }
+        // Stamp BEFORE the scan, not after: two lease ticks racing here would otherwise both read
+        // the old stamp and both pay for a full scan. Losing one collection to a crash between
+        // stamp and scan costs nothing — open collects the same extents.
+        self.last_orphan_sweep_ms.store(now_millis, Ordering::SeqCst);
+        self.collect_orphaned_extents()
+    }
+
+    /// [`Reaper::drain_pending`], told up front about arenas the caller already touched.
+    ///
+    /// **D40.** `seed` carries the candidates the pending-free log cannot name — `reap` passes
+    /// the arenas of the branch it just retired, which the slow path releases pages into and
+    /// `mark_reaped` then makes ownerless. Everything else is accumulated here from
+    /// `pf.arena_id` as pages are released. The union is swept once at the end, and it is
+    /// *exactly* the set the old global scan could have found anything in.
+    fn drain_pending_seeded(&self, seed: BTreeSet<ArenaId>) -> Result<u32, FerroError> {
+        let mut released = 0u32;
+        let mut touched = seed;
+        // Retest to a fixed point: releasing pages can empty an extent, and freeing that extent
+        // can retire an id, neither of which changes `live_children` — but a caller may have
+        // detached several branches before draining, so loop until nothing moves.
+        loop {
+            let entries = self.store.take_pending();
+            if entries.is_empty() {
+                break;
+            }
+            let mut still_pinned = Vec::new();
+            let mut moved = false;
+            for pf in entries {
+                let pinned = match self.catalog.get_raw(pf.owner.id) {
+                    // **D18, second site.** This read `rec.live_children` too, and on the table
+                    // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
+                    // TRUE, so `pinned` was always false and EVERY parked page was released. The
+                    // slow path above parks exactly the pages a live child can see, and this
+                    // handed them straight back. Ask the index instead, which is the same
+                    // predicate asked of a structure that can actually answer it.
+                    Ok(_) => self.catalog.live_child_in_epoch_range(
+                        pf.owner.id,
+                        pf.birth_epoch,
+                        pf.free_epoch,
+                    )?,
+                    // No record at all: nothing can be forked off it, so nothing can see the page.
+                    Err(_) => false,
+                };
+                if pinned {
+                    still_pinned.push(pf);
+                } else {
+                    self.store.release_page(pf.page_id, pf.arena_id);
+                    // The page went back into this extent, so this extent is the only kind of
+                    // thing that can have become empty. Recorded rather than rediscovered.
+                    touched.insert(pf.arena_id);
+                    released += 1;
+                    moved = true;
+                }
+            }
+            self.store.put_pending(still_pinned)?;
+            if !moved {
+                break;
+            }
+        }
+        self.sweep_touched_extents(&touched)?;
+        Ok(released)
     }
 
     /// Post-order copy of the page graph rooted at `page` into `branch`'s own extents, stamping
@@ -283,6 +466,14 @@ impl Reaper for TwoTierReaper {
         // `TableBranchCatalog` the field is ALWAYS empty, the guard was ALWAYS true, and every
         // reap took the wholesale-free fast path with no sharing analysis at all -- freeing pages
         // a live child could still read. Reproduced in `tests/d18_fastpath_asks_the_catalog.rs`.
+        // **D40 — capture the arenas before `mark_reaped` clears them.** The slow path releases
+        // pages back into this branch's *own* extents, and those extents can be left empty and
+        // ownerless by the very `mark_reaped` below. They are the one set of candidates that the
+        // pending-free log does not name, so `drain_pending` is seeded with them explicitly. The
+        // old code found them by scanning every live arena in the database; this is the same set,
+        // asked of the caller that already has it.
+        let own_arenas: BTreeSet<ArenaId> = rec.arenas.iter().copied().collect();
+
         if !self.catalog.has_live_children(rec.branch_id.id)? {
             // FAST PATH. No sharing analysis: nobody forked off this branch, so nothing outside
             // it can see a page born inside its own extents.
@@ -314,7 +505,7 @@ impl Reaper for TwoTierReaper {
 
         // The parent's live-children array just shrank, so pages parked against it may have
         // become reclaimable. This is the only moment that can happen.
-        freed += self.drain_pending()?;
+        freed += self.drain_pending_seeded(own_arenas)?;
         Ok(freed)
     }
 
@@ -344,54 +535,20 @@ impl Reaper for TwoTierReaper {
             }
         }
 
-        // Anything whose pages all went back but whose extent was still registered.
-        self.sweep_empty_extents()?;
+        // **D40 — the crash-orphan collector rides the background tick, on a cadence.**
+        //
+        // This used to be an unconditional global scan here *as well as* one inside every `reap`
+        // above. The per-reap copies are gone (see `sweep_touched_extents`), and what is left is
+        // the only caller that can reasonably pay for a full pass: a periodic lease scan, which
+        // already holds the cluster's time. It is still O(live_arenas) when it fires, which is
+        // why it fires at most once per `ORPHAN_SWEEP_INTERVAL_MS` — the complete answer is at
+        // open, in `resume_interrupted_reaps`.
+        self.collect_orphans_if_due(now_millis)?;
         Ok(reaped)
     }
 
     fn drain_pending(&self) -> Result<u32, FerroError> {
-        let mut released = 0u32;
-        // Retest to a fixed point: releasing pages can empty an extent, and freeing that extent
-        // can retire an id, neither of which changes `live_children` — but a caller may have
-        // detached several branches before draining, so loop until nothing moves.
-        loop {
-            let entries = self.store.take_pending();
-            if entries.is_empty() {
-                break;
-            }
-            let mut still_pinned = Vec::new();
-            let mut moved = false;
-            for pf in entries {
-                let pinned = match self.catalog.get_raw(pf.owner.id) {
-                    // **D18, second site.** This read `rec.live_children` too, and on the table
-                    // catalog that vec is always empty -- `reclaimable(&[], ..)` is vacuously
-                    // TRUE, so `pinned` was always false and EVERY parked page was released. The
-                    // slow path above parks exactly the pages a live child can see, and this
-                    // handed them straight back. Ask the index instead, which is the same
-                    // predicate asked of a structure that can actually answer it.
-                    Ok(_) => self.catalog.live_child_in_epoch_range(
-                        pf.owner.id,
-                        pf.birth_epoch,
-                        pf.free_epoch,
-                    )?,
-                    // No record at all: nothing can be forked off it, so nothing can see the page.
-                    Err(_) => false,
-                };
-                if pinned {
-                    still_pinned.push(pf);
-                } else {
-                    self.store.release_page(pf.page_id, pf.arena_id);
-                    released += 1;
-                    moved = true;
-                }
-            }
-            self.store.put_pending(still_pinned)?;
-            if !moved {
-                break;
-            }
-        }
-        self.sweep_empty_extents()?;
-        Ok(released)
+        self.drain_pending_seeded(BTreeSet::new())
     }
 
     fn collapse(&self, branch: BranchId) -> Result<BranchRecord, FerroError> {
@@ -1863,6 +2020,230 @@ mod tests {
             "reap detached BEFORE marking reaped ({log:?}). A crash in that window leaves no \
              entry for a child that still reads Live, so the parent looks childless and its \
              pages are freed underneath a branch that can still read them."
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // D40 — the narrowed sweep, and the crash-orphan collector it does NOT replace.
+    // ---------------------------------------------------------------------------------------
+
+    /// Put the store and the catalog into exactly the durable state a crash between `reap`'s
+    /// `mark_reaped` and its `free_arena` leaves: an extent that is live, empty, and charged to a
+    /// branch generation that no longer exists.
+    ///
+    /// No mock and no flag — this is the real write sequence with the real window, because the
+    /// only interesting question about the collector is whether it fires on the state a crash
+    /// actually produces. Returns the orphaned arenas and the id they are still charged to.
+    fn orphan_one_extent(h: &Harness) -> (Vec<ArenaId>, BranchId) {
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(h, b.branch_id, 3);
+        let mut rec = h.catalog.get(b.branch_id).unwrap();
+        let arenas: Vec<ArenaId> = rec.arenas.clone();
+        assert!(!arenas.is_empty(), "fixture: the branch owns no extent to orphan");
+        // Hand every page back, which is what leaves the extent EMPTY. `extent_is_empty` is the
+        // collector's second conjunct, so an extent that still holds pages tests nothing.
+        for arena in arenas.iter().copied() {
+            for p in h.store.allocated_pages(arena) {
+                h.store.release_page(p, arena);
+            }
+            assert!(h.store.extent_is_empty(arena), "fixture: the extent did not empty");
+        }
+        let owner = rec.branch_id;
+        // ...and now the crash. `mark_reaped` bumps the generation and clears `rec.arenas`, so
+        // after this write nothing in the catalog names these extents ever again — which is the
+        // whole reason a global scan is the only instrument that can find them.
+        rec.mark_reaped();
+        h.catalog.put(&rec).unwrap();
+        (arenas, owner)
+    }
+
+    #[test]
+    fn the_crash_orphan_collector_fires_on_state_the_narrowed_sweep_cannot_see() {
+        let (h, reaper) = setup();
+        let baseline_reserved = h.store.reserved_page_count();
+
+        let (arenas, dead) = orphan_one_extent(&h);
+        let orphaned_reserved = h.store.reserved_page_count();
+        assert!(
+            orphaned_reserved > baseline_reserved,
+            "fixture: no extent is charged to the dead branch, so there is nothing to collect"
+        );
+        for a in arenas.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), Some(dead), "fixture: extent is not charged");
+        }
+
+        // NEGATIVE CONTROL, and the reason the collector still exists after D40. The narrowed
+        // sweep is structurally blind here: a crash leaves no pending-free entry and no live
+        // caller holding the arena id, so `drain_pending`'s touched set is empty. If this ever
+        // starts collecting the orphan, the assertion below has stopped testing the collector.
+        assert_eq!(reaper.drain_pending().unwrap(), 0);
+        assert_eq!(
+            h.store.reserved_page_count(),
+            orphaned_reserved,
+            "the narrowed sweep collected a crash orphan; it cannot know about one"
+        );
+
+        // Forced to fire: the condition was manufactured on purpose and the collector must find
+        // it. A collector that has never been made to fire is an untested detector.
+        let freed = reaper.collect_orphaned_extents().unwrap();
+        assert_eq!(freed as usize, arenas.len(), "the collector did not free every orphan");
+        for a in arenas.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "arena {a:?} survived the collector");
+        }
+        assert_eq!(
+            h.store.reserved_page_count(),
+            baseline_reserved,
+            "reserved pages did not return to baseline — exit criterion 8 is stated in this number"
+        );
+    }
+
+    #[test]
+    fn the_orphan_collector_refuses_a_live_owner_and_refuses_a_non_empty_extent() {
+        // The other half of forcing a detector to fire: prove it does not fire spuriously. The
+        // guard is a conjunction, so each conjunct gets its own case — a collector that dropped
+        // either one would pass a test that only offered it a true orphan.
+        let (h, reaper) = setup();
+
+        // (a) LIVE owner, EMPTY extent. Every page handed back, but the branch is alive and will
+        //     write again into the extent it still owns. Freeing it aliases live storage.
+        let live = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
+        write_pages(&h, live.branch_id, 3);
+        let live_arenas: Vec<ArenaId> = h.catalog.get(live.branch_id).unwrap().arenas.clone();
+        for a in live_arenas.iter().copied() {
+            for p in h.store.allocated_pages(a) {
+                h.store.release_page(p, a);
+            }
+            assert!(h.store.extent_is_empty(a), "fixture (a): extent must be empty to be tempting");
+        }
+
+        // (b) DEAD owner, NON-EMPTY extent. The same crash window, but with pages still out —
+        //     freeing it would hand a live page range back to the allocator.
+        let doomed = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(&h, doomed.branch_id, 3);
+        let mut drec = h.catalog.get(doomed.branch_id).unwrap();
+        let doomed_arenas: Vec<ArenaId> = drec.arenas.clone();
+        drec.mark_reaped();
+        h.catalog.put(&drec).unwrap();
+        for a in doomed_arenas.iter().copied() {
+            assert!(!h.store.extent_is_empty(a), "fixture (b): extent must still hold pages");
+        }
+
+        let reserved_before = h.store.reserved_page_count();
+        assert_eq!(
+            reaper.collect_orphaned_extents().unwrap(),
+            0,
+            "the collector freed an extent that is either still owned or still holding pages"
+        );
+        assert_eq!(h.store.reserved_page_count(), reserved_before);
+        for a in live_arenas {
+            assert!(h.store.arena_owner(a).is_some(), "a LIVE branch lost its extent");
+        }
+        for a in doomed_arenas {
+            assert!(h.store.arena_owner(a).is_some(), "an extent still holding pages was freed");
+        }
+    }
+
+    #[test]
+    fn the_narrowed_sweep_leaves_the_global_scan_nothing_to_find() {
+        // **D40's own falsifier.** "Reserved-page count is the ledger: if reserved pages do not
+        // return to the same figure the global sweep reached, the narrowed sweep is missing a
+        // case." Stated as a residue check on ONE store rather than a matched pair of runs, so
+        // no cross-run variance can absorb a miss: the instrument the narrowed sweep replaced is
+        // run afterwards, on the same state, and must find nothing.
+        let (h, reaper) = setup();
+        let baseline_live = h.store.live_page_count().unwrap();
+        let baseline_reserved = h.store.reserved_page_count();
+
+        // FAST path: childless leaves, extents freed wholesale.
+        for _ in 0..8 {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            write_pages(&h, b.branch_id, 5);
+            reaper.reap(b.branch_id).unwrap();
+        }
+        // SLOW path: pages parked against a live child and released by a later reap's drain —
+        // the one path that empties an extent WITHOUT freeing it, and therefore the only place
+        // the narrowed sweep can be wrong.
+        for _ in 0..8 {
+            let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            write_pages(&h, parent.branch_id, 4);
+            let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+            write_pages(&h, child.branch_id, 2);
+            reaper.reap(parent.branch_id).unwrap();
+            reaper.reap(child.branch_id).unwrap();
+        }
+        reaper.drain_pending().unwrap();
+
+        let narrowed = h.store.reserved_page_count();
+        assert_eq!(h.store.live_page_count().unwrap(), baseline_live, "pages did not come back");
+        assert_eq!(h.store.pending_len(), 0, "the pending log did not drain");
+        assert_eq!(narrowed, baseline_reserved, "the narrowed sweep left extents reserved");
+
+        assert_eq!(
+            reaper.collect_orphaned_extents().unwrap(),
+            0,
+            "the global scan found extents the narrowed sweep left behind — option 2 is missing \
+             a case, which is exactly what D40 says would falsify it"
+        );
+        assert_eq!(h.store.reserved_page_count(), narrowed, "the global scan moved the ledger");
+    }
+
+    #[test]
+    fn the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence() {
+        let (h, reaper) = setup();
+        // Well below `LeaseDeadline::from_now`, so nothing the fixtures fork can expire here and
+        // the only thing these ticks do is decide whether to run the collector.
+        let t0 = 1_000_000u64;
+
+        // Tick 1. Never collected before, so it collects.
+        let (a1, _) = orphan_one_extent(&h);
+        assert!(reaper.reap_expired(t0).unwrap().is_empty(), "fixture: nothing should expire");
+        for a in a1.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "the first tick did not collect");
+        }
+
+        // Tick 2, inside the interval. The orphan STAYS. That is the point: the scan is
+        // O(live_arenas) and D40 moved it off the per-reap path precisely so it cannot run at
+        // will. Nothing is lost — open collects it.
+        let (a2, _) = orphan_one_extent(&h);
+        reaper.reap_expired(t0 + ORPHAN_SWEEP_INTERVAL_MS - 1).unwrap();
+        for a in a2.iter().copied() {
+            assert!(h.store.arena_owner(a).is_some(), "the cadence gate did not hold");
+        }
+
+        // Tick 3, at the interval. Collected — the gate closes and re-opens, rather than only
+        // ever having been open once.
+        reaper.reap_expired(t0 + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+        for a in a2.iter().copied() {
+            assert_eq!(h.store.arena_owner(a), None, "the cadence never re-opened");
+        }
+    }
+
+    #[test]
+    fn a_crash_orphaned_extent_is_collected_when_the_store_is_reopened() {
+        // Where the collector's job actually is after D40. A crash is its only producer, so the
+        // complete answer is at open — and this runs it through the durable image rather than
+        // in-memory state, because the image is what a real crash leaves behind.
+        let (h, _reaper) = setup();
+        let baseline_reserved = h.store.reserved_page_count();
+        let (arenas, _dead) = orphan_one_extent(&h);
+        h.store.flush().unwrap();
+        let checkpoint = h.store.state_bytes();
+
+        let store2 = h.fresh_store();
+        store2.load_state(&checkpoint).unwrap();
+        for a in arenas.iter().copied() {
+            assert!(store2.arena_owner(a).is_some(), "fixture: the reopened image lost the orphan");
+        }
+
+        let reaper2 = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&store2));
+        reaper2.resume_interrupted_reaps().unwrap();
+        for a in arenas.iter().copied() {
+            assert_eq!(store2.arena_owner(a), None, "open did not collect the crash orphan");
+        }
+        assert_eq!(
+            store2.reserved_page_count(),
+            baseline_reserved,
+            "reserved pages did not return to baseline across the restart"
         );
     }
 
