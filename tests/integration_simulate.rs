@@ -761,7 +761,17 @@ fn the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_re
         "the long-lease branch lost its rows to the scan that reclaimed the losers"
     );
     // And the trunk is intact.
-    assert_eq!(db.runtime.scan_rows(BranchId::TRUNK, "ballast").unwrap().len(), 400);
+    // `.count()` would be wrong here: it counts `Err` items too, so a failing scan would still
+    // report 400. Collecting through the `Result` keeps the assertion as strong as it was.
+    assert_eq!(
+        db.runtime
+            .scan_rows(BranchId::TRUNK, "ballast")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
     assert_eq!(db.qty(1), 4, "the two admitted candidates did not compose (20 - 8 - 8)");
 }
 

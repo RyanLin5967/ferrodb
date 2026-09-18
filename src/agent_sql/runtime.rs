@@ -611,12 +611,16 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Every row of `table` as `branch` sees it, in row order.
+    /// Every row of `table` as `branch` sees it, in row order, **lazily**.
+    ///
+    /// The iterator is the public edge of the streaming scan: collecting it costs exactly what
+    /// this call used to cost unconditionally, and not collecting it costs one page. A caller
+    /// that wants the whole table writes `.collect::<Result<Vec<_>, _>>()?` and has said so.
     pub fn scan_rows(
         &self,
         branch: BranchId,
         table: &str,
-    ) -> Result<Vec<(u64, Vec<Value>)>, FerroError> {
+    ) -> Result<impl Iterator<Item = Result<(u64, Vec<Value>), FerroError>>, FerroError> {
         let rows = self.rows()?;
         rows.scan_table(self.root_of(branch)?, table_id(table).0)
     }

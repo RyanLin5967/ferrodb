@@ -1,0 +1,3 @@
+  n=10000 build=363.695333ms allocs: scan=20021 table=40023 first10=20021
+  n=100000 build=4.091791916s allocs: scan=200118 table=400084 first10=200082
+  n=1000000 build=47.21294175s allocs: scan=2000721 table=4000689 first10=2000687
