@@ -1,0 +1,231 @@
+D51 SHARED-WORD PROBE — the premise option C rests on, measured before building on it
+=====================================================================================
+[HERE] this session, 18-core box, release, load ~5.4 at launch.
+
+SCALE-DESIGN D51 chose option C over A and B on one sentence: "a shared LOAD does not bounce a
+cache line -- only an RMW does." The entry itself flagged that as ASSUMED, not measured. D49 had
+measured the RMW side on a real engine; the load side had no number anywhere. Building on an
+unmeasured premise is the exact move D48 punished, so it is measured here FIRST.
+
+Three arms, identical but for one operation on a word every thread shares. Prediction recorded
+in the harness source before the run: LOAD scales, ARC and RWLOCK do not.
+
+RESULT, and both arm orders agree:
+
+  threads        LOAD          ARC       RWLOCK        LOAD        ARC     RWLOCK
+                (fwd)        (fwd)        (fwd)       (rev)      (rev)      (rev)
+        1       1.000        1.000        1.000       1.000      1.000      1.000
+        2       1.844        0.184        0.201       2.522      0.109      0.191
+        4       3.033        0.109        0.092       4.501      0.117      0.095
+        8       5.997        0.129        0.123       7.269      0.128      0.109
+       16       7.823        0.137        0.121       7.763      0.158      0.125
+
+ABSOLUTE at 16 threads: LOAD 3,347,527,176 ops/s against RWLOCK 6,828,543 -- 490x apart.
+
+WHAT IS NOW SETTLED
+-------------------
+* Option C's foundation HOLDS. A shared relaxed load scales x7.8 on 18 cores.
+* Option A (RwLock<Catalog>, readers take .read()) is MEASURED DEAD at x0.121 -- it was already
+  rejected on D49's turso evidence, and this is the same verdict from an independent instrument.
+* Option B (Arc::clone per statement) is MEASURED DEAD at x0.137. The refcount RMW is the whole
+  cost, exactly as the entry argued.
+
+THE AGREEMENT THAT MATTERS
+--------------------------
+D49 measured turso's per-statement SHARED read-mark lock at x0.308 total at 16 threads, on a real
+engine doing real work. A bare RwLock::read here measures x0.121 with no work at all. Same shape,
+same direction, two completely different instruments. The microbenchmark did not discover the
+wall -- it confirms that what D49 found in turso is the primitive's behaviour and not turso's.
+
+THE ARM-ORDER ROTATION FOUND NO BIAS THIS TIME, WHICH IS ALSO A RESULT
+----------------------------------------------------------------------
+1T absolutes, forward vs reversed: LOAD 427,903,837 / 418,668,156; ARC 165,594,234 / 147,280,649;
+RWLOCK 56,518,894 / 53,070,870. D50's arms differed 2.2x for identical work; these do not. A
+rotation that reports "no bias" is doing its job, and is why the D50 result needed it and this
+one did not.
+
+=================== RAW: forward order ===================
+# D51 shared-word probe. measure=500ms warmup=150ms rounds=3
+# PREDICTION (recorded before the run): LOAD scales ~linearly; ARC and RWLOCK do not.
+# If LOAD does not scale, SCALE-DESIGN D51 option C is dead and the decision reopens.
+
+=== ARM LOAD   (relaxed atomic load -- option C) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 696648843 ops/s (slowest 349433603)
+#   2T -> 788996403 ops/s (slowest 200068955)
+#   4T -> 944191010 ops/s (slowest 118079425)
+#   8T -> 1076821533 ops/s (slowest 58198745)
+#   16T -> 705465927 ops/s (slowest 20284601)
+# round 1 order: 2 4 8 16 1
+#   2T -> 508530128 ops/s (slowest 128694474)
+#   4T -> 1297817947 ops/s (slowest 163671275)
+#   8T -> 2566061632 ops/s (slowest 159110741)
+#   16T -> 3347527176 ops/s (slowest 77372099)
+#   1T -> 427903837 ops/s (slowest 214008295)
+# round 2 order: 4 8 16 1 2
+#   4T -> 1833622058 ops/s (slowest 233100228)
+#   8T -> 3069401756 ops/s (slowest 190865298)
+#   16T -> 3357682901 ops/s (slowest 94711343)
+#   1T -> 399043266 ops/s (slowest 202383322)
+#   2T -> 944782574 ops/s (slowest 239820716)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1        427903837    427903837         1.000
+      2        788996403    394498202         1.844
+      4       1297817947    324454487         3.033
+      8       2566061632    320757704         5.997
+     16       3347527176    209220448         7.823
+
+=== ARM ARC    (Arc::clone, an RMW on a refcount -- option B) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 176974204 ops/s (slowest 88713054)
+#   2T -> 17661119 ops/s (slowest 4414326)
+#   4T -> 13406080 ops/s (slowest 1702254)
+#   8T -> 21243823 ops/s (slowest 1250177)
+#   16T -> 22970014 ops/s (slowest 523824)
+# round 1 order: 2 4 8 16 1
+#   2T -> 30412482 ops/s (slowest 7663566)
+#   4T -> 18032278 ops/s (slowest 2079205)
+#   8T -> 21402039 ops/s (slowest 1288023)
+#   16T -> 22753682 ops/s (slowest 644816)
+#   1T -> 152338215 ops/s (slowest 76212784)
+# round 2 order: 4 8 16 1 2
+#   4T -> 20226264 ops/s (slowest 2415685)
+#   8T -> 22380850 ops/s (slowest 1306075)
+#   16T -> 22304903 ops/s (slowest 551201)
+#   1T -> 165594234 ops/s (slowest 83470216)
+#   2T -> 33304590 ops/s (slowest 8264482)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1        165594234    165594234         1.000
+      2         30412482     15206241         0.184
+      4         18032278      4508069         0.109
+      8         21402039      2675255         0.129
+     16         22753682      1422105         0.137
+
+=== ARM RWLOCK (RwLock::read -- option A, the standard answer) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 71997994 ops/s (slowest 36170964)
+#   2T -> 11364126 ops/s (slowest 2867655)
+#   4T -> 5196625 ops/s (slowest 648138)
+#   8T -> 7061732 ops/s (slowest 441200)
+#   16T -> 6828543 ops/s (slowest 167580)
+# round 1 order: 2 4 8 16 1
+#   2T -> 15543941 ops/s (slowest 3875828)
+#   4T -> 5697196 ops/s (slowest 678715)
+#   8T -> 6979869 ops/s (slowest 422615)
+#   16T -> 6919536 ops/s (slowest 196668)
+#   1T -> 56518894 ops/s (slowest 28405664)
+# round 2 order: 4 8 16 1 2
+#   4T -> 4204605 ops/s (slowest 526968)
+#   8T -> 5686124 ops/s (slowest 342066)
+#   16T -> 6064754 ops/s (slowest 183292)
+#   1T -> 53814373 ops/s (slowest 27027540)
+#   2T -> 11300053 ops/s (slowest 2819556)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1         56518894     56518894         1.000
+      2         11364126      5682063         0.201
+      4          5196625      1299156         0.092
+      8          6979869       872484         0.123
+     16          6828543       426784         0.121
+
+threads           LOAD            ARC         RWLOCK   (total_vs_1T)
+      1          1.000          1.000          1.000
+      2          1.844          0.184          0.201
+      4          3.033          0.109          0.092
+      8          5.997          0.129          0.123
+     16          7.823          0.137          0.121
+
+=================== RAW: reversed order ===================
+# D51 shared-word probe. measure=500ms warmup=150ms rounds=3
+# PREDICTION (recorded before the run): LOAD scales ~linearly; ARC and RWLOCK do not.
+# If LOAD does not scale, SCALE-DESIGN D51 option C is dead and the decision reopens.
+
+=== ARM RWLOCK (RwLock::read -- option A, the standard answer) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 116202546 ops/s (slowest 58976617)
+#   2T -> 17132608 ops/s (slowest 4280675)
+#   4T -> 8817920 ops/s (slowest 1114129)
+#   8T -> 6964489 ops/s (slowest 434963)
+#   16T -> 8172066 ops/s (slowest 245142)
+# round 1 order: 2 4 8 16 1
+#   2T -> 10144756 ops/s (slowest 2451150)
+#   4T -> 5055653 ops/s (slowest 632557)
+#   8T -> 5768871 ops/s (slowest 357002)
+#   16T -> 5638872 ops/s (slowest 150431)
+#   1T -> 44861412 ops/s (slowest 22880864)
+# round 2 order: 4 8 16 1 2
+#   4T -> 4437261 ops/s (slowest 533653)
+#   8T -> 5423300 ops/s (slowest 339818)
+#   16T -> 6620953 ops/s (slowest 184920)
+#   1T -> 53070870 ops/s (slowest 26544130)
+#   2T -> 8866822 ops/s (slowest 2110505)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1         53070870     53070870         1.000
+      2         10144756      5072378         0.191
+      4          5055653      1263913         0.095
+      8          5768871       721109         0.109
+     16          6620953       413810         0.125
+
+=== ARM ARC    (Arc::clone, an RMW on a refcount -- option B) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 158439342 ops/s (slowest 79661677)
+#   2T -> 18185825 ops/s (slowest 4441049)
+#   4T -> 19544382 ops/s (slowest 2323345)
+#   8T -> 18792025 ops/s (slowest 1137634)
+#   16T -> 24074890 ops/s (slowest 737546)
+# round 1 order: 2 4 8 16 1
+#   2T -> 16086575 ops/s (slowest 3816847)
+#   4T -> 17265498 ops/s (slowest 2136359)
+#   8T -> 14851219 ops/s (slowest 918038)
+#   16T -> 19649097 ops/s (slowest 594608)
+#   1T -> 140479463 ops/s (slowest 71183203)
+# round 2 order: 4 8 16 1 2
+#   4T -> 17226967 ops/s (slowest 2019732)
+#   8T -> 22333356 ops/s (slowest 1381011)
+#   16T -> 23229941 ops/s (slowest 538282)
+#   1T -> 147280649 ops/s (slowest 74424054)
+#   2T -> 14868127 ops/s (slowest 3694164)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1        147280649    147280649         1.000
+      2         16086575      8043288         0.109
+      4         17265498      4316374         0.117
+      8         18792025      2349003         0.128
+     16         23229941      1451871         0.158
+
+=== ARM LOAD   (relaxed atomic load -- option C) ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 640285811 ops/s (slowest 320791355)
+#   2T -> 1309140384 ops/s (slowest 332098953)
+#   4T -> 2513548561 ops/s (slowest 318367875)
+#   8T -> 3043276823 ops/s (slowest 188819747)
+#   16T -> 2207861341 ops/s (slowest 54519099)
+# round 1 order: 2 4 8 16 1
+#   2T -> 570909142 ops/s (slowest 142405876)
+#   4T -> 1497332227 ops/s (slowest 185234903)
+#   8T -> 2905831001 ops/s (slowest 180519608)
+#   16T -> 3257721886 ops/s (slowest 68366788)
+#   1T -> 416874308 ops/s (slowest 211807305)
+# round 2 order: 4 8 16 1 2
+#   4T -> 1884335831 ops/s (slowest 236675042)
+#   8T -> 3500214477 ops/s (slowest 215663614)
+#   16T -> 3249914375 ops/s (slowest 91627082)
+#   1T -> 418668156 ops/s (slowest 213534349)
+#   2T -> 1055848093 ops/s (slowest 264446198)
+
+threads      total_ops_s   per_thread   total_vs_1T
+      1        418668156    418668156         1.000
+      2       1055848093    527924047         2.522
+      4       1884335831    471083958         4.501
+      8       3043276823    380409603         7.269
+     16       3249914375    203119648         7.763
+
+threads           LOAD            ARC         RWLOCK   (total_vs_1T)
+      1          1.000          1.000          1.000
+      2          2.522          0.109          0.191
+      4          4.501          0.117          0.095
+      8          7.269          0.128          0.109
+     16          7.763          0.158          0.125
