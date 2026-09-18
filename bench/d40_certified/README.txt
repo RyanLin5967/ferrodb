@@ -1,60 +1,49 @@
-D40 certification on the merged tip
-===================================
-Merged agent-isolation (375e5da, S22-BUFPOOL-LAND) into d40-reaper-quadratic.
-Merge was clean, no conflicts, no file edited by both sides. Merge commit
-240a8e5, which is the tip this certification is OF.
+# D40 CERTIFICATION — THREE RUNS. THIS DIRECTORY'S CANONICAL NAMES CARRY THE LANDED ONE.
 
-Runner: tools/verify-suite.sh, not a bare cargo test. It rebuilds examples
-first (refusing if that fails), runs --lib plus every tests/*.rs by name,
-requires a `test result:` verdict AFTER each target's own marker, refuses a
-zero-collected run, and re-reads HEAD and the dirty count at the end so a tree
-that moved during the run cannot be recorded as green.
+  RUNNER.txt / suite.log / suite.go.log      head=c49e605  <- WHAT THE LANDING RESTS ON
+  prev-240a8e5-*                             head=240a8e5  green, but at a tip EARLIER than the landed one
+  run1-RED-*                                 head=240a8e5  RED on a load-sensitive Raft flake
 
-  VERIFY_OUT=/tmp/d40_verify_out2 VERIFY_MODE=per-target VERIFY_TIMEOUT=1800 \
-    timeout 10800 tools/verify-suite.sh D40-final
+⚠ THIS LAYOUT IS A CORRECTION. As first landed, the canonical names held the SUPERSEDED 240a8e5
+run, and the old README asserted "head=240a8e5 equals the merge commit" -- false for the tip that
+was landed. A reader opening RUNNER.txt, the name you reach for first, would have concluded the
+landing rested on a tip that is not the landed tip. That is exactly the shape refused twice in S22
+(ccb9eea recorded head=2450722), sitting inside D40's own evidence directory.
 
-CERTIFIED GREEN — runner's own summary, verbatim (suite.log, suite.go.log):
+Cause, recorded because it will recur: the landing session added its artifact under a `run3-LANDED-`
+prefix ALONGSIDE the existing canonical files rather than replacing them, and the merge brought the
+older canonically-named files in from the branch. Two naming schemes in one directory, and the
+better-known name won the reader's attention while carrying the worse record. Found by the D40
+builder reading what actually landed rather than the commit subject.
 
-  D40-final: mode=per-target rc=0 passed=2048 failed=0 build_errors=0 head=240a8e5 log=/tmp/d40_verify_out2/suite-D40-final.log
-  D40-final: go rc=0 passed=97 failed=0 log=/tmp/d40_verify_out2/suite-D40-final.go.log
+⇒ RULE: in an evidence directory, the UNPREFIXED name must always be the run the claim rests on.
+Supersede by RENAMING the old one out of the way, never by adding a longer name beside it.
+
+# RUN 3 — THE RUN D40 ACTUALLY LANDED ON. head=c49e605.
+
+The two runs already in this directory are NOT the landing evidence:
+  run1  rc=101  head=240a8e5  RED on a known load-sensitive Raft flake
+  RUNNER.txt (run 2)  rc=0  head=240a8e5  green, but against a tip EARLIER than the one landed
+
+This one:
+  D40-final: mode=per-target rc=0 passed=2048 failed=0 build_errors=0 head=c49e605
+  D40-final: go rc=0 passed=97 failed=0
   RUNNER_EXIT=0
 
-105 targets, 105 verdicts, 0 failed. head=240a8e5 equals the merge commit.
+Re-derived from the raw log by the landing session rather than read off RUNNER.txt:
+  verdicts            105   (104 + this branch's tests/d40_reserved_pages_return_to_baseline.rs)
+  FAILED verdicts       0
+  passed sum         2048
+  ENOSPC                0
+  rustc compile errs    0
+  go PASS lines        99   go FAIL 0
 
-RUN 1 WAS RED, AND IS KEPT HERE ON PURPOSE
-==========================================
-run1-RED-RUNNER.txt / run1-RED-load-flake.log:
+head=c49e605 is the tip that was landed, and agent-isolation was an ancestor of it, so
+`git merge-tree agent-isolation c49e605` produced tree 7b62b4549edd4f4c0a4543b485d3767981a8e7c8
+-- byte-identical to c49e605's own tree. The certified tree and the landed tree are the same
+git object. That is only true because agent-isolation was frozen while this branch certified;
+one more commit on the base would have produced a third tree no suite had seen.
 
-  D40-final: mode=per-target rc=101 passed=2047 failed=1 build_errors=2 head=240a8e5 log=/tmp/d40_verify_out/suite-D40-final.log
-
-One failure: integration_consensus_failover::
-a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost — "timed out
-after 45s waiting for a new leader after the kill." The `build_errors=2` are
-cargo's own `error: test failed` / `error: 1 target failed:` lines matching the
-runner's `^error(\[|:)` heuristic, not compile errors; run 2 reports 0.
-
-Why it is read as a load flake and not as a D40 regression, in the order the
-evidence was taken:
-
-1. The failure is a 45-second election timeout in a 3-node failover fixture.
-   Run 1 ran alongside another worktree's `cargo test -j 3`; load average was
-   8.26 / 9.90 / 10.15 when run 1 finished.
-2. Re-run alone at the same commit: 3 for 3 green, 3.16s / 3.22s / 3.07s —
-   against a 45s timeout. Two orders of magnitude of headroom when the machine
-   is not contended.
-3. `git diff 375e5da...240a8e5 --name-only` shows the D40 side touches
-   src/branch/arena.rs (+4 lines) and src/branch/reaper.rs and nothing else in
-   src/. Nothing matching consensus|cluster|replic|raft is touched at all.
-4. Run 2, on a quiet machine, same commit: 105/105, 0 failures.
-
-Kept rather than deleted because a certification whose first attempt was red is
-a fact about this suite that the next person running it should have. The claim
-being made is run 2's green, at head=240a8e5.
-
-THE HEADLINE, UNCHANGED BY THE MERGE
-====================================
-Measured: 2031120 -> 0 descents at N=2016.
-See bench/d40_README.txt and bench/d40_descent_curve.txt. That number carries
-no disk confound and no load confound: it is an operation count, identical on
-an idle machine and a thrashing one, and the BEFORE arm lands on the
-pre-registered N(N-1)/2 exactly at every point.
+Copied out of /tmp/d40_verify_out3/ because verify-suite.sh defaults VERIFY_OUT to a mktemp
+dir, and a finished run whose log lives only in /tmp is one reboot from being unciteable.
+That happened earlier the same day with S22 and cost real time.
