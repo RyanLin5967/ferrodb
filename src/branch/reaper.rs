@@ -153,7 +153,10 @@ impl TwoTierReaper {
         // correctness bug for an unbounded space leak, which is not a trade worth making.
         //
         // Terminates because each step moves strictly up the parent chain, whose length is capped
-        // at `MAX_BRANCH_DEPTH`.
+        // at `MAX_BRANCH_DEPTH`. Note the STEPS are bounded (<= 8); the WORK per step is not --
+        // each one asks `has_live_children`, which scans a CHILD span and recurses into reaped
+        // children. See the cost note in `table_catalog.rs::live_child_at`, which corrects an
+        // earlier "O(1) in N" claim of mine that was simply wrong.
         if let Ok(prec) = self.catalog.get_raw(parent.id) {
             if prec.state == BranchState::Reaped {
                 self.detach_from_parent(&prec)?;
