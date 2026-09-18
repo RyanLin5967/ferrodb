@@ -39,9 +39,16 @@ WINDOW=${WINDOW:-45}
 LOCK=/tmp/ferrodb-suite.lock
 IOTMP=$(mktemp -d)
 
+# Kill a wrapper AND everything under it. `kill -9 $timeout_pid` alone orphans the grandchild.
+_kill_tree() {
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
+    kill -9 "$p" 2>/dev/null
+}
+
 load_pids=()
 stop_load() {
-    for p in "${load_pids[@]:-}"; do kill -9 "$p" 2>/dev/null; done
+    for p in "${load_pids[@]:-}"; do _kill_tree "$p"; done
     load_pids=()
     return 0
 }
@@ -53,15 +60,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Each worker carries its own `timeout` as well as the trap: a trap dies with the shell, and
-# hundreds of orphaned spinners would be indistinguishable from a wedged machine. `disown` keeps
-# bash from printing the whole worker command line when it reaps one, which buried the first run of
-# this sweep in several hundred lines of noise.
+# ⛔ THE BURNER SHAPE BELOW IS NOT A STYLE CHOICE — IT IS A FIX FOR A MEASURED INCIDENT.
+#
+# An earlier version of this script left **317 orphaned processes at ppid=1**, still running 1.5
+# hours after their parent died, at loadavg 282. It froze this shared box TWICE and starved every
+# other project on it, while looking like "the machine is slow". Three compounding defects, in the
+# order that matters:
+#
+#   1. the burner body was `while :` / `while True` — UNBOUNDED, so an abandoned one never stops;
+#   2. cleanup did `kill -9 "$!"`, and `$!` is the **`timeout` WRAPPER's** pid. Killing `timeout`
+#      does NOT kill the `sh`/`python3` it spawned — the grandchild survives, reparents to init,
+#      and now has nothing enforcing its bound at all. The cleanup CREATED the orphans;
+#   3. `disown` detached them explicitly, defeating even SIGHUP.
+#
+# Fix (1) is the load-bearing one: **a self-terminating burner needs no parent, no `timeout` and no
+# trap.** Each burner below carries its own wall-clock deadline and exits on its own, so an orphan
+# is bounded by construction. `timeout` and the trap are kept as belt-and-braces, and cleanup now
+# kills the wrapper's DESCENDANTS rather than just the wrapper. `disown` is gone.
 start_cpu() {
     local n=$1
     for _ in $(seq "$n"); do
-        timeout 300 sh -c 'while :; do :; done' >/dev/null 2>&1 &
-        load_pids+=($!); disown $! 2>/dev/null
+        timeout 300 sh -c '
+            end=$(( $(date +%s) + 300 ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+            done' >/dev/null 2>&1 &
+        load_pids+=($!)
     done
 }
 # Write-and-fsync in a tight loop. This is the half pure-CPU load does not have, and the half the
@@ -70,13 +94,14 @@ start_io() {
     local n=$1 i
     for i in $(seq "$n"); do
         timeout 300 python3 -c "
-import os,sys
+import os,sys,time
 f=os.open(sys.argv[1], os.O_CREAT|os.O_WRONLY, 0o600)
 b=b'x'*65536
-while True:
+end=time.time()+300          # self-terminating: an orphan of this stops on its own
+while time.time() < end:
     os.pwrite(f,b,0); os.fsync(f)
 " "$IOTMP/io$i" >/dev/null 2>&1 &
-        load_pids+=($!); disown $! 2>/dev/null
+        load_pids+=($!)
     done
 }
 

@@ -177,3 +177,39 @@ arms, so the arms get measured against different machine states while being repo
 
 Called without a throwaway worktree it reports arm 4 as SKIPPED and exits non-zero, rather than
 reporting the must-fire half alone — which would be a detector nobody had tried to make misfire.
+
+## 10. ⛔ An incident caused by this row's own load harness, and the fix
+
+**The first version of `d42_fire_starved.sh` left 317 orphaned processes at ppid=1, still running
+1.5 hours after their parent died, at loadavg 282. It froze this shared box twice and starved every
+other project on it, while presenting as "the machine is slow".** It is recorded here because the
+harness is committed and would otherwise do it again to the next person who runs it.
+
+Three defects compounded, and the order matters:
+
+1. the burner body was `while :` / `while True` — **unbounded**, so an abandoned one never stops;
+2. cleanup did `kill -9 "$!"`, and `$!` is the **`timeout` WRAPPER's** pid. Killing `timeout` does
+   not kill the `sh`/`python3` it spawned: the grandchild survives, reparents to init, and now has
+   nothing enforcing its bound at all. **The cleanup created the orphans it existed to prevent;**
+3. `disown` detached them explicitly, defeating even SIGHUP.
+
+Fix (1) is the load-bearing one — a self-terminating burner needs no parent, no `timeout` and no
+trap — so every burner now carries its own wall-clock deadline, checked between bounded bursts of
+arithmetic. `timeout` and the trap are kept as belt-and-braces, cleanup kills the wrapper's
+DESCENDANTS via `_kill_tree`, and `disown` is gone.
+
+`bench/d42_fire_orphans.sh` forces the exact incident state rather than trusting the fix:
+it SIGKILLs the parent (so no trap can run) **and** SIGKILLs the `timeout` wrappers (so no bound is
+enforced), leaving bare burners at ppid=1. Both directions are required, because "they are all
+gone" would also pass for burners that never started:
+
+| direction | required | measured (`d42_fire_orphans.txt`) |
+|---|---|---|
+| A — anti-vacuity | orphans at ppid=1 must EXIST after the kills | **8** |
+| B — the fix | none alive after their own deadline | **0** |
+
+⚠ **This is also a caution about the project rule that produced it.** "Oversubscribe 14x to force a
+guard that won't fire" is sound for an IN-PROCESS race window, which is what it was measured on. It
+is the instruction most likely to spawn exactly these orphans, and — per §4b — it does not even work
+for starving a process on this machine. Prefer SIGSTOP aimed at named pids; if external load really
+is needed, the burner must be self-terminating before anything else about it is considered.

@@ -1,0 +1,3 @@
+D42: mode=per-target rc=0 passed=2065 failed=0 build_errors=0 head=2045e97 log=/Users/idide/wt/d42_verify_out/suite-D42.log
+D42: go rc=0 passed=97 failed=0 log=/Users/idide/wt/d42_verify_out/suite-D42.go.log
+RUNNER_EXIT=0

@@ -38,9 +38,16 @@ SPIN_BOUND=${SPIN_BOUND:-900}
 TEST_BOUND=${TEST_BOUND:-900}
 LOCK=/tmp/ferrodb-suite.lock
 
+# Kill a wrapper AND everything under it. `kill -9 $timeout_pid` alone orphans the grandchild.
+_kill_tree() {
+    local p=$1 c
+    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
+    kill -9 "$p" 2>/dev/null
+}
+
 spinners=()
 cleanup() {
-    for p in "${spinners[@]:-}"; do kill -9 "$p" 2>/dev/null; done
+    for p in "${spinners[@]:-}"; do _kill_tree "$p"; done
     [ "${held:-0}" = 1 ] && rm -rf "$LOCK"
     return 0
 }
@@ -69,9 +76,30 @@ echo "  cpus            : $NCPU"
 echo "  shape           : nice -n $NICE, ${FACTOR}x oversubscription = $N pure-CPU spinners"
 echo "  loadavg before  : $(uptime | sed 's/.*load averages*: //')"
 
+# ⛔ THE BURNER SHAPE BELOW IS NOT A STYLE CHOICE — IT IS A FIX FOR A MEASURED INCIDENT.
+#
+# An earlier version of this script left **317 orphaned processes at ppid=1**, still running 1.5
+# hours after their parent died, at loadavg 282. It froze this shared box TWICE and starved every
+# other project on it, while looking like "the machine is slow". Three compounding defects, in the
+# order that matters:
+#
+#   1. the burner body was `while :` / `while True` — UNBOUNDED, so an abandoned one never stops;
+#   2. cleanup did `kill -9 "$!"`, and `$!` is the **`timeout` WRAPPER's** pid. Killing `timeout`
+#      does NOT kill the `sh`/`python3` it spawned — the grandchild survives, reparents to init,
+#      and now has nothing enforcing its bound at all. The cleanup CREATED the orphans;
+#   3. `disown` detached them explicitly, defeating even SIGHUP.
+#
+# Fix (1) is the load-bearing one: **a self-terminating burner needs no parent, no `timeout` and no
+# trap.** Each burner below carries its own wall-clock deadline and exits on its own, so an orphan
+# is bounded by construction. `timeout` and the trap are kept as belt-and-braces, and cleanup now
+# kills the wrapper's DESCENDANTS rather than just the wrapper. `disown` is gone.
 for _ in $(seq "$N"); do
-    timeout "$SPIN_BOUND" sh -c 'while :; do :; done' >/dev/null 2>&1 &
-    spinners+=($!); disown $! 2>/dev/null
+    timeout "$SPIN_BOUND" sh -c '
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' >/dev/null 2>&1 &
+    spinners+=($!)
 done
 sleep 20
 echo "  loadavg loaded  : $(uptime | sed 's/.*load averages*: //')"
