@@ -23,9 +23,11 @@ use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
 use crate::wal::log::WalManager;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
+use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
@@ -40,18 +42,74 @@ pub struct BufferPoolManager {
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
     pub wal: OnceLock<Arc<WalManager>>,
+    /// **Page latches, and they are ABOVE this struct's own locks in the order.**
+    ///
+    /// They live here rather than on `BPlusTreeManager` because a manager is opened per statement
+    /// — `planner::plan::open_table` builds a fresh one on every INSERT — so latch state held by a
+    /// manager would be private to one statement and exclude nothing. The buffer pool is the only
+    /// thing two concurrent users of the same tree share.
+    ///
+    /// Nothing in this file may take one: `fetch_page` holds `arc_cache` across frame locks, so
+    /// the order is `page_latch -> arc_cache -> page_table -> frame` and taking a page latch from
+    /// underneath would invert it. See `src/storage/page_latch.rs`.
+    pub page_latches: PageLatches,
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
 
+/// A frame lock guard that also records, for its whole lifetime, that this thread is holding a
+/// buffer-pool lock.
+///
+/// This exists so the lock-order assertion in `src/storage/page_latch.rs` can SEE a frame lock.
+/// `self.frames[i].read()` is invisible to it; `self.frame_read(i)` is not. The two modules that
+/// take page latches — `src/storage/index.rs` and `src/storage/range_scan.rs` — must go through
+/// here, because they are the only ones that can produce the `frame -> page latch` inversion.
+/// Everywhere else may keep indexing `frames` directly: those modules take no page latch, and
+/// `tests/lock_order_allowlist.rs` fails if that ever stops being true.
+///
+/// Derefs to `Frame`, so it is a drop-in for the guard it wraps.
+pub struct FrameGuard<G> {
+    // Declared first so the frame lock is released BEFORE the pool section closes.
+    guard: G,
+    _pool: PoolSection,
+}
+
+impl<G: Deref<Target = Frame>> Deref for FrameGuard<G> {
+    type Target = Frame;
+    fn deref(&self) -> &Frame {
+        &self.guard
+    }
+}
+
+impl<G: DerefMut<Target = Frame>> DerefMut for FrameGuard<G> {
+    fn deref_mut(&mut self) -> &mut Frame {
+        &mut self.guard
+    }
+}
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
-        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new()}
+        BufferPoolManager {frames, page_table: RwLock::new(HashMap::new()), disk_manager, arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)), wal: OnceLock::new(), page_latches: PageLatches::new()}
+    }
+
+    /// Read-lock a frame, tracked for lock ordering. See [`FrameGuard`].
+    pub fn frame_read(&self, frame_i: usize) -> FrameGuard<RwLockReadGuard<'_, Frame>> {
+        let _pool = enter_pool();
+        FrameGuard { guard: self.frames[frame_i].read().unwrap(), _pool }
+    }
+
+    /// Write-lock a frame, tracked for lock ordering. See [`FrameGuard`].
+    pub fn frame_write(&self, frame_i: usize) -> FrameGuard<RwLockWriteGuard<'_, Frame>> {
+        let _pool = enter_pool();
+        FrameGuard { guard: self.frames[frame_i].write().unwrap(), _pool }
     }
 
     // if cached, return page. else, load from disk into a frame (and evicting if all frames are full), then pin
     pub fn fetch_page(&self, page_id: u32) -> Result<usize, FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // The cache's verdict and the action taken on it must be one atomic step.
         //
         // This lock used to be taken just for `request` and released immediately, so the verdict
@@ -205,6 +263,9 @@ impl BufferPoolManager {
 
     // decrement pin count, if page was modified, add dirty flag
     pub fn unpin_page(&self, page_id: u32, is_dirty: bool) {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let pt = self.page_table.read().unwrap();
         let frame_i = pt[&page_id];
         drop(pt);
@@ -220,6 +281,9 @@ impl BufferPoolManager {
 
     // allocate new page on disk using disk manager, load into a frame, return page id
     pub fn new_page(&self) -> Result<u32, FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let page_id = self.disk_manager.allocate()?;
         self.disk_manager.write(page_id, &[0u8; PAGE_SIZE])?;
         self.fetch_page(page_id)?;
@@ -229,6 +293,9 @@ impl BufferPoolManager {
 
     // writes a dirty page to disk
     pub fn flush_page(&self, page_id: u32) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // The read lock is held across the frame access on purpose. Reassigning a frame requires
         // the WRITE lock, so holding this one makes "which frame holds this page" stable for the
         // duration of the flush. Dropping it first left a window in which the frame could be
@@ -257,6 +324,9 @@ impl BufferPoolManager {
 
     // write all dirty pages to disk
     pub fn flush_all(&self) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let pt = self.page_table.read().unwrap();
 
         // **Ascending page id, not HashMap order, and the sort is load-bearing.**
@@ -294,6 +364,9 @@ impl BufferPoolManager {
 
     // remove from buffer pool, deallocate on disk
     pub fn delete_page(&self, page_id: u32) -> Result<(), FerroError>{
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let mut pt = self.page_table.write().unwrap();
         
         let frame_i = match pt.get(&page_id){
@@ -329,6 +402,9 @@ impl BufferPoolManager {
     }
 
     pub fn free_page(&self, page_id: u32) -> Result<(), FerroError> {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let mut pt = self.page_table.write().unwrap();
         let resident = match pt.get(&page_id) {
             Some(&frame_i) => {
@@ -371,6 +447,9 @@ impl BufferPoolManager {
     /// another database's bytes with no error anywhere. The caller's answer to a refusal is to
     /// stop its readers, not to retry.
     pub fn invalidate_all(&self) -> Result<(), FerroError> {
+        // Lock-order: this method takes one of the pool's locks, so page latches are
+        // forbidden from here down. See src/storage/page_latch.rs.
+        let _pool = enter_pool();
         // **`arc_cache` BEFORE `page_table`.** `fetch_page` holds the cache across the whole of its
         // work and takes the page table inside it, and its comment states the order as
         // `arc_cache -> page_table -> frame`. Taking them the other way round here — which the

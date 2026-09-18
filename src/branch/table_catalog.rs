@@ -651,9 +651,17 @@ impl TableBranchCatalog {
             // is the semantically correct one: a grandchild's root is the interior node's root at
             // fork time, which is the grandparent's root at *that* epoch.
             //
-            // Recursion is bounded by branch depth (`MAX_BRANCH_DEPTH = 8`, types.rs), not by the
-            // number of branches, so this stays O(1) in N and is NOT the global reachability walk
-            // that `mod.rs:13` forbids.
+            // ⛔ **COST, STATED CORRECTLY — an earlier version of this comment said "O(1) in N"
+            // and that was WRONG.** Recursion DEPTH is bounded by `MAX_BRANCH_DEPTH = 8`, but the
+            // WORK is not: `has_live_children` scans a node's whole CHILD span and recurses into
+            // every REAPED child, so this explores the reaped subtree breadth-first with an early
+            // exit on the first live descendant. A parent with 10^6 reaped children and one live
+            // child at the end of the span scans all 10^6.
+            //
+            // It is therefore O(explored reaped subtree), cheap in the common case (few reaped
+            // children, early exit) and NOT bounded by 8. It is still not the global reachability
+            // walk `mod.rs:13` forbids -- it never leaves this branch's own subtree -- but the
+            // honest bound is the subtree, not a constant.
             Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
@@ -1009,8 +1017,25 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // Under `logical` so it cannot interleave with the multi-key writers (`put`, `fork`,
         // `attach_child`), all of which also rewrite this span.
+        //
+        // **D33.** The first version of this wrote the key and returned. Every other mutating
+        // method here ends `let seq = self.stage()?; drop(_g); self.durable(seq)`, and skipping it
+        // cost two things, not one. The ARENA key was never fsynced -- and `stage()` is the ONLY
+        // caller of `publish_root()` (:331-333), so an `upsert` that happened to split the tree's
+        // root left the header page naming the OLD root, after which a reopen came back on a
+        // perfectly valid B+tree of an older state. Measured: 0 of 64 arenas survived a reopen.
+        //
+        // The generation check is the same story: `get_mut`-by-id alone let a STALE handle whose
+        // slot had been recycled attach an arena to the slot's new occupant.
         let _g = self.logical.lock().unwrap();
-        self.upsert(keys::arena(branch.id, arena.0), Vec::new())
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

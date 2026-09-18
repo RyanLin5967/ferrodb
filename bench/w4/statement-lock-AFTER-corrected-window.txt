@@ -1,0 +1,39 @@
+# W4 -- AFTER, re-measured with the sample window CORRECTED.
+#
+# The earlier oneshot took the prober's max over its WHOLE lifetime, including the 20 ms
+# warm-up before the sweep starts and the tail after it ends -- intervals where nothing holds
+# the lock at all. On this machine (agent fleet running) the idle control reaches tens of ms,
+# which is the same magnitude as the entire AFTER column, so the contamination was not
+# hypothetical. Samples are now filtered to those that OVERLAP the sweep, and a run where none
+# overlap refuses instead of reporting 0.
+#
+# S=100000, 64 reaped, 9 fixtures, nanoseconds. TWO independent runs, both kept, because they
+# disagree by ~2x on a busy machine and quoting only one would hide that spread:
+#
+#   run   arm     stall_med   stall_max
+#     1   recon      608417     2021917   <- this change (chunked reconciliation)
+#     1   fast        83833      188792   <- forget_branches(&reaped), successful-tick path
+#     2   recon      336500      448166
+#     2   fast        64875      151250
+#
+# Run 2's table is the one appended below. Take the WORSE of the two (run 1) as the claim.
+#
+# Against the same-instrument-contaminated AFTER previously recorded (682us med / 12279us max):
+# the MEDIAN is unchanged (682 -> 608 us) and the MAX falls 6x (12279 -> 2022 us). So the
+# outliers in the old AFTER column were warm-up noise, not lock waits, exactly as the review
+# said. The BEFORE column is untouched by this: 111-187 ms dwarfs a ~20 ms noise floor.
+#
+# Corrected headline at S=10^5, quoting the worse run: 129.0 ms -> 0.61 ms median (212x), and
+# 187.4 ms -> 2.02 ms max (93x). Run 2 would say 384x / 418x; run 1 is the honest one to publish.
+
+# TABLE 2 -- a reap really happened: 64 of the S branches are gone from the
+# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, 9 fixtures;
+# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.
+#
+# TWO ARMS. `recon` is `forget_reaped_branches` -- the reconciliation, which walks
+# every open session and is the BACKSTOP the lease thread now runs only when a scan
+# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,
+# which is what `scan_once` calls on every successful tick: O(gone), not O(S).
+       S    gone   reps    arm    stall_med    stall_max     wall_med     wall_max
+  100000      64      9  recon       336500       448166     21138834     22209709
+  100000      64      9   fast        64875       151250       125166       235917

@@ -99,7 +99,14 @@ fn beginning_an_agent_session_copies_zero_data_pages() {
         Some(vec![Value::Integer(399), Value::Varchar("widget-399".into())]),
         "the forked branch must see the trunk's rows without copying them"
     );
-    assert_eq!(rt.scan_rows(session.branch, "inventory").unwrap().len(), 400);
+    assert_eq!(
+        rt.scan_rows(session.branch, "inventory")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
 }
 
 #[test]
@@ -222,7 +229,14 @@ fn an_abandoned_agent_session_returns_its_pages_with_no_client_cooperation() {
     );
 
     // Reclamation must not have taken the trunk's pages with it.
-    assert_eq!(rt.scan_rows(BranchId::TRUNK, "inventory").unwrap().len(), 400);
+    assert_eq!(
+        rt.scan_rows(BranchId::TRUNK, "inventory")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
     assert_eq!(
         rt.get_row(BranchId::TRUNK, "inventory", 7).unwrap(),
         Some(vec![Value::Integer(7), Value::Varchar("widget-7".into())]),

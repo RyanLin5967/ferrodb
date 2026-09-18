@@ -24,7 +24,7 @@
 //!
 //! Every rule below has a named test and a mutant that was applied on purpose, run, and seen to
 //! kill that test. The mutants and what each printed are listed in
-//! `scratchpad/F9-agents-cluster.md`. A test nobody has watched fail is not evidence.
+//! `bench/evidence/F9-agents-cluster.md`. A test nobody has watched fail is not evidence.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;

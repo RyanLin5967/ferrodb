@@ -712,10 +712,21 @@ fn criterion_2_isolation(led: &mut Ledger) {
         db.runtime.scan_rows(BranchId::TRUNK, "inventory"),
     ) {
         (Ok(on_branch), Ok(on_trunk)) => {
-            println!("      rows in agent-a's copy-on-write tree ... {}", on_branch.len());
-            println!("      rows in trunk's tree .................. {}", on_trunk.len());
+            // `scan_rows` streams; counting is the whole demand here, so the rows are counted
+            // as they arrive rather than gathered first.
+            let (mut branch_rows, mut trunk_rows) = (0usize, 0usize);
+            for r in on_branch {
+                r.expect("read agent-a's tree");
+                branch_rows += 1;
+            }
+            for r in on_trunk {
+                r.expect("read trunk's tree");
+                trunk_rows += 1;
+            }
+            println!("      rows in agent-a's copy-on-write tree ... {branch_rows}");
+            println!("      rows in trunk's tree .................. {trunk_rows}");
             println!("      (trunk is heap-backed; a fork's writes land on pages in its own tree)");
-            !on_branch.is_empty()
+            branch_rows > 0
         }
         (Err(e), _) | (_, Err(e)) => {
             println!("      the branch tree could not be read: {e}");

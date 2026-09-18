@@ -73,3 +73,7 @@ target
 COMPACTION_HANDOFF_*.md
 .claude/hooks/.handoff_gate.log
 .claude/hooks/.sessionstart_full.txt.stale
+
+# working scratch -- never publish. Evidence the SOURCE cites lives in bench/evidence/.
+/scratchpad/
+/.e82/

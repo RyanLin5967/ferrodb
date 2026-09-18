@@ -489,13 +489,28 @@ impl BranchCatalog for LogBranchCatalog {
     fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
         // This catalog keeps the arena list inside the record, so the read-modify-write is real
         // and must be done under the write lock rather than around it. See D20.
+        //
+        // **D33.** The first version mutated `state.records` and returned. This catalog rebuilds
+        // every record by REPLAYING ITS LOG (`index`, last-append-wins), so an in-memory mutation
+        // that never appends is gone at restart. Measured: 0 of 8 arenas survived a reopen, and
+        // the reaper frees exactly `record.arenas` -- so each one was an extent reserved in the
+        // free-space map that no branch owned and nothing would ever free.
+        //
+        // The append happens WHILE THE STATE LOCK IS HELD, which `put` deliberately does not do.
+        // That is the whole point here: two concurrent `add_arena`s that mutate under the lock and
+        // append after releasing it can append out of order, and last-append-wins then drops the
+        // arena from the earlier-appended-but-later-mutated record. Holding the lock across the
+        // fsync costs throughput on a catalog that is a test oracle rather than the shipped one
+        // (`TableBranchCatalog` is what production opens), and correctness is not tradeable for it.
         let mut st = self.state.write().unwrap();
-        if let Some(rec) = st.records.get_mut(&branch.id) {
-            if !rec.arenas.contains(&arena) {
-                rec.arenas.push(arena);
-            }
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        if rec.arenas.contains(&arena) {
+            return Ok(()); // idempotent, and no log entry for a write that changes nothing
         }
-        Ok(())
+        rec.arenas.push(arena);
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

@@ -1,8 +1,0 @@
-### at_most_one_leader_per_term_across_a_chaos_sweep
-at_most_one_leader_per_term: 10000 seeds, 34845 elections, 302597 committed rounds, max term 10
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 842 filtered out; finished in 3.57s
-### a_committed_round_is_never_lost_across_a_chaos_sweep
-a_committed_round_is_never_lost: 10000 seeds, 301902 committed rounds, 40911 crashes, 33584 restarts
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 842 filtered out; finished in 3.61s
-### the_safety_properties_hold_under_partitions_alone
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 842 filtered out; finished in 4.29s

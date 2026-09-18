@@ -1,0 +1,79 @@
+=== D23 clean verification run ===
+date:   2026-09-18T03:08:12Z
+sha:    de980e2ddd34c6795accf4e5fe1dcd42496347ba + uncommitted (see quarantine/S20-lockorder-foreign)
+NOTE:   a second writer was active in this worktree until 23:06:53 local.
+        Tree fingerprint is recorded before AND after this run; if they differ,
+        the run overlapped another writer and must be discarded.
+
+--- tree fingerprint BEFORE ---
+ M src/buffer/buffer_pool.rs
+ M src/storage/index.rs
+ M src/storage/page_latch.rs
+ M src/storage/range_scan.rs
+?? bench/d23_clean_verify.txt
+?? bench/d23_fire_check.txt
+?? bench/d23_lockorder_verify.txt
+?? tests/lock_order_allowlist.rs
+?? tests/lock_order_runtime.rs
+23:01:13 src/storage/page_latch.rs
+23:02:05 src/buffer/buffer_pool.rs
+23:02:16 src/storage/range_scan.rs
+23:05:02 tests/lock_order_allowlist.rs
+23:05:36 tests/lock_order_runtime.rs
+23:06:33 src/storage/index.rs
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.53s
+
+--- cargo test --test integration_btree_concurrency ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.03s
+
+--- cargo test --test lock_order_allowlist ---
+test every_pool_method_that_locks_opens_a_pool_section ... ok
+test only_the_tree_may_take_a_page_latch ... ok
+test the_scanner_catches_a_pool_method_missing_its_marker ... ok
+test the_scanner_catches_an_unlisted_latcher ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+--- cargo test --test lock_order_runtime ---
+test a_page_latch_taken_while_holding_a_frame_read_lock_is_caught - should panic ... ok
+test a_page_latch_taken_while_holding_a_frame_write_lock_is_caught - should panic ... ok
+test pool_sections_do_not_leak_across_calls ... ok
+test the_correct_order_latch_then_frame_is_not_flagged ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+--- cargo test --test integration_buffer_pool_concurrency ---
+test concurrent_fetches_never_return_another_pages_bytes ... ok
+test every_frame_agrees_with_the_page_table_about_which_page_it_holds ... ok
+test every_page_reads_back_its_own_stamp_single_threaded ... ok
+test reading_a_page_that_does_not_exist_twice_errors_twice_instead_of_panicking ... ok
+test the_page_table_never_maps_two_pages_to_one_frame ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.28s
+
+--- cargo test --test integration_index_debt ---
+test deleting_rows_does_not_shrink_the_primary_index ... ok
+test no_workload_drives_a_leaf_underfull ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 49.85s
+
+--- cargo test --lib storage:: ---
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 1205 filtered out; finished in 1.87s
+
+--- tree fingerprint AFTER ---
+ M src/buffer/buffer_pool.rs
+ M src/storage/index.rs
+ M src/storage/page_latch.rs
+ M src/storage/range_scan.rs
+?? bench/d23_clean_verify.txt
+?? bench/d23_fire_check.txt
+?? bench/d23_lockorder_verify.txt
+?? tests/lock_order_allowlist.rs
+?? tests/lock_order_runtime.rs
+23:01:13 src/storage/page_latch.rs
+23:02:05 src/buffer/buffer_pool.rs
+23:02:16 src/storage/range_scan.rs
+23:05:02 tests/lock_order_allowlist.rs
+23:05:36 tests/lock_order_runtime.rs
+23:06:33 src/storage/index.rs

@@ -1,0 +1,12 @@
+=== D33: add_arena was not durable -- raw failing run, BEFORE the fix ===
+commit: feee712b3635cd66f695ed6b005e9d032e03013c
+date: 2026-09-18T03:33:43Z
+cmd: cargo test --test d33_add_arena_must_be_durable
+found by: an adversarial review of the D19/D20 merge, then reproduced here
+
+test log_catalog_add_arena_survives_a_reopen ... FAILED
+test table_catalog_add_arena_survives_a_reopen ... FAILED
+test add_arena_refuses_a_stale_generation ... FAILED
+assertion `left == right` failed: add_arena recorded 0 of 8 arenas in the LOG. It mutated the in-memory record and never appended, and this catalog rebuilds every record by replaying its log -- so the ownership is gone at restart and the reaper can never free those extents.
+assertion `left == right` failed: add_arena wrote 0 of 64 arenas durably. The reaper frees exactly `record.arenas`, so every arena missing here is an extent reserved in the free-space map that no branch owns and nothing will ever free -- a permanent leak across a restart. `add_arena` is the only mutating method in TableBranchCatalog that never calls stage()/durable().
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
