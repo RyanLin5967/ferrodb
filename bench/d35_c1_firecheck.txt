@@ -1,7 +1,7 @@
 # D35 C1 fire check: break the page-table mirror on purpose, confirm the suite notices
-# generated 2026-09-18T07:59:50-0400
-# base commit: 8bf34ad1cbba641317ac93489f67f81ea610cdfe on D35-C1-firecheck
-# host: 18 cores, load average at start: (8.857421875, 7.8798828125, 6.017578125)
+# generated 2026-09-18T11:40:25-0400
+# base commit: 8d1314fdb879f453c6ad9940a25d6e1496dd1a7f on D44-firecheck
+# host: 18 cores, load average at start: (32.2392578125, 86.02490234375, 283.81494140625)
 #
 # FIRED  = at least one test failed against the break. That is the result wanted.
 # SILENT = everything passed against the break. A hole in the suite, not a pass --
@@ -9,112 +9,199 @@
 #          mirror being USED rather than to the pool being CORRECT.
 
 ===== BASELINE (unmutated, 2 reps) =====
-  rep1 test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.0s)
-  rep1 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.4s)
-  rep1 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.8s)
-  rep1 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s (0.7s)
-  rep2 test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (0.2s)
-  rep2 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (0.2s)
-  rep2 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.2s)
-  rep2 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.4s)
+  rep1 test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (17.7s)
+  rep1 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s (13.5s)
+  rep1 test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s (0.7s)
+  rep1 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (1.2s)
+  rep1 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s (2.1s)
+  rep2 test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (0.2s)
+  rep2 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s (1.3s)
+  rep2 test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s (0.1s)
+  rep2 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.3s)
+  rep2 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s (1.3s)
+  BASELINE eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   BASELINE = GREEN
 
 ===== M1-remove-leaves-the-slot  (expect FIRED) =====
 # in src/buffer/page_table.rs
-  test --lib buffer::: rc=101 test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.5s)
+  test --lib buffer::: rc=101 test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (7.5s)
       test buffer::page_table::tests::a_removed_page_is_gone_from_both_halves ... FAILED
-      test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
+      test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s (7.1s)
       test delete_and_free_take_the_mirror_entry_with_them ... FAILED
-      test the_mirror_agrees_with_the_page_table_after_an_eviction_storm ... FAILED
       test a_page_that_is_evicted_and_refetched_resolves_to_its_new_frame ... FAILED
+      test the_mirror_agrees_with_the_page_table_after_an_eviction_storm ... FAILED
       test concurrent_fetches_never_resolve_to_the_wrong_frame_through_the_mirror ... FAILED
-      test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s (0.8s)
+      test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s (0.8s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.9s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s (2.2s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M2-lookup-drops-the-tag-check  (expect FIRED) =====
 # in src/buffer/page_table.rs
-  test --lib buffer::: rc=101 test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (3.4s)
-      test buffer::page_table::tests::a_collision_costs_the_fast_path_and_never_returns_the_wrong_frame ... FAILED
+  test --lib buffer::: rc=101 test result: FAILED. 16 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (7.4s)
       test buffer::page_table::tests::clear_empties_both_halves ... FAILED
-      test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s (1.6s)
+      test buffer::page_table::tests::a_collision_costs_the_fast_path_and_never_returns_the_wrong_frame ... FAILED
+      test result: FAILED. 16 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s (6.5s)
       test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
-      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s (0.5s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.8s)
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s (0.7s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (1.0s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s (2.1s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M3-clear-leaves-the-mirror  (expect FIRED) =====
 # in src/buffer/page_table.rs
-  test --lib buffer::: rc=101 test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.4s)
+  test --lib buffer::: rc=101 test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.15s (7.5s)
       test buffer::page_table::tests::clear_empties_both_halves ... FAILED
-      test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
+      test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.15s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s (7.8s)
       test invalidate_all_empties_the_mirror ... FAILED
-      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.6s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s (0.8s)
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s (0.9s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s (1.2s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s (2.2s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M4-fetch-drops-the-frame-label-recheck  (expect FIRED) =====
 # in src/buffer/buffer_pool.rs
-  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.5s)
-  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.7s)
-  test --test integration_buffer_pool_latch: rc=101 test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (4.9s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s (3.2s)
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s (0.6s)
+  test --test integration_buffer_pool_latch: rc=101 test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s (0.9s)
       test a_stale_page_table_entry_never_yields_another_pages_frame ... FAILED
-      test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s (0.8s)
+      test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s (1.1s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M5-unpin-drops-the-frame-label-recheck  (expect FIRED) =====
 # in src/buffer/buffer_pool.rs
-  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (1.9s)
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.3s)
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (3.3s)
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (2.5s)
       test unpin_never_touches_a_frame_that_does_not_hold_the_page ... FAILED
-      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.6s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s (0.8s)
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s (0.6s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s (0.9s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s (1.1s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M6-fetch-does-not-fall-back-to-the-map  (expect FIRED) =====
 # in src/buffer/buffer_pool.rs
-  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.0s)
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.4s)
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (3.2s)
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (2.1s)
       test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
-      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s (0.6s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s (0.7s)
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s (0.6s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.9s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s (0.8s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
 
 ===== M7-insert-never-publishes  (expect FIRED) =====
 # in src/buffer/page_table.rs
-  test --lib buffer::: rc=101 test result: FAILED. 7 passed; 6 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.02s (2.2s)
-      test buffer::page_table::tests::remapping_a_page_moves_its_mirror_entry ... FAILED
-      test buffer::page_table::tests::page_zero_in_frame_zero_is_not_mistaken_for_an_empty_slot ... FAILED
+  test --lib buffer::: rc=101 test result: FAILED. 12 passed; 6 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.02s (3.5s)
       test buffer::page_table::tests::a_collision_costs_the_fast_path_and_never_returns_the_wrong_frame ... FAILED
-      test buffer::page_table::tests::the_largest_page_id_round_trips ... FAILED
+      test buffer::page_table::tests::page_zero_in_frame_zero_is_not_mistaken_for_an_empty_slot ... FAILED
+      test buffer::page_table::tests::remapping_a_page_moves_its_mirror_entry ... FAILED
       test buffer::page_table::tests::removing_a_collided_out_page_leaves_the_slot_owner_alone ... FAILED
+      test buffer::page_table::tests::the_largest_page_id_round_trips ... FAILED
       test buffer::page_table::tests::the_mirror_answers_what_the_map_answers ... FAILED
-  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.5s)
-      test delete_and_free_take_the_mirror_entry_with_them ... FAILED
-      test unpin_never_touches_a_frame_that_does_not_hold_the_page ... FAILED
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s (2.8s)
       test invalidate_all_empties_the_mirror ... FAILED
+      test unpin_never_touches_a_frame_that_does_not_hold_the_page ... FAILED
+      test delete_and_free_take_the_mirror_entry_with_them ... FAILED
       test a_page_that_is_evicted_and_refetched_resolves_to_its_new_frame ... FAILED
       test the_mirror_agrees_with_the_page_table_after_an_eviction_storm ... FAILED
       test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s (0.8s)
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s (0.7s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s (0.8s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s (1.0s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: FIRED   expected FIRED   -> OK
+
+===== T1-record-drops-a-full-batch  (expect FIRED) =====
+# in src/buffer/touch_queue.rs
+  test --lib buffer::: rc=101 test result: FAILED. 15 passed; 3 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (4.5s)
+      test buffer::touch_queue::tests::every_recorded_update_comes_back_exactly_once ... FAILED
+      test buffer::touch_queue::tests::nothing_is_returned_until_the_batch_is_full ... FAILED
+      test buffer::touch_queue::tests::concurrent_recorders_lose_nothing ... FAILED
+      test result: FAILED. 15 passed; 3 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s (3.1s)
+  test --test integration_buffer_pool_touch_batching: rc=101 test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s (0.7s)
+      test a_full_batch_is_applied_rather_than_dropped ... FAILED
+      test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.9s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s (1.1s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== T2-arc_locked-does-not-drain  (expect FIRED) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (4.9s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s (3.0s)
+  test --test integration_buffer_pool_touch_batching: rc=101 test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s (0.5s)
+      test acquiring_the_policy_applies_every_pending_hit_first ... FAILED
+      test draining_twice_does_not_replay_the_same_updates ... FAILED
+      test concurrent_hits_lose_no_policy_updates ... FAILED
+      test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s (0.8s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s (0.8s)
+  eviction trace: DIFFERS (sha256 2347dc643fa4ff1fcf00472c75517639820d74a20ea1c79ae13bffceef89528b)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== T3-hit-path-ignores-the-returned-batch  (expect FIRED) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.14s (2.9s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s (2.0s)
+  test --test integration_buffer_pool_touch_batching: rc=101 test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s (0.5s)
+      test a_full_batch_is_applied_rather_than_dropped ... FAILED
+      test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.8s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s (1.2s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== T4-drain-does-not-empty-the-shard  (expect FIRED) =====
+# in src/buffer/touch_queue.rs
+  test --lib buffer::: rc=101 test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.15s (5.4s)
+      test buffer::touch_queue::tests::a_drain_takes_everything_and_empties_the_queue ... FAILED
+      test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.15s
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.27s (9.6s)
+  test --test integration_buffer_pool_touch_batching: rc=101 test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s (0.6s)
+      test acquiring_the_policy_applies_every_pending_hit_first ... FAILED
+      test draining_twice_does_not_replay_the_same_updates ... FAILED
+      test concurrent_hits_lose_no_policy_updates ... FAILED
+      test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s (1.5s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.40s (19.0s)
+  eviction trace: DIFFERS (sha256 fc4bc6fadca08b1c4be6862509f0626771f77dd7640092f4dc28a971c7dc77c9)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== CONTROL-batch-size-must-not-change-behaviour  (expect SILENT) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (4.0s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s (3.1s)
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s (0.7s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s (0.8s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s (1.2s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
+  VERDICT: SILENT   expected SILENT   -> OK
 
 ===== CONTROL-stronger-ordering-must-stay-silent  (expect SILENT) =====
 # in src/buffer/page_table.rs
-  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.2s)
-  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
-  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
-  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.8s)
+  test --lib buffer::: rc=0 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.15s (3.1s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s (3.2s)
+  test --test integration_buffer_pool_touch_batching: rc=0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s (0.8s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s (0.9s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s (1.2s)
+  eviction trace: MATCH (sha256 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe)
   VERDICT: SILENT   expected SILENT   -> OK
 
 ===== SUMMARY =====
@@ -125,5 +212,10 @@
   OK   M5-unpin-drops-the-frame-label-recheck: expected FIRED, got FIRED
   OK   M6-fetch-does-not-fall-back-to-the-map: expected FIRED, got FIRED
   OK   M7-insert-never-publishes: expected FIRED, got FIRED
+  OK   T1-record-drops-a-full-batch: expected FIRED, got FIRED
+  OK   T2-arc_locked-does-not-drain: expected FIRED, got FIRED
+  OK   T3-hit-path-ignores-the-returned-batch: expected FIRED, got FIRED
+  OK   T4-drain-does-not-empty-the-shard: expected FIRED, got FIRED
+  OK   CONTROL-batch-size-must-not-change-behaviour: expected SILENT, got SILENT
   OK   CONTROL-stronger-ordering-must-stay-silent: expected SILENT, got SILENT
-FIRECHECK_RESULT=PASS (8/8)
+FIRECHECK_RESULT=PASS (13/13)
