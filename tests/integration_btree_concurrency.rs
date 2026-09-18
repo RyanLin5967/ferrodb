@@ -32,7 +32,7 @@
 //! already own that. Any failure this file reports is the tree's.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
@@ -110,6 +110,16 @@ struct Round {
     /// Entries a full range scan returned, against the number of keys inserted.
     scan_len: usize,
     scan_expected: usize,
+    /// Pre-populated keys a scan running CONCURRENTLY with the writers failed to return.
+    ///
+    /// Distinct from `scan_len`: that scan runs after every writer has joined, so it can only see
+    /// damage that PERSISTED. This one is the live signal, and it is the only thing in this file
+    /// that exercises `RangeScanner`'s page read latch at all.
+    live_scan_misses: usize,
+    /// Out-of-order, duplicate, or failed entries from a concurrent scan.
+    live_scan_disorder: usize,
+    /// Concurrent scans actually completed. A zero here means the signal above is vacuous.
+    live_scans: usize,
 }
 
 impl Round {
@@ -122,6 +132,8 @@ impl Round {
             && self.wrong_values == 0
             && self.scan_disorder == 0
             && self.scan_len == self.scan_expected
+            && self.live_scan_misses == 0
+            && self.live_scan_disorder == 0
     }
 }
 
@@ -150,7 +162,15 @@ fn one_round(threads: usize, tag: &str) -> Round {
     // pre-existing keys descend subtrees the writers are actively splitting.
     let phantoms = Arc::new(AtomicUsize::new(0));
     let ins_err = Arc::new(AtomicUsize::new(0));
-    let barrier = Arc::new(Barrier::new(threads));
+    // The scanner joins the barrier too, so it starts with the writers rather than after them.
+    // The 1-thread arm runs WITHOUT it: that arm is the control and has to stay genuinely
+    // single-threaded, or a failure there would no longer isolate concurrency as the variable.
+    let scanning = threads > 1;
+    let barrier = Arc::new(Barrier::new(threads + usize::from(scanning)));
+    let writers_done = Arc::new(AtomicBool::new(false));
+    let live_misses = Arc::new(AtomicUsize::new(0));
+    let live_disorder = Arc::new(AtomicUsize::new(0));
+    let live_scans = Arc::new(AtomicUsize::new(0));
 
     let handles: Vec<_> = (0..threads)
         .map(|t| {
@@ -178,11 +198,82 @@ fn one_round(threads: usize, tag: &str) -> Round {
         })
         .collect();
 
+    // --- a scan running WHILE the writers split leaves -----------------------------------------
+    //
+    // Why a pre-populated key is a sound invariant for a non-snapshot scan: every such key is in
+    // the tree before the scan starts and nothing in this file removes one. A leaf-chain walk can
+    // legitimately miss a key INSERTED after it passed that point, but it cannot legitimately miss
+    // a key that was already there - the split protocol only ever moves keys RIGHTWARD into a new
+    // leaf that the scan has not reached yet, and writes that leaf before publishing the `next`
+    // pointer to it. A missing pre-populated key therefore means the walk left the chain.
+    let scanner = scanning.then(|| {
+        let tree = Arc::clone(&tree);
+        let barrier = Arc::clone(&barrier);
+        let writers_done = Arc::clone(&writers_done);
+        let (misses, disorder, scans) =
+            (Arc::clone(&live_misses), Arc::clone(&live_disorder), Arc::clone(&live_scans));
+        std::thread::spawn(move || {
+            barrier.wait();
+            // At least one scan even if the writers finish first, so the counter is never vacuous.
+            loop {
+                let mut seen_prepop = 0usize;
+                let mut last: Option<Value> = None;
+                match tree.range_scan(Bound::Unbounded, Bound::Unbounded) {
+                    Ok(scan) => {
+                        for e in scan {
+                            match e {
+                                Ok((k, _)) => {
+                                    if let Some(prev) = &last {
+                                        if *prev >= k {
+                                            disorder.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    // Pre-populated keys are exactly the multiples of GAP;
+                                    // `worker_key` adds 1..=5 so it never produces one.
+                                    if let Value::Integer(i) = k {
+                                        if i % GAP == 0 {
+                                            seen_prepop += 1;
+                                        }
+                                    }
+                                    last = Some(k);
+                                }
+                                Err(_) => {
+                                    disorder.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        disorder.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                misses.fetch_add(PREPOP as usize - seen_prepop.min(PREPOP as usize), Ordering::Relaxed);
+                scans.fetch_add(1, Ordering::Relaxed);
+                if writers_done.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        })
+    });
+
     for h in handles {
         if h.join().is_err() {
             r.panics += 1;
         }
     }
+    writers_done.store(true, Ordering::Release);
+    if let Some(s) = scanner {
+        if s.join().is_err() {
+            r.panics += 1;
+        }
+    }
+    r.live_scan_misses = live_misses.load(Ordering::Relaxed);
+    r.live_scan_disorder = live_disorder.load(Ordering::Relaxed);
+    r.live_scans = live_scans.load(Ordering::Relaxed);
+    assert!(
+        !scanning || r.live_scans > 0,
+        "no concurrent scan completed - live_scan_misses is measuring nothing"
+    );
     r.phantom_misses = phantoms.load(Ordering::Relaxed);
     r.insert_errors = ins_err.load(Ordering::Relaxed);
 

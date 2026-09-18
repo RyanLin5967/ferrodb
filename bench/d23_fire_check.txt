@@ -1,0 +1,51 @@
+=== D23 fire-check: break the latch protocol, watch the test fail, restore ===
+HEAD: 40e6fcd (fix(D23): release the parent read latch as soon as the leaf latch is held)
+tree: HEAD + this commit's lock-order guard, live scanner, and tracked-accessor migration
+date: 2026-09-18T03:24:01Z
+cmd:  cargo test --test integration_btree_concurrency -- --test-threads=1
+guard: source checksum a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14 verified identical after the run (see the tail of this file).
+
+RE-RUN FROM SCRATCH. An earlier pass of this file measured a tree that a SECOND AGENT was
+concurrently editing - commit 40e6fcd landed on this branch mid-run and changed
+latch_leaf_for_write. Those numbers are discarded rather than quoted; everything below is
+against the tree as it now stands.
+
+--- BASELINE (as it stands) ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.63s
+
+applied BREAK A
+--- BREAK A: fast-path leaf latch released mid read-modify-write (the original defect) ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... FAILED
+threads=16 dirty_rounds=3/3
+threads=32 dirty_rounds=3/3
+threads=8 dirty_rounds=3/3
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.74s
+
+applied BREAK B
+--- BREAK B: parent read latch released BEFORE the leaf is write-latched ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... ok
+threads=16 dirty_rounds=3/3
+threads=32 dirty_rounds=2/3
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.25s
+
+applied BREAK C
+--- BREAK C: range scanner walks the leaf chain with no read latch ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+--- RESTORED ---
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.42s
+source checksum before=a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14 after=a6eeae082cfb04b38d0d1e26cd6dd30bc43e4f14  MATCH

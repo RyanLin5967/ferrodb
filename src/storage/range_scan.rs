@@ -12,18 +12,37 @@ pub struct RangeScanner<K, V> {
 }
 
 impl<K: Ord + Clone + BTreeSerialize, V: Clone + BTreeSerialize> RangeScanner<K, V> {
-    /// Copy one leaf out **under its page read latch**.
+    /// Copy one leaf out under its page read latch.
     ///
-    /// Without the latch this walked the `next` chain straight through a concurrent split: D23
-    /// measured a full scan returning 1649 of 2200 entries at 8 threads. The latch is released
-    /// when this returns — the scan is not a repeatable read — but no page is read while a writer
-    /// is part-way through rewriting it, and `src/storage/index.rs` writes a new leaf before
-    /// publishing the `next` pointer to it, so this never arrives at an unwritten page.
+    /// **This latch is defence in depth. Nothing currently demonstrates that it is load-bearing,
+    /// and an earlier version of this comment claimed otherwise.** Removing it —
+    /// `bench/d23_fire_check.txt`, BREAK C — leaves all four arms of
+    /// `tests/integration_btree_concurrency.rs` green, including a scanner running concurrently
+    /// with 32 writers over 49-98 full scans per round.
+    ///
+    /// The retracted claim was that "a full scan returned 1649 of 2200 entries at 8 threads
+    /// without this latch". That measurement is real but it is **not** evidence for this latch: it
+    /// was taken before the fix, when the split's write ordering was broken too, and the short
+    /// scan was the write ordering. Attributing it here made a redundant guard look load-bearing.
+    ///
+    /// Two properties make the latch redundant *today*, and it is kept precisely because it is the
+    /// cheap guard if either stops holding:
+    ///
+    /// - `index.rs::write_page` assigns `frame.data` under the frame WRITE lock while this takes
+    ///   the READ lock, so the 4096-byte page is already copied atomically — a scanner cannot see
+    ///   a half-rewritten leaf.
+    /// - a split writes the new leaf **before** publishing the `next` pointer to it, so the chain
+    ///   never points at an unwritten page.
+    ///
+    /// The latch is released when this returns, so a scan is not a repeatable read: entries
+    /// inserted while it runs may or may not appear. Entries present when it started always do.
     pub fn load_leaf(&self, page_id: u32) -> Result<BPlusTreeLeafPage<K, V>, FerroError> {
         let _latch = self.buffer_pool.page_latches.read(page_id);
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let node = {
-            let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+            // Tracked accessor: the read latch above is held across this, so an inverted order
+            // here must fail loudly rather than deadlock. See src/storage/page_latch.rs.
+            let frame = self.buffer_pool.frame_read(frame_i);
             BPlusTreePage::<K, V>::deserialize(frame.data)?
         };
         self.buffer_pool.unpin_page(page_id, false);

@@ -246,7 +246,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
             // The parent latch covers exactly this gap and not one instruction more: once the leaf
             // is write-latched, a splitter needs that same latch and is excluded by it, so the
             // parent is released immediately below rather than held for the whole modification.
-            // Fire-checked - see bench/d23_fire_check.txt, BREAK B.
+            // Fire-checked, and it FIRES: bench/d23_fire_check.txt, BREAK B releases the parent
+            // before latching the leaf and takes 16- and 32-thread arms to 3/3 and 3/3 dirty
+            // rounds (lost_inserts 2-6, live_scan_disorder up to 169). Worth saying that this
+            // only became demonstrable once the test grew a scanner that runs DURING the writes;
+            // against the post-join scan it had, BREAK B passed and this comment was unearned.
             drop(guard);
             let leaf = self.latches().write(leaf_id);
             if parent.is_none() && self.root_page_id.load(Ordering::Acquire) != leaf_id {
@@ -351,7 +355,9 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     fn read_node_raw(&self, page_id: u32) -> Result<BPlusTreePage<K, V>, FerroError> {
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         let node = {
-            let frame = self.buffer_pool.frames[frame_i].read().unwrap();
+            // `frame_read`, not `frames[..].read()`: this runs while a page latch is held, and
+            // the tracked accessor is what makes an inverted order fail a test instead of hanging.
+            let frame = self.buffer_pool.frame_read(frame_i);
             BPlusTreePage::<K, V>::deserialize(frame.data)
         };
         self.buffer_pool.unpin_page(page_id, false);
@@ -372,7 +378,8 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     fn write_page(&self, page_id: u32, data: [u8; PAGE_SIZE]) -> Result<(), FerroError> {
         let frame_i = self.buffer_pool.fetch_page(page_id)?;
         {
-            let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+            // Tracked accessor - see `read_node_raw`.
+            let mut frame = self.buffer_pool.frame_write(frame_i);
             frame.data = data;
         }
         self.buffer_pool.unpin_page(page_id, true);

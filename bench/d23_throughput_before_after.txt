@@ -1,0 +1,72 @@
+=== D23: what the latch costs UNCONTENDED (single thread) ===
+date: 2026-09-18T03:18:31Z
+host: Darwin 25.6.0 arm64, 18 cpus
+build: cargo build --release  (the debug-only lock-order assertion is NOT in these binaries)
+bench: examples/d23_insert_throughput.rs, identical file in both arms
+BEFORE = ac230b8 (git archive; grep -cE 'Mutex|RwLock|latch|crab' src/storage/index.rs -> 0)
+AFTER  = working tree (same grep -> 71)
+Arms run SEQUENTIALLY, not in parallel, so they do not contend for cpu.
+
+--- BEFORE (no latches) ---
+D23 single-threaded B+tree throughput
+N=40000 inserts + 40000 searches per round, 5 rounds, one thread
+
+round 0: insert      80602 ops/s (0.496s)   search     202033 ops/s (0.198s)
+round 1: insert      75946 ops/s (0.527s)   search     198196 ops/s (0.202s)
+round 2: insert      76571 ops/s (0.522s)   search     207387 ops/s (0.193s)
+round 3: insert      64142 ops/s (0.624s)   search     199709 ops/s (0.200s)
+round 4: insert      69544 ops/s (0.575s)   search     194500 ops/s (0.206s)
+
+insert  best      80602 ops/s   median      75946 ops/s
+search  best     207387 ops/s   median     199709 ops/s
+
+--- AFTER (crabbing latches) ---
+D23 single-threaded B+tree throughput
+N=40000 inserts + 40000 searches per round, 5 rounds, one thread
+
+round 0: insert      67498 ops/s (0.593s)   search     273276 ops/s (0.146s)
+round 1: insert      71515 ops/s (0.559s)   search     276363 ops/s (0.145s)
+round 2: insert      75959 ops/s (0.527s)   search     298143 ops/s (0.134s)
+round 3: insert      71630 ops/s (0.558s)   search     279937 ops/s (0.143s)
+round 4: insert      73978 ops/s (0.541s)   search     282803 ops/s (0.141s)
+
+insert  best      75959 ops/s   median      71630 ops/s
+search  best     298143 ops/s   median     279937 ops/s
+
+--- INTERLEAVED REPEATS (B,A,B,A,B,A) to cancel machine drift ---
+The single pass above left insert ambiguous: the BEFORE arm spanned 64142-80602 ops/s (26%),
+so a 5.7% median gap sits inside its own noise. Repeating, interleaved.
+rep 1 BEFORE: insert  best      75717 ops/s   median      60910 ops/s search  best     208991 ops/s   median     183481 ops/s 
+rep 1 AFTER : insert  best      77617 ops/s   median      71650 ops/s search  best     301637 ops/s   median     284897 ops/s 
+rep 2 BEFORE: insert  best      71475 ops/s   median      64093 ops/s search  best     219454 ops/s   median     203199 ops/s 
+rep 2 AFTER : insert  best      74015 ops/s   median      53203 ops/s search  best     313196 ops/s   median     304359 ops/s 
+rep 3 BEFORE: insert  best      82056 ops/s   median      73092 ops/s search  best     212373 ops/s   median     209344 ops/s 
+rep 3 AFTER : insert  best      72332 ops/s   median      63135 ops/s search  best     298727 ops/s   median     293564 ops/s 
+
+=== VERDICT (4 passes each, best-of-5-rounds per pass) ===
+
+INSERT  best-of, BEFORE: 80602 / 75717 / 71475 / 82056   (range 71475-82056)
+INSERT  best-of, AFTER : 75959 / 77617 / 74015 / 72332   (range 72332-77617)
+  -> NO RESOLVABLE DIFFERENCE. The ranges overlap heavily; AFTER's best (77617) beats two of the
+     four BEFORE passes. The first pass's "5.7% slower" was noise. What can be said with this
+     instrument: the latch does not halve uncontended insert throughput, and any cost is small
+     enough that 4 passes of 40k inserts cannot separate it from run-to-run variation on a machine
+     running an agent fleet. An upper bound of roughly 5% is the honest claim; the point estimate
+     is not resolved. Medians are WORSE behaved than best-of here (AFTER ranged 53203-71650), which
+     is what you expect when the noise is external load rather than the code.
+
+SEARCH  best-of, BEFORE: 207387 / 208991 / 219454 / 212373  (range 207387-219454)
+SEARCH  best-of, AFTER : 298143 / 301637 / 313196 / 298727  (range 298143-313196)
+  -> +43%, and the two ranges DO NOT OVERLAP. This is a real effect.
+
+  ** It is NOT caused by latching, and must not be reported as a benefit of it. ** Verified in the
+  source, not inferred from the number: the pre-latch `search` did the leaf work TWICE --
+
+      let (page_id, _) = self.find_leaf(key.clone())?;   // descends; deserializes the leaf
+      let frame_i = self.buffer_pool.fetch_page(page_id)?; // fetches the SAME page again
+      let leaf = BPlusTreeLeafPage::deserialize(frame.data)?;  // deserializes it again
+
+  plus a key clone and a Vec<u32> path allocation on every point lookup. The latching rewrite
+  replaced it with `read_leaf_for(key)`, which returns the leaf the descent already deserialized.
+  The win is deleted duplicate work that happened to be removed in the same commit. A latch cannot
+  make a read faster; attributing this to the latch would be a false mechanism.
