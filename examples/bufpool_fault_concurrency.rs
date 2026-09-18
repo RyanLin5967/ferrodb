@@ -170,6 +170,11 @@ fn stamp(data: &mut [u8; PAGE_SIZE], page_id: u32) {
     data[0..4].copy_from_slice(&page_id.to_be_bytes());
 }
 
+/// Greatest common divisor, for the disjointness guard in [`sweep_point`].
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 fn read_stamp(data: &[u8; PAGE_SIZE]) -> u32 {
     u32::from_be_bytes([data[0], data[1], data[2], data[3]])
 }
@@ -271,6 +276,30 @@ fn sweep_point(
             );
         }
     }
+    // ---- DISJOINTNESS GUARD. The doc comment above promises each thread a disjoint slice, and
+    // that promise has a precondition nothing was checking.
+    //
+    // `slot = (t + k * threads) % len` lets thread `t` reach exactly the slots congruent to `t`
+    // modulo `gcd(threads, len)`. When `threads` divides `len` that gcd is `threads` and the
+    // slices really are disjoint -- which is why 1/2/4/8/16 over 512 or 8192 pages have always
+    // been fine. With 3, 5, 6 or 12 threads it is not: two threads share pages, `frames[i]` stops
+    // being thread-private, and the run measures same-page contention while every comment here
+    // still says it does not. Thread counts come from the command line, so that was reachable.
+    //
+    // Refused before the measurement rather than reported after it: a run whose premise is false
+    // is not a result to be caveated.
+    if ids.len() % threads != 0 {
+        eprintln!(
+            "\nDISJOINTNESS GUARD FAILED: {threads} threads over {} pages. This harness gives \
+             thread `t` the slots congruent to t modulo gcd(threads, pages) = {}, so the threads \
+             would SHARE pages and the run would measure same-page contention instead of the \
+             scaling claim. Use a thread count that divides the page count.",
+            ids.len(),
+            gcd(threads, ids.len())
+        );
+        std::process::exit(2);
+    }
+
     let reads_before = read_counter.load(Ordering::Relaxed);
     let mut elapsed = Duration::ZERO;
     // Accumulated ACROSS repeats, outside every timed window.

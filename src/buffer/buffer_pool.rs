@@ -119,15 +119,31 @@
 //! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
 //! five, which is why removing it bought 33% and nothing else.
 //!
-//! ⚠ **CORRECTED 2026-09-18: only TWO of those four are SHARED, and the "floor" has never been
-//! measured under contention.** `examples/bufpool_fault_concurrency.rs` hands each thread a
-//! **disjoint** slice of the page space — `slot = (t + k * threads) % ids.len()` with every thread
-//! count dividing the page count, and the harness says so in its own doc comment. Disjoint pages
-//! mean disjoint FRAMES, so `frames[i].read()` and both pin-counter RMWs sit on **thread-private
-//! cache lines** in every number this project owns. What is genuinely shared is the two
-//! `page_table.read()` acquisitions and the `arc_cache` mutex — and C1's mirror already removes the
-//! former. So "four RwLock acquisitions" is a correct count of the CODE and a wrong count of the
-//! CONTENTION, and the remaining floor beneath the pair has not been measured.
+//! ⚠ **CORRECTED 2026-09-18: on the RESIDENT arm only TWO of those four are SHARED, and the
+//! "floor" has never been measured under contention.**
+//! `examples/bufpool_fault_concurrency.rs` gives each thread a **disjoint** slice of the page
+//! space — `slot = (t + k * threads) % ids.len()`, then `ids[(slot * 4099) % len]`, and 4099 is
+//! coprime with both page counts so the second step is a bijection. On the RESIDENT arm 512 pages
+//! sit in a 1024-frame pool and nothing is ever evicted, so disjoint pages mean disjoint FRAMES
+//! for the whole run: `frames[i].read()` and both pin-counter RMWs are on **thread-private cache
+//! lines**. What is genuinely shared there is the two `page_table.read()` acquisitions and the
+//! `arc_cache` mutex — and C1 removes the former, D44 the latter. So "four RwLock acquisitions" is
+//! a correct count of the CODE and a wrong count of the CONTENTION.
+//!
+//! Two limits on that, because the first draft of this correction did not carry them:
+//!
+//! * **It is the RESIDENT arm's property, not the harness's.** The OVERSUBSCRIBED arm runs 8192
+//!   pages through 1024 frames and evicts continuously, so frames are handed between threads and
+//!   `frames[i].read()` there *is* shared. The hit-path numbers this lane quotes are all RESIDENT,
+//!   so the correction applies to them — but "in every number this project owns" would be wrong.
+//! * **Disjointness holds only while `threads` divides the page count.** Thread `t` reaches the
+//!   slots congruent to `t` modulo `gcd(threads, len)`, so 1/2/4/8/16 over 512 or 8192 are
+//!   disjoint and **3, 5, 6 or 12 are not** — two threads would silently share pages while the
+//!   harness's own doc comment still claimed they did not. Thread counts are a command-line
+//!   argument, so that was reachable; `sweep_point` now refuses rather than measuring the other
+//!   thing.
+//!
+//! The remaining floor beneath the pair is unmeasured either way.
 //!
 //! # D35 C1, which is what this file now does
 //!
