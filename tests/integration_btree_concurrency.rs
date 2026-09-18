@@ -46,6 +46,25 @@ const PREPOP: i32 = 1000;
 /// Keys each worker inserts. Enough, across 8+ threads, to drive many leaf splits and some
 /// internal splits while staying far inside 1024 frames.
 const PER_THREAD: i32 = 150;
+/// Spacing between consecutive pre-populated keys. Worker keys are placed in the gaps, so the two
+/// sets INTERLEAVE across the whole key range instead of occupying disjoint tails of it.
+///
+/// The first cut of this file gave the workers keys above every pre-populated one. Readers then
+/// only ever descended leaves no writer was touching, `phantom_misses` was 0, and that 0 was a
+/// statement about the key layout rather than about reader safety. With the sets interleaved, a
+/// reader probing a pre-existing key descends the same subtrees the writers are splitting.
+const GAP: i32 = 64;
+
+/// Pre-populated key `k` (`k` in `0..PREPOP`).
+fn prepop_key(k: i32) -> i32 {
+    k * GAP
+}
+
+/// Worker key for global insert index `g`. Lands strictly between two pre-populated keys, and is
+/// unique across `g` as long as `PER_THREAD * threads / PREPOP < GAP - 1` — 4.8 at the widest arm.
+fn worker_key(g: i32) -> i32 {
+    (g % PREPOP) * GAP + 1 + (g / PREPOP)
+}
 /// Independent rounds per arm, each on a fresh tree. A race that fires in 1 round of 3 is still a
 /// race; reporting the rate is what makes "it passed once" uninformative.
 const ROUNDS: usize = 3;
@@ -111,10 +130,12 @@ fn one_round(threads: usize, tag: &str) -> Round {
     let mut r = Round::default();
 
     // --- pre-populate, single-threaded. These keys exist before any worker starts. -------------
-    for k in 0..PREPOP {
+    for i in 0..PREPOP {
+        let k = prepop_key(i);
         tree.insert(Value::Integer(k), rid(k)).expect("pre-populate insert");
     }
-    for k in 0..PREPOP {
+    for i in 0..PREPOP {
+        let k = prepop_key(i);
         assert_eq!(
             tree.search(&Value::Integer(k)).expect("pre-populate search"),
             Some(rid(k)),
@@ -123,8 +144,10 @@ fn one_round(threads: usize, tag: &str) -> Round {
     }
 
     // --- the concurrent phase -----------------------------------------------------------------
-    // Keys are strided (t, t+T, t+2T, ...) so threads land in the SAME leaves rather than each
-    // owning its own tail of the key space, which is where a read-modify-write on one page shows.
+    // Worker keys are strided across threads (g = i*T + t) so threads land in the SAME leaves
+    // rather than each owning its own tail of the key space — that is where a read-modify-write on
+    // one page shows — and `worker_key` places them between pre-populated keys so readers probing
+    // pre-existing keys descend subtrees the writers are actively splitting.
     let phantoms = Arc::new(AtomicUsize::new(0));
     let ins_err = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(threads));
@@ -138,12 +161,12 @@ fn one_round(threads: usize, tag: &str) -> Round {
             std::thread::spawn(move || {
                 barrier.wait();
                 for i in 0..PER_THREAD {
-                    let k = PREPOP + i * threads as i32 + t as i32;
+                    let k = worker_key(i * threads as i32 + t as i32);
                     if tree.insert(Value::Integer(k), rid(k)).is_err() {
                         ins_err.fetch_add(1, Ordering::Relaxed);
                     }
                     // A key that existed before this thread started, and that nothing removes.
-                    let probe = (i * 7 + t as i32 * 13) % PREPOP;
+                    let probe = prepop_key((i * 7 + t as i32 * 13) % PREPOP);
                     match tree.search(&Value::Integer(probe)) {
                         Ok(Some(v)) if v == rid(probe) => {}
                         _ => {
@@ -164,21 +187,20 @@ fn one_round(threads: usize, tag: &str) -> Round {
     r.insert_errors = ins_err.load(Ordering::Relaxed);
 
     // --- verify, single-threaded --------------------------------------------------------------
-    for k in 0..PREPOP {
+    for i in 0..PREPOP {
+        let k = prepop_key(i);
         match tree.search(&Value::Integer(k)) {
             Ok(Some(v)) if v == rid(k) => {}
             Ok(Some(_)) => r.wrong_values += 1,
             _ => r.lost_prepop += 1,
         }
     }
-    for t in 0..threads as i32 {
-        for i in 0..PER_THREAD {
-            let k = PREPOP + i * threads as i32 + t;
-            match tree.search(&Value::Integer(k)) {
-                Ok(Some(v)) if v == rid(k) => {}
-                Ok(Some(_)) => r.wrong_values += 1,
-                _ => r.lost_inserts += 1,
-            }
+    for g in 0..(threads as i32 * PER_THREAD) {
+        let k = worker_key(g);
+        match tree.search(&Value::Integer(k)) {
+            Ok(Some(v)) if v == rid(k) => {}
+            Ok(Some(_)) => r.wrong_values += 1,
+            _ => r.lost_inserts += 1,
         }
     }
 

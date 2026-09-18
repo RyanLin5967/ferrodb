@@ -1,24 +1,26 @@
-=== D23 B+tree concurrency, BEFORE any fix ===
-commit: cb12805c97ed1132498272eb5db1234fafd7c9b9
-date:   2026-09-18T02:40:45Z
+=== D23 B+tree concurrency, BEFORE any fix -- WIDENED fixture ===
+(worker keys interleaved between pre-populated keys, so readers descend splitting subtrees)
+commit: 071b5d24474a136a9a903070974132b83fc58796
+date:   2026-09-18T02:42:10Z
 cmd:    cargo test --test integration_btree_concurrency -- --test-threads=1 --nocapture
 
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-S20-btree-latch)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.49s
      Running tests/integration_btree_concurrency.rs (target/debug/deps/integration_btree_concurrency-1effae439b3de802)
 
 running 4 tests
 test btree_concurrent_16_threads ... threads=16 dirty_rounds=3/3
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 998, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1113, scan_expected: 3400 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 1057, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1114, scan_expected: 3400 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 1008, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1115, scan_expected: 3400 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 857, lost_prepop: 0, wrong_values: 0, scan_disorder: 4, scan_len: 2304, scan_expected: 3400 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 917, lost_prepop: 0, wrong_values: 0, scan_disorder: 5, scan_len: 2194, scan_expected: 3400 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 979, lost_prepop: 0, wrong_values: 0, scan_disorder: 5, scan_len: 2184, scan_expected: 3400 }
 
-thread 'btree_concurrent_16_threads' (352507640) panicked at tests/integration_btree_concurrency.rs:223:5:
+thread 'btree_concurrent_16_threads' (352550447) panicked at tests/integration_btree_concurrency.rs:245:5:
 assertion `left == right` failed: 
 B+tree lost or corrupted state under 16 concurrent threads (3 of 3 rounds dirty).
 Every counted field must be 0 and scan_len must equal scan_expected.
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 998, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1113, scan_expected: 3400 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 1057, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1114, scan_expected: 3400 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 1008, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1115, scan_expected: 3400 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 857, lost_prepop: 0, wrong_values: 0, scan_disorder: 4, scan_len: 2304, scan_expected: 3400 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 917, lost_prepop: 0, wrong_values: 0, scan_disorder: 5, scan_len: 2194, scan_expected: 3400 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 979, lost_prepop: 0, wrong_values: 0, scan_disorder: 5, scan_len: 2184, scan_expected: 3400 }
 
   left: 3
  right: 0
@@ -30,33 +32,33 @@ test btree_concurrent_1_thread ... threads=1 dirty_rounds=0/3
   round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1150, scan_expected: 1150 }
 ok
 test btree_concurrent_32_threads ... threads=32 dirty_rounds=3/3
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2305, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 5800 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2153, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1113, scan_expected: 5800 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2279, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1119, scan_expected: 5800 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 17, lost_inserts: 1346, lost_prepop: 0, wrong_values: 0, scan_disorder: 9, scan_len: 3287, scan_expected: 5800 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 25, lost_inserts: 1313, lost_prepop: 0, wrong_values: 0, scan_disorder: 7, scan_len: 3218, scan_expected: 5800 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 21, lost_inserts: 1200, lost_prepop: 0, wrong_values: 0, scan_disorder: 7, scan_len: 3022, scan_expected: 5800 }
 
-thread 'btree_concurrent_32_threads' (352509074) panicked at tests/integration_btree_concurrency.rs:223:5:
+thread 'btree_concurrent_32_threads' (352551609) panicked at tests/integration_btree_concurrency.rs:245:5:
 assertion `left == right` failed: 
 B+tree lost or corrupted state under 32 concurrent threads (3 of 3 rounds dirty).
 Every counted field must be 0 and scan_len must equal scan_expected.
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2305, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 5800 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2153, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1113, scan_expected: 5800 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 2279, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1119, scan_expected: 5800 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 17, lost_inserts: 1346, lost_prepop: 0, wrong_values: 0, scan_disorder: 9, scan_len: 3287, scan_expected: 5800 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 25, lost_inserts: 1313, lost_prepop: 0, wrong_values: 0, scan_disorder: 7, scan_len: 3218, scan_expected: 5800 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 21, lost_inserts: 1200, lost_prepop: 0, wrong_values: 0, scan_disorder: 7, scan_len: 3022, scan_expected: 5800 }
 
   left: 3
  right: 0
 FAILED
 test btree_concurrent_8_threads ... threads=8 dirty_rounds=3/3
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 516, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1112, scan_expected: 2200 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 512, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 2200 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 552, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 2200 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 4, lost_inserts: 472, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1666, scan_expected: 2200 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 424, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1697, scan_expected: 2200 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 459, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1649, scan_expected: 2200 }
 
-thread 'btree_concurrent_8_threads' (352510817) panicked at tests/integration_btree_concurrency.rs:223:5:
+thread 'btree_concurrent_8_threads' (352553039) panicked at tests/integration_btree_concurrency.rs:245:5:
 assertion `left == right` failed: 
 B+tree lost or corrupted state under 8 concurrent threads (3 of 3 rounds dirty).
 Every counted field must be 0 and scan_len must equal scan_expected.
-  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 516, lost_prepop: 0, wrong_values: 0, scan_disorder: 1, scan_len: 1112, scan_expected: 2200 }
-  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 512, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 2200 }
-  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 552, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1110, scan_expected: 2200 }
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 4, lost_inserts: 472, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1666, scan_expected: 2200 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 424, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1697, scan_expected: 2200 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 459, lost_prepop: 0, wrong_values: 0, scan_disorder: 2, scan_len: 1649, scan_expected: 2200 }
 
   left: 3
  right: 0
@@ -69,7 +71,7 @@ failures:
     btree_concurrent_32_threads
     btree_concurrent_8_threads
 
-test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.32s
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.17s
 
 error: test failed, to rerun pass `--test integration_btree_concurrency`
 exit=101
