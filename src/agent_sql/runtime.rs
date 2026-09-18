@@ -273,7 +273,74 @@ struct State {
     /// here when the publish happens rather than re-derived at seal time from a flag that cannot
     /// answer for an ancestor.
     published_txns: BTreeSet<u64>,
+    /// How many LIVE workspaces still reference each txn — as their own `txn`, or in their
+    /// `inherited` list. A reverse index over exactly the question `capture_is_protected` asks.
+    ///
+    /// **Why an index and not the scan it replaces.** That predicate ran
+    /// `workspaces.values().any(..)` while holding the one Mutex every statement takes, once per
+    /// branch being forgotten — O(forgotten × open sessions) under the per-statement lock. With
+    /// 10⁵ open sessions and 64 branches reaped, an unrelated statement waited **134 ms at the
+    /// median** for the sweep to finish (`artie-research/W4/statement-lock-BEFORE.txt`, table 2).
+    /// A count keyed by txn answers the same question in O(log n) and is maintained at the two
+    /// places a workspace enters and leaves the map.
+    ///
+    /// Maintained ONLY by [`State::insert_workspace`] and [`State::remove_workspace`], which are
+    /// the only doors into `workspaces` for exactly that reason: an insert or a remove that went
+    /// straight to the map would leave this under- or over-counted, and an under-count makes
+    /// `capture_is_protected` answer "nothing needs this" about a capture a live task is standing
+    /// on — which is the F6 data loss, reached by a new door. A `debug_assert` in
+    /// `capture_is_protected` re-derives the answer by brute force on every call, so the whole
+    /// test suite is a differential test of this index against the scan it replaced.
+    txn_refs: BTreeMap<u64, u32>,
     policy: PolicyTable,
+}
+
+impl State {
+    /// Insert a workspace, taking the txn references it holds. One of the two doors into
+    /// `workspaces`; see [`State::txn_refs`] for why there are only two.
+    fn insert_workspace(&mut self, id: u64, ws: Workspace) {
+        for t in txn_refs_of(&ws) {
+            *self.txn_refs.entry(t).or_insert(0) += 1;
+        }
+        // An id slot is recycled after a reap, so an insert CAN land on an occupied key. Dropping
+        // the old value's references here is what keeps the index balanced on that path; letting
+        // `BTreeMap::insert` silently discard it would strand them forever.
+        if let Some(old) = self.workspaces.insert(id, ws) {
+            self.drop_txn_refs(&old);
+        }
+    }
+
+    /// Remove a workspace, releasing the txn references it held.
+    ///
+    /// The references are released **before** the caller inspects the result, which is what makes
+    /// `capture_is_protected` a question about the workspaces that REMAIN — the same thing the
+    /// scan meant when it ran after `BTreeMap::remove` had already taken this one out.
+    fn remove_workspace(&mut self, id: &u64) -> Option<Workspace> {
+        let ws = self.workspaces.remove(id)?;
+        self.drop_txn_refs(&ws);
+        Some(ws)
+    }
+
+    fn drop_txn_refs(&mut self, ws: &Workspace) {
+        for t in txn_refs_of(ws) {
+            match self.txn_refs.get_mut(&t) {
+                Some(n) if *n > 1 => *n -= 1,
+                Some(_) => {
+                    self.txn_refs.remove(&t);
+                }
+                // Loud in debug, and a no-op rather than a wrapping subtraction in release: an
+                // over-count strands a capture (a leak), an under-count deletes a live premise.
+                // Of the two, refusing to go below zero is the direction that loses no data.
+                None => debug_assert!(false, "txn_refs underflow for txn {t}"),
+            }
+        }
+    }
+}
+
+/// Every txn one workspace keeps alive: the ancestors' staged writes it copied at fork time, and
+/// its own. Exactly the disjunction `capture_is_protected` used to scan for.
+fn txn_refs_of(ws: &Workspace) -> impl Iterator<Item = u64> + '_ {
+    ws.inherited.iter().map(|t| t.0).chain(std::iter::once(ws.txn.0))
 }
 
 /// What one live agent task has written and read, as counts. See [`AgentRuntime::run_activity`]
@@ -300,6 +367,33 @@ pub struct RunActivity {
     /// Rows staged without ever being read — DESIGN.md section 4's cheap metric.
     pub blind_writes: u64,
 }
+
+/// How many workspaces one acquisition of the state lock will examine in
+/// [`AgentRuntime::forget_reaped_branches`].
+///
+/// This is the knob that bounds that sweep's blocking cost. The walk is the same length either
+/// way — the sweep is still O(open sessions) of work in total — but it is spread over
+/// ⌈sessions / chunk⌉ separate acquisitions, so what any ONE statement waits for is a chunk
+/// rather than the whole map.
+///
+/// **1024 chosen on the TAIL, not the median, and the cost is not monotone in either direction.**
+/// A smaller chunk holds the lock for less time per acquisition but takes it far more often, and
+/// each acquisition is another chance to be descheduled while still holding it — so shrinking the
+/// chunk makes the worst case WORSE, which is the opposite of the obvious guess. Measured at 10⁵
+/// open sessions, round-robin across chunk sizes over 9 rounds, worst stall observed for an
+/// unrelated statement (`artie-research/W4/forget-chunk-selection.txt`):
+///
+/// ```text
+///   chunk     median        worst
+///      64    757 us     17644 us
+///     256    280 us      2908 us
+///    1024    462 us       574 us
+///    4096   1080 us      1281 us
+/// ```
+///
+/// 256 wins the median and loses the tail by 5x; 1024 stayed inside 419-574 us on every single
+/// round. A latency bound is a claim about the worst case, so the tail is what decides it.
+const FORGET_CHUNK: usize = 1024;
 
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {
@@ -750,7 +844,7 @@ impl AgentRuntime {
             }
             _ => Vec::new(),
         };
-        state.workspaces.insert(
+        state.insert_workspace(
             branch.id,
             Workspace {
                 name: name.clone(),
@@ -3242,42 +3336,98 @@ impl AgentRuntime {
     ///
     /// Safe to call at any time. A branch that is still live is left completely alone.
     pub fn forget_reaped_branches(&self) -> usize {
-        // Two phases on purpose: the catalog is asked about each branch with the state lock NOT
-        // held, because the catalog takes its own lock and the two are taken in the other order
-        // elsewhere.
-        let candidates: Vec<(u64, String, BranchId)> = {
-            let state = self.state.lock().unwrap();
-            state
-                .workspaces
-                .keys()
-                .filter_map(|id| {
-                    let name = format!("b_{id}");
-                    let bid = *state.names.get(&name)?;
-                    // The name now points at a different slot: this workspace's own branch is
-                    // unreachable through it, so leave it rather than guess.
-                    (bid.id == *id).then_some((*id, name, bid))
-                })
-                .collect()
-        };
-        let gone: Vec<(u64, String, BranchId)> = candidates
-            .into_iter()
-            .filter(|(_, _, bid)| self.branches.get(*bid).is_err())
-            .collect();
-        let mut state = self.state.lock().unwrap();
-        for (id, name, bid) in &gone {
-            // Reaped without client cooperation, so nothing this branch buffered was published
-            // BY IT: the same reasoning as the ABANDON arm of `seal`, and reached by a different
-            // door. A descendant may still have published what this branch staged, so the same
-            // helper decides -- the reaper is the door the fixture reaches this through with no
-            // client cooperation at all.
-            if let Some(ws) = state.workspaces.remove(id) {
-                forget_captures_unless_published(&mut state, &ws);
+        let mut forgotten = 0usize;
+        // Where the next chunk starts. `workspaces` is a `BTreeMap<u64, _>`, so a slot id is a
+        // resumable cursor into it and a chunk boundary needs nothing kept across the gap.
+        let mut cursor = 0u64;
+        loop {
+            // ---- phase 1: ONE CHUNK of candidates, under the lock ---------------------------
+            //
+            // **Bounded on purpose.** This walk used to run to the end of the map in a single
+            // acquisition, so the per-statement lock was held across O(open sessions) work and an
+            // unrelated statement waited for all of it. Taking it `FORGET_CHUNK` at a time makes
+            // the longest wait a function of the chunk, not of how many agents are connected.
+            //
+            // Releasing between chunks means the map can change under us, and both directions are
+            // fine: a workspace opened behind the cursor is not reap-eligible (it was just forked)
+            // and a workspace removed is one this sweep no longer has to remove. Nothing is missed
+            // permanently — this is a reconciliation that runs again.
+            let (chunk, last_seen, examined) = {
+                let state = self.state.lock().unwrap();
+                let mut chunk: Vec<(u64, BranchId)> = Vec::with_capacity(FORGET_CHUNK);
+                let mut last_seen: Option<u64> = None;
+                let mut examined = 0usize;
+                for (id, ws) in state.workspaces.range(cursor..).take(FORGET_CHUNK) {
+                    examined += 1;
+                    last_seen = Some(*id);
+                    // `ws.name` is the `b_{id}` this workspace was forked under and is already
+                    // allocated. `format!` here would allocate one `String` per workspace while
+                    // holding the lock, which is precisely the cost being bounded.
+                    match state.names.get(&ws.name) {
+                        // The name now points at a different slot: this workspace's own branch is
+                        // unreachable through it, so leave it rather than guess.
+                        Some(bid) if bid.id == *id => chunk.push((*id, *bid)),
+                        _ => {}
+                    }
+                }
+                (chunk, last_seen, examined)
+            };
+
+            // ---- phase 2: ask the catalog, with the state lock NOT held ---------------------
+            //
+            // Not held because the catalog takes its own lock and the two are taken in the other
+            // order elsewhere. It is also the expensive half in wall-clock terms, and it costs no
+            // statement anything.
+            let gone: Vec<(u64, BranchId)> = chunk
+                .into_iter()
+                .filter(|(_, bid)| self.branches.get(*bid).is_err())
+                .collect();
+
+            // ---- phase 3: forget them, under the lock ---------------------------------------
+            if !gone.is_empty() {
+                let mut state = self.state.lock().unwrap();
+                for (id, bid) in &gone {
+                    // **Re-validate, because phase 2 ran with the lock released.** The catalog
+                    // releases a reaped branch's id SLOT for reuse and bumps the generation, and
+                    // both `workspaces` and `names` are keyed by the slot alone — a new session
+                    // forking into slot 5 takes the same `b_5` name and the same map key. Acting
+                    // on phase 2's answer without re-reading would then delete a LIVE agent's
+                    // workspace, release its escrow and unbind its name, for a branch the catalog
+                    // had never been asked about. The generation is what tells the two apart, so
+                    // the check is against the whole `BranchId` and not its id half.
+                    let still_ours = match state.workspaces.get(id) {
+                        Some(ws) => state.names.get(&ws.name) == Some(bid),
+                        None => false,
+                    };
+                    if !still_ours {
+                        continue;
+                    }
+                    // Reaped without client cooperation, so nothing this branch buffered was
+                    // published BY IT: the same reasoning as the ABANDON arm of `seal`, and
+                    // reached by a different door. A descendant may still have published what this
+                    // branch staged, so the same helper decides -- the reaper is the door the
+                    // fixture reaches this through with no client cooperation at all.
+                    let Some(ws) = state.remove_workspace(id) else { continue };
+                    forget_captures_unless_published(&mut state, &ws);
+                    state.names.remove(&ws.name);
+                    state.escrow.release(*bid);
+                    state.quarantine_reasons.remove(id);
+                    forgotten += 1;
+                }
             }
-            state.names.remove(name);
-            state.escrow.release(*bid);
-            state.quarantine_reasons.remove(id);
+
+            // A short chunk means the range ran out, which is the only end condition: `examined`
+            // counts what was LOOKED AT, not what survived the filter, so a chunk that matched
+            // nothing still advances rather than stopping the sweep early.
+            if examined < FORGET_CHUNK {
+                return forgotten;
+            }
+            match last_seen.and_then(|id| id.checked_add(1)) {
+                Some(next) => cursor = next,
+                // The map reached u64::MAX; there is nothing above it to visit.
+                None => return forgotten,
+            }
         }
-        gone.len()
     }
 
     /// Drop a branch and everything buffered on it.
@@ -3322,7 +3472,7 @@ impl AgentRuntime {
                     }
                 }
             }
-            if let Some(ws) = state.workspaces.remove(&branch.id) {
+            if let Some(ws) = state.remove_workspace(&branch.id) {
                 state.names.remove(&ws.name);
                 // **A task that published nothing is not a dependent of anything.**
                 //
@@ -4031,12 +4181,20 @@ fn forget_captures_unless_published(state: &mut State, ws: &Workspace) {
 }
 
 /// Is anything still relying on `txn`'s capture -- a publish that happened, or one that still could?
+///
+/// The second half reads [`State::txn_refs`] rather than scanning `workspaces`. The scan was
+/// O(open sessions) and ran under the per-statement lock once per branch being forgotten; see that
+/// field for the measurement. The `debug_assert` re-derives the answer the slow way on every call,
+/// so every test in this repository that forks, merges, abandons or reaps is checking the index
+/// against the scan it replaced.
 fn capture_is_protected(state: &State, txn: TxnId) -> bool {
-    state.published_txns.contains(&txn.0)
-        || state
-            .workspaces
-            .values()
-            .any(|w| w.txn == txn || w.inherited.contains(&txn))
+    let indexed = state.txn_refs.contains_key(&txn.0);
+    debug_assert_eq!(
+        indexed,
+        state.workspaces.values().any(|w| w.txn == txn || w.inherited.contains(&txn)),
+        "txn_refs disagrees with a scan of workspaces about txn {txn:?}"
+    );
+    state.published_txns.contains(&txn.0) || indexed
 }
 
 fn dependency_graph_of(captures: &BTreeMap<u64, TxnCapture>) -> DependencyGraph {
@@ -4562,6 +4720,81 @@ fn access_shape(where_clause: Option<&Expr>, schema: &Schema) -> AccessShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace with nothing in it but the two fields `txn_refs` indexes.
+    fn ws(name: &str, txn: u64, inherited: &[u64]) -> Workspace {
+        let branch = BranchId::new(1, 0);
+        Workspace {
+            name: name.into(),
+            prov: ProvId::NONE,
+            txn: TxnId(txn),
+            fork_seq: 0,
+            fork_root: 0,
+            rows: BTreeMap::new(),
+            base_rows: BTreeMap::new(),
+            inherited: inherited.iter().map(|t| TxnId(*t)).collect(),
+            tables: BTreeMap::new(),
+            frame: TxnFrame::new(TxnId(txn), branch, CommitHash::ZERO, 0, 1),
+            schema_edits: Vec::new(),
+            base_shapes: BTreeMap::new(),
+        }
+    }
+
+    /// The two doors keep `txn_refs` balanced — including over a RECYCLED id slot, where an
+    /// insert lands on an occupied key and `BTreeMap::insert` discards the old value.
+    ///
+    /// Asserted against a brute-force scan of `workspaces` rather than against a second copy of
+    /// the arithmetic: the index exists to give the same answer as that scan, so that is what it
+    /// is compared to.
+    #[test]
+    fn the_txn_ref_index_tracks_a_scan_of_the_workspaces() {
+        let scan = |st: &State, t: u64| {
+            st.workspaces.values().any(|w| w.txn == TxnId(t) || w.inherited.contains(&TxnId(t)))
+        };
+        let mut st = State::default();
+        st.insert_workspace(7, ws("b_7", 100, &[]));
+        // A child of 7 inherits its parent's staged txn, so txn 100 now has TWO referents.
+        st.insert_workspace(8, ws("b_8", 101, &[100]));
+        assert_eq!(st.txn_refs.get(&100), Some(&2));
+        for t in [100, 101] {
+            assert_eq!(st.txn_refs.contains_key(&t), scan(&st, t), "txn {t} after inserts");
+        }
+
+        // Slot 8 is reaped and recycled: the same key, a different branch and a different txn.
+        // The discarded workspace's references must go with it.
+        st.insert_workspace(8, ws("b_8", 102, &[]));
+        assert_eq!(st.txn_refs.get(&100), Some(&1), "the recycled slot kept its old reference");
+        for t in [100, 101, 102] {
+            assert_eq!(st.txn_refs.contains_key(&t), scan(&st, t), "txn {t} after recycling");
+        }
+
+        assert!(st.remove_workspace(&7).is_some());
+        assert!(st.remove_workspace(&8).is_some());
+        assert!(st.txn_refs.is_empty(), "left over: {:?}", st.txn_refs);
+        assert!(st.remove_workspace(&7).is_none(), "removing twice must not double-decrement");
+    }
+
+    /// **The differential assertion has to be able to FAIL**, and nothing in a passing suite shows
+    /// that it can: `capture_is_protected`'s `debug_assert` is the only thing standing between a
+    /// desynchronised index and the F6 data loss, so it is worth one input that makes it fire.
+    ///
+    /// The desync is done by reaching past the two doors and editing `txn_refs` directly — which
+    /// is exactly the mistake the doors exist to prevent, so this is the failure being simulated
+    /// rather than an artificial one.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "txn_refs disagrees with a scan")]
+    fn the_index_scan_assertion_fires_on_a_desynchronised_index() {
+        let mut st = State::default();
+        st.insert_workspace(7, ws("b_7", 100, &[]));
+        assert!(capture_is_protected(&st, TxnId(100)), "a live workspace holds txn 100");
+
+        // The under-count: the index forgets a reference a live workspace still holds. Left
+        // unchecked, `forget_captures_unless_published` would drop a capture that is the read
+        // premise of a published row.
+        st.txn_refs.remove(&100);
+        capture_is_protected(&st, TxnId(100));
+    }
 
     fn applied_at(seq: u64) -> AppliedOp {
         AppliedOp {
