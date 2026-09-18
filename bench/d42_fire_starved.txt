@@ -1,0 +1,25 @@
+queued behind a running suite (29795 cert-208c77a 2026-09-18T15:25:56Z)
+D42 falsifier 1 — the classifier must fire when the run is starved
+  when            : 2026-09-18T15:36:00Z
+  head            : ddbc601, 5 dirty file(s)
+  cpus            : 18
+  shape           : nice -n 20, 28x oversubscription = 504 pure-CPU spinners
+  loadavg before  : 24.92 51.80 337.99
+  loadavg loaded  : 189.90 87.67 344.21
+
+---------------- nice -n 20 cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.12s
+---------------- exit 0 ----------------
+  loadavg after   : 254.67 104.92 347.33
+
+⛔ FALSIFIER 1 DID NOT REACH ITS PRECONDITION — no wait expired, so there was no verdict
+   to classify. Raise FACTOR or NICE; this run proves nothing in either direction.
+
+FALSIFIER 1 FAILED — 1 check(s) did not hold.
+EXIT=1

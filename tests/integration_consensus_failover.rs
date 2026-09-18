@@ -541,13 +541,13 @@ impl LoadWitness {
                     .to_string()
             }
             Kind::Inconclusive => format!(
-                "    verdict       : INCONCLUSIVE — {} was starved, so this expiry says nothing \
+                "    verdict       : INCONCLUSIVE — {} starved, so this expiry says nothing \
                  about\n                    the cluster. Re-run it on a quieter machine; do NOT \
                  record this as a failure.",
                 match (starved_self, starved_children) {
-                    (true, true) => "both this process and its nodes",
-                    (true, false) => "this process",
-                    _ => "the node child processes",
+                    (true, true) => "both this process and its nodes were",
+                    (true, false) => "this process was",
+                    _ => "the node child processes were",
                 }
             ),
             Kind::ClassifierBroken => format!(

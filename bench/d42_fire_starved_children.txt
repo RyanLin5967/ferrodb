@@ -1,0 +1,78 @@
+D42 falsifier 1 (decisive arm) — starve the NODES, leave the test thread scheduled
+  when          : 2026-09-18T15:40:49Z
+  head          : ddbc601, 7 dirty file(s)
+  tree          : /Users/idide/wt/ferrodb-ferrodb-D42-inconclusive
+  method        : SIGSTOP every node for 60s once all three have said READY
+  budget        : ELECTION_BUDGET is 45s, so the hold outlasts one full budget
+  predicted     : child CPU ~0.000000 per node-wall-s (a stopped process consumes none);
+                  threshold is 0.00043, itself 10% of the measured running rate 0.0043
+  loadavg       : 29.06 81.80 277.70
+
+---------------- cargo test --test integration_consensus_failover ----------------
+bench/d42_fire_starved_children.sh: line 128: 50213 Killed: 9               ( n=0; while [ "$n" -lt 3 ]; do
+    n=$(pgrep -f "$PAT" 2>/dev/null | wc -l | tr -d ' '); sleep 0.2;
+done; echo "$(date -u +%T) saw $n node(s); waiting 2.5s for READY" >> "$STOPLOG"; sleep 2.5; got=$(pgrep -f "$PAT" 2>/dev/null | tr '\n' ' '); c=0; for p in $got;
+do
+    kill -STOP "$p" 2> /dev/null && c=$((c+1));
+done; echo "$(date -u +%T) STOPPED $c pid(s): $got" >> "$STOPLOG"; e=0; while [ "$e" -lt "$HOLD" ]; do
+    for p in $(pgrep -f "$PAT" 2>/dev/null);
+    do
+        kill -STOP "$p" 2> /dev/null;
+    done; sleep 2; e=$((e+2));
+done; c=0; for p in $(pgrep -f "$PAT" 2>/dev/null);
+do
+    kill -CONT "$p" 2> /dev/null && c=$((c+1));
+done; echo "$(date -u +%T) CONTINUED $c pid(s) after ${HOLD}s" >> "$STOPLOG" )
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... FAILED
+
+failures:
+
+---- a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost stdout ----
+
+thread 'a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost' (382681406) panicked at tests/integration_consensus_failover.rs:600:31:
+FERRODB-VERDICT: INCONCLUSIVE — waiting for the first writes to be acknowledged ran out of budget, but this run did not get the machine, so the expiry is not evidence about the cluster.
+  classifier (D42): whether this 45s expiry is a verdict at all
+    window        : the last 22.50s of the 45s budget
+    self-schedule : 1882 of 2250 nominal 10ms polls = 0.8366  (starved below 0.085)  HEALTHY
+    max stall     : 90ms between consecutive polls  (informational; not a verdict input)
+    child CPU     : 0.00 cpu-s over 22.50s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+    verdict       : INCONCLUSIVE — the node child processes was starved, so this expiry says nothing about
+                    the cluster. Re-run it on a quieter machine; do NOT record this as a failure.
+transcript:
+  n1: ROLE PreCandidate 0
+  n1: ROLE Candidate 1
+  n1: ROLE Leader 1
+  n2: ROLE Follower 1
+  n3: ROLE Follower 1
+  n1 stderr: 
+  n2 stderr: 
+  n3 stderr: 
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.82s
+
+error: test failed, to rerun pass `--test integration_consensus_failover`
+---------------- exit 101 ----------------
+
+keeper log (anti-vacuity: this run means nothing if nothing was actually stopped):
+   15:40:50 saw 3 node(s); waiting 2.5s for READY
+   15:40:52 STOPPED 3 pid(s): 50272 50480 50487 
+
+ok: the starved-children run earned INCONCLUSIVE — the classifier fired
+ok: self-scheduling read HEALTHY — signal C fired ALONE, covering B's known blind spot
+       window        : the last 22.50s of the 45s budget
+       self-schedule : 1882 of 2250 nominal 10ms polls = 0.8366  (starved below 0.085)  HEALTHY
+       max stall     : 90ms between consecutive polls  (informational; not a verdict input)
+       child CPU     : 0.00 cpu-s over 22.50s across 3 live node(s) = 0.00000 per node-wall-s  (starved below 0.00043)  STARVED
+       verdict       : INCONCLUSIVE — the node child processes was starved, so this expiry says nothing about
+
+FALSIFIER 1 PASSED
+EXIT=0
