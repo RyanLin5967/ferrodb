@@ -46,7 +46,9 @@ use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
-use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
+use crate::branch::types::{
+    BranchId, BranchState, CommitHash, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+};
 use crate::cow::PageStore;
 use crate::branch::{BranchCatalog, Reaper};
 
@@ -666,6 +668,65 @@ impl AgentRuntime {
         self.begin_session_as(RunIdentity { agent_id, run_id, model, prompt: None }, parent)
     }
 
+    /// The depth cap is a **trigger, not a refusal** — this is the production caller of
+    /// `collapse`, and before it there was none.
+    ///
+    /// `MAX_BRANCH_DEPTH` is 8, and `collapse` exists precisely to reset a branch's ancestry to 1
+    /// by materialising it to a fresh root under trunk. Every call site of it in the tree was
+    /// under `#[cfg(test)]`, so nothing ever invoked it: a 9th fork down a chain returned
+    /// `DepthExceeded` and the chain simply ended. An agent that forks a sub-agent that forks a
+    /// sub-agent hit a hard floor after eight hops with no route past it — a correctness hole
+    /// rather than a limit, because the system had the remedy and never ran it.
+    ///
+    /// **Two costs a caller should know about, neither of them a correctness problem.** Collapse
+    /// copies the branch's whole tree, so the fork that triggers it is not the O(1) metadata write
+    /// every other fork is. And it renumbers every page, which is what
+    /// [`AgentRuntime::page_changeset`] prunes on: a diff taken after a collapse shares no page id
+    /// with the cached fork root, so it decodes both trees in full instead of only what changed.
+    /// The deltas it returns are still exactly the keys whose values differ — `CowTree::diff`
+    /// compares values, not page identity — so the answer is unchanged and only the work is not.
+    fn fork_through_the_depth_wall(
+        &self,
+        parent: BranchId,
+        lease: LeaseDeadline,
+        refusal: FerroError,
+    ) -> Result<crate::branch::BranchRecord, FerroError> {
+        // **Ask the catalog what state the parent is in; never read the error text.** A guard that
+        // matches on a message is walked around by rewording the message, usually by accident —
+        // and `From<BranchError> for FerroError` flattens the typed error to a string before it
+        // reaches here, so the wording is all that survives. The *state* does survive:
+        // `BranchRecord::fork_child_parts` returns `DepthExceeded` for exactly "the parent is Live
+        // and one more level would pass the cap", and that is the condition asked here. Any other
+        // failure — a reaped parent, a corrupt record — is re-raised untouched rather than
+        // answered with a collapse.
+        let at_the_wall = match self.branches.get(parent) {
+            Ok(p) => p.state == BranchState::Live && p.depth >= MAX_BRANCH_DEPTH,
+            Err(_) => false,
+        };
+        if !at_the_wall {
+            return Err(refusal);
+        }
+        let Some(reaper) = &self.reaper else {
+            return Err(FerroError::Branch(format!(
+                "{refusal}, and no reaper is attached to this runtime to collapse it with. \
+                 Collapse is the only way past the cap: it materialises the branch onto a fresh \
+                 root, re-parents it to trunk and resets its depth to 1. Attach one built over \
+                 this runtime's catalog and page store with `AgentRuntime::with_reaper`."
+            )));
+        };
+        // Collapse the PARENT, not the child that does not exist yet. The cap is on the parent's
+        // ancestry, and resetting that to 1 is what makes room for this fork and for every later
+        // one down the same chain.
+        reaper.collapse(parent).map_err(|why| {
+            // Both halves, because either alone is a dead end for whoever reads it: the depth
+            // says the fork was refused, and only the collapse failure says why the remedy did
+            // not run — a missing `PageLinks` walker, most often, which is a wiring fault at
+            // startup and not visible from "depth exceeded" at all.
+            FerroError::Branch(format!("{refusal}, and collapsing it failed: {why}"))
+        })?;
+        self.branches.fork(parent, lease)
+    }
+
     /// The full form: fork a branch and intern the run under everything the caller declared
     /// about it, the prompt included.
     ///
@@ -681,9 +742,11 @@ impl AgentRuntime {
         if agent_id.trim().is_empty() {
             return Err(FerroError::Bind("agent id must not be empty".into()));
         }
-        let record = self
-            .branches
-            .fork(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
+        let lease = LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS);
+        let record = match self.branches.fork(parent, lease) {
+            Ok(r) => r,
+            Err(refusal) => self.fork_through_the_depth_wall(parent, lease, refusal)?,
+        };
         let branch = record.branch_id;
         let mut state = self.state.lock().unwrap();
 
