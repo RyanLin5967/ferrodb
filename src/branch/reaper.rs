@@ -84,6 +84,10 @@ pub struct TwoTierReaper {
     links: Option<Arc<dyn PageLinks>>,
     /// Cluster-time stamp of the last crash-orphan collection, or [`ORPHAN_SWEEP_NEVER`].
     last_orphan_sweep_ms: AtomicU64,
+    /// Catalog descents the extent sweep has made. See [`Self::sweep_descents`].
+    sweep_descents: AtomicU64,
+    /// Arenas the extent sweep has examined. See [`Self::sweep_visits`].
+    sweep_visits: AtomicU64,
 }
 
 impl TwoTierReaper {
@@ -93,6 +97,8 @@ impl TwoTierReaper {
             store,
             links: None,
             last_orphan_sweep_ms: AtomicU64::new(ORPHAN_SWEEP_NEVER),
+            sweep_descents: AtomicU64::new(0),
+            sweep_visits: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +209,31 @@ impl TwoTierReaper {
         Ok(())
     }
 
+    /// Catalog descents the extent sweep has made since this reaper was built.
+    ///
+    /// **Not a statistic for its own sake — it is the instrument D40's claim is stated in.** That
+    /// claim is a complexity class, O(branches x live_arenas) -> O(arenas actually touched), and
+    /// an operation count proves a class directly while a wall clock only illustrates it: a clock
+    /// moves when the machine is loaded, a descent count does not. Each descent here is one
+    /// `BPlusTreeManager::search` through `TableBranchCatalog`, which is the work `sample`(1)
+    /// found 74% of d19's stacks inside.
+    ///
+    /// Counted at the single site both the narrowed sweep and the orphan collector descend
+    /// through, so the two code paths are measured by the same instrument at the same point.
+    pub fn sweep_descents(&self) -> u64 {
+        self.sweep_descents.load(Ordering::Relaxed)
+    }
+
+    /// Arenas the extent sweep has examined, whether or not it descended for them.
+    ///
+    /// Reported next to [`Self::sweep_descents`] so the shape change cannot be confused with the
+    /// work merely moving somewhere unmeasured: the global scan visited every live arena and
+    /// descended for every one, so its two numbers are equal. The narrowed sweep visits only the
+    /// arenas a drain touched and descends only for those still live, so both must fall.
+    pub fn sweep_visits(&self) -> u64 {
+        self.sweep_visits.load(Ordering::Relaxed)
+    }
+
     /// Is `arena` an extent whose owning branch no longer exists at that generation and which
     /// holds no allocated page any more?
     ///
@@ -210,6 +241,7 @@ impl TwoTierReaper {
     /// question; the only thing that ever differed between them is **which arenas it is asked
     /// about**, and stating it once is what keeps them from drifting apart.
     fn extent_is_collectable(&self, arena: ArenaId, owner: BranchId) -> bool {
+        self.sweep_descents.fetch_add(1, Ordering::Relaxed);
         let owner_gone = match self.catalog.get_raw(owner.id) {
             Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
             Err(_) => true,
@@ -248,6 +280,7 @@ impl TwoTierReaper {
     /// workload out differently — the same reason `ArenaPageStore::live_arenas` sorts.
     fn sweep_touched_extents(&self, touched: &BTreeSet<ArenaId>) -> Result<(), FerroError> {
         for arena in touched.iter().copied() {
+            self.sweep_visits.fetch_add(1, Ordering::Relaxed);
             // Re-read the owner from the store rather than trusting the `PendingFree` entry's:
             // `free_arena` may already have removed the extent, in which case there is nothing to
             // collect and `owner_of` says so.
@@ -279,6 +312,7 @@ impl TwoTierReaper {
     pub fn collect_orphaned_extents(&self) -> Result<u32, FerroError> {
         let mut freed = 0u32;
         for (arena, owner) in self.store.live_arenas() {
+            self.sweep_visits.fetch_add(1, Ordering::Relaxed);
             if self.extent_is_collectable(arena, owner) {
                 self.store.free_arena(arena)?;
                 freed += 1;
