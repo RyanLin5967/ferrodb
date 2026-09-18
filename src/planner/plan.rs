@@ -23,7 +23,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
             // B8: `_fulltext` is dropped on purpose. DELETE removes no posting - it stamps
             // `end_ts` on the version and leaves every index entry in place, so no full-text tree
             // is written and no full-text root can move. See `execution::delete`.
-            let (heap, tree, handles, _fulltext) = open_table(entry, bp.clone(), txn, txn_id)?;
+            let (heap, tree, handles, _fulltext) = open_table(entry, catalog, bp.clone(), txn, txn_id)?;
             let bound_where = match where_clause {
                 Some(w) => {
                     let binder = Binder::new(catalog);
@@ -39,7 +39,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Insert { table, values } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles, fulltext) = open_table(entry, bp, txn, txn_id)?;
+            let (heap, tree, handles, fulltext) = open_table(entry, catalog, bp, txn, txn_id)?;
             let binder = Binder::new(catalog);
             let empty = Scope::new();
             // Positional: value i lands in column i, so column i's declared type is what decides
@@ -53,7 +53,7 @@ pub fn plan(stmt: Stmt, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn_ctx: 
         Stmt::Update { table, assignments, where_clause } => {
             let entry = catalog.require_table(&table)?;
             let (txn, txn_id) = txn_ctx.ok_or(FerroError::Wal("no transaction for delete".into()))?;
-            let (heap, tree, handles, fulltext) = open_table(entry, bp.clone(), txn.clone(), txn_id)?;
+            let (heap, tree, handles, fulltext) = open_table(entry, catalog, bp.clone(), txn.clone(), txn_id)?;
             let binder = Binder::new(catalog);
             let scope = single_table_scope(catalog, &table)?;
             let mut resolved = Vec::with_capacity(assignments.len());
@@ -93,14 +93,31 @@ pub fn explain(stmt: Stmt, catalog: &Catalog) -> Result<String, FerroError> {
 }
 
 // opens heapfilemanager twice (could cause errors)
-fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, txn_id: u64) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>, Vec<FullTextHandle>), FerroError> {
+/// Open the trees a statement needs, **sharing each tree's root cell with every other statement**.
+///
+/// `catalog.root_cell(..)` is a plain hash lookup on `&Catalog` — no lock — and the `Arc` it
+/// returns is the same cell a concurrent split stores into. That is what makes the root-split
+/// retry in `BPlusTreeManager::read_leaf_for` able to fire at all: before this, every statement
+/// wrapped the catalog's recorded root in a PRIVATE atomic and the retry compared that private
+/// value against itself. See `SCALE-DESIGN` D53.
+///
+/// The fallback to `open` is deliberate and is not a silent degradation: it can only be reached
+/// for a tree this catalog has never registered, which means nothing else holds a handle on it
+/// either, so a private cell is correct for exactly that case.
+fn open_table(entry: &TableEntry, catalog: &Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, txn_id: u64) -> Result<(HeapFileManager, BPlusTreeManager<Value, RecordId>, Vec<IndexHandle>, Vec<FullTextHandle>), FerroError> {
     let mut heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
     heap.set_transaction(txn, txn_id);
-    let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+    let tree = match catalog.root_cell(&entry.name, None) {
+        Some(cell) => BPlusTreeManager::<Value, RecordId>::open_shared(cell, bp.clone()),
+        None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
+    };
     let mut handles = Vec::with_capacity(entry.indexes.len());
     for info in &entry.indexes {
         let col_index = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-        let tree = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
+        let tree = match catalog.root_cell(&entry.name, Some(&info.column_name)) {
+            Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
+            None => BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone()),
+        };
         handles.push(IndexHandle{col_index, tree})
     }
     // B8 — the full-text indexes, opened the same way and kept apart for the reason
@@ -108,7 +125,10 @@ fn open_table(entry: &TableEntry, bp: Arc<BufferPoolManager>, txn: Arc<TxnManage
     let mut fulltext = Vec::with_capacity(entry.fulltext_indexes.len());
     for info in &entry.fulltext_indexes {
         let col_index = entry.schema.columns.iter().position(|c| c.name == info.column_name).ok_or(FerroError::KeyNotFound)?;
-        let tree = BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone());
+        let tree = match catalog.root_cell(&entry.name, Some(&info.column_name)) {
+            Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
+            None => BPlusTreeManager::<(Value, Value), ()>::open(info.root_page_id, bp.clone()),
+        };
         fulltext.push(FullTextHandle{col_index, column_name: info.column_name.clone(), tree})
     }
     Ok((heap, tree, handles, fulltext))

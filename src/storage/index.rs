@@ -79,7 +79,22 @@ use std::sync::atomic::Ordering;
 use std::ops::Bound;
 
 pub struct BPlusTreeManager<K, V> {
-    pub root_page_id: AtomicU32,
+    /// The tree's current root page, **shared** with every other handle on the same tree.
+    ///
+    /// # Why this is an `Arc` and not a plain `AtomicU32`
+    ///
+    /// `read_leaf_for` opens every descent with a root-split retry — load the root, latch it,
+    /// re-load and restart if it moved. That guard is correct and it was **DORMANT**: `open()`
+    /// wrapped the catalog's recorded root in a *fresh private* atomic, so two statements over one
+    /// table held two independent root pointers and the retry compared a private value against
+    /// itself. It could never fire. The global catalog mutex was the only thing actually providing
+    /// the safety, which meant removing that mutex for concurrency would have ACTIVATED a latent
+    /// defect rather than merely exposing a stale value. See `SCALE-DESIGN` D53.
+    ///
+    /// Sharing the cell — rather than sharing the whole manager — is what lets every existing
+    /// call site keep building a cheap per-statement handle: `.load()` and `.store()` deref
+    /// through the `Arc` unchanged.
+    pub root_page_id: Arc<AtomicU32>,
     pub buffer_pool: Arc<BufferPoolManager>,
     pub marker: PhantomData<(K, V)>
 }
@@ -87,22 +102,43 @@ pub struct BPlusTreeManager<K, V> {
 impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeManager<K,V> {
 
     pub fn new(root_page_id: AtomicU32, buffer_pool: Arc<BufferPoolManager>) -> Self{
-        BPlusTreeManager {root_page_id, buffer_pool, marker: PhantomData}
+        BPlusTreeManager {root_page_id: Arc::new(root_page_id), buffer_pool, marker: PhantomData}
+    }
+
+    /// Open a handle that SHARES `root` with every other handle built from the same cell.
+    ///
+    /// This is the constructor a statement should use, so a root split performed by one statement
+    /// is seen by another's descent and the retry in `read_leaf_for` can fire. `open` below keeps
+    /// the private-cell behaviour for callers that genuinely own the tree alone — recovery, and
+    /// one-shot page-freeing.
+    pub fn open_shared(root: Arc<AtomicU32>, buffer_pool: Arc<BufferPoolManager>) -> Self {
+        Self { root_page_id: root, buffer_pool, marker: PhantomData }
+    }
+
+    /// The shared root cell, for registering this tree so later handles can share it.
+    pub fn root_cell(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.root_page_id)
     }
 
     // allocates empty root leaf
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let root_page_id = buffer_pool.new_page()?;
         let root_node = BPlusTreeLeafPage::<K, V>::new(root_page_id);
-        let tree = Self {root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData};
+        let tree = Self {root_page_id: Arc::new(AtomicU32::new(root_page_id)), buffer_pool, marker: PhantomData};
         let guard = tree.latches().write(root_page_id);
         tree.write_page(root_page_id, root_node.serialize()?)?;
         drop(guard);
         Ok(tree)
     }
 
+    /// Open a handle with a **private** root cell.
+    ///
+    /// ⚠ Two handles opened this way over one tree do NOT see each other's root splits, and the
+    /// retry in `read_leaf_for` cannot fire between them. That is correct only for a caller that
+    /// owns the tree alone for the duration — recovery, and one-shot page-freeing. Everything on
+    /// a statement path wants [`open_shared`].
     pub fn open(root_page_id: u32, buffer_pool: Arc<BufferPoolManager>) -> Self{
-        Self { root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData }
+        Self { root_page_id: Arc::new(AtomicU32::new(root_page_id)), buffer_pool, marker: PhantomData }
     }
 
     // ---------------------------------------------------------------------------------------
