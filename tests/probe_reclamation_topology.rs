@@ -301,3 +301,35 @@ fn collapse_survives_a_branch_bigger_than_one_extent() {
         "a 601-page branch must be collapsible: collapse is the ONLY way past MAX_BRANCH_DEPTH"
     );
 }
+
+/// MEASUREMENT. Creation vs reclamation on ONE instrument, so the ratio is not cross-bench.
+#[test]
+#[ignore]
+fn fork_versus_reap_rate() {
+    for n in [128u32, 512] {
+        let r = rig(&format!("ratio{n}"));
+        let reaper = TwoTierReaper::new(r.catalog.clone(), r.store.clone());
+        let t = Instant::now();
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            ids.push(r.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap().branch_id);
+        }
+        let fork_el = t.elapsed();
+        for b in &ids {
+            write_pages(&r, *b, 2);
+        }
+        let t = Instant::now();
+        let reaped = reaper.reap_expired(u64::MAX / 2).unwrap();
+        let reap_el = t.elapsed();
+        println!(
+            "RATIO n={n} fork_total_ms={:.1} fork_us_each={:.1} reap_total_ms={:.1} \
+             reap_us_each={:.1} reap_over_fork={:.1}x reaped={}",
+            fork_el.as_secs_f64() * 1e3,
+            fork_el.as_secs_f64() * 1e6 / n as f64,
+            reap_el.as_secs_f64() * 1e3,
+            reap_el.as_secs_f64() * 1e6 / n as f64,
+            reap_el.as_secs_f64() / fork_el.as_secs_f64(),
+            reaped.len()
+        );
+    }
+}

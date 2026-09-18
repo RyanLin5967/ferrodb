@@ -50,3 +50,19 @@ Residual with the sweep off still rises 39.6 -> 59.3 ms/branch (1.50x over 16x N
 Flat in page count on BOTH paths, and the slow path is not measurably dearer than the fast one.
 The per-page interval query is invisible under the ~35 ms durable-catalog floor of one reap.
 No structural limit found in the per-page cost of the rule itself at this scale.
+
+--- MEASUREMENT: creation vs reclamation, ONE instrument (serial, debug build) -------------
+  RATIO n=128 fork_us_each=14087.6  reap_us_each=65142.2  reap_over_fork=4.6x
+  RATIO n=512 fork_us_each=17483.7  reap_us_each=81480.7  reap_over_fork=4.7x
+Stable across 4x N. NOTE: this is a SERIAL forker, so it does not see group commit's x17.3
+(bench/fork_concurrency_after.txt). reap_expired has no concurrent peer to group with by
+construction -- it is one sequential loop in the lease thread -- so in deployment the gap is
+wider than 4.7x by whatever factor group commit buys fork. That factor is NOT measured here
+and is not claimed.
+
+--- CAVEAT ON ABSOLUTES -------------------------------------------------------------------
+Every number above is a DEBUG build. Ratios and shapes (sweep on/off, reap/fork, the 256-page
+collapse wall, the fired detectors) are sound; absolute ms/branch are ~3x pessimistic against
+a ~14 ms four-fsync floor (4 durable() calls per reap x 3.56 ms F_FULLFSYNC).
+Sweep-term crossover, from the fit and instrument-internal: the per-arena sweep cost overtakes
+the fixed per-reap durability floor at ~665 live arenas (44.4 ms / 0.0668 ms per arena).
