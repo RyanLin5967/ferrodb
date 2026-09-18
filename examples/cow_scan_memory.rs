@@ -170,20 +170,19 @@ fn main() {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    println!("# S23 cow range-scan memory, BEFORE any change");
+    println!("# S23 cow range-scan memory");
     println!("# instrument: tracking global allocator (peak live bytes between resets)");
     println!("# row = (Integer, Varchar(16)); key = 12 bytes; buffer pool = 1024 frames (4 MiB)");
+    println!("#");
+    println!("# stream  = drain the cursor, keeping nothing   (before: `scan_heap`)");
+    println!("# stream2 = the same drain a second time -- pool bookkeeping already warm");
+    println!("# table   = drain `scan_table`, keeping nothing  (before: `table_heap`)");
+    println!("# first10 = read the first ten rows and stop     (before: `first10`)");
+    println!("# collect = ask for the whole table as a Vec -- the cost a caller opts into");
     println!();
     println!(
-        "{:>9}  {:>12}  {:>10}  {:>12}  {:>10}  {:>12}  {:>10}  {:>10}  {:>9}",
-        "rows",
-        "scan_heap_B",
-        "scan_MiB",
-        "table_heap_B",
-        "table_MiB",
-        "first10_B",
-        "first10_MiB",
-        "B/row",
+        "{:>9}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11}  {:>9}",
+        "rows", "stream_B", "stream2_B", "table_B", "first10_B", "collect_B", "collect_MiB",
         "rss_MiB"
     );
 
@@ -194,52 +193,83 @@ fn main() {
         let lo = table_lo(TABLE);
         let hi = table_hi(TABLE);
 
-        // (a) the tree-level scan on its own: one Vec of owned (key, value) byte pairs.
+        // (a) the tree-level scan, consumed as it arrives. This is the shape claim: peak is one
+        //     page plus one path, whatever `n` is.
         let (b, ba) = reset_peak();
-        let entries = db.rows.tree().range_scan(db.root, Some(&lo), Some(&hi)).expect("range_scan");
-        let got = entries.len();
-        let (scan_heap, scan_allocs) = window(b, ba);
-        drop(entries);
-        assert_eq!(got as u64, n, "range_scan returned {got} of {n} rows");
+        let mut got = 0u64;
+        for e in db.rows.tree().range_scan(db.root, Some(&lo), Some(&hi)).expect("range_scan") {
+            e.expect("scan entry");
+            got += 1;
+        }
+        let (stream_heap, stream_allocs) = window(b, ba);
+        assert_eq!(got, n, "range_scan yielded {got} of {n} rows");
 
-        // (b) the production path: `range_scan` plus the caller's own decoded Vec.
+        // (a2) the identical drain, again. The first window after a build also pays for whatever
+        //      the buffer pool's ARC bookkeeping allocates as its working set turns over, and
+        //      that is a cost of the pool (fixed at 1024 frames), not of the cursor. Repeating
+        //      the drain attributes the two apart instead of asserting which is which.
         let (b, ba) = reset_peak();
-        let table = db.rows.scan_table(db.root, TABLE).expect("scan_table");
-        let got = table.len();
+        let mut got = 0u64;
+        for e in db.rows.tree().range_scan(db.root, Some(&lo), Some(&hi)).expect("range_scan") {
+            e.expect("scan entry");
+            got += 1;
+        }
+        let (stream2_heap, stream2_allocs) = window(b, ba);
+        assert_eq!(got, n, "range_scan yielded {got} of {n} rows on the second pass");
+
+        // (b) the production path, likewise streamed.
+        let (b, ba) = reset_peak();
+        let mut got = 0u64;
+        for r in db.rows.scan_table(db.root, TABLE).expect("scan_table") {
+            r.expect("scan_table row");
+            got += 1;
+        }
         let (table_heap, table_allocs) = window(b, ba);
-        drop(table);
-        assert_eq!(got as u64, n, "scan_table returned {got} of {n} rows");
+        assert_eq!(got, n, "scan_table yielded {got} of {n} rows");
 
-        // (c) a consumer that wants ten rows. A streaming cursor would make this O(page); an
-        //     eager Vec makes it identical to (a), which is the whole point of the measurement.
+        // (c) a consumer that wants ten rows and stops. Before the change this cost the same as
+        //     the whole table, because the size of the answer was fixed before the caller saw it.
         let (b, ba) = reset_peak();
         let ten: Vec<_> = db
             .rows
             .tree()
             .range_scan(db.root, Some(&lo), Some(&hi))
             .expect("range_scan")
-            .into_iter()
             .take(10)
+            .map(|e| e.expect("scan entry"))
             .collect();
         let (first10_heap, first10_allocs) = window(b, ba);
         assert_eq!(ten.len(), 10.min(n as usize));
         drop(ten);
 
+        // (d) the deliberate materialise. Still Theta(table) -- it has to be, the caller asked
+        //     for the table in RAM -- and reported so the change cannot hide a regression here.
+        let (b, ba) = reset_peak();
+        let all: Vec<_> = db
+            .rows
+            .tree()
+            .range_scan(db.root, Some(&lo), Some(&hi))
+            .expect("range_scan")
+            .map(|e| e.expect("scan entry"))
+            .collect();
+        let (collect_heap, collect_allocs) = window(b, ba);
+        assert_eq!(all.len() as u64, n);
+        drop(all);
+
         println!(
-            "{:>9}  {:>12}  {:>10.2}  {:>12}  {:>10.2}  {:>12}  {:>10.2}  {:>10.1}  {:>9.1}",
+            "{:>9}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11.2}  {:>9.1}",
             n,
-            scan_heap,
-            mib(scan_heap),
+            stream_heap,
+            stream2_heap,
             table_heap,
-            mib(table_heap),
             first10_heap,
-            mib(first10_heap),
-            scan_heap as f64 / n as f64,
+            collect_heap,
+            mib(collect_heap),
             peak_rss_bytes() as f64 / (1024.0 * 1024.0),
         );
         eprintln!(
-            "  n={n} build={:?} allocs: scan={scan_allocs} table={table_allocs} first10={first10_allocs}",
-            built
+            "  n={n} build={built:?} allocs: stream={stream_allocs} stream2={stream2_allocs} \
+             table={table_allocs} first10={first10_allocs} collect={collect_allocs}"
         );
         drop(db);
     }

@@ -1,0 +1,14 @@
+# S23 cow range-scan memory
+# instrument: tracking global allocator (peak live bytes between resets)
+# row = (Integer, Varchar(16)); key = 12 bytes; buffer pool = 1024 frames (4 MiB)
+#
+# stream  = drain the cursor, keeping nothing   (before: `scan_heap`)
+# stream2 = the same drain a second time -- pool bookkeeping already warm
+# table   = drain `scan_table`, keeping nothing  (before: `table_heap`)
+# first10 = read the first ten rows and stop     (before: `first10`)
+# collect = ask for the whole table as a Vec -- the cost a caller opts into
+
+     rows    stream_B   stream2_B     table_B   first10_B     collect_B  collect_MiB    rss_MiB
+    10000        5024        5024        5024        5708       1171076         1.12        7.2
+   100000      108196        5540        5540        5824      10096416         9.63       17.2
+  1000000      160120        5640        5640        6008      88336816        84.24      100.2

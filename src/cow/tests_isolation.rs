@@ -310,18 +310,226 @@ fn splits_and_multi_level_growth_preserve_every_key() {
     }
     assert_eq!(f.get(root, "key999999"), None);
 
-    let scanned = f.tree.range_scan(root, None, None).unwrap();
+    // The scan streams now, so materialising it is the test's own choice; the assertions below
+    // are the same ones, on the same `Vec`.
+    let scanned: Vec<_> =
+        f.tree.range_scan(root, None, None).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(scanned.len(), n);
     assert!(scanned.windows(2).all(|w| w[0].0 < w[1].0), "scan is not ordered");
     assert_eq!(scanned[0].0, b"key000000".to_vec());
 
-    let ranged = f
+    let ranged: Vec<_> = f
         .tree
         .range_scan(root, Some(b"key000100"), Some(b"key000110"))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(ranged.len(), 10);
     assert_eq!(ranged[0].0, b"key000100".to_vec());
     assert_eq!(ranged[9].0, b"key000109".to_vec());
+}
+
+// ---- the scan cursor ------------------------------------------------------------------------
+
+/// A `PageStore` that counts the pages read through it. Everything else is delegation.
+///
+/// The count is the only instrument that can tell a lazy scan from an eager one from the
+/// outside: both return the same rows, and only one of them reads the whole tree to hand over
+/// the first.
+struct CountingStore {
+    inner: Arc<dyn PageStore>,
+    reads: AtomicU64,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<dyn PageStore>) -> Arc<CountingStore> {
+        Arc::new(CountingStore { inner, reads: AtomicU64::new(0) })
+    }
+    fn take(&self) -> u64 {
+        self.reads.swap(0, Ordering::SeqCst)
+    }
+}
+
+impl PageStore for CountingStore {
+    fn alloc_in_arena(
+        &self,
+        arena: ArenaId,
+        page_type: PageType,
+        birth_epoch: Epoch,
+    ) -> Result<PageId, crate::error::FerroError> {
+        self.inner.alloc_in_arena(arena, page_type, birth_epoch)
+    }
+    fn read_page(&self, page_id: PageId) -> Result<PageHandle, crate::error::FerroError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_page(page_id)
+    }
+    fn cow_page(
+        &self,
+        page_id: PageId,
+        branch: BranchId,
+        epoch: Epoch,
+    ) -> Result<crate::cow::CowPage, crate::error::FerroError> {
+        self.inner.cow_page(page_id, branch, epoch)
+    }
+    fn free_page(&self, page_id: PageId, free_epoch: Epoch) -> Result<(), crate::error::FerroError> {
+        self.inner.free_page(page_id, free_epoch)
+    }
+    fn alloc_arena(&self, branch: BranchId) -> Result<ArenaId, crate::error::FerroError> {
+        self.inner.alloc_arena(branch)
+    }
+    fn arena_for(&self, branch: BranchId) -> Result<ArenaId, crate::error::FerroError> {
+        self.inner.arena_for(branch)
+    }
+    fn free_arena(&self, arena: ArenaId) -> Result<u32, crate::error::FerroError> {
+        self.inner.free_arena(arena)
+    }
+    fn live_page_count(&self) -> Result<u32, crate::error::FerroError> {
+        self.inner.live_page_count()
+    }
+    fn flush(&self) -> Result<(), crate::error::FerroError> {
+        self.inner.flush()
+    }
+}
+
+/// Build a multi-level tree and return it wrapped in a read counter.
+fn counted_tree(n: u32) -> (Fixture, Arc<CountingStore>, CowTree, PageId) {
+    let f = Fixture::new(128);
+    let e = f.tick();
+    let mut root = f.tree.create(BranchId::TRUNK, e).unwrap();
+    for i in 0..n {
+        root = f.put(root, BranchId::TRUNK, &format!("key{i:06}"), &format!("value-{i}"));
+    }
+    let counting = CountingStore::new(Arc::clone(&f.store) as Arc<dyn PageStore>);
+    let tree = CowTree::new(Arc::clone(&counting) as Arc<dyn PageStore>);
+    (f, counting, tree, root)
+}
+
+/// The shape claim, made falsifiable: reading the first row must not read the tree.
+///
+/// This is the test that stops the `Vec` coming back. Every other scan assertion in this file
+/// passes just as happily against an eager implementation — same rows, same order — so without a
+/// page count there is nothing in the suite that a reverted `range_scan` would break. The two
+/// halves matter equally: `all` proves the tree really is large enough for the question to mean
+/// something, and `one` proves the cursor did not visit it.
+#[test]
+fn reading_the_first_row_of_a_scan_does_not_read_the_whole_tree() {
+    let (_f, counting, tree, root) = counted_tree(1500);
+
+    counting.take();
+    let first = tree.range_scan(root, None, None).unwrap().next().unwrap().unwrap();
+    let one = counting.take();
+    assert_eq!(first.0, b"key000000".to_vec(), "the cursor did not start at the first key");
+
+    let drained: Vec<_> =
+        tree.range_scan(root, None, None).unwrap().collect::<Result<_, _>>().unwrap();
+    let all = counting.take();
+    assert_eq!(drained.len(), 1500);
+
+    assert!(
+        all >= 15,
+        "the fixture tree is only {all} pages, so 'the scan did not read the tree' is vacuous"
+    );
+    assert!(
+        one <= 4,
+        "the first row cost {one} page reads against a {all}-page tree. A root-to-leaf descent is \
+         3 or 4; anything near {all} means the scan materialised the tree before yielding, which \
+         is the Theta(table) memory ceiling this cursor exists to remove."
+    );
+}
+
+/// A cursor that skips or repeats a row is worse than the `Vec` it replaced, so the bounds are
+/// checked against an independent `BTreeMap` rather than against the tree's own opinion.
+///
+/// The interesting cases are the ones the rewrite touched: the start slot is now found by binary
+/// search instead of by skipping entries one at a time, and `hi` now ends the whole scan instead
+/// of just the current leaf. Both are off-by-one territory, and both are exercised at keys that
+/// exist, keys that do not, and keys outside the tree entirely.
+#[test]
+fn every_bound_yields_exactly_the_keys_a_reference_map_holds() {
+    use std::collections::BTreeMap;
+
+    let n = 1500u32;
+    let (_f, _counting, tree, root) = counted_tree(n);
+    let reference: BTreeMap<Vec<u8>, Vec<u8>> = (0..n)
+        .map(|i| (format!("key{i:06}").into_bytes(), format!("value-{i}").into_bytes()))
+        .collect();
+
+    let k = |i: u32| format!("key{i:06}").into_bytes();
+    let cases: Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> = vec![
+        (None, None),
+        (Some(k(0)), None),
+        (None, Some(k(n))),
+        (Some(k(0)), Some(k(n))),
+        // Inside one leaf, and spanning many.
+        (Some(k(100)), Some(k(110))),
+        (Some(k(7)), Some(k(1400))),
+        // Bounds that are not keys: before everything, after everything, between two keys.
+        (Some(b"aaa".to_vec()), Some(b"zzz".to_vec())),
+        (Some(b"key000100x".to_vec()), Some(b"key000200x".to_vec())),
+        (Some(b"zzz".to_vec()), None),
+        (None, Some(b"aaa".to_vec())),
+        // Degenerate: empty by construction, and one key wide.
+        (Some(k(500)), Some(k(500))),
+        (Some(k(900)), Some(k(100))),
+        (Some(k(42)), Some(k(43))),
+        // Exactly the last key, which is where an exclusive upper bound goes wrong.
+        (Some(k(n - 1)), None),
+        (Some(k(n - 1)), Some(k(n))),
+        (None, Some(k(n - 1))),
+    ];
+
+    for (lo, hi) in cases {
+        let got: Vec<(Vec<u8>, Vec<u8>)> = tree
+            .range_scan(root, lo.as_deref(), hi.as_deref())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = reference
+            .iter()
+            .filter(|(key, _)| {
+                lo.as_deref().is_none_or(|l| key.as_slice() >= l)
+                    && hi.as_deref().is_none_or(|h| key.as_slice() < h)
+            })
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        let show = |b: &Option<Vec<u8>>| match b {
+            Some(v) => String::from_utf8_lossy(v).into_owned(),
+            None => "unbounded".into(),
+        };
+        assert_eq!(
+            got,
+            want,
+            "scan of [{}, {}) does not match the reference map",
+            show(&lo),
+            show(&hi)
+        );
+    }
+}
+
+/// A cursor that hit an error must stay dead. Polling a fused iterator after a failure has to
+/// return `None`, not re-raise the same page fault forever — a caller looping on `while let
+/// Some(x)` would otherwise spin on a corrupt page rather than surface it once.
+#[test]
+fn a_cursor_that_failed_does_not_yield_again() {
+    let (_f, _counting, tree, root) = counted_tree(1500);
+    // A root that is not a btree node at all: the store's own page 0 header is not stamped as
+    // one, so the first `next()` must fail and every later one must be `None`.
+    let mut cursor = tree.range_scan(root, None, None).unwrap();
+    assert!(cursor.next().is_some(), "fixture: the tree is empty");
+
+    // Now the failing case, on a page that exists but is not a node.
+    let bad = tree.store().alloc_in_arena(
+        tree.store().arena_for(BranchId::TRUNK).unwrap(),
+        PageType::Heap,
+        Epoch(1),
+    ).unwrap();
+    let mut cursor = tree.range_scan(bad, None, None).unwrap();
+    assert!(
+        matches!(cursor.next(), Some(Err(_))),
+        "a non-node root must be reported, not silently scanned as empty"
+    );
+    assert!(cursor.next().is_none(), "the cursor re-raised after an error instead of fusing");
+    assert!(cursor.next().is_none());
 }
 
 #[test]
