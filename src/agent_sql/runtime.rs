@@ -3335,6 +3335,13 @@ impl AgentRuntime {
     /// so its claim goes back to the pool exactly as an abandoned branch's does.
     ///
     /// Safe to call at any time. A branch that is still live is left completely alone.
+    ///
+    /// **Not atomic, deliberately.** The walk releases the state lock every [`FORGET_CHUNK`]
+    /// entries rather than holding it across the whole map, so this does not observe one
+    /// consistent snapshot of `workspaces` and does not promise to: a session opened while it runs
+    /// may or may not be examined, and either way it is not reap-eligible. What the return value
+    /// counts is what this call actually removed. Callers that want a total are asking a question
+    /// no reconciliation can answer, since the answer changes while it is being computed.
     pub fn forget_reaped_branches(&self) -> usize {
         let mut forgotten = 0usize;
         // Where the next chunk starts. `workspaces` is a `BTreeMap<u64, _>`, so a slot id is a
