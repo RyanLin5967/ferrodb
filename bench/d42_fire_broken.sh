@@ -111,9 +111,17 @@ else
     echo "   Without an expiry there is no verdict to check, so this proves nothing."
     fails=$((fails+1))
 fi
-if grep -q 'verdict       : FAILED' <<<"$OUT"; then
-    echo "ok: the classifier explicitly recorded FAILED"
+# The TWO-SIGNAL form specifically. `FAILED ON SIGNAL B ALONE` also contains the substring
+# "verdict       : FAILED", and accepting it here would let this falsifier pass on a run where
+# signal C never spoke — i.e. where child starvation was never excluded at all. That is exactly the
+# weaker claim this check exists to reject.
+if grep -q 'verdict       : FAILED —' <<<"$OUT"; then
+    echo "ok: the classifier recorded a TWO-SIGNAL FAILED"
     grep -E 'self-schedule|child CPU|max stall|window        :' <<<"$OUT" | sed 's/^/   /'
+elif grep -q 'verdict       : FAILED ON SIGNAL B ALONE' <<<"$OUT"; then
+    echo "⛔ the classifier recorded FAILED ON SIGNAL B ALONE — signal C never spoke, so child"
+    echo "   starvation was not excluded and this run does not demonstrate the two-signal verdict."
+    fails=$((fails+1))
 else
     echo "⛔ no 'verdict : FAILED' line — the classifier did not run on this expiry."
     fails=$((fails+1))

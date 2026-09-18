@@ -494,11 +494,18 @@ impl LoadWitness {
         let starved_self = self_ratio < STARVED_SELF;
 
         let cpu_now = cpu0.map(|_| sample_child_cpu(pids));
+        // `c_spoke` exists because the FAILED verdict line used to read "both signals say this
+        // process and its nodes got the machine" unconditionally. That sentence is FALSE whenever C
+        // is Unavailable — B alone had spoken, and child starvation had not been excluded at all.
+        // A verdict that claims more coverage than it has is the precise failure a guard is
+        // supposed to prevent, so the wording is now derived from whether C actually answered.
+        let mut c_spoke = false;
         let (starved_children, c_line, c_broken) = match (cpu0, &cpu_now) {
             (Some(ChildCpu::Sampled(a)), Some(ChildCpu::Sampled(b))) => {
                 let delta = (b - a).max(0.0);
                 let n = pids.len().max(1) as f64;
                 let rate = delta / (n * wall);
+                c_spoke = true;
                 (
                     rate < STARVED_CHILD,
                     format!(
@@ -534,10 +541,17 @@ impl LoadWitness {
         };
 
         let verdict_line = match kind {
-            Kind::Failed => {
+            Kind::Failed if c_spoke => {
                 "    verdict       : FAILED — both signals say this process and its nodes got the \
                  machine,\n                    so the expiry belongs to the cluster, not the \
                  scheduler."
+                    .to_string()
+            }
+            Kind::Failed => {
+                "    verdict       : FAILED ON SIGNAL B ALONE — this process got the machine. \
+                 Signal C\n                    could not speak (see the line above), so CHILD \
+                 starvation was NOT excluded\n                    and this verdict is weaker than \
+                 a two-signal FAILED."
                     .to_string()
             }
             Kind::Inconclusive => format!(

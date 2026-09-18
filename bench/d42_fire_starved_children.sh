@@ -95,23 +95,37 @@ echo "  predicted     : child CPU ~0 per node-wall-s — a stopped process consu
 echo "                  threshold 0.00043 is itself 10% of the measured running rate 0.0043."
 echo "  loadavg       : $(uptime | sed 's/.*load averages*: //')"
 
-# The keeper. It waits for all three nodes, gives them time to say READY (stopping one before that
-# trips the unrelated `never said READY` panic), then holds them stopped. Every action is logged
-# with a count: a keeper that silently matched nothing would make this whole run a false negative,
-# which is the exact trap this row exists to close.
+# The keeper. Two conditions have to be met before it may stop anything, and the second one is a
+# CONDITION rather than a timer for a reason that was measured: the first version waited a fixed
+# 2.5 s for READY, and on a quiet machine the entire test finished in 3.15 s inside that wait. The
+# keeper stopped nothing, and the run would have read as "the classifier did not fire" when in fact
+# nothing had been starved. (The anti-vacuity check below caught it and refused — which is the only
+# reason it is a corrected script and not a false negative in the record.)
+#
+# So: wait for all three nodes, then wait until all three are LISTENING on TCP. The example binds
+# its listener and then prints the address it bound as READY, so a listening socket means READY has
+# been published. Stopping a node before that trips the unrelated `never said READY` panic and
+# measures nothing at all.
 (
     n=0
-    while [ "$n" -lt 3 ]; do n=$(pgrep -f "$PAT" 2>/dev/null | wc -l | tr -d ' '); sleep 0.2; done
-    echo "$(date -u +%T) saw $n node(s); waiting 2.5s for READY" >> "$STOPLOG"
-    sleep 2.5
+    while [ "$n" -lt 3 ]; do n=$(pgrep -f "$PAT" 2>/dev/null | wc -l | tr -d ' '); sleep 0.05; done
+    pids=$(pgrep -f "$PAT" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    echo "$(date -u +%T) saw 3 node(s): $pids; waiting for all three to LISTEN" >> "$STOPLOG"
+    i=0; lis=0
+    while [ "$lis" -lt 3 ] && [ "$i" -lt 600 ]; do
+        lis=$(lsof -nP -iTCP -sTCP:LISTEN -a -p "$pids" 2>/dev/null | grep -c LISTEN)
+        [ "$lis" -lt 3 ] && sleep 0.05
+        i=$((i+1))
+    done
+    echo "$(date -u +%T) $lis of 3 listening after $((i*50))ms — READY has been published" >> "$STOPLOG"
     got=$(pgrep -f "$PAT" 2>/dev/null | tr '\n' ' ')
     c=0; for p in $got; do kill -STOP "$p" 2>/dev/null && c=$((c+1)); done
     echo "$(date -u +%T) STOPPED $c pid(s): $got" >> "$STOPLOG"
-    # Re-stop on a timer: the test kills one node and the rest must stay stopped for the whole hold.
+    # Re-stop on a short timer, so nothing drifts back to running during the hold.
     e=0
-    while [ "$e" -lt "$HOLD" ]; do
+    while [ "$e" -lt $((HOLD * 2)) ]; do
         for p in $(pgrep -f "$PAT" 2>/dev/null); do kill -STOP "$p" 2>/dev/null; done
-        sleep 2; e=$((e+2))
+        sleep 0.5; e=$((e+1))
     done
     c=0; for p in $(pgrep -f "$PAT" 2>/dev/null); do kill -CONT "$p" 2>/dev/null && c=$((c+1)); done
     echo "$(date -u +%T) CONTINUED $c pid(s) after ${HOLD}s" >> "$STOPLOG"
