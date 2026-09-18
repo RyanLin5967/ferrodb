@@ -418,7 +418,22 @@ fn scan_once(
                     return;
                 }
                 counters.reaped.fetch_add(reaped.len() as u64, Ordering::SeqCst);
-                let forgotten = runtime.forget_reaped_branches();
+                // **Forget exactly what was reaped, not everything that might have been.**
+                //
+                // This used to call `forget_reaped_branches`, which re-derives the set by walking
+                // every open session and asking the catalog about each one — O(open sessions),
+                // inside this `with_lock`, which is the pgwire server's PER-STATEMENT mutex. So a
+                // timer stopped every statement in the database for the length of that walk. The
+                // list is right here; searching for what we were already handed was the whole cost.
+                //
+                // Measured in `artie-research/W4/statement-lock-FASTPATH.txt`: the reconciliation's
+                // wall time — which is what this lock is held for — rises 91x across 100x open
+                // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
+                // O(reaped). A larger figure for the same walk is reported on branch
+                // S15-runtime-at-1e6 (commit 0ac1931, `bench/runtime_at_1e6.txt`, W4); that file is
+                // not in this worktree and the number is NOT reproduced here, so it is motivation
+                // rather than evidence.
+                let forgotten = runtime.forget_branches(&reaped);
                 counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
                 report(format!(
                     "lease: reaped {} expired branch(es) with no client cooperation ({}); {} \
@@ -430,9 +445,21 @@ fn scan_once(
             }
             Err(e) => {
                 counters.failed.fetch_add(1, Ordering::SeqCst);
+                // **The one path where the list cannot be trusted, so the full sweep runs.**
+                //
+                // `reap_expired` accumulates the ids it reaps and then DISCARDS that vector if any
+                // later branch fails (`reaper.rs`, the `Err(e) => return Err(e)` arm; likewise if
+                // `sweep_empty_extents` fails after a clean loop). Those branches are gone from the
+                // catalog and nothing will ever name them again, so the fast path above cannot see
+                // them and they would leak for the life of the process. The reconciliation is what
+                // covers that, and this is the only tick that has to pay for it.
+                let forgotten = runtime.forget_reaped_branches();
+                counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
                 report(format!(
                     "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
-                     is re-entrant, so the next scan resumes rather than double-freeing."
+                     is re-entrant, so the next scan resumes rather than double-freeing. \
+                     {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
+                     does not report which branches it had already reaped."
                 ));
             }
         }
