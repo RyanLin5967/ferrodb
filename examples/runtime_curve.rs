@@ -43,6 +43,54 @@ use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
+/// This run's scratch directory, removed when the harness drops.
+///
+/// **It used to be a bare `PathBuf` with a `remove_dir_all` at the end of each phase**, which
+/// cleans up on the SUCCESS path and only there. A run killed by `timeout` (SIGTERM), killed by the
+/// agent fleet, panicked, or stopped by `ENOSPC` never reaches that last line, and leaves its whole
+/// catalog behind — about 270 MB for a 10^6 run. Enough of those took this machine to 100% disk
+/// TWICE in one session, at which point unrelated suites start failing with
+/// `wal error: No space left on device (os error 28)` and read as a regression in the WAL layer
+/// rather than as a full disk. A benchmark that can do that to the next person's test run is a
+/// defect in the benchmark.
+struct ScratchDir(std::path::PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Remove the scratch directories of previous runs whose process is **gone**.
+///
+/// `Drop` closes the panic and early-return cases but NOT the one that actually happens here:
+/// `timeout` sends `SIGTERM`, and Rust's default disposition terminates the process without
+/// unwinding, so no destructor runs. Nothing inside a killed process can clean up after it, so the
+/// next run does it instead — which also covers `SIGKILL`, where not even a signal handler would.
+///
+/// Liveness is decided by `kill(pid, 0)`, not by mtime. An mtime sweep cannot tell a long run from
+/// an abandoned one and would delete the catalog out from under a live 10^6 benchmark. Pid reuse
+/// can only make a dead run look alive, which skips a cleanup and is the safe direction.
+fn sweep_stale_scratch() {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name.strip_prefix("ferrodb-rtcurve-") else { continue };
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        // 0 means the process exists; -1 means it does not (or is not ours to signal).
+        if unsafe { kill(pid, 0) } != 0 {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 fn peak_rss_bytes() -> u64 {
     // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
     #[repr(C)]
@@ -71,11 +119,13 @@ struct Db {
     txn: Arc<TxnManager>,
     runtime: Arc<AgentRuntime>,
     cat: Arc<TableBranchCatalog>,
-    _dir: std::path::PathBuf,
+    _dir: ScratchDir,
 }
 
 impl Db {
     fn new() -> Self {
+        // Before taking any space, give back what previous killed runs left behind.
+        sweep_stale_scratch();
         let dir = std::env::temp_dir().join(format!("ferrodb-rtcurve-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = OpenOptions::new()
@@ -98,7 +148,7 @@ impl Db {
         let _ = std::fs::remove_file(&cat_path);
         let cat = Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("open catalog"));
         let runtime = Arc::new(AgentRuntime::with_catalog(cat.clone() as Arc<dyn BranchCatalog>));
-        Db { catalog, bp, txn, runtime, cat, _dir: dir }
+        Db { catalog, bp, txn, runtime, cat, _dir: ScratchDir(dir) }
     }
 
     fn session(&self) -> Session {
@@ -328,7 +378,6 @@ fn query_phase() {
     println!("BEGIN/INSERT/SELECT/ASOF are per-STATEMENT costs. br_* / runs / activity / quaran are");
     println!("one system-view read each. br_1row and br_all are the SAME query shape with and without");
     println!("a WHERE that selects exactly one row.");
-    let _ = std::fs::remove_dir_all(&db._dir);
 }
 
 // =================================================================================================
@@ -417,7 +466,6 @@ fn firecheck_phase() {
     println!();
     println!("Rising here + flat in phase 1 = the SQL data path is sensitive to TABLE size and not to");
     println!("BRANCH count, which is the claim. Flat here would mean the timers see nothing at all.");
-    let _ = std::fs::remove_dir_all(&db._dir);
 }
 
 // =================================================================================================
@@ -526,7 +574,6 @@ fn fork_phase() {
     println!("Workspace, the name and the capture. `stmt - rt` is scanner + parser + binder + dispatch.");
     println!("If `raw` carries the whole rise, the per-statement cost is the catalog's and the device's,");
     println!("and nothing above the catalog scales with branch count.");
-    let _ = std::fs::remove_dir_all(&db._dir);
 }
 
 // =================================================================================================
@@ -652,5 +699,4 @@ fn session_phase() {
     println!();
     println!("B/session is MARGINAL RSS over the whole run divided by N, so it carries the catalog's");
     println!("own growth too (266 B/branch, bench/curve_to_1e6.txt). Subtract that for the runtime's share.");
-    let _ = std::fs::remove_dir_all(&db._dir);
 }
