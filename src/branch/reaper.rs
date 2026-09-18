@@ -1551,6 +1551,148 @@ mod tests {
         );
     }
 
+    /// **Known-open: `collapse`'s final `put` is still a whole-record write.**
+    ///
+    /// D13b narrowed the window — `collapse` re-reads the record immediately before writing it,
+    /// instead of writing back the snapshot it took before copying the whole tree — but it did not
+    /// close it, because `parent_id`, `depth` and `fork_epoch` have no narrower setter and must
+    /// move together with the new root. Anything that mutates the record between that re-read and
+    /// that `put` is silently discarded.
+    ///
+    /// This drives the smallest of those: a lease renewal. The wrapper below renews the lease to
+    /// `u64::MAX` at the exact instant of collapse's re-read, which is what a live client's
+    /// keepalive does. Collapse then writes the pre-renewal deadline back on top, and the branch is
+    /// reapable while its holder believes the lease is good — `reap_expired` needs no cooperation
+    /// at all, so nothing else stands between that and the branch being reclaimed underneath it.
+    ///
+    /// `renew_lease` is the cheapest field to demonstrate with, not the worst case. `envelope`
+    /// (a `charge_row_writes` spend) and `state` travel in the same record.
+    ///
+    /// **This is NOT the D13b rollover defect and is NOT fixed here.** Closing it needs exclusion
+    /// against a concurrent writer on the branch being collapsed, or a narrow
+    /// `reparent(branch, parent, epoch, root)` catalog operation that each implementation makes
+    /// atomic — the shape `add_arena` and `detach_child` already took, for this same reason. That
+    /// is a catalog-trait change and belongs with the latching work, not inside a page-copy fix.
+    #[test]
+    #[ignore = "known-open defect: collapse's whole-record `put` discards a concurrent write. \
+                Needs a narrow reparent() catalog op or exclusion; run with --ignored"]
+    fn collapse_discards_a_lease_renewal_that_lands_on_its_re_read() {
+        use std::sync::Mutex;
+
+        /// Renews the subject's lease at the instant of collapse's SECOND `get` — the re-read.
+        struct RacingKeepalive {
+            inner: Arc<dyn BranchCatalog>,
+            subject: Mutex<Option<BranchId>>,
+            gets: Mutex<u32>,
+            fired: Mutex<bool>,
+        }
+        impl BranchCatalog for RacingKeepalive {
+            fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> {
+                let rec = self.inner.get(b)?;
+                let subject = *self.subject.lock().unwrap();
+                if subject == Some(b) {
+                    let mut n = self.gets.lock().unwrap();
+                    *n += 1;
+                    if *n == 2 {
+                        // A live client's keepalive, landing in the window.
+                        self.inner.renew_lease(b, LeaseDeadline(u64::MAX)).unwrap();
+                        *self.fired.lock().unwrap() = true;
+                    }
+                }
+                Ok(rec)
+            }
+            fn next_epoch(&self) -> Epoch { self.inner.next_epoch() }
+            fn current_epoch(&self) -> Epoch { self.inner.current_epoch() }
+            fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+                self.inner.fork(p, l)
+            }
+            fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
+                self.inner.add_arena(b, a)
+            }
+            fn put(&self, r: &BranchRecord) -> Result<(), FerroError> { self.inner.put(r) }
+            fn set_root(&self, b: BranchId, r: PageId) -> Result<(), FerroError> {
+                self.inner.set_root(b, r)
+            }
+            fn expired_before(&self, n: u64) -> Result<Vec<CoreRecord>, FerroError> {
+                self.inner.expired_before(n)
+            }
+            fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.in_state(s)
+            }
+            fn scan(&self)
+                -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+                self.inner.scan()
+            }
+            fn live_count(&self) -> usize { self.inner.live_count() }
+            fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> { self.inner.get_raw(id) }
+            fn release_id(&self, id: u64) { self.inner.release_id(id) }
+            fn max_live_child(&self, p: u64) -> Result<Option<Epoch>, FerroError> {
+                self.inner.max_live_child(p)
+            }
+            fn live_child_in_epoch_range(&self, p: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+                self.inner.live_child_in_epoch_range(p, lo, hi)
+            }
+            fn has_live_children(&self, p: u64) -> Result<bool, FerroError> {
+                self.inner.has_live_children(p)
+            }
+            fn attach_child(&self, p: u64, e: Epoch, c: u64) -> Result<(), FerroError> {
+                self.inner.attach_child(p, e, c)
+            }
+            fn detach_child(&self, p: u64, e: Epoch) -> Result<bool, FerroError> {
+                self.inner.detach_child(p, e)
+            }
+            fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+                self.inner.renew_lease(b, l)
+            }
+            fn envelope_of(&self, b: BranchId)
+                -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+                self.inner.envelope_of(b)
+            }
+            fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+                self.inner.charge_row_writes(b, n)
+            }
+        }
+
+        let h = Harness::new_with($table);
+        let racer = Arc::new(RacingKeepalive {
+            inner: Arc::clone(&h.catalog),
+            subject: Mutex::new(None),
+            gets: Mutex::new(0),
+            fired: Mutex::new(false),
+        });
+        let reaper =
+            TwoTierReaper::new(Arc::clone(&racer) as Arc<dyn BranchCatalog>, Arc::clone(&h.store))
+                .with_links(Arc::new(ToyLinks));
+
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
+        let arena = h.store.arena_for(b.branch_id).unwrap();
+        let e = h.catalog.next_epoch();
+        let root = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, e).unwrap();
+        {
+            let handle = h.store.read_page(root).unwrap();
+            let mut f = handle.write();
+            stamp_checksum(&mut f.data);
+        }
+        h.catalog.set_root(b.branch_id, root).unwrap();
+        *racer.subject.lock().unwrap() = Some(b.branch_id);
+
+        reaper.collapse(b.branch_id).expect("collapse");
+
+        // Never let this pass vacuously: if the interleaving did not happen there is nothing to
+        // assert about, and a green line would be a lie about a defect that is still there.
+        assert!(
+            *racer.fired.lock().unwrap(),
+            "the keepalive never fired, so this test proves nothing either way"
+        );
+        assert_eq!(
+            h.catalog.get(b.branch_id).unwrap().lease_deadline,
+            LeaseDeadline(u64::MAX),
+            "collapse's whole-record `put` overwrote a lease renewal that landed after its \
+             re-read. The branch is now reapable while its holder believes the lease is live, and \
+             `reap_expired` needs no cooperation from that holder."
+        );
+    }
+
     /// **The ordering inside `reap` is load-bearing for crash safety, and nothing enforced it.**
     ///
     /// `reap` must mark a child `Reaped` BEFORE removing its entry from the parent's live set.
