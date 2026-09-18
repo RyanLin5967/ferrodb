@@ -259,6 +259,34 @@ impl BranchState {
 
 /// Maximum ancestry depth before a branch is collapsed (materialised to a fresh root and
 /// re-parented to trunk). Cheap because ancestry lives only in branch metadata.
+///
+/// **What this cap actually buys, measured rather than assumed** (`examples/depth_cost.rs`, raw
+/// numbers in `bench/d13b_depth_cost.txt`, release build, depths 2→64 with the constant
+/// temporarily raised to 128 for the measurement and the shallow rows cross-checking identically
+/// against the shipped build):
+///
+/// * **Read latency is FLAT: 14.79–14.96 us from depth 2 to depth 64.** Depth costs a read
+///   nothing, exactly as the module invariant promises — the read path never walks the parent
+///   chain, and nothing in it consults `depth` at all. A naive run showed 22.3 us at depth 64,
+///   which was the taller B+tree (each level had added 200 keys), not the ancestry; the control
+///   run holding total data near-constant shows no effect whatsoever.
+/// * **Fork latency is FLAT: 0.67–1.12 us across the same range.** Fork is one metadata record
+///   and does not care how long the chain behind it is.
+/// * **Reserved space is the cost, and it is LINEAR: exactly `depth * ARENA_EXTENT_PAGES`.**
+///   512 / 1024 / 2048 / 4096 / 8192 / 16384 pages at depth 2 / 4 / 8 / 16 / 32 / 64 — ~1 MB per
+///   level, held open by a SINGLE live leaf, because the interval rule protects any page a live
+///   child can still read. **Independent of how much each level wrote**: the control run, where
+///   every level writes four keys (~2 pages), pins the same whole extent per level. So the cap is
+///   a memory bound on a live chain, and `collapse` exists to break that pin rather than to
+///   shorten a chain for its own sake.
+/// * Reaping a whole chain grows with depth — 27 us at 8, 227 us at 64 in the control — via the
+///   cascade in `TwoTierReaper::detach_from_parent`, one `has_live_children` per level. Real, but
+///   sub-millisecond and not what the cap is protecting.
+///
+/// So 8 is not arbitrary in KIND — there is a genuine linear cost behind it — but it is arbitrary
+/// in VALUE: nothing derives 8 rather than 6 or 24. Read it as "a live chain may pin at most
+/// `MAX_BRANCH_DEPTH` MB of reserved extents", which at 8 is 8 MB. Raising it trades exactly that,
+/// linearly, and costs nothing on either latency path.
 pub const MAX_BRANCH_DEPTH: u8 = 8;
 
 /// Default arena extent size in pages (~1MB at 4KB pages).

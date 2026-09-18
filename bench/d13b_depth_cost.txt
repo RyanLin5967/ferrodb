@@ -1,0 +1,38 @@
+=== D13b: what degrades as branch depth rises ===
+instrument: examples/depth_cost.rs, cargo run --release, darwin 25.6.0, 2026-09-18T03:09Z
+
+--- RUN 1: shipped MAX_BRANCH_DEPTH = 8 (the cap refuses deeper, and the binary skips rather than forces) ---
+MAX_BRANCH_DEPTH = 8  (depths above it are skipped, not forced)
+trunk_keys=4000 own_keys_per_level=200 read_samples=2000 fork_repeats=9
+
+depth     fork us     read us    live pages    pinned pgs   pinned rsvd       reap us
+    2        1.00      14.750            65            10           512          12.3
+    4        1.04      15.042            74            19          1024          18.7
+    8        1.17      14.917            93            38          2048          48.0
+   16  skipped: above the compiled MAX_BRANCH_DEPTH of 8
+   32  skipped: above the compiled MAX_BRANCH_DEPTH of 8
+   64  skipped: above the compiled MAX_BRANCH_DEPTH of 8
+
+--- RUN 2: constant raised to 128 FOR MEASUREMENT ONLY, reverted afterwards; OWN_KEYS=200 ---
+MAX_BRANCH_DEPTH = 128  (depths above it are skipped, not forced)
+trunk_keys=4000 own_keys_per_level=200 read_samples=2000 fork_repeats=9
+
+depth     fork us     read us    live pages    pinned pgs   pinned rsvd       reap us
+    2        0.79      14.708            65            10           512          13.0
+    4        0.67      15.042            74            19          1024          62.4
+    8        0.83      15.000            93            38          2048          53.5
+   16        0.92      15.125           131            76          4096         122.5
+   32        0.88      15.125           207           152          8192         226.9
+   64        0.83      22.292           382           327         16384         329.9
+
+--- RUN 3: CONTROL, cap 128, OWN_KEYS=4 so total data is near-constant across depths ---
+MAX_BRANCH_DEPTH = 128  (depths above it are skipped, not forced)
+trunk_keys=4000 own_keys_per_level=4 read_samples=2000 fork_repeats=9
+
+depth     fork us     read us    live pages    pinned pgs   pinned rsvd       reap us
+    2        0.75      14.916            59             4           512           8.7
+    4        1.04      14.792            64             9          1024          18.0
+    8        0.96      14.833            72            17          2048          27.2
+   16        0.92      14.917            88            33          4096          75.7
+   32        1.12      14.792           121            66          8192          88.2
+   64        1.00      14.958           187           132         16384         226.5
