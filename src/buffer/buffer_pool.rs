@@ -91,15 +91,45 @@
 //! 1/2/4/8/16 threads BEFORE and x1.00 / x0.51 / x0.51 / x0.27 / x0.26 AFTER. Both collapse.
 //! Single-thread throughput improved about 30%; scaling did not improve at all.
 //!
-//! The known fix is BP-Wrapper (Ding, Jiang, Zhang, ICDE 2009), which exists precisely to make an
-//! arbitrary replacement policy lock-contention-free: batch the hit-path policy updates into a
-//! lock-free per-thread buffer and let whichever thread next holds the policy lock drain it. It
-//! preserves ARC's decisions rather than replacing them, because a delayed `touch` changes only
-//! the order of a recency list and can never change which page is resident -- the page is already
-//! pinned by the time `touch` is called. That is the next structural change to this file, and it
-//! is deliberately not bundled with this one: this change is being merged against a concurrent
-//! B+tree latch layer that also edits `BufferPoolManager`, and two structural changes to the same
-//! struct in one merge is how a correctness regression gets in unnoticed.
+//! ⛔ **CORRECTED 2026-09-18: the paragraph that stood here named BP-Wrapper as "the next
+//! structural change to this file". That has since been MEASURED and it is wrong** -- not the
+//! citation, which is sound, but the diagnosis it rests on. Recorded here rather than deleted,
+//! because the reasoning was reasonable and the next reader will otherwise re-derive it.
+//!
+//! BP-Wrapper (Ding, Jiang, Zhang, ICDE 2009) batches hit-path policy updates into per-thread
+//! buffers and lets whichever thread next holds the policy lock drain them, so an arbitrary
+//! replacement policy stops being a contention point. It is the correct standard answer **to the
+//! question as posed**, and the question as posed was wrong: it assumed `arc_cache` is what holds
+//! the slope.
+//!
+//! `bench/d35_gate_stubtouch.txt` (branch `D35-gate-stubtouch`, `ad46887`; 3 interleaved reps,
+//! RESIDENT arm, parameters byte-identical to `bench/s22_bufpool_before_after.txt`) measures the
+//! **upper bound** on every batching scheme by deleting `touch` from the hit path outright -- no
+//! batcher can cost less than not doing the work at all. Medians, throughput at 16 threads
+//! relative to 1: **BASE x0.142, `touch` deleted x0.129.** One-thread throughput rises 47% and
+//! 16-thread rises 33%, and **the slope does not change sign; it gets marginally worse**, because
+//! a constant-factor win lands harder at 1 thread than at 16. That is the signature of a curve
+//! contention-bound by something else. **BP-Wrapper here is a constant, not a shape.**
+//!
+//! What actually holds the slope was in this file the whole time. The resident hit loop is
+//! `fetch_page` + `unpin_page`, and between them each iteration takes `page_table.read()` twice,
+//! `frames[i].read()` twice, and two atomic RMWs on the pin counter -- **four RwLock read
+//! acquisitions before `touch` is even reached.** A Rust `RwLock`'s reader count is one
+//! process-wide cache line that every reader atomically RMWs; it contends exactly like a mutex,
+//! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
+//! five, which is why removing it bought 33% and nothing else.
+//!
+//! The candidate that measures as a shape change is therefore **taking the page table off the hit
+//! path** -- resolving `page_id -> frame` through a lock-free direct-mapped mirror in both
+//! `fetch_page` and `unpin_page`, keeping the frame latch and the pin, so it is correct rather
+//! than a ceiling: **x0.936 across the same sweep, the curve rising monotonically from 2 to 16
+//! threads, ~15x against BASE at 16 threads.** Quote the SLOPE and not that multiplier to more
+//! than two significant figures: the medians are over 3 reps with a BASE spread of 18.1M-23.6M at
+//! one thread under loadavg 16-33. What reproduces in every rep is the sign of the slope.
+//!
+//! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
+//! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror sized for a
+//! benchmark.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
