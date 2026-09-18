@@ -1,0 +1,145 @@
+D49-READMARK-ABLATION — RAW, four arms
+======================================
+[HERE] 2026-09-18T22:23:01Z, this session, 18-core box, release.
+[HERE] turso worktree at 53f153e07 Merge 'bindings/dotnet: add connection-string embedded replicas' from Marc-André Moreau
+
+⭐ THE ABLATION NEEDS NO PATCH TO TURSO, which is why arm D is still measuring the
+   real engine. core/vdbe/execute.rs:4562 reads:
+
+       if pager.holds_read_lock() {
+           ... continue;          // skip begin_read_tx entirely
+       }
+       pager.begin_read_tx()?;
+
+   so one open read transaction per reader removes the PER-STATEMENT snapshot
+   acquisition and changes nothing else: same Database, same buffer-pool arena, same
+   WAL file, same IO, same connection count. The private-Database control could not
+   do this — it duplicated every shared structure at once, so it proved that SOME
+   shared structure was the wall and could not say which.
+
+⚠ Arm D is an ABLATION, NOT A FIX. Holding a read transaction open freezes the
+   reader's snapshot, so it no longer observes concurrent commits. It is here to
+   establish causation, and it must never be quoted as a turso configuration.
+
+# connections probed: 4  distinct Arc<Pager>: 4
+# => the page cache is PRIVATE (one per connection) across connections
+# rows=2000 warmup=300ms measure=1s rounds=3 databases=16
+
+=== ARM SHARED  (one Database, N connections) ===
+# order is rotated per round: a within-round position bias has constant sign and
+# cannot be averaged away by repeating the same order.
+# round 0 order: 1 2 4 8 16
+#   1T -> 2638731 ops/s (slowest thread 2648293 iters, io_steps 0)
+#   2T -> 1514011 ops/s (slowest thread 760810 iters, io_steps 0)
+#   4T -> 1217847 ops/s (slowest thread 291035 iters, io_steps 0)
+#   8T -> 840341 ops/s (slowest thread 103887 iters, io_steps 0)
+#   16T -> 840947 ops/s (slowest thread 50990 iters, io_steps 0)
+# round 1 order: 2 4 8 16 1
+#   2T -> 1529043 ops/s (slowest thread 763553 iters, io_steps 0)
+#   4T -> 1212583 ops/s (slowest thread 292663 iters, io_steps 0)
+#   8T -> 836753 ops/s (slowest thread 101748 iters, io_steps 0)
+#   16T -> 847212 ops/s (slowest thread 51023 iters, io_steps 0)
+#   1T -> 2538297 ops/s (slowest thread 2548240 iters, io_steps 0)
+# round 2 order: 4 8 16 1 2
+#   4T -> 1204053 ops/s (slowest thread 291306 iters, io_steps 0)
+#   8T -> 834488 ops/s (slowest thread 100877 iters, io_steps 0)
+#   16T -> 852614 ops/s (slowest thread 52581 iters, io_steps 0)
+#   1T -> 2589704 ops/s (slowest thread 2596900 iters, io_steps 0)
+#   2T -> 1652089 ops/s (slowest thread 820732 iters, io_steps 0)
+
+threads   total_ops_s   per_thread_ops_s   total_vs_1T   per_thread_vs_1T   io_steps
+      1       2589704            2589704         1.000              1.000          0
+      2       1529043             764521         0.590              0.295          0
+      4       1212583             303146         0.468              0.117          0
+      8        836753             104594         0.323              0.040          0
+     16        847212              52951         0.327              0.020          0
+
+=== ARM PRIVATE (N Databases, one connection each) -- the CONTROL ===
+# order is rotated per round: a within-round position bias has constant sign and
+# cannot be averaged away by repeating the same order.
+# round 0 order: 1 2 4 8 16
+#   1T -> 2561505 ops/s (slowest thread 2585756 iters, io_steps 0)
+#   2T -> 2210795 ops/s (slowest thread 1103695 iters, io_steps 0)
+#   4T -> 4976921 ops/s (slowest thread 953348 iters, io_steps 0)
+#   8T -> 6970897 ops/s (slowest thread 699569 iters, io_steps 0)
+#   16T -> 6851135 ops/s (slowest thread 359393 iters, io_steps 0)
+# round 1 order: 2 4 8 16 1
+#   2T -> 2485554 ops/s (slowest thread 1241094 iters, io_steps 0)
+#   4T -> 4734996 ops/s (slowest thread 994486 iters, io_steps 0)
+#   8T -> 5554769 ops/s (slowest thread 533126 iters, io_steps 0)
+#   16T -> 5769622 ops/s (slowest thread 293806 iters, io_steps 0)
+#   1T -> 1662647 ops/s (slowest thread 1665211 iters, io_steps 0)
+# round 2 order: 4 8 16 1 2
+#   4T -> 4674141 ops/s (slowest thread 907003 iters, io_steps 0)
+#   8T -> 4720789 ops/s (slowest thread 459054 iters, io_steps 0)
+#   16T -> 5956296 ops/s (slowest thread 278796 iters, io_steps 0)
+#   1T -> 1737968 ops/s (slowest thread 1750529 iters, io_steps 0)
+#   2T -> 2724298 ops/s (slowest thread 1371299 iters, io_steps 0)
+
+threads   total_ops_s   per_thread_ops_s   total_vs_1T   per_thread_vs_1T   io_steps
+      1       1737968            1737968         1.000              1.000          0
+      2       2485554            1242777         1.430              0.715          0
+      4       4734996            1183749         2.724              0.681          0
+      8       5554769             694346         3.196              0.400          0
+     16       5956296             372268         3.427              0.214          0
+
+=== ARM C (shared Database, one live WRITER thread alongside the readers) ===
+
+=== ARM SHARED + WRITER ===
+# order is rotated per round: a within-round position bias has constant sign and
+# cannot be averaged away by repeating the same order.
+# round 0 order: 1 2 4 8 16
+#   1T -> 2107213 ops/s (slowest thread 2128301 iters, io_steps 0)
+#   2T -> 1223654 ops/s (slowest thread 614421 iters, io_steps 0)
+#   4T -> 787565 ops/s (slowest thread 196224 iters, io_steps 0)
+#   8T -> 428897 ops/s (slowest thread 52633 iters, io_steps 0)
+#   16T -> 64499 ops/s (slowest thread 2515 iters, io_steps 0)
+# round 1 order: 2 4 8 16 1
+#   2T -> 977802 ops/s (slowest thread 491664 iters, io_steps 0)
+#   4T -> 795161 ops/s (slowest thread 199077 iters, io_steps 0)
+#   8T -> 443174 ops/s (slowest thread 54073 iters, io_steps 0)
+#   16T -> 81867 ops/s (slowest thread 3399 iters, io_steps 0)
+#   1T -> 1613196 ops/s (slowest thread 1626126 iters, io_steps 0)
+# round 2 order: 4 8 16 1 2
+#   4T -> 782573 ops/s (slowest thread 193762 iters, io_steps 0)
+#   8T -> 436344 ops/s (slowest thread 53229 iters, io_steps 0)
+#   16T -> 82469 ops/s (slowest thread 3503 iters, io_steps 0)
+#   1T -> 1322564 ops/s (slowest thread 1335726 iters, io_steps 0)
+#   2T -> 1084128 ops/s (slowest thread 542985 iters, io_steps 0)
+
+threads   total_ops_s   per_thread_ops_s   total_vs_1T   per_thread_vs_1T   io_steps
+      1       1613196            1613196         1.000              1.000          0
+      2       1084128             542064         0.672              0.336          0
+      4        787565             196891         0.488              0.122          0
+      8        436344              54543         0.270              0.034          0
+     16         81867               5117         0.051              0.003          0
+# writer committed 352270 UPDATEs during arm C
+
+=== ARM SHARED + one open read txn per reader -- D49-READMARK-ABLATION ===
+# order is rotated per round: a within-round position bias has constant sign and
+# cannot be averaged away by repeating the same order.
+# round 0 order: 1 2 4 8 16
+#   1T -> 3107488 ops/s (slowest thread 3134039 iters, io_steps 0)
+#   2T -> 2874362 ops/s (slowest thread 1336520 iters, io_steps 0)
+#   4T -> 6213974 ops/s (slowest thread 1304581 iters, io_steps 0)
+#   8T -> 5691502 ops/s (slowest thread 582303 iters, io_steps 0)
+#   16T -> 6979157 ops/s (slowest thread 327436 iters, io_steps 0)
+# round 1 order: 2 4 8 16 1
+#   2T -> 1699867 ops/s (slowest thread 852601 iters, io_steps 0)
+#   4T -> 5173824 ops/s (slowest thread 835416 iters, io_steps 0)
+#   8T -> 6261705 ops/s (slowest thread 503454 iters, io_steps 0)
+#   16T -> 8168039 ops/s (slowest thread 360089 iters, io_steps 0)
+#   1T -> 1905853 ops/s (slowest thread 1906816 iters, io_steps 0)
+# round 2 order: 4 8 16 1 2
+#   4T -> 4606089 ops/s (slowest thread 1020062 iters, io_steps 0)
+#   8T -> 7291943 ops/s (slowest thread 577093 iters, io_steps 0)
+#   16T -> 7917996 ops/s (slowest thread 345804 iters, io_steps 0)
+#   1T -> 1917185 ops/s (slowest thread 1930634 iters, io_steps 0)
+#   2T -> 3113936 ops/s (slowest thread 1565854 iters, io_steps 0)
+
+threads   total_ops_s   per_thread_ops_s   total_vs_1T   per_thread_vs_1T   io_steps
+      1       1917185            1917185         1.000              1.000          0
+      2       2874362            1437181         1.499              0.750          0
+      4       5173824            1293456         2.699              0.675          0
+      8       6261705             782713         3.266              0.408          0
+     16       7917996             494875         4.130              0.258          0
