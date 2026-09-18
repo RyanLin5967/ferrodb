@@ -1,0 +1,26 @@
+D27: what one fork costs when the parent is a live agent task holding W staged rows.
+
+Instrument: examples/d27_fork_workspace_cost.rs, release build.
+  us_per_fork  -- std::time::Instant around the begin_session loop ONLY. Setup excluded.
+  peak_rss_MB  -- getrusage(RUSAGE_SELF).ru_maxrss, one configuration per process.
+  rss_delta_MB -- peak after the fork loop minus peak before it.
+Runtime: AgentRuntime::new() (map-backed, no page store). Parent stages W rows with ONE
+  UPDATE over a trunk table of W rows, then N children fork off that one live parent.
+Every row is a separate process, because ru_maxrss is a high-water mark that never falls.
+Each child's staged_rows is checked against W via run_activity() after the timer stops, so a
+fork that copied nothing could not be reported as a fast fork.
+Recorded 2026-09-17T23:00:11-04:00 on Darwin arm64, Apple M5 Pro. One run per cell.
+Commit: feee712 (before any fix)
+
+     W      N        NxW   setup_s     fork_s  us_per_fork  peak_rss_MB  rss_delta_MB
+  1000     16      16000     4.104   0.001107       69.195         15.9           5.8
+  1000     64      64000     3.888   0.003754       58.657         35.4          25.3
+  1000    256     256000     4.184   0.018358       71.712        113.9         103.9
+  1000   1024    1024000     4.931   0.078864       77.016        427.1         417.0
+   250     64      16000     1.200   0.001506       23.527         15.2           6.7
+   500     64      32000     3.056   0.002460       38.433         21.9          12.9
+  2000     64     128000    10.424   0.009062      141.598         62.3          50.5
+  4000     64     256000    27.514   0.019120      298.754        111.6         100.4
+  4000   1024    4096000    43.091   0.272105      265.727       1666.4        1650.9
+
+RAW OUTPUT COMMITTED BEFORE INTERPRETATION. Interpretation follows in a later commit.

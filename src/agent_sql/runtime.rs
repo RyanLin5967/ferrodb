@@ -23,6 +23,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::agent_sql::persistent_map::PersistentMap;
+
 use crate::catalog::alter::{
     conform_row, refuse_if_the_row_cannot_land, resulting_schema, AlterPlan, NARROW_THE_ROW_FIRST,
 };
@@ -156,9 +158,9 @@ struct Workspace {
     /// gone the moment the branch writes anything. It has to be captured here or the changeset
     /// has nothing to diff against.
     fork_root: PageId,
-    rows: BTreeMap<(u32, u64), RowState>,
+    rows: PersistentMap<(u32, u64), RowState>,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
-    base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
+    base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
     ///
     /// A fork takes a snapshot of the parent's `rows`/`schema_edits` rather than a link, so a
@@ -170,7 +172,7 @@ struct Workspace {
     /// `REVERT MERGE m1` reporting `blocked_by = []` and then removing the row the published row
     /// was derived from.
     inherited: Vec<TxnId>,
-    tables: BTreeMap<u32, String>,
+    tables: PersistentMap<u32, String>,
     frame: TxnFrame,
     // B11's fields, WITHOUT its `reads`: B4 deleted `Workspace::reads` as a second copy of a
     // read-set the runtime already keeps in `State::captures`, and re-adding it here would restore
@@ -182,7 +184,7 @@ struct Workspace {
     /// typed the statement, and abandoning the branch would not take it away. Published at
     /// `MERGE`, after [`crate::tel::schema_merge::merge_schema`] has decided they compose with
     /// whatever the target's shape has become.
-    schema_edits: Vec<(String, SchemaEdit)>,
+    schema_edits: Arc<Vec<(String, SchemaEdit)>>,
     /// Each touched table's shape **at first touch** — the fork point, in exactly the sense
     /// `base_rows` is the fork-point row image.
     ///
@@ -190,7 +192,7 @@ struct Workspace {
     /// rows to a target whose shape a sibling agent has widened since. Without it a branch that
     /// forked before a concurrent `ADD COLUMN` publishes rows one value short and the failure
     /// surfaces from inside `Tuple::serialize`.
-    base_shapes: BTreeMap<String, Schema>,
+    base_shapes: PersistentMap<String, Schema>,
 }
 
 impl Workspace {
@@ -734,13 +736,27 @@ impl AgentRuntime {
         // page is the parent's root page. Taking a snapshot rather than a link is what keeps the
         // parent's *later* writes invisible to the child, and keeps the read path from walking
         // the parent chain — the one pattern DESIGN.md rules out outright.
+        //
+        // **These clones are O(1), and the snapshot is still a snapshot.** The maps are
+        // [`PersistentMap`]s: a clone is an `Arc` bump, the child shares the parent's nodes, and a
+        // write copies only its own root-to-leaf path. That is what makes this affordable at
+        // fanout. It used to be a deep copy of the parent's whole staged working set, so N
+        // children of a parent holding W staged rows cost O(N·W) — measured at 4.1M row copies and
+        // 1651 MB for N=1024, W=4000 (`bench/d27_fork_workspace_cost_before.txt`).
+        //
+        // Sharing does not weaken either property above, and the reason is worth keeping: the
+        // nodes are immutable, so a later parent write allocates new nodes and rebinds the
+        // PARENT's root while the child still addresses the fork-point tree, and a read is still a
+        // descent of the child's own tree with no parent pointer anywhere to walk. Both are tested
+        // directly in `tests/d27_fork_shares_without_leaking.rs`, the second against an ancestor
+        // chain abandoned out from under the child.
         let (rows, base_rows, tables) = match state.workspaces.get(&parent.id) {
             Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
-            None => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+            None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new()),
         };
         let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
             Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
-            None => (Vec::new(), BTreeMap::new()),
+            None => (Arc::new(Vec::new()), PersistentMap::new()),
         };
         // Which ancestors' staged writes did that snapshot just hand us? Only recorded when the
         // parent actually had staged state to hand over: a parent that staged nothing has no
@@ -1327,7 +1343,7 @@ impl AgentRuntime {
     fn note_base_shape(&self, branch: BranchId, table: &str, shape: Schema) {
         let mut state = self.state.lock().unwrap();
         if let Some(ws) = state.workspaces.get_mut(&branch.id) {
-            ws.base_shapes.entry(table.to_string()).or_insert(shape);
+            ws.base_shapes.insert_if_absent(table.to_string(), shape);
         }
     }
 
@@ -1339,7 +1355,7 @@ impl AgentRuntime {
         let state = self.state.lock().unwrap();
         let Some(ws) = state.workspaces.get(&branch.id) else { return shared.clone() };
         let mut shape = ws.base_shapes.get(table).cloned().unwrap_or_else(|| shared.clone());
-        for (t, edit) in &ws.schema_edits {
+        for (t, edit) in ws.schema_edits.iter() {
             if t == table {
                 let _ = edit.apply(&mut shape);
             }
@@ -1395,7 +1411,7 @@ impl AgentRuntime {
             .workspaces
             .get_mut(&branch.id)
             .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
-        ws.schema_edits.push((table.to_string(), edit));
+        Arc::make_mut(&mut ws.schema_edits).push((table.to_string(), edit));
         Ok(())
     }
 
@@ -1406,7 +1422,7 @@ impl AgentRuntime {
             .unwrap()
             .workspaces
             .get(&branch.id)
-            .map(|ws| ws.schema_edits.clone())
+            .map(|ws| ws.schema_edits.as_ref().clone())
             .unwrap_or_default()
     }
 
@@ -1822,7 +1838,7 @@ impl AgentRuntime {
             ws.tables.insert(tbl.0, table.to_string());
             for item in items {
                 let key = Workspace::key(tbl, item.row);
-                ws.base_rows.entry(key).or_insert(item.before);
+                ws.base_rows.insert_if_absent(key, item.before);
                 ws.rows.insert(key, item.after.clone());
                 for op in item.ops {
                     ws.frame.push_op(op);
@@ -2185,7 +2201,7 @@ impl AgentRuntime {
         for (_, name) in &snapshot.tables {
             altered_tables.insert(name.clone());
         }
-        for (name, _) in &snapshot.schema_edits {
+        for (name, _) in snapshot.schema_edits.iter() {
             altered_tables.insert(name.clone());
         }
         let mut merged_shapes: BTreeMap<String, Schema> = BTreeMap::new();
@@ -2230,7 +2246,7 @@ impl AgentRuntime {
         for (_, name) in &snapshot.tables {
             altered_tables.insert(name.clone());
         }
-        for (name, _) in &snapshot.schema_edits {
+        for (name, _) in snapshot.schema_edits.iter() {
             altered_tables.insert(name.clone());
         }
         for name in &altered_tables {
@@ -2258,7 +2274,8 @@ impl AgentRuntime {
 
         let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
         let mut schemas: BTreeMap<u32, Schema> = BTreeMap::new();
-        let mut table_names: BTreeMap<u32, String> = snapshot.tables.clone();
+        let mut table_names: BTreeMap<u32, String> =
+            snapshot.tables.iter().map(|(t, n)| (*t, n.clone())).collect();
         // ...and for every table an assertion ranges over, which need not be one this branch
         // wrote to. An assertion over a table the candidate never touched is still a claim about
         // the state the merge would leave behind, and it is read here so the fingerprint below
@@ -3814,14 +3831,14 @@ struct WorkspaceSnapshot {
     /// The run behind this task, carried into the merge so authorship outlives the workspace.
     prov: ProvId,
     fork_seq: u64,
-    rows: BTreeMap<(u32, u64), RowState>,
-    base_rows: BTreeMap<(u32, u64), Option<Vec<Value>>>,
-    tables: BTreeMap<u32, String>,
+    rows: PersistentMap<(u32, u64), RowState>,
+    base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
+    tables: PersistentMap<u32, String>,
     ops: Vec<Op>,
     guards: Vec<Guard>,
     reads: Vec<crate::provenance::readset::ReadSet>,
-    schema_edits: Vec<(String, SchemaEdit)>,
-    base_shapes: BTreeMap<String, Schema>,
+    schema_edits: Arc<Vec<(String, SchemaEdit)>>,
+    base_shapes: PersistentMap<String, Schema>,
 }
 
 /// A cell's value as an integer, for escrow accounting. `None` for anything not numeric.
@@ -3904,7 +3921,7 @@ fn crash_after_rows(published: usize) {
 /// same table for an unrelated reason. Under-reporting is the safe direction — an operator who
 /// stops trusting the metric gets nothing from it.
 fn blind_writes_of(
-    rows: &BTreeMap<(u32, u64), RowState>,
+    rows: &PersistentMap<(u32, u64), RowState>,
     reads: &[crate::provenance::readset::ReadSet],
 ) -> Vec<(TableId, RowId)> {
     use crate::provenance::readset::ReadSet;
