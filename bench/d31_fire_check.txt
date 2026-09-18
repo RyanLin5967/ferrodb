@@ -1,0 +1,45 @@
+D31 — fire-check of the growth rule and of the verdict classifier.
+
+WHICH DIRECTION IS THE PASS, stated first because it is the thing most easily read backwards:
+
+  A fire-check PASSES when breaking the mechanism CHANGES the number and flips the verdict.
+  It FAILS if the mutant produces the same reading as the fixed tree — that would mean the
+  measurement is not sensitive to the thing it claims to measure, and the green result would be
+  telling us nothing. "The mutant made it fail" is the GOOD outcome here, not a defect.
+
+Instrument: examples/branch_curve_writes.rs, N = 496 branches x 1 page written, 8 threads,
+release build, rebuilt per mutant. Space columns only; see the note on wall-clock below.
+
+1. THE FIXED TREE (HEAD, no mutation)
+     4104 len B/branch
+     VERDICT — AMPLIFICATION GONE.
+
+2. MUTANT A — `next_extent_pages` returns ARENA_EXTENT_PAGES unconditionally, i.e. the flat
+   pre-D31 allocator. This is the mutation that says whether geometric growth is doing the work.
+     1046478 len B/branch
+     VERDICT — AMPLIFICATION PRESENT.
+   PASS: 4104 -> 1046478, a 255x change, and the verdict flips. The number is the pre-D31 figure
+   to the byte (bench/d31_before.txt reports 1046478 at this same N), so the mutant reproduces
+   the original wall exactly rather than merely moving in the right direction.
+
+3. MUTANT B — `ARENA_FIRST_EXTENT_PAGES = 16`, chosen to land BETWEEN the two reference values
+   so the classifier's third branch is forced rather than assumed.
+     65420 len B/branch
+     VERDICT — AMBIGUOUS. ... "Do NOT read this as either result."
+   PASS: the classifier refuses to classify instead of rounding to the nearer reference. A
+   detector that never fires its own "I cannot tell" branch has not been shown to have one.
+
+So all three branches of `verdict()` were made to fire on purpose, and the growth rule was shown
+to be load-bearing rather than incidental.
+
+RESTORE VERIFIED, because a failed revert is indistinguishable from a passing test:
+  `git checkout HEAD -- src/branch/types.rs` -> `git diff HEAD` reports 0 lines.
+  Rebuilt binary sha1 2f4ab8b1077432fa91beb9d7e3e12fd058edfa07 vs mutant B's
+  003b98605c7cb1275ce00b825d3bdd1b88bf1e08 — `cmp` says they DIFFER, so cargo really did rebuild
+  and the final reading is not the mutant's artifact being re-run.
+  Re-measured after restore: 4104 B/branch, AMPLIFICATION GONE. Back where it started.
+
+WALL CLOCK IS NOT REPORTED HERE AND SHOULD NOT BE READ OUT OF THESE RUNS. The machine was at
+load average 28-46 with another project's builds throughout, and hit 100% disk during one
+attempt. Every figure above is a byte count or a page count, neither of which moves under
+contention — which is the reason D31 is stated in space and not in time.

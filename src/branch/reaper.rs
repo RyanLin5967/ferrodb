@@ -233,8 +233,7 @@ impl TwoTierReaper {
             rewrites.push((child, new_child));
         }
 
-        let arena = self.store.arena_for(branch)?;
-        let new_id = self.store.alloc_in_arena(arena, page_type, epoch)?;
+        let new_id = self.store.alloc_for(branch, page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
             let mut frame = handle.write();
@@ -501,13 +500,32 @@ mod tests {
         (h, r)
     }
 
-    /// Do what an agent task does: take an arena and write `pages` novel pages into it.
+    /// Pages this branch still holds, summed over EVERY extent it owns.
+    ///
+    /// Not `allocated_pages(arena_for(b))`: that reads one extent, and since D31 a branch that has
+    /// written more than one page owns several. Worse, `arena_for` on a full extent CLAIMS A FRESH
+    /// ONE, so the old spelling could report zero and grow the file while doing it.
+    fn pages_of(h: &Harness, branch: BranchId) -> usize {
+        h.catalog
+            .get(branch)
+            .unwrap()
+            .arenas
+            .iter()
+            .map(|a| h.store.allocated_pages(*a).len())
+            .sum()
+    }
+
+    /// Do what an agent task does: write `pages` novel pages, rolling over extents as it goes.
+    ///
+    /// **D31 — `alloc_for`, not a captured `ArenaId`.** This took one arena up front and filled
+    /// it, which worked only because an extent used to be 256 pages and no case here wrote that
+    /// many. Under geometric growth the first extent is ONE page, so the second allocation
+    /// refuses — the same trap `collapse` fell into (D13b). A real writer asks per page.
     fn write_pages(h: &Harness, branch: BranchId, pages: u32) -> Vec<PageId> {
-        let arena = h.store.arena_for(branch).unwrap();
         let epoch = h.catalog.next_epoch();
         (0..pages)
             .map(|i| {
-                let p = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+                let p = h.store.alloc_for(branch, PageType::BTreeLeaf, epoch).unwrap();
                 let handle = h.store.read_page(p).unwrap();
                 let mut frame = handle.write();
                 frame.data[PAGE_HEADER_SIZE] = (i & 0xff) as u8;
@@ -605,7 +623,9 @@ mod tests {
         let reaped = reaper.reap_expired(now).unwrap();
         assert_eq!(reaped, vec![doomed.branch_id]);
         assert!(h.catalog.get(kept.branch_id).is_ok());
-        assert_eq!(h.store.allocated_pages(h.store.arena_for(kept.branch_id).unwrap()).len(), 3);
+        // Every extent the branch owns, not just the one it happens to be filling. Asking
+        // `arena_for` here would ALLOCATE a fresh empty extent and then count its zero pages.
+        assert_eq!(pages_of(&h, kept.branch_id), 3);
     }
 
     #[test]
@@ -870,10 +890,9 @@ mod tests {
                         let rec = catalog
                             .fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS))
                             .expect("fork under contention");
-                        let arena = store.arena_for(rec.branch_id).expect("arena");
                         let epoch = catalog.next_epoch();
                         let p = store
-                            .alloc_in_arena(arena, PageType::BTreeLeaf, epoch)
+                            .alloc_for(rec.branch_id, PageType::BTreeLeaf, epoch)
                             .expect("alloc under contention");
                         {
                             let handle = store.read_page(p).expect("read");
@@ -1055,19 +1074,34 @@ mod tests {
     #[test]
     fn a_freed_extent_is_reused_so_a_second_wave_costs_no_new_space() {
         let (h, reaper) = setup();
-        let mut high = 0;
+        // The peak each wave reaches, rather than one number baked in. This asserted
+        // `high == 4 * ARENA_EXTENT_PAGES`, which stated the claim in the OLD geometry: four
+        // branches, one fixed-size extent each. Under D31 four branches writing nine pages each
+        // hold 1+2+4+8 = 15 pages apiece, and pinning 60 here would be the same mistake again.
+        //
+        // The property was never the number. It is that a wave costs no NEW space once the
+        // previous wave's extents came back, so the peaks must not grow.
+        let mut peaks = Vec::new();
         for _ in 0..3 {
             for _ in 0..4 {
                 let b =
                     h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
                 write_pages(&h, b.branch_id, 9);
             }
-            high = high.max(h.store.reserved_page_count());
+            peaks.push(h.store.reserved_page_count());
             reaper.reap_expired(far_future()).unwrap();
             assert_eq!(h.store.live_page_count().unwrap(), 0);
             assert_eq!(h.store.reserved_page_count(), 0);
         }
-        assert_eq!(high, 4 * ARENA_EXTENT_PAGES, "three waves never exceeded four extents");
+        assert!(peaks[0] > 0, "fixture: the waves reserved nothing, so reuse proves nothing");
+        for (i, p) in peaks.iter().enumerate() {
+            assert_eq!(
+                *p, peaks[0],
+                "wave {i} peaked at {p} reserved pages against the first wave's {}; freed extents \
+                 are not being handed out again",
+                peaks[0]
+            );
+        }
     }
 
     #[test]
@@ -1163,17 +1197,16 @@ mod tests {
 
         // Build a 3-page tree owned by an ancestor, then a deep chain that inherits it.
         let anc = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-        let a_arena = h.store.arena_for(anc.branch_id).unwrap();
         let e = h.catalog.next_epoch();
-        let leaf_a = h.store.alloc_in_arena(a_arena, PageType::BTreeLeaf, e).unwrap();
-        let leaf_b = h.store.alloc_in_arena(a_arena, PageType::BTreeLeaf, e).unwrap();
+        let leaf_a = h.store.alloc_for(anc.branch_id, PageType::BTreeLeaf, e).unwrap();
+        let leaf_b = h.store.alloc_for(anc.branch_id, PageType::BTreeLeaf, e).unwrap();
         for (p, tag) in [(leaf_a, 0xA1u8), (leaf_b, 0xB2)] {
             let handle = h.store.read_page(p).unwrap();
             let mut f = handle.write();
             f.data[PAGE_HEADER_SIZE + 32] = tag;
             stamp_checksum(&mut f.data);
         }
-        let root = h.store.alloc_in_arena(a_arena, PageType::BTreeInternal, e).unwrap();
+        let root = h.store.alloc_for(anc.branch_id, PageType::BTreeInternal, e).unwrap();
         {
             let handle = h.store.read_page(root).unwrap();
             let mut f = handle.write();
@@ -1231,14 +1264,21 @@ mod tests {
             .expect("toy links decode");
         assert_eq!(new_children.len(), 2);
         assert_ne!(new_children[0], leaf_a);
-        let owner_arena = *collapsed.arenas.last().unwrap();
         for (p, tag) in new_children.iter().zip([0xA1u8, 0xB2]) {
             let handle = h.store.read_page(*p).unwrap();
             assert_eq!(handle.read().data[PAGE_HEADER_SIZE + 32], tag);
-            assert_eq!(handle.header().unwrap().arena_id, owner_arena);
+            // The branch's OWN extents, not one specific extent. This used to read
+            // `== *collapsed.arenas.last().unwrap()`, which was the same statement only while a
+            // branch had exactly one extent; since D31 a three-page copy spans two.
+            let landed = handle.header().unwrap().arena_id;
+            assert!(
+                collapsed.arenas.contains(&landed),
+                "a materialised page landed in {landed}, which the branch does not own: {:?}",
+                collapsed.arenas
+            );
         }
         // And the ancestor's originals are untouched.
-        assert_eq!(h.store.allocated_pages(a_arena).len(), 3);
+        assert_eq!(pages_of(&h, anc.branch_id), 3);
         let _ = ArenaId(0);
     }
 
@@ -1269,9 +1309,8 @@ mod tests {
         // Give the chain a real root before collapsing. A branch that has never written still
         // carries the trunk's placeholder root id, which is not an allocated page — collapse then
         // fails while trying to copy it, with an IO error rather than anything explanatory.
-        let arena = h.store.arena_for(cur).unwrap();
         let ep = h.catalog.next_epoch();
-        let root = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, ep).unwrap();
+        let root = h.store.alloc_for(cur, PageType::BTreeLeaf, ep).unwrap();
         {
             let handle = h.store.read_page(root).unwrap();
             let mut f = handle.write();
@@ -1306,16 +1345,15 @@ mod tests {
 
         // An ancestor owns the pages; a deep chain inherits them.
         let anc = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
-        let a_arena = h.store.arena_for(anc.branch_id).unwrap();
         let e = h.catalog.next_epoch();
-        let leaf = h.store.alloc_in_arena(a_arena, PageType::BTreeLeaf, e).unwrap();
+        let leaf = h.store.alloc_for(anc.branch_id, PageType::BTreeLeaf, e).unwrap();
         {
             let handle = h.store.read_page(leaf).unwrap();
             let mut f = handle.write();
             f.data[PAGE_HEADER_SIZE + 32] = 0xD6;
             stamp_checksum(&mut f.data);
         }
-        let root = h.store.alloc_in_arena(a_arena, PageType::BTreeInternal, e).unwrap();
+        let root = h.store.alloc_for(anc.branch_id, PageType::BTreeInternal, e).unwrap();
         {
             let handle = h.store.read_page(root).unwrap();
             let mut f = handle.write();
@@ -1368,10 +1406,9 @@ mod tests {
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-        let arena = h.store.arena_for(b.branch_id).unwrap();
         let e = h.catalog.next_epoch();
-        let p1 = h.store.alloc_in_arena(arena, PageType::BTreeInternal, e).unwrap();
-        let p2 = h.store.alloc_in_arena(arena, PageType::BTreeInternal, e).unwrap();
+        let p1 = h.store.alloc_for(b.branch_id, PageType::BTreeInternal, e).unwrap();
+        let p2 = h.store.alloc_for(b.branch_id, PageType::BTreeInternal, e).unwrap();
         for (a, c) in [(p1, p2), (p2, p1)] {
             let handle = h.store.read_page(a).unwrap();
             let mut f = handle.write();
@@ -1435,8 +1472,7 @@ mod tests {
         for _ in 0..FANOUT {
             let mut leaves = Vec::with_capacity(LEAVES_PER);
             for _ in 0..LEAVES_PER {
-                let arena = h.store.arena_for(cur).unwrap();
-                let p = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+                let p = h.store.alloc_for(cur, PageType::BTreeLeaf, epoch).unwrap();
                 let handle = h.store.read_page(p).unwrap();
                 let mut f = handle.write();
                 f.data[PAGE_HEADER_SIZE + 32] = (leaves_all.len() % 256) as u8;
@@ -1445,8 +1481,7 @@ mod tests {
                 leaves.push(p);
                 leaves_all.push(p);
             }
-            let arena = h.store.arena_for(cur).unwrap();
-            let node = h.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch).unwrap();
+            let node = h.store.alloc_for(cur, PageType::BTreeInternal, epoch).unwrap();
             let handle = h.store.read_page(node).unwrap();
             let mut f = handle.write();
             ToyLinks::write(&mut f.data, &leaves);
@@ -1454,8 +1489,7 @@ mod tests {
             drop(f);
             internals.push(node);
         }
-        let arena = h.store.arena_for(cur).unwrap();
-        let root = h.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch).unwrap();
+        let root = h.store.alloc_for(cur, PageType::BTreeInternal, epoch).unwrap();
         {
             let handle = h.store.read_page(root).unwrap();
             let mut f = handle.write();
@@ -1532,11 +1566,22 @@ mod tests {
                  exactly `record.arenas`, so this extent could never be reclaimed."
             );
         }
+        // The two trees are reserved under DIFFERENT geometries, which is the point of D31.
+        //
+        //   source: the branch starts with nothing, so it climbs 1+2+4+...+128+256+256 = 767
+        //           pages across ten extents to hold 664.
+        //   copy:   by then the branch is already at the 256-page cap, so `collapse` claims
+        //           3 x 256 = 768.
+        //
+        // Spelled as arithmetic rather than as `2 * EXTENTS * ARENA_EXTENT_PAGES`, which was the
+        // uniform-extent statement and is now wrong by exactly the one page the climb saves.
+        const SOURCE_RESERVED: u32 = 1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 256 + 256;
+        const COPY_RESERVED: u32 = 3 * ARENA_EXTENT_PAGES;
+        assert_eq!(SOURCE_RESERVED, 767);
         assert_eq!(
             h.store.reserved_page_count(),
-            baseline_reserved + 2 * EXTENTS as u32 * ARENA_EXTENT_PAGES,
-            "the original tree and its copy should hold {} extents between them",
-            2 * EXTENTS
+            baseline_reserved + SOURCE_RESERVED + COPY_RESERVED,
+            "the original tree and its copy do not hold the extents the growth rule predicts"
         );
 
         // THE OUTCOME, not the field. The reaper frees exactly `record.arenas`; if collapse
@@ -1554,13 +1599,36 @@ mod tests {
         );
     }
 
-    /// **Known-open: `collapse`'s final `put` is still a whole-record write.**
+    /// **Known-open, ledger row D29: `collapse`'s final `put` is still a whole-record write.**
     ///
     /// D13b narrowed the window — `collapse` re-reads the record immediately before writing it,
     /// instead of writing back the snapshot it took before copying the whole tree — but it did not
     /// close it, because `parent_id`, `depth` and `fork_epoch` have no narrower setter and must
     /// move together with the new root. Anything that mutates the record between that re-read and
     /// that `put` is silently discarded.
+    ///
+    /// **WHICH DIRECTION D13b AND D31 MOVED THE WINDOW, because the D29 fix needs to know what it
+    /// is aiming at.** Both NARROWED it; neither widened it.
+    ///
+    /// * D13b: before it, `collapse` took its snapshot ABOVE `deep_copy` and wrote it back after,
+    ///   so the window was the whole page copy — unbounded in the size of the tree. It is now the
+    ///   four field assignments below the re-read.
+    /// * D31 (geometric extents): the extra `alloc_arena`/`add_arena` round-trips a collapse now
+    ///   makes all happen DURING the copy, i.e. above the re-read and outside the window. What
+    ///   D31 does change is the COST of removing the re-read: a collapse now claims several
+    ///   extents instead of one, so writing back a pre-copy snapshot would drop all of them from
+    ///   `record.arenas` and leak the lot. Mutant D in the D13b fire-check measured exactly that —
+    ///   664 of 664 copied pages unreclaimable after the branch was reaped.
+    ///
+    /// **Why `reap` has the same shape and is safe, which is the clue to the cheap fix.** `reap`
+    /// publishes `Reaping` durably BEFORE it frees anything, and `check_readable` rejects that
+    /// state — so nothing can land in its window, because every writer is already refused.
+    /// `renew_lease` goes through `check_readable` on both catalogs, so a `collapse` that
+    /// published such a marker would make the keepalive below REFUSE rather than be silently lost.
+    /// By inspection, not measured, and not free either: `reap` marks branches that are dying,
+    /// while `collapse` runs on a LIVE branch, so making it briefly unreadable is a real
+    /// behaviour change and not a drop-in swap. Recorded as a lead worth costing, not a
+    /// recommendation.
     ///
     /// This drives the smallest of those: a lease renewal. The wrapper below renews the lease to
     /// `u64::MAX` at the exact instant of collapse's re-read, which is what a live client's
@@ -1668,9 +1736,8 @@ mod tests {
                 .with_links(Arc::new(ToyLinks));
 
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS)).unwrap();
-        let arena = h.store.arena_for(b.branch_id).unwrap();
         let e = h.catalog.next_epoch();
-        let root = h.store.alloc_in_arena(arena, PageType::BTreeLeaf, e).unwrap();
+        let root = h.store.alloc_for(b.branch_id, PageType::BTreeLeaf, e).unwrap();
         {
             let handle = h.store.read_page(root).unwrap();
             let mut f = handle.write();
