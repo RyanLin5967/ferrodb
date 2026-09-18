@@ -10,11 +10,26 @@ PROVENANCE, STATED BEFORE THE NUMBERS
 -------------------------------------
 Two different sources are mixed below and they are NOT equally strong. Labelled per line.
 
-  [AGENT]  measured by the `fork-decision` subagent, NOT re-run by me. I could not re-run
-           it: a cold `cargo build` writes into /Users/idide/wt/.turso-shared-target, which
-           a live peer session (turso-bughunt-d5) is using, and that session has been asked
-           and has not yet answered. Running it anyway would disturb a peer's incremental
-           state to re-derive a number, which is not a trade worth making.
+  [AGENT]  measured by the `fork-decision` subagent, NOT re-run by me at the time this file
+           was first written: a cold `cargo build` writes into
+           /Users/idide/wt/.turso-shared-target, which a live peer session
+           (turso-bughunt-d5) is using, and disturbing a peer's incremental state to
+           re-derive a number is not a trade worth making.
+
+           ⛔ CORRECTED, SAME DAY. This paragraph first said that session "has been asked
+           and has not yet answered". IT HAS NOT BEEN ASKED. Two messages to it were held
+           for the recipient's approval and BOTH EXPIRED UNDELIVERED. "Sent" is not
+           "delivered", and `success: true` from the send tool means it was queued, not
+           that anyone read it. Same shape as the error this pass corrected in the ledger:
+           recording an outcome that the channel never actually produced.
+
+           ⭐ AND THE BLOCK IS NOT REAL, which is the useful half. turso's
+           .cargo/config.toml pins rustflags and env but NOT target-dir (checked at
+           176fd75c2), so CARGO_TARGET_DIR set per invocation is honoured. A build in my
+           own worktree with a private target dir touches neither the peer's tree nor
+           .turso-shared-target, and needs no permission from anyone. What remains is a
+           LOAD question, not a permission question, and load has a normal answer: read the
+           process table first and build when the box is quiet.
   [HERE]   re-derived by me in this checkout, read-only (grep/sed), zero builds.
 
 1. BUILD AND TEST COST  — the criterion D46 recorded as the one that could disqualify turso
