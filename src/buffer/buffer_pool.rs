@@ -6,9 +6,17 @@
 //! lock — first the page table's write lock, then `arc_cache` — across the entire miss path. That
 //! was correct and it was a wall: the lock was held across `DiskManager::read`, so every page miss
 //! serialised every other thread in the process for the duration of a read syscall. Measured at 500
-//! microseconds of modelled IO per read, aggregate fault throughput went from 1574/s at one thread
-//! to 1409/s at sixteen — *negative* scaling, because the threads were queueing on the mutex and
-//! paying its cache-line traffic for the privilege. `bench/s22_bufpool_fault_before.txt`.
+//! microseconds of modelled IO per read, aggregate fault throughput was 1548/s at one thread and
+//! 1570/s at sixteen — **flat**, sixteen threads doing the work of one, which is the signature of a
+//! lock held across the read syscall. After: 1557/s at one thread and 25248/s at sixteen, x16.22.
+//! `bench/s22_bufpool_before_after.txt`, two interleaved repetitions that agree.
+//!
+//! An earlier draft of this paragraph said the before-curve was *negative* (1574/s falling to
+//! 1409/s) and cited `bench/s22_bufpool_fault_before.txt`. That run was taken on a machine under
+//! heavy and uncontrolled load from other work, and the decline did not reproduce when the two
+//! arms were run interleaved. The honest before-curve is flat, not negative. Flat is already the
+//! whole point, so nothing downstream of it changes — but a number that was quoted and then
+//! failed to reproduce is corrected here rather than quietly dropped.
 //!
 //! The races those fixes closed are all of one shape: **a decision made under one lock, acted on
 //! after it was released.** Holding the lock longer is one answer. The answer here is the standard
@@ -39,6 +47,59 @@
 //! write-back also happens *before* the victim leaves the page table — see
 //! [`BufferPoolManager::evict_into`] — because the other order lets a concurrent fetch of the victim
 //! miss, read the stale copy from disk, and lose the dirty bytes still sitting in the frame.
+//!
+//! # What was considered, and why the losers lost
+//!
+//! Prior art first, because none of this is novel. The shape chosen here -- a per-frame latch, an
+//! "IO in progress" marker that other faulters wait on, and a replacement policy that is consulted
+//! and then released -- is the classic buffer manager of Gray and Reuter, and it is what
+//! PostgreSQL's `bufmgr.c` does with its `BM_IO_IN_PROGRESS` flag, its per-buffer IO condition
+//! variable, and its partitioned buffer mapping table. LeanStore and Umbra reach the same place by
+//! a different route: one atomic state word per page (Unlocked / Shared / Exclusive / Marked /
+//! Evicted) plus optimistic version validation, which is the same "verify the decision at the
+//! point of use" rule expressed as a CAS rather than as a re-check under a latch.
+//!
+//! **CHOSEN: per-frame latch + `in_transit` marker + consult-don't-hold policy.** The critical
+//! sections are all bounded by memory accesses rather than by syscalls. It keeps ARC exactly as it
+//! is, so eviction QUALITY is untouched, and it is the option whose failure modes were already
+//! understood here -- every race D18 and D19 fixed is of the form "decision made under one lock,
+//! acted on after it was released", and the answer is to re-verify at the point of use rather than
+//! to hold the lock longer.
+//!
+//! **REJECTED: shard `arc_cache` into N independent caches keyed by page id.** This is the first
+//! thing anyone suggests and it is wrong for this structure. ARC's adaptivity is *global by
+//! construction*: the `p` parameter and the b1/b2 ghost lists are how it decides whether the
+//! workload is recency- or frequency-biased. Sharding produces N caches of capacity/N, each
+//! adapting to a 1/N sample, and a hot shard cannot borrow a frame from a cold one. The cost is
+//! paid in hit RATE, which does not appear in a throughput benchmark at all -- so this option
+//! could have been shipped, measured as "faster", and been a regression. It also does not fix the
+//! thing this change was for: a shard lock is still held across the read syscall.
+//!
+//! **REJECTED: replace ARC with CLOCK/second-chance.** This would make the hit path a single
+//! atomic store of a reference bit and genuinely fix the arm that is still broken (below). It
+//! loses because it is a replacement-policy decision wearing a concurrency fix's clothes. The
+//! engine implements ARC deliberately, ghost lists and all; swapping it for CLOCK should be
+//! decided on hit-rate evidence against real workloads, not smuggled in because CLOCK happens to
+//! have a cheaper hit path.
+//!
+//! # What this did NOT fix, measured rather than assumed
+//!
+//! **The hit path still takes the process-wide `arc_cache` mutex on every hit**, in `fetch_page`,
+//! for `touch`. Taking IO out from under that lock does nothing for a workload whose working set
+//! fits in the pool, and `bench/s22_bufpool_before_after.txt` shows exactly that: with the working
+//! set resident, throughput relative to one thread goes x1.00 / x0.74 / x0.43 / x0.31 / x0.31 at
+//! 1/2/4/8/16 threads BEFORE and x1.00 / x0.51 / x0.51 / x0.27 / x0.26 AFTER. Both collapse.
+//! Single-thread throughput improved about 30%; scaling did not improve at all.
+//!
+//! The known fix is BP-Wrapper (Ding, Jiang, Zhang, ICDE 2009), which exists precisely to make an
+//! arbitrary replacement policy lock-contention-free: batch the hit-path policy updates into a
+//! lock-free per-thread buffer and let whichever thread next holds the policy lock drain it. It
+//! preserves ARC's decisions rather than replacing them, because a delayed `touch` changes only
+//! the order of a recency list and can never change which page is resident -- the page is already
+//! pinned by the time `touch` is called. That is the next structural change to this file, and it
+//! is deliberately not bundled with this one: this change is being merged against a concurrent
+//! B+tree latch layer that also edits `BufferPoolManager`, and two structural changes to the same
+//! struct in one merge is how a correctness regression gets in unnoticed.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
