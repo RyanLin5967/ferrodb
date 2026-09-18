@@ -22,24 +22,48 @@ use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::storage::disk_manager::DiskManager;
 
-fn peak_rss_bytes() -> u64 {
-    // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
-    #[repr(C)]
-    #[derive(Default)]
-    struct RUsage {
-        ru_utime: [i64; 2],
-        ru_stime: [i64; 2],
-        ru_maxrss: i64,
-        rest: [i64; 14],
+/// Peak resident set in bytes, or `None` where this platform cannot answer.
+///
+/// `Option`, not `0`. The old signature returned `0` both when `getrusage` FAILED and when the
+/// platform had no `getrusage` at all -- a zero is indistinguishable from a real measurement of a
+/// tiny process, and a memory number is the entire point of this harness. Callers render `None`
+/// as `NaN` so the column keeps its position in the tab-separated output while being impossible
+/// to mistake for a measurement.
+///
+/// Gated the way `storage::disk_manager::pwrite` already gates its platform split -- the
+/// repo's existing pattern, not a new one. `getrusage` does not exist on Windows, and linking
+/// against it there fails with `LNK2019: unresolved external symbol getrusage`, which broke CI's
+/// windows-latest job for every example in this directory.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
+        #[repr(C)]
+        #[derive(Default)]
+        struct RUsage {
+            ru_utime: [i64; 2],
+            ru_stime: [i64; 2],
+            ru_maxrss: i64,
+            rest: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+        }
+        let mut u = RUsage::default();
+        if unsafe { getrusage(0, &mut u) } != 0 {
+            return None;
+        }
+        Some(if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 })
     }
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    #[cfg(not(unix))]
+    {
+        None
     }
-    let mut u = RUsage::default();
-    if unsafe { getrusage(0, &mut u) } != 0 {
-        return 0;
-    }
-    if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 }
+}
+
+/// `peak_rss_bytes()` in megabytes, or `NaN` where the platform cannot answer.
+fn peak_rss_mb() -> f64 {
+    peak_rss_bytes().map_or(f64::NAN, |b| b as f64 / 1e6)
 }
 
 fn main() {
@@ -159,7 +183,7 @@ fn main() {
             actually as f64 / seg_syncs.max(1) as f64,
             bytes as f64 / 1e6,
             bytes as f64 / done as f64,
-            peak_rss_bytes() as f64 / 1e6,
+            peak_rss_mb(),
             reopen_ms,
             live_ms,
             read_us,

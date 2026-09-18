@@ -22,7 +22,6 @@
 //! with it. It stops at the budget and SAYS SO, naming the N it reached. "Stopped early on space" is
 //! the result, not a failure of the run — and if it does NOT stop early, that kills D31, which is
 //! the outcome D31's own falsifier asks for.
-use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -74,6 +73,29 @@ fn verdict(bytes_per_branch: f64) {
         println!("VERDICT — AMBIGUOUS. {bytes_per_branch:.0} B/branch sits between the two references above,");
         println!("near neither. Do NOT read this as either result: say which tree it was taken on,");
         println!("and look at `pages live` and the allocated-blocks column before concluding.");
+    }
+}
+
+
+/// Bytes actually ALLOCATED to a file, as opposed to its addressed length -- `None` where the
+/// platform cannot answer.
+///
+/// This is the whole instrument of D31: the gap between `len()` and allocation is the 256x space
+/// amplification, so a fabricated number here would fabricate the finding. `std` exposes
+/// `MetadataExt::blocks()` on unix only and has no Windows equivalent, so Windows gets `None` and
+/// the caller prints `NaN` rather than a zero that reads as "no amplification".
+///
+/// Gated the way `storage::disk_manager::pwrite` already gates its platform split.
+fn allocated_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.blocks() * 512)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -153,7 +175,7 @@ fn main() {
 
         let md = std::fs::metadata(&main_path).ok();
         let data = md.as_ref().map(|m| m.len()).unwrap_or(0);
-        let alloc = md.as_ref().map(|m| m.blocks() * 512).unwrap_or(0);
+        let alloc = allocated_bytes(&main_path).unwrap_or(0);
         let cbytes = std::fs::metadata(&cat_path).map(|m| m.len()).unwrap_or(0);
         println!(
             "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}",
@@ -176,7 +198,7 @@ fn main() {
     println!();
     match stopped_early {
         Some((n, bytes)) => {
-            let alloc_b = std::fs::metadata(&main_path).map(|m| m.blocks() * 512).unwrap_or(0);
+            let alloc_b = allocated_bytes(&main_path).unwrap_or(0);
             let alloc_per = alloc_b as f64 / n as f64;
             let per_branch = bytes as f64 / n as f64;
             println!("Allocated (blocks*512) rather than merely addressed: {:.0} B/branch, {:.2} GB total.",

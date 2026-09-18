@@ -46,23 +46,42 @@ use ferrodb::wal::txn::TxnManager;
 ///
 /// Same shape as `examples/branch_curve.rs`, deliberately: one already-used instrument rather
 /// than a second one that might disagree with it.
-fn peak_rss_bytes() -> u64 {
-    #[repr(C)]
-    #[derive(Default)]
-    struct RUsage {
-        ru_utime: [i64; 2],
-        ru_stime: [i64; 2],
-        ru_maxrss: i64,
-        rest: [i64; 14],
+/// `Option`, not `0`: the old signature returned `0` both when `getrusage` FAILED and, once this
+/// harness was built on Windows, when the platform had no `getrusage` at all. A zero is
+/// indistinguishable from a real measurement of a tiny process. Callers render `None` as `NaN`.
+///
+/// Platform split gated the way `storage::disk_manager::pwrite` already gates its -- the repo's
+/// existing pattern. Linking `getrusage` on windows-latest fails with `LNK2019`, which broke CI
+/// for every example in this directory.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct RUsage {
+            ru_utime: [i64; 2],
+            ru_stime: [i64; 2],
+            ru_maxrss: i64,
+            rest: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+        }
+        let mut u = RUsage::default();
+        if unsafe { getrusage(0, &mut u) } != 0 {
+            return None;
+        }
+        Some(if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 })
     }
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    #[cfg(not(unix))]
+    {
+        None
     }
-    let mut u = RUsage::default();
-    if unsafe { getrusage(0, &mut u) } != 0 {
-        return 0;
-    }
-    if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 }
+}
+
+/// `peak_rss_bytes()` in megabytes, or `NaN` where the platform cannot answer.
+fn peak_rss_mb() -> f64 {
+    peak_rss_bytes().map_or(f64::NAN, |b| b as f64 / 1e6)
 }
 
 struct Db {
@@ -234,7 +253,10 @@ fn main() {
         "{w}\t{n}\t{}\t{seed_s:.3}\t{stage_s:.6}\t{fork_s:.6}\t{:.3}\t{child_write_s:.6}\t{:.1}\t{:.1}",
         n * w,
         (fork_s * 1e6) / n as f64,
-        peak_rss_bytes() as f64 / 1e6,
-        (rss_after.saturating_sub(rss_before)) as f64 / 1e6,
+        peak_rss_mb(),
+        match (rss_after, rss_before) {
+            (Some(a), Some(b)) => a.saturating_sub(b) as f64 / 1e6,
+            _ => f64::NAN,
+        },
     );
 }

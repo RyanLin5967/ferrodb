@@ -99,24 +99,42 @@ fn window(base_live: usize, base_allocs: usize) -> (usize, usize) {
     )
 }
 
-fn peak_rss_bytes() -> u64 {
-    // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
-    #[repr(C)]
-    #[derive(Default)]
-    struct RUsage {
-        ru_utime: [i64; 2],
-        ru_stime: [i64; 2],
-        ru_maxrss: i64,
-        rest: [i64; 14],
+/// Peak resident set in bytes, or `None` where this platform cannot answer.
+///
+/// `Option`, not `0`. The old signature returned `0` both when `getrusage` FAILED and when the
+/// platform had no `getrusage` at all -- a zero is indistinguishable from a real measurement of a
+/// tiny process, and a memory number is the entire point of this harness. The one call site
+/// renders `None` as `NaN`, in MiB, which is this file's unit; a second helper in MB would be two
+/// instruments that can disagree.
+///
+/// Gated the way `storage::disk_manager::pwrite` already gates its platform split -- the repo's
+/// existing pattern, not a new one. Linking `getrusage` on windows-latest fails with `LNK2019:
+/// unresolved external symbol getrusage`, which broke CI for every example in this directory.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
+        #[repr(C)]
+        #[derive(Default)]
+        struct RUsage {
+            ru_utime: [i64; 2],
+            ru_stime: [i64; 2],
+            ru_maxrss: i64,
+            rest: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+        }
+        let mut u = RUsage::default();
+        if unsafe { getrusage(0, &mut u) } != 0 {
+            return None;
+        }
+        Some(if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 })
     }
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    #[cfg(not(unix))]
+    {
+        None
     }
-    let mut u = RUsage::default();
-    if unsafe { getrusage(0, &mut u) } != 0 {
-        return 0;
-    }
-    if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 }
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -265,7 +283,7 @@ fn main() {
             first10_heap,
             collect_heap,
             mib(collect_heap),
-            peak_rss_bytes() as f64 / (1024.0 * 1024.0),
+            peak_rss_bytes().map_or(f64::NAN, |b| b as f64 / (1024.0 * 1024.0)),
         );
         eprintln!(
             "  n={n} build={built:?} allocs: stream={stream_allocs} stream2={stream2_allocs} \
