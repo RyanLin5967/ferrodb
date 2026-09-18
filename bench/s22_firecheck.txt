@@ -1,0 +1,29 @@
+S22 FIRE-CHECK: each guard broken on purpose, in an isolated worktree
+restore source: git HEAD, never the working tree
+
+M1  CAUGHT
+    break: try_pin_resident: drop the frame-label re-check
+    test:  a_stale_page_table_entry_never_yields_another_pages_frame
+    saw:   thread 'a_stale_page_table_entry_never_yields_another_pages_frame' (355449571) panicked at tests/integration_buffer_pool_latch.rs:251:13:
+
+M2  CAUGHT (hang)
+    break: fetch_page: remove from in_transit only on success
+    test:  a_failed_load_does_not_strand_the_page_in_transit
+    saw:   the test did not terminate, which is this break's failure mode
+
+M3  CAUGHT (hang)
+    break: invalidate_all: drop the in_transit refusal
+    test:  invalidate_all_refuses_while_a_write_back_is_in_flight
+    saw:   the test did not terminate, which is this break's failure mode
+
+M4  CAUGHT
+    break: evict_into: unpublish the dirty victim BEFORE the write-back
+    test:  the_victim_stays_reachable_until_its_write_back_lands
+    saw:   thread 'the_victim_stays_reachable_until_its_write_back_lands' (356084897) panicked at tests/integration_buffer_pool_latch.rs:696:9:
+
+M5  CAUGHT
+    break: fault_in: do not reinstate a declined victim
+    test:  a_declined_eviction_leaves_the_victim_tracked_as_resident
+    saw:   thread 'a_declined_eviction_leaves_the_victim_tracked_as_resident' (356119049) panicked at tests/integration_buffer_pool_latch.rs:638:5:
+
+5 of 5 guards verified to fire.
