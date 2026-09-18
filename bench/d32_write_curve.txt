@@ -1,0 +1,25 @@
+=== D32: the curve WITH ONE PAGE WRITTEN PER BRANCH -- raw, uninterpreted ===
+commit: feee712b3635cd66f695ed6b005e9d032e03013c
+date:   2026-09-18T03:25:00Z
+cmd:    ./target/debug/examples/branch_curve_writes '500,1000,2000,4000' 8 3.0
+note:   machine was under load (6 build agents + a full suite), so forks/sec is NOT a
+        throughput claim. The column that matters here is data B/branch, which is a
+        SPACE measurement and is not distorted by contention.
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 3 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   data B/branch   cat MB   cat B/branch   pages live
+       496       569.2     519.1         1046478      0.2            347          496
+      1000       477.5    1047.5         1047536      0.3            332         1000
+      2000       638.2    2096.1         1048056      0.7            328         2000
+      4000       380.5    4193.3         1048316      1.3            330         4000
+
+STOPPED EARLY ON SPACE at N = 4000, data file 4.19 GB (1048316 bytes/branch).
+Extrapolated (ARITHMETIC, NOT MEASURED) to the objective:
+  10^6 branches x 1048316 B = 1.05 TB of data file.
+D31 CONFIRMED as the binding wall on the ACTUAL objective: the 10^6 result in
+bench/curve_to_1e6.txt was reached fork-only, on the one workload that does not
+pay this. Fix is geometric extent growth (SCALE-DESIGN D31 option 1), NOT
+lowering ARENA_EXTENT_PAGES -- reclamation is per-extent on purpose.
