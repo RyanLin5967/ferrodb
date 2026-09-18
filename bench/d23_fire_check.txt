@@ -1,0 +1,101 @@
+=== D23 fire-check: break the latch protocol, watch the test fail, restore ===
+commit under test: de980e2ddd34c6795accf4e5fe1dcd42496347ba
+date: 2026-09-18T02:55:21Z
+cmd:  cargo test --test integration_btree_concurrency -- --test-threads=1
+
+--- BASELINE (as committed) ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.83s
+
+--- BREAK A: fast-path leaf latch released mid read-modify-write (the original defect) ---
+test btree_concurrent_16_threads ... FAILED
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... FAILED
+test btree_concurrent_8_threads ... FAILED
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.16s
+
+--- BREAK B: parent read latch NOT retained while the leaf is write-latched ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.27s
+
+--- BREAK C: range scanner walks the leaf chain with no read latch ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.07s
+
+--- RESTORED ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.82s
+?? bench/d23_fire_check.txt
+
+=== ADDENDUM: breaks B and C did not fire above, so the window was widened ===
+A guard whose removal cannot be made to fail is not a proven guard. Both
+variants below insert the SAME scheduling point; only the latch differs, so a
+difference between them is attributable to the latch and nothing else.
+
+--- B-CONTROL: yield_now() in the window, parent read latch KEPT ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.38s
+
+--- B-BROKEN: same yield_now(), parent read latch DROPPED ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.27s
+
+--- RESTORED ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.68s
+?? bench/d23_fire_check.txt
+
+=== ADDENDUM 2: BREAK B above was mis-aimed, and this corrects it ===
+That break released the parent latch AFTER the leaf write latch was already in
+hand, so the window the parent latch exists to cover was still covered and the
+test was right not to fail. The window is [release leaf read latch, acquire
+leaf write latch] and nothing else -- so the code now also releases the parent
+immediately after that acquisition instead of holding it for the whole insert.
+Both variants below carry the SAME yield_now() inside that window; only the
+latch differs.
+
+--- B2-CONTROL: yield_now() inside the window, parent read latch HELD across it ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.79s
+
+--- B2-BROKEN: same yield_now(), parent read latch RELEASED before the window ---
+test btree_concurrent_16_threads ... error: test failed, to rerun pass `--test integration_btree_concurrency`
+
+--- RESTORED (parent released right after the leaf latch is acquired) ---
+test btree_concurrent_16_threads ... ok
+test btree_concurrent_1_thread ... ok
+test btree_concurrent_32_threads ... ok
+test btree_concurrent_8_threads ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.85s
+ M src/buffer/buffer_pool.rs
+ M src/storage/index.rs
+ M src/storage/page_latch.rs
+ M src/storage/range_scan.rs
+?? bench/d23_fire_check.txt
+?? bench/d23_lockorder_verify.txt
+?? tests/lock_order_allowlist.rs
+?? tests/lock_order_runtime.rs

@@ -1,0 +1,33 @@
+=== D23 lock-order guard: verification run ===
+date: 2026-09-18T03:05:51Z
+sha:  de980e2ddd34c6795accf4e5fe1dcd42496347ba + uncommitted
+
+--- cargo test --test integration_btree_concurrency ---
+error: test failed, to rerun pass `--test integration_btree_concurrency`
+--- cargo test --test lock_order_allowlist ---
+test the_scanner_catches_an_unlisted_latcher ... ok
+test the_scanner_catches_a_pool_method_missing_its_marker ... ok
+test every_pool_method_that_locks_opens_a_pool_section ... ok
+test only_the_tree_may_take_a_page_latch ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+--- cargo test --test lock_order_runtime ---
+test a_page_latch_taken_while_holding_a_frame_write_lock_is_caught - should panic ... ok
+test a_page_latch_taken_while_holding_a_frame_read_lock_is_caught - should panic ... ok
+test the_correct_order_latch_then_frame_is_not_flagged ... ok
+test pool_sections_do_not_leak_across_calls ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+--- cargo test --test integration_buffer_pool_concurrency ---
+test reading_a_page_that_does_not_exist_twice_errors_twice_instead_of_panicking ... ok
+test every_page_reads_back_its_own_stamp_single_threaded ... ok
+test concurrent_fetches_never_return_another_pages_bytes ... ok
+test the_page_table_never_maps_two_pages_to_one_frame ... ok
+test every_frame_agrees_with_the_page_table_about_which_page_it_holds ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+--- cargo test --test integration_flush_concurrency ---
+test flushing_a_page_that_is_being_evicted_does_not_panic ... ok
+test concurrent_flush_and_fetch_never_write_the_wrong_page_to_disk ... ok
+test flush_all_is_atomic_against_concurrent_fetches ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+--- cargo test --lib (storage+buffer) ---
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 1205 filtered out; finished in 0.97s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1281 filtered out; finished in 0.00s

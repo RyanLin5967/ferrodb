@@ -17,6 +17,50 @@
 //! order is `page latch → arc_cache → page_table → frame`, and nothing under `arc_cache` ever
 //! reaches for a page latch.
 //!
+//! # The ONE property this layer needs from the buffer pool
+//!
+//! **No `BufferPoolManager` operation may acquire a page latch, directly or transitively.**
+//!
+//! That is the whole contract, and it is worth stating separately because the paragraph above is
+//! *not* it. "`fetch_page` holds `arc_cache` across frame locks" explains why the frame `RwLock`s
+//! could not themselves be used as the crabbing latches — it is a fact about the pool's internals
+//! that motivated building this layer, not a requirement on them. The pool is free to shard that
+//! lock, drop it off the I/O path, or remove it entirely: crabbing keeps working, because crabbing
+//! only ever calls *downward* (it holds a page latch and then calls `fetch_page`), and downward
+//! calls cannot close a cycle unless the callee calls back up.
+//!
+//! This distinction is live: `S22-bufpool-latch` is taking the pool's global lock off the I/O path
+//! while this is being written. That change is orthogonal to this layer by the contract above.
+//!
+//! # That contract is ENFORCED, not merely documented
+//!
+//! A documented invariant nothing checks is the exact shape that produced the three defects this
+//! module exists to fix — `branch/group_commit.rs` said "BPlusTreeManager is not safe for
+//! concurrent compound mutations" and enforced it by asking callers to remember a mutex. So the
+//! contract is mechanical here, in two halves, both active under `debug_assertions`:
+//!
+//! 1. **A thread-local depth counter.** Every `BufferPoolManager` method that takes one of the
+//!    pool's locks opens a *pool section* ([`enter_pool`]), and [`PageLatches::read`] and
+//!    [`PageLatches::write`] refuse — loudly, with a panic naming the inversion — if a pool
+//!    section is open on the calling thread. A future `fetch_page` that reaches up for a page
+//!    latch therefore fails a test instead of deadlocking rarely in production.
+//! 2. **An allowlist over who may latch at all** (`tests/lock_order_allowlist.rs`). Only
+//!    `src/storage/index.rs` and `src/storage/range_scan.rs` may acquire a page latch. That is
+//!    what makes half 1 complete rather than partial: the ~40 other `frames[i]` lock sites in the
+//!    tree (`heap_file_manager`, `catalog`, `cow`, `wal`, `branch/arena`) are *untracked*, and
+//!    that is sound only for as long as none of them takes a page latch. The allowlist test fails
+//!    the moment one does.
+//!
+//! **Blind spots, stated here rather than discovered later.** (a) The counter is compiled out in
+//! release; it is a test-time detector, not a runtime guard. (b) `src/branch/arena.rs` locks
+//! `page_table` and `arc_cache` directly rather than through a `BufferPoolManager` method, so
+//! those two acquisitions are untracked — harmless only because `arena.rs` is not on the
+//! allowlist. (c) If `index.rs` or `range_scan.rs` ever reaches a frame lock through a *third*
+//! module rather than through [`BufferPoolManager::frame_read`]/[`frame_write`] or a pool method,
+//! that acquisition is invisible to half 1.
+//!
+//! [`frame_write`]: BufferPoolManager::frame_write
+//!
 //! # Why hand-rolled rather than `RwLock` per page
 //!
 //! A `HashMap<u32, RwLock<()>>` cannot hand out a guard that outlives the map lookup without
@@ -45,6 +89,91 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Condvar, Mutex};
 
+#[cfg(doc)]
+use crate::buffer::buffer_pool::BufferPoolManager;
+
+// ------------------------------------------------------------------------------------------
+// MECHANICAL LOCK-ORDER ENFORCEMENT — see "That contract is ENFORCED" in the module doc
+// ------------------------------------------------------------------------------------------
+
+/// Thread-local tracking of "am I inside the buffer pool right now".
+///
+/// A `u32` depth rather than a `bool` because pool methods nest: `free_page` calls
+/// `delete_page`, and `flush_all` walks pages one at a time.
+#[cfg(debug_assertions)]
+mod order {
+    use std::cell::Cell;
+
+    thread_local! {
+        static POOL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// How many buffer-pool sections this thread currently has open. `0` means it holds no pool
+    /// lock and may therefore acquire a page latch.
+    pub fn pool_depth() -> u32 {
+        POOL_DEPTH.with(|d| d.get())
+    }
+
+    /// Open a pool section: "this thread now holds, or is about to take, a buffer-pool lock."
+    ///
+    /// Call this at the top of any `BufferPoolManager` method that locks `arc_cache`,
+    /// `page_table`, or a frame, and hold the returned guard for the whole method.
+    #[must_use = "the pool section closes when this guard is dropped"]
+    pub fn enter_pool() -> PoolSection {
+        POOL_DEPTH.with(|d| d.set(d.get() + 1));
+        PoolSection(())
+    }
+
+    pub struct PoolSection(pub(super) ());
+
+    impl Drop for PoolSection {
+        fn drop(&mut self) {
+            POOL_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+}
+
+/// Release build: every hook is a zero-sized no-op and `pool_depth()` const-folds to `0`, so the
+/// assertion below compiles away entirely.
+#[cfg(not(debug_assertions))]
+mod order {
+    pub struct PoolSection(pub(super) ());
+
+    #[inline(always)]
+    pub fn pool_depth() -> u32 {
+        0
+    }
+
+    #[inline(always)]
+    #[must_use]
+    pub fn enter_pool() -> PoolSection {
+        PoolSection(())
+    }
+}
+
+pub use order::{PoolSection, enter_pool, pool_depth};
+
+/// Panic if this thread is inside the buffer pool, because taking a page latch from there is the
+/// `frame → arc_cache` inversion this layer exists to make impossible.
+///
+/// A panic and not a `Result`: the caller cannot do anything useful with "you have deadlocked the
+/// storage engine", and the alternative to failing here is failing rarely, under load, as a hang
+/// with no stack.
+#[track_caller]
+fn assert_page_latch_is_above_the_pool(mode: &str, page_id: u32) {
+    let depth = pool_depth();
+    assert!(
+        depth == 0,
+        "LOCK-ORDER INVERSION: a page latch ({mode} on page {page_id}) was requested while this \
+         thread holds {depth} buffer-pool lock section(s). The order is \
+         `page latch -> arc_cache -> page_table -> frame`, so a page latch may only be taken by a \
+         thread holding NO pool lock. Taking one from underneath lets thread A hold frame(P) and \
+         wait on this latch while thread B holds this latch and waits on frame(P). Fix the CALLER: \
+         acquire the page latch first, then call into BufferPoolManager. See \
+         src/storage/page_latch.rs."
+    );
+}
+
 #[derive(Default)]
 struct Latch {
     readers: u32,
@@ -72,7 +201,12 @@ impl PageLatches {
     }
 
     /// Shared access to `page_id`. Blocks while a writer holds or is waiting for it.
+    ///
+    /// Panics in a debug build if the calling thread is inside the buffer pool; see
+    /// [`assert_page_latch_is_above_the_pool`].
+    #[track_caller]
     pub fn read(&self, page_id: u32) -> PageReadGuard<'_> {
+        assert_page_latch_is_above_the_pool("read", page_id);
         let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             let l = table.entry(page_id).or_default();
@@ -85,7 +219,12 @@ impl PageLatches {
     }
 
     /// Exclusive access to `page_id`. Blocks until no reader and no writer holds it.
+    ///
+    /// Panics in a debug build if the calling thread is inside the buffer pool; see
+    /// [`assert_page_latch_is_above_the_pool`].
+    #[track_caller]
     pub fn write(&self, page_id: u32) -> PageWriteGuard<'_> {
+        assert_page_latch_is_above_the_pool("write", page_id);
         let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
         table.entry(page_id).or_default().writers_waiting += 1;
         loop {
@@ -230,5 +369,71 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(*cell.lock().unwrap(), 4000, "the write latch did not serialise");
+    }
+
+    // --------------------------------------------------------------------------------------
+    // THE LOCK-ORDER DETECTOR — forced to fire, then shown not to fire spuriously
+    // --------------------------------------------------------------------------------------
+    //
+    // A detector that has never fired is not a passing detector, so both directions are pinned
+    // here. These use an IDLE page on purpose: without the assertion the inverted order below
+    // would simply succeed (nothing holds the latch), so the test exercises the check itself
+    // rather than hoping to catch a real deadlock.
+
+    #[test]
+    #[should_panic(expected = "LOCK-ORDER INVERSION")]
+    fn a_read_latch_taken_from_inside_the_pool_is_refused() {
+        let l = PageLatches::new();
+        let _inside = enter_pool(); // stands in for being part-way through `fetch_page`
+        let _g = l.read(1); // must panic: `frame -> page latch` is the inverted order
+    }
+
+    #[test]
+    #[should_panic(expected = "LOCK-ORDER INVERSION")]
+    fn a_write_latch_taken_from_inside_the_pool_is_refused() {
+        let l = PageLatches::new();
+        let _inside = enter_pool();
+        let _g = l.write(1);
+    }
+
+    /// The other half: the CORRECT order must stay silent, or the detector is useless noise.
+    #[test]
+    fn latching_first_and_then_entering_the_pool_is_allowed() {
+        let l = PageLatches::new();
+        let _g = l.write(1); // page latch first ...
+        let _inside = enter_pool(); // ... then down into the pool. This is the whole protocol.
+        assert_eq!(pool_depth(), 1);
+    }
+
+    /// The depth is a counter, not a flag, because pool methods nest (`free_page` ->
+    /// `delete_page`). An inner section closing must not re-open the door.
+    #[test]
+    fn nested_pool_sections_unwind_to_zero_and_not_below() {
+        assert_eq!(pool_depth(), 0);
+        {
+            let _a = enter_pool();
+            {
+                let _b = enter_pool();
+                assert_eq!(pool_depth(), 2);
+            }
+            assert_eq!(pool_depth(), 1, "an inner section closing must not clear the outer one");
+        }
+        assert_eq!(pool_depth(), 0);
+        let l = PageLatches::new();
+        let _g = l.read(1); // and now latching is permitted again
+    }
+
+    /// The counter is per-thread: one thread being inside the pool must not block another from
+    /// latching, or the detector would fire on correct concurrent code.
+    #[test]
+    fn the_depth_is_per_thread() {
+        let _inside = enter_pool();
+        std::thread::spawn(|| {
+            assert_eq!(pool_depth(), 0, "pool depth leaked across threads");
+            let l = PageLatches::new();
+            let _g = l.read(1);
+        })
+        .join()
+        .unwrap();
     }
 }
