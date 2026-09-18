@@ -20,3 +20,15 @@ Predictions were recorded before this run: artie-research/S12-PREDICTIONS.md
 # 859,904 forks in 560s (~1535/sec aggregate), so 10^6 cumulative forks needs ~650s of forking
 # BEFORE any per-N measurement overhead. The command as written could never have reached 10^6.
 # Four N points are valid and are reported as such; nothing here licenses a 10^6 claim.
+#
+# ⛔⛔ RETRACTION, written where the claim was made. The "KNEE" in this file's own commit
+# subject IS WRONG and I am the one who was wrong.
+#   live_count @ 499,968 -- this run 477.109 ms | prior run 36.096 ms | RE-MEASURED 39.387 ms
+#   (bench/s18_livecount_500k_recheck.txt, rc=0, standalone, same binary, same N)
+# 39.387 vs the prior 36.096 is a 1.09x match. The 477.109 was a SINGLE-POINT OUTLIER -- almost
+# certainly this machine at load ~15 with four agent probes running, not a property of the code.
+# live_count remains LINEAR exactly as bench/curve_to_1e6.txt recorded it. S20 is unchanged.
+#
+# The tell was already in the data before I re-ran: 1e4/1e5/2.5e5 reproduced the prior run within
+# 15%, and a real regression in live_count would have moved EVERY row, not one. I wrote "KNEE"
+# into a commit subject on one anomalous point whose three neighbours already contradicted it.
