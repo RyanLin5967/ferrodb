@@ -158,7 +158,7 @@ fn fixture(s: usize) -> (Arc<AgentRuntime>, Vec<AgentSession>) {
 /// fixture has `gone = 0` and measures nothing. The periodic arm cannot be used here at all, and
 /// rebuilding the fixture is the only honest way to take more than one sample. Each rep
 /// contributes the prober's largest stall while that single sweep ran.
-fn oneshot(s: usize, g: usize, reps: usize) -> (Samples, Samples) {
+fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples) {
     let mut stalls: Vec<u64> = Vec::with_capacity(reps);
     let mut walls: Vec<u64> = Vec::with_capacity(reps);
     for _ in 0..reps {
@@ -170,6 +170,8 @@ fn oneshot(s: usize, g: usize, reps: usize) -> (Samples, Samples) {
             rec.mark_reaped();
             rt.branches().put(&rec).expect("put reaped record");
         }
+        // Exactly what `reap_expired` hands `scan_once`, for the targeted arm to be given.
+        let reaped: Vec<BranchId> = sessions.iter().take(g).map(|sess| sess.branch).collect();
 
         let stop = Arc::new(AtomicBool::new(false));
         let probe_rt = Arc::clone(&rt);
@@ -187,7 +189,11 @@ fn oneshot(s: usize, g: usize, reps: usize) -> (Samples, Samples) {
         std::thread::sleep(Duration::from_millis(20));
 
         let t0 = Instant::now();
-        let dropped = rt.forget_reaped_branches();
+        // `recon` is the full reconciliation -- the backstop, O(open sessions). `fast` is
+        // `forget_branches(&reaped)`, which is what `scan_once` calls on every successful tick
+        // now that it stops re-deriving a list `reap_expired` already handed it.
+        let dropped =
+            if targeted { rt.forget_branches(&reaped) } else { rt.forget_reaped_branches() };
         walls.push(t0.elapsed().as_nanos() as u64);
         assert_eq!(dropped, g, "fixture reaped {g} branches, sweep forgot {dropped}");
 
@@ -293,24 +299,35 @@ fn main() {
     println!("# TABLE 2 -- a reap really happened: {gone} of the S branches are gone from the");
     println!("# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, {reps} fixtures;");
     println!("# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.");
+    println!("#");
+    println!("# TWO ARMS. `recon` is `forget_reaped_branches` -- the reconciliation, which walks");
+    println!("# every open session and is the BACKSTOP the lease thread now runs only when a scan");
+    println!("# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,");
+    println!("# which is what `scan_once` calls on every successful tick: O(gone), not O(S).");
     println!(
-        "{:>8} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12}",
-        "S", "gone", "reps", "stall_med", "stall_max", "wall_med", "wall_max"
+        "{:>8} {:>7} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
+        "S", "gone", "reps", "arm", "stall_med", "stall_max", "wall_med", "wall_max"
     );
     for &s in &sweep {
         let g = gone.min(s);
-        let t0 = Instant::now();
-        let (stalls, walls) = oneshot(s, g, reps);
-        eprintln!("# T2 S={s} g={g}: {reps} fixtures in {} ms", t0.elapsed().as_millis());
-        println!(
-            "{:>8} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12}",
-            s,
-            g,
-            reps,
-            stalls.pct(0.50),
-            stalls.max(),
-            walls.pct(0.50),
-            walls.max(),
-        );
+        for (name, targeted) in [("recon", false), ("fast", true)] {
+            let t0 = Instant::now();
+            let (stalls, walls) = oneshot(s, g, reps, targeted);
+            eprintln!(
+                "# T2 S={s} g={g} {name}: {reps} fixtures in {} ms",
+                t0.elapsed().as_millis()
+            );
+            println!(
+                "{:>8} {:>7} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
+                s,
+                g,
+                reps,
+                name,
+                stalls.pct(0.50),
+                stalls.max(),
+                walls.pct(0.50),
+                walls.max(),
+            );
+        }
     }
 }

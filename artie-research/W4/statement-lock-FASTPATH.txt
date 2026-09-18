@@ -1,0 +1,41 @@
+# W4 FAST PATH -- forget_branches(&reaped) vs the full reconciliation.
+# Same harness, same prober, same protocol as statement-lock-BEFORE/AFTER.txt.
+# host: Apple M5 Pro; rustc 1.97.1 (8bab26f4f 2026-07-14)
+# NOTE: the agent fleet was running throughout, as it was for every other file here.
+# TABLE 2 carries the new arms; TABLE 1 is unchanged and is reproduced as a control.
+
+# W4 statement-lock sweep. os=macos window=3s op_period=2ms gone=64 reps=5
+# prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)
+# probe_* = one unrelated statement's lock acquisition, NANOSECONDS
+# stall_mean = mean of the op_n largest probe samples: one acquisition blocks per op,
+#           so this averages the population that waited. THE HEADLINE NUMBER.
+# op_*    = the arm's own operation, wall, NANOSECONDS (sweep wall is dominated by
+#           phase 2, which holds NO lock -- it is not the blocking number)
+       S     arm   probe_n      p50       p999  stall_mean   probe_max    op_n     op_mean      op_max
+#
+# TABLE 1 -- steady state: nothing is reap-eligible, so only PHASE 1 runs.
+    1000    idle     42159       42        792         617       46042    1257        5431     1997625
+    1000   sweep     40830       42     132791       57122      595833    1261      136042      544500
+    1000   activ     40117       42     233750      157539      416709    1267      228199      390791
+   10000    idle     35218       42        792         824      128458    1067      642544    10994375
+   10000   sweep     20366    64750    3413916      401653    14033375    1247     2140136    30546125
+   10000   activ      5746       83   17483500     2566587    24538750     990     3026014    23641917
+  100000    idle     28872       83        833         712       50083     932     1113969    20851250
+  100000   sweep     15692      417    5792667     3977991    16578917     108    28039936    61618583
+  100000   activ      4992       83   29827792    24947262    62292541     105    28750856    66048459
+#
+# TABLE 2 -- a reap really happened: 64 of the S branches are gone from the
+# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, 5 fixtures;
+# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.
+#
+# TWO ARMS. `recon` is `forget_reaped_branches` -- the reconciliation, which walks
+# every open session and is the BACKSTOP the lease thread now runs only when a scan
+# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,
+# which is what `scan_once` calls on every successful tick: O(gone), not O(S).
+       S    gone   reps    arm    stall_med    stall_max     wall_med     wall_max
+    1000      64      5  recon       104875       144542       269208       309667
+    1000      64      5   fast          833       144667        76417       183084
+   10000      64      5  recon       716583      2677000      4054250      4912875
+   10000      64      5   fast       118875       195292       257708       485292
+  100000      64      5  recon       530125      2565667     24493958     27702708
+  100000      64      5   fast        56542       109750       135458       173875

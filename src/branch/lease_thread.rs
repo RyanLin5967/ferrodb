@@ -418,7 +418,15 @@ fn scan_once(
                     return;
                 }
                 counters.reaped.fetch_add(reaped.len() as u64, Ordering::SeqCst);
-                let forgotten = runtime.forget_reaped_branches();
+                // **Forget exactly what was reaped, not everything that might have been.**
+                //
+                // This used to call `forget_reaped_branches`, which re-derives the set by walking
+                // every open session and asking the catalog about each one — O(open sessions),
+                // inside this `with_lock`, which is the pgwire server's PER-STATEMENT mutex. So a
+                // timer stopped every statement in the database for the length of that walk: 39.3 s
+                // at 10⁶ open sessions (`bench/runtime_at_1e6.txt`, W4). The list is right here;
+                // searching for what we were already handed was the whole cost.
+                let forgotten = runtime.forget_branches(&reaped);
                 counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
                 report(format!(
                     "lease: reaped {} expired branch(es) with no client cooperation ({}); {} \
@@ -430,9 +438,21 @@ fn scan_once(
             }
             Err(e) => {
                 counters.failed.fetch_add(1, Ordering::SeqCst);
+                // **The one path where the list cannot be trusted, so the full sweep runs.**
+                //
+                // `reap_expired` accumulates the ids it reaps and then DISCARDS that vector if any
+                // later branch fails (`reaper.rs`, the `Err(e) => return Err(e)` arm; likewise if
+                // `sweep_empty_extents` fails after a clean loop). Those branches are gone from the
+                // catalog and nothing will ever name them again, so the fast path above cannot see
+                // them and they would leak for the life of the process. The reconciliation is what
+                // covers that, and this is the only tick that has to pay for it.
+                let forgotten = runtime.forget_reaped_branches();
+                counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
                 report(format!(
                     "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
-                     is re-entrant, so the next scan resumes rather than double-freeing."
+                     is re-entrant, so the next scan resumes rather than double-freeing. \
+                     {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
+                     does not report which branches it had already reaped."
                 ));
             }
         }

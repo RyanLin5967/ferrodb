@@ -1,0 +1,9 @@
+# T1 S=1000: opened 1000 sessions in 1 ms
+# T1 S=10000: opened 10000 sessions in 30 ms
+# T1 S=100000: opened 100000 sessions in 1280 ms
+# T2 S=1000 g=64 recon: 5 fixtures in 122 ms
+# T2 S=1000 g=64 fast: 5 fixtures in 132 ms
+# T2 S=10000 g=64 recon: 5 fixtures in 318 ms
+# T2 S=10000 g=64 fast: 5 fixtures in 455 ms
+# T2 S=100000 g=64 recon: 5 fixtures in 8449 ms
+# T2 S=100000 g=64 fast: 5 fixtures in 8479 ms

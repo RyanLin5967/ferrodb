@@ -3,6 +3,12 @@
 Status: done, measured, committed. Evidence files in this directory are the raw runs; every number
 below names the file it came from.
 
+**Read the addendum at the end before acting on this record.** Everything here is about
+`AgentRuntime`'s `Mutex<State>` and holds. It is not the only lock the sweep runs under, and the
+brief's 39.3 s headline is about the other one — the pgwire per-statement mutex that `scan_once`
+holds across the *entire* call, phase 2 included. That was found after this section was written and
+is fixed separately; the addendum has the change and its numbers.
+
 ## What was actually wrong
 
 `AgentRuntime` holds one `Mutex<State>`, taken by every statement that touches branch state.
@@ -151,3 +157,91 @@ naming the slot.
    check. Reproduction is recorded in `tests/w4_sweep_slot_recycle.rs` at the point that measured
    it. Closing it means a generation check at every workspace lookup — a different change from this
    one, and a wider one.
+
+## Addendum — the OTHER lock, found after this record said "done"
+
+The record above is about `AgentRuntime`'s `Mutex<State>`, and everything it claims about that lock
+holds. It is not the only lock the sweep runs under, and the brief's headline number is about the
+other one.
+
+`scan_once` (`src/branch/lease_thread.rs`) runs its **entire** body inside `with_lock(lock, ..)`.
+That lock is `ServerContext::catalog()` — the pgwire server's per-statement mutex (the
+`RuntimeLock` impl in the same file), or `CatalogLock` for the CLI. So chunking `State` changes
+nothing about it: the outer lock is taken once, before the sweep starts, and released once, after it
+finishes. Between those two points every statement in the database is blocked, for the whole sweep,
+including **phase 2** — the O(open sessions) run of catalog reads that `State` chunking deliberately
+does not cover because phase 2 holds no `State` lock at all.
+
+That is what S15's 39.3 s at 10⁶ open sessions is made of (`bench/runtime_at_1e6.txt`, W4), and it
+is the number the brief asked about: *"39.3 s HOLDING the server's per-statement lock"*. The
+chunk-and-index change fixes the 129 ms → 0.68 ms `State` stall and leaves that untouched.
+
+### What was done about it
+
+`scan_once` stops re-deriving a list it was already handed. `reap_expired` returns exactly the
+branches it reaped; the sweep then walked every open session and asked the catalog about each one to
+rediscover them. The successful tick now calls `AgentRuntime::forget_branches(&reaped)`, which is
+O(branches actually reaped) and touches the catalog `reaped.len()` times instead of
+`open_sessions` times. It is chunked by the same `FORGET_CHUNK`, because a simulation can expire
+thousands of candidates at once and an O(that) hold is the same wall through the other door.
+
+**This is not the "notification inbox" rejected above.** That option was a stateful queue the reaper
+pushes into, carrying a new invariant — every door that reaps must notify — whose silent rot
+reintroduces unbounded growth with no backstop. This is a stateless argument on a call that already
+had the list in hand, and the reconciliation is kept and still runs:
+
+- `simulate.rs` calls `forget_reaped_branches()` as a general GC pass, unchanged.
+- `LeaseThread::start` calls it after a crash resume, unchanged.
+- `scan_once`'s **error** arm now calls it, which is new and is the point. `reap_expired`
+  accumulates reaped ids and then discards that vector if a later branch fails (`reaper.rs`, the
+  `Err(e) => return Err(e)` arm; likewise if `sweep_empty_extents` fails after a clean loop). Those
+  branches are gone from the catalog and nothing will ever name them again. Before this, a failed
+  scan swept anyway and happened to catch them; a purely list-driven design would have leaked
+  exactly them. So the reconciliation runs on precisely the path where the list is known to be
+  incomplete.
+
+`tests/w4_forget_branches.rs` pins all three properties: the fast path drops what it is handed and
+is idempotent; it refuses a branch the catalog still holds, so one wrong id cannot delete a working
+agent's session; and a branch reaped but never reported is still found by the reconciliation. The
+third is the leak guard. Verified by mutation rather than by being green — with `forget_one_branch`
+stubbed to return `false`, two of the three fail; the third correctly does not, because it asserts
+that *nothing* is forgotten and a no-op satisfies that.
+
+### Result
+
+`statement-lock-FASTPATH.txt`, same harness and same prober as every other file here, with the two
+arms measured against one fixture: `recon` is `forget_reaped_branches()` (the backstop, O(sessions))
+and `fast` is `forget_branches(&reaped)` (what a successful tick now costs, O(reaped)).
+
+Largest wait an unrelated statement suffered (`stall`) and the sweep's own wall time (`wall`),
+median of 5 fixtures, nanoseconds. **`wall` is the column that matters for the server's statement
+lock**, because `scan_once` holds that lock for the whole call — `stall` is only the `State` mutex.
+
+| S | arm | stall_med | wall_med |
+|---|---|---|---|
+| 1 000 | recon | 104 875 | 269 208 |
+| 1 000 | **fast** | **833** | **76 417** |
+| 10 000 | recon | 716 583 | 4 054 250 |
+| 10 000 | **fast** | **118 875** | **257 708** |
+| 100 000 | recon | 530 125 | 24 493 958 |
+| 100 000 | **fast** | **56 542** | **135 458** |
+
+The shape is the result, not the ratio. `recon`'s wall rises 91x across 100x S (269 us -> 4.05 ms ->
+24.5 ms) — the O(open sessions) term, measured. `fast`'s wall has no trend across the same range
+(76 us -> 258 us -> 135 us); it is O(gone), and `gone` is fixed at 64. At S=10^5 that is 181x less
+time holding the pgwire statement lock, and unlike the `recon` column it does not get worse as more
+agents connect.
+
+Read the `fast` spread with the same caution the record applies to the after-column above: this
+machine's idle control reached 20.8 ms in table 1 with nothing holding the lock at all, so the
+single-sample maxima here sit near the floor this machine can resolve. The claim that survives is
+the `recon` wall column's slope, which is far above that floor.
+
+### What this still does not fix
+
+The reconciliation's own wall time is unchanged — it is still O(open sessions) catalog reads, and on
+the error path it still runs inside the server's statement lock. That path is rare by construction
+(it needs `reap_expired` to fail), but it is not free, and a database that is failing to reap is
+exactly one that may then also stall. Bounding it properly means either moving the sweep outside
+`with_lock` — which opens a window where a statement can touch a workspace whose branch is already
+reaped — or teaching the reaper to report what it freed before it failed. Neither was measured here.
