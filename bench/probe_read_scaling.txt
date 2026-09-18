@@ -1,0 +1,31 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-reads-limit-probe)
+    Finished `release` profile [optimized] target(s) in 0.55s
+     Running tests/probe_read_scaling2.rs (target/release/deps/probe_read_scaling2-9fe8ec4ec249c42d)
+
+running 1 test
+test read_scaling_across_threads_and_across_the_buffer_pool_boundary ... MAX_BUFFER_POOL_PAGES = 1024 frames (compile-time const, buffer_pool.rs:45)
+
+--- resident: 20000 rows, 298 pages, pool residency 100.0%
+   threads |      reads/s | speedup
+         1 |        40553 |   x1.00
+         2 |        79822 |  x1.97
+         4 |       148687 |  x3.67
+         8 |       226444 |  x5.58
+        12 |       244466 |  x6.03
+        16 |       243494 |  x6.00
+
+--- oversubscribed: 400000 rows, 5953 pages, pool residency 17.2%
+   threads |      reads/s | speedup
+         1 |        37122 |   x1.00
+         2 |        66967 |  x1.80
+         4 |        69190 |  x1.86
+         8 |        86061 |  x2.32
+        12 |        83754 |  x2.26
+        16 |        82090 |  x2.21
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 68.99s
+
+
+[exited with code 0]
