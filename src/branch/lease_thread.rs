@@ -423,9 +423,16 @@ fn scan_once(
                 // This used to call `forget_reaped_branches`, which re-derives the set by walking
                 // every open session and asking the catalog about each one — O(open sessions),
                 // inside this `with_lock`, which is the pgwire server's PER-STATEMENT mutex. So a
-                // timer stopped every statement in the database for the length of that walk: 39.3 s
-                // at 10⁶ open sessions (`bench/runtime_at_1e6.txt`, W4). The list is right here;
-                // searching for what we were already handed was the whole cost.
+                // timer stopped every statement in the database for the length of that walk. The
+                // list is right here; searching for what we were already handed was the whole cost.
+                //
+                // Measured in `artie-research/W4/statement-lock-FASTPATH.txt`: the reconciliation's
+                // wall time — which is what this lock is held for — rises 91x across 100x open
+                // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
+                // O(reaped). A larger figure for the same walk is reported on branch
+                // S15-runtime-at-1e6 (commit 0ac1931, `bench/runtime_at_1e6.txt`, W4); that file is
+                // not in this worktree and the number is NOT reproduced here, so it is motivation
+                // rather than evidence.
                 let forgotten = runtime.forget_branches(&reaped);
                 counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
                 report(format!(
