@@ -117,13 +117,44 @@
 //! left standing rather than deleted because the next reader will otherwise re-derive it from the
 //! same real numbers.
 //!
-//! What actually holds the slope was in this file the whole time. The resident hit loop is
-//! `fetch_page` + `unpin_page`, and between them each iteration takes `page_table.read()` twice,
-//! `frames[i].read()` twice, and two atomic RMWs on the pin counter -- **four RwLock read
-//! acquisitions before `touch` is even reached.** A Rust `RwLock`'s reader count is one
-//! process-wide cache line that every reader atomically RMWs; it contends exactly like a mutex,
-//! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
-//! five, which is why removing it bought 33% and nothing else.
+//! The resident hit loop is `fetch_page` + `unpin_page`, and between them each iteration takes
+//! `page_table.read()` twice, `frames[i].read()` twice, and two atomic RMWs on the pin counter --
+//! four RwLock read acquisitions before `touch` is even reached. A Rust `RwLock`'s reader count is
+//! one cache line that every reader atomically RMWs; it contends exactly like a mutex, it is simply
+//! not spelled `Mutex`.
+//!
+//! ⚠ **CORRECTED 2026-09-18: only TWO of those four are SHARED, and the "floor" has never been
+//! measured under contention.** `examples/bufpool_fault_concurrency.rs` gives each thread a
+//! **disjoint** slice of the page space -- `slot = (t + k * threads) % ids.len()` with every thread
+//! count dividing the page count, and the harness says so in its own doc comment at `:205`. Disjoint
+//! pages mean disjoint FRAMES, so `frames[i].read()` and both pin-counter RMWs sit on THREAD-PRIVATE
+//! cache lines in every number this project owns. What is genuinely shared is the two
+//! `page_table.read()` acquisitions and the `arc_cache` mutex -- and the C1 mirror already removes
+//! the former. So "four RwLock acquisitions" is a correct count of the CODE and a wrong count of the
+//! CONTENTION.
+//!
+//! ⛔ **AND THE HARNESS CONTAINS THE CONSTRUCT UNDER TEST, INSIDE THE TIMED WINDOW.**
+//! `bufpool_fault_concurrency.rs:220` creates ONE `Arc<AtomicUsize>` and `:314` does
+//! `done.fetch_add(1, Ordering::Relaxed)` on it per operation, inside the measured section --
+//! ~9.6M contended RMWs on a single cache line per 16-thread point. `refused` and `wrong` are the
+//! same shape. That cannot explain the 2x2's ORDERING, because every arm carries it; what it plausibly
+//! IS is the ceiling every arm runs into. A standalone model measured the same code shape with
+//! per-thread padded counters at 203.5 M/s at 16T with a POSITIVE slope, and with one shared counter
+//! at 45.7 M/s -- within 2% of C1STUB's measured 44.7-45.4 M/s. **Unconfirmed** (synthetic, 2 reps,
+//! loaded machine), and being settled by re-running BASE and C1STUB with padded counters.
+//! ⇒ Until that lands, treat **×0.579 as the INSTRUMENT's ceiling, not the design's**, and treat
+//! D44's pre-registered bar as provisional.
+//!
+//! ⭐ This is D44's own lesson turned on the instrument: an arm that removes one of two serialised
+//! walls measures the other. A shared counter inside the timed window is a third wall present in
+//! EVERY arm including the control, which is exactly why it cancels in comparisons and survives as
+//! a ceiling nobody attributes to the harness.
+//!
+//! ⚠ One more serialising point sits ABOVE the pool and is named nowhere in D35 or D44:
+//! `PageLatches` is a `Mutex<HashMap<u32, Latch>>` (`page_latch.rs:194`) with `wake.notify_all()` on
+//! every release, taken twice per tree level per lookup. On the branch path that is plausibly larger
+//! than anything in this file, and removing the pool's RMWs underneath it would reproduce the same
+//! mistake at a larger scale.
 //!
 //! # ⛔ TWO SERIALISED WALLS, AND EVERY EARLIER SINGLE-ARM READING OF THEM WAS WRONG
 //!
