@@ -2,7 +2,7 @@
 //!
 //! Every test below names a rule from `DISTRIBUTED.md` §F3 or from the module header of
 //! `transport.rs`, and every one of them has been seen to **fail** with that rule deliberately
-//! broken — the mutants and what each printed are recorded in `scratchpad/F3-transport.md`. A test
+//! broken — the mutants and what each printed are recorded in `F3-transport.md` (a session scratch file that was NEVER committed -- the run is not preserved in this tree). A test
 //! that has never failed is not evidence.
 
 use std::collections::BTreeMap;

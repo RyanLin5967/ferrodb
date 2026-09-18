@@ -1,0 +1,17 @@
+N	first_us	last_us	total_s	log_bytes	reopen_s	live	peak_rss_bytes
+16000	7192.79	2885.46	59.628	1088000	0.008	16001	27688960
+32000	3403.96	3699.58	113.896	2176000	0.015	32001	48742400
+64000	5308.96	4096.17	247.570	4352000	0.037	64001	90128384
+128000	8841.88	4001.00	592.135	8704000	0.056	128001	186433536
+# Raw output of examples/durable_fork, FERRODB_BRANCH_COUNTS=16000,32000,64000,128000
+# Recorded 2026-09-17 on the machine described in bench/README, single run per N, no repeats.
+# Instrument: examples/durable_fork; peak_rss_bytes from getrusage(RUSAGE_SELF).ru_maxrss.
+# UNINTERPRETED. Three things are visible and only the first is settled:
+#   1. bytes/branch is EXACTLY 68.0 at every N -- S1's O(N) log holds to 128k.
+#   2. peak RSS/branch is ~1450 B, flat. Extrapolated, 10^6 branches ~= 1.45 GB resident.
+#      That is ~21x the 68 bytes the record costs on disk, and it is the residency problem D1
+#      exists to remove. Extrapolation is NOT measurement; 10^6 has not been run.
+#   3. total_s per doubling is 1.91, 2.17, 2.39 -- drifting super-linear, and the drift is
+#      GROWING. Per-fork cost goes 3.7ms at 16k to 4.6ms at 128k. MECHANISM UNKNOWN. Do not
+#      state one until it is read from the code or bisected; three predicted walls in this
+#      project were wrong and the real one was invisible to the benchmark that "found" it.

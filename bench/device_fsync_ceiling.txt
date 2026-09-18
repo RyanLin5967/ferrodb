@@ -1,0 +1,66 @@
+S7: is ~4,400 forks/sec the DEVICE's limit, or still ours?
+Instrument: a standalone rustc program, NO ferrodb code involved (bench/fsyncrate_probe.rs.txt).
+300 syncs per cell, one untimed warm-up. Recorded 2026-09-17.
+
+  directory                    F_FULLFSYNC              plain fsync()            ratio
+  /var/folders/.../T/          276.1/sec (3.622 ms)     27549.9/sec (0.036 ms)   x99.8
+  /Users/idide/projects/ferrodb 280.9/sec (3.560 ms)    30674.1/sec (0.033 ms)   x109.2
+
+⛔ CORRECTION, SAME DAY, BEFORE THIS FILE WAS ACTED ON. The first version of this section said
+"ANSWER: THE DEVICE. And it is not close." THAT IS WRONG, and the numbers already in this file
+disprove it. Recorded here rather than edited away, because the reversal is the useful part.
+
+WHAT IS TRUE: the device IS saturated in flush COUNT.
+  Measured F_FULLFSYNC ceiling on this machine:         ~281 /sec
+  flushes the fork run achieves at 64 threads:          ~317 /sec   (287 syncs / 0.905 s)
+  There is no headroom left in the NUMBER OF FLUSHES.
+
+WHY THAT DOES NOT MAKE THE DEVICE THE LIMIT. Each flush carries a BATCH. Throughput is
+
+    throughput = batch_size x flush_rate
+    batch_size = flush_duration / serial_time      (how many forks pass `logical` during one flush)
+    flush_rate = 1 / flush_duration
+
+    => throughput = (flush_duration / serial_time) x (1 / flush_duration) = 1 / serial_time
+
+THE FLUSH DURATION CANCELS. The device sets how many forks SHARE a flush, not how many happen per
+second. Checked against every measurement taken on this path, none of which was collected with this
+model in mind:
+
+    serial ms   predicted 1/serial   measured forks/sec   error
+      0.306          3268.0              3269.6         -0.05%   before arena fix, 2000 arenas
+      0.247          4048.6              4042.7         +0.15%   after  arena fix, 2000 arenas
+      0.220          4545.5              4541.3         +0.09%   after  arena fix,    0 arenas
+      0.228          4386.0              4382.7         +0.07%   group-commit commit, 64 threads
+
+  Four for four, inside 0.15%, and ~281/sec appears nowhere in it.
+
+SO THE LIMIT IS THE SERIAL SECTION, AND IT IS A LINEAR LEVER: halve the time a fork holds `logical`
+and the throughput doubles. That is not a guess -- the arena-scan fix already demonstrated it
+prospectively (0.306 -> 0.247 ms predicted 3268 -> 4049; measured 3269.6 -> 4042.7).
+To reach 10k forks/sec the serial section must fall from ~0.22 ms to ~0.10 ms.
+
+HOW THE WRONG ANSWER HAPPENED, since it is the kind that repeats: two numbers agreed (~317 achieved
+vs ~281 ceiling), agreement felt like a conclusion, and "the disk is saturated" is a satisfying
+story. The arithmetic that connects flush rate to THROUGHPUT was never written down. The 1-thread
+confirmation below is real and still stands -- it just does not imply what it was taken to imply.
+
+CONFIRMATION THAT STANDS. Single-threaded per-fork latency (bench/fork_concurrency_after.txt) is
+3.574 ms; one F_FULLFSYNC here is 3.560-3.622 ms. A SERIAL fork is exactly one barrier flush, to
+three digits -- two instruments never calibrated against each other agreeing. That is why group
+commit worked at all. It is not evidence about the concurrent ceiling.
+
+THE THING THIS MEASUREMENT EXPOSED, WHICH WAS NOT WHAT IT WENT LOOKING FOR:
+
+  plain fsync() is ~100x faster than F_FULLFSYNC here, and ferrodb pays F_FULLFSYNC on every group
+  commit. That is MORE conservative than standard practice, not less:
+    - SQLite's `fullfsync` pragma is OFF by default.
+    - Postgres does not use F_FULLFSYNC by default either (fsync_writethrough exists and is opt-in).
+  So ferrodb is buying power-loss durability that most engines make the user ask for.
+
+  DO NOT READ THIS AS A FREE 100x. It is not a bug and it is not slack -- it is a guarantee. On
+  Apple hardware plain fsync() does not flush the drive's write cache, so a power failure can lose
+  writes the application was told were durable. F_FULLFSYNC is the only call that does. Switching
+  would trade a real guarantee for throughput, which is a decision to be made explicitly and
+  configurably, not a number to harvest quietly. It is written up as an option in SCALE-DESIGN D8
+  with that cost stated, and it is NOT chosen on the strength of being the biggest number available.

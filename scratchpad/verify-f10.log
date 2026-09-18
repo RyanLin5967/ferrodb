@@ -1,5 +1,0 @@
-tools/verify-suite.sh: line 110: 54271 Terminated: 15          timeout "$BOUND" cargo test --test "$t" --no-fail-fast >> "$LOG" 2>&1
-F10-1815Z: REFUSING — target 'integration_base_backup' produced no 'test result:' line, so it was killed,
-  timed out, or failed to build. A silent target is not a passing one, and its
-  tests would vanish from the total while every other target still reported green.
-  log: /Users/idide/wt/artie-research/build-G/suite-F10-1815Z.log

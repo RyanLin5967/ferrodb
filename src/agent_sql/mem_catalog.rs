@@ -17,8 +17,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::branch::record::CoreRecord;
 use crate::branch::record::BranchRecord;
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -128,11 +129,81 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(())
     }
 
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        self.records
-            .lock()
-            .unwrap()
-            .insert(record.branch_id.id, record.clone());
+    /// **D41.** Under the one lock this catalog has, like `fork` and `charge_row_writes`, so the
+    /// four fields move together and nothing else in the record is written back.
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let mut rec = Self::lookup(&records, branch)?;
+        let depth = records
+            .get(&parent.id)
+            .ok_or(BranchError::NotFound(parent))?
+            .depth
+            .saturating_add(1);
+        if depth > crate::branch::types::MAX_BRANCH_DEPTH {
+            return Err(BranchError::DepthExceeded { branch, depth }.into());
+        }
+        rec.parent_id = Some(parent);
+        rec.fork_epoch = fork_epoch;
+        rec.depth = depth;
+        rec.root_page_id = root;
+        records.insert(branch.id, rec.clone());
+        Ok(rec)
+    }
+
+    /// **D41.** The narrowing is compared against the envelope in force under the lock, never
+    /// against a snapshot a caller read before it.
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: crate::branch::record::CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let mut rec = Self::lookup(&records, branch)?;
+        rec.restrict(envelope)?;
+        records.insert(branch.id, rec);
+        Ok(())
+    }
+
+    /// **D41.** Compare-and-set on the state alone; `Reaped` carries `mark_reaped`'s full meaning.
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        // Generation-checked but not `check_readable`-checked, so the transition out of `Reaping`
+        // — the second half of every reap — stays expressible. `lookup` would refuse it.
+        let rec = records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        if rec.generation != branch.generation {
+            return Err(BranchError::Reaped {
+                requested: branch,
+                current_generation: rec.generation,
+            }
+            .into());
+        }
+        if rec.state != expect {
+            return Err(BranchError::UnexpectedState {
+                branch,
+                expected: expect,
+                actual: rec.state,
+            }
+            .into());
+        }
+        if expect == to {
+            return Ok(());
+        }
+        if to == BranchState::Reaped {
+            rec.mark_reaped();
+        } else {
+            rec.state = to;
+        }
         Ok(())
     }
 
@@ -144,19 +215,114 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(())
     }
 
-    fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
-        Ok(self
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        let mut out: Vec<CoreRecord> = self
             .records
             .lock()
             .unwrap()
             .values()
-            .filter(|r| r.state == BranchState::Live)
-            .cloned()
-            .collect())
+            .filter(|r| {
+                r.state == BranchState::Live
+                    && !r.branch_id.is_trunk()
+                    && r.lease_deadline.is_expired_at(now_millis)
+            })
+            .map(CoreRecord::narrow)
+            .collect();
+        out.sort_unstable_by_key(|r| r.branch_id().id);
+        Ok(out)
     }
 
-    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
-        Ok(self.records.lock().unwrap().values().cloned().collect())
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        let mut out: Vec<BranchRecord> =
+            self.records.lock().unwrap().values().filter(|r| r.state == state).cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(out)
+    }
+
+    /// Ordered, like the durable catalog's, so that a caller cannot come to depend on hash order
+    /// in tests and then meet a different order in production. The two implementations agreeing
+    /// about order is the only reason a test against this one says anything about that one.
+    fn scan(&self)
+        -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        let mut out: Vec<BranchRecord> = self.records.lock().unwrap().values().cloned().collect();
+        out.sort_unstable_by_key(|r| r.branch_id.id);
+        Ok(Box::new(out.into_iter().map(Ok)))
+    }
+
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        Ok(self.records.lock().unwrap().get(&parent_id).and_then(|r| r.live_children.last().copied()))
+    }
+
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        let records = self.records.lock().unwrap();
+        let Some(rec) = records.get(&parent_id) else { return Ok(false) };
+        Ok(!crate::branch::record::reclaimable(&rec.live_children, lo, hi))
+    }
+
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .get(&parent_id)
+            .map(|r| !r.live_children.is_empty())
+            .unwrap_or(false))
+    }
+
+    fn live_count(&self) -> usize {
+        self.records.lock().unwrap().values().filter(|r| r.state == BranchState::Live).count()
+    }
+
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BranchError::NotFound(BranchId::new(id, 0)).into())
+    }
+
+    /// The in-memory catalog does not recycle ids, so this is a no-op rather than a lie: `fork`
+    /// here always mints a fresh id, and a free list nothing reads would be dead state.
+    fn release_id(&self, _id: u64) {}
+
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        _child_id: u64,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(prec) = records.get_mut(&parent_id) else {
+            return Err(BranchError::NotFound(BranchId::new(parent_id, 0)).into());
+        };
+        prec.add_live_child(fork_epoch);
+        Ok(())
+    }
+
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };
+        Ok(prec.remove_live_child(fork_epoch))
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // **D33.** `get_mut`-by-id ignored `branch.generation` and returned Ok for a branch that
+        // does not exist, so a stale handle attached its arena to the slot's new occupant and a
+        // missing id dropped it silently -- with `alloc_arena` reporting success either way.
+        // Every other method in this impl goes through `lookup`, which checks both.
+        let mut records = self.records.lock().unwrap();
+        Self::lookup(&records, branch)?;
+        let rec = records.get_mut(&branch.id).expect("lookup just proved it is there");
+        if !rec.arenas.contains(&arena) {
+            rec.arenas.push(arena);
+        }
+        Ok(())
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

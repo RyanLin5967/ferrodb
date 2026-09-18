@@ -1,0 +1,39 @@
+D11 / S19: expired_before returns CORE records; the reaper never needed the unbounded ones.
+Instrument: examples/branch_curve, release, N=10,000, 64 threads, 500-branch expiry fixture.
+⭐ THE TWO BINARIES WERE ALTERNATED IN ONE SESSION, under load average 35 on 18 cores. Alternating
+is what makes a number trustworthy on a contended machine: the load is common-mode to both arms.
+
+  round   BEFORE read/reap0/reap500 us        AFTER read/reap0/reap500 us
+      1      25.46    11.6   11542.6            25.17    12.2    2784.6
+      2      19.38     8.6    9339.2            20.12    43.8    3198.1
+      3      25.88    11.3   11896.2            26.38    10.5    4609.9
+
+  reap(500) median 11542.6 -> 3198.1 us   = x3.61
+  RANGES DO NOT OVERLAP: slowest after 4609.9 < fastest before 9339.2.
+  Per answer row: 23.1 us -> 6.4 us.
+
+WHAT CHANGED. The trait said `expired_before -> Vec<BranchRecord>`, so the table catalog called
+`hydrate` on EVERY ANSWER ROW: an arena range-scan plus an envelope point lookup. The reaper
+(reaper.rs:273-287) reads branch_id, depth and fork_epoch -- all CORE -- and never touches arenas
+or envelope, the only two fields hydrate exists to fetch. The trait now returns Vec<CoreRecord>.
+
+This is SCALE-DESIGN D2 -- *the linear scan is in the TRAIT, not the implementation* -- recurring
+at ANSWER scale. D2 fixed it for catalog-sized answers; the same shape survived where an answer can
+be 10^6 rows during a mass expiry.
+
+CONTROLS, and they are what make the 3.61x mean something:
+  - reap(0) UNCHANGED (11.6/8.6/11.3 -> 12.2/43.8/10.5; the 43.8 is noise at load 35). Correct: an
+    empty answer never hydrated anything, so nothing should move.
+  - read_us UNCHANGED (25.46/19.38/25.88 -> 25.17/20.12/26.38). Correct: reads do not go through
+    expired_before. A change here would mean the harness, not the catalog, had moved.
+  - ⭐ THE CALIBRATION GAP SURVIVES: reap(500) vs reap(0) was 894x, is now ~290x. D11's falsifier
+    said "if the calibration gap collapses, the instrument stopped seeing answer size rather than
+    the cost going away". It did not collapse. The instrument still responds to the answer.
+
+PREDICTED vs MEASURED, prediction made before the run: ~5x from 24.3 us/row against ~5 us for a
+core descent. Measured 3.61x, 23.1 -> 6.4 us/row. The residual per row IS the core descent, which
+was always going to remain -- the prediction's STRUCTURE was right and its constant was optimistic.
+
+WHAT THIS IS EVIDENCE FOR: a SHAPE. "A trait that returns more than its only caller reads forces
+every implementation to fetch it" is true of any engine. The absolute microseconds are ferrodb's
+and are not claimable anywhere else.

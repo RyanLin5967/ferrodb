@@ -1,0 +1,42 @@
+O1-residual, part 2: the MARGINAL resident cost per branch.
+Recorded 2026-09-17. Instrument: /usr/bin/time -l on examples/durable_fork N, release build,
+FERRODB_SKIP_REOPEN=1 throughout so exactly ONE catalog is resident. One run per N.
+
+  N       peak RSS (bytes)   peak RSS (MB)
+  8000            7634944          7.63
+  16000          11534336         11.53
+  32000          21331968         21.33
+  64000          43237376         43.24
+
+  marginal, measured                       predicted live HashMap table
+  8000 -> 16000    488 B/branch            363 B/branch
+  16000 -> 32000   613 B/branch            363 B/branch
+  32000 -> 64000   685 B/branch            363 B/branch
+
+  predicted live table = capacity * (168 record + 8 key + 1 control) / N, capacity being the
+  next power of two above N/0.875. size_of::<BranchRecord>() = 168, measured, not assumed.
+
+FOR COMPARISON, the figure this replaces: bench/durable_fork_curve_to_128k.tsv reported a
+marginal of 1417 B/branch. That harness reopened the catalog while the first was still alive,
+so its peak covered TWO catalogs. Same fork loop with one: 43.2 MB vs 90.0 MB at 64k, ratio 2.08.
+
+INTERPRETATION, and it is an interpretation:
+The measured marginal is not constant -- it RISES, 488 -> 613 -> 685, approaching but not
+reaching 2x the live-table figure of 363. That is the signature of a doubling table whose freed
+predecessors are retained by the allocator rather than returned to the OS: the capacities
+1024, 2048, ... C sum to ~2C, so total HashMap residency tends to 2x the live table and the
+marginal tends to ~726 B/branch from below. 685 and still climbing fits.
+
+WHAT WOULD FALSIFY IT: if the marginal continues past ~726 B/branch at 128k and 256k, the
+retained-history model is wrong and something else is charging per branch. That run has NOT
+been done, so the model is supported, not proven.
+
+WHAT IT MEANS FOR D1: essentially all of the residency is the resident
+`HashMap<u64, BranchRecord>`. D1 keeps records in tree pages under a bounded buffer pool and
+holds no per-branch map at all, so it removes this term rather than shrinking it. The earlier
+estimate in this session -- that the catalog was only ~13% of residency -- was computed from the
+double-counted figure and was WRONG in the direction that would have aimed D1 away from the
+right target.
+
+At 10^6 branches this projects to ~685-726 MB resident, not the ~1.45 GB the old figure implied.
+A projection, not a measurement: 10^6 has not been run.

@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::TableBranchCatalog;
 use ferrodb::branch::lease_thread::{LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::record::BranchRecord;
@@ -358,28 +359,56 @@ fn arena_state(db: &Path) -> ArenaState {
         .expect("open the database file");
     let dm = Arc::new(DiskManager::new(file).expect("disk manager"));
     let bp = Arc::new(BufferPoolManager::new(dm));
+    // REFUSE if the catalog is missing rather than open one. `open_sidecar` would CREATE an empty
+    // catalog over a missing file, and this fixture would then see a database with no branches and
+    // assert against it - which is exactly how the switchover's durability bug stayed quiet until
+    // it was driven end to end. A missing catalog is a failure, not an empty one.
+    let cat_path = side(db, "branchcat");
+    assert!(
+        cat_path.exists(),
+        "no branch catalog at {}: the binaries wrote none, so there is nothing to inspect and an \
+         empty one would make every assertion below vacuous",
+        cat_path.display()
+    );
     let branches =
-        Arc::new(LogBranchCatalog::open(&side(db, "branches"), 1).expect("branch catalog"));
+        Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("branch catalog"));
     let store =
-        ArenaPageStore::reopen_from_checkpoint(bp, Arc::clone(&branches), &side(db, "arena"))
+        ArenaPageStore::reopen_from_checkpoint(bp, Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, &side(db, "arena"))
             .expect("reattach to the arena");
     ArenaState {
         live: store.live_page_count().expect("live page count"),
         reserved: store.reserved_page_count(),
         arenas: store.live_arenas(),
-        branches: branches.all_branches().expect("branch records"),
+        branches: branches.scan().expect("scan").collect::<Result<Vec<_>, _>>().expect("branch records"),
     }
 }
 
-/// Rewrite one branch record in `<db>.branches`, the way a fixture must when it cannot wait out a
-/// fifteen-minute lease or crash a process mid-reap on purpose.
+/// Open `<db>.branchcat` and hand the fixture the record it is about to amend.
 ///
-/// The append-only log's last write per id slot wins, so this is the same mutation the engine makes.
-fn amend_branch(db: &Path, id: u64, amend: impl FnOnce(&mut BranchRecord)) {
-    let catalog = LogBranchCatalog::open(&side(db, "branches"), 1).expect("branch catalog");
-    let mut rec = catalog.get_raw(id).expect("branch record");
-    amend(&mut rec);
-    catalog.put(&rec).expect("rewrite the branch record");
+/// **D41 — a fixture may no longer rewrite a whole record, because nothing may.** `amend_branch`
+/// used to take a `FnMut(&mut BranchRecord)` and `put` the result; its two amendments were a lease
+/// deadline and a state, and each now has its own catalog operation. Both commit — flush and fsync
+/// — so the amended record is on disk before the next binary opens the database.
+fn open_branchcat(db: &Path) -> TableBranchCatalog {
+    let cat_path = side(db, "branchcat");
+    assert!(cat_path.exists(), "no branch catalog at {} to amend", cat_path.display());
+    TableBranchCatalog::open_sidecar(&cat_path, 1).expect("branch catalog")
+}
+
+/// Expire a branch's lease, the way a fixture must when it cannot wait out a fifteen-minute one.
+fn expire_lease(db: &Path, id: u64) {
+    let catalog = open_branchcat(db);
+    let rec = catalog.get_raw(id).expect("branch record");
+    catalog.renew_lease(rec.branch_id, LeaseDeadline(0)).expect("expire the lease");
+}
+
+/// Leave a branch durably `Reaping`, the way a crash mid-reap does, without crashing a process.
+fn interrupt_reap(db: &Path, id: u64) {
+    let catalog = open_branchcat(db);
+    let rec = catalog.get_raw(id).expect("branch record");
+    catalog
+        .set_state(rec.branch_id, rec.state, BranchState::Reaping)
+        .expect("mark the record Reaping");
 }
 
 // ---- the fixture both binaries are tested against ----------------------------------------------
@@ -450,7 +479,7 @@ fn the_cli_reaps_an_abandoned_branch_with_no_client_action_and_pages_return_to_b
     // The lease expires. Compressed in time rather than waited out: the deadline is a durable field
     // and `is_expired_at` is a pure comparison, so a deadline in the past is exactly the state a
     // fifteen-minute wait would produce.
-    amend_branch(&db, branch.id, |r| r.lease_deadline = LeaseDeadline(0));
+    expire_lease(&db, branch.id);
 
     // NO CLIENT ACTION. The process is started and sent nothing at all — not one statement — and
     // the only thing waited on is the line its own lease thread prints.
@@ -498,7 +527,7 @@ fn the_server_reaps_an_abandoned_branch_without_one_socket_being_opened() {
     let db = dir.path().join("reap.db");
     let (baseline, populated) = abandoned_branch_fixture(&db);
     let branch = populated.only_agent_branch().branch_id;
-    amend_branch(&db, branch.id, |r| r.lease_deadline = LeaseDeadline(0));
+    expire_lease(&db, branch.id);
 
     let server = start_server(&db, BRISK_SCAN_MILLIS);
     server.wait_for_stderr("lease: reaped");
@@ -617,7 +646,7 @@ fn the_server_finishes_a_reap_a_crash_interrupted_before_it_serves_anything() {
     // `reap` writes *before* it frees anything, precisely so the evidence exists — with the
     // branch's extents still charged to it. **The lease is left alone**, so it has not expired and
     // a lease scan has no business touching this branch at all.
-    amend_branch(&db, branch.id, |r| r.state = BranchState::Reaping);
+    interrupt_reap(&db, branch.id);
     assert_eq!(arena_state(&db).branch(branch.id).state, BranchState::Reaping);
 
     // `NEVER_SCAN_MILLIS`: no scan can fire during this test beyond the one at startup, and that
@@ -744,7 +773,7 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
     let bp = Arc::new(BufferPoolManager::new(dm));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
     let base = bp.disk_manager.high_water().unwrap() + HEADROOM;
-    let store = Arc::new(ArenaPageStore::new(bp, Arc::clone(&catalog), base).unwrap());
+    let store = Arc::new(ArenaPageStore::new(bp, Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).unwrap());
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
@@ -754,7 +783,7 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
         .unwrap(),
     );
     let reaper = Arc::new(
-        TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store))
+        TwoTierReaper::new(Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store))
             .with_links(Arc::new(CowPageLinks) as Arc<dyn PageLinks>),
     );
 

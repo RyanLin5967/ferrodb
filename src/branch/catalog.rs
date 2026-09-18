@@ -27,8 +27,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-use crate::branch::record::{BranchRecord, CapabilityEnvelope};
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
+use crate::branch::types::{
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -138,6 +140,61 @@ impl LogBranchCatalog {
             records.insert(r.branch_id.id, r);
         }
 
+        // **`live_children` is DERIVED here, not read from the parent's serialised record.**
+        //
+        // It used to be stored, which meant `fork` had to rewrite the whole parent record on every
+        // fork so the new epoch reached disk — and `live_children` grows with the number of
+        // children, so bytes-per-fork grew with the children the parent already had. Measured
+        // before this change (`bench/durable_catalog_scaling.txt`): the catalog log QUADRUPLED on
+        // every doubling of branch count — 1.07MB at 500 branches, 257MB at 8,000 — and reopen time
+        // with it. That is O(N^2) in a structure whose whole purpose is to make forking cheap.
+        //
+        // The array was always redundant: a child record already carries `parent_id` and
+        // `fork_epoch`, so the parent's live children are exactly the live records that name it.
+        // Deriving costs one pass over records that were being read anyway.
+        //
+        // **It also closes a correctness hole rather than trading against one.** `fork` wrote child
+        // and parent under a single fsync precisely because a child durable without its parent's
+        // entry would be a page nobody knows to park. Derived, the child record *is* the parent's
+        // entry — the two cannot disagree because there is only one of them.
+        //
+        // A reaped child is not live, and `detach_from_parent` runs BEFORE `mark_reaped`, so a
+        // crash between the two leaves a parent whose stored array had already lost the epoch while
+        // the child still reads Live. Derivation re-adds it, which PARKS the pages until the
+        // resumed reap finishes — the safe direction. The unsafe direction, dropping a child that
+        // is still live, cannot happen: a live child's own record says so.
+        let mut derived: HashMap<u64, Vec<Epoch>> = HashMap::new();
+        for r in records.values() {
+            if r.state == BranchState::Reaped {
+                continue;
+            }
+            if let Some(p) = r.parent_id {
+                derived.entry(p.id).or_default().push(r.fork_epoch);
+            }
+        }
+        for (id, mut kids) in derived {
+            // Sorted ascending: `reclaimable` runs a range-emptiness query over this array and
+            // `add_live_child` maintains the same order, so a derived array that arrived in hash
+            // order would answer differently from a stored one.
+            kids.sort_unstable();
+            if let Some(rec) = records.get_mut(&id) {
+                rec.live_children = kids;
+            }
+        }
+        // A parent that now has no live children must end up with an EMPTY array, not the stale one
+        // its last serialised copy held — `release_id` refuses to recycle a slot while the array is
+        // non-empty, so a leftover entry would strand the id for ever.
+        let has_kids: std::collections::HashSet<u64> = records
+            .values()
+            .filter(|r| r.state != BranchState::Reaped)
+            .filter_map(|r| r.parent_id.map(|p| p.id))
+            .collect();
+        for (id, rec) in records.iter_mut() {
+            if !has_kids.contains(id) {
+                rec.live_children.clear();
+            }
+        }
+
         let mut max_id = 0u64;
         let mut max_epoch = 0u64;
         let mut free_ids = Vec::new();
@@ -208,23 +265,6 @@ impl LogBranchCatalog {
             .ok_or_else(|| BranchError::NotFound(BranchId::new(id, 0)).into())
     }
 
-    /// Every record, live or reaped, **in branch-id order**.
-    ///
-    /// Ordered so that a sweep over every record is reproducible at all: each reap this feeds
-    /// appends durable branch records and frees pages, and a `HashMap`'s order made that sequence
-    /// depend on nothing a test or a replay can pin.
-    ///
-    /// Id order is **not** the order a reap wants, and `reaper::resume_interrupted_reaps` re-sorts
-    /// deepest-first before acting — a parent resumed before its own child cannot release its id
-    /// slot. Ordering here is what makes *this* accessor deterministic; the reap key belongs to the
-    /// reaper, which states why at its sort.
-    pub fn all_records(&self) -> Vec<BranchRecord> {
-        let mut out: Vec<BranchRecord> =
-            self.state.read().unwrap().records.values().cloned().collect();
-        out.sort_unstable_by_key(|r| r.branch_id.id);
-        out
-    }
-
     /// Mark an id slot reusable. Refuses while the slot's record still lists live children,
     /// because that array is what decides the fate of pages parked under this branch's name.
     pub fn release_id(&self, id: u64) {
@@ -259,6 +299,44 @@ impl LogBranchCatalog {
             .values()
             .filter(|r| r.state == BranchState::Live)
             .count()
+    }
+
+    /// Durably replace a whole record. **Inherent and private — D41 removed this from
+    /// `BranchCatalog`.**
+    ///
+    /// It survives here for two jobs, neither of which is a catalog operation:
+    ///
+    /// 1. The multi-field trait methods below that this implementation still expresses as a
+    ///    read-modify-write over the resident record (`set_root`, `renew_lease`, `attach_child`,
+    ///    `detach_child`). They are unchanged by D41 and exposed to the same window they always
+    ///    were; the D41 entry scopes them out explicitly as "internal, and not the hazard".
+    /// 2. The format and replay tests in this file, which have to write records the engine would
+    ///    never produce on purpose — a parent still listing a reaped child, a torn tail, a slot
+    ///    whose generation has to be forced.
+    ///
+    /// Private so that no `dyn BranchCatalog` holder, and nothing outside this module, can reach
+    /// it. That is the whole of D41: the whole-record write is an implementation detail of one
+    /// catalog, not something a caller may ask any catalog for.
+    /// **`#[cfg(test)]` since D45, and that is a RESULT rather than a tidy-up.**
+    ///
+    /// D41 removed `put` from the `BranchCatalog` trait, and this inherent one survived because
+    /// four methods here still needed it. D45 converted the last of them — `set_root`,
+    /// `renew_lease`, `attach_child`, `detach_child` — to do their read-modify-write under
+    /// `state.write()`, which left this with **no non-test caller at all**. CI builds with
+    /// `-D dead_code` and said so.
+    ///
+    /// Gated rather than deleted because the replay tests below genuinely need a whole-record
+    /// writer: they construct records the engine would never produce on purpose, which is the
+    /// point of a format test. Gated rather than `#[allow(dead_code)]` because the gate is the
+    /// stronger statement — `tests/` compiles against the library WITHOUT `cfg(test)`, so this is
+    /// what stops an integration test reaching for a whole-record write instead of naming the
+    /// field it means. Same gate and same reason as `TableBranchCatalog::put`
+    /// (`table_catalog.rs:715`); this file is now consistent with it.
+    #[cfg(test)]
+    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
+        self.append(&[record])?;
+        self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
+        Ok(())
     }
 }
 
@@ -300,7 +378,11 @@ impl BranchCatalog for LogBranchCatalog {
 
         // One durable write covering both halves. A child that exists but is not listed in its
         // parent is a GC correctness hole, so the two records share a single fsync.
-        self.append(&[&child, &new_parent])?;
+        // **Only the child is appended.** The parent's `live_children` is derived at replay from
+        // the children that name it (see `index`), so rewriting the parent here would write bytes
+        // that replay ignores — and those bytes are what made the log O(N^2). The in-memory parent
+        // is still updated below, because live readers use it without replaying.
+        self.append(&[&child])?;
 
         st.records.insert(parent.id, new_parent);
         st.records.insert(child_num, child.clone());
@@ -314,40 +396,311 @@ impl BranchCatalog for LogBranchCatalog {
         Ok(rec.clone())
     }
 
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        self.append(&[record])?;
-        self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        // **D41 — under the write lock, appending while it is held.** Exactly the shape
+        // `add_arena` and `charge_row_writes` take here, and for exactly their reason: this
+        // catalog rebuilds every record by replaying its log, last-append-wins, so two mutators
+        // that copy under the lock and append after releasing it can append out of order and the
+        // earlier-appended-but-later-mutated record wins. The append has to be inside.
+        //
+        // ⚠ **That means an fsync with `state.write()` held, and it is the cost the D41 design
+        // entry flagged as this option's one falsifier.** It is not new: `add_arena` already
+        // accepts it here, stating that "correctness is not tradeable for it" — this is the
+        // test-oracle catalog, `TableBranchCatalog` is what production opens, and there the
+        // logical lock is released before the fsync so this pays nothing. Recorded rather than
+        // worked around.
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        let depth = st
+            .records
+            .get(&parent.id)
+            .ok_or(BranchError::NotFound(parent))?
+            .depth
+            .saturating_add(1);
+        if depth > MAX_BRANCH_DEPTH {
+            return Err(BranchError::DepthExceeded { branch, depth }.into());
+        }
+        let mut rec = rec.clone();
+        rec.parent_id = Some(parent);
+        rec.fork_epoch = fork_epoch;
+        rec.depth = depth;
+        rec.root_page_id = root;
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec.clone());
+        Ok(rec)
+    }
+
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        // The comparison and the write under one lock. Split across a `get`/`put` the narrowing
+        // was checked against a snapshot, so a second restriction could reinstate an envelope a
+        // first one had already narrowed away.
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        let mut rec = rec.clone();
+        rec.restrict(envelope)?;
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec);
         Ok(())
     }
 
-    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
-        let mut rec = self.get(branch)?;
-        rec.root_page_id = root;
-        self.put(&rec)
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
+        // second half of every reap, and `check_readable` refuses `Reaping` outright.
+        if rec.generation != branch.generation {
+            return Err(BranchError::Reaped {
+                requested: branch,
+                current_generation: rec.generation,
+            }
+            .into());
+        }
+        if rec.state != expect {
+            return Err(BranchError::UnexpectedState {
+                branch,
+                expected: expect,
+                actual: rec.state,
+            }
+            .into());
+        }
+        if expect == to {
+            // Idempotent, and no log entry for a write that changes nothing — the same rule
+            // `add_arena` applies. It also keeps a second `set_state(.., Reaped)` from bumping the
+            // generation twice.
+            return Ok(());
+        }
+        let mut rec = rec.clone();
+        if to == BranchState::Reaped {
+            // The full meaning of the state: generation bumped so the old handle is a hard error,
+            // arenas cleared because the reaper has already returned them.
+            rec.mark_reaped();
+        } else {
+            rec.state = to;
+        }
+        self.append(&[&rec])?;
+        st.records.insert(branch.id, rec);
+        Ok(())
     }
 
-    fn live_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+    /// **D45.** Read, publish and append **under the write lock**, for the reason `add_arena`
+    /// already states two methods below: this catalog keeps the whole record together, so a
+    /// read-modify-write done *around* the lock writes back every field the caller never named.
+    ///
+    /// The version this replaces was `get` (read lock, released) then `put` (write lock), and a
+    /// `renew_lease` landing in the gap put back the `root_page_id` it had read before this
+    /// publish. Measured, `tests/d45_log_catalog_rmw.rs`: 4000 published roots against 4000
+    /// concurrent renewals left the record at root **3917**, so 83 shadow-paging commit points
+    /// were silently undone and the pages they published became invisible.
+    ///
+    /// It cannot call `self.put` — that takes this same lock and it is not reentrant.
+    fn set_root(&self, branch: BranchId, root: PageId) -> Result<(), FerroError> {
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        rec.root_page_id = root;
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
+    }
+
+    /// Still a walk, and deliberately so. This is the *log* catalog: its records live in a
+    /// `HashMap` with no index over deadlines, so O(N) is the best it can do and pretending
+    /// otherwise would be a lie in a signature. D2 narrowed the interface first precisely so this
+    /// body can later be replaced by a range descent without a single caller changing.
+    ///
+    /// Sorted because `reap_expired`'s own `sort_by_key` is stable, so whatever order arrives here
+    /// survives as its tie-break and reaches every record and page that reap makes durable.
+    fn expired_before(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
         let st = self.state.read().unwrap();
-        // Same `HashMap` as `all_records`, and sorted for the same reason: the lease scan feeds
-        // this straight into `reap_expired`, whose `sort_by_key` is stable, so hash order survives
-        // as its tie-break and reaches every record and page that reap makes durable.
+        // This catalog holds whole records resident, so narrowing costs nothing here — but the
+        // TRAIT must promise core-only, or the table catalog is forced to hydrate every answer
+        // row to satisfy it. That is D2's lesson: the shape lives in the trait.
+        let mut out: Vec<CoreRecord> = st
+            .records
+            .values()
+            .filter(|r| {
+                r.state == BranchState::Live
+                    && !r.branch_id.is_trunk()
+                    && r.lease_deadline.is_expired_at(now_millis)
+            })
+            .map(CoreRecord::narrow)
+            .collect();
+        out.sort_unstable_by_key(|r| r.branch_id().id);
+        Ok(out)
+    }
+
+    fn in_state(&self, state: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+        let st = self.state.read().unwrap();
         let mut out: Vec<BranchRecord> =
-            st.records.values().filter(|r| r.state == BranchState::Live).cloned().collect();
+            st.records.values().filter(|r| r.state == state).cloned().collect();
         out.sort_unstable_by_key(|r| r.branch_id.id);
         Ok(out)
     }
 
-    fn all_branches(&self) -> Result<Vec<BranchRecord>, FerroError> {
+    /// Ordered by branch id so that a sweep over every record is reproducible at all: each reap
+    /// this feeds appends durable branch records and frees pages, and a `HashMap`'s order made
+    /// that sequence depend on nothing a test or a replay can pin.
+    ///
+    /// Id order is **not** the order a reap wants, and `reaper::resume_interrupted_reaps` re-sorts
+    /// deepest-first before acting — a parent resumed before its own child cannot release its id
+    /// slot. Ordering here is what makes the accessor deterministic; the reap key belongs to the
+    /// reaper, which states why at its sort.
+    ///
+    /// It buffers, which the trait's contract permits but does not want. The records are already
+    /// all resident in the `HashMap` this reads, so buffering costs a second copy and no more —
+    /// and removing the first copy is D1's job, not this method's.
+    fn scan(&self)
+        -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
         let st = self.state.read().unwrap();
         let mut out: Vec<BranchRecord> = st.records.values().cloned().collect();
         out.sort_unstable_by_key(|r| r.branch_id.id);
-        Ok(out)
+        Ok(Box::new(out.into_iter().map(Ok)))
     }
 
+    /// Answered from the in-memory `live_children` array this implementation already derives at
+    /// replay. That array is what the table catalog replaces with a key span; the queries are
+    /// declared on the trait so callers stop depending on the representation.
+    fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
+        let st = self.state.read().unwrap();
+        Ok(st.records.get(&parent_id).and_then(|r| r.live_children.last().copied()))
+    }
+
+    fn live_child_in_epoch_range(
+        &self,
+        parent_id: u64,
+        lo: Epoch,
+        hi: Epoch,
+    ) -> Result<bool, FerroError> {
+        let st = self.state.read().unwrap();
+        let Some(rec) = st.records.get(&parent_id) else { return Ok(false) };
+        // `!reclaimable` is exactly "a live child forked in [lo, hi)". Expressed through the same
+        // function so the two can never drift apart.
+        Ok(!crate::branch::record::reclaimable(&rec.live_children, lo, hi))
+    }
+
+    fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
+        let st = self.state.read().unwrap();
+        Ok(st.records.get(&parent_id).map(|r| !r.live_children.is_empty()).unwrap_or(false))
+    }
+
+    fn live_count(&self) -> usize {
+        LogBranchCatalog::live_count(self)
+    }
+
+    /// Delegates to the inherent method of the same name. Rust resolves inherent methods first, so
+    /// callers holding the concrete type are unaffected and `dyn BranchCatalog` callers get this.
+    fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> {
+        LogBranchCatalog::get_raw(self, id)
+    }
+
+    fn release_id(&self, id: u64) {
+        LogBranchCatalog::release_id(self, id)
+    }
+
+    /// **D45, sites 3 and 4** -- found by the D41 builder, not by my own sweep, which used a
+    /// hand-written method list and never looked at these two.
+    ///
+    /// Same shape as `set_root` and `renew_lease`: `get_raw` takes the read lock and drops it,
+    /// `put` takes the write lock, and the live-children array is rebuilt from a snapshot read
+    /// before whatever else landed. It is a worse loss than the other two, because
+    /// `has_live_children` is what `reap_expired` consults (`reaper.rs:185`, `:528`): **a lost
+    /// `attach_child` leaves a parent believing it is childless, and it is then reaped out from
+    /// under a live child.**
+    ///
+    /// Generation-blindness is PRESERVED, deliberately. `get_raw` exists so the reaper can read
+    /// the record of a branch mid-reap and consult an already-reaped parent's `live_children`;
+    /// adding `check_readable` here would break exactly the caller this method has.
+    fn attach_child(
+        &self,
+        parent_id: u64,
+        fork_epoch: Epoch,
+        _child_id: u64,
+    ) -> Result<(), FerroError> {
+        let mut st = self.state.write().unwrap();
+        let prec = st
+            .records
+            .get_mut(&parent_id)
+            .ok_or_else(|| FerroError::from(BranchError::NotFound(BranchId::new(parent_id, 0))))?;
+        prec.add_live_child(fork_epoch);
+        let snapshot = prec.clone();
+        self.append(&[&snapshot])
+    }
+
+    /// The log catalog keeps the live set inside the record, so this is exactly what the reaper
+    /// used to do inline.
+    /// **D45, the mirror of `attach_child`.** A lost `detach_child` strands a child epoch in the
+    /// parent's array, so `has_live_children` answers true forever and the parent is **never
+    /// reapable** -- a leak rather than a premature free, but unbounded.
+    ///
+    /// The missing-record case still returns `Ok(false)` rather than an error, unchanged: the
+    /// caller is the reaper walking up a chain whose parent may already be gone.
+    fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
+        let mut st = self.state.write().unwrap();
+        let Some(prec) = st.records.get_mut(&parent_id) else { return Ok(false) };
+        if prec.remove_live_child(fork_epoch) {
+            let snapshot = prec.clone();
+            self.append(&[&snapshot])?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // This catalog keeps the arena list inside the record, so the read-modify-write is real
+        // and must be done under the write lock rather than around it. See D20.
+        //
+        // **D33.** The first version mutated `state.records` and returned. This catalog rebuilds
+        // every record by REPLAYING ITS LOG (`index`, last-append-wins), so an in-memory mutation
+        // that never appends is gone at restart. Measured: 0 of 8 arenas survived a reopen, and
+        // the reaper frees exactly `record.arenas` -- so each one was an extent reserved in the
+        // free-space map that no branch owned and nothing would ever free.
+        //
+        // The append happens WHILE THE STATE LOCK IS HELD, which `put` deliberately does not do.
+        // That is the whole point here: two concurrent `add_arena`s that mutate under the lock and
+        // append after releasing it can append out of order, and last-append-wins then drops the
+        // arena from the earlier-appended-but-later-mutated record. Holding the lock across the
+        // fsync costs throughput on a catalog that is a test oracle rather than the shipped one
+        // (`TableBranchCatalog` is what production opens), and correctness is not tradeable for it.
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
+        if rec.arenas.contains(&arena) {
+            return Ok(()); // idempotent, and no log entry for a write that changes nothing
+        }
+        rec.arenas.push(arena);
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
+    }
+
+    /// **D45, and the more serious of the pair.** Same defect, same fix — but the field is the
+    /// keepalive, so losing a write here is not a lost update, it is a **live branch being
+    /// reaped**: the deadline stays at its pre-renewal value and `reap_expired` reclaims a branch
+    /// whose holder believes its lease is running. That is D29's failure reached without
+    /// `collapse` being involved at all — D29 recorded it as a property of the collapse copy, and
+    /// it is equally a property of the renewal itself.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
-        let mut rec = self.get(branch)?;
+        let mut st = self.state.write().unwrap();
+        let rec = st.records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        rec.check_readable(branch)?;
         rec.lease_deadline = lease;
-        self.put(&rec)
+        let snapshot = rec.clone();
+        self.append(&[&snapshot])
     }
 
     fn envelope_of(&self, branch: BranchId) -> Result<Option<CapabilityEnvelope>, FerroError> {
@@ -397,7 +750,134 @@ mod tests {
         LogBranchCatalog::in_memory(1)
     }
 
+        /// **A parent whose stored array still lists a child that is Reaped comes back EMPTY.**
+    ///
+    /// The derivation only visits parents that HAVE live children, so a parent that has none is
+    /// never written by that loop and would keep whatever its last serialised copy held. That is
+    /// reachable: `detach_from_parent` runs before `mark_reaped`, so a crash between them — or a
+    /// `put` that never landed — leaves exactly this shape on disk.
+    ///
+    /// It matters because `release_id` refuses to recycle a slot while `live_children` is
+    /// non-empty. A stale entry for a child that no longer exists strands that id permanently, and
+    /// `reclaimable` keeps parking pages against a fork epoch nothing can ever reach.
+    ///
+    /// Written after a mutant that deleted the `clear()` survived the test above.
     #[test]
+    fn a_parent_listing_only_reaped_children_comes_back_with_an_empty_array() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("branches.log");
+
+        {
+            let c = LogBranchCatalog::open(&path, 1).unwrap();
+            let child = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
+            // The parent's stored copy still lists the child — this is what a crash between
+            // `detach_from_parent` and `mark_reaped` leaves behind.
+            let mut trunk = c.get_raw(0).unwrap();
+            assert_eq!(trunk.live_children, vec![child.fork_epoch]);
+            c.put(&trunk).unwrap();
+            let mut crec = c.get_raw(child.branch_id.id).unwrap();
+            crec.mark_reaped();
+            c.put(&crec).unwrap();
+            trunk = c.get_raw(0).unwrap();
+            assert_eq!(
+                trunk.live_children,
+                vec![child.fork_epoch],
+                "precondition: the stored parent must still list the now-reaped child"
+            );
+        }
+
+        let reopened = LogBranchCatalog::open(&path, 1).unwrap();
+        assert!(
+            reopened.get(BranchId::TRUNK).unwrap().live_children.is_empty(),
+            "trunk came back listing a child that is Reaped; release_id will refuse that slot for \
+             ever and reclaimable will park pages against an epoch nothing can reach"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`live_children` survives a reopen even though `fork` never writes the parent.**
+    ///
+    /// S1: the array used to be stored inside the parent record, so every fork rewrote the whole
+    /// parent and the log grew O(N^2) — 257MB at 8,000 branches, measured in
+    /// `bench/durable_catalog_scaling.txt`. It is now derived at replay from the children that name
+    /// the parent, and `fork` appends the child alone.
+    ///
+    /// This pins the derivation against a real file, because the in-memory path cannot fail the way
+    /// replay can: the live catalog keeps the array `add_live_child` built, so a broken derivation
+    /// is invisible until something reopens. Reaped children must be excluded, and a parent that
+    /// loses its last live child must end up with an EMPTY array — `release_id` refuses to recycle
+    /// a slot while the array is non-empty, so a stale entry strands the id for ever.
+    #[test]
+    fn live_children_is_derived_at_replay_and_excludes_reaped_children() {
+        let dir = std::env::temp_dir().join(format!("ferrodb-derive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("branches.log");
+
+        let (kept, gone) = {
+            let c = LogBranchCatalog::open(&path, 1).unwrap();
+            // ENOUGH children that hash order is reliably not ascending. With two, a derived
+            // array left in `HashMap` order passes by luck — measured: dropping the sort survived
+            // this test until the count went up.
+            let kids: Vec<_> = (0..24)
+                .map(|_| c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap())
+                .collect();
+            let (a, b, d) = (kids[0].clone(), kids[11].clone(), kids[23].clone());
+            assert_eq!(
+                c.get(BranchId::TRUNK).unwrap().live_children.len(),
+                24,
+                "in-memory array is built by add_live_child and is not what this test is about"
+            );
+            // Reap the middle one the way the reaper does: detach, then mark reaped.
+            let mut brec = c.get_raw(b.branch_id.id).unwrap();
+            let mut trunk = c.get_raw(0).unwrap();
+            trunk.remove_live_child(brec.fork_epoch);
+            c.put(&trunk).unwrap();
+            brec.mark_reaped();
+            c.put(&brec).unwrap();
+            let mut expect: Vec<_> =
+                kids.iter().filter(|k| k.fork_epoch != b.fork_epoch).map(|k| k.fork_epoch).collect();
+            expect.sort_unstable();
+            let _ = (&a, &d);
+            (expect, b.fork_epoch)
+        };
+
+        let reopened = LogBranchCatalog::open(&path, 1).unwrap();
+        let trunk = reopened.get(BranchId::TRUNK).unwrap();
+        assert_eq!(
+            trunk.live_children, kept,
+            "after a reopen trunk should list exactly its LIVE children, ascending — a fork whose \
+             parent was never rewritten still has to reach the array, and a reaped child must not"
+        );
+        assert!(
+            !trunk.live_children.contains(&gone),
+            "a reaped child is still listed as live, so pages it could see will never be freed"
+        );
+        // ASCENDING, asserted separately from the contents. `reclaimable` answers the liveness
+        // question with `partition_point` over this array, so an array holding the right epochs in
+        // the wrong order returns a wrong answer while every membership check still passes — which
+        // is exactly how a mutant that deleted the sort survived the first version of this test.
+        assert!(
+            trunk.live_children.windows(2).all(|w| w[0] <= w[1]),
+            "derived live_children is not ascending, so the range-emptiness query that decides \
+             whether a page is reclaimable will answer on an unsorted array: {:?}",
+            trunk.live_children
+        );
+
+        // A childless branch must come back with an EMPTY array, not the stale one its last
+        // serialised copy held.
+        let leaf = reopened
+            .get_raw(reopened.get(BranchId::TRUNK).unwrap().live_children.len() as u64)
+            .map(|r| r.live_children.clone())
+            .unwrap_or_default();
+        assert!(leaf.is_empty(), "a branch with no children came back with a non-empty array: {leaf:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+#[test]
     fn fork_records_the_child_in_the_parent_atomically() {
         let c = cat();
         let child = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
@@ -609,30 +1089,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `resume_interrupted_reaps` walks `all_records` and reaps in the order it arrives, and every
-    /// reap appends durable records and frees pages.
+    /// `resume_interrupted_reaps` walks `in_state` and reaps in the order it arrives, and every
+    /// reap appends durable records and frees pages — so every accessor that can feed a sweep has
+    /// to be ordered, not merely happen to be.
     #[test]
     fn every_record_sweep_comes_back_in_branch_id_order() {
         let c = cat();
         for _ in 0..16 {
             c.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         }
-        // One reaped slot, so `all_records` and `live_branches` are not the same list.
+        // One reaped and one quarantined slot, so the three accessors are three different lists
+        // and a test that passed by returning the same list every time would fail here.
         let mut rec = c.get_raw(3).unwrap();
         rec.mark_reaped();
         c.put(&rec).unwrap();
+        let mut held = c.get_raw(5).unwrap();
+        held.state = BranchState::Quarantined;
+        c.put(&held).unwrap();
 
-        let sweeps: Vec<(&str, Vec<u64>)> = vec![
-            ("all_records", c.all_records().iter().map(|r| r.branch_id.id).collect()),
-            ("live_branches", c.live_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
-            ("all_branches", c.all_branches().unwrap().iter().map(|r| r.branch_id.id).collect()),
+        // 17 records: trunk plus 16 forks. Live is 15 of them (id 3 reaped, id 5 quarantined),
+        // and `expired_before` is 14 of those — it excludes trunk as well, which is the whole
+        // reason the exclusion lives inside the query rather than in each caller.
+        let sweeps: Vec<(&str, usize, Vec<u64>)> = vec![
+            ("scan", 17, c.scan().unwrap().map(|r| r.unwrap().branch_id.id).collect()),
+            ("in_state(Live)", 15,
+             c.in_state(BranchState::Live).unwrap().iter().map(|r| r.branch_id.id).collect()),
+            ("in_state(Quarantined)", 1,
+             c.in_state(BranchState::Quarantined).unwrap().iter().map(|r| r.branch_id.id).collect()),
+            ("expired_before", 14,
+             c.expired_before(u64::MAX).unwrap().iter().map(|r| r.branch_id().id).collect()),
         ];
-        for (name, ids) in sweeps {
-            assert_eq!(ids.len(), if name == "live_branches" { 16 } else { 17 }, "fixture: {name}");
+        for (name, want, ids) in sweeps {
+            assert_eq!(ids.len(), want, "fixture: {name} returned {ids:?}");
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             assert_eq!(ids, sorted, "{name} came back in hash order");
         }
+    }
+
+    /// The three queries that replace `live_children` as an array. They are the reclamation rule
+    /// and the privacy barrier, so they get asserted directly rather than only through the arena.
+    #[test]
+    fn the_live_child_queries_answer_the_rule_the_array_used_to() {
+        let c = cat();
+        // Children of trunk at successive fork epochs.
+        let a = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let d = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        assert!(a.fork_epoch < b.fork_epoch && b.fork_epoch < d.fork_epoch, "fixture ordering");
+
+        // max_live_child is the LATEST, which is what the privacy barrier depends on.
+        assert_eq!(c.max_live_child(BranchId::TRUNK.id).unwrap(), Some(d.fork_epoch));
+        assert_eq!(c.max_live_child(a.branch_id.id).unwrap(), None, "a leaf has no children");
+        assert!(c.has_live_children(BranchId::TRUNK.id).unwrap());
+        assert!(!c.has_live_children(a.branch_id.id).unwrap());
+
+        // The reclamation rule, half-open: a page born at `lo` and freed at `hi` is pinned exactly
+        // when some live child forked inside [lo, hi).
+        let t = BranchId::TRUNK.id;
+        assert!(
+            c.live_child_in_epoch_range(t, a.fork_epoch, Epoch(a.fork_epoch.0 + 1)).unwrap(),
+            "a child forked exactly at lo is INSIDE a half-open [lo, hi)"
+        );
+        assert!(
+            !c.live_child_in_epoch_range(t, d.fork_epoch, d.fork_epoch).unwrap(),
+            "an empty window pins nothing"
+        );
+        assert!(
+            !c.live_child_in_epoch_range(t, Epoch(d.fork_epoch.0 + 1), Epoch(d.fork_epoch.0 + 99))
+                .unwrap(),
+            "a window entirely after every child pins nothing"
+        );
+        assert!(
+            c.live_child_in_epoch_range(t, a.fork_epoch, Epoch(d.fork_epoch.0 + 1)).unwrap(),
+            "a window spanning every child is pinned"
+        );
+
+        // A slot with no record answers false rather than erroring: nothing pins the page.
+        assert!(!c.live_child_in_epoch_range(9_999, Epoch(0), Epoch(u64::MAX)).unwrap());
+        assert_eq!(c.max_live_child(9_999).unwrap(), None);
+        assert!(!c.has_live_children(9_999).unwrap());
+    }
+
+    /// The narrowed surface exists to make a selective question selective. These assert the
+    /// *selection*, which is the part a re-implementation over a B+tree must preserve exactly.
+    #[test]
+    fn expired_before_excludes_trunk_the_unexpired_and_the_not_live() {
+        let c = cat();
+        // Trunk's own lease must be EXPIRED for this fixture to test anything. Left at
+        // `TRUNK_LEASE` it is not expired at `now`, so the trunk assertion below passes whether
+        // or not the exclusion exists — and a mutant that deleted the exclusion survived exactly
+        // that way before this line was added. The exclusion is now the only thing keeping trunk
+        // out of the result.
+        let mut trunk = c.get(BranchId::TRUNK).unwrap();
+        trunk.lease_deadline = LeaseDeadline(1);
+        c.put(&trunk).unwrap();
+
+        let early = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let late = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
+        let reaping = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let mut r = c.get(reaping.branch_id).unwrap();
+        r.state = BranchState::Reaping;
+        c.put(&r).unwrap();
+
+        let ids: Vec<u64> =
+            c.expired_before(1_000).unwrap().iter().map(|r| r.branch_id().id).collect();
+        assert_eq!(ids, vec![early.branch_id.id], "expected only the expired Live non-trunk branch");
+        assert!(!ids.contains(&BranchId::TRUNK.id), "trunk must never be a reap candidate");
+        assert!(!ids.contains(&late.branch_id.id), "an unexpired lease is not a candidate");
+        assert!(!ids.contains(&reaping.branch_id.id), "a Reaping branch is not a fresh candidate");
+
+        // Boundary: `is_expired_at` is inclusive, so a deadline exactly at `now` is expired.
+        assert!(c.expired_before(100).unwrap().iter().any(|r| r.branch_id() == early.branch_id));
+        assert!(c.expired_before(99).unwrap().is_empty(), "a lease one ms out is not expired");
     }
 
     #[test]

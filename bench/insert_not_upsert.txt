@@ -1,0 +1,42 @@
+D10 / S10: fork writes provably-new keys with tree.insert instead of upsert.
+Instrument: examples/fork_concurrency, release, 64 threads, N=2000, FERRODB_PARENT_ARENAS=0.
+
+⭐ METHOD: THE TWO BINARIES WERE BUILT AND THEN ALTERNATED IN ONE SESSION.
+A first attempt ran the AFTER build and compared it against numbers taken an hour earlier. It
+looked like a 19% REGRESSION -- from a change that only removes work, which is implausible on its
+face. The machine had genuinely slowed over hours of building (absolute throughput is ~3400-4400
+here against ~4000-5000 earlier). Comparing across sessions on a drifting machine measures the
+drift. Alternating the two binaries round by round makes the drift common-mode.
+
+  round   before (upsert)   after (tree.insert)   ratio
+      1          3404.9            3898.0         x1.145
+      2          3651.1            3809.2         x1.043
+      3          3259.7            3854.1         x1.182
+      4          3443.8            4388.6         x1.274
+
+  medians          3424.4            3876.1        x1.13
+  ranges     [3259.7, 3651.1]  [3809.2, 4388.6]   NON-OVERLAPPING
+
+4 rounds out of 4, and the slowest after-run beats the fastest before-run. ~13% more forks/sec.
+
+PREDICTED vs MEASURED. The profile priced the wasted delete at 0.01277 ms (56% of an upsert, from
+the child key measured both ways in the same run). Four such deletes removed from write_record is
+~0.035 ms; against the ~0.228 ms effective serial section and D8's throughput = 1/serial_time that
+predicts ~15%. Measured ~13%. The prediction was made before the run and is recorded as made.
+
+WHAT WAS REMOVED, per fork with a freshly minted id:
+  - the delete probe on the record, state, deadline and envelope keys (4 guaranteed-miss descents)
+  - the arena-span range_scan write_record performs to reconcile arenas, which for a brand-new
+    child can only ever find an empty span
+
+SAFETY, CHECKED NOT ASSUMED: no path anywhere deletes a RECORD key -- the only operations on
+keys::record are insert, search and upsert -- so a reaped branch's record SURVIVES with
+state = Reaped and a RECYCLED id's keys DO exist. fork therefore uses write_record_new only for an
+id taken from next_id, never one taken from FREE_ID, and it knows which it chose because it chose.
+write_record_new also carries a real assert (not debug_assert) that the record has no arenas: it
+does not reconcile the arena span, and silently dropped arenas is exactly the defect that leaked
+pages permanently once already (6e28372) while the obvious assertion passed.
+
+NOT SUPPORTED BY THIS FILE: any claim about a real engine. This measures ferrodb, a proof of
+concept. What transfers is the shape -- a delete probe on a key that cannot exist is a wasted
+descent in any B+tree -- not the absolute numbers.

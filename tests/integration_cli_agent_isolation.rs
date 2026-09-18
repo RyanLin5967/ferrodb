@@ -117,7 +117,7 @@ fn an_agent_sessions_write_is_invisible_to_trunk_and_survives_a_restart() {
         "no arena checkpoint was written, so the CLI is not running the page-backed runtime"
     );
     assert!(
-        db.with_extension("db.branches").exists(),
+        db.with_extension("db.branchcat").exists(),
         "no branch catalog was written, so branches are not durable"
     );
 

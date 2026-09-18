@@ -31,6 +31,7 @@ use crate::cow::node::{self, Node, NodeMut};
 use crate::cow::page_header::{stamp_checksum, PageHeader, PageType};
 use crate::cow::{PageHandle, PageStore, WriteBuffer, WriteBufferEntry};
 use crate::error::FerroError;
+use crate::storage::disk_manager::PAGE_SIZE;
 
 /// Descent guard. A well-formed tree is far shallower than this; exceeding it means a cycle, and
 /// looping forever inside a page store is worse than failing.
@@ -115,80 +116,19 @@ impl CowTree {
 
     /// Ordered scan over `[lo, hi)`. `None` bounds are unbounded.
     ///
-    /// Uses a descent stack rather than leaf sibling pointers: in a shadow-paging tree a
-    /// `next_leaf` link would force shadowing the left neighbour of every leaf that is copied,
-    /// cascading a one-key update into a whole-level copy.
+    /// Returns a **cursor**, not a materialised `Vec`. See [`ScanCursor`] for why the peak memory
+    /// of a scan is the property this signature exists to fix, and why the cursor carries a
+    /// descent stack instead of following leaf sibling pointers.
+    ///
+    /// Nothing is read until the first `next()`, so the `Result` is about the arguments, not the
+    /// tree; it is kept so a future seek-on-open cannot become a silent panic.
     pub fn range_scan(
         &self,
         root: PageId,
         lo: Option<&[u8]>,
         hi: Option<&[u8]>,
-    ) -> Result<node::LeafEntries, FerroError> {
-        let mut out = Vec::new();
-        self.scan_into(root, lo, hi, 0, &mut out)?;
-        Ok(out)
-    }
-
-    fn scan_into(
-        &self,
-        pid: PageId,
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-        depth: usize,
-        out: &mut node::LeafEntries,
-    ) -> Result<(), FerroError> {
-        if depth > MAX_DESCENT {
-            return Err(FerroError::Cow("btree scan exceeded the depth guard".into()));
-        }
-        let children: Vec<PageId> = {
-            let h = self.store.read_page(pid)?;
-            let f = h.read();
-            let ty = PageHeader::read_from(&f.data)?.page_type;
-            let n = Node::new(&f.data);
-            match ty {
-                PageType::BTreeLeaf => {
-                    for i in 0..n.count() {
-                        let k = n.key(i)?;
-                        if lo.map(|b| k < b).unwrap_or(false) {
-                            continue;
-                        }
-                        if hi.map(|b| k >= b).unwrap_or(false) {
-                            break;
-                        }
-                        out.push((k.to_vec(), n.value(i)?.to_vec()));
-                    }
-                    return Ok(());
-                }
-                PageType::BTreeInternal => {
-                    // A child is worth visiting when its key range can overlap [lo, hi).
-                    let mut keep = Vec::with_capacity(n.count() + 1);
-                    let all = n.all_children()?;
-                    for (ci, child) in all.into_iter().enumerate() {
-                        // child ci covers keys >= key(ci-1) and < key(ci)
-                        let lower = if ci == 0 { None } else { Some(n.key(ci - 1)?) };
-                        let upper = if ci < n.count() { Some(n.key(ci)?) } else { None };
-                        if upper.zip(lo).is_some_and(|(u, l)| u <= l) {
-                            continue;
-                        }
-                        if lower.zip(hi).is_some_and(|(lw, h)| lw >= h) {
-                            continue;
-                        }
-                        keep.push(child);
-                    }
-                    keep
-                }
-                other => {
-                    return Err(FerroError::Cow(format!(
-                        "page {} is a {:?}, not a btree node",
-                        pid, other
-                    )))
-                }
-            }
-        };
-        for c in children {
-            self.scan_into(c, lo, hi, depth + 1, out)?;
-        }
-        Ok(())
+    ) -> Result<ScanCursor, FerroError> {
+        Ok(ScanCursor::new(Arc::clone(&self.store), root, lo, hi))
     }
 
     /// Every page reachable from `root`, root first. This is the honest way to answer "how many
@@ -593,6 +533,269 @@ impl CowTree {
     }
 }
 
+// ---- the scan cursor -----------------------------------------------------------------------
+
+/// One level of a cursor's root-to-leaf path: the children of that node which survived range
+/// pruning, and which of them the cursor visits next.
+struct Level {
+    children: Vec<PageId>,
+    next: usize,
+}
+
+/// A lazy, ordered cursor over `[lo, hi)`. One leaf page at a time; peak memory is a property of
+/// the tree's *depth*, not of the rows it returns.
+///
+/// # Why this is a cursor and not a `Vec`
+///
+/// `range_scan` used to materialise every matching entry before returning, and
+/// `PagedRows::scan_table` then built a second `Vec` of decoded rows from it. At 10^6 branches
+/// with per-branch state, a scan whose ceiling the consumer cannot set is a hard memory wall.
+///
+/// Peak **live heap**, measured with a tracking global allocator — instrument
+/// `examples/cow_scan_memory.rs`, raw output `bench/s23_cow_scan_memory_{before,after}.txt`:
+///
+/// ```text
+///                       10^6 rows, before  ->  after
+///   full scan, streamed        84.36 MiB   ->   5,640 B
+///   scan_table, streamed      154.81 MiB   ->   5,640 B
+///   first ten rows             84.24 MiB   ->   6,008 B
+///   collect the whole table    84.36 MiB   ->   84.24 MiB   (unchanged, and must be)
+/// ```
+///
+/// The first-ten-rows row is the one that states the defect: it was indistinguishable from the
+/// full scan, because the size of the answer was decided before the caller ever saw a row. The
+/// last row is the control — asking for the table in RAM still costs the table in RAM, so the
+/// change moved the decision to the caller rather than hiding a cost somewhere else.
+///
+/// The streamed figures are flat from 10^4 to 10^6 rows (5,024 → 5,540 → 5,640 B): one 4 KiB
+/// leaf buffer, the descent stack, and the entry being yielded. The first scan after a build
+/// reads higher (160,120 B at 10^6) and that is the buffer pool's ARC bookkeeping settling, not
+/// the cursor — the identical drain repeated immediately costs 5,640 B, which is why the
+/// measurement runs it twice rather than asserting which cost is which.
+///
+/// # Why a descent stack rather than leaf sibling pointers
+///
+/// The textbook streaming cursor saves a leaf position and follows a `next_leaf` link. That is
+/// ruled out here by the page layout, not by taste: with no sibling links, shadowing one leaf
+/// copies one page; with them, the left neighbour's link must be rewritten too, and a one-key
+/// update cascades into a copy of the whole leaf level. `cow::node` rejects them in its module
+/// doc for exactly this reason, and LMDB — the design this store follows — iterates with a
+/// cursor stack for the same reason. So the sibling link is replaced by an explicit stack of the
+/// path from the root, which is the recursion `scan_into` used to run on the call stack, reified
+/// so it can be suspended between `next()` calls.
+///
+/// Two other shapes were considered and lost:
+///
+/// - **Internal iteration** (`for_each(|k, v| ...)`) is also O(page) and is a smaller change, but
+///   it inverts control: the consumer cannot stop early without threading a control-flow enum
+///   through the callback, cannot interleave two scans (a merge join across branches), and does
+///   not fit the pull-based `Executor::next()` shape the rest of the engine already uses.
+///   "Bounded by the consumer's appetite" requires the consumer to hold the pull.
+/// - **Chunked resume** (`range_scan_from(lo, limit)` returning a `Vec` and a resume key) bounds
+///   memory too, but re-descends from the root for every chunk and makes each caller responsible
+///   for writing the resume loop correctly. That is the right shape for a network boundary, not
+///   for an in-process iterator.
+///
+/// # What it does *not* change
+///
+/// The leaf is copied out under the same read guard the eager scan decoded it under, so a
+/// concurrent in-place write to an already-private leaf can no more be observed half-applied
+/// than it could before. Per-leaf atomicity is preserved exactly; nothing here makes the scan a
+/// snapshot that it was not already.
+pub struct ScanCursor {
+    store: Arc<dyn PageStore>,
+    lo: Option<Vec<u8>>,
+    hi: Option<Vec<u8>>,
+    /// The suspended descent, root level first.
+    stack: Vec<Level>,
+    /// A private copy of the leaf currently being read from. This is the whole memory budget:
+    /// one page, allocated once per cursor and reused for every leaf.
+    leaf: Box<[u8; PAGE_SIZE]>,
+    slot: usize,
+    count: usize,
+    /// Fused. Set on exhaustion and on error, so a caller that keeps polling after a failure
+    /// gets `None` rather than the same page fault forever.
+    done: bool,
+}
+
+impl ScanCursor {
+    fn new(store: Arc<dyn PageStore>, root: PageId, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Self {
+        let leaf: Box<[u8; PAGE_SIZE]> = vec![0u8; PAGE_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .expect("a PAGE_SIZE vector is a PAGE_SIZE array");
+        ScanCursor {
+            store,
+            lo: lo.map(|b| b.to_vec()),
+            hi: hi.map(|b| b.to_vec()),
+            // Seeding the root as a one-child level means the descent loop has no special first
+            // step, and the depth guard counts the same levels the recursion used to count.
+            stack: vec![Level { children: vec![root], next: 0 }],
+            leaf,
+            slot: 0,
+            count: 0,
+            done: false,
+        }
+    }
+
+    /// The entry at slot `i` of the current leaf, or `None` when it is at or past `hi`.
+    ///
+    /// Reaching `hi` ends the **whole** scan, not just this leaf: a B+tree is ordered across
+    /// leaves as well as within one, so every later entry is greater still. The eager scan only
+    /// `break`ed out of the leaf and left the rest to range pruning, which returned the same
+    /// entries while visiting more pages.
+    fn entry_at(&self, i: usize) -> Result<Option<(Vec<u8>, Vec<u8>)>, FerroError> {
+        let n = Node::new(&self.leaf);
+        let k = n.key(i)?;
+        if self.hi.as_deref().is_some_and(|h| k >= h) {
+            return Ok(None);
+        }
+        Ok(Some((k.to_vec(), n.value(i)?.to_vec())))
+    }
+
+    /// A child is worth visiting when its key range can overlap `[lo, hi)`.
+    fn children_in_range(&self, n: &Node<'_>) -> Result<Vec<PageId>, FerroError> {
+        let (lo, hi) = (self.lo.as_deref(), self.hi.as_deref());
+        let mut keep = Vec::with_capacity(n.count() + 1);
+        for (ci, child) in n.all_children()?.into_iter().enumerate() {
+            // child ci covers keys >= key(ci-1) and < key(ci)
+            let lower = if ci == 0 { None } else { Some(n.key(ci - 1)?) };
+            let upper = if ci < n.count() { Some(n.key(ci)?) } else { None };
+            if upper.zip(lo).is_some_and(|(u, l)| u <= l) {
+                continue;
+            }
+            if lower.zip(hi).is_some_and(|(lw, h)| lw >= h) {
+                continue;
+            }
+            keep.push(child);
+        }
+        Ok(keep)
+    }
+
+    /// Walk the stack to the next leaf that can hold a matching key. `false` means the scan is
+    /// over; the cursor holds at most one page and one path while it runs.
+    fn advance_leaf(&mut self) -> Result<bool, FerroError> {
+        loop {
+            // The node about to be visited sits at depth `stack.len() - 1`, so this is the same
+            // bound the recursive `scan_into` applied to its `depth` parameter.
+            if self.stack.len() > MAX_DESCENT + 1 {
+                return Err(FerroError::Cow("btree scan exceeded the depth guard".into()));
+            }
+            let Some(top) = self.stack.last_mut() else {
+                return Ok(false);
+            };
+            if top.next >= top.children.len() {
+                self.stack.pop();
+                continue;
+            }
+            let pid = top.children[top.next];
+            top.next += 1;
+
+            // ONE read guard for the whole page, as the eager scan had. The page type and the
+            // bytes must be sampled together: a second `h.read()` would let an in-place write to
+            // an already-private leaf land between the two, and the cursor would be built from a
+            // page observed at two different moments.
+            //
+            // The `drop(h)` is the enforcement, and it is deliberate. A comment asking the next
+            // editor not to re-read the handle is advice; dropping it means a second read does
+            // not COMPILE. That property is not observable from a test here — it lives inside
+            // the frame lock, not in anything `PageStore` exposes, and a concurrency test for it
+            // would be a detector that cannot be forced to fire — so the structure has to carry
+            // it. (`bench/s23_fire_check.txt`, mutant D.) Releasing the pin here rather than at
+            // the end of the iteration also matches `storage::range_scan::RangeScanner`, which
+            // copies its leaf out and unpins immediately for the same reason.
+            let h = self.store.read_page(pid)?;
+            let step = {
+                let f = h.read();
+                match PageHeader::read_from(&f.data)?.page_type {
+                    PageType::BTreeLeaf => {
+                        self.leaf.copy_from_slice(&f.data);
+                        Step::Leaf
+                    }
+                    PageType::BTreeInternal => {
+                        Step::Internal(self.children_in_range(&Node::new(&f.data))?)
+                    }
+                    other => Step::NotANode(other),
+                }
+            };
+            drop(h);
+            match step {
+                Step::Leaf => {
+                    let (count, slot) = {
+                        let n = Node::new(&self.leaf);
+                        let slot = match self.lo.as_deref() {
+                            // Equivalent to skipping entries below `lo` one at a time, which is
+                            // what the eager scan did, but in log(count) comparisons.
+                            Some(lo) => match n.search(lo)? {
+                                Ok(i) => i,
+                                Err(i) => i,
+                            },
+                            None => 0,
+                        };
+                        (n.count(), slot)
+                    };
+                    self.count = count;
+                    self.slot = slot;
+                    return Ok(true);
+                }
+                Step::Internal(children) => self.stack.push(Level { children, next: 0 }),
+                Step::NotANode(other) => {
+                    return Err(FerroError::Cow(format!(
+                        "page {} is a {:?}, not a btree node",
+                        pid, other
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// What one page of the descent turned out to be, decided under a single read guard so the page
+/// type and the page contents cannot be sampled from two different moments.
+enum Step {
+    Leaf,
+    Internal(Vec<PageId>),
+    NotANode(PageType),
+}
+
+impl Iterator for ScanCursor {
+    type Item = Result<(Vec<u8>, Vec<u8>), FerroError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if self.slot < self.count {
+                let i = self.slot;
+                self.slot += 1;
+                return match self.entry_at(i) {
+                    Ok(Some(kv)) => Some(Ok(kv)),
+                    Ok(None) => {
+                        self.done = true;
+                        None
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        Some(Err(e))
+                    }
+                };
+            }
+            match self.advance_leaf() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
 /// The CoW B+tree's page layout, described to the branch reaper.
 ///
 /// `TwoTierReaper::collapse` materialises a branch's visible state by deep-copying every page
@@ -707,7 +910,7 @@ mod diff_tests {
         let dm = Arc::new(DiskManager::new(file).unwrap());
         let pool = Arc::new(BufferPoolManager::new(dm));
         let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-        let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+        let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, ARENA_BASE).unwrap());
         let t = CowTree::new(store as Arc<dyn PageStore>);
         (dir, catalog, t)
     }

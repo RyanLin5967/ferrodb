@@ -44,13 +44,12 @@ fn parts(tag: &str) -> (tempfile::TempDir, Arc<DiskManager>, Arc<BufferPoolManag
 fn the_legacy_allocator_never_hands_out_a_page_inside_an_arena_extent() {
     let (_dir, dm, pool, catalog) = parts("exclusive");
     let store =
-        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), ARENA_BASE).unwrap());
+        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
 
     // A branch takes an extent and writes pages into it.
     let epoch = catalog.next_epoch();
-    let arena = store.arena_for(BranchId::TRUNK).unwrap();
     let arena_pages: Vec<u32> = (0..64)
-        .map(|_| store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap())
+        .map(|_| store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, epoch).unwrap())
         .collect();
 
     // The ordinary heap/index path allocates, as any non-agent statement would.
@@ -81,7 +80,7 @@ fn the_bitmap_allocator_refuses_rather_than_crossing_the_floor() {
     let (_dir, dm, pool, catalog) = parts("starved");
     let base = dm.next_page_id.load(Ordering::SeqCst);
     let _store =
-        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).unwrap();
 
     let err = dm.allocate().unwrap_err();
     assert!(
@@ -114,7 +113,7 @@ fn a_second_lower_arena_region_is_refused() {
     // Lowering the floor would put pages that are already inside the first store's extents back
     // into circulation.
     let (_dir, dm, pool, catalog) = parts("twofloors");
-    let _a = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), ARENA_BASE).unwrap();
+    let _a = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap();
     let err = dm.reserve_from(ARENA_BASE - 100).unwrap_err();
     assert!(err.to_string().contains("already reserved"), "got {}", err);
     assert_eq!(dm.arena_floor(), ARENA_BASE);
@@ -126,7 +125,7 @@ fn an_arena_page_cannot_be_freed_through_the_bitmap() {
     // unrelated page belonging to the legacy allocator.
     let (_dir, dm, pool, catalog) = parts("crossfree");
     let _store =
-        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), ARENA_BASE).unwrap();
+        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap();
     let err = dm.deallocate(ARENA_BASE + 5).unwrap_err();
     assert!(err.to_string().contains("not this allocator's to free"), "got {}", err);
 }

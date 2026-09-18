@@ -10,13 +10,13 @@ use crate::wal::txn::TxnManager;
 use crate::{buffer::buffer_pool::BufferPoolManager, catalog::{catalog::Catalog, column::Value}, error::FerroError, execution::executor::Outcome, storage::disk_manager::DiskManager};
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::arena::ArenaPageStore;
-use crate::branch::catalog::LogBranchCatalog;
+use crate::branch::TableBranchCatalog;
 use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseThread, RuntimeLock};
 use crate::branch::reaper::TwoTierReaper;
 use crate::branch::{BranchCatalog, Reaper};
 use crate::cow::{CowPageLinks, PageStore};
 use crate::storage::db_lock::DbLock;
-use crate::tel::MemEffectLog;
+use crate::tel::DurableEffectLog;
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
 
 /// Placeholder root recorded for trunk before a real tree exists. `AgentRuntime::with_storage`
@@ -82,10 +82,14 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // so an agent session's writes lived in a `BTreeMap` and the copy-on-write branch engine -
     // zero-copy fork, lease reaping, shadow paging - was reachable only from tests. The engine was
     // real and the binary did not use it.
-    let branches_path = format!("{db_path}.branches");
     let arena_path = format!("{db_path}.arena");
-    let branches = Arc::new(LogBranchCatalog::open(
-        Path::new(&branches_path),
+    // `default_for_database` rather than a path spelled out here, for the same reason
+    // `DurableEffectLog::default_for_database` is used below: the naming convention and the choice
+    // of implementation belong beside the format, and an entry point wiring a runtime should make
+    // no decision. It also owns the one-time conversion of a legacy `{db}.branches` log, which an
+    // entry point has no business knowing about.
+    let branches = Arc::new(TableBranchCatalog::default_for_database(
+        db_path,
         TRUNK_ROOT_PLACEHOLDER,
     )?);
 
@@ -130,17 +134,29 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
     // as the CLI is open and answer nothing after a restart — the rows keep their author stamp, and
     // the table mapping a slot to an agent is gone. Applied here because this is the layer that owns
     // the database's name; the constructors take page stores and have no path to open.
+    // The effect log on disk, for the same reason the provenance store below is, and it is the
+    // sharper of the two. Merges are computed FROM these frames, so a runtime handed
+    // `MemEffectLog::new()` begins every process with none of the effects its branches were
+    // written by. `reopen_with_storage` is the arm that makes this plain: its whole job is
+    // attaching to a tree another process wrote, and an in-memory log hands it that tree's rows,
+    // that tree's provenance, and an empty effect log.
+    //
+    // `default_for_database` rather than a path spelled out here: the naming convention and the
+    // choice of implementation belong beside the format, and an entry point wiring a runtime
+    // should make no decision. Built once and shared by both arms, which open the same file.
+    let effects = DurableEffectLog::default_for_database(db_path)?;
+
     let runtime = Arc::new(
         if arena_exists {
             AgentRuntime::reopen_with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
-                Arc::new(MemEffectLog::new()),
+                effects.clone(),
                 store.clone() as Arc<dyn PageStore>,
             )?
         } else {
             AgentRuntime::with_storage(
                 branches.clone() as Arc<dyn BranchCatalog>,
-                Arc::new(MemEffectLog::new()),
+                effects.clone(),
                 store.clone() as Arc<dyn PageStore>,
             )?
         }

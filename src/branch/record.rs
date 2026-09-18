@@ -50,6 +50,96 @@ pub struct BranchRecord {
     pub envelope: Option<CapabilityEnvelope>,
 }
 
+/// Exact width of [`BranchRecord::serialize_core`]. Named so the encoder and the decoder cannot
+/// drift: both assert against it.
+pub const CORE_BYTES: usize = 51;
+
+/// A branch record as it is **stored**: the fixed-width core, with `arenas` empty and `envelope`
+/// `None` because both live in their own key spans and loading them costs a range scan.
+///
+/// ⛔ THIS TYPE EXISTS BECAUSE TWO BUGS SHIPPED THROUGH THE GAP IT CLOSES, and both were invisible
+/// to the tests that were looking at the code around them:
+///
+///  1. `set_root` / `renew_lease` / `scan` read a core record and wrote it back. `write_record`
+///     makes the arena span match the record it is handed, so the span was EMPTIED -- and the
+///     reaper frees precisely `record.arenas`, so those pages leaked permanently. The obvious
+///     assertion (`populated.reserved > baseline.reserved`) PASSED.
+///  2. `fork` read the parent as a core record, so its `envelope` was `None`, and `fork_child`
+///     does `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`. `None` maps to `None`,
+///     which is the UNGOVERNED default -- so a child of a governed branch came back ungoverned.
+///     **That is a capability escape, and it reached the remote before it was caught.**
+///
+/// Both are one defect: an incomplete value accepted where a complete one was required. Commenting
+/// "remember to hydrate" is validation, and validation is forgotten; this is the parse, and its
+/// result is carried in the type. (Alexis King, *Parse, don't validate*, 2019.)
+///
+/// **Deliberately absent, and each absence is load-bearing:** no `Deref`, no `AsRef<BranchRecord>`,
+/// no `pub` field, no `into_inner()`. Any one of them reopens the hole. There are no `arenas()` or
+/// `envelope()` accessors either -- those are exactly the two fields this value does not have, and
+/// an accessor returning an empty vec would be a lie with a type signature.
+///
+/// It also lives in **this** module rather than beside its only consumer in `table_catalog.rs`,
+/// because a newtype declared next to its consumer is honour-system: `.0` would be in scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreRecord(BranchRecord);
+
+impl CoreRecord {
+    /// The **only** way to a `BranchRecord`, and it demands the two fields the core is missing.
+    /// You cannot obtain the complete value without supplying what made it incomplete.
+    pub fn into_hydrated(
+        mut self,
+        arenas: Vec<ArenaId>,
+        envelope: Option<CapabilityEnvelope>,
+    ) -> BranchRecord {
+        self.0.arenas = arenas;
+        self.0.envelope = envelope;
+        self.0
+    }
+
+    /// Narrow a whole record to its core. **Safe by direction**: this can only REMOVE information
+    /// (`arenas`, `live_children`, `envelope`), never fabricate it, so it cannot manufacture the
+    /// "looks whole but is not" value `CoreRecord` exists to make unrepresentable. It is here for
+    /// the catalogs that hold whole records in memory (`LogBranchCatalog`, `MemBranchCatalog`) and
+    /// must satisfy a trait method whose answer is core-only.
+    pub fn narrow(rec: &BranchRecord) -> CoreRecord {
+        let mut core = rec.clone();
+        core.arenas = Vec::new();
+        core.live_children = Vec::new();
+        core.envelope = None;
+        CoreRecord(core)
+    }
+
+    pub fn branch_id(&self) -> BranchId {
+        self.0.branch_id
+    }
+    pub fn generation(&self) -> u32 {
+        self.0.generation
+    }
+    pub fn state(&self) -> BranchState {
+        self.0.state
+    }
+    pub fn lease_deadline(&self) -> LeaseDeadline {
+        self.0.lease_deadline
+    }
+    pub fn depth(&self) -> u8 {
+        self.0.depth
+    }
+    pub fn fork_epoch(&self) -> Epoch {
+        self.0.fork_epoch
+    }
+    pub fn root_page_id(&self) -> PageId {
+        self.0.root_page_id
+    }
+    /// Safe on a core record: it reads `generation` and `state`, and neither is an unbounded field.
+    pub fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
+        self.0.check_readable(requested)
+    }
+    /// Re-encoding the core needs no unbounded field by definition, so this is exact.
+    pub fn serialize_core(&self) -> Vec<u8> {
+        self.0.serialize_core()
+    }
+}
+
 impl BranchRecord {
     /// The trunk record. Never reaped, no parent, depth 0.
     pub fn trunk(root_page_id: PageId, lease_deadline: LeaseDeadline) -> Self {
@@ -76,20 +166,75 @@ impl BranchRecord {
         fork_epoch: Epoch,
         lease_deadline: LeaseDeadline,
     ) -> Result<Self, BranchError> {
-        if parent.state != BranchState::Live {
-            return Err(BranchError::NotWritable(parent.branch_id));
+        Self::fork_child_parts(
+            parent.branch_id,
+            parent.state,
+            parent.depth,
+            parent.root_page_id,
+            parent.envelope.as_ref(),
+            child_id,
+            fork_epoch,
+            lease_deadline,
+        )
+    }
+
+    /// Fork from a parent read as a [`CoreRecord`] plus its envelope, with **no arena scan**.
+    ///
+    /// `fork_child` takes a whole `BranchRecord`, and the only way to obtain one is `hydrate`,
+    /// which range-scans the parent's entire arena span. `fork_child` never reads `arenas`, so
+    /// every fork was paying for a vector it discarded — measured at ~42 ns per arena of the
+    /// parent, x0.72 throughput at 2000 arenas (`bench/fork_parent_arena_scan.txt`). The type
+    /// system pushed toward that scan, so the fix is this signature rather than a warning comment.
+    ///
+    /// It takes the envelope SEPARATELY rather than accepting a `BranchRecord` with empty `arenas`,
+    /// which would tunnel under the guarantee `CoreRecord` exists to provide.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fork_child_from_core(
+        parent: &CoreRecord,
+        parent_envelope: Option<&CapabilityEnvelope>,
+        child_id: BranchId,
+        fork_epoch: Epoch,
+        lease_deadline: LeaseDeadline,
+    ) -> Result<Self, BranchError> {
+        Self::fork_child_parts(
+            parent.branch_id(),
+            parent.state(),
+            parent.depth(),
+            parent.root_page_id(),
+            parent_envelope,
+            child_id,
+            fork_epoch,
+            lease_deadline,
+        )
+    }
+
+    /// The single body both entry points share, so the two can never drift — and drift here is a
+    /// capability bug, since the envelope rule lives in it.
+    #[allow(clippy::too_many_arguments)]
+    fn fork_child_parts(
+        parent_branch_id: BranchId,
+        parent_state: BranchState,
+        parent_depth: u8,
+        parent_root_page_id: PageId,
+        parent_envelope: Option<&CapabilityEnvelope>,
+        child_id: BranchId,
+        fork_epoch: Epoch,
+        lease_deadline: LeaseDeadline,
+    ) -> Result<Self, BranchError> {
+        if parent_state != BranchState::Live {
+            return Err(BranchError::NotWritable(parent_branch_id));
         }
-        let depth = parent.depth + 1;
+        let depth = parent_depth + 1;
         if depth > MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch: parent.branch_id, depth });
+            return Err(BranchError::DepthExceeded { branch: parent_branch_id, depth });
         }
         Ok(BranchRecord {
             branch_id: child_id,
             generation: child_id.generation,
-            parent_id: Some(parent.branch_id),
+            parent_id: Some(parent_branch_id),
             fork_epoch,
             // The whole fork: the child's root IS the parent's root.
-            root_page_id: parent.root_page_id,
+            root_page_id: parent_root_page_id,
             lease_deadline,
             state: BranchState::Live,
             arenas: Vec::new(),
@@ -100,7 +245,7 @@ impl BranchRecord {
             // agent session in this system runs on a forked child. The child's budget is the
             // parent's REMAINING budget, so forking cannot mint row-writes the parent had already
             // used. See `CapabilityEnvelope::inherited` for the residual limit that leaves.
-            envelope: parent.envelope.as_ref().map(CapabilityEnvelope::inherited),
+            envelope: parent_envelope.map(CapabilityEnvelope::inherited),
         })
     }
 
@@ -122,20 +267,21 @@ impl BranchRecord {
         }
     }
 
-    /// A childless leaf takes the reaper's fast path: free its arenas wholesale, no sharing
-    /// analysis at all. This is the overwhelming majority of abandoned agent branches.
-    pub fn is_childless_leaf(&self) -> bool {
-        self.live_children.is_empty()
-    }
+    // `is_childless_leaf()` REMOVED (D18). It read `self.live_children`, which
+    // `deserialize_core` leaves empty and `hydrate` never refills, so on the shipped
+    // `TableBranchCatalog` it answered "childless" for every branch and the reaper freed pages a
+    // live child could still read. The question is now asked of the catalog
+    // (`BranchCatalog::has_live_children`), which is the only thing that can answer it.
+    // Deleted rather than documented: a comment does not stop the next caller.
 
     /// **The reclamation rule.** Page `p` is reclaimable iff no live child of this branch has
     /// `fork_epoch` in `[birth, freed)`.
     ///
     /// Correctness: a child forked at epoch `e` sees pages live at `e`; `p` was live over
     /// `[birth, freed)`; so `p` is visible to that child iff `e` falls in that interval.
-    pub fn page_reclaimable(&self, birth: Epoch, freed: Epoch) -> bool {
-        reclaimable(&self.live_children, birth, freed)
-    }
+    // `page_reclaimable()` REMOVED (D18). Same trap, and it had NO production callers -- it was
+    // a loaded gun left on the table. `BranchCatalog::live_child_in_epoch_range` is the live
+    // version of this question.
 
     /// Ordinary reads/writes reject anything not `Live`, and reject a stale generation outright.
     pub fn check_readable(&self, requested: BranchId) -> Result<(), BranchError> {
@@ -190,6 +336,78 @@ impl BranchRecord {
     // Appending a field does not do that, so paying for it here would have been a migration for a
     // problem that does not exist.
 
+    /// Bytes of the **core** record: everything that is not unbounded.
+    ///
+    /// The table catalog stores this, and keeps `arenas`, `live_children` and `envelope` in their
+    /// own key spans. Not a space optimisation — a correctness one. A B+tree leaf holds about 2 KB
+    /// of entries in total, and all three of those fields are unbounded: trunk's `live_children` at
+    /// 10⁶ branches is 8 MB, and a branch that has written ~230 MB owns ~900 arena ids. A record
+    /// that can outgrow a page is a wall with no error message.
+    ///
+    /// Fixed 51 bytes, no length prefixes, because every field is fixed-width. `CORE_BYTES` is
+    /// asserted on the way back in, so a short or long buffer is a refusal rather than a record
+    /// deserialized out of the next one's bytes.
+    pub fn serialize_core(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(CORE_BYTES);
+        b.extend_from_slice(&self.branch_id.id.to_be_bytes());
+        b.extend_from_slice(&self.branch_id.generation.to_be_bytes());
+        b.extend_from_slice(&self.generation.to_be_bytes());
+        match self.parent_id {
+            Some(p) => {
+                b.push(1);
+                b.extend_from_slice(&p.id.to_be_bytes());
+                b.extend_from_slice(&p.generation.to_be_bytes());
+            }
+            None => {
+                b.push(0);
+                b.extend_from_slice(&0u64.to_be_bytes());
+                b.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+        b.extend_from_slice(&self.fork_epoch.0.to_be_bytes());
+        b.extend_from_slice(&self.root_page_id.to_be_bytes());
+        b.extend_from_slice(&self.lease_deadline.0.to_be_bytes());
+        b.push(self.state.as_u8());
+        b.push(self.depth);
+        debug_assert_eq!(b.len(), CORE_BYTES);
+        b
+    }
+
+    /// Inverse of [`Self::serialize_core`]. The three unbounded fields come back **empty**, and
+    /// that is deliberate: a caller that needs them asks the catalog, which answers from an index.
+    /// Silently returning an empty `live_children` where the old record had a full one would be a
+    /// wrong answer, so every caller of those fields was moved onto catalog queries first.
+    /// Decode the stored core. Returns a [`CoreRecord`], **not** a `BranchRecord`: the bytes on
+    /// disk do not contain `arenas` or `envelope`, so the value this produces is not a whole
+    /// record and must not be usable as one. See [`CoreRecord`].
+    pub fn deserialize_core(bytes: &[u8]) -> Result<CoreRecord, BranchError> {
+        if bytes.len() != CORE_BYTES {
+            return Err(BranchError::Corrupt(format!(
+                "core branch record must be exactly {CORE_BYTES} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let u64_at = |i: usize| u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap());
+        let u32_at = |i: usize| u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap());
+        let branch_id = BranchId::new(u64_at(0), u32_at(8));
+        let generation = u32_at(12);
+        let parent_id =
+            if bytes[16] == 1 { Some(BranchId::new(u64_at(17), u32_at(25))) } else { None };
+        Ok(CoreRecord(BranchRecord {
+            branch_id,
+            generation,
+            parent_id,
+            fork_epoch: Epoch(u64_at(29)),
+            root_page_id: u32_at(37),
+            lease_deadline: LeaseDeadline(u64_at(41)),
+            state: BranchState::from_u8(bytes[49])?,
+            depth: bytes[50],
+            arenas: Vec::new(),
+            live_children: Vec::new(),
+            envelope: None,
+        }))
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::with_capacity(64 + self.arenas.len() * 4 + self.live_children.len() * 8);
         b.extend_from_slice(&self.branch_id.id.to_be_bytes());
@@ -224,27 +442,7 @@ impl BranchRecord {
             None => b.push(0),
             Some(e) => {
                 b.push(1);
-                b.push(e.verbs);
-                b.extend_from_slice(&e.max_row_writes.to_be_bytes());
-                b.extend_from_slice(&e.row_writes.to_be_bytes());
-                b.extend_from_slice(&(e.tables.len() as u32).to_be_bytes());
-                for t in &e.tables {
-                    b.extend_from_slice(&t.table.to_be_bytes());
-                    b.extend_from_slice(&(t.columns.len() as u32).to_be_bytes());
-                    for c in &t.columns {
-                        b.extend_from_slice(&c.col.to_be_bytes());
-                        match c.floor {
-                            None => {
-                                b.push(0);
-                                b.extend_from_slice(&0i64.to_be_bytes());
-                            }
-                            Some(f) => {
-                                b.push(1);
-                                b.extend_from_slice(&f.to_be_bytes());
-                            }
-                        }
-                    }
-                }
+                b.extend_from_slice(&e.serialize());
             }
         }
         let crc = crc32(&b);
@@ -299,50 +497,7 @@ impl BranchRecord {
         } else {
             match c.u8()? {
                 0 => None,
-                1 => {
-                    let verbs = c.u8()?;
-                    let max_row_writes = c.u64()?;
-                    let row_writes = c.u64()?;
-                    let table_len = c.u32()? as usize;
-                    let mut tables = Vec::new();
-                    for _ in 0..table_len {
-                        let table = c.u32()?;
-                        let col_len = c.u32()? as usize;
-                        let mut columns = Vec::new();
-                        for _ in 0..col_len {
-                            let col = c.u32()?;
-                            // Anything but 0 or 1 is refused, not read as "no floor". A tag this
-                            // read does not understand turning a floored column into an unbounded
-                            // one is the one direction this type forbids: a bound it cannot
-                            // evaluate refuses, it does not wave the write past.
-                            let floor = match c.u8()? {
-                                0 => {
-                                    c.i64()?;
-                                    None
-                                }
-                                1 => Some(c.i64()?),
-                                other => {
-                                    return Err(BranchError::Corrupt(format!(
-                                        "unknown capability floor tag {other} on table {table} \
-                                         column {col}"
-                                    )))
-                                }
-                            };
-                            columns.push(ColumnCapability { col, floor });
-                        }
-                        tables.push((table, columns));
-                    }
-                    // Built through `allow`, which sorts and deduplicates, so an envelope read off
-                    // disk carries the same invariant as one built in process. Reconstructing the
-                    // struct raw here is what let a non-canonical record mis-resolve a table it
-                    // had actually been granted.
-                    let mut e = CapabilityEnvelope::new(verbs, max_row_writes);
-                    for (table, columns) in tables {
-                        e = e.allow(table, columns);
-                    }
-                    e.row_writes = row_writes;
-                    Some(e)
-                }
+                1 => Some(CapabilityEnvelope::deserialize_from(&mut c)?),
                 other => {
                     return Err(BranchError::Corrupt(format!(
                         "unknown capability envelope tag {other}"
@@ -799,6 +954,87 @@ impl CapabilityEnvelope {
     }
 
     /// Row-writes still available.
+    /// The envelope's bytes, **without** the presence tag that `BranchRecord` writes before them.
+    ///
+    /// Extracted from `BranchRecord::serialize` rather than written a second time: the table
+    /// catalog stores envelopes under their own key (`tree_keys::ENVELOPE`) because they are
+    /// variable-length and `envelope_of` is already a separate query, and two encoders for one
+    /// format drift the first time either is touched.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(self.verbs);
+        b.extend_from_slice(&self.max_row_writes.to_be_bytes());
+        b.extend_from_slice(&self.row_writes.to_be_bytes());
+        b.extend_from_slice(&(self.tables.len() as u32).to_be_bytes());
+        for t in &self.tables {
+            b.extend_from_slice(&t.table.to_be_bytes());
+            b.extend_from_slice(&(t.columns.len() as u32).to_be_bytes());
+            for c in &t.columns {
+                b.extend_from_slice(&c.col.to_be_bytes());
+                match c.floor {
+                    None => {
+                        b.push(0);
+                        b.extend_from_slice(&0i64.to_be_bytes());
+                    }
+                    Some(f) => {
+                        b.push(1);
+                        b.extend_from_slice(&f.to_be_bytes());
+                    }
+                }
+            }
+        }
+        b
+    }
+
+    /// Inverse of [`Self::serialize`], reading from a standalone buffer.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, BranchError> {
+        let mut c = Cursor::new(bytes);
+        Self::deserialize_from(&mut c)
+    }
+
+    fn deserialize_from(c: &mut Cursor<'_>) -> Result<Self, BranchError> {
+        let verbs = c.u8()?;
+        let max_row_writes = c.u64()?;
+        let row_writes = c.u64()?;
+        let table_len = c.u32()? as usize;
+        let mut tables = Vec::new();
+        for _ in 0..table_len {
+            let table = c.u32()?;
+            let col_len = c.u32()? as usize;
+            let mut columns = Vec::new();
+            for _ in 0..col_len {
+                let col = c.u32()?;
+                // Anything but 0 or 1 is refused, not read as "no floor". A tag this read does not
+                // understand turning a floored column into an unbounded one is the one direction
+                // this type forbids: a bound it cannot evaluate refuses, it does not wave the
+                // write past.
+                let floor = match c.u8()? {
+                    0 => {
+                        c.i64()?;
+                        None
+                    }
+                    1 => Some(c.i64()?),
+                    other => {
+                        return Err(BranchError::Corrupt(format!(
+                            "unknown capability floor tag {other} on table {table} column {col}"
+                        )))
+                    }
+                };
+                columns.push(ColumnCapability { col, floor });
+            }
+            tables.push((table, columns));
+        }
+        // Built through `allow`, which sorts and deduplicates, so an envelope read off disk carries
+        // the same invariant as one built in process. Reconstructing the struct raw is what let a
+        // non-canonical record mis-resolve a table it had actually been granted.
+        let mut e = CapabilityEnvelope::new(verbs, max_row_writes);
+        for (table, columns) in tables {
+            e = e.allow(table, columns);
+        }
+        e.row_writes = row_writes;
+        Ok(e)
+    }
+
     pub fn remaining(&self) -> u64 {
         self.max_row_writes.saturating_sub(self.row_writes)
     }
@@ -1672,5 +1908,101 @@ mod tests {
             vec![ColumnCapability::floored(1, 0), ColumnCapability::open(1), ColumnCapability::floored(1, 5)],
         );
         assert_eq!(cap.columns(), &[ColumnCapability::floored(1, 5)]);
+    }
+}
+#[cfg(test)]
+mod core_record_tests {
+    use super::*;
+
+    /// Every field must survive the round trip. A silently dropped field here is a branch that
+    /// comes back pointing at the wrong root page or with the wrong lease.
+    #[test]
+    fn the_core_record_round_trips_every_field_it_carries() {
+        let mut rec = BranchRecord::trunk(7, LeaseDeadline(1234));
+        rec.branch_id = BranchId::new(42, 3);
+        rec.generation = 9;
+        rec.parent_id = Some(BranchId::new(41, 2));
+        rec.fork_epoch = Epoch(555);
+        rec.root_page_id = 777;
+        rec.lease_deadline = LeaseDeadline(u64::MAX - 1);
+        rec.state = BranchState::Quarantined;
+        rec.depth = 11;
+        // The unbounded fields are deliberately NOT carried; they live in key spans.
+        rec.arenas = vec![ArenaId(1), ArenaId(2)];
+        rec.live_children = vec![Epoch(3), Epoch(4)];
+
+        let bytes = rec.serialize_core();
+        assert_eq!(bytes.len(), CORE_BYTES, "core record width drifted from the constant");
+        // Through `into_hydrated`, NOT through `.0`. The field is reachable here because this
+        // test shares the module, and using it would make the guard honour-system in exactly the
+        // place that is supposed to prove it is not. Passing the empty arenas and absent envelope
+        // explicitly is also the honest statement of what `serialize_core` drops.
+        let back = BranchRecord::deserialize_core(&bytes)
+            .expect("round trip")
+            .into_hydrated(Vec::new(), None);
+
+        assert_eq!(back.branch_id, rec.branch_id);
+        assert_eq!(back.generation, rec.generation);
+        assert_eq!(back.parent_id, rec.parent_id);
+        assert_eq!(back.fork_epoch, rec.fork_epoch);
+        assert_eq!(back.root_page_id, rec.root_page_id);
+        assert_eq!(back.lease_deadline, rec.lease_deadline);
+        assert_eq!(back.state, rec.state);
+        assert_eq!(back.depth, rec.depth);
+        assert!(back.arenas.is_empty(), "arenas must come back empty, not stale");
+        assert!(back.live_children.is_empty(), "live_children must come back empty, not stale");
+        assert!(back.envelope.is_none());
+    }
+
+    /// The guard itself, asserted rather than assumed: a `CoreRecord` must not be usable as a
+    /// whole record. This is a compile-time property, so the test that matters is the one in
+    /// `tools/` that tries it and expects rustc to refuse -- see `d5_core_record_has_no_bypass`.
+    /// What is checkable here is that the ONLY exit carries both missing fields through.
+    #[test]
+    fn d5_into_hydrated_is_the_only_exit_and_it_carries_both_fields() {
+        let mut rec = BranchRecord::trunk(1, LeaseDeadline(0));
+        rec.arenas = vec![ArenaId(7), ArenaId(9)];
+        let core = BranchRecord::deserialize_core(&rec.serialize_core()).unwrap();
+        // The core genuinely lost them...
+        let empty = core.clone().into_hydrated(Vec::new(), None);
+        assert!(empty.arenas.is_empty(), "core must not resurrect arenas it never stored");
+        // ...and the only way to a whole record is to supply them.
+        let whole = core.into_hydrated(vec![ArenaId(7), ArenaId(9)], None);
+        assert_eq!(whole.arenas, vec![ArenaId(7), ArenaId(9)]);
+    }
+
+    /// Trunk has no parent, and the absent-parent tag must not be confused with parent id 0 —
+    /// which is trunk's own id, so getting this wrong makes trunk its own parent.
+    #[test]
+    fn an_absent_parent_is_distinguishable_from_parent_zero() {
+        let trunk = BranchRecord::trunk(1, LeaseDeadline(0));
+        assert_eq!(trunk.parent_id, None, "fixture");
+        let back = BranchRecord::deserialize_core(&trunk.serialize_core())
+            .unwrap()
+            .into_hydrated(Vec::new(), None);
+        assert_eq!(back.parent_id, None, "absent parent came back as Some");
+
+        let mut child = trunk.clone();
+        child.branch_id = BranchId::new(5, 0);
+        child.parent_id = Some(BranchId::TRUNK);
+        let back = BranchRecord::deserialize_core(&child.serialize_core())
+            .unwrap()
+            .into_hydrated(Vec::new(), None);
+        assert_eq!(back.parent_id, Some(BranchId::TRUNK), "parent 0 came back as absent");
+    }
+
+    /// A buffer of the wrong length must refuse rather than read into whatever follows it.
+    #[test]
+    fn a_wrong_length_core_record_is_refused() {
+        let rec = BranchRecord::trunk(1, LeaseDeadline(0));
+        let bytes = rec.serialize_core();
+        assert!(BranchRecord::deserialize_core(&bytes[..CORE_BYTES - 1]).is_err(), "short accepted");
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(BranchRecord::deserialize_core(&long).is_err(), "long accepted");
+        // An unknown state tag is corruption, not a default.
+        let mut bad = bytes.clone();
+        bad[49] = 200;
+        assert!(BranchRecord::deserialize_core(&bad).is_err(), "unknown state tag accepted");
     }
 }

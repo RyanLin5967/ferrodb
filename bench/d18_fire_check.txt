@@ -1,0 +1,20 @@
+D18 fire-check: the reaper asked the RECORD a question only the CATALOG can answer.
+
+MUTANT C -- fast-path guard reads rec.live_children.is_empty() again
+    log_catalog_reap_must_not_free_what_a_live_child_reads   ... ok
+    table_catalog_reap_must_not_free_what_a_live_child_reads ... FAILED
+MUTANT D -- drain_pending un-pins everything (exactly what reclaimable(&[],..) did)
+    log_catalog_reap_must_not_free_what_a_live_child_reads   ... FAILED
+    table_catalog_reap_must_not_free_what_a_live_child_reads ... FAILED
+RESTORED
+    both ... ok
+
+C fails ONLY the table arm: LogBranchCatalog keeps live_children inside the record, so it
+survives reading it. That asymmetry IS the bug -- the SHIPPED catalog was the broken one, and a
+log-catalog-only test would have reported all clear. D fails both arms because un-pinning is
+wrong for any catalog.
+
+Original reproduction, before the fix:
+    table_catalog_parks_the_page_its_live_child_can_read ... FAILED
+    assertion `left == right` failed: TableBranchCatalog freed a page a live child can still read
+      left: 1    right: 0

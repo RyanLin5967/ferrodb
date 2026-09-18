@@ -198,7 +198,7 @@ fn page_env(tag: &str) -> PageEnv {
     // otherwise both allocators hand out the same pages. Ask the bitmap, don't guess.
     let base = pool.disk_manager.high_water().expect("high water mark");
     let store = Arc::new(
-        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).expect("arena store"),
+        ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena store"),
     );
     println!(
         "  page store ready: 4KB pages, arena extents of {} pages, arena floor at page {}",
@@ -309,7 +309,7 @@ root page id is the parent's. Measured with PageStore::live_page_count on a real
 fn criterion_8_lease_reaping(led: &mut Ledger) {
     criterion(8, "*** THE THESIS *** branches abandoned with NO client cooperation are reaped");
     let env = page_env("c8");
-    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog), Arc::clone(&env.store))
+    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&env.store))
         .with_links(Arc::new(CowPageLinks));
 
     // The baseline must NOT be an empty database. "Page count returns to baseline" is trivially
@@ -353,12 +353,13 @@ fn criterion_8_lease_reaping(led: &mut Ledger) {
             .catalog
             .fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS))
             .expect("fork agent branch");
-        let arena = env.store.arena_for(rec.branch_id).expect("arena");
         let epoch = env.catalog.next_epoch();
         for i in 0..PAGES_EACH {
+            // `alloc_for`, not a captured `ArenaId`: a branch's first extent is one page (D31),
+            // so filling one arena refuses on the second write. Every real writer asks per page.
             let p = env
                 .store
-                .alloc_in_arena(arena, PageType::BTreeLeaf, epoch)
+                .alloc_for(rec.branch_id, PageType::BTreeLeaf, epoch)
                 .expect("alloc");
             let handle = env.store.read_page(p).expect("read back");
             let mut frame = handle.write();
@@ -547,7 +548,7 @@ impl Db {
         );
         let base = bp.disk_manager.high_water().expect("high water") + 256;
         let store = Arc::new(
-            ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone(), base)
+            ferrodb::branch::arena::ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base)
                 .expect("arena"),
         );
         let runtime = Arc::new(
@@ -711,10 +712,21 @@ fn criterion_2_isolation(led: &mut Ledger) {
         db.runtime.scan_rows(BranchId::TRUNK, "inventory"),
     ) {
         (Ok(on_branch), Ok(on_trunk)) => {
-            println!("      rows in agent-a's copy-on-write tree ... {}", on_branch.len());
-            println!("      rows in trunk's tree .................. {}", on_trunk.len());
+            // `scan_rows` streams; counting is the whole demand here, so the rows are counted
+            // as they arrive rather than gathered first.
+            let (mut branch_rows, mut trunk_rows) = (0usize, 0usize);
+            for r in on_branch {
+                r.expect("read agent-a's tree");
+                branch_rows += 1;
+            }
+            for r in on_trunk {
+                r.expect("read trunk's tree");
+                trunk_rows += 1;
+            }
+            println!("      rows in agent-a's copy-on-write tree ... {branch_rows}");
+            println!("      rows in trunk's tree .................. {trunk_rows}");
             println!("      (trunk is heap-backed; a fork's writes land on pages in its own tree)");
-            !on_branch.is_empty()
+            branch_rows > 0
         }
         (Err(e), _) | (_, Err(e)) => {
             println!("      the branch tree could not be read: {e}");

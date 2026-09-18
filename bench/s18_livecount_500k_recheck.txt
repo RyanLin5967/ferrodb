@@ -1,0 +1,20 @@
+# Is live_count=477ms at 5e5 a KNEE or an OUTLIER? Prior run (bench/curve_to_1e6.txt) says 36.096 ms
+# at the same N. Neighbours at 1e4/1e5/2.5e5 reproduced within 15%, so a systematic S19 regression
+# is already excluded -- that would move every row. This re-measures the ONE disputed point.
+# HEAD: 44b5039
+# load BEFORE: 17.86 15.00 18.41
+S12: the curve to 10^6 branches. ONE catalog, forked cumulatively. 64 threads.
+Predictions were recorded before this run: artie-research/S12-PREDICTIONS.md
+
+         N   seg forks/sec   per-fork ms   fsyncs   f/fsync   cat MB   B/branch   peak RSS MB   reopen ms   live_count ms   read us   reap(0) us   reap(500) us
+    499968         2366.6        0.4225    27117      18.4    133.3      266.6          24.3      0.5237         39.387     38.62         14.6         4620.0
+
+seg forks/sec is for THAT SEGMENT only, so a knee shows as a drop between rows rather
+than being averaged away across the whole run.
+
+reap(0) and reap(500) are the SAME function at the SAME N, differing only in how many
+rows the answer contains. If BOTH are flat in N, the reaper's cost tracks the answer
+and not the catalog -- which is the claim. If reap(0) grows with N, the claim is false.
+If reap(500) ~= reap(0), the instrument cannot see answer size and proves nothing.
+# rc=0  (124 == TIMEOUT == NOT A RESULT)
+# load AFTER: 19.37 15.75 17.86

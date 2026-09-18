@@ -49,7 +49,7 @@ fn key(n: u32) -> Vec<u8> {
 /// The obvious implementation: read everything from both sides and compare.
 fn naive_diff(t: &CowTree, base: u32, head: u32) -> Vec<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let collect = |root: u32| -> BTreeMap<Vec<u8>, Vec<u8>> {
-        t.range_scan(root, None, None).unwrap().into_iter().collect()
+        t.range_scan(root, None, None).unwrap().map(|e| e.unwrap()).collect()
     };
     let (b, h) = (collect(base), collect(head));
     let mut keys: Vec<&Vec<u8>> = b.keys().chain(h.keys()).collect();
@@ -81,7 +81,7 @@ fn fixture(tag: &str) -> Fixture {
     let dm = Arc::new(DiskManager::new(file).unwrap());
     let pool = Arc::new(BufferPoolManager::new(dm));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
     let tree = CowTree::new(store as Arc<dyn PageStore>);
     Fixture { _dir: dir, catalog, tree }
 }
@@ -166,7 +166,7 @@ proptest! {
         let (base, head) = build(&f, n, &edits);
 
         let mut rebuilt: BTreeMap<Vec<u8>, Vec<u8>> =
-            f.tree.range_scan(base, None, None).unwrap().into_iter().collect();
+            f.tree.range_scan(base, None, None).unwrap().map(|e| e.unwrap()).collect();
         for (k, _before, after) in f.tree.diff(base, head).unwrap().deltas {
             match after {
                 Some(v) => rebuilt.insert(k, v),
@@ -175,7 +175,7 @@ proptest! {
         }
 
         let actual: BTreeMap<Vec<u8>, Vec<u8>> =
-            f.tree.range_scan(head, None, None).unwrap().into_iter().collect();
+            f.tree.range_scan(head, None, None).unwrap().map(|e| e.unwrap()).collect();
         prop_assert_eq!(rebuilt, actual, "replaying the diff did not reproduce the head");
     }
 

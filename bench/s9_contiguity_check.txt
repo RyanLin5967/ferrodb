@@ -1,0 +1,33 @@
+S9: does anything depend on next_id / epoch being CONTIGUOUS across a reopen?
+The check SCALE-NEXT required before writing any code for D9 (sequence-cache the header).
+
+FOUND: six assertions demand exact equality across a reopen.
+  src/branch/table_catalog.rs:1236   re.next_id == next_id           "next_id did not survive"
+  src/branch/table_catalog.rs:1237   re.current_epoch() == epoch     "epoch did not survive"
+  src/branch/table_catalog.rs:1242   fresh.branch_id.id == next_id   "a reopened catalog reused a live id"
+  src/branch/table_catalog.rs:1275   re.next_id == next_id           "counters did not survive"
+  src/branch/table_catalog.rs:1277   fresh.branch_id.id == next_id   "a reopened catalog reused a live id"
+  src/branch/table_catalog.rs:1630   src.current_epoch() == dst.current_epoch()   (migration)
+
+READING THEM, NOT JUST COUNTING THEM:
+  The 1242/1277 assertion MESSAGE states an INEQUALITY invariant -- "a reopened catalog reused a
+  live id" -- while the assertion demands EQUALITY. Sequence caching satisfies the invariant the
+  message names and violates the assertion the line makes. That gap is the whole finding.
+
+PRODUCTION DOES NOT DEPEND ON EXACTNESS.
+  The only non-test caller of current_epoch() is the migration path (table_catalog.rs:299), which
+  copies source -> dest. Nothing in the live read or write path reads an exact counter value.
+  So D9 is NOT unsafe. The worry SCALE-NEXT raised does not materialise.
+
+BUT D9 IS NOT THE RIGHT NEXT CHANGE, AND THE PROFILE SAYS SO.
+  write_header is 0.0157 ms of a 0.228 ms effective serial section = 6.9%. Buying 6.9% by relaxing
+  an observable guarantee and re-deriving six assertions is a constant-factor trade with a caveat
+  attached. D9 is DEPRIORITISED, not cancelled, behind D10 -- which is ~11%, weakens no guarantee,
+  and rewrites no test. Recorded here so a later pass does not re-derive the same conclusion from
+  scratch, and does not mistake "deprioritised" for "rejected".
+
+METHOD NOTE, AGAINST MY OWN RESULT: the suite that verified 034712b ran with this file's sibling
+change (the profiler's flush fix) UNCOMMITTED. The verifier's tree-moved check passed because the
+tree was dirty consistently at both ends, not because it was clean -- so that green is for
+"034712b plus an uncommitted diff", not for a SHA. The diff is confined to an #[ignore]d test.
+Stated rather than left for someone to infer from a timestamp.

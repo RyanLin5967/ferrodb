@@ -32,6 +32,7 @@ pub mod gate;
 pub mod mem_catalog;
 pub mod merge_engine;
 pub mod paged_rows;
+pub mod persistent_map;
 pub mod runtime;
 pub mod session;
 pub mod simulate;

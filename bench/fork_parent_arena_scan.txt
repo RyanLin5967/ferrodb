@@ -1,0 +1,41 @@
+D7: fork range-scanned the PARENT's arena span on every fork, and discarded the result.
+Instrument: examples/fork_concurrency, release, 64 threads, N=2000, FERRODB_PARENT_ARENAS=k.
+THREE runs per cell, arms INTERLEAVED so machine drift hits both equally. Recorded 2026-09-17.
+
+per-fork milliseconds
+                       run1     run2     run3    median
+  BEFORE  0 arenas     0.215    0.213    0.236    0.215
+  BEFORE  2000 arenas  0.306    0.289    0.315    0.306
+  AFTER   0 arenas     0.236    0.220    0.201    0.220
+  AFTER   2000 arenas  0.247    0.229    0.248    0.247
+
+forks/sec
+  BEFORE  0 arenas    4645.7   4691.2   4238.6   4645.7
+  BEFORE  2000 arenas 3269.6   3462.3   3175.6   3269.6
+  AFTER   0 arenas    4229.9   4541.3   4978.9   4541.3
+  AFTER   2000 arenas 4042.7   4361.9   4031.3   4042.7
+
+WHAT IS SUPPORTED, AND WHAT IS NOT:
+
+  SUPPORTED. At 2000 parent arenas the before and after ranges DO NOT OVERLAP: the slowest
+  after-run (0.248 ms) is faster than the fastest before-run (0.289 ms). Median per-fork
+  0.306 -> 0.247 ms, throughput 3269.6 -> 4042.7 forks/sec (x1.24).
+
+  SUPPORTED, AND IT IS THE REAL CLAIM. The PENALTY for the parent owning 2000 arenas fell from
+  x0.738 to x0.956 -- i.e. fork's cost is now nearly independent of how much the parent has
+  written, which is the structural point. Before, every fork paid for a vector fork_child never
+  reads, and the bill grew with the parent's history.
+
+  NOT SUPPORTED. Any change at 0 arenas. Those ranges overlap completely (0.213-0.236 before,
+  0.201-0.236 after) and a single-run comparison earlier appeared to show a 9% REGRESSION there,
+  which was noise. Run-to-run spread on this machine is about +-10%, which is larger than several
+  effects this project has been tempted to report. One run per cell cannot see past it.
+
+  ALSO NOT SUPPORTED BY THIS FILE: anything about a real engine. This measures ferrodb, which is a
+  proof of concept. What transfers is the SHAPE -- loading a field the caller never reads, on a
+  path taken per operation, costs in proportion to how much the parent has written -- not the
+  absolute numbers.
+
+METHOD NOTE. The first "after" numbers were taken against a STALE RELEASE BINARY: the rebuild was
+`cargo build --lib --examples --tests`, which is a DEBUG build, while the harness runs from
+target/release. They showed no improvement and were nearly written up as a null result.

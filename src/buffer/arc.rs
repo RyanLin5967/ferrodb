@@ -21,6 +21,62 @@ impl ArcCache {
         ArcCache {t1: LinkedHashSet::new(), t2: LinkedHashSet::new(), b1: LinkedHashSet::new(), b2: LinkedHashSet::new(), p:0, capacity}
     }
 
+    /// Put a page back among the resident entries after the pool **declined to evict it**.
+    ///
+    /// [`ArcCache::request`] chooses a victim by REMOVING it from `t1`/`t2` — the choice and the
+    /// removal are one step — and the buffer pool may then find it cannot take that victim after
+    /// all, because it was pinned or re-dirtied while the write-back was in flight. Under the
+    /// pool-wide lock that could not happen; without one it is ordinary, and a victim left out of
+    /// the resident lists while it is still in the page table is a page **no future eviction can
+    /// ever choose again**. Its frame is gone for the life of the process.
+    ///
+    /// Measured before this existed: one forced decline took a 1024-frame pool to 1024 resident
+    /// pages against 1023 tracked — see
+    /// `a_declined_eviction_leaves_the_victim_tracked_as_resident`.
+    ///
+    /// The ghost list it is sitting in says where it came from, because [`ArcCache::replace`] files
+    /// a `t1` victim under `b1` and a `t2` victim under `b2`. So it goes back to the list it left
+    /// rather than to an arbitrary one. The direct `check_unpinned` path in `request` files it under
+    /// no ghost at all, and `t1` is the right home for that case.
+    ///
+    /// Only for a page that is still resident. A victim that has genuinely gone — deleted, or its
+    /// frame already handed to someone else — must NOT be reinstated, which is why the pool
+    /// distinguishes those two outcomes rather than treating every refusal alike.
+    pub fn reinstate(&mut self, page_id: u32) {
+        if self.b2.contains(page_id) {
+            self.b2.remove(page_id).ok();
+            self.t2.insert(page_id).ok();
+        } else {
+            self.b1.remove(page_id).ok();
+            self.t1.insert(page_id).ok();
+        }
+    }
+
+    /// Record a hit on a page the caller has **already established is resident**, doing only the
+    /// recency bookkeeping [`ArcCache::request`] would do on its `Hit` path.
+    ///
+    /// `request` conflates two questions — "is this resident?" and "what should I evict?" — and
+    /// answering the second one needs the caller to hold this lock while it acts. The buffer pool's
+    /// hit path knows the answer to the first from the page table and the frame latch, so it has no
+    /// business paying for the second: taking this lock across the whole of `fetch_page` is what
+    /// serialised even pure cache hits behind other threads' disk reads.
+    ///
+    /// Returns whether the page was found in a resident list. `false` means the cache and the
+    /// caller disagree; the caller decides what to do about it rather than this deciding for it.
+    pub fn touch(&mut self, page_id: u32) -> bool {
+        if self.t1.contains(page_id) {
+            // Second reference promotes T1 -> T2, exactly as the `Hit` arm of `request` does.
+            self.t1.remove(page_id).ok();
+            self.t2.insert(page_id).ok();
+            return true;
+        }
+        if self.t2.contains(page_id) {
+            self.t2.move_to_front(page_id).ok();
+            return true;
+        }
+        false
+    }
+
     pub fn request(&mut self, page_id: u32, is_pinned:&dyn Fn(u32) -> bool) -> ArcResult {
         // case 1: hit in t1 or t2
         if self.t1.contains(page_id) {

@@ -261,8 +261,41 @@ impl BranchState {
 /// re-parented to trunk). Cheap because ancestry lives only in branch metadata.
 pub const MAX_BRANCH_DEPTH: u8 = 8;
 
-/// Default arena extent size in pages (~1MB at 4KB pages).
+/// **Largest** arena extent size in pages (~1MB at 4KB pages).
+///
+/// This is a CAP, not the size every extent takes. See [`next_extent_pages`].
 pub const ARENA_EXTENT_PAGES: u32 = 256;
+
+/// Size of the FIRST extent a branch takes, in pages.
+///
+/// **D31 — every branch used to pay 1 MiB for its first 4 KiB page.** Extents were one fixed
+/// size, so a branch that wrote a single page reserved `ARENA_EXTENT_PAGES` of them. Measured on
+/// `examples/branch_curve_writes.rs`: 4000 branches writing one page each produced a 4.19 GB file
+/// holding 16 MB of data (262x), and `pages live` equalled the branch count throughout, so every
+/// branch really did hold exactly one page. Extrapolated to the 10^6 branches this project is
+/// aimed at, that is ~1.05 TB. The existing 10^6 result was fork-only and never paid it.
+pub const ARENA_FIRST_EXTENT_PAGES: u32 = 1;
+
+/// How big a branch's next extent should be, given the size of the one it is currently filling.
+///
+/// Geometric growth, doubling per extent and capped at [`ARENA_EXTENT_PAGES`]. A branch that
+/// writes one page costs one page; a branch that writes a million still lands on 256-page extents
+/// within its first 511, so **per-extent reclamation stays coarse exactly where coarseness pays**
+/// — the reaper's fast path frees `record.arenas` wholesale and does no per-page analysis, which
+/// is the entire reason extents exist.
+///
+/// This is engineering, not invention. XFS grows a file's allocation geometrically for the same
+/// reason (small files stay small, large files stop fragmenting), ext4 does the same, and the
+/// doubling-to-a-cap shape is what slab allocators call size classes.
+///
+/// Pure, and takes the previous size rather than a store, so the sequence can be pinned without
+/// allocating anything.
+pub fn next_extent_pages(current: Option<u32>) -> u32 {
+    match current {
+        None => ARENA_FIRST_EXTENT_PAGES.min(ARENA_EXTENT_PAGES).max(1),
+        Some(p) => p.saturating_mul(2).min(ARENA_EXTENT_PAGES).max(1),
+    }
+}
 
 /// Errors specific to the branch engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +307,11 @@ pub enum BranchError {
     Reaped { requested: BranchId, current_generation: u32 },
     /// The branch is mid-reap and cannot accept reads or writes.
     Reaping(BranchId),
+    /// A [`crate::branch::BranchCatalog::set_state`] transition was refused: the branch is not in
+    /// the state its caller read. **D41.** The transition is published from a state that no longer
+    /// holds, so applying it would undo whatever moved the branch — lifting a quarantine that was
+    /// already lifted, or re-marking a branch somebody else is reaping.
+    UnexpectedState { branch: BranchId, expected: BranchState, actual: BranchState },
     /// The lease expired; the branch is eligible for non-cooperative reaping.
     LeaseExpired { branch: BranchId, deadline: LeaseDeadline, now_millis: u64 },
     /// Forking here would exceed `MAX_BRANCH_DEPTH`; collapse first.
@@ -296,6 +334,12 @@ impl Display for BranchError {
                 requested, current_generation
             ),
             BranchError::Reaping(b) => write!(f, "branch {} is being reaped", b),
+            BranchError::UnexpectedState { branch, expected, actual } => write!(
+                f,
+                "branch {} is {:?}, not {:?}: the state transition was computed against a record \
+                 that has since moved",
+                branch, actual, expected
+            ),
             BranchError::LeaseExpired { branch, deadline, now_millis } => write!(
                 f,
                 "lease on branch {} expired at {} (now {})",

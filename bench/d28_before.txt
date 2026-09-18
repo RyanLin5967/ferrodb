@@ -1,0 +1,13 @@
+S15: the RUNTIME and SQL path at N branches. Durable catalog, full scanner->parser->executor.
+Every timing is mean-of-reps through `execution::executor::run`, the path the CLI and
+pgserver both take. `live_count` is the CALIBRATION CONTROL: it is already known linear
+(bench/curve_to_1e6.txt), so a flat row is only meaningful while this column rises.
+
+        N   BEGIN ms  INSERT ms  SELECT ms    ASOF ms   br_1row ms    br_all ms      runs ms  activity ms    quaran ms  live_cnt ms     RSS MB
+     9984    18.9439     0.0456     0.0338     0.0377       185.09       189.39       182.68       0.0159       0.0118        0.396       31.4
+    99968    33.5502     0.0430     0.0321     0.0316      1919.30      1907.48      1858.38       0.0351       0.0933        6.098      150.8
+  1000000    12.8180     0.0342     0.0149     0.0161     22170.73     21556.55     22654.23       0.0288       0.0583       53.929     1220.2
+
+BEGIN/INSERT/SELECT/ASOF are per-STATEMENT costs. br_* / runs / activity / quaran are
+one system-view read each. br_1row and br_all are the SAME query shape with and without
+a WHERE that selects exactly one row.

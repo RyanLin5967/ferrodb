@@ -1,0 +1,57 @@
+# D35 C1 hit-rate gate, TIER 1: the eviction sequence is bit-identical before and after.
+# generated 2026-09-18T08:06:43-04:00
+#
+# WHY AN EQUALITY ASSERTION AND NOT A TOLERANCE. The D35 design entry names hit rate as the
+# check a throughput benchmark cannot make, and the one that killed the arc_cache-sharding
+# option. C1 has an unusually strong answer to it: ARC IS NOT MODIFIED AT ALL. The page table
+# carries no policy and no adaptivity. So the eviction sequence must be IDENTICAL, and any
+# difference at all is a bug rather than a regression to be argued about.
+#
+# INSTRUMENT: examples/d35_eviction_trace.rs, single-threaded, a fixed 16,192-step trace in
+# three phases (sequential scan, frequency-biased hot/cold, reverse scan) over 4096 pages in
+# a 1024-frame pool. It prints every page id that leaves the page table, in order.
+#
+# REPRODUCE:
+#   cargo run --release --example d35_eviction_trace > /tmp/a.txt   # at the base commit
+#   cargo run --release --example d35_eviction_trace > /tmp/b.txt   # at the C1 commit
+#   diff /tmp/a.txt /tmp/b.txt
+
+===== BASE c56127f =====
+# trace_steps=16192
+# evictions=7899
+# eviction_sequence_fnv1a=0xf67b4cd8435a1eed
+# final_resident_count=1024
+TRACE_EXIT=0
+
+===== C1 8bf34ad =====
+# trace_steps=16192
+# evictions=7899
+# eviction_sequence_fnv1a=0xf67b4cd8435a1eed
+# final_resident_count=1024
+TRACE_EXIT=0
+
+===== VERDICT =====
+IDENTICAL: diff reports no differences across all     7910 lines.
+sha256 BASE = 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe
+sha256 C1   = 7672ca6558349135203f360b729e184ff0a9d812a623241078dda07a88ea81fe
+
+===== DETERMINISM CONTROL =====
+Two C1 runs of the same binary: byte-identical
+
+===== NEGATIVE CONTROL: force the gate to fire =====
+# A gate that has never fired is not a clean result. The mutation is the one the D35
+# measurement scaffold shipped in its C1 arm: delete arc_cache.touch() from the hit path.
+# It must change the sequence, and it does -- which is also the direct evidence that the
+# scaffold's C1 arm was not measuring a shippable buffer pool.
+# evictions=7896
+# eviction_sequence_fnv1a=0x1d0614b707fa8d79
+sha256 touch-deleted = 2aff766a866489e598cd855a3168fea74ace56fe059d7df018aa785cc906f0eb
+first divergence from C1:
+3245,6835c3245,6832
+< 4375	cold	EVICT	3242
+< 4376	hot	EVICT	3243
+< 4378	hot	EVICT	3244
+GATE_FIRES=YES
+
+# The full raw sequences are bench/d35_c1_evictiontrace_c1.txt (identical to the BASE run,
+# see the sha256 above) and bench/d35_c1_evictiontrace_notouch.txt (the negative control).

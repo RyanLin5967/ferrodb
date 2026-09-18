@@ -1,0 +1,18 @@
+  N=9984: begin 26.9339 insert 0.0582 select 0.0360 asof 0.0804 ms
+  N=9984: ferro_branches WHERE branch_id=1 -> 1 row in 0.09 ms
+  N=9984: ferro_runs -> 1 rows in 0.04 ms
+  N=9984: activity 0.0169 quarantine 0.0196 ms
+  N=9984: live_count (CONTROL, known linear) 0.738 ms
+  N=9984: ferro_branches (all) -> 10486 rows in 216.90 ms, peak RSS 26.4 MB
+  N=99968: begin 22.8425 insert 0.0453 select 0.0306 asof 0.0308 ms
+  N=99968: ferro_branches WHERE branch_id=1 -> 1 row in 0.37 ms
+  N=99968: ferro_runs -> 1 rows in 0.16 ms
+  N=99968: activity 0.0284 quarantine 0.0205 ms
+  N=99968: live_count (CONTROL, known linear) 51.459 ms
+  N=99968: ferro_branches (all) -> 100971 rows in 1831.07 ms, peak RSS 123.0 MB
+  N=1000000: begin 15.7270 insert 0.0357 select 0.0154 asof 0.0174 ms
+  N=1000000: ferro_branches WHERE branch_id=1 -> 1 row in 0.13 ms
+  N=1000000: ferro_runs -> 1 rows in 0.05 ms
+  N=1000000: activity 0.0146 quarantine 0.0164 ms
+  N=1000000: live_count (CONTROL, known linear) 78.825 ms
+  N=1000000: ferro_branches (all) -> 1001204 rows in 23624.71 ms, peak RSS 1076.6 MB

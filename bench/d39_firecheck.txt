@@ -1,0 +1,46 @@
+# D39 FIRE-CHECK — the two release-side guards added by 97099fe
+#
+# M1 = make the depth tracker REAL in release: in src/storage/page_latch.rs,
+#      #[cfg(debug_assertions)]      mod order  ->  #[cfg(all())]
+#      #[cfg(not(debug_assertions))] mod order  ->  #[cfg(any())]
+# That is the exact design change the two new tests exist to force someone to make
+# deliberately. Under it BOTH must fail, and no unrelated test may.
+
+## BEFORE THE FIX, unmutated tree at e44f77e — the defect being fixed
+  --lib                  test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 1324 filtered out; finished in 0.06s
+  --test lock_order_runtime test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+## AFTER THE FIX, unmutated tree at 97099fe
+  DEBUG    test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1326 filtered out; finished in 0.05s
+  DEBUG    test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  DEBUG    test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+  RELEASE  test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1324 filtered out; finished in 0.03s
+  RELEASE  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+  RELEASE  test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+## M1 APPLIED — both guards must die
+  tests/lock_order_runtime.rs:
+    test pool_sections_do_not_leak_across_calls ... ok
+    test release_does_not_flag_the_inversion ... FAILED
+    test the_correct_order_latch_then_frame_is_not_flagged ... ok
+    test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  src/storage/page_latch.rs (--lib):
+    test storage::page_latch::tests::different_pages_do_not_block_each_other ... ok
+    test storage::page_latch::tests::readers_share_and_a_writer_excludes ... ok
+    test storage::page_latch::tests::release_is_a_documented_no_op ... FAILED
+    test storage::page_latch::tests::the_depth_is_per_thread ... ok
+    test storage::page_latch::tests::the_table_empties_when_every_guard_is_dropped ... ok
+    test storage::page_latch::tests::the_write_latch_actually_serialises ... ok
+    test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 1324 filtered out; finished in 0.03s
+
+## VERDICT
+  release_does_not_flag_the_inversion   KILLED by M1
+  release_is_a_documented_no_op         KILLED by M1
+  Unrelated tests under M1: 5 passed in --lib, 2 passed in lock_order_runtime.
+  The mutation is narrowly aimed: it kills the two guards and nothing else, so
+  their failure is attributable to the design change and not to collateral damage.
+
+## NOT PROVEN BY THIS FILE
+  The first attempt at the --lib half died on 'No space left on device' mid-codegen.
+  That run was VOID, not a pass, and is not counted here; the result above is from a
+  second, complete run. A mutant whose test never ran is not a killed mutant.

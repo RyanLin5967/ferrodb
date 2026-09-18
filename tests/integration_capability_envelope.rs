@@ -1405,8 +1405,11 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     // B11 has since landed, and its two `Workspace` fields are now part of the expected list —
     // which is the point of an allowlist, that a new field has to come here and be declared.
     //
-    // `State` covers the sibling-map shape: `escrow`, `quarantine_reasons` and `row_author` are
-    // already per-branch maps, so a schema-edit map next to them is the established pattern.
+    // `State` covers the sibling-map shape: `escrow` and `quarantine_reasons` are already
+    // per-branch maps, so a schema-edit map next to them is the established pattern. (`row_author`
+    // was the third example this sentence used to give. E79c moved it onto the durable provenance
+    // store, so it is no longer a `State` map and citing it would send the next reader looking for
+    // a field that is not there.)
     // `Workspace` covers B11's actual shape: per-branch state added to the workspace itself, which
     // a statement can then write without ever entering `stage_all`.
     let field_names = |decl: &str, what: &str| -> Vec<String> {
@@ -1445,8 +1448,17 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     assert_eq!(
         field_names("struct State {", "State"),
         [
-            "workspaces", "names", "runs", "next_txn", "next_merge", "apply_seq", "applied",
-            "merges", "quarantine_reasons", "escrow", "row_author", "versions", "captures",
+            "workspaces", "names", "next_txn", "next_merge", "apply_seq", "applied",
+            "merges", "quarantine_reasons", "escrow", "versions", "captures",
+            // `runs` and `row_author` were REMOVED by E79c (`ee01420`), and a removal gets the
+            // same determination an addition does — the difference is which way it can be wrong.
+            // Both were per-branch/per-row maps a write path filled, and both are now four methods
+            // on `ProvenanceStore`, so the state they held survives the process instead of dying
+            // with it. For this guard that is a strict NARROWING: there is one less place a
+            // statement can write branch state without entering `stage_all`, and the surface that
+            // replaced them is not `State` at all, so no funnel moved out from under the envelope.
+            // Recorded here rather than left as a silent shrink, because a list that quietly gets
+            // shorter is how a field leaves the allowlist without anyone deciding it should.
             // I21's, added by the merge at `c6dcb3a`. Declared here only after making the
             // determination this assertion demands, and it is NOT a second funnel:
             //
@@ -1460,6 +1472,27 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
             //
             // A field that failed any of those three would be a governance hole, not a list entry.
             "published_txns",
+            // W4's, added by the merge at `23f9a2d` (commit `a4f6d16`). Declared here only after
+            // making the determination this assertion demands, and it is NOT a second funnel:
+            //
+            //   * it is keyed by TRANSACTION id, not by branch, so it is not per-branch state at all.
+            //   * it is PURELY DERIVED from `workspaces`: `State::audit_txn_refs` re-derives the whole
+            //     index by brute force and asserts equality, and it runs at BOTH doors in debug, so
+            //     every fork and every seal in the suite is a differential test of the index against
+            //     the scan it replaced. A statement cannot write it independently of the workspace it
+            //     mirrors -- and that is fire-checked, not asserted: two `#[should_panic(expected =
+            //     "txn_refs disagrees with a scan")]` tests poke the index directly and require the
+            //     audit to fire.
+            //   * its two write sites are `insert_workspace` and `remove_workspace`, which the field's
+            //     own doc names as the ONLY doors into `workspaces` for exactly this reason -- an
+            //     insert that went straight to the map would leave it under-counted, and an
+            //     under-count makes `capture_is_protected` answer "nothing needs this" about a capture
+            //     a live task is standing on, which is the F6 data loss reached by a new door.
+            //
+            // So it ADMITS no write: it is an O(log n) index replacing an O(open sessions) scan, and
+            // `stage_all` remains the single write funnel the envelope governs. A field that failed
+            // any of those three would be a governance hole, not a list entry.
+            "txn_refs",
             "policy",
         ],
         "the fields of `AgentRuntime`'s `State` have changed. If a new one holds per-branch state \
@@ -1572,9 +1605,11 @@ fn a_branch_being_reaped_cannot_write_even_with_its_workspace_intact() {
     // Anti-vacuity first: while it is Live the write is admitted.
     db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut a);
 
-    let mut rec = db.runtime.branches().get(branch).unwrap();
-    rec.state = BranchState::Reaping;
-    db.runtime.branches().put(&rec).unwrap();
+    let rec = db.runtime.branches().get(branch).unwrap();
+    db.runtime
+        .branches()
+        .set_state(branch, rec.state, BranchState::Reaping)
+        .unwrap();
 
     let err = db.refused("UPDATE inventory SET qty = 6 WHERE id = 1;", &mut a);
     assert!(err.contains("being reaped"), "got {err}");

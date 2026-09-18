@@ -64,7 +64,7 @@ impl Db {
 
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store = Arc::new(
-            ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap(),
+            ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap(),
         );
         let runtime = Arc::new(
             AgentRuntime::with_storage(

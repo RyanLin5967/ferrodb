@@ -1,0 +1,89 @@
+D27: the fork's workspace cost, BEFORE and AFTER structural sharing.
+
+Instrument: examples/d27_fork_workspace_cost.rs, release build, one configuration per process.
+  us_per_fork    -- std::time::Instant around the begin_session loop ONLY.
+  fork_rss_MB    -- getrusage ru_maxrss after the fork loop minus before it.
+  stage_s        -- the parent's UPDATE staging W rows into an UNSHARED workspace map.
+  child_write_s  -- a child's UPDATE over W rows into a map SHARED with parent + N-1 siblings.
+  seed_s         -- W trunk INSERTs. This path is NOT touched by the change; it is reported
+                    because it is the noise gauge (see CAVEAT).
+Both arms were run back to back on the same machine, from the same binary source, with only
+src/agent_sql/{runtime,mod}.rs stashed between them. BEFORE reproduces the earlier
+bench/d27_fork_workspace_cost_before.txt run (fork_rss 6.3/25.9/104.3/417.7 vs 5.8/25.3/103.9/417.0).
+
+BEFORE (BTreeMap deep clone)
+     W      N        NxW    seed_s     stage_s      fork_s   us_per_fork  child_write_s  peak_MB  fork_rss_MB
+  1000     16      16000    12.286    0.000762    0.001446        90.354       0.000539     16.9          6.3
+  1000     64      64000     5.979    0.000728    0.004267        66.680       0.000686     36.7         25.9
+  1000    256     256000     5.747    0.000841    0.017020        66.483       0.000621    115.4        104.3
+  1000   1024    1024000     4.930    0.000632    0.070781        69.122       0.001169    428.8        417.7
+   250     64      16000     1.298    0.000266    0.001464        22.876       0.000209     15.5          6.7
+   500     64      32000     2.589    0.000476    0.002226        34.785       0.000288     22.4         13.0
+  2000     64     128000    11.540    0.001417    0.008742       136.598       0.001453     65.3         51.6
+  4000     64     256000    24.268    0.002608    0.022258       347.782       0.002725    121.6        102.5
+  4000   1024    4096000    25.260    0.002942    0.413019       403.339       0.002928   1673.2       1653.5
+
+AFTER (PersistentMap, structural sharing)
+     W      N        NxW    seed_s     stage_s      fork_s   us_per_fork  child_write_s  peak_MB  fork_rss_MB
+  1000     16      16000     8.055    0.001337    0.000031         1.911       0.000851     10.9          0.0
+  1000     64      64000     8.737    0.001213    0.000056         0.868       0.000708     11.0          0.1
+  1000    256     256000     6.020    0.001403    0.000273         1.065       0.000882     11.5          0.4
+  1000   1024    1024000     7.410    0.001164    0.001095         1.069       0.001088      9.0          0.3
+   250     64      16000     1.480    0.000323    0.000067         1.044       0.000249      9.2          0.2
+   500     64      32000     3.066    0.000646    0.000058         0.902       0.000435      9.8          0.1
+  2000     64     128000    16.642    0.002122    0.000059         0.928       0.001333     13.5          0.1
+  4000     64     256000    45.751    0.004777    0.000081         1.273       0.003589     19.1          0.1
+  4000   1024    4096000    43.154    0.005823    0.000932         0.911       0.003692     21.5          1.6
+
+     W      N   us/fork before    after   speedup |  fork_rss_MB before   after
+  1000     16           90.354    1.911       47x |                 6.3     0.0
+  1000     64           66.680    0.868       77x |                25.9     0.1
+  1000    256           66.483    1.065       62x |               104.3     0.4
+  1000   1024           69.122    1.069       65x |               417.7     0.3
+   250     64           22.876    1.044       22x |                 6.7     0.2
+   500     64           34.785    0.902       39x |                13.0     0.1
+  2000     64          136.598    0.928      147x |                51.6     0.1
+  4000     64          347.782    1.273      273x |               102.5     0.1
+  4000   1024          403.339    0.911      443x |              1653.5     1.6
+
+INTERPRETATION (written after the numbers, not before):
+
+1. THE PREMISE HELD: the cost was O(N·W), and memory is the cleanest instrument that says so.
+   Divide fork_rss by N·W and BEFORE gives a constant across every configuration --
+   393.8, 404.7, 407.4, 407.9, 418.8, 406.2, 403.1, 400.4, 403.7 bytes per copied row.
+   Nine cells spanning 16000..4096000 row-copies, spread of 6%. That is not a trend line fitted
+   to noise; it is one number. AFTER, the same quotient is 0.0-12.5 bytes, which is the 0.1 MB
+   quantisation of ru_maxrss rather than a measurement of anything.
+
+2. THE FORK IS NOW O(1) IN W, WHICH IS THE ACTUAL CLAIM. Speedup ratios are the eye-catching
+   number but the SHAPE is the real result. At fixed N=64, sweeping W from 250 to 4000:
+     BEFORE  22.876 -> 34.785 -> 66.680 -> 136.598 -> 347.782 us/fork  (15.2x for 16x the work)
+     AFTER    1.044 ->  0.902 ->  0.868 ->   0.928 ->   1.273 us/fork  (no trend at all)
+   Before, a fork cost what the parent's working set cost. After, it does not depend on it. The
+   ~1 us that remains is the rest of `begin_session` -- interning the run, forking the branch
+   record, inserting the name -- so the five maps have left the critical path entirely.
+
+3. THE WALL AT THE 10^6 OBJECTIVE, QUANTIFIED. At 404 bytes per copied row, one parent holding a
+   thousand staged rows with 10^6 children is 10^9 row copies = ~404 GB of resident memory, which
+   is why this was a wall and not a slow path. The measured 1024-child, 4000-row cell already
+   costs 1.65 GB. After: 1.6 MB.
+
+4. WHAT IT COST, STATED PLAINLY. Writes got slower, because an insert now allocates the ~log2(W)
+   nodes on its root-to-leaf path instead of updating a BTreeMap in place. `stage_s` is slower in
+   9 cells out of 9 -- 1.21x, 1.36x, 1.50x, 1.67x, 1.67x, 1.75x, 1.83x, 1.84x, 1.98x -- and
+   `child_write_s` in 7 of 9. Nine out of nine in the same direction is not noise, so the
+   regression is real. In absolute terms the worst cell is a 4000-row statement going from
+   2.9 ms to 5.8 ms. That is the trade: ~2x on the staging path, against 443x on fork latency and
+   1034x on fork memory. It is the right way round for an agent workload, where one parent is
+   forked many times and each statement is staged once -- but it IS a cost, and a workload that
+   staged huge statements and never forked would be worse off.
+
+CAVEAT -- how much of the wall clock to trust. `seed_s` measures W trunk INSERTs, a path this
+change does not touch at all, and it moved 24.268 -> 45.751 between the two arms at W=4000. That
+is a ~1.9x swing from machine contention alone (a fleet of other agents was building and testing
+on this machine throughout). So: treat individual wall-clock ratios as approximate, and treat
+the 1.21x-1.98x write regression as "real in direction, uncertain in magnitude". The two results
+that do NOT depend on wall clock are the memory column and the flatness of us_per_fork against W,
+and those are the ones the conclusions above rest on.
+
+Recorded 2026-09-17 on Darwin arm64, Apple M5 Pro. One run per cell.

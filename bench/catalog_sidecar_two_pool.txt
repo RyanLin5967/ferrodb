@@ -1,0 +1,40 @@
+D1-sidecar-catalog: residency under the TWO-POOL arrangement the runtime actually has.
+Recorded 2026-09-17. examples/durable_fork, FERRODB_CATALOG=table, FERRODB_SKIP_REOPEN=1,
+release build, one run per N. The harness now allocates a main-database pool AND opens the
+catalog on its own file, because the earlier curve ran a single pool and the design recorded
+that as a falsifier: "if the two-pool arrangement's resident cost is materially worse than the
+single-pool curve, the win was partly an artifact of sharing."
+
+peak RSS, bytes        N=8000      N=16000     N=32000     N=64000
+  log catalog         7634944     11534336    21331968    43237376
+  table, ONE pool     7340032      7651328     7897088     8192000
+  table, TWO pools   11665408     11829248    12124160    12320768
+
+marginal per branch, 8000 -> 64000
+  log                 636 B/branch      (rising: 488 -> 613 -> 685 per step)
+  table, one pool      15.2 B/branch
+  table, two pools     11.7 B/branch
+
+fixed offset, two pools vs one, at N=8000
+  11665408 - 7340032 = 4,325,376 B = 4.13 MiB
+  predicted:           1024 frames x 4096 B = 4,194,304 B = 4.00 MiB
+  the extra ~131 KB is the second file's page table and bitmap.
+
+on-disk bytes, two-pool run
+  8000 2129920   16000 4259840   32000 8527872   64000 17051648   = 266 B/branch
+  (up from 250 in the single-file run: the sidecar carries its own bitmap page and header page)
+
+VERDICT ON THE FALSIFIER: it does NOT fire. The marginal did not get worse - it is 11.7 against
+15.2, and both are noise against the log's 636. The whole cost of the second pool is a CONSTANT
+4.13 MiB, which is what a fixed frame budget predicts and is independent of branch count.
+
+NOT MEASURED: 10^6. Extrapolating the marginals gives ~636 MB for the log and ~12 MB plus the
+~11.7 MB fixed floor for the table. An extrapolation is not a measurement and the two differ by
+enough that the ORDER of the answer is safe while the digits are not.
+
+WHY THE SIDECAR AT ALL: putting the catalog tree in the main database file inherited a ceiling it
+had no reason to. The ordinary allocator is confined below the arena floor -
+DEFAULT_ARENA_HEADROOM = 32,736 pages (~134 MB), shared with every user table and fixed when the
+database is created (cli.rs:27: "a real cap: past it, INSERT fails"). At 250 B/branch, 10^6
+branches want ~61,000 pages: 1.87x that entire budget, before one user row. LogBranchCatalog is a
+sidecar and never competed for it.

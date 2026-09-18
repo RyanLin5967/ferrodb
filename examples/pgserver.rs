@@ -12,7 +12,7 @@ use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::branch::arena::ArenaPageStore;
-use ferrodb::branch::catalog::LogBranchCatalog;
+use ferrodb::branch::TableBranchCatalog;
 use ferrodb::branch::lease_thread::{scan_interval_from_env, LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::{BranchCatalog, Reaper};
@@ -86,18 +86,17 @@ fn main() {
     // sit above what the catalog has already allocated, or the ordinary allocator and the arena hand
     // out the same page. The floor is persisted in the checkpoint, so a reopen reattaches to the
     // region it left rather than inventing a new one on top of live pages.
-    let branches_path = format!("{db}.branches");
     let arena_path = format!("{db}.arena");
     let branches = Arc::new(
-        LogBranchCatalog::open(Path::new(&branches_path), 1).expect("branch catalog"),
+        TableBranchCatalog::default_for_database(&db, 1).expect("branch catalog"),
     );
     let arena_exists = Path::new(&arena_path).exists();
     let store: Arc<ArenaPageStore> = Arc::new(if arena_exists {
-        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone(), Path::new(&arena_path))
+        ArenaPageStore::reopen_from_checkpoint(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Path::new(&arena_path))
             .expect("reattach to the arena")
     } else {
         let base = bp.disk_manager.high_water().expect("high water") + 32_736;
-        ArenaPageStore::new(bp.clone(), branches.clone(), base).expect("arena")
+        ArenaPageStore::new(bp.clone(), branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).expect("arena")
     });
     store.checkpoint_to(std::path::PathBuf::from(&arena_path));
 
@@ -108,7 +107,7 @@ fn main() {
     // walker rather than re-parenting a branch onto ancestor-owned pages, and this is the tree this
     // server's branches are on. `examples/agent_isolation_demo.rs` attaches the same one.
     let reaper = Arc::new(
-        TwoTierReaper::new(branches.clone(), store.clone()).with_links(Arc::new(CowPageLinks)),
+        TwoTierReaper::new(branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, store.clone()).with_links(Arc::new(CowPageLinks)),
     );
 
     let runtime = Arc::new(

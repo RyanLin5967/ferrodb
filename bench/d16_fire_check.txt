@@ -1,0 +1,16 @@
+D16 fire-check: is each half of the fix load-bearing, and do the two test arms differ?
+An untested guard is not a guard; two of three mutants survived the first S1 test here.
+
+MUTANT A -- remove the pin in reaper.rs::detach_from_parent  ("if false")
+    log_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned   ... FAILED
+    table_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... FAILED
+MUTANT B -- remove the pin in table_catalog.rs::live_child_at ("if false")
+    log_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned   ... ok
+    table_catalog_keeps_the_grandchild_when_an_interior_node_is_pruned ... FAILED
+RESTORED
+    both ... ok   (2 passed; 0 failed)
+
+READ B CAREFULLY: it fails ONLY the table arm. That is the point of having two arms -- the two
+catalogs lose the grandchild through DIFFERENT lines, so a single-catalog test would have shipped
+half this fix unverified. The log arm is the one that proves it is the DESIGN and not the table
+catalog's empty live_children.

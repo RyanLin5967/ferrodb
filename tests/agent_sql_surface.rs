@@ -54,6 +54,20 @@ impl Db {
         Db { catalog, bp, txn, runtime: Arc::new(AgentRuntime::new()), _dir: dir }
     }
 
+    /// The same database, but with provenance kept in a file at `prov` instead of in memory.
+    ///
+    /// The database file itself still lives in a fresh tempdir per instance — that is what makes
+    /// this usable for a restart test: the caller owns `prov`, so two instances built against the
+    /// same path are two processes sharing one provenance log, which is exactly the CLI's shape
+    /// (`cli.rs` passes `<db>.provenance`).
+    fn with_provenance(prov: &std::path::Path) -> Self {
+        let mut db = Db::new();
+        db.runtime = Arc::new(
+            AgentRuntime::new().with_durable_provenance(prov).expect("open durable provenance"),
+        );
+        db
+    }
+
     /// A connection sharing this database's agent runtime, so branches are mutually visible.
     fn session(&self) -> Session {
         Session::with_runtime(self.runtime.clone())
@@ -891,6 +905,106 @@ fn row_authorship_survives_the_merge_that_published_it() {
     assert!(db.runtime.who_wrote_row("inventory", RowId(999)).is_none());
     // and an unknown table does not resolve to some other table's rows
     assert!(db.runtime.who_wrote_row("no_such_table", RowId(1)).is_none());
+}
+
+/// **Exit criterion 9 across a process restart** (row E79c).
+///
+/// The gap this closes, and why the sibling test above could not see it: `who_wrote_row` used to
+/// answer from two `BTreeMap`s on `AgentRuntime::State` — `row_author` and `runs`. Both are
+/// process-lifetime, so a database answered correctly for the whole session and then answered
+/// NOTHING after a restart. That is the worst available shape, because the rows still look
+/// attributed and the audit trail is simply gone; a product that sells attribution cannot lose it
+/// at exit. Both halves now come from the provenance store, which is the layer that outlives the
+/// process.
+///
+/// **This drives the public API, not `provenance().attribute()`.** The pre-existing durable test in
+/// `integration_run_identity_feed.rs` interns and stamps the store directly, so it round-trips the
+/// FILE and says nothing about whether `who_wrote_row` reads it — which was the actual defect. Here
+/// the row is written by ordinary SQL through a real `MERGE`, and the question is asked the way a
+/// user asks it.
+///
+/// **The anti-vacuity half is the whole test.** "Attribution survives a reopen" would also pass if
+/// the second runtime somehow inherited the first one's memory, so the identical sequence is run on
+/// a default in-memory runtime and must LOSE the answer. One assertion without the other proves
+/// nothing about where the answer came from.
+#[test]
+fn row_authorship_survives_a_process_restart_when_provenance_is_durable() {
+    use ferrodb::tel::ids::RowId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let prov = dir.path().join("attribution.provenance");
+
+    // ---- first process: an agent publishes a row, then the whole database goes away ----
+    {
+        let mut db = Db::with_provenance(&prov);
+        db.seed();
+        let mut a = db.session();
+        db.ok(
+            "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus-5/2026-05';",
+            &mut a,
+        );
+        db.ok("UPDATE inventory SET qty = qty + 30 WHERE id = 1;", &mut a);
+        assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+
+        // It answers before the restart. Without this the test could pass by never attributing
+        // anything at all and finding nothing at both ends.
+        let who = db.runtime.who_wrote_row("inventory", RowId(1)).expect("attributed in-process");
+        assert_eq!(who.agent_id, "restock-agent");
+    }
+
+    // ---- second process: a brand new runtime and database, same provenance log ----
+    let reopened = Db::with_provenance(&prov);
+    let who = reopened
+        .runtime
+        .who_wrote_row("inventory", RowId(1))
+        .expect("row 1 lost its author across a restart: the audit trail does not survive exit");
+    assert_eq!(who.agent_id, "restock-agent");
+    assert_eq!(who.run_id, "run-42");
+    assert_eq!(who.model, "claude-opus-5");
+    assert_eq!(who.model_version, "2026-05");
+
+    // The table-wide view reads the same store, so `ferro_row_authors` survives with it.
+    let authored = reopened.runtime.authors_of("inventory");
+    assert_eq!(authored.len(), 1, "expected exactly row 1 attributed, got {authored:?}");
+    assert_eq!(authored[0].0, RowId(1));
+    assert_eq!(authored[0].1.agent_id, "restock-agent");
+
+    // Still no guessing after a restart: an untouched row, an absent row and an unknown table.
+    assert!(reopened.runtime.who_wrote_row("inventory", RowId(2)).is_none());
+    assert!(reopened.runtime.who_wrote_row("inventory", RowId(999)).is_none());
+    assert!(reopened.runtime.who_wrote_row("no_such_table", RowId(1)).is_none());
+
+    // ---- anti-vacuity: the default runtime is in-memory and MUST lose the same answer ----
+    {
+        let mut db = Db::new();
+        db.seed();
+        let mut a = db.session();
+        db.ok(
+            "BEGIN AGENT SESSION AS 'restock-agent' RUN 'run-42' MODEL 'claude-opus-5/2026-05';",
+            &mut a,
+        );
+        db.ok("UPDATE inventory SET qty = qty + 30 WHERE id = 1;", &mut a);
+        assert!(report(db.ok("MERGE;", &mut a)).applied_to_target);
+        assert!(
+            db.runtime.who_wrote_row("inventory", RowId(1)).is_some(),
+            "the in-memory runtime did not attribute the row at all, so its loss below proves \
+             nothing about durability"
+        );
+    }
+    let fresh = Db::new();
+    assert!(
+        fresh.runtime.who_wrote_row("inventory", RowId(1)).is_none(),
+        "a default in-memory runtime answered for a row written by a runtime that no longer \
+         exists — then the durable assertion above is not evidence of anything"
+    );
+
+    // And the answer really came from THAT file: a durable runtime on a different path is as blank
+    // as the in-memory one. This is what rules out the reopen having been served from elsewhere.
+    let elsewhere = Db::with_provenance(&dir.path().join("unrelated.provenance"));
+    assert!(
+        elsewhere.runtime.who_wrote_row("inventory", RowId(1)).is_none(),
+        "a durable runtime opened on an unrelated path answered for this row"
+    );
 }
 
 #[test]

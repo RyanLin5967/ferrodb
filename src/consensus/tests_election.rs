@@ -1,5 +1,5 @@
 //! F1 — the election rules, one named test per rule, each with a mutant recorded in
-//! `scratchpad/F1-election.md`.
+//! `bench/evidence/F1-election.md`.
 //!
 //! Two things about how these are written.
 //!

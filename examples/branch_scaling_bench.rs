@@ -81,7 +81,7 @@ fn build(tag: &str) -> (tempfile::TempDir, Arc<ArenaPageStore>, AgentRuntime) {
     let dm = Arc::new(DiskManager::new(file).unwrap());
     let pool = Arc::new(BufferPoolManager::new(Arc::clone(&dm)));
     let branches = Arc::new(LogBranchCatalog::in_memory(1));
-    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&branches), ARENA_BASE).unwrap());
+    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
     let rt = AgentRuntime::with_storage(
         branches,
         Arc::new(MemEffectLog::new()),
@@ -260,9 +260,25 @@ fn main() {
     }
     println!("the instrument responds to tree size, so flatness below is a real result.\n");
 
+    // Counts are configurable so pushing the scale does not need a code edit — the point of this
+    // harness now is to find where the design BREAKS, and the break is not at a number anyone can
+    // predict. `FERRODB_BRANCH_COUNTS=10,100,1000,10000` etc.
+    //
+    // The claim the committed output carries is still the 10..1000 diverged series; a run with
+    // other counts is an experiment, not a replacement for it.
+    let counts: Vec<usize> = match std::env::var("FERRODB_BRANCH_COUNTS") {
+        Ok(v) => v
+            .split(',')
+            .map(|t| t.trim().parse().unwrap_or_else(|_| panic!("bad count in FERRODB_BRANCH_COUNTS: {t:?}")))
+            .collect(),
+        Err(_) => vec![10, 100, 1000],
+    };
+    assert!(!counts.is_empty(), "FERRODB_BRANCH_COUNTS parsed to nothing");
+
     let mut rows: Vec<Row> = Vec::new();
     for diverged in [false, true] {
-        for n in [10usize, 100, 1000] {
+        for n in counts.iter().copied() {
+            eprintln!("  measuring {n} branches, diverged={diverged} ...");
             rows.push(measure(n, diverged));
         }
     }
@@ -292,8 +308,10 @@ fn main() {
     }
 
     // The diverged series is the one that carries the claim.
-    let base = rows.iter().find(|r| r.diverged && r.branches == 10).unwrap();
-    let top = rows.iter().find(|r| r.diverged && r.branches == 1000).unwrap();
+    let lo = *counts.first().unwrap();
+    let hi = *counts.last().unwrap();
+    let base = rows.iter().find(|r| r.diverged && r.branches == lo).unwrap();
+    let top = rows.iter().find(|r| r.diverged && r.branches == hi).unwrap();
     let read_ratio = us(top.read.p50) / us(base.read.p50);
     let fork_ratio = us(top.fork.p50) / us(base.fork.p50);
 
@@ -318,8 +336,8 @@ fn main() {
     // The load-bearing claim, asserted rather than left for the reader to eyeball. Generous
     // bound: this is a wall-clock measurement on a shared machine, so it is a check against
     // *degradation*, not a performance target.
-    let idle_top = rows.iter().find(|r| !r.diverged && r.branches == 1000).unwrap();
-    if idle_top.pages != rows.iter().find(|r| !r.diverged && r.branches == 10).unwrap().pages {
+    let idle_top = rows.iter().find(|r| !r.diverged && r.branches == hi).unwrap();
+    if idle_top.pages != rows.iter().find(|r| !r.diverged && r.branches == lo).unwrap().pages {
         eprintln!("\nidle forks allocated pages; a fork is supposed to copy nothing");
         std::process::exit(1);
     }

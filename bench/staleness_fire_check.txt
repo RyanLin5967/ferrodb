@@ -1,0 +1,52 @@
+tools/staleness.sh v3 FIRE-CHECK, 2026-09-18T05:11:42Z
+v3 adds the Rust/non-Rust breakdown and the COMMENT-ONLY classification, with the doctest caveat.
+
+##### 1: Rust changes comment-only, one non-Rust code file (S21 vs agent-isolation)
+branch S21-statement-lock vs agent-isolation: 2 behind, 17 ahead
+  base moved under: 12 Rust file(s), 1 other code file(s)
+  NOTE: the Rust changes are COMMENT-ONLY, so compiled behaviour cannot have changed.
+  What moved that is not Rust -- judge these yourself, a build or verification script CAN
+  change what a suite measures even though it compiles nothing:
+      tools/staleness.sh
+STALE-GREEN: the base moved under code this branch has not seen.
+  code files changed on agent-isolation since the fork point: 13
+  (no file is edited by both sides -- lower risk, but still re-run: a lock-order
+   inversion does not fail loudly, it hangs rarely under load, and it can be created
+   by two files that never appear in the same diff.)
+  tests present on agent-isolation but NOT on this branch:
+rc=1
+
+##### 2: NEGATIVE CONTROL -- real code change must still be STALE-GREEN with the overlap named
+branch S22-bufpool-latch vs agent-isolation: 27 behind, 11 ahead
+  base moved under: 45 Rust file(s), 1 other code file(s)
+STALE-GREEN: the base moved under code this branch has not seen.
+  code files changed on agent-isolation since the fork point: 46
+  ** BOTH SIDES EDIT THESE -- this is where an unmeasured interaction lives:
+      src/buffer/buffer_pool.rs
+  tests present on agent-isolation but NOT on this branch:
+      tests/d15_concurrent_fork_and_reap.rs
+      tests/d19_leak_is_a_race.rs
+      tests/d27_fork_shares_without_leaking.rs
+      tests/d33_add_arena_must_be_durable.rs
+      tests/integration_btree_concurrency.rs
+      tests/lock_order_allowlist.rs
+      tests/lock_order_runtime.rs
+rc=1
+
+##### 3: COVERED (0 behind)
+branch D28-view-pushdown vs agent-isolation: 0 behind, 5 ahead
+COVERED
+rc=0
+
+##### 4: COVERED-NO-CODE (bench-only commit)
+branch a9bfc84 vs 786707a: 1 behind, 0 ahead
+COVERED-NO-CODE: the base moved 1 commit(s), none touching code.
+    bench/d23_btree_concurrency_after.txt
+    bench/d23_fire_check.txt
+rc=0
+
+##### 5: UNKNOWN refuses, non-zero
+UNKNOWN: not a directory: /nonexistent-dir
+rc=2
+UNKNOWN: cannot resolve base 'no-such-ref' in .
+rc=2

@@ -14,7 +14,6 @@ use ferrodb::agent_sql::dispatch::AgentOutput;
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::agent_sql::MergeReport;
 use ferrodb::branch::types::BranchId;
-use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
@@ -243,11 +242,14 @@ fn reaping_a_parent_whose_child_published_its_write_loses_the_dependent() {
     let blocked = plan(db.ok(&format!("REVERT MERGE {};", m1), &mut main));
     assert_eq!(blocked.blocked_by, vec![ptxn], "got {:?}", blocked.blocked_by);
 
-    // Exactly what `TwoTierReaper::reap` does to the catalog record (reaper.rs:231-233), with no
-    // page store in the way: mark reaped, which bumps the generation and makes the old id an error.
-    let mut rec = db.runtime.branches().get(pbranch).unwrap();
-    rec.mark_reaped();
-    db.runtime.branches().put(&rec).unwrap();
+    // Exactly what `TwoTierReaper::reap` does to the catalog record, with no page store in the
+    // way: mark reaped, which bumps the generation and makes the old id an error.
+    use ferrodb::branch::types::BranchState;
+    let rec = db.runtime.branches().get(pbranch).unwrap();
+    db.runtime
+        .branches()
+        .set_state(pbranch, rec.state, BranchState::Reaped)
+        .unwrap();
     let dropped = db.runtime.forget_reaped_branches();
     assert_eq!(dropped, 1, "the sweep did not see the reaped parent; the fixture proves nothing");
 

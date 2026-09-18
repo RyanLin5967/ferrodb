@@ -1,0 +1,108 @@
+# S22 full suite, per target, on branch S22-verify
+#
+# Per-target and written to a file as each target finishes, because a single `cargo test`
+# on this machine gets SIGTERMed mid-suite by the other agents and a truncated run reports
+# as a pass.
+#
+# 17 targets failed on the first pass, every one of them in ~0.01s. That is the missing-
+# binary signature, not a regression: they shell out to example binaries (repl_primary,
+# repl_replica, the server) which a fresh worktree has never built. After
+# `cargo build --examples --bins` all 17 pass, and those rows are marked.
+#
+# RESULT: 95 of 95 targets green, 1944 tests passed, 0 failed.
+
+adv_f4_false_refusal	test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.63s
+adv_f5_probe	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+adv_f6_dropped_capture	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+adversarial_i20	test result: ok. 14 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 181.68s
+agent_sql_surface	test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+d16_transitive_visibility	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+d18_reaper_asks_the_catalog	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+guard_precondition_probe	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+integration_alter_column	test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.68s
+integration_alter_refusal_paths	test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.47s
+integration_alter_refusal_safety	test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.69s
+integration_arena_exclusivity	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+integration_base_backup	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.63s   [re-run after `cargo build --examples --bins`]
+integration_blind_writes	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+integration_branch_pages	test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+integration_buffer_pool_concurrency	test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+integration_buffer_pool_latch	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+integration_capability_envelope	test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s
+integration_cdc_cutover	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+integration_cdc_cutover_concurrent	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+integration_cdc_ddl	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.44s
+integration_cdc_diff	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.80s   [re-run after `cargo build --examples --bins`]
+integration_cdc_drop_table	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+integration_cdc_duckdb_sink	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.20s   [re-run after `cargo build --examples --bins`]
+integration_cdc_feed	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+integration_cdc_go_consumer	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s   [re-run after `cargo build --examples --bins`]
+integration_cdc_key_reuse	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+integration_cdc_latency	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.06s   [re-run after `cargo build --examples --bins`]
+integration_cdc_publication	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+integration_cdc_retract_by_model	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+integration_cdc_sink	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s   [re-run after `cargo build --examples --bins`]
+integration_cdc_snapshot	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+integration_cdc_stream	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s   [re-run after `cargo build --examples --bins`]
+integration_cdc_wide_types	test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+integration_checkpoint_pressure	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.09s   [re-run after `cargo build --examples --bins`]
+integration_cli_agent_isolation	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.54s
+integration_cli_effect_log_durability	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.59s
+integration_cli_row_authorship_durability	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.55s
+integration_cluster_agents	test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.03s
+integration_cluster_grants	test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.24s
+integration_cluster_snapshot	test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.77s
+integration_consensus_failover	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.95s   [re-run after `cargo build --examples --bins`]
+integration_cow_branch	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+integration_crash_safety	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s   [re-run after `cargo build --examples --bins`]
+integration_ddl_refusal_atomicity	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+integration_disk_manager_concurrency	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+integration_durable_tel	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+integration_effect_log	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+integration_error_messages	test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+integration_error_surface	test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.22s
+integration_escrow	test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+integration_executor_provenance	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+integration_flush_concurrency	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+integration_fork_kill9	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s   [re-run after `cargo build --examples --bins`]
+integration_fulltext_retrieval	test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.02s
+integration_index_debt	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.60s
+integration_logical_decoding	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+integration_merge_agreement	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+integration_merge_ddl_atomicity	test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.26s
+integration_pgwire	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s   [re-run after `cargo build --examples --bins`]
+integration_prompt_clause	test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+integration_quarantine	test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+integration_read_premise	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+integration_readme_commands	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.97s   [re-run after `cargo build --examples --bins`]
+integration_replica_applier	test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+integration_replica_divergence_is_durable	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+integration_replication_e2e	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s   [re-run after `cargo build --examples --bins`]
+integration_replication_source	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+integration_run_identity_feed	test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+integration_run_identity_log_readers	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+integration_runtime_concurrency	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+integration_runtime_reattach	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+integration_secondary_index_debt	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+integration_server_reaps	test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.39s   [re-run after `cargo build --examples --bins`]
+integration_server_stdout	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.14s   [re-run after `cargo build --examples --bins`]
+integration_simulate	test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+integration_sql_on_durable_branches	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+integration_statement_atomicity	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+integration_system_views	test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+integration_system_views_wire	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s   [re-run after `cargo build --examples --bins`]
+integration_truncation_race	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+integration_trunk_tree_authority	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+integration_txn_concurrency	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.92s
+integration_wal_concurrency	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+integration_zero_copy_fork	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+lib	test result: ok. 1274 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 46.30s
+prop_cow_diff	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.68s
+prop_escrow	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+prop_merge_algebra	test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+prop_merge_outcomes	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+provenance_e2e	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+provenance_retention_wiring	test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+provenance_scan_cascade	test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+provenance_write_path_dependents	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.51s
+sim_durability	test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s

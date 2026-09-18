@@ -39,7 +39,7 @@ fn runtime(tag: &str) -> (tempfile::TempDir, Arc<LogBranchCatalog>, Arc<ArenaPag
     let dm = Arc::new(DiskManager::new(file).unwrap());
     let pool = Arc::new(BufferPoolManager::new(Arc::clone(&dm)));
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
-    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), ARENA_BASE).unwrap());
+    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
     let rt = AgentRuntime::with_storage(
         Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
         Arc::new(MemEffectLog::new()),
@@ -99,7 +99,14 @@ fn beginning_an_agent_session_copies_zero_data_pages() {
         Some(vec![Value::Integer(399), Value::Varchar("widget-399".into())]),
         "the forked branch must see the trunk's rows without copying them"
     );
-    assert_eq!(rt.scan_rows(session.branch, "inventory").unwrap().len(), 400);
+    assert_eq!(
+        rt.scan_rows(session.branch, "inventory")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
 }
 
 #[test]
@@ -210,7 +217,7 @@ fn an_abandoned_agent_session_returns_its_pages_with_no_client_cooperation() {
     );
 
     // No abandon(), no cooperation of any kind. The lease simply runs out.
-    let reaper = TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store));
+    let reaper = TwoTierReaper::new(Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store));
     let reaped = reaper.reap_expired(u64::MAX).unwrap();
     assert!(reaped.contains(&session.branch), "the expired session was not reaped: {reaped:?}");
     reaper.drain_pending().ok();
@@ -222,7 +229,14 @@ fn an_abandoned_agent_session_returns_its_pages_with_no_client_cooperation() {
     );
 
     // Reclamation must not have taken the trunk's pages with it.
-    assert_eq!(rt.scan_rows(BranchId::TRUNK, "inventory").unwrap().len(), 400);
+    assert_eq!(
+        rt.scan_rows(BranchId::TRUNK, "inventory")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
     assert_eq!(
         rt.get_row(BranchId::TRUNK, "inventory", 7).unwrap(),
         Some(vec![Value::Integer(7), Value::Varchar("widget-7".into())]),

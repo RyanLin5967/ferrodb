@@ -1,0 +1,47 @@
+# W4 statement-lock sweep. os=macos window=3s op_period=2ms gone=64 reps=5
+# prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)
+# probe_* = one unrelated statement's lock acquisition, NANOSECONDS
+# stall_mean = mean of the op_n largest probe samples: one acquisition blocks per op,
+#           so this averages the population that waited. THE HEADLINE NUMBER.
+# op_*    = the arm's own operation, wall, NANOSECONDS (sweep wall is dominated by
+#           phase 2, which holds NO lock -- it is not the blocking number)
+       S     arm   probe_n      p50       p999  stall_mean   probe_max    op_n     op_mean      op_max
+#
+# TABLE 1 -- steady state: nothing is reap-eligible, so only PHASE 1 runs.
+      10    idle     41101       42        709         541       47208    1258       25124     4599416
+      10   sweep     42573       42       5833         764       35208    1265        3662       45666
+      10   activ     39760       42      12500        1494      100125    1251        6706      104667
+     100    idle     42609       42        583         465       12917    1260       11598     7320375
+     100   sweep     41384       42      21625        2544       58459    1268       13591       80292
+     100   activ     39455       42      39125        6775      145834    1256       26108      165041
+    1000    idle     39107       42        750         697       50000    1211      161681    10524042
+    1000   sweep     42502       42     116875       51788      433333    1262      128271      336750
+    1000   activ     39035       42     250459      157407      466792    1263      226933      641000
+   10000    idle     33293       83       7833         968       62334    1185      182141    11082333
+   10000   sweep     25991     5542     455542      221734      913708    1399     1562037     2951916
+   10000   activ      5334      125    4763208     2345209    23099125    1089     2756084     6592083
+  100000    idle     38076       42        792         738       91500    1211      154965    13027042
+  100000   sweep     18815    54917    1147000      940501     4090667     105    28766823    83900125
+  100000   activ      4234       84   61484791    31683079   151361250      84    35871289   154862333
+#
+# TABLE 2 -- a reap really happened: 64 of the S branches are gone from the
+# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, 5 fixtures;
+# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.
+       S    gone   reps    stall_med    stall_max     wall_med     wall_max
+      10      10      5          583        94416        16375        91500
+     100      64      5        13417        23416        66917        72125
+    1000      64      5        64292       158625       217708       236416
+   10000      64      5       173083       234625      2014500      2193125
+  100000      64      5       408166       984000     21789334     24014333
+
+# --- fixture build progress (stderr) ---
+# T1 S=10: opened 10 sessions in 0 ms
+# T1 S=100: opened 100 sessions in 0 ms
+# T1 S=1000: opened 1000 sessions in 1 ms
+# T1 S=10000: opened 10000 sessions in 24 ms
+# T1 S=100000: opened 100000 sessions in 1797 ms
+# T2 S=10 g=10: 5 fixtures in 112 ms
+# T2 S=100 g=64: 5 fixtures in 119 ms
+# T2 S=1000 g=64: 5 fixtures in 118 ms
+# T2 S=10000 g=64: 5 fixtures in 254 ms
+# T2 S=100000 g=64: 5 fixtures in 7516 ms

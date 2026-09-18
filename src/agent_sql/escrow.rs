@@ -70,9 +70,17 @@ struct Pool {
     /// Total headroom above the floor when the pool was opened.
     slack: i64,
     /// Reserved but not yet spent, per branch.
-    claimed: BTreeMap<u64, i64>,
-    /// Spent against a claim, per branch.
-    spent: BTreeMap<u64, i64>,
+    ///
+    /// **Keyed by the whole `BranchId`, generation included, and that is load-bearing.** These
+    /// were keyed by `branch.id` — the id SLOT — and the catalog recycles a reaped branch's slot
+    /// (`release_id` returns it, `fork` pops it). So a session forking into a dead branch's slot
+    /// inherited that branch's claims and spends: `remaining` handed it units it never claimed,
+    /// and its `MERGE` settled the dead branch's spend against the pool for writes that never
+    /// landed. The generation is the only thing that distinguishes the two occupants, so it has to
+    /// be in the key.
+    claimed: BTreeMap<BranchId, i64>,
+    /// Spent against a claim, per branch. Keyed by whole `BranchId` for the reason above.
+    spent: BTreeMap<BranchId, i64>,
 }
 
 impl Pool {
@@ -126,8 +134,8 @@ impl EscrowLedger {
     /// What `branch` has reserved and not yet spent.
     pub fn remaining(&self, branch: BranchId, cell: &Cell) -> Option<i64> {
         self.pools.get(cell).map(|p| {
-            p.claimed.get(&branch.id).copied().unwrap_or(0)
-                - p.spent.get(&branch.id).copied().unwrap_or(0)
+            p.claimed.get(&branch).copied().unwrap_or(0)
+                - p.spent.get(&branch).copied().unwrap_or(0)
         })
     }
 
@@ -148,7 +156,7 @@ impl EscrowLedger {
                 "escrow claim of {amount} exceeds the {free} unit(s) still unclaimed on {cell:?}"
             )));
         }
-        *pool.claimed.entry(branch.id).or_insert(0) += amount;
+        *pool.claimed.entry(branch).or_insert(0) += amount;
         Ok(())
     }
 
@@ -188,8 +196,8 @@ impl EscrowLedger {
             let Some(pool) = self.pools.get(&cell) else {
                 continue;
             };
-            let claimed = pool.claimed.get(&branch.id).copied().unwrap_or(0);
-            let spent = pool.spent.get(&branch.id).copied().unwrap_or(0);
+            let claimed = pool.claimed.get(&branch).copied().unwrap_or(0);
+            let spent = pool.spent.get(&branch).copied().unwrap_or(0);
             let left = claimed - spent;
             if amount > left {
                 return Err(FerroError::Constraint(format!(
@@ -208,8 +216,8 @@ impl EscrowLedger {
         if amount <= 0 {
             return Ok(()); // giving headroom back is always safe
         }
-        let claimed = pool.claimed.get(&branch.id).copied().unwrap_or(0);
-        let spent = pool.spent.get(&branch.id).copied().unwrap_or(0);
+        let claimed = pool.claimed.get(&branch).copied().unwrap_or(0);
+        let spent = pool.spent.get(&branch).copied().unwrap_or(0);
         let left = claimed - spent;
         if amount > left {
             return Err(FerroError::Constraint(format!(
@@ -217,7 +225,7 @@ impl EscrowLedger {
                  (claimed {claimed}, already spent {spent}); claim more before writing"
             )));
         }
-        *pool.spent.entry(branch.id).or_insert(0) += amount;
+        *pool.spent.entry(branch).or_insert(0) += amount;
         Ok(())
     }
 
@@ -226,8 +234,8 @@ impl EscrowLedger {
     /// makes reservation schemes unusable in practice.
     pub fn release(&mut self, branch: BranchId) {
         for pool in self.pools.values_mut() {
-            pool.claimed.remove(&branch.id);
-            pool.spent.remove(&branch.id);
+            pool.claimed.remove(&branch);
+            pool.spent.remove(&branch);
         }
     }
 
@@ -240,9 +248,9 @@ impl EscrowLedger {
     /// That bounds concurrent agents and not sequential ones, which is not a bound at all.
     pub fn settle_all(&mut self, branch: BranchId) {
         for pool in self.pools.values_mut() {
-            let spent = pool.spent.remove(&branch.id).unwrap_or(0);
+            let spent = pool.spent.remove(&branch).unwrap_or(0);
             pool.slack -= spent;
-            pool.claimed.remove(&branch.id);
+            pool.claimed.remove(&branch);
         }
     }
 
@@ -250,10 +258,10 @@ impl EscrowLedger {
     /// Used when a branch's writes are published: the resource really was consumed.
     pub fn settle(&mut self, branch: BranchId, cell: &Cell) {
         if let Some(pool) = self.pools.get_mut(cell) {
-            let spent = pool.spent.get(&branch.id).copied().unwrap_or(0);
+            let spent = pool.spent.get(&branch).copied().unwrap_or(0);
             pool.slack -= spent;
-            pool.claimed.remove(&branch.id);
-            pool.spent.remove(&branch.id);
+            pool.claimed.remove(&branch);
+            pool.spent.remove(&branch);
         }
     }
 }
@@ -298,6 +306,45 @@ mod tests {
     }
     fn b(n: u64) -> BranchId {
         BranchId::new(n, 0)
+    }
+
+    /// **A recycled id slot must not inherit the dead branch's escrow.**
+    ///
+    /// The catalog hands a reaped branch's id SLOT back out (`release_id` returns it, `fork` pops
+    /// it) with the generation bumped. These maps were keyed by `branch.id` alone, so the next
+    /// session to fork into slot 7 was answered about its predecessor's ledger: `remaining` handed
+    /// it units it never claimed, and settling it charged the pool for writes that never landed.
+    /// Only the generation distinguishes the two occupants.
+    ///
+    /// Both directions are asserted, because keying by the slot is wrong in each: the new branch
+    /// must not SEE the old claim, and releasing the old branch must not erase the new one's.
+    #[test]
+    fn a_recycled_id_slot_does_not_inherit_the_dead_branchs_escrow() {
+        let mut e = EscrowLedger::new();
+        e.open(CELL, 100).unwrap();
+
+        let dead = BranchId::new(7, 0);
+        e.claim(dead, CELL, 10).unwrap();
+        e.spend(dead, CELL, 4).unwrap();
+        assert_eq!(e.remaining(dead, &CELL), Some(6), "fixture did not establish a claim");
+
+        // Slot 7 is reaped and handed back out; the generation is what changed.
+        let reborn = BranchId::new(7, 1);
+        assert_eq!(
+            e.remaining(reborn, &CELL),
+            Some(0),
+            "a new session inherited the previous occupant's escrow claim"
+        );
+        e.spend(reborn, CELL, 1).expect_err("it could spend against a claim it never made");
+
+        // And the old branch's release must not take the new occupant's claim with it.
+        e.claim(reborn, CELL, 5).unwrap();
+        e.release(dead);
+        assert_eq!(
+            e.remaining(reborn, &CELL),
+            Some(5),
+            "releasing the dead branch erased the live one's claim"
+        );
     }
 
     /// DESIGN.md section 3's worked example, which without escrow lands at -4.

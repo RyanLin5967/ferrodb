@@ -1,0 +1,23 @@
+D6: fork throughput vs concurrency. N=2000 forks per arm, TableBranchCatalog, release.
+Recorded 2026-09-17T17:33:49-0400. One run per cell.
+
+  threads   forks     seconds    forks/sec   per-fork ms
+        1      2000      7.275       274.9      3.637
+        8      2000      6.761       295.8      3.380
+       64      1984      7.810       254.0      3.936
+
+Read it this way: if forks/sec is FLAT across threads, the forks are serializing and
+group commit has nothing to batch. That is the D6 premise check, as a number.
+
+INTERPRETATION (written after the numbers, not before):
+  x1.08 at 8 threads and x0.92 at 64 is FLAT. Adding 64 concurrent forkers produced no more forks
+  per second than one. That is the D6 premise check confirmed as a measurement rather than as a
+  reading of the source: `TableBranchCatalog::fork` holds `self.logical` across `commit()`, and
+  `commit()` fsyncs, so the forks serialize on the mutex and each pays a private disk round-trip.
+
+  THIS IS WHY THE PLANNED MEASUREMENT WOULD HAVE LIED. `SCALE-NEXT` originally said "measure group
+  commit". Group commit batches CONCURRENT commits. Against this code it would have returned x1.00
+  and the conclusion on the page would have been "batching does not help an agent workload" -- a
+  false statement about batching, caused by a mutex. The split has to come first.
+
+  The 64-thread arm being slightly SLOWER (x0.92) is the mutex convoy, and it is the expected sign.

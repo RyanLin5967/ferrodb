@@ -44,7 +44,7 @@ fn env(tag: &str) -> Env {
     let catalog = Arc::new(LogBranchCatalog::in_memory(1));
     let base = pool.disk_manager.high_water().unwrap();
     let store =
-        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap());
+        Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, base).unwrap());
     Env { catalog, store, path }
 }
 
@@ -91,7 +91,7 @@ fn the_cow_btree_runs_on_the_arena_store_and_a_child_sees_the_parents_data_witho
 fn collapse_materialises_a_real_cow_btree_through_the_real_page_walker() {
     let e = env("collapse");
     let tree = CowTree::new(Arc::clone(&e.store) as Arc<dyn PageStore>);
-    let reaper = TwoTierReaper::new(Arc::clone(&e.catalog), Arc::clone(&e.store))
+    let reaper = TwoTierReaper::new(Arc::clone(&e.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&e.store))
         .with_links(Arc::new(CowPageLinks));
 
     let ep = e.catalog.next_epoch();
@@ -160,7 +160,7 @@ fn collapse_materialises_a_real_cow_btree_through_the_real_page_walker() {
 #[test]
 fn collapse_still_refuses_when_no_walker_is_supplied() {
     let e = env("norefuse");
-    let reaper = TwoTierReaper::new(Arc::clone(&e.catalog), Arc::clone(&e.store));
+    let reaper = TwoTierReaper::new(Arc::clone(&e.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&e.store));
     let b = e.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
     let err = reaper.collapse(b.branch_id).unwrap_err();
     assert!(err.to_string().contains("refusing to re-parent"), "got {}", err);

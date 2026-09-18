@@ -33,11 +33,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::branch::record::{reclaimable, ArenaExtent, BranchRecord, PendingFree};
+use crate::branch::record::{ArenaExtent, BranchRecord, PendingFree};
 use crate::branch::types::{
-    ArenaId, BranchError, BranchId, Epoch, PageId, ARENA_EXTENT_PAGES,
+    next_extent_pages, ArenaId, BranchError, BranchId, Epoch, PageId, ARENA_EXTENT_PAGES,
 };
-use crate::branch::catalog::LogBranchCatalog;
 use crate::branch::BranchCatalog;
 use crate::cluster::GrantedCounter;
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -55,10 +54,15 @@ use crate::wal::log::crc32;
 /// a child forked off this branch after the page was born (so that child has it too). The
 /// barrier is therefore the later of this branch's fork epoch and its most recent child's fork
 /// epoch, and it is what gets handed to [`PageHeader::is_private_to`].
-pub fn privacy_barrier(rec: &BranchRecord) -> Epoch {
-    match rec.live_children.last() {
-        Some(latest) => Epoch(rec.fork_epoch.0.max(latest.0)),
-        None => rec.fork_epoch,
+/// Takes the two epochs it actually depends on rather than a whole record, because the second one
+/// used to be `rec.live_children.last()` — the last element of an unbounded array that trunk would
+/// grow to 10⁶ entries. The question "what is my latest live child's fork epoch?" is one index
+/// lookup (`BranchCatalog::max_live_child`); materialising the array to take its last element is
+/// not. Pure, so it is testable without a catalog at all.
+pub fn privacy_barrier(fork_epoch: Epoch, max_live_child: Option<Epoch>) -> Epoch {
+    match max_live_child {
+        Some(latest) => Epoch(fork_epoch.0.max(latest.0)),
+        None => fork_epoch,
     }
 }
 
@@ -89,24 +93,37 @@ const SELF_GRANT_ARENA_IDS: u64 = 64;
 /// **refuses** when it holds nothing. See [`crate::cluster`].
 struct ArenaSpaceManager {
     base_page: PageId,
+    /// The LARGEST extent this store hands out. **D31:** extents are no longer one size — a
+    /// branch's first is [`crate::branch::types::ARENA_FIRST_EXTENT_PAGES`] and each subsequent
+    /// one doubles up to this cap. Kept as a field rather than read from the constant because
+    /// `CowStore` already parameterises it and the grant accounting below is stated in it.
     extent_pages: u32,
-    /// Start pages of extents. Issues `extent_pages` at a time.
+    /// Start pages of extents. Issues as many pages as the extent being claimed actually needs.
     extent_starts: GrantedCounter,
-    /// Extent start pages returned by `free_arena`, ready to be handed out again. Reuse is what
+    /// Freed extents, **keyed by size in pages**, ready to be handed out again. Reuse is what
     /// makes the reserved page count return to baseline rather than merely stopping its growth.
+    ///
+    /// **Segregated exact fit, and the key is why.** With one extent size a freed start could
+    /// serve any request; with geometric growth it cannot, and handing a 1-page hole to a
+    /// 256-page request would alias 255 pages that belong to somebody else. Sizes are powers of
+    /// two from 1 to `extent_pages`, so there are at most nine classes and no coalescing: a freed
+    /// 4-page extent is reusable only by another 4-page request. That is the standard slab
+    /// trade-off — bounded internal reuse in exchange for never splitting or merging — and the
+    /// bound is what makes the lookup O(1) rather than a scan of a free list that reaches 10^6
+    /// entries at the scale this store is aimed at.
     ///
     /// **Recycling needs no grant** — and that is a property, not an oversight. These pages were
     /// already granted to this node and were never given back to the leader, so handing one out
     /// again is this node issuing from its own space. What it *does* need is the epoch check
     /// below: pages self-granted under a previous authority are not this node's to reuse.
-    free_extent_starts: Mutex<Vec<PageId>>,
+    free_extents: Mutex<HashMap<u32, Vec<PageId>>>,
     /// Arena ids. Issues one at a time.
     ///
     /// In a cluster these come from the same [`crate::consensus::Command::ArenaGrant`] as the
     /// pages — see [`ArenaPageStore::apply_arena_grant`] for why, and for what the frozen contract
     /// does not carry.
     arena_ids: GrantedCounter,
-    /// The authority epoch `free_extent_starts` was filled under.
+    /// The authority epoch `free_extents` was filled under.
     ///
     /// A store that recycled pages while standalone, in a process that then joined a cluster, is
     /// sitting on space no leader knows it has. [`crate::cluster::GrantedCounter`] evicts stale
@@ -128,16 +145,21 @@ impl ArenaSpaceManager {
     ///
     /// That cannot happen, and the reason is an invariant worth stating rather than relying on.
     /// [`ArenaPageStore::apply_arena_grant`] grants `page_count` arena ids alongside `page_count`
-    /// pages, while one reserve consumes `extent_pages` pages against a single id — so ids
-    /// outnumber the extents they can name by `extent_pages` to one, and the page counter is always
-    /// the binding constraint. Pinned by
+    /// pages, while one reserve consumes at least one page against exactly one id — so ids can
+    /// never run out before pages do, and the page take is always the one reached first. Pinned by
     /// `an_arena_grant_always_carries_more_ids_than_the_extents_it_can_name`.
-    fn reserve(&self) -> Result<(ArenaId, PageId), FerroError> {
+    ///
+    /// **D31 narrowed that margin and did not reverse it.** With one fixed extent size the ratio
+    /// was `extent_pages` ids per extent. With geometric growth the smallest extent is one page,
+    /// so a grant of `n` pages names at most `n` extents and the two counters can now be exhausted
+    /// by the SAME reserve. The order is what keeps that safe: pages are consumed first, so the
+    /// reserve that would exhaust both refuses on pages and never consumes the id.
+    fn reserve(&self, pages: u32) -> Result<(ArenaId, PageId), FerroError> {
         let epoch = crate::cluster::epoch();
-        let start = match self.recycled_start(epoch) {
+        let start = match self.recycled_start(epoch, pages) {
             Some(s) => s,
             None => {
-                let v = self.extent_starts.take(self.extent_pages as u64)?;
+                let v = self.extent_starts.take(pages as u64)?;
                 // Every value in this counter is a page id, and a `PageId` is a `u32`. A grant
                 // that pushed the watermark past that is a leader arithmetic error, and truncating
                 // it silently would alias page 0.
@@ -155,24 +177,28 @@ impl ArenaSpaceManager {
         Ok((arena, start))
     }
 
-    /// Pop a recycled extent start, discarding the stack outright if it was filled under a
-    /// superseded authority.
-    fn recycled_start(&self, epoch: u64) -> Option<PageId> {
-        let mut free = self.free_extent_starts.lock().unwrap();
+    /// Pop a recycled extent of **exactly** `pages` pages, discarding the whole map if it was
+    /// filled under a superseded authority.
+    ///
+    /// Exactly, never "at least": a bigger hole handed to a smaller request would strand its tail
+    /// with no record that it exists, and a smaller one handed to a bigger request aliases pages
+    /// the next extent owns.
+    fn recycled_start(&self, epoch: u64, pages: u32) -> Option<PageId> {
+        let mut free = self.free_extents.lock().unwrap();
         if self.recycle_epoch.swap(epoch, Ordering::SeqCst) != epoch {
             free.clear();
             return None;
         }
-        free.pop()
+        free.get_mut(&pages)?.pop()
     }
 
-    fn give_back(&self, start: PageId) {
+    fn give_back(&self, start: PageId, pages: u32) {
         let epoch = crate::cluster::epoch();
-        let mut free = self.free_extent_starts.lock().unwrap();
+        let mut free = self.free_extents.lock().unwrap();
         if self.recycle_epoch.swap(epoch, Ordering::SeqCst) != epoch {
             free.clear();
         }
-        free.push(start);
+        free.entry(pages).or_default().push(start);
     }
 }
 
@@ -201,11 +227,13 @@ struct StoreState {
 /// Copy-on-write page store backed by per-branch arenas.
 pub struct ArenaPageStore {
     pool: Arc<BufferPoolManager>,
-    /// Concrete rather than `dyn BranchCatalog` on purpose: GC decisions must be able to read the
-    /// record of a branch that is mid-reap or already reaped (`get_raw`), because that record's
-    /// `live_children` array is still the authority over its parked pages. The trait's `get` is
-    /// generation-guarded and correctly refuses those, so it cannot answer a GC question.
-    catalog: Arc<LogBranchCatalog>,
+    /// `dyn` since D1-wire-runtime. It used to be concrete, and the comment here said that was
+    /// "on purpose: GC decisions must be able to read" things the trait did not expose - namely
+    /// `get_raw`, which is generation-blind and which the reclamation path genuinely needs. That
+    /// was a real requirement expressed the wrong way: it made the CATALOG unswappable in order to
+    /// reach ONE method. `get_raw` and `release_id` are on the trait now, so the requirement is
+    /// stated where it belongs and any catalog can satisfy it.
+    catalog: Arc<dyn BranchCatalog>,
     space: ArenaSpaceManager,
     state: Mutex<StoreState>,
     /// Pages handed out by `alloc_in_arena` and not yet returned to the free space map.
@@ -234,7 +262,7 @@ impl ArenaPageStore {
     /// this store alone.
     pub fn new(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         // NOT `next_page_id` — that counter only advances when a new bitmap page is created, so
@@ -278,7 +306,7 @@ impl ArenaPageStore {
     /// a different arena will alias it, and nothing here can currently detect that.
     pub fn reopen(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         let bitmap_mark = pool.disk_manager.bitmap_high_water()?;
@@ -295,7 +323,7 @@ impl ArenaPageStore {
 
     fn assemble(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         base_page: PageId,
     ) -> Result<Self, FerroError> {
         Ok(ArenaPageStore {
@@ -309,7 +337,7 @@ impl ArenaPageStore {
                     base_page as u64,
                     ARENA_EXTENT_PAGES as u64 * SELF_GRANT_EXTENTS,
                 ),
-                free_extent_starts: Mutex::new(Vec::new()),
+                free_extents: Mutex::new(HashMap::new()),
                 // Starts at 1: arena 0 is the shared/trunk arena and is never an extent.
                 arena_ids: GrantedCounter::new("arena-id", 1, SELF_GRANT_ARENA_IDS),
                 recycle_epoch: AtomicU64::new(crate::cluster::epoch()),
@@ -408,13 +436,26 @@ impl ArenaPageStore {
         Ok(pages)
     }
 
-    /// How many extents this node may still claim without a new grant.
+    /// How many extent pages this node may still claim without a new grant.
+    ///
+    /// **D31 — this is the honest unit now.** Extents are no longer one size, so "how many
+    /// extents" depends on which sizes get asked for; pages are what the grant is actually
+    /// denominated in and what `reserve` actually consumes.
+    pub fn grantable_pages(&self) -> u64 {
+        self.space.extent_starts.remaining()
+    }
+
+    /// How many **full-size** extents this node may still claim without a new grant.
     ///
     /// Diagnostic, for an operator and for the leader loop that decides when to propose the next
     /// grant. A caller that branches on it to decide whether to allocate is re-implementing the
     /// guard in [`ArenaSpaceManager::reserve`], which already refuses.
+    ///
+    /// Since D31 this is a **lower bound**, not a count: a node holding 300 pages can claim one
+    /// 256-page extent or three hundred 1-page ones, and this reports 1. Use
+    /// [`Self::grantable_pages`] when the number has to be exact.
     pub fn grantable_extents(&self) -> u64 {
-        self.space.extent_starts.remaining() / self.space.extent_pages as u64
+        self.grantable_pages() / self.space.extent_pages as u64
     }
 
     /// The extent-start watermark, i.e. what the checkpoint image carries. Diagnostic.
@@ -433,6 +474,10 @@ impl ArenaPageStore {
     }
 
     /// The branch that owns `arena`, or `None` if the extent has been freed.
+    ///
+    /// **D40.** This is how `reaper::sweep_touched_extents` asks about a handful of named arenas
+    /// instead of walking [`Self::live_arenas`]. `None` is the ordinary answer for an arena the
+    /// reaper's fast path already freed wholesale, not an error.
     pub fn arena_owner(&self, arena: ArenaId) -> Option<BranchId> {
         self.state.lock().unwrap().extents.get(&arena).map(|e| e.owner)
     }
@@ -547,10 +592,10 @@ impl ArenaPageStore {
     ///
     /// Sorted because this order reaches durable state rather than a diagnostic:
     /// `reaper::sweep_empty_extents` frees empty extents in exactly this sequence, each
-    /// `free_arena` pushes the freed extent's start page onto `free_extent_starts`, and
-    /// `ArenaSpaceManager::reserve` **pops** that stack. So the `extents` map's hash order decided
-    /// which page range the next arena was handed, and two runs of one workload laid their extents
-    /// out differently.
+    /// `free_arena` pushes the freed extent's start page onto `free_extents` under its size class,
+    /// and `ArenaSpaceManager::reserve` **pops** that stack. So the `extents` map's hash order
+    /// decided which page range the next arena was handed, and two runs of one workload laid their
+    /// extents out differently.
     pub fn live_arenas(&self) -> Vec<(ArenaId, BranchId)> {
         let mut live: Vec<(ArenaId, BranchId)> =
             self.state.lock().unwrap().extents.iter().map(|(a, e)| (*a, e.owner)).collect();
@@ -570,7 +615,14 @@ impl ArenaPageStore {
         for arena in rec.arenas.iter().copied() {
             for page_id in self.allocated_pages(arena) {
                 let birth = self.page_birth(page_id)?;
-                if reclaimable(&rec.live_children, birth, free_epoch) {
+                // The reclamation rule as an index question rather than an array walk: is
+                // there a live child forked in [birth, free_epoch)? Same predicate, asked of a
+                // structure that can answer it without holding every child resident.
+                if !self.catalog.live_child_in_epoch_range(
+                    rec.branch_id.id,
+                    birth,
+                    free_epoch,
+                )? {
                     self.release_page(page_id, arena);
                     released += 1;
                 } else {
@@ -609,7 +661,7 @@ impl ArenaPageStore {
     // Format (big-endian, matching the rest of ferrodb):
     //   version u8 | base_page u32 | next_extent_start u32 | next_arena_id u32 | live u32
     //       | reserved u32
-    //   free_starts: u32 count, u32 each
+    //   free_extents: u32 count, then start u32 | page_count u32   (v3; v2 wrote start only)
     //   extents: u32 count, then per extent
     //       arena u32 | owner.id u64 | owner.gen u32 | start u32 | page_count u32 | next_free u32
     //       | recycled u32 count, u32 each
@@ -621,7 +673,17 @@ impl ArenaPageStore {
     /// v2 added `base_page` immediately after the version byte. It is what makes a checkpoint
     /// self-describing: before it, the region's base existed only as an argument the caller
     /// remembered to pass, and reattaching at the wrong base aliased another arena silently.
-    const STATE_VERSION: u8 = 2;
+    ///
+    /// **v3 (D31) gives every freed extent its size.** Extents stopped being uniform, so a bare
+    /// start page no longer says how big the hole is, and reusing a v2 entry as if it were the
+    /// cap would alias up to 255 pages. v2 images still load — every extent a v2 store could
+    /// free was exactly `extent_pages` long, so that is what its entries are read as, which is a
+    /// fact about the old format rather than a guess. See [`Self::READABLE_STATE_VERSIONS`].
+    const STATE_VERSION: u8 = 3;
+
+    /// Versions [`Self::load_state`] accepts. Written as an allowlist: a denylist of known-bad
+    /// versions would accept every future one.
+    const READABLE_STATE_VERSIONS: &'static [u8] = &[2, 3];
 
     /// Serialize the free-space map and pending-free log.
     pub fn state_bytes(&self) -> Vec<u8> {
@@ -641,12 +703,19 @@ impl ArenaPageStore {
         b.extend_from_slice(&self.live_pages.load(Ordering::SeqCst).to_be_bytes());
         b.extend_from_slice(&self.reserved_pages.load(Ordering::SeqCst).to_be_bytes());
 
-        let free = self.space.free_extent_starts.lock().unwrap();
-        b.extend_from_slice(&(free.len() as u32).to_be_bytes());
-        for s in free.iter() {
-            b.extend_from_slice(&s.to_be_bytes());
-        }
+        // Sorted, for the same reason the two maps below are: this function decides the bytes of
+        // a durable file and the CRC32 over them, and a `HashMap` iterated in hash order gives two
+        // processes in identical states two different images.
+        let free = self.space.free_extents.lock().unwrap();
+        let mut flat: Vec<(PageId, u32)> =
+            free.iter().flat_map(|(pages, starts)| starts.iter().map(|s| (*s, *pages))).collect();
         drop(free);
+        flat.sort_unstable();
+        b.extend_from_slice(&(flat.len() as u32).to_be_bytes());
+        for (start, pages) in &flat {
+            b.extend_from_slice(&start.to_be_bytes());
+            b.extend_from_slice(&pages.to_be_bytes());
+        }
 
         // The two maps below are walked in **key order**, not hash order, because this function
         // decides the bytes of a durable file and the CRC32 over them. Iterated as `HashMap`s, one
@@ -710,11 +779,11 @@ impl ArenaPageStore {
         }
         let mut c = StateCursor { b: &bytes[..body], at: 0 };
         let version = c.u8()?;
-        if version != Self::STATE_VERSION {
+        if !Self::READABLE_STATE_VERSIONS.contains(&version) {
             return Err(BranchError::Arena(format!(
-                "unknown arena state version {} (expected {})",
+                "unknown arena state version {} (readable: {:?})",
                 version,
-                Self::STATE_VERSION
+                Self::READABLE_STATE_VERSIONS
             ))
             .into());
         }
@@ -735,9 +804,13 @@ impl ArenaPageStore {
         let reserved = c.u32()?;
 
         let n = c.u32()? as usize;
-        let mut free_starts = Vec::with_capacity(n);
+        let mut free_extents: HashMap<u32, Vec<PageId>> = HashMap::new();
         for _ in 0..n {
-            free_starts.push(c.u32()?);
+            let start = c.u32()?;
+            // v2 had exactly one extent size and could not have freed any other, so this is what
+            // its entries mean rather than an assumption about them.
+            let pages = if version >= 3 { c.u32()? } else { self.space.extent_pages };
+            free_extents.entry(pages).or_default().push(start);
         }
 
         let n = c.u32()? as usize;
@@ -816,7 +889,7 @@ impl ArenaPageStore {
         let claim_epoch = extents.keys().map(|a| (*a, crate::cluster::epoch())).collect();
         *self.state.lock().unwrap() =
             StoreState { extents, recycled, current, pending, claim_epoch };
-        *self.space.free_extent_starts.lock().unwrap() = free_starts;
+        *self.space.free_extents.lock().unwrap() = free_extents;
         // Raised, never lowered, and every held range is trimmed to match: the image says this
         // much was already issued, and a grant replayed afterwards must only re-offer its unissued
         // suffix. See `GrantedCounter::raise_issued_through`.
@@ -900,11 +973,11 @@ impl ArenaPageStore {
         }
         let mut c = StateCursor { b: &bytes[..body], at: 0 };
         let version = c.u8()?;
-        if version != Self::STATE_VERSION {
+        if !Self::READABLE_STATE_VERSIONS.contains(&version) {
             return Err(BranchError::Arena(format!(
-                "unknown arena state version {} (expected {})",
+                "unknown arena state version {} (readable: {:?})",
                 version,
-                Self::STATE_VERSION
+                Self::READABLE_STATE_VERSIONS
             ))
             .into());
         }
@@ -926,7 +999,7 @@ impl ArenaPageStore {
     /// deliberately with [`ArenaPageStore::new`], not something to paper over with a default base.
     pub fn reopen_from_checkpoint(
         pool: Arc<BufferPoolManager>,
-        catalog: Arc<LogBranchCatalog>,
+        catalog: Arc<dyn BranchCatalog>,
         path: &std::path::Path,
     ) -> Result<Self, FerroError> {
         let bytes = std::fs::read(path).map_err(|e| FerroError::Io(e.to_string()))?;
@@ -1035,12 +1108,27 @@ impl PageStore for ArenaPageStore {
     ) -> Result<CowPage, FerroError> {
         // Hard-errors on a reaped or mid-reap branch: never stale data.
         let rec = self.catalog.get(branch)?;
-        let arena = self.arena_for(branch)?;
-        let barrier = privacy_barrier(&rec);
+        let barrier = privacy_barrier(rec.fork_epoch, self.catalog.max_live_child(rec.branch_id.id)?);
 
         let handle = self.read_page(page_id)?;
         let header = handle.header()?;
-        if header.is_private_to(arena, barrier) {
+
+        // **D31 — privacy is OWNERSHIP of the page's extent, not identity with the writer's
+        // CURRENT one.** This used to be `header.is_private_to(arena_for(branch), barrier)`, i.e.
+        // "is this page in the extent I am allocating from right now". A branch used to have
+        // exactly one extent almost always, so the two questions coincided and the narrower one
+        // looked right.
+        //
+        // They stopped coinciding the moment a branch could hold several extents. Every rollover
+        // made every page in the branch's EARLIER extents read as foreign, so the branch shadowed
+        // its own private pages and freed the originals — correct, but it doubles the space and
+        // defeats the in-place path this test exists to protect. Geometric growth turns that from
+        // "after 256 pages" into "after the first page", which is how it was found.
+        //
+        // The predicate below is the one the shadow path twenty lines down already uses, word for
+        // word: *"only if this branch owns the arena it came from"*. One question, asked once.
+        let owns_it = self.arena_owner(header.arena_id) == Some(branch);
+        if owns_it && header.birth_epoch >= barrier {
             // Nobody else can see it: mutate in place. This is what keeps a hot branch from
             // shadowing the same page on every single write.
             return Ok(CowPage { page_id, previous_page_id: page_id, copied: false, handle });
@@ -1049,6 +1137,11 @@ impl PageStore for ArenaPageStore {
         let source = handle.read().data;
         drop(handle);
 
+        // Asked only NOW, on the path that actually allocates. Eagerly above, a branch whose
+        // extent had just filled would claim a fresh one on every in-place mutation too — one
+        // whole extent per write, which at a one-page first extent is unbounded growth on a
+        // workload that allocates nothing.
+        let arena = self.arena_for(branch)?;
         let new_id = self.alloc_in_arena(arena, header.page_type, epoch)?;
         let new_handle = self.read_page(new_id)?;
         {
@@ -1081,31 +1174,58 @@ impl PageStore for ArenaPageStore {
             return Ok(());
         };
 
-        // The owner may be mid-reap or already reaped, and its `live_children` array is still
-        // the authority over this page, so read it raw rather than through the generation guard.
-        let owner_children = match self.catalog.get_raw(owner.id) {
-            Ok(rec) => Some(rec.live_children),
-            Err(_) => None,
-        };
+        // The owner may be mid-reap or already reaped and its children are still the authority
+        // over this page, so the query is generation-blind by construction: it takes an id slot,
+        // not a `BranchId`. An owner with no record at all answers `false` — nothing pins the page.
+        // An owner with no record at all pins nothing: the previous shape matched `None` into the
+        // same branch as "not pinned", so a missing owner and an unpinned page already behaved
+        // identically. `&&` short-circuits on the missing record, so the query is not asked of a
+        // slot that has none.
+        let pinned = self.catalog.get_raw(owner.id).is_ok()
+            && self.catalog.live_child_in_epoch_range(
+                owner.id,
+                header.birth_epoch,
+                free_epoch,
+            )?;
 
-        match owner_children {
-            Some(children) if !reclaimable(&children, header.birth_epoch, free_epoch) => {
-                self.state.lock().unwrap().pending.push(PendingFree {
-                    page_id,
-                    arena_id: arena,
-                    birth_epoch: header.birth_epoch,
-                    free_epoch,
-                    owner,
-                });
-            }
-            _ => self.release_page(page_id, arena),
+        if pinned {
+            self.state.lock().unwrap().pending.push(PendingFree {
+                page_id,
+                arena_id: arena,
+                birth_epoch: header.birth_epoch,
+                free_epoch,
+                owner,
+            });
+        } else {
+            self.release_page(page_id, arena);
         }
         Ok(())
     }
 
     fn alloc_arena(&self, branch: BranchId) -> Result<ArenaId, FerroError> {
         let epoch = self.revoke_stale_authority();
-        let (arena, start) = self.space.reserve()?;
+
+        // **D31 — the size is a function of what this branch is already filling.** Derived from
+        // the current extent rather than from a counter kept beside it, so it needs no new durable
+        // field and survives a restart: `current` and every extent's `page_count` are both already
+        // in the checkpoint image. A branch whose extent was freed underneath it starts again at
+        // one page, which is the safe direction — it over-allocates nothing.
+        //
+        // Two threads allocating for one branch can read the same previous size and both claim it.
+        // That is benign: they get two distinct valid extents and the branch's growth is one step
+        // slower. Holding the state lock across `reserve` to prevent it would put a consensus-
+        // capable take inside the store's hottest lock to save one doubling.
+        let pages = {
+            let st = self.state.lock().unwrap();
+            let current = st
+                .current
+                .get(&branch)
+                .and_then(|a| st.extents.get(a))
+                .map(|e| e.page_count);
+            next_extent_pages(current)
+        };
+
+        let (arena, start) = self.space.reserve(pages)?;
         {
             let mut st = self.state.lock().unwrap();
             st.extents.insert(
@@ -1114,7 +1234,7 @@ impl PageStore for ArenaPageStore {
                     arena_id: arena,
                     owner: branch,
                     start_page: start,
-                    page_count: self.space.extent_pages,
+                    page_count: pages,
                     next_free: 0,
                 },
             );
@@ -1122,15 +1242,18 @@ impl PageStore for ArenaPageStore {
             st.current.insert(branch, arena);
             st.claim_epoch.insert(arena, epoch);
         }
-        self.reserved_pages.fetch_add(self.space.extent_pages, Ordering::SeqCst);
+        self.reserved_pages.fetch_add(pages, Ordering::SeqCst);
 
         // Keep the durable record truthful: the reaper frees exactly `record.arenas`.
-        if let Ok(mut rec) = self.catalog.get_raw(branch.id) {
-            if !rec.arenas.contains(&arena) {
-                rec.arenas.push(arena);
-                self.catalog.put(&rec)?;
-            }
-        }
+        //
+        // **D20 — ONE ATOMIC CATALOG OPERATION.** This was a read-modify-write across two
+        // different critical sections: `get_raw` took NO lock, `put` took `logical`. With no latch
+        // protocol under the B+tree, the unlocked read could descend through a node another thread
+        // was splitting, return a record with the wrong arena list, and have that list written
+        // back as truth -- after which the reaper freed exactly `record.arenas` and the arenas it
+        // could no longer see leaked. Measured before the fix: 0 leaked at 1 thread, 24 at 8,
+        // 0 on the log catalog (`bench/d20_race_control.txt`).
+        self.catalog.add_arena(branch, arena)?;
 
         // Persist the map now that the region has grown. This is the write that makes
         // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
@@ -1166,14 +1289,18 @@ impl PageStore for ArenaPageStore {
 
 
     fn free_arena(&self, arena: ArenaId) -> Result<u32, FerroError> {
-        let (start, allocated) = {
+        // **D31 — every one of these is the EXTENT's own size, never the store's cap.** Extents
+        // are no longer uniform, so `self.space.extent_pages` here would evict 255 pages belonging
+        // to other arenas, credit the reserved counter with space this extent never held, and hand
+        // a 1-page hole back to the free list as if it were 256.
+        let (start, pages, allocated) = {
             let st = self.state.lock().unwrap();
             let Some(ext) = st.extents.get(&arena) else { return Ok(0) };
             let recycled = st.recycled.get(&arena).map(|v| v.len() as u32).unwrap_or(0);
-            (ext.start_page, ext.next_free.saturating_sub(recycled))
+            (ext.start_page, ext.page_count, ext.next_free.saturating_sub(recycled))
         };
 
-        for i in 0..self.space.extent_pages {
+        for i in 0..pages {
             self.evict(start + i);
         }
 
@@ -1189,8 +1316,8 @@ impl PageStore for ArenaPageStore {
         drop(st);
 
         if ext.is_some() {
-            self.space.give_back(start);
-            self.reserved_pages.fetch_sub(self.space.extent_pages, Ordering::SeqCst);
+            self.space.give_back(start, pages);
+            self.reserved_pages.fetch_sub(pages, Ordering::SeqCst);
             self.live_pages.fetch_sub(allocated, Ordering::SeqCst);
             // Persist the shrunk map, for the same reason `alloc_arena` persists the grown one.
             // Without this only *claims* were durable and frees never were, so a crash after a reap
@@ -1233,7 +1360,8 @@ impl PageStore for ArenaPageStore {
 pub(crate) mod harness {
     use super::*;
     use crate::branch::catalog::LogBranchCatalog;
-    use crate::storage::disk_manager::DiskManager;
+    use crate::branch::table_catalog::TableBranchCatalog;
+        use crate::storage::disk_manager::DiskManager;
     use std::fs::OpenOptions;
     use std::sync::atomic::AtomicU64;
 
@@ -1241,13 +1369,30 @@ pub(crate) mod harness {
 
     /// A throwaway store on a real file, deleted when the guard drops.
     pub struct Harness {
-        pub catalog: Arc<LogBranchCatalog>,
+        pub catalog: Arc<dyn BranchCatalog>,
         pub store: Arc<ArenaPageStore>,
         path: std::path::PathBuf,
     }
 
     impl Harness {
+        /// The LOG catalog. Kept as the default so existing callers are unchanged, but see
+        /// [`Harness::new_with`]: it is **not** the catalog that ships.
         pub fn new() -> Harness {
+            Harness::new_with(false)
+        }
+
+        /// **D19.** `table = true` builds the catalog that actually ships.
+        ///
+        /// Every reclamation test in this project used to run against `LogBranchCatalog`, which
+        /// keeps `live_children` inside the record and therefore **structurally cannot exhibit
+        /// D18** -- live data loss on `TableBranchCatalog`, through which the whole suite stayed
+        /// green. A test that only exercises the safe implementation proves nothing about the
+        /// shipped one.
+        ///
+        /// The log catalog is deliberately KEPT rather than deleted: it is an independent
+        /// reference oracle, and it is what let D16 be proved to be the DESIGN rather than this
+        /// implementation. Two implementations are the instrument, not the problem.
+        pub fn new_with(table: bool) -> Harness {
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
             let path = std::env::temp_dir()
                 .join(format!("ferro-arena-{}-{}.db", std::process::id(), n));
@@ -1260,7 +1405,14 @@ pub(crate) mod harness {
                 .unwrap();
             let dm = Arc::new(DiskManager::new(file).unwrap());
             let pool = Arc::new(BufferPoolManager::new(dm));
-            let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+            let catalog: Arc<dyn BranchCatalog> = if table {
+                let cat_path = std::env::temp_dir()
+                    .join(format!("ferro-arena-{}-{}.cat", std::process::id(), n));
+                let _ = std::fs::remove_file(&cat_path);
+                Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).unwrap())
+            } else {
+                Arc::new(LogBranchCatalog::in_memory(1))
+            };
             let base = pool.disk_manager.high_water().unwrap();
             let store = Arc::new(
                 ArenaPageStore::new(
@@ -1302,9 +1454,10 @@ pub(crate) mod harness {
 
 #[cfg(test)]
 mod tests {
+    use crate::branch::catalog::LogBranchCatalog;
     use super::harness::Harness;
     use super::*;
-    use crate::branch::types::LeaseDeadline;
+    use crate::branch::types::{LeaseDeadline, ARENA_FIRST_EXTENT_PAGES};
 
     /// Write one payload byte and restamp the checksum, the way any real writer must.
     pub(crate) fn stamp_payload_byte(h: &Harness, page: PageId, value: u8) {
@@ -1342,12 +1495,13 @@ mod tests {
                 pool.disk_manager.deallocate(h).unwrap();
             }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as Arc<dyn BranchCatalog>, base).unwrap();
             let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-            let a = store.arena_for(br.branch_id).unwrap();
             let mut pages = Vec::new();
             for _ in 0..8 {
-                pages.push(store.alloc_in_arena(a, PageType::Heap, catalog.next_epoch()).unwrap());
+                pages.push(
+                    store.alloc_for(br.branch_id, PageType::Heap, catalog.next_epoch()).unwrap(),
+                );
             }
             (base, pages)
         }; // file closed here
@@ -1365,7 +1519,7 @@ mod tests {
         // this — after a reopen its high-water mark counts the arena's own pages — so reattach is
         // what `reopen` exists for.
         let reattached =
-            ArenaPageStore::reopen(Arc::clone(&pool2), Arc::clone(&catalog2), base);
+            ArenaPageStore::reopen(Arc::clone(&pool2), Arc::clone(&catalog2) as Arc<dyn BranchCatalog>, base);
         assert!(
             reattached.is_ok(),
             "an arena cannot reattach to the region it already owns: {:?}",
@@ -1417,11 +1571,10 @@ mod tests {
             // Push the base off 1 so a wrong base is actually distinguishable from the right one.
             for _ in 0..12 { pool.disk_manager.allocate().unwrap(); }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&catalog) as Arc<dyn BranchCatalog>, base).unwrap();
             let br = catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-            let a = store.arena_for(br.branch_id).unwrap();
             for _ in 0..4 {
-                store.alloc_in_arena(a, PageType::Heap, catalog.next_epoch()).unwrap();
+                store.alloc_for(br.branch_id, PageType::Heap, catalog.next_epoch()).unwrap();
             }
             store.checkpoint(&ckpt).unwrap();
             (base, store.live_page_count().unwrap())
@@ -1468,7 +1621,7 @@ mod tests {
             let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
             for _ in 0..8 { pool.disk_manager.allocate().unwrap(); }
             let base = pool.disk_manager.high_water().unwrap();
-            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap();
+            let store = ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat) as Arc<dyn BranchCatalog>, base).unwrap();
             store.checkpoint_to(ckpt.clone());
             let a = store.arena_for(BranchId::TRUNK).unwrap();
             store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
@@ -1481,7 +1634,7 @@ mod tests {
             let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
             let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
             let store =
-                ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+                ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, &ckpt).unwrap();
             let a = store.arena_for(BranchId::TRUNK).unwrap();
             let p = store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap();
             // `set_root` appends to the branch log, so this survives the crash. `checkpoint` is
@@ -1493,7 +1646,7 @@ mod tests {
         // --- session 3: reopen from the now-stale checkpoint ---
         let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
         let cat = Arc::new(LogBranchCatalog::open(&brs, 1).unwrap());
-        let store = ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat), &ckpt).unwrap();
+        let store = ArenaPageStore::reopen_from_checkpoint(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, &ckpt).unwrap();
         assert_eq!(store.base_page(), base, "fixture: the region moved between opens");
         assert_eq!(
             cat.get(BranchId::TRUNK).unwrap().root_page_id,
@@ -1502,10 +1655,11 @@ mod tests {
              page and this test cannot detect a collision"
         );
 
-        let a = store.arena_for(BranchId::TRUNK).unwrap();
         let mut handed = Vec::new();
         for _ in 0..4 {
-            handed.push(store.alloc_in_arena(a, PageType::BTreeLeaf, cat.next_epoch()).unwrap());
+            handed.push(
+                store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, cat.next_epoch()).unwrap(),
+            );
         }
         for f in [&db, &ckpt, &brs] { let _ = std::fs::remove_file(f); }
 
@@ -1623,12 +1777,21 @@ mod tests {
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         let first = h.store.arena_for(b.branch_id).unwrap();
         let e = h.catalog.next_epoch();
-        for _ in 0..ARENA_EXTENT_PAGES {
+        // The extent's OWN size, not the store's cap. D31 made those different, and looping to
+        // the cap here would refuse on the second allocation instead of testing the rollover.
+        let (_, first_pages) = h.store.extent_range(first).unwrap();
+        assert_eq!(first_pages, ARENA_FIRST_EXTENT_PAGES, "a branch's first extent is one page");
+        for _ in 0..first_pages {
             h.store.alloc_in_arena(first, PageType::Heap, e).unwrap();
         }
         assert!(h.store.alloc_in_arena(first, PageType::Heap, e).is_err(), "extent is full");
         let second = h.store.arena_for(b.branch_id).unwrap();
         assert_ne!(second, first);
+        assert_eq!(
+            h.store.extent_range(second).unwrap().1,
+            first_pages * 2,
+            "the second extent must DOUBLE the first; a flat sequence is the 262x wall D31 removed"
+        );
         assert_eq!(
             h.catalog.get(b.branch_id).unwrap().arenas,
             vec![first, second],
@@ -1641,15 +1804,25 @@ mod tests {
         let h = Harness::new();
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         let a1 = h.store.arena_for(b.branch_id).unwrap();
-        let start1 = h.store.allocated_pages(a1);
-        assert!(start1.is_empty());
+        assert!(h.store.allocated_pages(a1).is_empty());
+        let (range1, pages1) = h.store.extent_range(a1).unwrap();
         h.store.alloc_in_arena(a1, PageType::Heap, h.catalog.next_epoch()).unwrap();
         assert_eq!(h.store.free_arena(a1).unwrap(), 1);
         assert_eq!(h.store.reserved_page_count(), 0);
 
         let b2 = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         let a2 = h.store.alloc_arena(b2.branch_id).unwrap();
-        assert_eq!(h.store.reserved_page_count(), ARENA_EXTENT_PAGES, "one extent, reused");
+        // **The page range came back**, which is what recycling means. This used to assert
+        // `reserved == ARENA_EXTENT_PAGES`, which said "one extent is reserved" in the uniform
+        // geometry and says nothing about reuse: a freshly claimed extent reserves the same count
+        // as a recycled one. Since D31 the size classes make the distinction load-bearing, so the
+        // test asks the question it always meant to.
+        assert_eq!(
+            h.store.extent_range(a2).unwrap(),
+            (range1, pages1),
+            "the freed extent's page range was not handed out again"
+        );
+        assert_eq!(h.store.reserved_page_count(), pages1, "one extent, reused");
         assert_ne!(a1, a2, "arena ids are not reused even when the extent is");
     }
 
@@ -1678,13 +1851,73 @@ mod tests {
         assert!(err.is_err(), "overlapping the bitmap allocator must be refused, not warned about");
     }
 
+    /// **The claim `the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote`
+    /// used to make with a version number.**
+    ///
+    /// That test asserted `bytes[0] == 2` under the message *"the state version changed; every
+    /// <db>.arena on disk is now unreadable"*. D31 had to bump it to 3, because a freed extent's
+    /// SIZE is not derivable once extents stop being uniform and reusing a v2 entry as if it were
+    /// cap-sized would alias up to 255 pages.
+    ///
+    /// A version number is only a proxy for the consequence. This asserts the consequence: an
+    /// image in the old format still opens, and opens to **exactly** the same map. Without this,
+    /// renumbering that assertion would have been the move it exists to prevent.
+    #[test]
+    fn a_v2_checkpoint_image_still_loads_after_the_v3_bump() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+
+        // Climb to a cap-sized extent and free it. Only cap-sized extents can appear in a genuine
+        // v2 free list, because a v2 store could not produce any other size — which is exactly
+        // what makes reading them as cap-sized a fact rather than a guess.
+        let mut arena = h.store.alloc_arena(b.branch_id).unwrap();
+        while h.store.extent_range(arena).unwrap().1 < ARENA_EXTENT_PAGES {
+            arena = h.store.alloc_arena(b.branch_id).unwrap();
+        }
+        assert_eq!(h.store.extent_range(arena).unwrap().1, ARENA_EXTENT_PAGES);
+        h.store.free_arena(arena).unwrap();
+
+        let v3 = h.store.state_bytes();
+        assert_eq!(v3[0], 3, "fixture: this is not a v3 image");
+
+        // Rewrite it as v2: version byte 2, and the free list back to bare start pages. Every
+        // other field is untouched between the two versions, so this is a real v2 image.
+        let body = v3.len() - 4;
+        let n = u32::from_be_bytes(v3[21..25].try_into().unwrap()) as usize;
+        assert!(n > 0, "fixture: the free list is empty, so the downgrade changes nothing");
+        let mut v2 = Vec::new();
+        v2.push(2u8);
+        v2.extend_from_slice(&v3[1..21]);
+        v2.extend_from_slice(&(n as u32).to_be_bytes());
+        for i in 0..n {
+            let at = 25 + i * 8;
+            v2.extend_from_slice(&v3[at..at + 4]); // start, dropping the v3 page_count
+        }
+        v2.extend_from_slice(&v3[25 + n * 8..body]);
+        let crc = crc32(&v2);
+        v2.extend_from_slice(&crc.to_be_bytes());
+
+        let restored = h.fresh_store();
+        restored
+            .load_state(&v2)
+            .expect("a v2 image must still open, or every <db>.arena on disk is lost");
+
+        // Byte-identical when written back out: the v2 reader recovered the same map, freed
+        // extent's size included. A reader that guessed would differ here.
+        assert_eq!(
+            restored.state_bytes(),
+            v3,
+            "a v2 image did not round-trip to the same map"
+        );
+    }
+
     #[test]
     fn free_space_map_survives_a_restart() {
         let h = Harness::new();
         let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         let a1 = h.store.arena_for(parent.branch_id).unwrap();
         for _ in 0..5 {
-            h.store.alloc_in_arena(a1, PageType::Heap, h.catalog.next_epoch()).unwrap();
+            h.store.alloc_for(parent.branch_id, PageType::Heap, h.catalog.next_epoch()).unwrap();
         }
         // one extent handed back, so the free-extent list is non-empty
         let spare = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
@@ -1692,7 +1925,7 @@ mod tests {
         let a2_start = h.store.extent_range(a2).unwrap().0;
         h.store.free_arena(a2).unwrap();
         // and one page parked against a live child
-        let page = h.store.alloc_in_arena(a1, PageType::Heap, h.catalog.next_epoch()).unwrap();
+        let page = h.store.alloc_for(parent.branch_id, PageType::Heap, h.catalog.next_epoch()).unwrap();
         let _child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
         h.store.free_page(page, h.catalog.next_epoch()).unwrap();
 
@@ -1846,7 +2079,7 @@ mod tests {
         let u64_at = |at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
         // version u8, then base_page, next_extent_start, next_arena_id, live, reserved.
         let mut at = 1 + 4 * 5;
-        at += 4 + 4 * u32_at(at) as usize; // free_starts
+        at += 4 + 8 * u32_at(at) as usize; // free_extents: (start, page_count) pairs since v3
 
         let n_extents = u32_at(at) as usize;
         at += 4;
@@ -1988,7 +2221,7 @@ mod tests {
         h.store.checkpoint(&path).unwrap();
         assert_eq!(
             h.store.reserved_page_count(),
-            ARENA_EXTENT_PAGES,
+            h.store.extent_range(a).unwrap().1,
             "fixture: no extent was reserved, so freeing one proves nothing"
         );
 
@@ -2029,9 +2262,8 @@ mod tests {
         h.store.checkpoint_to(path.clone());
 
         let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-        let a = h.store.arena_for(parent.branch_id).unwrap();
         for _ in 0..4 {
-            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
         }
         // Forked *after* those pages were born, so it can still see them and the interval rule
         // parks them rather than releasing them.
@@ -2062,9 +2294,8 @@ mod tests {
         h.store.checkpoint_to(path.clone());
 
         let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
-        let a = h.store.arena_for(parent.branch_id).unwrap();
         for _ in 0..4 {
-            h.store.alloc_in_arena(a, PageType::Heap, Epoch(1)).unwrap();
+            h.store.alloc_for(parent.branch_id, PageType::Heap, Epoch(1)).unwrap();
         }
         h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
         let rec = h.catalog.get_raw(parent.branch_id.id).unwrap();
@@ -2107,11 +2338,19 @@ mod tests {
 
     #[test]
     fn privacy_barrier_is_the_later_of_own_fork_and_latest_child_fork() {
+        // Same rule, same asserted values. The call shape changed because the second argument is
+        // now the ONE epoch the rule depends on rather than an unbounded array to take the last of.
         let mut rec = BranchRecord::trunk(1, LeaseDeadline(0));
         rec.fork_epoch = Epoch(10);
-        assert_eq!(privacy_barrier(&rec), Epoch(10));
+        assert_eq!(privacy_barrier(rec.fork_epoch, None), Epoch(10));
         rec.add_live_child(Epoch(25));
         rec.add_live_child(Epoch(17));
-        assert_eq!(privacy_barrier(&rec), Epoch(25));
+        // `add_live_child` keeps the array sorted ascending, so `last()` is the LATEST fork -
+        // which is why 17 arriving after 25 must not move the barrier back.
+        assert_eq!(
+            privacy_barrier(rec.fork_epoch, rec.live_children.last().copied()),
+            Epoch(25)
+        );
+        assert_eq!(rec.live_children.last().copied(), Some(Epoch(25)), "array is not sorted");
     }
 }

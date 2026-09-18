@@ -1,0 +1,30 @@
+D4: what durability costs the table catalog, and the correction it forces.
+Recorded 2026-09-17. examples/durable_fork, release, FERRODB_SKIP_REOPEN=1, one run per arm.
+
+  8000 forks            total_s    on-disk bytes    peak RSS
+    LogBranchCatalog     24.661          544000      9748480
+    TableBranchCatalog   26.929         2129920     11960320   (table arm also holds a main pool)
+
+  table is 9.2% SLOWER on fork. Both are now fsync-bound: the log fsyncs each append, the table
+  flushes its dirty pages and fsyncs at the end of every mutating operation.
+
+THE CORRECTION. bench/catalog_table_vs_log.txt reported the table arm at 0.704s for 8000 forks and
+said plainly that TOTAL TIME WAS NOT COMPARABLE, because the log fsynced and the table did not.
+That caveat was correct and it was also hiding a defect rather than a trade-off: the catalog was
+not merely buffering, it was NOT DURABLE AT ALL. The switchover created a database, wrote the
+header page into a buffer frame, exited, and the next open reported
+
+    page 1 is not a branch-catalog header (magic 0x00000000, expected 0xfe440b01)
+
+because the page never reached disk. Every branch the process had created was gone. Thirteen
+integration tests caught it the first time the binaries were driven end to end; no unit test could,
+because they all held one long-lived pool where a frame is indistinguishable from a durable write.
+
+So the 38x apparent speed advantage was the absence of an fsync. Made durable, the real number is
+9.2% slower, which is the honest cost of writing ~4 pages per fork where the log writes 68 bytes.
+
+WHAT SURVIVES THE CORRECTION, and it is the part that mattered:
+  - marginal peak RSS  636 B/branch -> 11.7 B/branch   (bench/catalog_sidecar_two_pool.txt)
+  - reopen at 64k      0.030s -> 0.000008s, flat where the log doubles
+Neither depends on the fsync. The catalog was never claimed to make forking faster; S5 is the row
+for fork throughput, and it applies to both catalogs equally.

@@ -2,7 +2,7 @@
 //!
 //! Every test here has been run against a deliberately broken copy of the rule it names and seen
 //! to fail; the mutants and what each printed are recorded in
-//! `scratchpad/F11-server-reaps.md` and in the summary this row files.
+//! `bench/evidence/F11-server-reaps.md` and in the summary this row files.
 //!
 //! **Nothing here arms the process for a cluster.** The authority is process-scoped and `cargo
 //! test` runs a binary's tests as threads of one process, so a unit test that joined would make
@@ -49,14 +49,17 @@ fn fixture() -> Fixture {
     Fixture { h, reaper, runtime }
 }
 
-/// Allocate `pages` real pages inside `branch`'s own extent and stamp each one, the way any real
+/// Allocate `pages` real pages inside `branch`'s own extents and stamp each one, the way any real
 /// writer must. Lifted from `branch/reaper.rs`'s own helper rather than reinvented.
+///
+/// **D31 — `alloc_for`, not a captured `ArenaId`.** Same change as the reaper's copy, for the same
+/// reason: a branch's first extent is one page now, so filling a captured arena refuses on the
+/// second allocation.
 fn write_pages(f: &Fixture, branch: BranchId, pages: usize) -> Vec<PageId> {
-    let arena = f.h.store.arena_for(branch).unwrap();
     let epoch = f.h.catalog.next_epoch();
     (0..pages)
         .map(|i| {
-            let p = f.h.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+            let p = f.h.store.alloc_for(branch, PageType::BTreeLeaf, epoch).unwrap();
             let handle = f.h.store.read_page(p).unwrap();
             let mut frame = handle.write();
             frame.data[PAGE_HEADER_SIZE] = (i & 0xff) as u8;
@@ -199,9 +202,8 @@ fn start_finishes_a_reap_a_crash_interrupted_before_any_scan_runs() {
     let peak = f.h.store.live_page_count().unwrap();
     assert!(peak > baseline, "the branch must really have allocated pages");
 
-    let mut rec: BranchRecord = f.h.catalog.get_raw(interrupted.id).unwrap();
-    rec.state = BranchState::Reaping;
-    f.h.catalog.put(&rec).unwrap();
+    let rec: BranchRecord = f.h.catalog.get_raw(interrupted.id).unwrap();
+    f.h.catalog.set_state(rec.branch_id, rec.state, BranchState::Reaping).unwrap();
 
     let lease = LeaseThread::start(
         Arc::clone(&f.reaper),

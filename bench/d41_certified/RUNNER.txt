@@ -1,0 +1,3 @@
+D41: mode=per-target rc=0 passed=2062 failed=0 build_errors=0 head=ae126ee log=/tmp/d41_verify_out2/suite-D41.log
+D41: go rc=0 passed=97 failed=0 log=/tmp/d41_verify_out2/suite-D41.go.log
+RUNNER_EXIT=0

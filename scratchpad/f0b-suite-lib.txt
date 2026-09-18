@@ -1,8 +1,0 @@
-test execution::hash_join::tests::hash_join_matches_integer_key_against_float_key ... ok
-test execution::hash_join::tests::nested_loop_and_hash_join_agree_across_integer_and_float_keys ... ok
-test optimizer::cost_model::tests::test_join_picks_hash ... ok
-test optimizer::cost_model::tests::explain_index_flip_at_volume ... ok
-test optimizer::cost_model::tests::test_cost_index_vs_seq ... ok
-
-test result: ok. 856 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.54s
-

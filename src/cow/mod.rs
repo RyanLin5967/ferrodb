@@ -23,7 +23,7 @@ pub mod store;
 #[cfg(test)]
 mod tests_isolation;
 
-pub use btree::{CowPageLinks, CowTree};
+pub use btree::{CowPageLinks, CowTree, ScanCursor};
 pub use page_header::{
     flags, stamp_checksum, verify_checksum, PageHeader, PageType, PAGE_HEADER_SIZE,
 };
@@ -144,13 +144,43 @@ pub trait PageStore: Send + Sync {
     /// page.
     fn read_page(&self, page_id: PageId) -> Result<PageHandle, FerroError>;
 
+    /// Allocate a novel page for `branch`, **rolling over to a fresh extent when the current one
+    /// is full**.
+    ///
+    /// This is [`PageStore::arena_for`] followed by [`PageStore::alloc_in_arena`], which is what
+    /// every allocating path in the engine already spelled out by hand: `cow_page`, all four
+    /// B+tree split paths, and — after D13b — `TwoTierReaper::deep_copy`.
+    ///
+    /// **It exists because spelling it out by hand is a trap with a bug history.** An `ArenaId`
+    /// captured once and reused refuses the moment its extent fills (`alloc_in_arena` never grows
+    /// one, by design), so the caller works perfectly until the branch happens to write past an
+    /// extent boundary and then fails with "arena aN is exhausted". That is exactly how `collapse`
+    /// was unable to materialise any tree over 1 MiB (D13b), and geometric extent growth (D31)
+    /// moves the boundary to the FIRST page, where every such caller finds it immediately.
+    ///
+    /// Reach for `alloc_in_arena` only when the arena is genuinely the subject — a test pinning
+    /// the refusal, or a caller that must not be handed a different extent.
+    fn alloc_for(
+        &self,
+        branch: BranchId,
+        page_type: PageType,
+        epoch: Epoch,
+    ) -> Result<PageId, FerroError> {
+        let arena = self.arena_for(branch)?;
+        self.alloc_in_arena(arena, page_type, epoch)
+    }
+
     /// Obtain a writable version of `page_id` for `branch` at `epoch`.
     ///
-    /// If the page header reports `is_private_to(branch's arena, branch's fork epoch)` the same
-    /// page is returned with `copied == false`. Otherwise a new page is allocated in the
-    /// branch's arena, the contents are copied, the new header is stamped with `epoch`, and the
-    /// old page is handed to `free_page` at the same epoch. The caller must relink the parent
-    /// when `copied` is true.
+    /// If the page lives in an extent this branch **owns** and was born at or after the branch's
+    /// privacy barrier, the same page is returned with `copied == false`. Otherwise a new page is
+    /// allocated in the branch's arena, the contents are copied, the new header is stamped with
+    /// `epoch`, and the old page is handed to `free_page` at the same epoch. The caller must
+    /// relink the parent when `copied` is true.
+    ///
+    /// **Ownership, not arena identity.** Asking whether the page sits in the writer's *current*
+    /// extent gives the same answer only while a branch has exactly one, and shadows a branch's
+    /// own pages after every rollover otherwise. See `ArenaPageStore::cow_page`.
     fn cow_page(
         &self,
         page_id: PageId,

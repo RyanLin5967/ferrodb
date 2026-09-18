@@ -1,0 +1,129 @@
+# D35 C1 fire check: break the page-table mirror on purpose, confirm the suite notices
+# generated 2026-09-18T07:59:50-0400
+# base commit: 8bf34ad1cbba641317ac93489f67f81ea610cdfe on D35-C1-firecheck
+# host: 18 cores, load average at start: (8.857421875, 7.8798828125, 6.017578125)
+#
+# FIRED  = at least one test failed against the break. That is the result wanted.
+# SILENT = everything passed against the break. A hole in the suite, not a pass --
+#          except for the CONTROL, which must be SILENT or the tests are keyed to the
+#          mirror being USED rather than to the pool being CORRECT.
+
+===== BASELINE (unmutated, 2 reps) =====
+  rep1 test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.0s)
+  rep1 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.4s)
+  rep1 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.8s)
+  rep1 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s (0.7s)
+  rep2 test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (0.2s)
+  rep2 test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (0.2s)
+  rep2 test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.2s)
+  rep2 test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.4s)
+  BASELINE = GREEN
+
+===== M1-remove-leaves-the-slot  (expect FIRED) =====
+# in src/buffer/page_table.rs
+  test --lib buffer::: rc=101 test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.5s)
+      test buffer::page_table::tests::a_removed_page_is_gone_from_both_halves ... FAILED
+      test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
+      test delete_and_free_take_the_mirror_entry_with_them ... FAILED
+      test the_mirror_agrees_with_the_page_table_after_an_eviction_storm ... FAILED
+      test a_page_that_is_evicted_and_refetched_resolves_to_its_new_frame ... FAILED
+      test concurrent_fetches_never_resolve_to_the_wrong_frame_through_the_mirror ... FAILED
+      test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M2-lookup-drops-the-tag-check  (expect FIRED) =====
+# in src/buffer/page_table.rs
+  test --lib buffer::: rc=101 test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (3.4s)
+      test buffer::page_table::tests::a_collision_costs_the_fast_path_and_never_returns_the_wrong_frame ... FAILED
+      test buffer::page_table::tests::clear_empties_both_halves ... FAILED
+      test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s (1.6s)
+      test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s (0.5s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M3-clear-leaves-the-mirror  (expect FIRED) =====
+# in src/buffer/page_table.rs
+  test --lib buffer::: rc=101 test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.4s)
+      test buffer::page_table::tests::clear_empties_both_halves ... FAILED
+      test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
+      test invalidate_all_empties_the_mirror ... FAILED
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.6s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M4-fetch-drops-the-frame-label-recheck  (expect FIRED) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.5s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.7s)
+  test --test integration_buffer_pool_latch: rc=101 test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
+      test a_stale_page_table_entry_never_yields_another_pages_frame ... FAILED
+      test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M5-unpin-drops-the-frame-label-recheck  (expect FIRED) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (1.9s)
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.3s)
+      test unpin_never_touches_a_frame_that_does_not_hold_the_page ... FAILED
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.6s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M6-fetch-does-not-fall-back-to-the-map  (expect FIRED) =====
+# in src/buffer/buffer_pool.rs
+  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.0s)
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.4s)
+      test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
+      test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s (0.6s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s (0.7s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== M7-insert-never-publishes  (expect FIRED) =====
+# in src/buffer/page_table.rs
+  test --lib buffer::: rc=101 test result: FAILED. 7 passed; 6 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.02s (2.2s)
+      test buffer::page_table::tests::remapping_a_page_moves_its_mirror_entry ... FAILED
+      test buffer::page_table::tests::page_zero_in_frame_zero_is_not_mistaken_for_an_empty_slot ... FAILED
+      test buffer::page_table::tests::a_collision_costs_the_fast_path_and_never_returns_the_wrong_frame ... FAILED
+      test buffer::page_table::tests::the_largest_page_id_round_trips ... FAILED
+      test buffer::page_table::tests::removing_a_collided_out_page_leaves_the_slot_owner_alone ... FAILED
+      test buffer::page_table::tests::the_mirror_answers_what_the_map_answers ... FAILED
+  test --test integration_buffer_pool_mirror: rc=101 test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s (1.5s)
+      test delete_and_free_take_the_mirror_entry_with_them ... FAILED
+      test unpin_never_touches_a_frame_that_does_not_hold_the_page ... FAILED
+      test invalidate_all_empties_the_mirror ... FAILED
+      test a_page_that_is_evicted_and_refetched_resolves_to_its_new_frame ... FAILED
+      test the_mirror_agrees_with_the_page_table_after_an_eviction_storm ... FAILED
+      test two_pages_sharing_a_mirror_slot_are_both_served_correctly ... FAILED
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s (0.8s)
+  VERDICT: FIRED   expected FIRED   -> OK
+
+===== CONTROL-stronger-ordering-must-stay-silent  (expect SILENT) =====
+# in src/buffer/page_table.rs
+  test --lib buffer::: rc=0 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1346 filtered out; finished in 0.13s (2.2s)
+  test --test integration_buffer_pool_mirror: rc=0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s (1.5s)
+  test --test integration_buffer_pool_latch: rc=0 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s (0.5s)
+  test --test integration_buffer_pool_concurrency: rc=0 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s (0.8s)
+  VERDICT: SILENT   expected SILENT   -> OK
+
+===== SUMMARY =====
+  OK   M1-remove-leaves-the-slot: expected FIRED, got FIRED
+  OK   M2-lookup-drops-the-tag-check: expected FIRED, got FIRED
+  OK   M3-clear-leaves-the-mirror: expected FIRED, got FIRED
+  OK   M4-fetch-drops-the-frame-label-recheck: expected FIRED, got FIRED
+  OK   M5-unpin-drops-the-frame-label-recheck: expected FIRED, got FIRED
+  OK   M6-fetch-does-not-fall-back-to-the-map: expected FIRED, got FIRED
+  OK   M7-insert-never-publishes: expected FIRED, got FIRED
+  OK   CONTROL-stronger-ordering-must-stay-silent: expected SILENT, got SILENT
+FIRECHECK_RESULT=PASS (8/8)

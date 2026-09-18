@@ -67,9 +67,9 @@ impl Db {
 
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
         let reaper =
-            Arc::new(TwoTierReaper::new(Arc::clone(&branches), Arc::clone(&store)));
+            Arc::new(TwoTierReaper::new(Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store)));
         let runtime = Arc::new(
             AgentRuntime::with_storage(
                 Arc::clone(&branches) as Arc<dyn BranchCatalog>,
@@ -761,7 +761,17 @@ fn the_losers_are_reaped_on_lease_expiry_with_no_client_cooperation_and_pages_re
         "the long-lease branch lost its rows to the scan that reclaimed the losers"
     );
     // And the trunk is intact.
-    assert_eq!(db.runtime.scan_rows(BranchId::TRUNK, "ballast").unwrap().len(), 400);
+    // `.count()` would be wrong here: it counts `Err` items too, so a failing scan would still
+    // report 400. Collecting through the `Result` keeps the assertion as strong as it was.
+    assert_eq!(
+        db.runtime
+            .scan_rows(BranchId::TRUNK, "ballast")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        400
+    );
     assert_eq!(db.qty(1), 4, "the two admitted candidates did not compose (20 - 8 - 8)");
 }
 
@@ -1144,14 +1154,14 @@ fn a_reaper_wired_to_a_different_catalog_is_caught_at_the_first_seal() {
         let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
         let branches = Arc::new(LogBranchCatalog::in_memory(1));
         let store =
-            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+            Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
         (bp, branches, store)
     };
     let (bp_a, cat_a, store_a) = mk("a.db");
     let (_bp_b, cat_b, store_b) = mk("b.db");
 
     // The reaper belongs to catalog B; the runtime to catalog A.
-    let wrong = Arc::new(TwoTierReaper::new(Arc::clone(&cat_b), Arc::clone(&store_b)));
+    let wrong = Arc::new(TwoTierReaper::new(Arc::clone(&cat_b) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store_b)));
     let rt = AgentRuntime::with_storage(
         Arc::clone(&cat_a) as Arc<dyn BranchCatalog>,
         Arc::new(MemEffectLog::new()),

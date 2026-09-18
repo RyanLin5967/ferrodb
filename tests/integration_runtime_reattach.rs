@@ -52,7 +52,7 @@ fn env(tag: &str) -> Env {
     let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
     let branches = Arc::new(LogBranchCatalog::in_memory(1));
     let store =
-        Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches), ARENA_BASE).unwrap());
+        Arc::new(ArenaPageStore::new(bp.clone(), Arc::clone(&branches) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, ARENA_BASE).unwrap());
     Env { bp, branches, store, _dir: dir }
 }
 

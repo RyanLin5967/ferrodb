@@ -1,0 +1,12 @@
+# S22 FINAL — merged tree (both agents' work reconciled), commit 5ad68bd
+# Interleaved against the pre-fix binary to cancel machine-load drift on a shared box.
+# run at 2026-09-18T04:42:09Z, loadavg: 13.36 13.30 15.33
+
+threads  before_faults_s  after_faults_s   speedup
+1        1302             1326             x1.02
+2        1011             2607             x2.58
+4        1166             4829             x4.14
+8        1242             10733            x8.64
+16       1184             20808            x17.57
+
+# loadavg at end: 18.72 14.50 15.71

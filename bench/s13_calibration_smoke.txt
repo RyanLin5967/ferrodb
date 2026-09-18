@@ -1,0 +1,44 @@
+S12: the curve to 10^6 branches. ONE catalog, forked cumulatively. 64 threads.
+Predictions were recorded before this run: artie-research/S12-PREDICTIONS.md
+
+         N   seg forks/sec   per-fork ms   fsyncs   f/fsync   cat MB   B/branch   peak RSS MB   reopen ms   live_count ms   read us   reap(0) us   reap(500) us
+      9984         4250.5        0.2353     1081       9.2      2.8      279.4          18.7      0.5525          0.628     19.75         13.6        12152.0
+
+seg forks/sec is for THAT SEGMENT only, so a knee shows as a drop between rows rather
+than being averaged away across the whole run.
+
+reap(0) and reap(500) are the SAME function at the SAME N, differing only in how many
+rows the answer contains. If BOTH are flat in N, the reaper's cost tracks the answer
+and not the catalog -- which is the claim. If reap(0) grows with N, the claim is false.
+If reap(500) ~= reap(0), the instrument cannot see answer size and proves nothing.
+
+=== WHAT THIS FILE IS, AND WHAT IT IS NOT ===
+
+It is a CORRECTNESS AND CALIBRATION check of the S13 arms, run at N=10,000 on a machine under
+LOAD AVERAGE 29 ON 18 CORES (four subagents compiling and benchmarking). **The timings here are
+NOT trustworthy and no claim rests on them.** The real measurement to 10^6 waits for a quiet
+machine; a number taken under contention cannot be told apart from a regression, which is a rule
+this project already has on record.
+
+WHAT IT DOES ESTABLISH, because correctness is not load-sensitive:
+
+  1. The fixture is right. 500 branches are seeded with a distinct short deadline; every other
+     branch takes LeaseDeadline(MAX). Both asserts pass at every N:
+        expired_before(SEED_D - 1) returns EXACTLY 0 rows
+        expired_before(SEED_D + 1) returns EXACTLY 500 rows
+     So the two arms differ ONLY in answer size, at the same N, through the same function.
+
+  2. ⭐ THE INSTRUMENT MOVES, AND BY A LOT. reap(0) = 13.6 us, reap(500) = 12,152 us -- a factor of
+     894. This is the calibration the standing rule demands: a detector that has never been forced
+     to fire proves nothing, and "the reaper is flat in N" would be a vacuous claim from an
+     instrument that cannot see anything. This one can.
+
+  3. THE PER-ROW COST IS ONE FULL HYDRATE. 12,152 / 500 = 24.3 us per returned row, against a
+     measured single read (get_raw, a descent plus hydrate) of 19.75 us on the same loaded machine.
+     They agree. `expired_before` is therefore ONE span scan plus ONE HYDRATE PER ANSWER ROW, and
+     hydrate range-scans the record's arena span -- which the reaper genuinely needs, because it
+     frees exactly `record.arenas`.
+
+     That is the shape the reaper is SUPPOSED to have (cost proportional to the ANSWER, not to the
+     catalog). What the real run must still settle is whether reap(0) stays flat as N grows to
+     10^6 -- if it grows, the "one descent" claim is false and that is a wall.
