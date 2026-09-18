@@ -232,6 +232,20 @@ fn the_binary_allocates_real_pages_above_the_arena_floor() {
 /// Reopening must reattach to the arena that is there, not start a new one beside it. A fresh arena
 /// on every open would silently orphan every branch page written before the restart, and the symptom
 /// would be data that reads correctly right up until it does not.
+///
+/// ⛔ THE FIXTURE GAINED AN INSERT. THE ASSERTION DID NOT CHANGE, AND THE TEST GOT STRONGER.
+///
+/// Since `SCALE-DESIGN.md` D6 option 2 a branch is durable at its FIRST WRITE, so a session that
+/// forks and writes nothing is deliberately absent after a restart and its id is deliberately
+/// re-minted. The branch counter is a PROXY for "the catalog was reopened rather than recreated",
+/// and against a never-writing session that proxy stopped meaning anything. The property it stands
+/// for was checked DIRECTLY before this fixture was touched, by hand against the CLI: with the
+/// insert below the second session gets `b_2`, and `ferro_branches` still lists branch 1 after the
+/// restart. Both of those are now asserted here rather than inferred from the counter.
+///
+/// The last two assertions are new and are the half the old shape could not express: a session
+/// that wrote NOTHING must be gone and its id free again. The old test would pass a catalog that
+/// fsynced every fork; the new assertions would fail one. Together they pin both directions.
 #[test]
 fn reopening_reattaches_to_the_existing_arena_and_branch_catalog() {
     let dir = tempfile::tempdir().unwrap();
@@ -240,7 +254,8 @@ fn reopening_reattaches_to_the_existing_arena_and_branch_catalog() {
     let first = ferrodb(
         &db,
         "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);\n\
-         BEGIN AGENT SESSION AS 'a' RUN 'r1';\n",
+         BEGIN AGENT SESSION AS 'a' RUN 'r1';\n\
+         INSERT INTO t VALUES (1, 42);\n",
     );
     assert_no_errors(&first, "the first session");
     assert!(first.contains("b_1"), "the first branch was not b_1:\n{first}");
@@ -251,6 +266,31 @@ fn reopening_reattaches_to_the_existing_arena_and_branch_catalog() {
         second.contains("b_2"),
         "after a restart the branch counter went back to the start, so the branch catalog was \
          recreated rather than reopened and b_1's pages are now unreachable:\n{second}"
+    );
+
+    // ...and the branch that wrote is still THERE, not merely counted past. A counter that
+    // advanced over a branch the catalog had lost would satisfy the assertion above and still be
+    // the orphaned-pages defect this test exists to catch.
+    let listed = ferrodb(&db, "SELECT branch_id, state FROM ferro_branches;\n");
+    assert_no_errors(&listed, "the branch listing");
+    assert!(
+        listed.contains("1 | Live"),
+        "the branch that wrote before the restart is not in the catalog afterwards:\n{listed}"
+    );
+
+    // The second session wrote nothing, so it is deliberately absent and its id is free again.
+    // This is the D6-option-2 contract at the product level: a speculative agent branch costs the
+    // disk nothing, and nothing is exactly what survives of it.
+    assert!(
+        !listed.contains("2 | Live"),
+        "a session that wrote NOTHING was made durable anyway, so a speculative fork is still \
+         paying for durability it does not need:\n{listed}"
+    );
+    let third = ferrodb(&db, "BEGIN AGENT SESSION AS 'c' RUN 'r3';\n");
+    assert_no_errors(&third, "the third session");
+    assert!(
+        third.contains("b_2"),
+        "the id slot of a session that never wrote was not recycled:\n{third}"
     );
 }
 
