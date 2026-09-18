@@ -208,8 +208,29 @@ gone" would also pass for burners that never started:
 | A — anti-vacuity | orphans at ppid=1 must EXIST after the kills | **8** |
 | B — the fix | none alive after their own deadline | **0** |
 
-⚠ **This is also a caution about the project rule that produced it.** "Oversubscribe 14x to force a
-guard that won't fire" is sound for an IN-PROCESS race window, which is what it was measured on. It
-is the instruction most likely to spawn exactly these orphans, and — per §4b — it does not even work
-for starving a process on this machine. Prefer SIGSTOP aimed at named pids; if external load really
-is needed, the burner must be self-terminating before anything else about it is considered.
+### A FOURTH defect, found by fixing the first three: never kill by recorded pid
+
+The first fix replaced `kill -9 "$!"` with `_kill_tree`, which walks `pgrep -P` from each **recorded
+wrapper pid**. Re-running it exited **137 — SIGKILL — having killed its own shell.**
+
+The cause is pid reuse. Spawning 504 burners, plus cargo, plus a `pgrep` fork per cleanup entry,
+churns through pids fast enough that **a pid recorded at spawn time can belong to an unrelated
+process by the time cleanup runs.** On a box shared with an agent fleet that is a `kill -9` aimed at
+somebody else's work, and the only reason it was noticed here is that it happened to hit this
+script's own shell rather than silently killing a neighbour.
+
+⇒ **Kill by a unique TAG in the command line, never by a recorded pid.** Each burner now carries
+`d42burn-$$` in its argv and cleanup is `pkill -9 -f "$BURN_TAG"`. A tag cannot be reused, so it can
+only ever match burners this run started. The recorded-pid arrays are gone from both harnesses.
+
+This is worth stating generally: **a recorded pid is a stale handle the moment the process exits,
+and every "clean up what I spawned" loop written against one is a latent kill of an innocent
+process.** It is the same class as the `ps -e` overriding `-p` trap — a cleanup that looks scoped
+and is not.
+
+⚠ **This is also a caution about the project rule that produced the whole incident.** "Oversubscribe
+14x to force a guard that won't fire" is sound for an IN-PROCESS race window, which is what it was
+measured on. It is the instruction most likely to spawn exactly these orphans, and — per §4b — it
+does not even work for starving a process on this machine. Prefer SIGSTOP aimed at named pids; if
+external load really is needed, the burner must be self-terminating before anything else about it is
+considered.

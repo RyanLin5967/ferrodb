@@ -38,16 +38,17 @@ SPIN_BOUND=${SPIN_BOUND:-900}
 TEST_BOUND=${TEST_BOUND:-900}
 LOCK=/tmp/ferrodb-suite.lock
 
-# Kill a wrapper AND everything under it. `kill -9 $timeout_pid` alone orphans the grandchild.
-_kill_tree() {
-    local p=$1 c
-    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
-    kill -9 "$p" 2>/dev/null
-}
+# ⛔ KILL BY TAG, NEVER BY RECORDED PID. A previous version recorded each `timeout` wrapper's pid
+# and killed those pids in cleanup. With 504 spawns plus cargo plus a `pgrep` fork per entry, this
+# box churns through pids fast enough that a RECORDED pid can be REUSED by an unrelated process
+# before cleanup runs — and on a machine shared with an agent fleet, that means `kill -9` aimed at
+# somebody else's work. It was observed killing this script's own shell (exit 137). Every burner
+# therefore carries a unique tag in its command line, and cleanup matches on that: a tag cannot be
+# reused, so it can only ever match burners this run started.
+BURN_TAG="d42burn-$$"
 
-spinners=()
 cleanup() {
-    for p in "${spinners[@]:-}"; do _kill_tree "$p"; done
+    pkill -9 -f "$BURN_TAG" 2>/dev/null
     [ "${held:-0}" = 1 ] && rm -rf "$LOCK"
     return 0
 }
@@ -94,12 +95,11 @@ echo "  loadavg before  : $(uptime | sed 's/.*load averages*: //')"
 # is bounded by construction. `timeout` and the trap are kept as belt-and-braces, and cleanup now
 # kills the wrapper's DESCENDANTS rather than just the wrapper. `disown` is gone.
 for _ in $(seq "$N"); do
-    timeout "$SPIN_BOUND" sh -c '
+    timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
         end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
         while [ "$(date +%s)" -lt "$end" ]; do
             i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
         done' >/dev/null 2>&1 &
-    spinners+=($!)
 done
 sleep 20
 echo "  loadavg loaded  : $(uptime | sed 's/.*load averages*: //')"

@@ -39,17 +39,17 @@ WINDOW=${WINDOW:-45}
 LOCK=/tmp/ferrodb-suite.lock
 IOTMP=$(mktemp -d)
 
-# Kill a wrapper AND everything under it. `kill -9 $timeout_pid` alone orphans the grandchild.
-_kill_tree() {
-    local p=$1 c
-    for c in $(pgrep -P "$p" 2>/dev/null); do _kill_tree "$c"; done
-    kill -9 "$p" 2>/dev/null
-}
+# ⛔ KILL BY TAG, NEVER BY RECORDED PID. A previous version recorded each `timeout` wrapper's pid
+# and killed those pids in cleanup. With 504 spawns plus cargo plus a `pgrep` fork per entry, this
+# box churns through pids fast enough that a RECORDED pid can be REUSED by an unrelated process
+# before cleanup runs — and on a machine shared with an agent fleet, that means `kill -9` aimed at
+# somebody else's work. It was observed killing this script's own shell (exit 137). Every burner
+# therefore carries a unique tag in its command line, and cleanup matches on that: a tag cannot be
+# reused, so it can only ever match burners this run started.
+BURN_TAG="d42burn-$$"
 
-load_pids=()
 stop_load() {
-    for p in "${load_pids[@]:-}"; do _kill_tree "$p"; done
-    load_pids=()
+    pkill -9 -f "$BURN_TAG" 2>/dev/null
     return 0
 }
 cleanup() {
@@ -80,12 +80,11 @@ trap cleanup EXIT INT TERM
 start_cpu() {
     local n=$1
     for _ in $(seq "$n"); do
-        timeout 300 sh -c '
+        timeout 300 sh -c ': '"$BURN_TAG"'
             end=$(( $(date +%s) + 300 ))
             while [ "$(date +%s)" -lt "$end" ]; do
                 i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
             done' >/dev/null 2>&1 &
-        load_pids+=($!)
     done
 }
 # Write-and-fsync in a tight loop. This is the half pure-CPU load does not have, and the half the
@@ -100,8 +99,7 @@ b=b'x'*65536
 end=time.time()+300          # self-terminating: an orphan of this stops on its own
 while time.time() < end:
     os.pwrite(f,b,0); os.fsync(f)
-" "$IOTMP/io$i" >/dev/null 2>&1 &
-        load_pids+=($!)
+" "$IOTMP/io$i" "$BURN_TAG" >/dev/null 2>&1 &
     done
 }
 
