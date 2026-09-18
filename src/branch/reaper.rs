@@ -2171,6 +2171,17 @@ mod tests {
             reaper.reap(parent.branch_id).unwrap();
             reaper.reap(child.branch_id).unwrap();
         }
+        // SLOW path that parks NOTHING — see
+        // `a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back`. Without this the
+        // residue check above is blind to the one arena the pending log cannot name, and a
+        // mutant that deleted `reap`'s seed survived this whole test.
+        for _ in 0..8 {
+            let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+            write_pages(&h, parent.branch_id, 4);
+            reaper.reap(parent.branch_id).unwrap();
+            reaper.reap(child.branch_id).unwrap();
+        }
         reaper.drain_pending().unwrap();
 
         let narrowed = h.store.reserved_page_count();
@@ -2185,6 +2196,51 @@ mod tests {
              a case, which is exactly what D40 says would falsify it"
         );
         assert_eq!(h.store.reserved_page_count(), narrowed, "the global scan moved the ledger");
+    }
+
+    #[test]
+    fn a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back() {
+        // **The case `reap`'s `own_arenas` seed exists for, and the one a fire-check found no
+        // test covered.** Deleting the seed survived every other D40 case here.
+        //
+        // The branch has a live child, so `reap` takes the slow path — but every one of its
+        // pages was born AFTER the child forked, so the interval rule finds none of them visible
+        // to the child and releases all of them immediately. Nothing is parked. So the
+        // pending-free log is EMPTY, `drain_pending` accumulates no `pf.arena_id` at all, and the
+        // only thing that can name the extent this reap just emptied is the caller that owned it.
+        // The old global scan found it by walking every live arena in the database.
+        let (h, reaper) = setup();
+        let baseline_live = h.store.live_page_count().unwrap();
+        let baseline_reserved = h.store.reserved_page_count();
+
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        // The child forks FIRST: every page below is born after its fork epoch and is therefore
+        // invisible to it. Reversing these two lines parks all four pages and tests nothing.
+        let child = h.catalog.fork(parent.branch_id, LeaseDeadline(0)).unwrap();
+        write_pages(&h, parent.branch_id, 4);
+        assert!(
+            h.catalog.has_live_children(parent.branch_id.id).unwrap(),
+            "fixture: without a live child this is the fast path, which frees extents wholesale"
+        );
+
+        let freed = reaper.reap(parent.branch_id).unwrap();
+        assert_eq!(freed, 4, "fixture: the slow path parked a page, so this is not the case");
+        assert_eq!(h.store.pending_len(), 0, "fixture: the pending log must be empty here");
+        assert_eq!(h.store.live_page_count().unwrap(), baseline_live);
+        assert_eq!(
+            h.store.reserved_page_count(),
+            baseline_reserved,
+            "the emptied extent is still reserved: the narrowed sweep was never told about it, \
+             and nothing else can name it"
+        );
+
+        reaper.reap(child.branch_id).unwrap();
+        assert_eq!(h.store.reserved_page_count(), baseline_reserved);
+        assert_eq!(
+            reaper.collect_orphaned_extents().unwrap(),
+            0,
+            "the global scan found an extent the narrowed sweep left behind"
+        );
     }
 
     #[test]
