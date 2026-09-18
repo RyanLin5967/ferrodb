@@ -1,0 +1,24 @@
+D31 reap cost. 50 branches per row, TableBranchCatalog on a real file.
+
+  pages/branch   extents/branch   reserved pages/branch   reaped   reap ms
+             1             1.00                   256.0       50    1678.6
+             7             1.00                   256.0       50    2166.9
+            64             1.00                   256.0       50    1726.1
+           500             2.00                   512.0       50    1615.3
+          2000             8.00                  2048.0       50    1382.9
+D31 reap cost. 50 branches per row, TableBranchCatalog on a real file.
+
+  pages/branch   extents/branch   reserved pages/branch   reaped   reap ms
+             1             1.00                   256.0       50    1169.8
+             7             1.00                   256.0       50    1102.2
+            64             1.00                   256.0       50    1211.2
+           500             2.00                   512.0       50    1326.6
+          2000             8.00                  2048.0       50    1405.7
+D31 reap cost. 50 branches per row, TableBranchCatalog on a real file.
+
+  pages/branch   extents/branch   reserved pages/branch   reaped   reap ms
+             1             1.00                   256.0       50    1284.6
+             7             1.00                   256.0       50    1409.1
+            64             1.00                   256.0       50    1289.8
+           500             2.00                   512.0       50    1369.9
+          2000             8.00                  2048.0       50    1547.8

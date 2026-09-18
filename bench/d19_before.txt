@@ -1,0 +1,10 @@
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D13b-depth-rollover)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.63s
+     Running tests/d19_leak_is_a_race.rs (target/debug/deps/d19_leak_is_a_race-118ee95556f7c6d4)
+
+running 1 test
+test the_control_that_says_race_or_logic has been running for over 60 seconds
+[table-1t] threads=1 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+[table-8t] threads=8 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+[log-8t] threads=8 total=1000 reaped=1000 baseline=0 after=0 LEAK=0
+timeout 540 cargo test --test d19_leak_is_a_race -- --nocapture  5.51s user 2.49s system 1% cpu 9:00.02 total
