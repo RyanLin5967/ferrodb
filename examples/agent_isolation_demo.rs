@@ -353,12 +353,13 @@ fn criterion_8_lease_reaping(led: &mut Ledger) {
             .catalog
             .fork(BranchId::TRUNK, LeaseDeadline::from_now(LEASE_MS))
             .expect("fork agent branch");
-        let arena = env.store.arena_for(rec.branch_id).expect("arena");
         let epoch = env.catalog.next_epoch();
         for i in 0..PAGES_EACH {
+            // `alloc_for`, not a captured `ArenaId`: a branch's first extent is one page (D31),
+            // so filling one arena refuses on the second write. Every real writer asks per page.
             let p = env
                 .store
-                .alloc_in_arena(arena, PageType::BTreeLeaf, epoch)
+                .alloc_for(rec.branch_id, PageType::BTreeLeaf, epoch)
                 .expect("alloc");
             let handle = env.store.read_page(p).expect("read back");
             let mut frame = handle.write();

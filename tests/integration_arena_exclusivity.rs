@@ -48,9 +48,8 @@ fn the_legacy_allocator_never_hands_out_a_page_inside_an_arena_extent() {
 
     // A branch takes an extent and writes pages into it.
     let epoch = catalog.next_epoch();
-    let arena = store.arena_for(BranchId::TRUNK).unwrap();
     let arena_pages: Vec<u32> = (0..64)
-        .map(|_| store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap())
+        .map(|_| store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, epoch).unwrap())
         .collect();
 
     // The ordinary heap/index path allocates, as any non-agent statement would.

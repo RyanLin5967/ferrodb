@@ -49,14 +49,17 @@ fn fixture() -> Fixture {
     Fixture { h, reaper, runtime }
 }
 
-/// Allocate `pages` real pages inside `branch`'s own extent and stamp each one, the way any real
+/// Allocate `pages` real pages inside `branch`'s own extents and stamp each one, the way any real
 /// writer must. Lifted from `branch/reaper.rs`'s own helper rather than reinvented.
+///
+/// **D31 — `alloc_for`, not a captured `ArenaId`.** Same change as the reaper's copy, for the same
+/// reason: a branch's first extent is one page now, so filling a captured arena refuses on the
+/// second allocation.
 fn write_pages(f: &Fixture, branch: BranchId, pages: usize) -> Vec<PageId> {
-    let arena = f.h.store.arena_for(branch).unwrap();
     let epoch = f.h.catalog.next_epoch();
     (0..pages)
         .map(|i| {
-            let p = f.h.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch).unwrap();
+            let p = f.h.store.alloc_for(branch, PageType::BTreeLeaf, epoch).unwrap();
             let handle = f.h.store.read_page(p).unwrap();
             let mut frame = handle.write();
             frame.data[PAGE_HEADER_SIZE] = (i & 0xff) as u8;

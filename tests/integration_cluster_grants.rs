@@ -24,7 +24,7 @@ use std::sync::Arc;
 use ferrodb::branch::arena::ArenaPageStore;
 use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::reaper::TwoTierReaper;
-use ferrodb::branch::types::{BranchId, LeaseDeadline, ARENA_EXTENT_PAGES};
+use ferrodb::branch::types::{BranchId, LeaseDeadline, ARENA_EXTENT_PAGES, ARENA_FIRST_EXTENT_PAGES};
 use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cluster::{self, Applied, ClusterScope, GrantError};
@@ -108,17 +108,18 @@ fn a_node_with_no_cluster_configured_grants_itself_everything() {
         Some(ARENA_BASE),
         "the first extent no longer starts at the region base"
     );
+    // D31: one claim consumes the FIRST extent's worth, not the cap's. `fetch_add` would have
+    // left exactly this, which is what the assertion has always meant.
     assert_eq!(
         s.store.extent_watermark(),
-        ARENA_BASE + ARENA_EXTENT_PAGES,
+        ARENA_BASE + ARENA_FIRST_EXTENT_PAGES,
         "the watermark a checkpoint carries is not what fetch_add would have left"
     );
 
     // And it keeps working, extent after extent, with no grant anywhere in sight.
     let epoch = s.catalog.next_epoch();
     for _ in 0..(ARENA_EXTENT_PAGES + 8) {
-        let a = s.store.arena_for(BranchId::TRUNK).unwrap();
-        s.store.alloc_in_arena(a, PageType::BTreeLeaf, epoch).unwrap();
+        s.store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, epoch).unwrap();
     }
 }
 
@@ -231,9 +232,12 @@ fn a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out() {
     let s = store("member_granted");
     let _scope = ClusterScope::joined(N1);
 
-    // Two extents' worth, and nothing more.
-    s.store.apply_arena_grant(N1, 4096, 2 * ARENA_EXTENT_PAGES).unwrap();
-    assert_eq!(s.store.grantable_extents(), 2);
+    // **Exactly two first-extents' worth, and nothing more.** This granted `2 *
+    // ARENA_EXTENT_PAGES` because that was two claims; since D31 two claims by two fresh branches
+    // take two pages, so a 512-page grant would leave 510 spare and the refusal below — the whole
+    // point of the case — would never fire. Sized in claims, which is what it always meant.
+    s.store.apply_arena_grant(N1, 4096, 2 * ARENA_FIRST_EXTENT_PAGES).unwrap();
+    assert_eq!(s.store.grantable_pages(), 2 * ARENA_FIRST_EXTENT_PAGES as u64);
 
     let a1 = s.store.arena_for(BranchId::TRUNK).unwrap();
     let b = s.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX / 2)).unwrap();
@@ -242,9 +246,9 @@ fn a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out() {
     let (s1, _) = s.store.extent_range(a1).unwrap();
     let (s2, _) = s.store.extent_range(a2).unwrap();
     assert_eq!(s1, 4096, "the first claim ignored the grant");
-    assert_eq!(s2, 4096 + ARENA_EXTENT_PAGES, "the second claim ignored the grant");
+    assert_eq!(s2, 4096 + ARENA_FIRST_EXTENT_PAGES, "the second claim ignored the grant");
     assert_ne!(a1, a2, "two live extents share one arena id");
-    assert_eq!(s.store.grantable_extents(), 0);
+    assert_eq!(s.store.grantable_pages(), 0);
 
     // A third branch has nothing left to claim, and is refused rather than served from a local
     // counter that would run straight into whatever the leader gave node 2.
@@ -298,9 +302,12 @@ fn a_redelivered_grant_does_not_hand_out_the_same_extent_twice() {
 
     // A committed round may be delivered more than once — `WalBatch` is idempotent for exactly
     // this reason — so applying one twice must be a no-op, not a second range.
+    // One claim's worth exactly — see the sizing note in
+    // `a_member_allocates_from_its_grant_and_refuses_again_when_it_runs_out`. A cap-sized grant
+    // would leave 255 pages spare and the refusal below would pass for the wrong reason.
     assert_eq!(
-        s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap(),
-        Applied::Accepted { usable: ARENA_EXTENT_PAGES as u64 }
+        s.store.apply_arena_grant(N1, 4096, ARENA_FIRST_EXTENT_PAGES).unwrap(),
+        Applied::Accepted { usable: ARENA_FIRST_EXTENT_PAGES as u64 }
     );
     let a1 = s.store.arena_for(BranchId::TRUNK).unwrap();
     // **Asserted on the outcome, not only on the consequence.** The mutation sweep showed that
@@ -309,7 +316,7 @@ fn a_redelivered_grant_does_not_hand_out_the_same_extent_twice() {
     // "no second extent" was pinning a rule it could not detect. The two are defence in depth and
     // this asserts the one the check itself owns.
     assert_eq!(
-        s.store.apply_arena_grant(N1, 4096, ARENA_EXTENT_PAGES).unwrap(),
+        s.store.apply_arena_grant(N1, 4096, ARENA_FIRST_EXTENT_PAGES).unwrap(),
         Applied::Duplicate,
         "a re-delivered grant was not recognised as already applied"
     );
@@ -531,7 +538,8 @@ fn a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued() 
         parent = s.catalog.fork(parent, LeaseDeadline(u64::MAX / 2)).unwrap().branch_id;
     }
     let watermark = s.store.extent_watermark();
-    assert_eq!(watermark, 4096 + 3 * ARENA_EXTENT_PAGES);
+    // Three claims by three fresh branches, so three FIRST extents (D31).
+    assert_eq!(watermark, 4096 + 3 * ARENA_FIRST_EXTENT_PAGES);
     s.store.checkpoint(&path).unwrap();
 
     // Restart. The image restores the watermark; the grant itself comes back by replaying the log.
@@ -561,7 +569,13 @@ fn a_restart_replays_its_grant_and_resumes_above_every_page_it_already_issued() 
 
     // Replay the same entry. Only its unconsumed suffix may be issued.
     reopened.apply_arena_grant(N1, 4096, 8 * ARENA_EXTENT_PAGES).unwrap();
-    assert_eq!(reopened.grantable_extents(), 5, "the replay re-offered pages already handed out");
+    // In PAGES, which is exact. `grantable_extents()` floor-divides by the cap, so it could only
+    // ever say "about five" and now cannot distinguish 2045 remaining from 1792.
+    assert_eq!(
+        reopened.grantable_pages(),
+        (8 * ARENA_EXTENT_PAGES - 3 * ARENA_FIRST_EXTENT_PAGES) as u64,
+        "the replay re-offered pages already handed out"
+    );
     let a = reopened.arena_for(BranchId::TRUNK).unwrap();
     assert_eq!(
         reopened.extent_range(a).map(|r| r.0),
@@ -607,9 +621,15 @@ fn the_checkpoint_image_is_byte_identical_to_what_a_node_local_counter_wrote() {
     let bytes = s.store.state_bytes();
 
     let u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
-    assert_eq!(bytes[0], 2, "the state version changed; every <db>.arena on disk is now unreadable");
+    // **The version moved 2 -> 3 (D31), and the old claim is kept as an OUTCOME instead.** The
+    // consequence this line names — "every <db>.arena on disk is now unreadable" — is the thing
+    // that must not happen, and a version number is only a proxy for it. `load_state` accepts both
+    // versions, and `a_v2_checkpoint_image_still_loads_after_the_v3_bump` in `branch::arena`
+    // asserts a real v2 image round-trips. Renumbering here without that test would be exactly the
+    // move this assertion exists to prevent.
+    assert_eq!(bytes[0], 3, "the state version changed unexpectedly");
     assert_eq!(u32_at(1), ARENA_BASE, "base_page moved");
-    assert_eq!(u32_at(5), ARENA_BASE + ARENA_EXTENT_PAGES, "next_extent_start slot is not the watermark");
+    assert_eq!(u32_at(5), ARENA_BASE + ARENA_FIRST_EXTENT_PAGES, "next_extent_start slot is not the watermark");
     assert_eq!(u32_at(9), 2, "next_arena_id slot is not the watermark");
 
     // A store that has self-granted far past what it issued writes the same header as one that has
@@ -744,7 +764,11 @@ fn an_authority_change_is_noticed_by_the_counters_and_not_merely_survived() {
     // The standalone self-grant took four extents (`SELF_GRANT_EXTENTS`) from the region base and
     // issued one, so it left the watermark at 1280 and the accepted high-water at 2048.
     let watermark = s.store.extent_watermark();
-    assert_eq!(watermark, ARENA_BASE + ARENA_EXTENT_PAGES, "fixture: the standalone era changed");
+    assert_eq!(
+        watermark,
+        ARENA_BASE + ARENA_FIRST_EXTENT_PAGES,
+        "fixture: the standalone era changed"
+    );
 
     let _scope = ClusterScope::joined(N1);
     // **The grant must straddle the old high-water**, or nothing is being tested: a range above
@@ -829,14 +853,34 @@ fn a_granted_extent_is_filled_without_any_further_consensus() {
     let s = store("fill_granted");
     let _scope = ClusterScope::joined(N1);
     s.store.apply_arena_grant(N1, 40_000, ARENA_EXTENT_PAGES).unwrap();
-    let a = s.store.arena_for(BranchId::TRUNK).unwrap();
     let epoch = s.catalog.next_epoch();
-    for _ in 0..64 {
+
+    // **Climb to a big extent first (D31).** This used to take one extent and put 64 pages in it,
+    // which worked because the first extent was already 256 pages. It is now one page, so the old
+    // form refused on the second allocation — and filling a ONE-page extent would test nothing.
+    // The claims below are grant-consuming by design; the pages inside them are not, and that is
+    // the distinction the case exists to pin.
+    for _ in 0..200 {
+        s.store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, epoch).unwrap();
+    }
+    let a = s.store.arena_for(BranchId::TRUNK).unwrap();
+    let (_, pages) = s.store.extent_range(a).unwrap();
+    let room = pages - s.store.allocated_pages(a).len() as u32;
+    assert!(room > 1, "fixture: no room left in this extent, so filling it tests nothing");
+
+    // Now fill inside it. Not one page of this is a cluster decision.
+    let before = s.store.grantable_pages();
+    for _ in 0..(room - 1) {
         s.store.alloc_in_arena(a, PageType::BTreeLeaf, epoch).unwrap();
     }
+    assert_eq!(
+        s.store.grantable_pages(),
+        before,
+        "filling an extent consumed grant; only the CLAIM may be a cluster decision"
+    );
     // And the fast path keeps returning it, with no grant consumed.
     assert_eq!(s.store.arena_for(BranchId::TRUNK).unwrap(), a);
-    assert_eq!(s.store.grantable_extents(), 0, "filling an extent consumed another grant");
+    assert_eq!(s.store.grantable_pages(), before, "the fast path consumed another grant");
 }
 
 // =================================================================================================
