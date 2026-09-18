@@ -1,3 +1,23 @@
+# ============================================================================================
+# ⚠ MEASURED ON THE CAPPED HARNESS. THE ORDERING STANDS; THE CEILING AND THE BAR DO NOT.
+#
+# Taken before ec0c53c, when examples/bufpool_fault_concurrency.rs incremented ONE shared
+# Arc<AtomicUsize> per fetch INSIDE its timed window -- ~9.6M contended RMWs on a single cache
+# line per 16-thread point, which is the same construct the buffer pool is being measured for.
+#
+# WHAT SURVIVES: every arm carried that counter, including the control, so it cancels in
+# comparisons. The ORDERING of the cells here is unaffected and still citable.
+#
+# WHAT DOES NOT: any statement about a CEILING. bench/d44_harness_counter.txt measures the same
+# ceiling arm at x0.740 on this harness and x2.630 on the fixed one -- 43.7 M/s against 152.1 M/s
+# at 16 threads. So "x0.579"/"x0.805 is the available headroom" and the x0.5 bar set against it
+# were both drawn against a number the instrument was capping, not the design's limit.
+#
+# SUPERSEDED for absolute figures by the re-run on the fixed harness.
+#
+# Everything below this line is the original artifact, unedited.
+# ============================================================================================
+
 # D35 C1 factorial: {page-table mirror} x {arc_cache touch}, RESIDENT arm
 # generated 2026-09-18T09:27:11-04:00
 # host: 18 cores, load average at start: 17.01 16.13 15.34
