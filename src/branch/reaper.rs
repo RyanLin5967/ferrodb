@@ -435,7 +435,22 @@ impl Reaper for TwoTierReaper {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //! **D19 — every case below runs against BOTH catalogs.**
+    //!
+    //! `Harness::new()` used to hardcode `LogBranchCatalog`, which keeps `live_children` inside
+    //! the record and therefore **structurally cannot exhibit D18** (live data loss on the shipped
+    //! `TableBranchCatalog`). The whole suite stayed green straight through that bug. A test that
+    //! only exercises the safe implementation says nothing about the one that ships.
+    //!
+    //! So the suite is instantiated once per catalog rather than duplicated: one `cargo test` now
+    //! runs each case twice, and a divergence between the two implementations fails the build
+    //! instead of waiting for someone to write a bespoke probe for it.
+
+    macro_rules! reaper_suite {
+        ($modname:ident, $table:expr) => {
+            mod $modname {
+
+    use super::super::*;
     use crate::branch::arena::harness::Harness;
     use crate::branch::types::{ArenaId, LeaseDeadline, ARENA_EXTENT_PAGES};
     use crate::cow::stamp_checksum;
@@ -448,7 +463,7 @@ mod tests {
     }
 
     fn setup() -> (Harness, TwoTierReaper) {
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let r = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store));
         (h, r)
     }
@@ -785,7 +800,9 @@ mod tests {
         assert_eq!(h.store.live_page_count().unwrap(), baseline, "the whole chain came back");
         assert_eq!(h.store.reserved_page_count(), 0);
         assert_eq!(h.store.pending_len(), 0);
-        assert_eq!(h.catalog.get(BranchId::TRUNK).unwrap().live_children, Vec::new());
+        // D19: asked of the CATALOG. Reading `live_children` off the record made this pass
+        // VACUOUSLY on the table catalog, which leaves that field empty by contract.
+        assert!(!h.catalog.has_live_children(BranchId::TRUNK.id).unwrap());
     }
 
     /// D1: fork and abandon 1000 branches from 8 threads at once.
@@ -865,14 +882,37 @@ mod tests {
         // is that `add_live_child` sorted-inserts rather than pushes. `live_children_stay_sorted`
         // already pins that insert, so this is not the only guard on it; what this one adds is the
         // concurrent ARRIVAL ORDER, which no single-threaded test can produce.
-        let trunk_children = h.catalog.get(BranchId::TRUNK).unwrap().live_children;
-        let mut sorted = trunk_children.clone();
-        sorted.sort();
+        // **D19.** Two assertions, because the two catalogs answer "who are my live children"
+        // through different structures and only one of them has an array to be out of order.
+        //
+        // (a) Catalog-level, asserted on BOTH: the newest live child trunk reports must be the
+        //     newest epoch actually forked. This is the ordering property that MATTERS -- it is
+        //     what the reclamation rule reads -- and it is meaningful whether the answer comes
+        //     from a sorted array or from key order in an index.
+        let newest_forked = all.iter().map(|(_, e)| e.0).max().expect("forks happened");
         assert_eq!(
-            trunk_children, sorted,
-            "live_children is out of order, so reclaimable()'s partition_point is undefined and \
-             can report a page reclaimable while a live child still sees it"
+            h.catalog.max_live_child(BranchId::TRUNK.id).unwrap(),
+            Some(Epoch(newest_forked)),
+            "trunk's newest live child disagrees with the newest epoch actually handed out, so \
+             the reclamation rule is reading a different child set than the one that exists"
         );
+
+        // (b) Representation-specific, LOG CATALOG ONLY. `reclaimable` binary-searches the array
+        //     with `partition_point`, which is only defined on a SORTED slice. `fork` allocates
+        //     the epoch BEFORE taking the write lock, so under contention children genuinely do
+        //     arrive out of epoch order; what saves it is that `add_live_child` sorted-inserts.
+        //     The table catalog has no such array -- ordering is inherent in big-endian key order
+        //     -- so running this against it asserted nothing at all and passed vacuously.
+        if !$table {
+            let trunk_children = h.catalog.get(BranchId::TRUNK).unwrap().live_children;
+            let mut sorted = trunk_children.clone();
+            sorted.sort();
+            assert_eq!(
+                trunk_children, sorted,
+                "live_children is out of order, so reclaimable()'s partition_point is undefined \
+                 and can report a page reclaimable while a live child still sees it"
+            );
+        }
 
         let reaped = reaper.reap_expired(far_future()).expect("reap with no cooperation");
         assert_eq!(reaped.len(), THREADS * PER_THREAD, "not every abandoned branch was reaped");
@@ -913,7 +953,7 @@ mod tests {
         // The thesis test with a process restart in the middle. If the free-space map were
         // rebuilt by guesswork rather than checkpointed, the reaper would come back believing
         // every extent was untouched and reclaim nothing.
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let baseline = h.store.live_page_count().unwrap();
 
         const N: usize = 12;
@@ -1084,7 +1124,7 @@ mod tests {
 
     #[test]
     fn collapse_materialises_the_whole_reachable_tree_and_reparents_to_trunk() {
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
 
@@ -1128,20 +1168,28 @@ mod tests {
             live_before + 3,
             "every reachable page was copied"
         );
+        // D19: asked of the CATALOG -- the record's `live_children` is empty by contract on
+        // the table catalog, so the original form passed vacuously there.
         assert!(
             !h.catalog
-                .get_raw(old_parent.id)
-                .unwrap()
-                .live_children
-                .contains(&deep.fork_epoch),
+                .live_child_in_epoch_range(
+                    old_parent.id,
+                    deep.fork_epoch,
+                    Epoch(deep.fork_epoch.0 + 1)
+                )
+                .unwrap(),
             "the old parent no longer pins anything for this branch"
         );
+        // D19: asked of the CATALOG. This one FAILED on the table catalog rather than passing
+        // vacuously, because it asserts PRESENCE in a field that catalog never populates.
         assert!(h
             .catalog
-            .get(BranchId::TRUNK)
-            .unwrap()
-            .live_children
-            .contains(&collapsed.fork_epoch));
+            .live_child_in_epoch_range(
+                BranchId::TRUNK.id,
+                collapsed.fork_epoch,
+                Epoch(collapsed.fork_epoch.0 + 1)
+            )
+            .unwrap());
 
         // The copy is a real copy: same payload, new ids, all in the branch's own arena.
         let new_root_handle = h.store.read_page(collapsed.root_page_id).unwrap();
@@ -1168,7 +1216,7 @@ mod tests {
     /// chain which has hit the ceiling can carry on working.
     #[test]
     fn a_chain_at_max_depth_can_only_fork_again_after_collapsing() {
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
 
@@ -1219,7 +1267,7 @@ mod tests {
     /// purpose: reap the entire ancestor chain afterwards and read the data back.
     #[test]
     fn after_collapse_the_ancestor_chain_can_be_reaped_and_the_data_survives() {
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
 
@@ -1283,7 +1331,7 @@ mod tests {
 
     #[test]
     fn collapse_refuses_a_cyclic_page_graph() {
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
@@ -1327,6 +1375,9 @@ mod tests {
                 self.inner.fork(p, l)
             }
             fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> { self.inner.get(b) }
+            fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
+                self.inner.add_arena(b, a)
+            }
             fn put(&self, r: &BranchRecord) -> Result<(), FerroError> {
                 if r.state == BranchState::Reaped {
                     self.log.lock().unwrap().push("mark_reaped");
@@ -1377,7 +1428,7 @@ mod tests {
             }
         }
 
-        let h = Harness::new();
+        let h = Harness::new_with($table);
         let child = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
         let rec = Arc::new(Recording {
             inner: Arc::clone(&h.catalog),
@@ -1401,4 +1452,11 @@ mod tests {
              pages are freed underneath a branch that can still read them."
         );
     }
+
+            }
+        };
+    }
+
+    reaper_suite!(log_catalog, false);
+    reaper_suite!(table_catalog, true);
 }

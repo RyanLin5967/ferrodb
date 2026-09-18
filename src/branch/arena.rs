@@ -1144,12 +1144,15 @@ impl PageStore for ArenaPageStore {
         self.reserved_pages.fetch_add(self.space.extent_pages, Ordering::SeqCst);
 
         // Keep the durable record truthful: the reaper frees exactly `record.arenas`.
-        if let Ok(mut rec) = self.catalog.get_raw(branch.id) {
-            if !rec.arenas.contains(&arena) {
-                rec.arenas.push(arena);
-                self.catalog.put(&rec)?;
-            }
-        }
+        //
+        // **D20 — ONE ATOMIC CATALOG OPERATION.** This was a read-modify-write across two
+        // different critical sections: `get_raw` took NO lock, `put` took `logical`. With no latch
+        // protocol under the B+tree, the unlocked read could descend through a node another thread
+        // was splitting, return a record with the wrong arena list, and have that list written
+        // back as truth -- after which the reaper freed exactly `record.arenas` and the arenas it
+        // could no longer see leaked. Measured before the fix: 0 leaked at 1 thread, 24 at 8,
+        // 0 on the log catalog (`bench/d20_race_control.txt`).
+        self.catalog.add_arena(branch, arena)?;
 
         // Persist the map now that the region has grown. This is the write that makes
         // `next_extent_start` durable: without it a crashed session's freshly claimed extent is
@@ -1252,6 +1255,7 @@ impl PageStore for ArenaPageStore {
 pub(crate) mod harness {
     use super::*;
     use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::table_catalog::TableBranchCatalog;
         use crate::storage::disk_manager::DiskManager;
     use std::fs::OpenOptions;
     use std::sync::atomic::AtomicU64;
@@ -1266,7 +1270,24 @@ pub(crate) mod harness {
     }
 
     impl Harness {
+        /// The LOG catalog. Kept as the default so existing callers are unchanged, but see
+        /// [`Harness::new_with`]: it is **not** the catalog that ships.
         pub fn new() -> Harness {
+            Harness::new_with(false)
+        }
+
+        /// **D19.** `table = true` builds the catalog that actually ships.
+        ///
+        /// Every reclamation test in this project used to run against `LogBranchCatalog`, which
+        /// keeps `live_children` inside the record and therefore **structurally cannot exhibit
+        /// D18** -- live data loss on `TableBranchCatalog`, through which the whole suite stayed
+        /// green. A test that only exercises the safe implementation proves nothing about the
+        /// shipped one.
+        ///
+        /// The log catalog is deliberately KEPT rather than deleted: it is an independent
+        /// reference oracle, and it is what let D16 be proved to be the DESIGN rather than this
+        /// implementation. Two implementations are the instrument, not the problem.
+        pub fn new_with(table: bool) -> Harness {
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
             let path = std::env::temp_dir()
                 .join(format!("ferro-arena-{}-{}.db", std::process::id(), n));
@@ -1279,12 +1300,19 @@ pub(crate) mod harness {
                 .unwrap();
             let dm = Arc::new(DiskManager::new(file).unwrap());
             let pool = Arc::new(BufferPoolManager::new(dm));
-            let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+            let catalog: Arc<dyn BranchCatalog> = if table {
+                let cat_path = std::env::temp_dir()
+                    .join(format!("ferro-arena-{}-{}.cat", std::process::id(), n));
+                let _ = std::fs::remove_file(&cat_path);
+                Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).unwrap())
+            } else {
+                Arc::new(LogBranchCatalog::in_memory(1))
+            };
             let base = pool.disk_manager.high_water().unwrap();
             let store = Arc::new(
                 ArenaPageStore::new(
                     Arc::clone(&pool),
-                    Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+                    Arc::clone(&catalog),
                     base,
                 )
                 .unwrap(),

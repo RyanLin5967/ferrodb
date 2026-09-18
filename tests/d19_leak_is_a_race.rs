@@ -63,6 +63,14 @@ fn the_control_that_says_race_or_logic() {
     let t1  = leak_for(1, 1000, true,  "table-1t");
     let t8  = leak_for(8,  125, true,  "table-8t");
     let l8  = leak_for(8,  125, false, "log-8t");
-    println!("TABLE 1-thread leak={t1}  TABLE 8-thread leak={t8}  LOG 8-thread leak={l8}");
-    assert_eq!(t1, 0, "single-threaded leak on the table catalog would mean a LOGIC bug, not a race");
+    // Higher contention than the arm the defect was found at. A race that merely becomes LESS
+    // LIKELY under the fix would still show here; that is the whole point of testing upward.
+    let t16 = leak_for(16, 125, true,  "table-16t");
+    let t32 = leak_for(32,  63, true,  "table-32t");
+    println!("TABLE 1t={t1} 8t={t8} 16t={t16} 32t={t32}  LOG 8t={l8}");
+    assert_eq!(t1, 0, "single-threaded leak would mean a LOGIC bug, not a race");
+    assert_eq!(l8, 0, "the log catalog is the control and must stay clean");
+    assert_eq!(t8, 0, "D20: the table catalog must not leak under concurrency");
+    assert_eq!(t16, 0, "D20: still clean at 2x the contention it was found at");
+    assert_eq!(t32, 0, "D20: still clean at 4x the contention it was found at");
 }
