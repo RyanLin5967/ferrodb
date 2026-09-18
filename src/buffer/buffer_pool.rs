@@ -119,21 +119,38 @@
 //! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
 //! five, which is why removing it bought 33% and nothing else.
 //!
-//! The candidate that measures as a shape change is therefore **taking the page table off the hit
-//! path** -- resolving `page_id -> frame` through a lock-free direct-mapped mirror in both
-//! `fetch_page` and `unpin_page`, keeping the frame latch and the pin, so it is correct rather
-//! than a ceiling: **x0.936 across the same sweep, the curve rising monotonically from 2 to 16
-//! threads, ~15x against BASE at 16 threads.** Quote the SLOPE and not that multiplier to more
-//! than two significant figures: the medians are over 3 reps with a BASE spread of 18.1M-23.6M at
-//! one thread under loadavg 16-33. What reproduces in every rep is the sign of the slope.
+//! # D35 C1, which is what this file now does
+//!
+//! **The page table is off the hit path.** `page_id -> frame` resolves through a lock-free,
+//! direct-mapped, tagged mirror in both `fetch_page` and `unpin_page` — see
+//! [`crate::buffer::page_table`] — and the map is consulted only when the mirror misses. The frame
+//! latch and the pin are KEPT, so this is correct and not a ceiling: the mirror produces the same
+//! *candidate* the map produced, and every caller still re-checks `frame.page_id` under the
+//! frame's own latch before using it. `touch` is KEPT as well; the stub that deleted it was a
+//! measurement scaffold and deleting it degrades ARC's recency for a constant-factor win.
+//!
+//! Measured on this implementation, RESIDENT arm, `bench/d35_c1_pagetable.txt`. Quote the SLOPE
+//! and not a multiplier to more than two significant figures: D35's medians are over 3 reps with a
+//! BASE spread of 18.1M-23.6M at one thread under loadavg 16-33, and the two reps of
+//! `s22_bufpool_before_after.txt` disagree 40% on multipliers under fleet load. **What reproduces
+//! is the sign of the slope**, and it changes sign: BEFORE, throughput at 16 threads is a fraction
+//! of throughput at 1; AFTER, the curve rises monotonically with the thread count.
 //!
 //! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
-//! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror sized for a
-//! benchmark.
+//! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror indexed
+//! directly by page id, which is O(max page id) and therefore a 32 GiB allocation in the limit.
+//! Only `bench/d35_gate_stubtouch.txt` from that branch is citable. This implementation is built
+//! on the current tip, retains `touch`, and tags its mirror slots so the table is a fixed size.
+//!
+//! **Still not fixed, and now the next candidate.** `touch` is back on the hit path, so the
+//! `arc_cache` mutex is once more a synchronisation point on every resident fetch — the one the
+//! STUB arm showed is worth about 47% at one thread and 33% at sixteen. It was not the binding
+//! constraint while the page table was; whether it has become one is a question for a fresh
+//! measurement against this file, not an assumption. BP-Wrapper is where that would go.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
@@ -142,6 +159,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
+use crate::buffer::page_table::PageTable;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
 
 pub struct Frame {
@@ -171,7 +189,10 @@ enum Evicted {
 
 pub struct BufferPoolManager {
     pub frames: Vec<RwLock<Frame>>,
-    pub page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
+    /// `page_id -> frame index`. A `HashMap` under an `RwLock`, **plus a lock-free mirror in front
+    /// of it** that the resident hit path resolves through instead. See
+    /// [`crate::buffer::page_table`] for why, and for why the map is private to that type.
+    pub page_table: PageTable,
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
     pub wal: OnceLock<Arc<WalManager>>,
@@ -217,6 +238,15 @@ pub struct BufferPoolManager {
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
 
+/// How many slots the page table's lock-free mirror gets, as a multiple of the frame count.
+///
+/// At most `MAX_BUFFER_POOL_PAGES` pages can be resident at once, so this is the load factor of a
+/// direct-mapped cache: eight slots per possible resident page. A collision costs one page its
+/// fast path and never returns a wrong answer (see [`crate::buffer::page_table`]), so this trades
+/// 64 KiB of memory against how often the hit path falls back to the map — it is a throughput
+/// knob, not a correctness one.
+const MIRROR_SLOTS_PER_FRAME: usize = 8;
+
 /// How many times `fetch_page` will re-verify before giving up.
 ///
 /// Every retry in `fetch_page` follows a *verified* change of state — a frame relabelled under its
@@ -261,7 +291,7 @@ impl BufferPoolManager {
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
         BufferPoolManager {
             frames,
-            page_table: RwLock::new(HashMap::new()),
+            page_table: PageTable::new(MAX_BUFFER_POOL_PAGES * MIRROR_SLOTS_PER_FRAME),
             disk_manager,
             arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)),
             wal: OnceLock::new(),
@@ -358,6 +388,15 @@ impl BufferPoolManager {
     /// own lock makes the pin and the check one step against the evictor, which takes the same
     /// frame's write lock to relabel it. One of the two wins; the loser sees a label it did not
     /// expect and retries.
+    ///
+    /// **D35: the lookup comes from the lock-free mirror first**, and the map only if that misses.
+    /// The re-check below is untouched and is what makes that sound — the mirror produces the same
+    /// *candidate* by a cheaper route, and a candidate is all this method has ever had. A mirror
+    /// entry that has gone stale is rejected here exactly like a stale map entry was.
+    ///
+    /// The fallback to the map is not optional. A mirror miss means "a collision took the slot",
+    /// never "not resident": returning `None` on it would send a resident page down the fault path,
+    /// where `fetch_page`'s re-check under the transit lock finds it resident and loops.
     fn try_pin_resident(&self, page_id: u32) -> Option<usize> {
         // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
         // only from `fetch_page`, which already opens a section -- the marker is here anyway
@@ -365,7 +404,27 @@ impl BufferPoolManager {
         // depends on the CALLER having opened it stops holding the moment someone adds a caller.
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
+
+        // The hit path: one Acquire load, no lock. This is the whole of D35's C1 on this side.
+        if let Some(frame_i) = self.page_table.lookup(page_id) {
+            if let Some(i) = self.pin_if_labelled(frame_i, page_id) {
+                return Some(i);
+            }
+            // The mirror named a frame the page has since left. The MAP may still hold a current,
+            // different entry for it, so fall through rather than reporting a miss -- that is what
+            // the unmirrored code did with a stale candidate and it must stay true.
+        }
+
         let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
+        self.pin_if_labelled(frame_i, page_id)
+    }
+
+    /// Pin frame `frame_i` if it really is holding `page_id`. The re-check and the pin under one
+    /// acquisition of that frame's latch; see [`BufferPoolManager::try_pin_resident`].
+    fn pin_if_labelled(&self, frame_i: usize, page_id: u32) -> Option<usize> {
+        // Lock-order: takes a frame lock, so page latches are forbidden from here down. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
         if frame.page_id != Some(page_id) {
             return None;
@@ -605,22 +664,87 @@ impl BufferPoolManager {
         Ok(Evicted::Took(frame_i))
     }
 
-    // decrement pin count, if page was modified, add dirty flag
+    /// Decrement the pin count, and mark the frame dirty if the caller wrote to it.
+    ///
+    /// **D35: resolved through the lock-free mirror**, with the map as the fallback. This is the
+    /// other half of the resident hit loop — `fetch_page` + `unpin_page` took `page_table.read()`
+    /// once each, and an `RwLock`'s reader count is one process-wide cache line that every reader
+    /// atomically RMWs, so those two acquisitions contended exactly like a mutex.
+    ///
+    /// # Why the mirror is safe here, which is a different argument from `fetch_page`'s
+    ///
+    /// `fetch_page` may act on a stale candidate because it re-checks the frame's label before
+    /// pinning. `unpin_page` has no such retry to fall back on: acting on the wrong frame would
+    /// decrement somebody else's pin count and, worse, set somebody else's dirty flag.
+    ///
+    /// The structural argument is that it cannot get a stale candidate at all: **a pinned page
+    /// cannot be evicted.** Every path that would unmap it refuses while `pin_counter > 0` —
+    /// `evict_into` returns `Declined`, `delete_page` and `free_page` return `PagePinned`,
+    /// `invalidate_all` refuses the whole sweep, and `branch::arena::evict` leaves it. So between
+    /// the pin this call is undoing and this call, the mapping cannot have changed.
+    ///
+    /// That argument is sound and it is not what this code relies on, because it rests on every
+    /// one of five call sites staying correct. **The frame's label is re-checked instead**, on
+    /// both resolution paths — the frame latch is being taken anyway, so it is one comparison.
+    ///
+    /// # The re-check is on the MAP path too, which is a change
+    ///
+    /// The unmirrored version of this method resolved through the map and then acted on whatever
+    /// frame it named, with no re-check, so it had the same exposure. Adding the check to the fast
+    /// path and not the fallback would leave the two halves of one method with different
+    /// guarantees, which is the kind of seam that becomes a bug the next time somebody edits one
+    /// of them. So both check, and the contract is uniform: **`unpin_page` acts only on a frame
+    /// that actually holds the page.**
+    ///
+    /// The choice it makes when neither path finds such a frame is to do nothing, and that is
+    /// deliberate. The alternative is to act anyway, which sets another page's dirty flag — and a
+    /// wrongly-set dirty flag on the wrong frame means the page that IS dirty gets written under
+    /// somebody else's id. A frame that stays pinned and therefore unevictable is a leak; serving
+    /// or persisting the wrong bytes is not recoverable. Neither state is reachable while the
+    /// pinned-page invariant above holds; this decides which one to be wrong in if it ever does
+    /// not.
     pub fn unpin_page(&self, page_id: u32, is_dirty: bool) {
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.
         let _pool = enter_pool();
+
+        // The hit path: one Acquire load, no lock.
+        if let Some(frame_i) = self.page_table.lookup(page_id) {
+            if self.release_pin_if_labelled(frame_i, page_id, is_dirty) {
+                return;
+            }
+            // A mirror miss is a collision and lands below. Getting HERE instead means the mirror
+            // named a frame the page has left, which the pinned-page invariant says cannot happen.
+            // Ask the authority rather than act on it.
+        }
+
         let pt = self.page_table.read().unwrap();
         let frame_i = pt[&page_id];
         drop(pt);
+        self.release_pin_if_labelled(frame_i, page_id, is_dirty);
+    }
 
+    /// Drop one pin on `frame_i` **if that frame holds `page_id`**, and mark it dirty if asked.
+    /// Returns whether it did. Shared by [`BufferPoolManager::unpin_page`]'s two resolution paths
+    /// so they cannot drift apart.
+    ///
+    /// `fetch_update` and not `fetch_sub`: an unpin of an already-unpinned frame must be a no-op
+    /// rather than an underflow to `u16::MAX`, which would make the frame permanently unevictable.
+    fn release_pin_if_labelled(&self, frame_i: usize, page_id: u32, is_dirty: bool) -> bool {
+        // Lock-order: takes a frame lock, so page latches are forbidden from here down. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
+        if frame.page_id != Some(page_id) {
+            return false;
+        }
         if is_dirty {
             frame.dirty_flag.store(true, Ordering::Relaxed);
         }
         let _ = frame.pin_counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
             if val > 0 {Some(val-1)} else {None}
         });
+        true
     }
 
     // allocate new page on disk using disk manager, load into a frame, return page id
