@@ -2233,6 +2233,43 @@ mod tests {
     }
 
     #[test]
+    fn reaping_n_branches_costs_no_catalog_descent_per_branch() {
+        // **The gate on D40's actual claim, which is a complexity class.** The wall clock is an
+        // illustration; this is the evidence. Measured on the pre-D40 call graph with this same
+        // counter (`bench/d40_descent_curve.txt`), this workload cost exactly N(N-1)/2 descents —
+        // 7,750 at N=125 and 2,031,120 at N=2016, growing x4 per doubling. Anything here that
+        // grows with N at all is the quadratic coming back.
+        let (h, reaper) = setup();
+        const N: usize = 64;
+        for _ in 0..N {
+            let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+            write_pages(&h, b.branch_id, 1);
+        }
+
+        let d0 = reaper.sweep_descents();
+        let reaped = reaper.reap_expired(far_future()).unwrap();
+        assert_eq!(reaped.len(), N, "fixture: not every branch was reaped");
+        let descents = reaper.sweep_descents() - d0;
+        assert_eq!(
+            descents, 0,
+            "the sweep descended into the catalog {descents} times to reap {N} branches. The fast \
+             path frees each extent wholesale, so the arena the drain is seeded with is already \
+             gone and the sweep has nothing to ask about."
+        );
+
+        // **AND THE COUNTER IS LIVE.** A zero from an instrument that never moves is not a
+        // measurement, it is an untested detector — so force it to move, here, in the same test
+        // that reads a zero off it.
+        let (_arenas, _dead) = orphan_one_extent(&h);
+        let d1 = reaper.sweep_descents();
+        reaper.collect_orphaned_extents().unwrap();
+        assert!(
+            reaper.sweep_descents() > d1,
+            "sweep_descents never moved even for the global scan, so the zero above says nothing"
+        );
+    }
+
+    #[test]
     fn a_slow_path_reap_that_parks_nothing_still_gives_its_extents_back() {
         // **The case `reap`'s `own_arenas` seed exists for, and the one a fire-check found no
         // test covered.** Deleting the seed survived every other D40 case here.
