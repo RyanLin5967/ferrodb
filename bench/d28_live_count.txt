@@ -120,20 +120,31 @@ per-statement path can reach `live_count`. It is (b), and it held BEFORE D28 as 
 this change did not remove the last caller, because there was never one in the engine.
 Recorded that way round so the row does not credit D28 with something it did not do.
 
-Complete census, all 26 occurrences of `live_count` in src/:
+Complete census, all 27 occurrences of `live_count` in src/, re-derived on the merged tip
+(post S22/D39/D40). 9 NON-TEST, 18 test-only.
 
-  DEFINITIONS AND TRAIT PLUMBING (7)
+  ** COUNT CORRECTED. An earlier version of this file labelled these groups "(7)" and
+     "(19)" over lists that actually held 9 and 18 line references. The split was caught by
+     the team lead re-deriving the census independently in the primary checkout rather than
+     relaying this file. The conclusion is unchanged -- none of the 9 is a call -- but a
+     wrong count in a document whose whole job is to be counted is worth fixing where it was
+     written. The file also cites `runtime_curve` as a caller; that example exists only on
+     this branch, which is why an independent count in the primary sees three examples plus
+     a test file rather than four. **
+
+  NON-TEST (9 line references across 6 sites) -- every one a DEFINITION, none a call
     src/branch/mod.rs:169                 trait declaration
     src/branch/catalog.rs:292             inherent, LogBranchCatalog
     src/branch/catalog.rs:451-452         trait impl -> delegates to the inherent
-    src/branch/table_catalog.rs:698-699   doc + inherent, TableBranchCatalog
-    src/branch/table_catalog.rs:977       trait impl -> delegates to the inherent
+    src/branch/table_catalog.rs:698-699   doc comment + inherent, TableBranchCatalog
+    src/branch/table_catalog.rs:976-977   trait impl -> delegates to the inherent
     src/agent_sql/mem_catalog.rs:207      trait impl
 
-  TEST-ONLY (19), every one inside a `#[cfg(test)]` module
-    src/branch/catalog.rs:776, 1025                   (cfg(test) begins line 545)
-    src/branch/reaper.rs:513, 533, 1403               (cfg(test) begins line 439)
-    src/branch/table_catalog.rs:1307 .. 1880          (cfg(test) begins line 1099)
+  TEST-ONLY (18), every one past its file's `#[cfg(test)]` boundary
+    src/branch/catalog.rs      (cfg at 560):  791, 1040
+    src/branch/reaper.rs       (cfg at 659):  752, 772, 1888, 2004
+    src/branch/table_catalog.rs(cfg at 1116): 1324, 1427, 1463, 1603, 1631, 1811,
+                                              1815, 1816, 1817, 1847, 1865, 1897
 
   PRODUCTION CALLERS: none.
 
@@ -141,15 +152,19 @@ So transitivity is vacuous: no statement path can reach `live_count` because NOT
 the shipped library calls it at all. Checked directly for the paths that matter --
 
     grep -rn "live_count" src/catalog/ src/execution/ src/agent_sql/runtime.rs \
-                          src/pgwire/ src/planner/ src/binder/
+                          src/pgwire/ src/planner/ src/binder/ src/storage/ src/buffer/
     -> no matches
 
 -- which covers every route the executor takes to serve a system view: the five
-generators, `run_select`, the binder, the planner and the wire.
+generators, `run_select`, the binder, the planner, the wire, and S22's buffer pool.
+
+And at the generator level, which is the part that is about D28's rewrite rather than the
+repo: the five generators call exactly `authors_of`, `branches`, `live_runs`,
+`quarantine_reason`, `quarantined_branches`, and via `branches()` only `scan` and
+`scan_ids`. None of those bodies calls `live_count`.
 
 Cargo.toml declares no `[[bin]]` and there is no src/bin, so the shipped surface is the
-library. The four callers outside it are examples/benchmarks -- branch_curve,
-durable_fork, runtime_curve, agent_isolation_demo -- none of which is a statement path.
+library. The remaining callers are examples/benchmarks, not statement paths.
 
 A counter would therefore make an O(N) walk fast that nothing on a statement path
 performs. It is unnecessary rather than merely unbuilt, which is the better outcome and
