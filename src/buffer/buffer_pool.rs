@@ -129,24 +129,56 @@
 //! frame's own latch before using it. `touch` is KEPT as well; the stub that deleted it was a
 //! measurement scaffold and deleting it degrades ARC's recency for a constant-factor win.
 //!
-//! Measured on this implementation, RESIDENT arm, `bench/d35_c1_pagetable.txt`. Quote the SLOPE
-//! and not a multiplier to more than two significant figures: D35's medians are over 3 reps with a
-//! BASE spread of 18.1M-23.6M at one thread under loadavg 16-33, and the two reps of
-//! `s22_bufpool_before_after.txt` disagree 40% on multipliers under fleet load. **What reproduces
-//! is the sign of the slope**, and it changes sign: BEFORE, throughput at 16 threads is a fraction
-//! of throughput at 1; AFTER, the curve rises monotonically with the thread count.
-//!
 //! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
 //! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror indexed
 //! directly by page id, which is O(max page id) and therefore a 32 GiB allocation in the limit.
 //! Only `bench/d35_gate_stubtouch.txt` from that branch is citable. This implementation is built
 //! on the current tip, retains `touch`, and tags its mirror slots so the table is a fixed size.
 //!
-//! **Still not fixed, and now the next candidate.** `touch` is back on the hit path, so the
-//! `arc_cache` mutex is once more a synchronisation point on every resident fetch — the one the
-//! STUB arm showed is worth about 47% at one thread and 33% at sixteen. It was not the binding
-//! constraint while the page table was; whether it has become one is a question for a fresh
-//! measurement against this file, not an assumption. BP-Wrapper is where that would go.
+//! # ⛔ AND IT IS NOT THE SHAPE CHANGE ON ITS OWN. MEASURED, AND IT CONTRADICTS THE ENTRY ABOVE.
+//!
+//! The paragraph this replaced predicted the slope would change sign. **It does not.** A C1 that
+//! RETAINS `touch` — the only C1 that can ship — leaves the curve collapsing exactly as before.
+//! `bench/d35_c1_pagetable.txt`, RESIDENT arm, medians over 3 interleaved reps: BASE **x0.107**
+//! at 16 threads relative to 1, C1 **x0.125**. The design entry's own falsifier was "the 16T/1T
+//! ratio does not clear x0.5 on a merge-ready implementation", and x0.125 does not clear it.
+//! What C1 buys is a **constant of roughly 1.2-1.5x**, which is the same order as the constant
+//! the entry rejected BP-Wrapper for being.
+//!
+//! **Why the gate saw x0.936 and this sees x0.125**, measured rather than argued —
+//! `bench/d35_c1_factorial.txt` runs all four cells of {mirror} x {`touch`}, same harness, same
+//! parameters, interleaved, 3 reps, and the per-rep slopes agree to within 0.01:
+//!
+//! | | `touch` KEPT | `touch` DELETED |
+//! |---|---|---|
+//! | **no mirror** | BASE x0.107 | STUB x0.095 |
+//! | **mirror** | C1 x0.125 | C1STUB **x0.581**, rising monotonically 2T->16T |
+//!
+//! **`touch` and the page table are two serialising points IN SERIES.** Removing either one alone
+//! leaves the other binding, which is why STUB alone was marginally WORSE than BASE and why C1
+//! alone is a constant. Removing BOTH is what produces the shape change. The gate's C1 arm was
+//! built on top of its STUB arm, so it measured "both removed" and attributed the result to the
+//! page table alone. Its 16-thread throughput (44.9M) and this C1STUB's (44.7M) agree closely;
+//! the ratio differs only because this machine's 1-thread number was higher under lighter load,
+//! and 16T/1T is most sensitive at the point that is most load-sensitive.
+//!
+//! **So `arc_cache` on the hit path is now the binding constraint, and BP-Wrapper is no longer
+//! "a constant".** The entry above rejected it on the STUB measurement, which was taken with the
+//! page table still in the way — a correct reading of a measurement that could not see past the
+//! other wall. That verdict needs re-taking against THIS file, and `bench/d35_c1_factorial.txt`'s
+//! C1STUB row is the upper bound it has to be judged against: x0.581, not x1.
+//!
+//! C1 stays because it is a prerequisite and not because it is the win. Deleting `touch` without
+//! it is *worse* than doing nothing, and `touch` cannot simply be deleted — it degrades ARC's
+//! recency, which `bench/d35_c1_evictiontrace.txt` shows outright: the eviction sequence changes.
+//!
+//! # Hit rate: an equality assertion, and it holds
+//!
+//! ARC is not modified by C1 at all, so the eviction sequence must be **bit-identical**, not
+//! merely close. It is: `bench/d35_c1_evictiontrace.txt`, a fixed 16,192-step single-threaded
+//! trace over 4096 pages, 7899 evictions, byte-identical output and equal sha256 before and after.
+//! The gate is forced to fire in the same file (deleting `touch` changes the sequence), so
+//! "identical" is a result rather than an instrument that cannot see anything.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
