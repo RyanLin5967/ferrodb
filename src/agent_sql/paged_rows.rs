@@ -243,17 +243,24 @@ impl PagedRows {
         self.tree.delete(root, branch, epoch, &key)
     }
 
-    /// Every row of one table, in `row_id` order.
+    /// Every row of one table, in `row_id` order, **lazily**.
+    ///
+    /// This used to return a `Vec` built from a `Vec`: `range_scan` materialised the table's
+    /// bytes and this loop decoded them into a second one, so a caller that wanted ten rows paid
+    /// for all of them (84 MiB at 10^6 rows — `bench/s23_cow_scan_memory_before.txt`). Both
+    /// copies are gone; the consumer now sets the ceiling by deciding how much it pulls, and a
+    /// caller that genuinely wants every row can still `.collect()` and pay the same price
+    /// deliberately.
     pub fn scan_table(
         &self,
         root: PageId,
         table_id: u32,
-    ) -> Result<Vec<(u64, Vec<Value>)>, FerroError> {
+    ) -> Result<impl Iterator<Item = Result<(u64, Vec<Value>), FerroError>>, FerroError> {
         let lo = table_lo(table_id);
         let hi = table_hi(table_id);
         let entries = self.tree.range_scan(root, Some(&lo), Some(&hi))?;
-        let mut out = Vec::with_capacity(entries.len());
-        for (k, v) in entries {
+        Ok(entries.map(move |e| {
+            let (k, v) = e?;
             let (t, row) = split_row_key(&k)?;
             // A key outside the requested table means the range bounds are wrong, which would
             // otherwise show up as one table quietly reading another's rows.
@@ -262,9 +269,8 @@ impl PagedRows {
                     "range scan for table {table_id} returned a key from table {t}"
                 )));
             }
-            out.push((row, decode_row(&v)?));
-        }
-        Ok(out)
+            Ok((row, decode_row(&v)?))
+        }))
     }
 }
 
@@ -463,11 +469,16 @@ mod tests {
                 .put(root, BranchId::TRUNK, e, t, r, &[Value::Integer(r as i32)])
                 .unwrap();
         }
-        let got: Vec<u64> = pr.scan_table(root, 1).unwrap().into_iter().map(|(r, _)| r).collect();
+        let got: Vec<u64> =
+            pr.scan_table(root, 1).unwrap().map(|e| e.unwrap().0).collect();
         assert_eq!(got, vec![1, 2, 3], "table 1 must yield its own rows, sorted");
-        let got2: Vec<u64> = pr.scan_table(root, 2).unwrap().into_iter().map(|(r, _)| r).collect();
+        let got2: Vec<u64> =
+            pr.scan_table(root, 2).unwrap().map(|e| e.unwrap().0).collect();
         assert_eq!(got2, vec![1, 9]);
-        assert!(pr.scan_table(root, 3).unwrap().is_empty(), "an unused table must scan empty");
+        assert!(
+            pr.scan_table(root, 3).unwrap().collect::<Result<Vec<_>, _>>().unwrap().is_empty(),
+            "an unused table must scan empty"
+        );
     }
 
     #[test]
@@ -479,7 +490,8 @@ mod tests {
             root = pr.put(root, BranchId::TRUNK, e, 1, r, &[Value::Integer(r as i32)]).unwrap();
         }
         root = pr.delete(root, BranchId::TRUNK, e, 1, 2).unwrap();
-        let got: Vec<u64> = pr.scan_table(root, 1).unwrap().into_iter().map(|(r, _)| r).collect();
+        let got: Vec<u64> =
+            pr.scan_table(root, 1).unwrap().map(|e| e.unwrap().0).collect();
         assert_eq!(got, vec![1, 3]);
         assert_eq!(pr.get(root, 1, 2).unwrap(), None);
     }
@@ -495,7 +507,8 @@ mod tests {
         let root = pr
             .put(root, BranchId::TRUNK, e, u32::MAX, u64::MAX, &[Value::Integer(1)])
             .unwrap();
-        let got = pr.scan_table(root, u32::MAX).unwrap();
+        let got: Vec<_> =
+            pr.scan_table(root, u32::MAX).unwrap().collect::<Result<_, _>>().unwrap();
         assert_eq!(
             got,
             vec![(u64::MAX, vec![Value::Integer(1)])],

@@ -1,0 +1,24 @@
+=== D23 verification: lock-order guard + live scanner + tracked accessors ===
+date: 2026-09-18T03:28:21Z
+HEAD: 40e6fcd + uncommitted work in this commit
+guard: source checksum a0b0b942af6887b42f1c3fcc14438093e95d3332, re-checked at the end
+
+--- cargo test --test integration_btree_concurrency ---
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s
+--- cargo test --test lock_order_allowlist ---
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+--- cargo test --test lock_order_runtime ---
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+--- cargo test --test integration_buffer_pool_concurrency ---
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+--- cargo test --test integration_flush_concurrency ---
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+--- cargo test --test integration_index_debt ---
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.10s
+--- cargo test --test integration_branch_pages ---
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+--- cargo test --lib storage:: ---
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 1205 filtered out; finished in 0.96s
+--- cargo test --lib buffer:: ---
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1281 filtered out; finished in 0.00s
+source checksum before=a0b0b942af6887b42f1c3fcc14438093e95d3332 after=a0b0b942af6887b42f1c3fcc14438093e95d3332 MATCH

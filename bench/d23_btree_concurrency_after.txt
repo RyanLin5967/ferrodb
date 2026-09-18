@@ -1,0 +1,27 @@
+=== D23 AFTER: the latched B+tree under concurrency ===
+date: 2026-09-18T03:20:17Z
+commit: a9bfc84 (measured on 40e6fcd plus the then-uncommitted lock-order, live-scanner and
+        tracked-accessor work that a9bfc84 committed; the source is byte-identical)
+cmd:  cargo test --test integration_btree_concurrency -- --test-threads=1 --nocapture
+
+NOTE: commit de980e2's message cited this path, but the file was never committed - only the
+BEFORE arm was. Regenerated here so the citation resolves. The counters now include the
+live_scan_* fields, which did not exist when that message was written.
+
+test btree_concurrent_16_threads ... threads=16 dirty_rounds=0/3
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 3400, scan_expected: 3400, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 94 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 3400, scan_expected: 3400, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 96 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 3400, scan_expected: 3400, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 84 }
+test btree_concurrent_1_thread ... threads=1 dirty_rounds=0/3
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1150, scan_expected: 1150, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 0 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1150, scan_expected: 1150, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 0 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 1150, scan_expected: 1150, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 0 }
+test btree_concurrent_32_threads ... threads=32 dirty_rounds=0/3
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 5800, scan_expected: 5800, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 56 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 5800, scan_expected: 5800, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 59 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 5800, scan_expected: 5800, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 55 }
+test btree_concurrent_8_threads ... threads=8 dirty_rounds=0/3
+  round 0: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 2200, scan_expected: 2200, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 148 }
+  round 1: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 2200, scan_expected: 2200, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 158 }
+  round 2: Round { panics: 0, insert_errors: 0, phantom_misses: 0, lost_inserts: 0, lost_prepop: 0, wrong_values: 0, scan_disorder: 0, scan_len: 2200, scan_expected: 2200, live_scan_misses: 0, live_scan_disorder: 0, live_scans: 157 }
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.27s

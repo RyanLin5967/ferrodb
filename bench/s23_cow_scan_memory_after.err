@@ -1,0 +1,3 @@
+  n=10000 build=1.24464725s allocs: stream=20014 stream2=20014 table=40015 first10=33 collect=20027
+  n=100000 build=11.938124625s allocs: stream=200108 stream2=200072 table=400073 first10=33 collect=200088
+  n=1000000 build=75.376759333s allocs: stream=2000708 stream2=2000674 table=4000675 first10=35 collect=2000693

@@ -1,0 +1,54 @@
+S23 fire-check: the streaming cursor's guards, forced to fail on purpose.
+
+A detector that has never fired is not a clean result. Each mutant below was applied to
+src/cow/btree.rs, the cursor tests run, and the file restored byte-for-byte (`diff` verified,
+last line). What matters is not only THAT each fires but WHICH one fires:
+
+  A, the eager scan, fails ONLY the page-count test. Both correctness tests pass it happily --
+  same rows, same order, same bounds. That is exactly why the page counter has to exist: a
+  revert to the Theta(table) `Vec` is invisible to every other assertion in this suite.
+
+  B and C, the two off-by-one bounds mutants, fail ONLY the reference-map test and leave the
+  page count alone, so the two guards are independent rather than one guard counted twice.
+
+  D is the one that changed the code. Sampling a leaf's type and its bytes under two separate
+  read guards is weaker than what the eager scan guaranteed, and on the first run of this file
+  ALL 26 TESTS PASSED IT. The property lives inside the buffer-pool frame lock, which nothing in
+  `PageStore` exposes, so no test here can see it -- and a concurrency test for it would be a
+  detector that cannot be forced to fire, which is worse than none. So `advance_leaf` now drops
+  the page handle at the end of the guard's block, and the mutant stops being a wrong program
+  and starts being one that does not compile. That is the result recorded below.
+
+MUTANT A -- range_scan materialises before returning (the pre-S23 behaviour)
+    test cow::tests_isolation::a_cursor_that_failed_does_not_yield_again ... ok
+    test cow::tests_isolation::every_bound_yields_exactly_the_keys_a_reference_map_holds ... ok
+    test cow::tests_isolation::reading_the_first_row_of_a_scan_does_not_read_the_whole_tree ... FAILED
+    test result: FAILED. 25 passed; 1 failed; 0 ignored; 0 measured; 1252 filtered out; finished in 0.18s
+
+MUTANT B -- the upper bound becomes inclusive (k > hi instead of k >= hi)
+    test cow::tests_isolation::a_cursor_that_failed_does_not_yield_again ... ok
+    test cow::tests_isolation::every_bound_yields_exactly_the_keys_a_reference_map_holds ... FAILED
+    test cow::tests_isolation::reading_the_first_row_of_a_scan_does_not_read_the_whole_tree ... ok
+    test result: FAILED. 24 passed; 2 failed; 0 ignored; 0 measured; 1252 filtered out; finished in 0.19s
+
+MUTANT C -- the lower-bound start slot is off by one (Err(i) => i + 1)
+    test cow::tests_isolation::a_cursor_that_failed_does_not_yield_again ... ok
+    test cow::tests_isolation::every_bound_yields_exactly_the_keys_a_reference_map_holds ... FAILED
+    test cow::tests_isolation::reading_the_first_row_of_a_scan_does_not_read_the_whole_tree ... ok
+    test result: FAILED. 25 passed; 1 failed; 0 ignored; 0 measured; 1252 filtered out; finished in 0.26s
+
+MUTANT D -- the leaf page re-read under a SECOND guard instead of copied under the first
+    error[E0382]: borrow of moved value: `h`
+       --> src/cow/btree.rs:703:48
+        |
+    689 |             let h = self.store.read_page(pid)?;
+        |                 - move occurs because `h` has type `PageHandle`, which does not implement the `Copy` trait
+    --
+    error: could not compile `ferrodb` (lib) due to 1 previous error
+
+RESTORED
+    test cow::tests_isolation::a_cursor_that_failed_does_not_yield_again ... ok
+    test cow::tests_isolation::every_bound_yields_exactly_the_keys_a_reference_map_holds ... ok
+    test cow::tests_isolation::reading_the_first_row_of_a_scan_does_not_read_the_whole_tree ... ok
+    test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 1252 filtered out; finished in 0.41s
+    (btree.rs restored byte-for-byte)
