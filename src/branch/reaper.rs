@@ -485,8 +485,25 @@ impl Reaper for TwoTierReaper {
 
         // Mark before freeing so a crash mid-reap resumes rather than leaking. `Reaping` is
         // observable and `check_readable` rejects it, so nothing reads through a half-freed tree.
+        //
+        // **D41 — `set_state`, not a whole-record `put`.** This was the read-modify-write the D41
+        // design entry singled out as the reason `reap`'s marker is NOT the cheap fix for the rest
+        // of the class: the marker that protects everything after it was published BY this write,
+        // so a `renew_lease` or an `add_arena` landing between the `get_raw` above and the `put`
+        // was clobbered — D20's arena leak, verbatim, reached through the reaper. The window is
+        // now inside the catalog's own lock and nothing outside it can land there.
+        //
+        // The transition is a compare-and-set from whatever state was READ — `Live` normally,
+        // `Quarantined` when a held branch is reaped, and `Reaping` when
+        // `resume_interrupted_reaps` re-enters a reap a crash cut short. What it refuses is a
+        // branch that MOVED between the `get_raw` above and this write: a concurrent reaper that
+        // published `Reaping` in that window makes this one refuse rather than free the same
+        // extents twice. A branch that was ALREADY `Reaping` when it was read is the resume path,
+        // and lands here as `expect == to` — a no-op write, not a refusal, which is what lets the
+        // resume proceed.
+        let from = rec.state;
+        self.catalog.set_state(branch, from, BranchState::Reaping)?;
         rec.state = BranchState::Reaping;
-        self.catalog.put(&rec)?;
 
         let free_epoch = self.catalog.next_epoch();
         let mut freed = 0u32;
@@ -532,8 +549,17 @@ impl Reaper for TwoTierReaper {
         // parent looks childless and the interval rule frees pages that child can still read.
         // Marking first makes the only possible inconsistency a STALE entry against an
         // already-reaped child, which every reader resolves and ignores.
-        rec.mark_reaped(); // state = Reaped, generation += 1, arenas cleared
-        self.catalog.put(&rec)?;
+        // **D41 — `set_state`, not `mark_reaped` + `put`.** Six of `put`'s sixteen callers were
+        // this exact three-line spelling. `Reaped` is not a plain state assignment: the catalog
+        // bumps the generation so the old handle is a hard error, and clears `arenas` because the
+        // extents above have just gone back to the free-space map. Both happen inside the
+        // catalog's lock now, so an `add_arena` racing a reap can no longer be resurrected by a
+        // stale snapshot — nor lost by one.
+        //
+        // The local `rec` is deliberately NOT re-marked. Everything below reads `branch_id`,
+        // `parent_id` and `fork_epoch`, none of which this transition touches, and a hand-applied
+        // copy of the catalog's bookkeeping is a second place for it to drift.
+        self.catalog.set_state(rec.branch_id, BranchState::Reaping, BranchState::Reaped)?;
         self.detach_from_parent(&rec)?;
         self.catalog.release_id(rec.branch_id.id);
 
@@ -628,27 +654,27 @@ impl Reaper for TwoTierReaper {
         // direction.
         self.catalog.attach_child(BranchId::TRUNK.id, new_fork_epoch, rec.branch_id.id)?;
 
-        // RE-READ before the final write, do not write back the snapshot taken above.
+        // **D41 — ONE NARROW WRITE, AND THE RE-READ IS GONE WITH THE `put` IT GUARDED.**
         //
-        // The copy may have claimed SEVERAL extents, each recorded against this branch inside
-        // `alloc_arena`'s atomic `add_arena`. Writing back `rec` as it stood before the copy would
-        // drop every one of them from `record.arenas` -- and the reaper frees exactly
-        // `record.arenas`, so those extents could never be reclaimed by anything. That is D20's
-        // read-modify-write, arriving through `collapse` instead of through `alloc_arena`.
+        // This used to be `get` -> assign four fields -> `put`. D13b had already narrowed the
+        // window from "the whole page copy" to "the four assignments" by re-reading here instead
+        // of writing back the pre-copy snapshot -- because the copy claims SEVERAL extents, each
+        // recorded against this branch by `alloc_arena`'s atomic `add_arena`, and writing back the
+        // old snapshot dropped every one of them from `record.arenas`. The reaper frees exactly
+        // `record.arenas`, so those extents could never be reclaimed by anything: measured by
+        // mutation at 664 of 664 copied pages leaked for the life of the file.
         //
-        // `put` is still a whole-record write because `parent_id`, `depth` and `fork_epoch` have
-        // no narrower setter and must move together with the root. The re-read narrows the window
-        // to the four lines below rather than to the whole page copy.
+        // But narrowing is not closing, and D29 recorded the remainder: anything that mutated the
+        // record between that re-read and that `put` was still discarded. The reproduction is
+        // `collapse_discards_a_lease_renewal_that_lands_on_its_re_read` below.
         //
-        // Measured by mutation: restore the pre-copy snapshot here and
-        // `collapse_rolls_over_extents_for_a_tree_larger_than_one` leaves 664 of 664 copied pages
-        // still allocated after the branch is reaped -- leaked for the life of the file.
-        let mut rec = self.catalog.get(branch)?;
-        rec.parent_id = Some(BranchId::TRUNK);
-        rec.fork_epoch = new_fork_epoch;
-        rec.depth = 1;
-        rec.root_page_id = new_root;
-        self.catalog.put(&rec)?;
+        // `reparent` closes it by construction. It names the four fields that move together --
+        // they are one position in the tree -- reads the record under the catalog's own lock, and
+        // writes nothing else. A keepalive, an envelope charge or an extent claimed during the
+        // copy is not part of this write and cannot be lost to it. It is UNCONDITIONAL rather than
+        // a compare-and-swap: by this line up to `MAX_COLLAPSE_PAGES` pages have been copied, and
+        // a caller that cannot retry cannot be handed a conflict.
+        let rec = self.catalog.reparent(branch, BranchId::TRUNK, new_fork_epoch, new_root)?;
 
         // The old ancestors just lost a child, so their parked pages may now be free.
         self.drain_pending()?;
@@ -910,9 +936,7 @@ mod tests {
 
         // What a crash mid-reap leaves behind: the record durably `Reaping`, nothing freed yet.
         for b in [parent.branch_id, child.branch_id] {
-            let mut rec = h.catalog.get_raw(b.id).unwrap();
-            rec.state = BranchState::Reaping;
-            h.catalog.put(&rec).unwrap();
+            h.catalog.set_state(b, BranchState::Live, BranchState::Reaping).unwrap();
         }
 
         assert_eq!(reaper.resume_interrupted_reaps().unwrap().len(), 2, "both reaps must finish");
@@ -1232,9 +1256,7 @@ mod tests {
 
         // Crash exactly where `reap` is most exposed: after the durable Reaping mark, before a
         // single page went back.
-        let mut rec = h.catalog.get(b.branch_id).unwrap();
-        rec.state = BranchState::Reaping;
-        h.catalog.put(&rec).unwrap();
+        h.catalog.set_state(b.branch_id, BranchState::Live, BranchState::Reaping).unwrap();
         assert!(h.catalog.get(b.branch_id).is_err(), "a half-reaped branch is not readable");
         assert_eq!(h.store.live_page_count().unwrap(), 9, "and its space is still charged to it");
 
@@ -1790,13 +1812,38 @@ mod tests {
         );
     }
 
-    /// **Known-open, ledger row D29: `collapse`'s final `put` is still a whole-record write.**
+    /// **D41 CLOSED THIS. Ledger row D29, and the test that was `#[ignore]`d while it was open.**
     ///
-    /// D13b narrowed the window — `collapse` re-reads the record immediately before writing it,
+    /// `collapse` no longer writes a record back at all: `reparent` names the four fields that
+    /// move together and the catalog performs the read-modify-write inside its own lock, so a
+    /// keepalive landing anywhere in this operation survives it. The history below is kept because
+    /// it says what the window WAS, and the assertion at the bottom is unchanged from the one that
+    /// failed while it was open.
+    ///
+    /// **Two things about this test changed with the fix, and neither weakens it.**
+    ///
+    /// 1. **The keepalive fires on EVERY `get` of the subject, with a DIFFERENT deadline each
+    ///    time, and the assertion is that the LAST one it wrote is the one in force.** It used to
+    ///    fire only on the second `get` — collapse's re-read — and the re-read is gone with the
+    ///    `put` it guarded, so a count-based arming could no longer fire at all and this test
+    ///    would have failed on its own anti-vacuity guard rather than on anything about the code.
+    ///
+    ///    Firing on every `get` with ONE value does not work either, and the fire-check caught it:
+    ///    a keepalive landing before collapse's re-read is picked UP by that re-read, so the old
+    ///    code passes and the test proves nothing. Distinct values are what make the observation
+    ///    independent of how many reads collapse makes. Against the pre-D41 code the re-read
+    ///    returns the value written at get #1, collapse writes that back on top of the value
+    ///    written at get #2, and the last keepalive is lost — which is the defect, stated without
+    ///    naming a read count. Against `reparent` there is one keepalive and it survives.
+    /// 2. It is no longer `#[ignore]`d.
+    ///
+    /// ---
+    ///
+    /// D13b narrowed the window — `collapse` re-read the record immediately before writing it,
     /// instead of writing back the snapshot it took before copying the whole tree — but it did not
-    /// close it, because `parent_id`, `depth` and `fork_epoch` have no narrower setter and must
-    /// move together with the new root. Anything that mutates the record between that re-read and
-    /// that `put` is silently discarded.
+    /// close it, because `parent_id`, `depth` and `fork_epoch` had no narrower setter and had to
+    /// move together with the new root. Anything that mutated the record between that re-read and
+    /// that `put` was silently discarded.
     ///
     /// **WHICH DIRECTION D13b AND D31 MOVED THE WINDOW, because the D29 fix needs to know what it
     /// is aiming at.** Both NARROWED it; neither widened it.
@@ -1822,30 +1869,32 @@ mod tests {
     /// recommendation.
     ///
     /// This drives the smallest of those: a lease renewal. The wrapper below renews the lease to
-    /// `u64::MAX` at the exact instant of collapse's re-read, which is what a live client's
-    /// keepalive does. Collapse then writes the pre-renewal deadline back on top, and the branch is
-    /// reapable while its holder believes the lease is good — `reap_expired` needs no cooperation
-    /// at all, so nothing else stands between that and the branch being reclaimed underneath it.
+    /// `u64::MAX` while collapse is reading the branch, which is what a live client's keepalive
+    /// does. Before D41, collapse then wrote the pre-renewal deadline back on top and the branch
+    /// was reapable while its holder believed the lease was good — `reap_expired` needs no
+    /// cooperation at all, so nothing else stood between that and the branch being reclaimed
+    /// underneath it.
     ///
     /// `renew_lease` is the cheapest field to demonstrate with, not the worst case. `envelope`
-    /// (a `charge_row_writes` spend) and `state` travel in the same record.
+    /// (a `charge_row_writes` spend) and `state` travel in the same record; the
+    /// `d41_narrow_ops_*` tests drive those two directly.
     ///
-    /// **This is NOT the D13b rollover defect and is NOT fixed here.** Closing it needs exclusion
-    /// against a concurrent writer on the branch being collapsed, or a narrow
-    /// `reparent(branch, parent, epoch, root)` catalog operation that each implementation makes
-    /// atomic — the shape `add_arena` and `detach_child` already took, for this same reason. That
-    /// is a catalog-trait change and belongs with the latching work, not inside a page-copy fix.
+    /// **NOT a threads test, deliberately.** A racing test fires sometimes, and a test that fires
+    /// sometimes reports green when the interleaving did not happen. A catalog decorator makes the
+    /// interleaving a fact of the test, and the `fired` flag makes it refuse to pass without one.
+    /// It intercepts `get`, never the write: intercepting the write would observe the clobber
+    /// instead of causing it, which tests the test.
     #[test]
-    #[ignore = "known-open defect: collapse's whole-record `put` discards a concurrent write. \
-                Needs a narrow reparent() catalog op or exclusion; run with --ignored"]
     fn collapse_discards_a_lease_renewal_that_lands_on_its_re_read() {
         use std::sync::Mutex;
 
-        /// Renews the subject's lease at the instant of collapse's SECOND `get` — the re-read.
+        /// Renews the subject's lease from inside every `get` collapse makes of it, to a
+        /// different deadline each time. `last` is the one a correct collapse must leave standing.
         struct RacingKeepalive {
             inner: Arc<dyn BranchCatalog>,
             subject: Mutex<Option<BranchId>>,
             gets: Mutex<u32>,
+            last: Mutex<LeaseDeadline>,
             fired: Mutex<bool>,
         }
         impl BranchCatalog for RacingKeepalive {
@@ -1853,13 +1902,18 @@ mod tests {
                 let rec = self.inner.get(b)?;
                 let subject = *self.subject.lock().unwrap();
                 if subject == Some(b) {
+                    // EVERY get of the subject, and a DISTINCT deadline each time. Counting gets
+                    // would pin the number of reads collapse happens to make, and D41 legitimately
+                    // removed one of them; what the test is about is that whatever a live client
+                    // last published is what stands afterwards, whichever read it landed on.
                     let mut n = self.gets.lock().unwrap();
                     *n += 1;
-                    if *n == 2 {
-                        // A live client's keepalive, landing in the window.
-                        self.inner.renew_lease(b, LeaseDeadline(u64::MAX)).unwrap();
-                        *self.fired.lock().unwrap() = true;
-                    }
+                    // Descending from u64::MAX so every value is comfortably unexpired, and so
+                    // that a stale write-back is distinguishable from the current one by value.
+                    let d = LeaseDeadline(u64::MAX - (*n as u64 - 1));
+                    self.inner.renew_lease(b, d).unwrap();
+                    *self.last.lock().unwrap() = d;
+                    *self.fired.lock().unwrap() = true;
                 }
                 Ok(rec)
             }
@@ -1871,7 +1925,21 @@ mod tests {
             fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
                 self.inner.add_arena(b, a)
             }
-            fn put(&self, r: &BranchRecord) -> Result<(), FerroError> { self.inner.put(r) }
+            fn reparent(&self, b: BranchId, p: BranchId, e: Epoch, r: PageId)
+                -> Result<BranchRecord, FerroError> {
+                self.inner.reparent(b, p, e, r)
+            }
+            fn restrict_envelope(
+                &self,
+                b: BranchId,
+                env: crate::branch::record::CapabilityEnvelope,
+            ) -> Result<(), FerroError> {
+                self.inner.restrict_envelope(b, env)
+            }
+            fn set_state(&self, b: BranchId, expect: BranchState, to: BranchState)
+                -> Result<(), FerroError> {
+                self.inner.set_state(b, expect, to)
+            }
             fn set_root(&self, b: BranchId, r: PageId) -> Result<(), FerroError> {
                 self.inner.set_root(b, r)
             }
@@ -1920,6 +1988,7 @@ mod tests {
             inner: Arc::clone(&h.catalog),
             subject: Mutex::new(None),
             gets: Mutex::new(0),
+            last: Mutex::new(LeaseDeadline(0)),
             fired: Mutex::new(false),
         });
         let reaper =
@@ -1945,12 +2014,16 @@ mod tests {
             *racer.fired.lock().unwrap(),
             "the keepalive never fired, so this test proves nothing either way"
         );
+        let last = *racer.last.lock().unwrap();
         assert_eq!(
             h.catalog.get(b.branch_id).unwrap().lease_deadline,
-            LeaseDeadline(u64::MAX),
-            "collapse's whole-record `put` overwrote a lease renewal that landed after its \
-             re-read. The branch is now reapable while its holder believes the lease is live, and \
-             `reap_expired` needs no cooperation from that holder."
+            last,
+            "collapse wrote a record it had read back over a lease renewal that landed after that \
+             read ({} keepalive(s) fired; the last published {:?}). The branch is now reapable \
+             while its holder believes the lease is live, and `reap_expired` needs no cooperation \
+             from that holder.",
+            *racer.gets.lock().unwrap(),
+            last
         );
     }
 
@@ -1982,11 +2055,26 @@ mod tests {
             fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
                 self.inner.add_arena(b, a)
             }
-            fn put(&self, r: &BranchRecord) -> Result<(), FerroError> {
-                if r.state == BranchState::Reaped {
+            fn reparent(&self, b: BranchId, p: BranchId, e: Epoch, r: crate::branch::types::PageId)
+                -> Result<BranchRecord, FerroError> {
+                self.inner.reparent(b, p, e, r)
+            }
+            fn restrict_envelope(
+                &self,
+                b: BranchId,
+                env: crate::branch::record::CapabilityEnvelope,
+            ) -> Result<(), FerroError> {
+                self.inner.restrict_envelope(b, env)
+            }
+            // **D41.** This read a whole-record `put` and inferred the mark from the state it
+            // carried. It now reads the narrow operation directly, which is the same outcome
+            // asked of a smaller surface: the reaper no longer has any other way to spell it.
+            fn set_state(&self, b: BranchId, expect: BranchState, to: BranchState)
+                -> Result<(), FerroError> {
+                if to == BranchState::Reaped {
                     self.log.lock().unwrap().push("mark_reaped");
                 }
-                self.inner.put(r)
+                self.inner.set_state(b, expect, to)
             }
             fn set_root(&self, b: BranchId, r: crate::branch::types::PageId) -> Result<(), FerroError> {
                 self.inner.set_root(b, r)
@@ -2071,7 +2159,7 @@ mod tests {
     fn orphan_one_extent(h: &Harness) -> (Vec<ArenaId>, BranchId) {
         let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         write_pages(h, b.branch_id, 3);
-        let mut rec = h.catalog.get(b.branch_id).unwrap();
+        let rec = h.catalog.get(b.branch_id).unwrap();
         let arenas: Vec<ArenaId> = rec.arenas.clone();
         assert!(!arenas.is_empty(), "fixture: the branch owns no extent to orphan");
         // Hand every page back, which is what leaves the extent EMPTY. `extent_is_empty` is the
@@ -2083,11 +2171,10 @@ mod tests {
             assert!(h.store.extent_is_empty(arena), "fixture: the extent did not empty");
         }
         let owner = rec.branch_id;
-        // ...and now the crash. `mark_reaped` bumps the generation and clears `rec.arenas`, so
-        // after this write nothing in the catalog names these extents ever again — which is the
-        // whole reason a global scan is the only instrument that can find them.
-        rec.mark_reaped();
-        h.catalog.put(&rec).unwrap();
+        // ...and now the crash. Reaping bumps the generation and clears the arena list, so after
+        // this write nothing in the catalog names these extents ever again — which is the whole
+        // reason a global scan is the only instrument that can find them.
+        h.catalog.set_state(owner, BranchState::Live, BranchState::Reaped).unwrap();
         (arenas, owner)
     }
 
@@ -2154,10 +2241,11 @@ mod tests {
         //     freeing it would hand a live page range back to the allocator.
         let doomed = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
         write_pages(&h, doomed.branch_id, 3);
-        let mut drec = h.catalog.get(doomed.branch_id).unwrap();
+        let drec = h.catalog.get(doomed.branch_id).unwrap();
         let doomed_arenas: Vec<ArenaId> = drec.arenas.clone();
-        drec.mark_reaped();
-        h.catalog.put(&drec).unwrap();
+        h.catalog
+            .set_state(doomed.branch_id, BranchState::Live, BranchState::Reaped)
+            .unwrap();
         for a in doomed_arenas.iter().copied() {
             assert!(!h.store.extent_is_empty(a), "fixture (b): extent must still hold pages");
         }

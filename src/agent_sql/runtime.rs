@@ -1858,9 +1858,15 @@ impl AgentRuntime {
         branch: BranchId,
         envelope: CapabilityEnvelope,
     ) -> Result<(), FerroError> {
-        let mut record = self.branches.get(branch)?;
-        record.restrict(envelope)?;
-        self.branches.put(&record)
+        // **D41 — one catalog operation, not `get`/`restrict`/`put`.** The old shape compared the
+        // new envelope against a SNAPSHOT and then wrote the whole record back, so two
+        // restrictions racing left the loser's envelope standing: a branch could end up wider than
+        // a narrowing that had already been accepted, which is a widening reached by losing a
+        // write rather than by being granted one. `restrict_envelope` makes the comparison and the
+        // write one atomic step inside the catalog, and touches nothing else in the record — a
+        // `set_root`, a `renew_lease` or an `add_arena` landing in the window is no longer part of
+        // this write and cannot be discarded by it.
+        self.branches.restrict_envelope(branch, envelope)
     }
 
     /// What `branch` is currently permitted to write, read from its durable record. `None` means
@@ -2181,30 +2187,43 @@ impl AgentRuntime {
     /// warrant a hold is the gate's business, and the blind-write tier deliberately reports
     /// without deciding.
     pub fn quarantine(&self, branch: BranchId, reason: &str) -> Result<(), FerroError> {
-        let mut rec = self.branches.get(branch)?;
+        let rec = self.branches.get(branch)?;
         if rec.state == BranchState::Quarantined {
             return Ok(());
         }
         // **The reason is recorded BEFORE the state is published, and the order is the whole point.**
         //
         // These are two stores with two locks: the reason lives in this runtime's in-memory state, the
-        // state flag in the durable branch record. `put` makes `Quarantined` visible to every reader
-        // on every connection — the runtime is shared by all of them (`pgwire::ServerContext`) — so
-        // publishing first left a window in which `ferro_quarantine` showed a held branch with a NULL
-        // reason. `system_views` tells the reader that a NULL there means the reason did not survive a
-        // restart, which would have been a false statement about a live process.
+        // state flag in the durable branch record. Publishing `Quarantined` makes it visible to every
+        // reader on every connection — the runtime is shared by all of them (`pgwire::ServerContext`)
+        // — so publishing first left a window in which `ferro_quarantine` showed a held branch with a
+        // NULL reason. `system_views` tells the reader that a NULL there means the reason did not
+        // survive a restart, which would have been a false statement about a live process.
         //
         // Reversed, the only window left is a branch whose reason is recorded and whose state is still
         // `Live` — invisible to the view, because it selects on state, so a reader sees either nothing
         // or a hold with its reason. `release_from_quarantine` already has the safe order for the same
         // reason: it clears the state first and the reason after.
+        //
+        // **D41 — `set_state`, not a whole-record `put`, and this pair of stores is untouched by
+        // that.** The old write carried the branch's whole record, so a `charge_row_writes` from
+        // the write funnel landing between the `get` above and the write was discarded and a
+        // governed branch got those row-writes for free — the direction a capability system must
+        // not fail in. `set_state` writes the state and nothing else, so the ordering reasoned
+        // about above still holds exactly as written: it replaces the durable half of the pair,
+        // not the pair.
         self.state
             .lock()
             .unwrap()
             .quarantine_reasons
             .insert(branch.id, reason.to_string());
-        rec.state = BranchState::Quarantined;
-        self.branches.put(&rec)?;
+        if let Err(e) = self.branches.set_state(branch, rec.state, BranchState::Quarantined) {
+            // The hold did not happen, so its reason must not outlive it. The two stores above are
+            // ordered, not atomic, and this is the one inconsistency between them that the method
+            // is in a position to undo.
+            self.state.lock().unwrap().quarantine_reasons.remove(&branch.id);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -2228,12 +2247,16 @@ impl AgentRuntime {
 
     /// Return a held branch to normal service.
     pub fn release_from_quarantine(&self, branch: BranchId) -> Result<(), FerroError> {
-        let mut rec = self.branches.get(branch)?;
+        let rec = self.branches.get(branch)?;
+        // Checked here as well as inside `set_state` so the ordinary refusal keeps the message a
+        // caller can act on. `set_state`'s own compare-and-set is what covers the race between
+        // this read and the write, and it can only fire on a branch that moved underneath us.
         if rec.state != BranchState::Quarantined {
             return Err(FerroError::Branch(format!("{branch} is not quarantined")));
         }
-        rec.state = BranchState::Live;
-        self.branches.put(&rec)?;
+        // **D41 — `set_state`, not a whole-record `put`.** Same window, same class: the old write
+        // carried the record's envelope, root and arenas back with it.
+        self.branches.set_state(branch, BranchState::Quarantined, BranchState::Live)?;
         self.state.lock().unwrap().quarantine_reasons.remove(&branch.id);
         Ok(())
     }
@@ -3669,16 +3692,25 @@ impl AgentRuntime {
         // as written: mark the record reaped (which bumps the generation, making the old id a
         // hard error) and drop our fork epoch from the parent's live-children array so the
         // parent's pages stop being pinned on our behalf.
-        let mut record = self.branches.get(branch)?;
+        //
+        // **D41 — both halves are now narrow catalog operations.** The parent's live set was
+        // being edited as `get`/`remove_live_child`/`put`, which `BranchCatalog::detach_child`
+        // exists to replace and says so at its own declaration: against a catalog that keeps
+        // children in an INDEX the record's live set comes back empty, so `remove_live_child`
+        // reported "nothing to do", the write was skipped, and the entry outlived its branch for
+        // ever. The reap mark was the six-caller `get`/`mark_reaped`/`put` spelling.
+        //
+        // The `get(parent)` is kept as a guard rather than folded into `detach_child`, because it
+        // is what scopes this to a parent that is still readable — the behaviour this path has
+        // today. A reaped parent's stale entries are the reaper's business (`detach_from_parent`,
+        // which cascades); this is the reaper-less fallback and does not take that on.
+        let record = self.branches.get(branch)?;
         if let Some(parent) = record.parent_id {
-            if let Ok(mut p) = self.branches.get(parent) {
-                if p.remove_live_child(record.fork_epoch) {
-                    self.branches.put(&p)?;
-                }
+            if self.branches.get(parent).is_ok() {
+                self.branches.detach_child(parent.id, record.fork_epoch)?;
             }
         }
-        record.mark_reaped();
-        self.branches.put(&record)?;
+        self.branches.set_state(branch, record.state, BranchState::Reaped)?;
         Ok(())
     }
 

@@ -1605,9 +1605,11 @@ fn a_branch_being_reaped_cannot_write_even_with_its_workspace_intact() {
     // Anti-vacuity first: while it is Live the write is admitted.
     db.ok("UPDATE inventory SET qty = 5 WHERE id = 1;", &mut a);
 
-    let mut rec = db.runtime.branches().get(branch).unwrap();
-    rec.state = BranchState::Reaping;
-    db.runtime.branches().put(&rec).unwrap();
+    let rec = db.runtime.branches().get(branch).unwrap();
+    db.runtime
+        .branches()
+        .set_state(branch, rec.state, BranchState::Reaping)
+        .unwrap();
 
     let err = db.refused("UPDATE inventory SET qty = 6 WHERE id = 1;", &mut a);
     assert!(err.contains("being reaped"), "got {err}");

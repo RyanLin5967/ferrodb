@@ -20,13 +20,14 @@
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::{AgentRuntime, BranchResolver};
-use ferrodb::branch::types::BranchId;
+use ferrodb::branch::types::{BranchId, BranchState};
 
 /// Reap a branch the way the lease reaper does — in the catalog, with nothing telling the runtime.
 fn reap_behind_the_runtimes_back(rt: &AgentRuntime, branch: BranchId) {
-    let mut rec = rt.branches().get(branch).expect("branch is live before being reaped");
-    rec.mark_reaped();
-    rt.branches().put(&rec).expect("put reaped record");
+    let rec = rt.branches().get(branch).expect("branch is live before being reaped");
+    rt.branches()
+        .set_state(branch, rec.state, BranchState::Reaped)
+        .expect("mark the record reaped");
     assert!(
         rt.branches().get(branch).is_err(),
         "the catalog still answers for a reaped branch, so this fixture proves nothing"

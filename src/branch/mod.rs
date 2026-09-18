@@ -59,8 +59,109 @@ pub trait BranchCatalog: Send + Sync {
     /// Load a record. Returns `BranchError::Reaped` for a stale generation.
     fn get(&self, branch: BranchId) -> Result<BranchRecord, FerroError>;
 
-    /// Durably replace a record. The caller is responsible for having read the current one.
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError>;
+    // **D41 — THERE IS NO `put`, AND THAT IS THE POINT.**
+    //
+    // `fn put(&self, record: &BranchRecord)` used to sit here: "durably replace a record, the
+    // caller is responsible for having read the current one". Every one of its sixteen callers
+    // was a read-modify-write — `get` (or `get_raw`), mutate one or two fields, write the whole
+    // record back — and a whole-record write is the **necessary condition** for the defect class
+    // D20, D29, D33 and D34 are all instances of: a field the caller never read travels back
+    // into the store as a stale snapshot, silently discarding whatever landed in the window. A
+    // `set_root` publishing a copy-on-write root, a `renew_lease` keepalive, a
+    // `charge_row_writes` spend, a `fork` appending a child's epoch — any of them.
+    //
+    // Narrowing it was not enough, because the caller's *read* is the racy half and no signature
+    // can force a caller to hold a lock it does not know about. So the operations below each take
+    // the branch id and the new value, and every implementation performs the read-modify-write
+    // inside its OWN lock. Nothing can clobber a field a caller never named.
+    //
+    // **None of them has a default body, for the same reason `charge_row_writes` refuses to have
+    // one: the obvious default IS the race.** A new implementation has to decide how it makes
+    // each of these atomic rather than inherit a `get`/mutate/write-back that looks correct.
+    //
+    // A concrete catalog may still keep a whole-record writer of its own — `LogBranchCatalog`
+    // needs one internally, and both durable catalogs' format and replay tests write records the
+    // engine would never produce on purpose. What it may not do is put one on this trait, where
+    // any holder of a `dyn BranchCatalog` reaches it.
+
+    /// Move `branch` under a new parent, publishing its new root in the same atomic write.
+    ///
+    /// **D41, site 1: `collapse`.** The four fields move together or not at all — `parent_id`,
+    /// `fork_epoch`, `depth` and `root_page_id` describe one position in the tree, and a reader
+    /// that saw three of them would see a branch whose root belongs to an ancestry it no longer
+    /// has. `depth` is not a parameter: it is `parent.depth + 1` by definition, and a caller
+    /// permitted to state it could contradict the tree it just asked for.
+    ///
+    /// **UNCONDITIONAL, not a compare-and-swap, and that is a decision rather than an omission.**
+    /// The standard answer to a lost update is a version check and a caller retry (ZooKeeper's
+    /// `BadVersionException`, etcd's `Compare(ModRevision)`, a conditional write). Its premise is
+    /// that the caller *can* retry, and `collapse`'s caller cannot: by the time it reaches here it
+    /// has copied up to `MAX_COLLAPSE_PAGES` (65,536 pages, 256 MiB) into fresh extents, and a
+    /// refusal leaves it the choice of copying a quarter-gigabyte again or abandoning the extents
+    /// it already claimed. So this write wins, and it wins **narrowly**: it touches four fields
+    /// and reads nothing else, so a lease renewal, an envelope charge or an arena claimed during
+    /// the copy survives it untouched. That is the whole difference from the `put` it replaces.
+    ///
+    /// Returns the record as written, because the caller needs it and the implementation has just
+    /// built it — a second `get` would be a second chance to read something else.
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError>;
+
+    /// Narrow what `branch` may write, **atomically with respect to every other mutation.**
+    ///
+    /// **D41, site 2: `AgentRuntime::restrict_branch`.** Narrow, never widen: an envelope already
+    /// in force refuses anything wider than itself ([`BranchRecord::restrict`]), and a branch with
+    /// no envelope is ungoverned, so the first call installs freely.
+    ///
+    /// The atomicity is the capability property, not a performance one. Through the old
+    /// `get`/`restrict`/`put` the comparison was made against a snapshot: two restrictions racing
+    /// meant the later write put back the envelope *it* had compared against, so a branch could
+    /// end up wider than a restriction that had already been accepted — a widening reached by
+    /// losing a write rather than by being granted one. Here the comparison and the write happen
+    /// under one lock, so the second restriction is measured against the first and refused.
+    ///
+    /// Only the envelope moves. A `set_root`, a `renew_lease` or an `add_arena` that lands in the
+    /// window is not part of this write and cannot be discarded by it.
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError>;
+
+    /// Move `branch` from state `expect` to state `to`, **atomically**, or refuse.
+    ///
+    /// **D41, sites 3 and 4: quarantine/release, and both of `reap`'s state marks.** Seven call
+    /// sites were hand-rolling this as `get` → assign → `put`, six of them spelled
+    /// `get` → [`BranchRecord::mark_reaped`] → `put`.
+    ///
+    /// **A compare-and-swap here, unlike [`Self::reparent`], because every caller can act on a
+    /// refusal and none of them has done irreversible work first.** `expect` is what the caller
+    /// read; a mismatch means the branch moved underneath it, and continuing would publish a
+    /// transition from a state that no longer holds — releasing a branch from a quarantine that
+    /// was already lifted, or re-reaping one somebody else is reaping. `expect == to` is a
+    /// no-op and writes nothing.
+    ///
+    /// **`to == Reaped` carries `mark_reaped`'s full meaning: the generation is bumped and the
+    /// arena list is cleared.** That is not an extra service, it is what the state means — a
+    /// reaped id slot must never answer to the handle that used to own it, and the reaper frees
+    /// exactly `record.arenas` before it gets here, so leaving them listed would name extents
+    /// that are already back in the free-space map. Implementations must do both.
+    ///
+    /// Generation-checked but **not** `check_readable`-checked: `Reaping` is unreadable by
+    /// design, and the transition out of it — the second half of every reap — has to be
+    /// expressible. A stale handle is still refused, for the reason `add_arena` refuses one
+    /// (D33): a recycled slot must not be driven by the branch that used to live in it.
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError>;
 
     /// Publish a new root for a branch. This is the commit point of shadow paging: until the
     /// root pointer moves, a writing branch's pages are invisible to everyone (exit criterion 2).

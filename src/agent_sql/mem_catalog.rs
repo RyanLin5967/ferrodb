@@ -129,11 +129,81 @@ impl BranchCatalog for MemBranchCatalog {
         Ok(())
     }
 
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
-        self.records
-            .lock()
-            .unwrap()
-            .insert(record.branch_id.id, record.clone());
+    /// **D41.** Under the one lock this catalog has, like `fork` and `charge_row_writes`, so the
+    /// four fields move together and nothing else in the record is written back.
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let mut rec = Self::lookup(&records, branch)?;
+        let depth = records
+            .get(&parent.id)
+            .ok_or(BranchError::NotFound(parent))?
+            .depth
+            .saturating_add(1);
+        if depth > crate::branch::types::MAX_BRANCH_DEPTH {
+            return Err(BranchError::DepthExceeded { branch, depth }.into());
+        }
+        rec.parent_id = Some(parent);
+        rec.fork_epoch = fork_epoch;
+        rec.depth = depth;
+        rec.root_page_id = root;
+        records.insert(branch.id, rec.clone());
+        Ok(rec)
+    }
+
+    /// **D41.** The narrowing is compared against the envelope in force under the lock, never
+    /// against a snapshot a caller read before it.
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: crate::branch::record::CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        let mut rec = Self::lookup(&records, branch)?;
+        rec.restrict(envelope)?;
+        records.insert(branch.id, rec);
+        Ok(())
+    }
+
+    /// **D41.** Compare-and-set on the state alone; `Reaped` carries `mark_reaped`'s full meaning.
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        // Generation-checked but not `check_readable`-checked, so the transition out of `Reaping`
+        // — the second half of every reap — stays expressible. `lookup` would refuse it.
+        let rec = records.get_mut(&branch.id).ok_or(BranchError::NotFound(branch))?;
+        if rec.generation != branch.generation {
+            return Err(BranchError::Reaped {
+                requested: branch,
+                current_generation: rec.generation,
+            }
+            .into());
+        }
+        if rec.state != expect {
+            return Err(BranchError::UnexpectedState {
+                branch,
+                expected: expect,
+                actual: rec.state,
+            }
+            .into());
+        }
+        if expect == to {
+            return Ok(());
+        }
+        if to == BranchState::Reaped {
+            rec.mark_reaped();
+        } else {
+            rec.state = to;
+        }
         Ok(())
     }
 

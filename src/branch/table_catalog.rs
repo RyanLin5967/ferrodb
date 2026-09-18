@@ -31,7 +31,7 @@ use crate::branch::group_commit::CommitGroup;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
-    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
 };
 use crate::branch::BranchCatalog;
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -700,6 +700,29 @@ impl TableBranchCatalog {
         let (lo, hi) = keys::whole_state(BranchState::Live.as_u8());
         Ok(self.ids_in_span(lo, hi)?.len())
     }
+
+    /// Durably replace a whole record. **Test-only — D41 removed this from `BranchCatalog`.**
+    ///
+    /// No engine path calls it; the narrow operations do. It exists because the format, index and
+    /// replay tests in this file have to write records the engine would never produce on purpose
+    /// — the same record twice to prove `insert` does not leave two of it, a `Reaped` state with
+    /// its CHILD entry deliberately left behind to prove readers resolve the entry rather than
+    /// trust it, an arena appended the way the page store used to do it.
+    ///
+    /// `#[cfg(test)]` rather than private, because private is not enough: `tests/` compiles
+    /// against the library without `cfg(test)`, so this gate is what stops an integration test
+    /// from reaching for a whole-record write instead of naming the field it means.
+    #[cfg(test)]
+    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
+        let _g = self.logical.lock().unwrap();
+        let old = self.core(record.branch_id.id)?;
+        self.write_record(record, old.as_ref())?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
+    }
 }
 
 impl BranchCatalog for TableBranchCatalog {
@@ -804,10 +827,114 @@ impl BranchCatalog for TableBranchCatalog {
         self.hydrate(rec)
     }
 
-    fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
+    fn reparent(
+        &self,
+        branch: BranchId,
+        parent: BranchId,
+        fork_epoch: Epoch,
+        root: PageId,
+    ) -> Result<BranchRecord, FerroError> {
+        // **D41.** Under `logical`, the lock every mutator here already takes, so no new lock and
+        // no new lock-order edge. The whole read-modify-write is inside it: what this writes back
+        // is a record read microseconds ago under the same lock, not the snapshot its caller took
+        // before copying up to 256 MiB of pages.
         let _g = self.logical.lock().unwrap();
-        let old = self.core(record.branch_id.id)?;
-        self.write_record(record, old.as_ref())?;
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        let depth = self
+            .core(parent.id)?
+            .ok_or(BranchError::NotFound(parent))?
+            .depth()
+            .saturating_add(1);
+        if depth > MAX_BRANCH_DEPTH {
+            return Err(BranchError::DepthExceeded { branch, depth }.into());
+        }
+        let old = core.clone();
+        // HYDRATED, for `set_root`'s reason: `write_record` makes the arena span match the record
+        // it is given, so writing back a core record would delete every extent the branch owns —
+        // including the ones `deep_copy` just claimed, which is the leak D13b's re-read exists to
+        // prevent and this method inherits the duty of.
+        let mut rec = self.hydrate(core)?;
+        rec.parent_id = Some(parent);
+        rec.fork_epoch = fork_epoch;
+        rec.depth = depth;
+        rec.root_page_id = root;
+        self.write_record(&rec, Some(&old))?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)?;
+        Ok(rec)
+    }
+
+    fn restrict_envelope(
+        &self,
+        branch: BranchId,
+        envelope: CapabilityEnvelope,
+    ) -> Result<(), FerroError> {
+        // **D41.** One key, and no record read at all beyond the readability check: the envelope
+        // lives in its own span, which is why `charge_row_writes` can already spend against it
+        // without touching the record. The narrowing is compared against what is IN FORCE under
+        // the lock, not against a snapshot the caller read — two restrictions racing now leave the
+        // narrower one standing instead of whichever wrote last.
+        let _g = self.logical.lock().unwrap();
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        if let Some(current) = self.envelope_bytes(branch.id)? {
+            current.permits(&envelope)?;
+        }
+        self.upsert(keys::envelope(branch.id), envelope.serialize())?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
+    }
+
+    fn set_state(
+        &self,
+        branch: BranchId,
+        expect: BranchState,
+        to: BranchState,
+    ) -> Result<(), FerroError> {
+        let _g = self.logical.lock().unwrap();
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        // Generation-checked, not `check_readable`-checked: the transition OUT of `Reaping` is the
+        // second half of every reap, and `check_readable` refuses `Reaping` outright.
+        if core.generation() != branch.generation {
+            return Err(BranchError::Reaped {
+                requested: branch,
+                current_generation: core.generation(),
+            }
+            .into());
+        }
+        if core.state() != expect {
+            return Err(BranchError::UnexpectedState {
+                branch,
+                expected: expect,
+                actual: core.state(),
+            }
+            .into());
+        }
+        if expect == to {
+            // Nothing to write, and it keeps a second `set_state(.., Reaped)` from bumping the
+            // generation twice.
+            return Ok(());
+        }
+        let old = core.clone();
+        // HYDRATED: `write_record` rewrites the arena span from the record it is handed, so a core
+        // record would silently drop every extent this branch owns.
+        let mut rec = self.hydrate(core)?;
+        if to == BranchState::Reaped {
+            // Generation bumped, arenas cleared. The cleared list is load-bearing here rather than
+            // cosmetic: `write_record` reconciles the arena span against the record, so this is
+            // what removes the ARENA keys of a branch whose extents the reaper has just returned.
+            rec.mark_reaped();
+        } else {
+            rec.state = to;
+        }
+        self.write_record(&rec, Some(&old))?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -1387,9 +1514,7 @@ mod tests {
         let early = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
         let late = c.fork(BranchId::TRUNK, LeaseDeadline(9_000)).unwrap();
         let held = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
-        let mut h = c.get(held.branch_id).unwrap();
-        h.state = BranchState::Quarantined;
-        c.put(&h).unwrap();
+        c.set_state(held.branch_id, BranchState::Live, BranchState::Quarantined).unwrap();
 
         let ids: Vec<u64> =
             c.expired_before(1_000).unwrap().iter().map(|r| r.branch_id().id).collect();
@@ -1498,10 +1623,9 @@ mod tests {
         assert_eq!(c.max_live_child(t).unwrap(), Some(survivor.fork_epoch));
         assert!(c.live_child_in_epoch_range(t, doomed.fork_epoch, Epoch(doomed.fork_epoch.0 + 1)).unwrap());
 
-        // THE CRASH WINDOW: mark reaped, do NOT detach.
-        let mut rec = c.get(doomed.branch_id).unwrap();
-        rec.state = BranchState::Reaped;
-        c.put(&rec).unwrap();
+        // THE CRASH WINDOW: mark reaped, do NOT detach. Spelled the way `reap` spells it, so a
+        // change to what `Reaped` means reaches this fixture instead of leaving it behind.
+        c.set_state(doomed.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
 
         // The entry is still there...
         let (lo, hi) = keys::children_of(t);
@@ -1535,9 +1659,7 @@ mod tests {
         assert!(c.has_live_children(t).unwrap(), "trunk still has a live child");
 
         // Reap the survivor too: now every entry is stale and the parent is genuinely childless.
-        let mut rec = c.get(survivor.branch_id).unwrap();
-        rec.state = BranchState::Reaped;
-        c.put(&rec).unwrap();
+        c.set_state(survivor.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
         assert!(
             !c.has_live_children(t).unwrap(),
             "trunk reports live children when both are reaped - its pages would never be reclaimed"
@@ -1571,9 +1693,7 @@ mod tests {
         );
 
         // And the entry it wrote is still a HINT: reap the child and it stops counting.
-        let mut rec = c.get(child.branch_id).unwrap();
-        rec.state = BranchState::Reaped;
-        c.put(&rec).unwrap();
+        c.set_state(child.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
         assert!(!c.has_live_children(t).unwrap(), "attach_child wrote an unverifiable entry");
         let _ = std::fs::remove_file(p);
     }
@@ -1705,21 +1825,22 @@ mod tests {
         // -- a branch with arenas and a spent envelope
         let rich = src.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
 
-        let mut r = src.get(rich.branch_id).unwrap();
-        r.arenas = vec![ArenaId(3), ArenaId(11)];
-        r.envelope = Some(CapabilityEnvelope::new(0b111, 1000));
-        src.put(&r).unwrap();
+        // D41: the fixture is built with the catalog's own operations rather than by assembling a
+        // record and writing it whole. That is not only because `put` is gone from the trait — a
+        // state the engine cannot reach is a state the migration is not obliged to carry, so a
+        // hand-built record could make this test fail for a migration that is in fact correct.
+        for a in [ArenaId(3), ArenaId(11)] {
+            src.add_arena(rich.branch_id, a).unwrap();
+        }
+        src.restrict_envelope(rich.branch_id, CapabilityEnvelope::new(0b111, 1000)).unwrap();
         src.charge_row_writes(rich.branch_id, 37).unwrap();
 
-        let mut h = src.get(held.branch_id).unwrap();
-        h.state = BranchState::Quarantined;
-        src.put(&h).unwrap();
+        src.set_state(held.branch_id, BranchState::Live, BranchState::Quarantined).unwrap();
 
         // -- a reaped branch, and its parent detached, so a slot is recyclable
-        let mut d = src.get(doomed.branch_id).unwrap();
+        let d = src.get(doomed.branch_id).unwrap();
         src.detach_child(lone_parent.branch_id.id, d.fork_epoch).unwrap();
-        d.mark_reaped();
-        src.put(&d).unwrap();
+        src.set_state(doomed.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
         src.release_id(d.branch_id.id);
         // -- and recycle it, so a slot carries a non-zero generation
         let recycled = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
@@ -1730,10 +1851,9 @@ mod tests {
         // indistinguishable from a correct one - a mutant proved exactly that. Having a recycled
         // slot is not the same as having a free one.
         let spare = src.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
-        let mut sp = src.get(spare.branch_id).unwrap();
+        let sp = src.get(spare.branch_id).unwrap();
         src.detach_child(BranchId::TRUNK.id, sp.fork_epoch).unwrap();
-        sp.mark_reaped();
-        src.put(&sp).unwrap();
+        src.set_state(spare.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
         src.release_id(sp.branch_id.id);
 
         // ---- migrate -------------------------------------------------------------------------
@@ -1900,57 +2020,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Exactly what `ArenaPageStore::alloc_arena` does: read the record generation-blind, append
-    /// an arena, write it back. If this does not round-trip, the reaper frees nothing, because it
-    /// frees precisely `record.arenas`.
+    /// Exactly what `ArenaPageStore::alloc_arena` does: claim an extent through `add_arena`. If it
+    /// does not round-trip, the reaper frees nothing, because it frees precisely `record.arenas`.
+    ///
+    /// **And then: every OTHER mutator must leave the span alone.** This is a whole-file hazard
+    /// rather than one method's, because `write_record` makes the arena span match the record it is
+    /// handed — so any mutator that reads a CORE record (whose `arenas` is empty by construction)
+    /// and writes it back DELETES every extent the branch owns, silently, and the pages are lost
+    /// for the life of the file. It has happened: the page store claimed an extent, recorded it,
+    /// and the next `set_root` threw it away. Each mutator here is a separate arm because each has
+    /// its own chance to make that mistake, and **D41 added three more of them** — `reparent`,
+    /// `set_state` and `restrict_envelope` all hydrate for exactly this reason.
     #[test]
     fn an_arena_appended_the_way_the_page_store_does_it_survives_a_round_trip() {
+        use crate::branch::record::CapabilityEnvelope;
         let (c, p, _pool) = cat("arenart");
         let child = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
 
-        let mut rec = c.get_raw(child.branch_id.id).expect("get_raw");
-        assert!(rec.arenas.is_empty(), "fixture: a fresh branch owns no arena");
-        rec.arenas.push(ArenaId(7));
-        c.put(&rec).expect("put");
+        assert!(
+            c.get_raw(child.branch_id.id).expect("get_raw").arenas.is_empty(),
+            "fixture: a fresh branch owns no arena"
+        );
+        c.add_arena(child.branch_id, ArenaId(7)).expect("add_arena");
 
-        let back = c.get_raw(child.branch_id.id).expect("get_raw after put");
-        assert_eq!(back.arenas, vec![ArenaId(7)], "the arena did not survive put/get_raw");
+        let back = c.get_raw(child.branch_id.id).expect("get_raw after add_arena");
+        assert_eq!(back.arenas, vec![ArenaId(7)], "the arena did not survive add_arena/get_raw");
 
         // and a second arena appends rather than replaces
-        let mut rec = c.get_raw(child.branch_id.id).unwrap();
-        rec.arenas.push(ArenaId(9));
-        c.put(&rec).unwrap();
+        c.add_arena(child.branch_id, ArenaId(9)).unwrap();
         assert_eq!(
             c.get_raw(child.branch_id.id).unwrap().arenas,
             vec![ArenaId(7), ArenaId(9)],
             "appending a second arena lost the first"
         );
 
-        // **set_root and renew_lease must not wipe them.** They read the record, modify one field
-        // and write it back; reading a CORE record there deletes every arena, because
-        // `write_record` makes the span match the record it is handed. That is exactly what
-        // happened: the page store claimed an extent, recorded it, and the next `set_root` threw
-        // it away - so the reaper, which frees precisely `record.arenas`, returned nothing.
+        let owned = vec![ArenaId(7), ArenaId(9)];
         c.set_root(child.branch_id, 123).expect("set_root");
         assert_eq!(
-            c.get_raw(child.branch_id.id).unwrap().arenas,
-            vec![ArenaId(7), ArenaId(9)],
+            c.get_raw(child.branch_id.id).unwrap().arenas, owned,
             "set_root deleted the branch's arenas"
         );
         c.renew_lease(child.branch_id, LeaseDeadline(5_000)).expect("renew_lease");
         assert_eq!(
-            c.get_raw(child.branch_id.id).unwrap().arenas,
-            vec![ArenaId(7), ArenaId(9)],
+            c.get_raw(child.branch_id.id).unwrap().arenas, owned,
             "renew_lease deleted the branch's arenas"
         );
         assert_eq!(c.get_raw(child.branch_id.id).unwrap().root_page_id, 123, "set_root lost");
+
+        // ---- D41's three, each with its own chance to write a core record back ---------------
+        c.restrict_envelope(child.branch_id, CapabilityEnvelope::new(0b001, 500))
+            .expect("restrict_envelope");
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas, owned,
+            "restrict_envelope deleted the branch's arenas"
+        );
+        c.set_state(child.branch_id, BranchState::Live, BranchState::Quarantined)
+            .expect("set_state");
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas, owned,
+            "set_state deleted the branch's arenas"
+        );
+        c.set_state(child.branch_id, BranchState::Quarantined, BranchState::Live).unwrap();
+        // `reparent` is the one whose predecessor leaked 664 of 664 copied pages by writing back a
+        // record that had lost its extents (D13b mutant D). Re-parenting onto trunk is what
+        // `collapse` does.
+        let moved = c
+            .reparent(child.branch_id, BranchId::TRUNK, c.next_epoch(), 321)
+            .expect("reparent");
+        assert_eq!(moved.arenas, owned, "reparent returned a record with no arenas");
+        assert_eq!(
+            c.get_raw(child.branch_id.id).unwrap().arenas, owned,
+            "reparent deleted the branch's arenas — the extents copied into during a collapse are \
+             exactly the ones at risk here, and nothing else would ever free them"
+        );
+        assert_eq!(c.get_raw(child.branch_id.id).unwrap().root_page_id, 321, "reparent lost root");
 
         // and `scan` must show them too - snapshot serializes what scan yields
         let scanned = c.scan().unwrap()
             .map(|r| r.unwrap())
             .find(|r| r.branch_id.id == child.branch_id.id)
             .expect("branch missing from scan");
-        assert_eq!(scanned.arenas, vec![ArenaId(7), ArenaId(9)], "scan dropped the arenas");
+        assert_eq!(scanned.arenas, owned, "scan dropped the arenas");
+
+        // LAST, because it is the one transition that MUST clear the span: the reaper has already
+        // handed those extents back, so a record that still names them names free space. It runs
+        // after every "must not wipe" arm above, which is why those arms can assert a non-empty
+        // span at all.
+        c.set_state(child.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        assert!(
+            c.get_raw(child.branch_id.id).unwrap().arenas.is_empty(),
+            "a reaped branch still names extents that are back in the free-space map"
+        );
         let _ = std::fs::remove_file(p);
     }
 
@@ -1964,9 +2124,7 @@ mod tests {
         let (c, p, _pool) = cat("inherit");
 
         let parent = c.fork(BranchId::TRUNK, LeaseDeadline(5_000)).unwrap();
-        let mut rec = c.get(parent.branch_id).unwrap();
-        rec.envelope = Some(CapabilityEnvelope::new(0b001, 500));
-        c.put(&rec).unwrap();
+        c.restrict_envelope(parent.branch_id, CapabilityEnvelope::new(0b001, 500)).unwrap();
         assert!(c.envelope_of(parent.branch_id).unwrap().is_some(), "fixture: parent is governed");
 
         let child = c.fork(parent.branch_id, LeaseDeadline(5_000)).unwrap();
