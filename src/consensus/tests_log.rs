@@ -4,7 +4,7 @@
 //! Every test here is named for the **rule** it pins, not for the method it calls, so that a
 //! failure names the property that stopped holding. Each rule was also broken on purpose and the
 //! test watched to fail — the mutants and what each printed are recorded in
-//! `scratchpad/F0b-log.md`.
+//! `F0b-log.md` (a session scratch file that was NEVER committed -- the run is not preserved in this tree).
 
 use std::collections::BTreeMap;
 

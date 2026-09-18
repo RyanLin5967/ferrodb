@@ -1,7 +1,7 @@
 //! F2 — the replication rules, each named after the rule it pins and the loss it prevents.
 //!
 //! Every test here was run against a deliberately broken copy of the rule it names before it was
-//! believed; the mutants and what each printed are in `scratchpad/F2-replicate.md`. A test that has
+//! believed; the mutants and what each printed are in `F2-replicate.md` (a session scratch file that was NEVER committed -- the run is not preserved in this tree). A test that has
 //! not been seen to fail is not evidence.
 //!
 //! Nothing here delivers `Event::Tick` or a vote message: `on_tick` and `on_vote_msg` belong to F1

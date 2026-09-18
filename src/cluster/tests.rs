@@ -8,7 +8,7 @@
 //! `tests/integration_cluster_grants.rs`, whose binary contains nothing else.
 //!
 //! Each test names the rule it pins. Every one of them has been run against a deliberately broken
-//! copy of the rule and seen to fail — recorded in `scratchpad/F4-clusterstate.md`.
+//! copy of the rule and seen to fail — recorded in `F4-clusterstate.md` (a session scratch file that was NEVER committed -- the run is not preserved in this tree).
 
 use super::*;
 

@@ -1,5 +1,5 @@
 //! F5 — the membership rules, one named test per rule, each with a mutant recorded in
-//! `scratchpad/F5-membership.md`.
+//! `F5-membership.md` (a session scratch file that was NEVER committed -- the run is not preserved in this tree).
 //!
 //! Three things about how these are written.
 //!

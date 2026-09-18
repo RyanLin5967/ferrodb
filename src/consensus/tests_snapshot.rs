@@ -1,7 +1,7 @@
 //! F6 — the state-transfer rules, each named after the rule it pins and the loss it prevents.
 //!
 //! Every test here was run against a deliberately broken copy of the rule it names before it was
-//! believed; the mutants and what each printed are in `scratchpad/F6-mutants.txt`. A test that has
+//! believed; the mutants and what each printed are in `bench/evidence/F6-mutants.txt`. A test that has
 //! not been seen to fail is not evidence.
 //!
 //! Nothing here touches a disk. The protocol half of F6 is a pure function of its events, which is

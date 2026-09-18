@@ -2,7 +2,7 @@
 //!
 //! Every test here has been run against a deliberately broken copy of the rule it names and seen
 //! to fail; the mutants and what each printed are recorded in
-//! `scratchpad/F11-server-reaps.md` and in the summary this row files.
+//! `bench/evidence/F11-server-reaps.md` and in the summary this row files.
 //!
 //! **Nothing here arms the process for a cluster.** The authority is process-scoped and `cargo
 //! test` runs a binary's tests as threads of one process, so a unit test that joined would make
