@@ -4879,13 +4879,16 @@ mod tests {
             txn: TxnId(txn),
             fork_seq: 0,
             fork_root: 0,
-            rows: BTreeMap::new(),
-            base_rows: BTreeMap::new(),
+            // D27 made these structurally shared (`PersistentMap` / `Arc<Vec>`). None of them is
+            // read by `txn_refs_of`, which is why the index survived that change untouched — only
+            // this fixture's spelling had to follow.
+            rows: PersistentMap::new(),
+            base_rows: PersistentMap::new(),
             inherited: inherited.iter().map(|t| TxnId(*t)).collect(),
-            tables: BTreeMap::new(),
+            tables: PersistentMap::new(),
             frame: TxnFrame::new(TxnId(txn), branch, CommitHash::ZERO, 0, 1),
-            schema_edits: Vec::new(),
-            base_shapes: BTreeMap::new(),
+            schema_edits: Arc::new(Vec::new()),
+            base_shapes: PersistentMap::new(),
         }
     }
 

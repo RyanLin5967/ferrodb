@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use ferrodb::agent_sql::runtime::AgentRuntime;
 use ferrodb::agent_sql::session::AgentSession;
 use ferrodb::branch::record::{BranchRecord, CoreRecord};
-use ferrodb::branch::types::{BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use ferrodb::branch::types::{ArenaId, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use ferrodb::agent_sql::runtime::BranchResolver;
 use ferrodb::branch::{BranchCatalog, LogBranchCatalog};
 use ferrodb::error::FerroError;
@@ -141,6 +141,12 @@ impl BranchCatalog for ForkInTheWindow {
     }
     fn charge_row_writes(&self, branch: BranchId, rows: u64) -> Result<(), FerroError> {
         self.inner.charge_row_writes(branch, rows)
+    }
+    // D33 added this to the trait after this file was written. Delegating is the only correct
+    // body for a decorator: `add_arena`'s contract is that the read-modify-write happens inside
+    // the implementation's own lock, and anything reimplemented here would be outside it.
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        self.inner.add_arena(branch, arena)
     }
 }
 
