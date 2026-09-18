@@ -124,3 +124,36 @@ scale. The ratio alone separates the cases (identical code paths cannot differ 1
 10^5 pair measured the control's own spread at 2.4x under load), and 'did this measure the
 N it claims' is now read from the harness's own first column instead, which is the
 question the absolute term was badly approximating.
+
+==== LOAD GUARD, ADDED AFTER THE FIRST FIRE CHECK AND FIRED AGAINST REALITY =====
+
+The first version of this driver had no load guard: quiet_or_refuse read only the suite
+lock. Measured 2026-09-18T13:33Z, while this work was in progress, the box entered a state
+that every signal the script had said was safe:
+
+    suite lock         FREE
+    cargo processes    0
+    rustc processes    0
+    1-minute loadavg   514, then 606, then 991 on 18 cores
+    cause              another lane running 500-1200 concurrent
+                       `sh -c 'while :; do :; done'` spinners
+
+A free lock is not a quiet box, and that is a different failure from a held lock, so it is
+a different guard. Load is now read directly, at start and again before EVERY rep, because
+the state that matters is the one during the run rather than the one at launch.
+
+-- the guard, fired against the real load (not a planted fixture) --
+   REFUSING: 1-minute load average is 606.67 on 18 cores, ceiling is 36.
+     A free suite lock is not a quiet box. Blocks time out and swap at this load, so the
+     run would fail mechanically rather than noisily. Wait for the box, then re-run.
+   exit 5
+
+-- NEGATIVE CONTROL: same box, same moment, LOAD_CEILING raised above the real load --
+   4 DATA rows emitted at N=200. The guard refuses the condition, not everything.
+
+THE CEILING IS DELIBERATELY GENEROUS: 2x cores. The landed 10^5 pair was taken at load
+14-20 on this same box and is a good measurement, because the design does not depend on a
+quiet machine -- br_all is the control that sets the noise floor and the rotation cancels
+drift. What this refuses is the PATHOLOGICAL case where blocks time out or swap and the run
+fails mechanically. A strict ceiling would refuse the conditions this project actually
+measures under, and a guard that cries wolf gets walked around.

@@ -44,6 +44,13 @@
 #
 # An empty process table is NOT proof of a quiet machine: between targets a per-target suite is a
 # bash script with no cargo or rustc child at all. The authority is the suite lock plus `kill -0`.
+#
+# ⛔ AND A FREE LOCK IS NOT A QUIET BOX EITHER, which is a separate guard because it is a separate
+# failure. Measured here 2026-09-18T13:33Z: the suite lock was FREE, `ps` showed ZERO cargo and
+# ZERO rustc, and the 1-minute load average was 514 on 18 cores -- another lane was running 500+
+# `sh -c 'while :; do :; done'` spinners as a deliberate load experiment. Every signal this script
+# had at that moment said "go". So load is read directly, and it is read again before every rep,
+# because the state that matters is the one during the run and not the one at launch.
 # Disk is guarded at the START as well as per round, because a 10^6 round costs tens of minutes and
 # discovering the volume is full at the end of one wastes all of it -- that is how the third
 # attempt died. Both are guards here rather than lines in a brief, because a brief is advice the
@@ -63,6 +70,14 @@ SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 # with the volume at 786 MiB, and a round that dies at the end has cost its whole wall time.
 MIN_FREE_KB=${MIN_FREE_KB:-12582912}
 SCRATCH=${SCRATCH:-/tmp/d28_1e6}
+# 2x cores. Deliberately generous rather than strict: the landed 10^5 pair was taken at load 14-20
+# on this 18-core box and is a good measurement, because the design does not depend on a quiet
+# machine -- br_all is the control that sets the noise floor and the rotation cancels drift. What
+# this ceiling exists to refuse is the PATHOLOGICAL case, where blocks time out or swap and the
+# run fails mechanically rather than noisily. A strict ceiling here would refuse the conditions
+# this project actually measures under, and a guard that cries wolf gets walked around.
+NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
+LOAD_CEILING=${LOAD_CEILING:-$((NCPU * 2))}
 
 for b in "$ARM_A" "$ARM_B"; do
   [ -x "$b" ] || { echo "REFUSING: $b is not an executable" >&2; exit 2; }
@@ -97,6 +112,19 @@ quiet_or_refuse() {
   fi
 }
 
+load_or_refuse() {
+  local l1
+  l1=$(loadavg)
+  # Integer compare: bash has no floats, and truncating toward zero is the permissive direction.
+  if [ "${l1%%.*}" -gt "$LOAD_CEILING" ]; then
+    echo "REFUSING: 1-minute load average is $l1 on $NCPU cores, ceiling is $LOAD_CEILING." >&2
+    echo "  A free suite lock is not a quiet box. Blocks time out and swap at this load, so the" >&2
+    echo "  run would fail mechanically rather than noisily. Wait for the box, then re-run." >&2
+    echo "  Override with LOAD_CEILING= only if you can say why the number is still quotable." >&2
+    exit 5
+  fi
+}
+
 disk_or_refuse() {
   local f; f=$(free_kb)
   if [ "${f:-0}" -lt "$MIN_FREE_KB" ]; then
@@ -109,6 +137,7 @@ disk_or_refuse() {
 
 mkdir -p "$SCRATCH"
 quiet_or_refuse
+load_or_refuse
 disk_or_refuse
 
 # The data row is keyed on "first field is a bare integer", NOT on N: the harness reports
@@ -122,6 +151,7 @@ row() { awk '$1 ~ /^[0-9]+$/ && NF >= 12 { last = $0 } END { if (last != "") pri
   echo "# host: $(sysctl -n hw.ncpu) cores; loadavg at start: $(uptime | sed 's/.*averages*: //')"
   echo "# suite lock at start: $(cat "$SUITE_LOCK/owner" 2>/dev/null || echo 'none held')"
   echo "# free at start: $(free_kb) KiB on $SCRATCH"
+  echo "# load ceiling: $LOAD_CEILING on $NCPU cores"
   echo "#"
   echo "# arm A = hinted   (Pushdown::On,  as it ships)   $SHA_A"
   echo "# arm B = unhinted (Pushdown::Off, SCAFFOLD)      $SHA_B"
@@ -198,6 +228,7 @@ for rep in $(seq 1 "$REPS"); do
   # measurement. Refusing partway leaves a truncated artifact, which is honest -- the summariser
   # counts blocks and says so.
   quiet_or_refuse
+  load_or_refuse
   disk_or_refuse
   if [ $((rep % 2)) -eq 1 ]; then order="A B"; else order="B A"; fi
   pos=0
