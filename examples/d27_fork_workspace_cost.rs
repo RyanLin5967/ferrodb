@@ -163,12 +163,18 @@ fn main() {
             &mut trunk,
         );
     }
+    let seed_s = setup.elapsed().as_secs_f64();
 
     // The parent is a LIVE agent task with W rows staged and uncommitted. One statement, so the
     // working set is W and the setup is not quadratic in statement count.
     let mut parent = db.session();
     db.ok("BEGIN AGENT SESSION AS 'planner' RUN 'r1';", &mut parent);
+    // **The write path, timed on its own.** A structure that made forks cheap by making writes
+    // expensive would have moved the cost rather than removed it, and the fork columns alone
+    // cannot see that. This is W rows into a workspace map nothing else holds.
+    let stage = Instant::now();
     db.ok("UPDATE inventory SET qty = qty + 1;", &mut parent);
+    let stage_s = stage.elapsed().as_secs_f64();
     let parent_branch: BranchId = parent.agent.as_ref().unwrap().branch;
     let staged = db
         .runtime
@@ -178,7 +184,6 @@ fn main() {
         .expect("parent workspace is live")
         .staged_rows;
     assert_eq!(staged as usize, w, "parent should hold exactly W staged rows, holds {staged}");
-    let setup_s = setup.elapsed().as_secs_f64();
 
     let rss_before = peak_rss_bytes();
 
@@ -214,11 +219,22 @@ fn main() {
         n * w
     );
 
+    // **The other half of the write path: a write into a map that IS shared.** The last child's
+    // workspace shares every node with its parent and its N-1 siblings, so this statement forces
+    // a path copy for each of its W rows -- the worst case for the new structure, and the one a
+    // fork-only measurement would miss entirely.
+    let mut kid = db.session();
+    kid.agent = Some(kids.last().expect("at least one child").clone());
+    let t = Instant::now();
+    let touched = db.ok("UPDATE inventory SET qty = qty + 5;", &mut kid);
+    let child_write_s = t.elapsed().as_secs_f64();
+    drop(touched);
+
     println!(
-        "{w}\t{n}\t{}\t{setup_s:.3}\t{fork_s:.6}\t{:.3}\t{:.1}\t{:.1}",
+        "{w}\t{n}\t{}\t{seed_s:.3}\t{stage_s:.6}\t{fork_s:.6}\t{:.3}\t{child_write_s:.6}\t{:.1}\t{:.1}",
         n * w,
         (fork_s * 1e6) / n as f64,
-        rss_after as f64 / 1e6,
+        peak_rss_bytes() as f64 / 1e6,
         (rss_after.saturating_sub(rss_before)) as f64 / 1e6,
     );
 }
