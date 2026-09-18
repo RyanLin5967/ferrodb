@@ -13,8 +13,12 @@
 //! Each page is stamped with its own id, so "did this fetch return the right page" is decidable
 //! from the bytes alone rather than from anything the pool reports about itself.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+
+use ferrodb::storage::storage::Storage;
 
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::storage::disk_manager::{DiskManager, PAGE_SIZE};
@@ -232,4 +236,271 @@ fn reading_a_page_that_does_not_exist_twice_errors_twice_instead_of_panicking() 
     let real = bp.new_page().expect("allocate");
     assert!(bp.fetch_page(real).is_ok(), "a real page became unreadable after failed probes");
     bp.unpin_page(real, false);
+}
+
+// =================================================================================================
+// S22 — the two invariants the pool-wide lock used to enforce structurally.
+//
+// Until S22, `fetch_page` held one process-wide mutex from its first line to every return, across
+// `DiskManager::read`. That made both invariants below true by construction and made them true for
+// a reason that cost every thread in the process a serialised disk read. S22 replaced the single
+// lock with a per-frame latch plus an in-transit marker, so both invariants are now enforced by a
+// protocol rather than by exclusion — and a protocol is a thing that can be got wrong.
+//
+// Each test states the invariant, and each asserts something a "tidied up afterwards" pool would
+// still fail: the first samples the invariant *continuously* rather than at the end, and the second
+// counts reads that reached the disk rather than inspecting only the state left behind.
+// =================================================================================================
+
+/// A real file that counts its `pread`s, so a test can assert how many times a page reached disk.
+///
+/// This is the instrument for both tests below. "The pool ended up consistent" is a much weaker
+/// claim than "the disk was touched exactly once": a pool that loaded one page into two frames and
+/// then tidied one away would satisfy the former and fail the latter.
+struct CountingFile {
+    file: std::fs::File,
+    reads: AtomicU64,
+}
+
+impl Storage for CountingFile {
+    fn pwrite(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        self.file.pwrite(buf, offset)
+    }
+    fn pread(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.file.pread(buf, offset)
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        Storage::sync_all(&self.file)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        Storage::sync_data(&self.file)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        Storage::set_len(&self.file, len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        Storage::len(&self.file)
+    }
+}
+
+/// The same populated pool as [`pool`], over storage whose reads are counted.
+fn counting_pool(tag: &str) -> (tempfile::TempDir, Arc<BufferPoolManager>, Vec<u32>, Arc<CountingFile>) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join(format!("{tag}.db")))
+        .unwrap();
+    let storage = Arc::new(CountingFile { file, reads: AtomicU64::new(0) });
+    let counter = Arc::clone(&storage);
+    let dm = Arc::new(DiskManager::with_storage(storage as Arc<dyn Storage>).unwrap());
+    let bp = Arc::new(BufferPoolManager::new(dm));
+
+    let mut ids = Vec::with_capacity(PAGES as usize);
+    for _ in 0..PAGES {
+        let id = bp.new_page().expect("allocate");
+        let idx = bp.fetch_page(id).expect("fetch for stamping");
+        {
+            let mut frame = bp.frames[idx].write().unwrap();
+            stamp(&mut frame.data, id);
+        }
+        bp.unpin_page(id, true);
+        ids.push(id);
+    }
+    bp.flush_all().expect("flush");
+    (dir, bp, ids, counter)
+}
+
+/// **INVARIANT 1: a pinned page is never evicted.**
+///
+/// A pin is a promise that the caller may keep reading the frame index it was handed. Breaking it
+/// does not lose a write — it serves *another page's bytes* to a reader that is still holding the
+/// index, which is the failure a storage engine cannot apologise for.
+///
+/// The check is a watcher thread sampling the invariant for the whole run, not an assertion at the
+/// end. That distinction is the point of the test: an eviction that happened and was subsequently
+/// repaired leaves a consistent end state, and an end-state assertion would call it a pass.
+#[test]
+fn a_pinned_page_is_never_evicted_however_hard_the_pool_churns() {
+    let (_d, bp, ids, counter) = counting_pool("pinned");
+
+    // Pinned here and NOT unpinned until the churn is over.
+    let pinned = ids[0];
+    let home = bp.fetch_page(pinned).expect("pin the page under test");
+    assert_eq!(
+        read_stamp(&bp.frames[home].read().unwrap().data),
+        pinned,
+        "precondition: the pinned frame must start out holding its own page"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples = Arc::new(AtomicU64::new(0));
+
+    let watcher = {
+        let (bp, stop, violations, samples) =
+            (Arc::clone(&bp), Arc::clone(&stop), Arc::clone(&violations), Arc::clone(&samples));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                samples.fetch_add(1, Ordering::Relaxed);
+                let note = |s: String| violations.lock().unwrap().push(s);
+
+                let mapped = bp.page_table.read().unwrap().get(&pinned).copied();
+                if mapped != Some(home) {
+                    note(format!(
+                        "the page table moved pinned page {pinned} out of frame {home} (now {mapped:?})"
+                    ));
+                }
+                let frame = bp.frames[home].read().unwrap();
+                if frame.page_id != Some(pinned) {
+                    note(format!(
+                        "frame {home} was relabelled to {:?} while page {pinned} was pinned in it",
+                        frame.page_id
+                    ));
+                }
+                if frame.pin_counter.load(Ordering::Relaxed) == 0 {
+                    note(format!(
+                        "frame {home} lost its pin count while page {pinned} was still held"
+                    ));
+                }
+                let got = read_stamp(&frame.data);
+                if got != pinned {
+                    note(format!(
+                        "frame {home} holds page {got}'s bytes while page {pinned} is pinned in it"
+                    ));
+                }
+            }
+        })
+    };
+
+    // Churn: more distinct pages than the pool has frames, so eviction is forced by pigeonhole.
+    let reads_before = counter.reads.load(Ordering::Relaxed);
+    let mut churn = Vec::new();
+    for t in 0..8usize {
+        let (bp, ids) = (Arc::clone(&bp), ids.clone());
+        churn.push(std::thread::spawn(move || {
+            for k in 0..3000usize {
+                let id = ids[(t * 7 + k * 13) % ids.len()];
+                if id == pinned {
+                    continue;
+                }
+                if let Ok(idx) = bp.fetch_page(id) {
+                    let _ = read_stamp(&bp.frames[idx].read().unwrap().data);
+                    bp.unpin_page(id, false);
+                }
+            }
+        }));
+    }
+    for h in churn {
+        h.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().unwrap();
+    let evictions_proxy = counter.reads.load(Ordering::Relaxed) - reads_before;
+
+    // ANTI-VACUITY, both halves. Without these the test passes on a pool that never evicted
+    // anything and on a watcher that never ran.
+    assert!(
+        evictions_proxy > PAGES as u64,
+        "the churn caused only {evictions_proxy} disk reads for {PAGES} pages, so eviction \
+         pressure was not actually applied and this test proves nothing about pinning"
+    );
+    let n = samples.load(Ordering::Relaxed);
+    assert!(
+        n > 1000,
+        "the watcher only sampled the invariant {n} times, which is too few to have overlapped \
+         the churn: this test would pass without checking anything"
+    );
+
+    let v = violations.lock().unwrap();
+    assert!(
+        v.is_empty(),
+        "a pinned page was evicted. {} violations across {n} samples; first 5:\n{}",
+        v.len(),
+        v.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+    );
+    drop(v);
+
+    bp.unpin_page(pinned, false);
+}
+
+/// **INVARIANT 2: two threads faulting the same page never load it into two frames.**
+///
+/// This is the orphaned-frame race. The page table resolves the page to one of the two frames, so
+/// every write that lands in the other is silently lost. The old code prevented it by holding a
+/// pool-wide lock across the whole miss path; S22 prevents it with the `in_transit` set, so the
+/// second thread waits on *that page* rather than on the pool.
+///
+/// The decisive assertion is the read count, not the end state. A pool that loaded the page twice
+/// and left one frame orphaned would still show a single page-table entry.
+#[test]
+fn concurrent_fetches_of_one_cold_page_read_it_once_into_one_frame() {
+    let (_d, bp, ids, counter) = counting_pool("onepage");
+
+    const ROUNDS: usize = 40;
+    const THREADS: usize = 16;
+
+    for round in 0..ROUNDS {
+        // Cold start, so the fetch below is a guaranteed miss and the threads genuinely race to
+        // load it. Nothing is pinned or dirty between rounds, so this cannot refuse.
+        bp.invalidate_all().expect("nothing is pinned between rounds");
+        let target = ids[(round * 37) % ids.len()];
+
+        let before = counter.reads.load(Ordering::Relaxed);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut hs = Vec::new();
+        for _ in 0..THREADS {
+            let (bp, barrier) = (Arc::clone(&bp), Arc::clone(&barrier));
+            hs.push(std::thread::spawn(move || {
+                barrier.wait();
+                let idx = bp.fetch_page(target).expect("fetch the target page");
+                let got = read_stamp(&bp.frames[idx].read().unwrap().data);
+                bp.unpin_page(target, false);
+                (idx, got)
+            }));
+        }
+        let got: Vec<(usize, u32)> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        let reads = counter.reads.load(Ordering::Relaxed) - before;
+
+        // 1. Every thread was handed the same frame.
+        let frames_used: BTreeSet<usize> = got.iter().map(|&(i, _)| i).collect();
+        assert_eq!(
+            frames_used.len(),
+            1,
+            "round {round}: {THREADS} concurrent fetches of page {target} were handed \
+             {} different frames {frames_used:?} — the page is in the pool twice and every write \
+             to the frame the page table does not name is lost",
+            frames_used.len()
+        );
+
+        // 2. And the pool itself carries the label exactly once.
+        let labelled: Vec<usize> = (0..bp.frames.len())
+            .filter(|&i| bp.frames[i].read().unwrap().page_id == Some(target))
+            .collect();
+        assert_eq!(
+            labelled.len(),
+            1,
+            "round {round}: page {target} is labelled in frames {labelled:?}"
+        );
+
+        // 3. The strong form, and the anti-vacuity check in the same assertion. `> 1` means the
+        //    page was loaded more than once even if the pool tidied up afterwards; `0` would mean
+        //    the page was already resident and the round raced nothing at all.
+        assert_eq!(
+            reads, 1,
+            "round {round}: {THREADS} concurrent fetches of cold page {target} caused {reads} \
+             disk reads, expected exactly 1"
+        );
+
+        // 4. And every thread saw that page's own bytes.
+        for &(i, s) in &got {
+            assert_eq!(
+                s, target,
+                "round {round}: frame {i} returned page {s}'s bytes for a fetch of page {target}"
+            );
+        }
+    }
 }
