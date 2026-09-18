@@ -1,0 +1,55 @@
+# S22 AFTER — per-frame latch + in-transit marker + declined-victim reinstate (HEAD b3da0de)
+# SAME harness binary and parameters as the BEFORE file. Only src/buffer/buffer_pool.rs differs.
+# run at 2026-09-18T04:07:11Z, loadavg: 27.55 23.68 22.25
+
+===== FAULT ARM: modelled IO, 500us per read =====
+# S22 buffer pool fault concurrency
+# pages=8192 pool_frames=1024 fetches_per_thread=500 repeats=1
+# arm=OVERSUBSCRIBED (working set exceeds the pool; every fetch is a page FAULT)
+# mode=modelled IO, 500 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.335	500	1492	500	1.000	0	0
+2	0.334	1000	2996	1000	1.000	0	0
+4	0.339	2000	5892	2000	1.000	0	0
+8	0.360	4000	11100	4000	1.000	0	0
+16	0.341	8000	23457	8000	1.000	0	0
+
+# calibration: 1 thread measured 1492 faults/s, 1/delay = 2000 faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 1492 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	1492		x1.00		x1.00
+# 2	2996		x2.01		x2.00
+# 4	5892		x3.95		x4.00
+# 8	11100		x7.44		x8.00
+# 16	23457		x15.72		x16.00
+HARNESS_EXIT=0
+
+===== HIT ARM: resident working set, no IO at all, repeats=200 =====
+# S22 buffer pool fault concurrency
+# pages=512 pool_frames=1024 fetches_per_thread=4000 repeats=200
+# arm=RESIDENT (working set fits the pool; every fetch is a cache HIT)
+# mode=modelled IO, 0 us per read
+# host: 18 cores
+
+threads	wall_s	fetches	faults_per_s	reads	reads_per_fetch	refused	wrong
+1	0.119	800000	6732484	511	0.001	0	0
+2	0.347	1600000	4617008	0	0.000	0	0
+4	0.861	3200000	3715223	0	0.000	0	0
+8	1.611	6400000	3972197	0	0.000	0	0
+16	4.561	12800000	2806551	0	0.000	0	0
+
+# calibration: 1 thread measured 6732484 faults/s, 1/delay = inf faults/s
+# (sleep granularity puts measured below ideal; the RATIO across thread counts is the result)
+
+# serialised bound = 6732484 faults/s at every thread count
+# threads	measured	vs_1_thread	perfect_scaling
+# 1	6732484		x1.00		x1.00
+# 2	4617008		x0.69		x2.00
+# 4	3715223		x0.55		x4.00
+# 8	3972197		x0.59		x8.00
+# 16	2806551		x0.42		x16.00
+HARNESS_EXIT=0

@@ -1472,6 +1472,27 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
             //
             // A field that failed any of those three would be a governance hole, not a list entry.
             "published_txns",
+            // W4's, added by the merge at `23f9a2d` (commit `a4f6d16`). Declared here only after
+            // making the determination this assertion demands, and it is NOT a second funnel:
+            //
+            //   * it is keyed by TRANSACTION id, not by branch, so it is not per-branch state at all.
+            //   * it is PURELY DERIVED from `workspaces`: `State::audit_txn_refs` re-derives the whole
+            //     index by brute force and asserts equality, and it runs at BOTH doors in debug, so
+            //     every fork and every seal in the suite is a differential test of the index against
+            //     the scan it replaced. A statement cannot write it independently of the workspace it
+            //     mirrors -- and that is fire-checked, not asserted: two `#[should_panic(expected =
+            //     "txn_refs disagrees with a scan")]` tests poke the index directly and require the
+            //     audit to fire.
+            //   * its two write sites are `insert_workspace` and `remove_workspace`, which the field's
+            //     own doc names as the ONLY doors into `workspaces` for exactly this reason -- an
+            //     insert that went straight to the map would leave it under-counted, and an
+            //     under-count makes `capture_is_protected` answer "nothing needs this" about a capture
+            //     a live task is standing on, which is the F6 data loss reached by a new door.
+            //
+            // So it ADMITS no write: it is an O(log n) index replacing an O(open sessions) scan, and
+            // `stage_all` remains the single write funnel the envelope governs. A field that failed
+            // any of those three would be a governance hole, not a list entry.
+            "txn_refs",
             "policy",
         ],
         "the fields of `AgentRuntime`'s `State` have changed. If a new one holds per-branch state \
