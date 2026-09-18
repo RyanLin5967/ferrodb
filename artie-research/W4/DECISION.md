@@ -223,6 +223,9 @@ Largest wait an unrelated statement suffered (`stall`) and the sweep's own wall 
 median of 5 fixtures, nanoseconds. **`wall` is the column that matters for the server's statement
 lock**, because `scan_once` holds that lock for the whole call — `stall` is only the `State` mutex.
 
+**⚠ SUPERSEDED TABLE — kept so the record shows what it said. Its `stall` column was produced by
+the uncorrected instrument (see 14d796c); do not quote it. The re-measured table follows.**
+
 | S | arm | stall_med | wall_med |
 |---|---|---|---|
 | 1 000 | recon | 104 875 | 269 208 |
@@ -232,16 +235,37 @@ lock**, because `scan_once` holds that lock for the whole call — `stall` is on
 | 100 000 | recon | 530 125 | 24 493 958 |
 | 100 000 | **fast** | **56 542** | **135 458** |
 
-The shape is the result, not the ratio. `recon`'s wall rises 91x across 100x S (269 us -> 4.05 ms ->
-24.5 ms) — the O(open sessions) term, measured. `fast`'s wall has no trend across the same range
-(76 us -> 258 us -> 135 us); it is O(gone), and `gone` is fixed at 64. At S=10^5 that is 181x less
-time holding the pgwire statement lock, and unlike the `recon` column it does not get worse as more
-agents connect.
+#### Re-measured with the corrected instrument
 
-Read the `fast` spread with the same caution the record applies to the after-column above: this
-machine's idle control reached 20.8 ms in table 1 with nothing holding the lock at all, so the
-single-sample maxima here sit near the floor this machine can resolve. The claim that survives is
-the `recon` wall column's slope, which is far above that floor.
+`statement-lock-FASTPATH.txt` was re-run at the merged tip. Two probe spacings, because one cannot
+answer both questions: **50 µs** is what every earlier artifact here used, so those rows compare
+with BEFORE/AFTER; **5 µs** is tight enough to resolve the fast arm, whose sweep is ~100 µs and can
+fall between two 50 µs probes. Both runs are kept and the WORSE of the two is quoted, because on a
+loaded machine they disagree by ~30 % and picking the better one would hide that. `wall_med`,
+nanoseconds:
+
+| S | recon (A / B) | fast (A / B) |
+|---|---|---|
+| 1 000 | 233 708 / 282 000 | 77 042 / 80 750 |
+| 10 000 | 2 032 792 / 2 279 042 | 115 000 / 113 375 |
+| 100 000 | 23 075 667 / 23 579 666 | 131 625 / 174 709 |
+
+The shape is the result, not the ratio. `recon`'s wall rises **99x (A) / 84x (B)** across 100x S —
+the O(open sessions) term, measured twice. `fast`'s rises **1.7x / 2.2x**, which is no trend: it is
+O(gone), and `gone` is fixed at 64. At S=10⁵ that is **175x (A) / 135x (B)** less time holding the
+pgwire statement lock, and unlike `recon` it does not worsen as more agents connect.
+
+**The conclusion is unchanged from the superseded table, and that is the point of re-running rather
+than annotating.** The instrument defect touched `stall` only — `wall` is timed around the sweep
+call itself — so the 91x/181x quoted above and the 99x/175x measured here are the same result with
+and without the fix. The `stall` column really did move: `recon` at 10⁵ went 2 566 µs → 1 002 µs
+max, so the old maxima were carrying warm-up noise exactly as 14d796c said.
+
+Two honest limits recorded rather than smoothed over. Run A reports **1 blind fixture** at S=1 000
+`fast` — no probe acquisition overlapped a sweep that short — and exits **non-zero** because of it;
+run B at 5 µs resolves that cell (0 blind) and exits 0. And run B's idle control (396–455 ns) is
+comparable to run A's, which is what says the busier prober is not adding contention of its own; a
+tighter probe that inflated the idle arm would have bought sensitivity with bias.
 
 ### What this still does not fix
 
@@ -385,3 +409,17 @@ its own numbers.
 - `workspaces` lookups are still generation-blind. The escrow half is fixed; the map is not.
 - The reconciliation's own wall time is still O(open sessions) on the error path, inside the
   server's statement lock. Addendum 1's closing note stands.
+
+- **The oneshot instrument defect (14d796c) reached this record's own addendum, and the fix to the
+  harness needed a fix of its own.** The addendum's first result table is marked superseded above
+  and re-measured beneath it; the conclusion did not move, because the defect touched `stall` and
+  the claim rests on `wall`.
+
+  The refusal 14d796c added — no probe overlapped the sweep, so report nothing rather than zero —
+  was right and fired on its first real use. But it was an `assert!`, so **one unobservable cell
+  killed the whole run**: the re-measurement lost the S=10⁵ row, which is the row the headline
+  quotes. It is now refused per fixture instead: the cell prints `--`, the run continues, and the
+  process exits non-zero if any fixture was blind. No number is invented for a sweep nobody saw,
+  and the cells that were measured survive. The probe spacing is a parameter for the same reason —
+  a sweep too short to see at 50 µs is a fact about the instrument, and the answer is to change the
+  instrument and say so, not to quote the blind cell as fast.

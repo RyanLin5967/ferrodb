@@ -158,9 +158,17 @@ fn fixture(s: usize) -> (Arc<AgentRuntime>, Vec<AgentSession>) {
 /// fixture has `gone = 0` and measures nothing. The periodic arm cannot be used here at all, and
 /// rebuilding the fixture is the only honest way to take more than one sample. Each rep
 /// contributes the prober's largest stall while that single sweep ran.
-fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples) {
+fn oneshot(
+    s: usize,
+    g: usize,
+    reps: usize,
+    targeted: bool,
+    probe_ns: u64,
+) -> (Samples, Samples, usize) {
     let mut stalls: Vec<u64> = Vec::with_capacity(reps);
     let mut walls: Vec<u64> = Vec::with_capacity(reps);
+    // Fixtures whose sweep no probe acquisition overlapped; see the refusal below.
+    let mut blind = 0usize;
     for _ in 0..reps {
         let (rt, sessions) = fixture(s);
         // Reap `g` branches behind the runtime's back -- exactly what the lease reaper does, and
@@ -189,7 +197,7 @@ fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples
                     t0.duration_since(base).as_nanos() as u64,
                     t0.elapsed().as_nanos() as u64,
                 ));
-                std::thread::sleep(Duration::from_micros(50));
+                std::thread::sleep(Duration::from_nanos(probe_ns));
             }
             out
         });
@@ -221,18 +229,31 @@ fn oneshot(s: usize, g: usize, reps: usize, targeted: bool) -> (Samples, Samples
             .map(|(_, dur)| *dur)
             .collect();
         // Zero overlapping samples is a fact about the run, not a zero stall: a sweep shorter than
-        // the 50 us probe interval can finish between two acquisitions. Refusing is the only
-        // honest reading -- reporting 0 would say "never blocked" about something never observed.
-        assert!(
-            !overlapping.is_empty(),
-            "no probe acquisition overlapped the sweep (sweep {} ns, {} samples); the prober              cannot see a sweep this short -- lower the probe interval or raise S",
-            sweep_end - sweep_start,
-            samples.len()
-        );
-        stalls.push(Samples::of(overlapping).max());
+        // the probe interval can finish between two acquisitions. Refusing is the only honest
+        // reading -- reporting 0 would say "never blocked" about something never observed.
+        //
+        // **Refused PER SAMPLE rather than by panicking the process.** This used to assert, which
+        // meant one unobservable cell destroyed every row after it: the run that found it lost the
+        // S=10^5 row entirely, which is the row the headline quotes. The guard's meaning is
+        // unchanged -- no number is invented for a sweep nobody saw -- but the cells that WERE
+        // measured survive, and `blind` is carried out so the caller can print "--" instead of a
+        // figure and exit non-zero. A blind cell is a fact about the instrument's resolution
+        // against this sweep, and at these sizes it is itself a result: the fast path's lock hold
+        // is short enough to fall between two probes.
+        if overlapping.is_empty() {
+            blind += 1;
+            eprintln!(
+                "# BLIND: no probe overlapped a {} ns sweep (S={s} g={g} targeted={targeted}, \
+                 {} samples at {probe_ns} ns spacing)",
+                sweep_end - sweep_start,
+                samples.len()
+            );
+        } else {
+            stalls.push(Samples::of(overlapping).max());
+        }
         drop(sessions);
     }
-    (Samples::of(stalls), Samples::of(walls))
+    (Samples::of(stalls), Samples::of(walls), blind)
 }
 
 fn mean(s: &Samples) -> u64 {
@@ -274,6 +295,11 @@ fn main() {
     );
     let gone: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(64);
     let reps: usize = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(7);
+    // Prober spacing, nanoseconds. Default 50 us, the value every artifact before this used.
+    // Lower it to resolve a sweep short enough to fall between two probes -- at the cost of a
+    // busier prober, which is itself contention, so the idle control is what says whether a
+    // tighter setting is still honest.
+    let probe_ns: u64 = std::env::args().nth(6).and_then(|s| s.parse().ok()).unwrap_or(50_000);
 
     println!(
         "# W4 statement-lock sweep. os={} window={:?} op_period={:?} gone={} reps={}",
@@ -335,30 +361,50 @@ fn main() {
     println!("# every open session and is the BACKSTOP the lease thread now runs only when a scan");
     println!("# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,");
     println!("# which is what `scan_once` calls on every successful tick: O(gone), not O(S).");
+    println!("#");
+    println!("# `blind` counts fixtures whose sweep NO probe acquisition overlapped -- the sweep");
+    println!("# finished between two probes {probe_ns} ns apart. Those contribute no stall sample and");
+    println!("# stall_* reads `--` when every fixture in the cell was blind. That is a fact about");
+    println!("# this instrument's resolution, not a zero: a sweep nobody saw is unmeasured, not");
+    println!("# fast. wall_* is timed around the sweep call itself and is never blind.");
     println!(
-        "{:>8} {:>7} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
-        "S", "gone", "reps", "arm", "stall_med", "stall_max", "wall_med", "wall_max"
+        "{:>8} {:>7} {:>6} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
+        "S", "gone", "reps", "arm", "blind", "stall_med", "stall_max", "wall_med", "wall_max"
     );
+    let mut any_blind = false;
     for &s in &sweep {
         let g = gone.min(s);
         for (name, targeted) in [("recon", false), ("fast", true)] {
             let t0 = Instant::now();
-            let (stalls, walls) = oneshot(s, g, reps, targeted);
+            let (stalls, walls, blind) = oneshot(s, g, reps, targeted, probe_ns);
             eprintln!(
-                "# T2 S={s} g={g} {name}: {reps} fixtures in {} ms",
+                "# T2 S={s} g={g} {name}: {reps} fixtures in {} ms ({blind} blind)",
                 t0.elapsed().as_millis()
             );
+            any_blind |= blind > 0;
+            let (med, max) = if stalls.n() == 0 {
+                ("--".to_string(), "--".to_string())
+            } else {
+                (stalls.pct(0.50).to_string(), stalls.max().to_string())
+            };
             println!(
-                "{:>8} {:>7} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
+                "{:>8} {:>7} {:>6} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
                 s,
                 g,
                 reps,
                 name,
-                stalls.pct(0.50),
-                stalls.max(),
+                blind,
+                med,
+                max,
                 walls.pct(0.50),
                 walls.max(),
             );
         }
+    }
+    if any_blind {
+        println!("#");
+        println!("# EXIT 1: at least one fixture's sweep was never observed by the prober. The wall");
+        println!("# columns stand; the affected stall cells are unmeasured and must not be quoted.");
+        std::process::exit(1);
     }
 }

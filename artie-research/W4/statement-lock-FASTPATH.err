@@ -1,9 +1,19 @@
 # T1 S=1000: opened 1000 sessions in 1 ms
-# T1 S=10000: opened 10000 sessions in 30 ms
-# T1 S=100000: opened 100000 sessions in 1280 ms
-# T2 S=1000 g=64 recon: 5 fixtures in 122 ms
-# T2 S=1000 g=64 fast: 5 fixtures in 132 ms
-# T2 S=10000 g=64 recon: 5 fixtures in 318 ms
-# T2 S=10000 g=64 fast: 5 fixtures in 455 ms
-# T2 S=100000 g=64 recon: 5 fixtures in 8449 ms
-# T2 S=100000 g=64 fast: 5 fixtures in 8479 ms
+# T1 S=10000: opened 10000 sessions in 28 ms
+# T1 S=100000: opened 100000 sessions in 1556 ms
+# T2 S=1000 g=64 recon: 5 fixtures in 121 ms (0 blind)
+# BLIND: no probe overlapped a 57667 ns sweep (S=1000 g=64 targeted=true, 290 samples at 50000 ns spacing)
+# T2 S=1000 g=64 fast: 5 fixtures in 124 ms (1 blind)
+# T2 S=10000 g=64 recon: 5 fixtures in 263 ms (0 blind)
+# T2 S=10000 g=64 fast: 5 fixtures in 251 ms (0 blind)
+# T2 S=100000 g=64 recon: 5 fixtures in 7069 ms (0 blind)
+# T2 S=100000 g=64 fast: 5 fixtures in 7506 ms (0 blind)
+# T1 S=1000: opened 1000 sessions in 1 ms
+# T1 S=10000: opened 10000 sessions in 32 ms
+# T1 S=100000: opened 100000 sessions in 1305 ms
+# T2 S=1000 g=64 recon: 5 fixtures in 115 ms (0 blind)
+# T2 S=1000 g=64 fast: 5 fixtures in 121 ms (0 blind)
+# T2 S=10000 g=64 recon: 5 fixtures in 264 ms (0 blind)
+# T2 S=10000 g=64 fast: 5 fixtures in 257 ms (0 blind)
+# T2 S=100000 g=64 recon: 5 fixtures in 6873 ms (0 blind)
+# T2 S=100000 g=64 fast: 5 fixtures in 7359 ms (0 blind)

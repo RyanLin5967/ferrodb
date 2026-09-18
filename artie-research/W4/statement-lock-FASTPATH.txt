@@ -1,9 +1,26 @@
 # W4 FAST PATH -- forget_branches(&reaped) vs the full reconciliation.
-# Same harness, same prober, same protocol as statement-lock-BEFORE/AFTER.txt.
+# Measured at 5c8583a+ with the CORRECTED overlap instrument (14d796c).
 # host: Apple M5 Pro; rustc 1.97.1 (8bab26f4f 2026-07-14)
-# NOTE: the agent fleet was running throughout, as it was for every other file here.
-# TABLE 2 carries the new arms; TABLE 1 is unchanged and is reproduced as a control.
+#
+# The first version of this file was produced by the UNCORRECTED instrument, which took
+# the prober's max over its whole thread lifetime and so credited the sweep with warm-up
+# and tail intervals where nothing held the lock. That affected the stall_* columns ONLY;
+# wall_* is timed around the sweep call itself and was never affected. wall is the column
+# this lane's claim rests on, because scan_once holds the pgwire per-statement lock for
+# the whole call, not just the part that takes the State mutex.
+#
+# TWO PROBE SPACINGS, because one cannot answer both questions:
+#   50us -- the spacing every earlier artifact in this directory used, so these rows are
+#           comparable with BEFORE/AFTER. It cannot resolve the fast arm: that sweep is
+#           ~100us and falls between two probes, which shows up as blind cells.
+#    5us -- tight enough to see the fast arm. A busier prober is itself contention, so
+#           compare its TABLE 1 idle control against the 50us one before trusting it.
+#
+# LOAD: agent fleet and a full verify-suite running throughout.
+#   uptime: 0:08  up 14 days,  4:20, 23 users, load averages: 25.66 24.39 22.66
+#   concurrent cargo test jobs: 9
 
+############ RUN A -- probe spacing 50us (comparable with earlier artifacts) ############
 # W4 statement-lock sweep. os=macos window=3s op_period=2ms gone=64 reps=5
 # prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)
 # probe_* = one unrelated statement's lock acquisition, NANOSECONDS
@@ -14,15 +31,15 @@
        S     arm   probe_n      p50       p999  stall_mean   probe_max    op_n     op_mean      op_max
 #
 # TABLE 1 -- steady state: nothing is reap-eligible, so only PHASE 1 runs.
-    1000    idle     42159       42        792         617       46042    1257        5431     1997625
-    1000   sweep     40830       42     132791       57122      595833    1261      136042      544500
-    1000   activ     40117       42     233750      157539      416709    1267      228199      390791
-   10000    idle     35218       42        792         824      128458    1067      642544    10994375
-   10000   sweep     20366    64750    3413916      401653    14033375    1247     2140136    30546125
-   10000   activ      5746       83   17483500     2566587    24538750     990     3026014    23641917
-  100000    idle     28872       83        833         712       50083     932     1113969    20851250
-  100000   sweep     15692      417    5792667     3977991    16578917     108    28039936    61618583
-  100000   activ      4992       83   29827792    24947262    62292541     105    28750856    66048459
+    1000    idle     37208       84       1209         658       31334    1101      623526    10082000
+    1000   sweep     40993       42     128417       56672      267916    1261      136661      295291
+    1000   activ     37226       42     236208      153387      392667    1264      222416      447083
+   10000    idle     41835       42        542         467       27417    1252       39514    10008750
+   10000   sweep     24613    23625     572292      200176     4168959    1401     1512529     5683250
+   10000   activ      6247      125    3726917     1969206     9271917    1283     2336138     8013708
+  100000    idle     41489       42        542         470       49125    1256       28313    10035333
+  100000   sweep     24966    50000     580833      529457     1601500     134    22502055    25360167
+  100000   activ      5478       42   24073042    22207986    25511583     118    25448385    29026250
 #
 # TABLE 2 -- a reap really happened: 64 of the S branches are gone from the
 # catalog, so PHASE 3 runs as well. One sweep per fresh fixture, 5 fixtures;
@@ -32,10 +49,64 @@
 # every open session and is the BACKSTOP the lease thread now runs only when a scan
 # failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,
 # which is what `scan_once` calls on every successful tick: O(gone), not O(S).
-       S    gone   reps    arm    stall_med    stall_max     wall_med     wall_max
-    1000      64      5  recon       104875       144542       269208       309667
-    1000      64      5   fast          833       144667        76417       183084
-   10000      64      5  recon       716583      2677000      4054250      4912875
-   10000      64      5   fast       118875       195292       257708       485292
-  100000      64      5  recon       530125      2565667     24493958     27702708
-  100000      64      5   fast        56542       109750       135458       173875
+#
+# `blind` counts fixtures whose sweep NO probe acquisition overlapped -- the sweep
+# finished between two probes 50000 ns apart. Those contribute no stall sample and
+# stall_* reads `--` when every fixture in the cell was blind. That is a fact about
+# this instrument's resolution, not a zero: a sweep nobody saw is unmeasured, not
+# fast. wall_* is timed around the sweep call itself and is never blind.
+       S    gone   reps    arm  blind    stall_med    stall_max     wall_med     wall_max
+    1000      64      5  recon      0        83750       114416       233708       248583
+    1000      64      5   fast      1        76792        78208        77042       114208
+   10000      64      5  recon      0       168167       455167      2032792      2242792
+   10000      64      5   fast      0        52208       120708       115000       137583
+  100000      64      5  recon      0       398334      1002208     23075667     25215792
+  100000      64      5   fast      0        76625       150000       131625       225958
+#
+# EXIT 1: at least one fixture's sweep was never observed by the prober. The wall
+# columns stand; the affected stall cells are unmeasured and must not be quoted.
+# run A exit: 1
+
+############ RUN B -- probe spacing 5us (resolves the fast arm) ############
+# W4 statement-lock sweep. os=macos window=3s op_period=2ms gone=64 reps=5
+# prober = AgentRuntime::quarantine_reason (acquires the state lock, reads an empty map)
+# probe_* = one unrelated statement's lock acquisition, NANOSECONDS
+# stall_mean = mean of the op_n largest probe samples: one acquisition blocks per op,
+#           so this averages the population that waited. THE HEADLINE NUMBER.
+# op_*    = the arm's own operation, wall, NANOSECONDS (sweep wall is dominated by
+#           phase 2, which holds NO lock -- it is not the blocking number)
+       S     arm   probe_n      p50       p999  stall_mean   probe_max    op_n     op_mean      op_max
+#
+# TABLE 1 -- steady state: nothing is reap-eligible, so only PHASE 1 runs.
+    1000    idle     33184       42        750         904       90125     732     2841329    11881167
+    1000   sweep     32712       83     270041       85273     1876750    1244      187275     2001084
+    1000   activ     27799       42    2050208      351041    11322958    1150      458235    11352208
+   10000    idle     41029       42        542         455       14291    1266       24187    10004875
+   10000   sweep     18084       84    9847916     1664294    42625916     583     4559637    78447042
+   10000   activ      5514       83   33842000     3425883    75408250     743     4038929    89228250
+  100000    idle     38841       42        584         396        3750    1033     1193270    16915583
+  100000   sweep     20457    58958    2317792     1483369    16504750     127    23703852    31591375
+  100000   activ      5102       42   53842750    32197004    70417625      82    36695115    73894625
+#
+# TABLE 2 -- a reap really happened: 64 of the S branches are gone from the
+# catalog, so PHASE 3 runs as well. One sweep per fresh fixture, 5 fixtures;
+# stall_* is the prober's largest wait during that single sweep, NANOSECONDS.
+#
+# TWO ARMS. `recon` is `forget_reaped_branches` -- the reconciliation, which walks
+# every open session and is the BACKSTOP the lease thread now runs only when a scan
+# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,
+# which is what `scan_once` calls on every successful tick: O(gone), not O(S).
+#
+# `blind` counts fixtures whose sweep NO probe acquisition overlapped -- the sweep
+# finished between two probes 5000 ns apart. Those contribute no stall sample and
+# stall_* reads `--` when every fixture in the cell was blind. That is a fact about
+# this instrument's resolution, not a zero: a sweep nobody saw is unmeasured, not
+# fast. wall_* is timed around the sweep call itself and is never blind.
+       S    gone   reps    arm  blind    stall_med    stall_max     wall_med     wall_max
+    1000      64      5  recon      0       135208       205583       282000       684791
+    1000      64      5   fast      0        50542       106125        80750       142875
+   10000      64      5  recon      0       234833       264333      2279042      2644041
+   10000      64      5   fast      0        79709       112792       113375       140667
+  100000      64      5  recon      0       542875      1732375     23579666     26599917
+  100000      64      5   fast      0       110208       146500       174709       247750
+# run B exit: 0
