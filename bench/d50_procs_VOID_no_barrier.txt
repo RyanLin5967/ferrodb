@@ -1,0 +1,58 @@
+D50 DISCRIMINATOR — separate client PROCESSES: ⛔ ALSO VOID, and it refutes my own fix
+====================================================================================
+[HERE] 2026-09-18T22:38:18Z, this session.
+
+# seeded and verified
+# clients   total_stmt_s   per_client   total_vs_1C   (SEPARATE PROCESSES, one server)
+       1          16676        16676         1.000
+       2          23036        11518         1.381
+       4          22464         5616         1.347
+       8          19334         2417         1.159
+      16          19508         1219         1.170
+# cleanup: server 652 down
+
+READ AGAINST THE THREADED RUN
+-----------------------------
+  clients   threaded, 1 server   threaded, 16 servers   PROCESSES, 1 server
+        1                1.000                  1.000                 1.000
+        2                1.959                  1.971                 1.381
+        4                1.959                  2.106                 1.347
+        8                1.378                  1.341                 1.159
+       16                1.348                  1.350                 1.170
+
+⛔ THE GIL HYPOTHESIS IS REFUTED. Separate processes share no GIL and are no better —
+   slightly WORSE at 2 and 4 clients. So the ceiling the threaded run hit is not the GIL,
+   and the explanation I wrote into the VOID artifact was wrong. Corrected here, at the
+   claim, rather than left standing.
+
+⛔ AND THIS RUN IS VOID TOO, FOR A DEFECT OF ITS OWN: it has NO CROSS-PROCESS BARRIER.
+   The threaded harness starts every client on a threading.Barrier so all N measure the
+   same wall window. Sixteen separate python processes each start when they start — import
+   included — and each times its own 2 s. Summing those and dividing by 2 s assumes an
+   overlap that was never enforced. The number is not wrong by a caveat; it is a sum over
+   windows that do not line up.
+
+WHAT THE THREE RUNS TOGETHER DO ESTABLISH
+-----------------------------------------
+All three plateau near 20,000 statements/s in TOTAL regardless of server count, client
+count, or GIL. Giving every client its own SERVER (16 independent Mutex<Catalog>s) moved
+nothing. A harness that cannot separate when the suspected wall is REMOVED has not reached
+that wall — so it cannot see it, in either direction.
+
+⇒ The instrument is the problem, and the honest report is that D50 is NOT ANSWERED.
+  A Python wire client costs ~60 us per statement at one client. Whatever ferrodb's
+  serialization limit is, this client cannot push hard enough to find it.
+
+WHAT NEEDED NO MEASUREMENT AND IS SETTLED
+-----------------------------------------
+  src/execution/executor.rs:60   pub fn run(stmt: Stmt, catalog: &mut Catalog, ...)
+  src/pgwire/mod.rs:64           pub catalog: Mutex<Catalog>
+  src/pgwire/mod.rs:100          'the catalog mutex ... is taken OUTERMOST, for the
+                                  duration of a single statement, and released before
+                                  the next message is read'
+
+ferrodb's server executes ONE STATEMENT AT A TIME, GLOBALLY, across all connections, and
+the &mut in executor::run is what forces it. That is a type-level and documented fact, not
+an inference. ⚠ But 'it must serialize' is a PREDICTION about the curve, and one hour
+before this file was written a careful read of turso's source produced a prediction that
+the run falsified. So the prediction stands unmeasured, and is labelled as such.

@@ -30,10 +30,16 @@ echo "# clients   total_stmt_s   per_client   total_vs_1C   (SEPARATE PROCESSES,
 BASE=""
 for N in 1 2 4 8 16; do
   OUT=$(mktemp)
+  # Collect the CLIENT pids and wait on THOSE. A bare `wait` waits for every child of this
+  # shell, and one of them is the SERVER, which never exits -- so the first version of this
+  # loop hung forever at N=1 with the header already printed, which reads exactly like a slow
+  # run. Wait on what you started, never on "everything".
+  CPIDS=()
   for i in $(seq 0 $((N-1))); do
     python3 bench/d50_one_client.py 127.0.0.1 "$PORT" $(( (i*97) % 200 + 1 )) 2 >> "$OUT" &
+    CPIDS+=($!)
   done
-  wait
+  for p in "${CPIDS[@]}"; do wait "$p"; done
   tot=$(awk '{i+=$1; r+=$2; e+=$3} END{print i" "r" "e}' "$OUT")
   set -- $tot; iters=$1; rows=$2; errs=$3
   lines=$(wc -l < "$OUT"); rm -f "$OUT"
