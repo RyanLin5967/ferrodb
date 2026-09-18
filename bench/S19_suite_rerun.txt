@@ -1,0 +1,28 @@
+rerun after cargo build --examples, 2026-09-18T03:29:30Z
+integration_base_backup: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.75s
+integration_cdc_diff: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.13s
+integration_cdc_duckdb_sink: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.44s
+integration_cdc_go_consumer: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+integration_cdc_latency: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+integration_cdc_sink: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+integration_cdc_stream: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+integration_checkpoint_pressure: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.08s
+integration_consensus_failover: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.29s
+integration_crash_safety: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s
+integration_fork_kill9: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+integration_pgwire: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.69s
+integration_readme_commands: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.65s
+integration_replication_e2e: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+integration_server_reaps: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+integration_server_stdout: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.13s
+integration_system_views_wire: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+FINAL TALLY (rerun result wins for the 16 targets it covers)
+  lib:                  1274 passed, 0 failed, 1 ignored
+  integration targets:  95, all ok
+  integration tests:    1940 passed, 0 failed
+  targets collecting nothing: 0
+NOTE: the 16 targets that failed in the first sweep all failed on the same
+staleness assert -- "cargo test does not rebuild examples, so this would test a
+stale binary". `cargo build --examples` after changing src/ is required, and all
+16 pass after it. Not a regression from this branch.
