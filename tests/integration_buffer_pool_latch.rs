@@ -105,6 +105,17 @@ impl GatedStorage {
         self.cv.notify_all();
     }
 
+    /// Read a page straight out of the image, bypassing the gate entirely.
+    ///
+    /// This is how a test asks "has the write-back actually landed yet?" without becoming the
+    /// thing it is measuring -- going through the pool would answer from the frame, and going
+    /// through `pread` would park on the gate.
+    fn raw_page(&self, page_id: u32) -> Vec<u8> {
+        let img = self.image.read().unwrap();
+        let start = page_id as usize * PAGE_SIZE;
+        img[start..start + PAGE_SIZE].to_vec()
+    }
+
     fn set_write_delay(&self, d: Duration) {
         self.write_delay_ns.store(d.as_nanos() as u64, Ordering::SeqCst);
     }
@@ -415,7 +426,16 @@ fn invalidate_all_refuses_while_a_write_back_is_in_flight() {
     let _ = faulting.join().unwrap();
 }
 
-/// **Kills: unpublishing a dirty victim before its write-back reaches disk.**
+/// A churn-shaped net for the same invariant as
+/// `the_victim_stays_reachable_until_its_write_back_lands`, and **not the detector for it**.
+///
+/// Stated plainly because the numbers say so: run against the break it is written for, it caught
+/// it once at 2 mismatches in 3200 fetches and then did NOT catch it on a repeat under different
+/// machine load. A detector that needs to land in a nanosecond window is a coin toss, and a green
+/// from it is not evidence. It is kept because a broad concurrent stress over the eviction path is
+/// worth having; the deterministic test below is what actually holds the invariant down.
+///
+/// Original intent:
 ///
 /// `evict_into` writes a dirty victim back **while it is still in the page table**. The other order
 /// is the tempting one — drop the mapping, then flush at leisure — and it loses writes silently: a
@@ -620,5 +640,88 @@ fn a_declined_eviction_leaves_the_victim_tracked_as_resident() {
         "after a declined eviction, {resident} pages are resident but the policy tracks {tracked}. \
          The declined victim was removed from the resident lists by `request` and never put back, \
          so its frame can never be reclaimed."
+    );
+}
+
+/// **Kills: unpublishing a dirty victim before its write-back reaches disk.** Deterministically.
+///
+/// The invariant: a dirty victim must not stop being reachable through the page table until its
+/// bytes are on disk. Reverse the two and a concurrent `fetch_page(victim)` misses, reads the stale
+/// copy, and the dirty bytes in the frame are lost — silently, because every byte involved still
+/// passes its checksum.
+///
+/// The churn version of this test hunts that race by hammering, and is a coin toss (see above).
+/// This one parks a fault inside its victim's write-back and states the invariant directly, so the
+/// window is held open rather than raced for:
+///
+///   * the write-back has provably NOT landed — the on-disk copy is checked, not assumed — and
+///   * the victim is STILL resolvable in the page table.
+///
+/// Both halves matter. Without the first the test could pass by checking after the write landed,
+/// which would be vacuous.
+#[test]
+fn the_victim_stays_reachable_until_its_write_back_lands() {
+    const MARKER: u8 = 0xE7;
+    let (bp, st, ids) = pool(FRAMES as u32 + 1);
+
+    let resident_before: Vec<u32> = bp.page_table.read().unwrap().keys().copied().collect();
+    assert_eq!(resident_before.len(), FRAMES, "precondition: the pool must be full");
+    for &id in &resident_before {
+        let idx = bp.fetch_page(id).unwrap();
+        bp.frames[idx].write().unwrap().data[8] = MARKER;
+        bp.unpin_page(id, true);
+    }
+    let absent = *ids.iter().find(|id| !resident_before.contains(id)).unwrap();
+
+    st.arm_writes();
+    let faulting = {
+        let bp = Arc::clone(&bp);
+        std::thread::spawn(move || bp.fetch_page(absent))
+    };
+    assert!(
+        st.wait_for_parked_reader(Duration::from_secs(10)),
+        "no write-back reached the gate; the window was never opened"
+    );
+
+    // The victim is the one page the table holds that the policy has stopped tracking, because
+    // `request` removed it from the resident lists when it named it.
+    let victim = {
+        let pt = bp.page_table.read().unwrap();
+        let c = bp.arc_cache.lock().unwrap();
+        let untracked: Vec<u32> = pt
+            .keys()
+            .copied()
+            .filter(|id| !c.t1.map.contains_key(id) && !c.t2.map.contains_key(id))
+            .collect();
+        assert_eq!(untracked.len(), 1, "expected exactly one victim, found {untracked:?}");
+        untracked[0]
+    };
+
+    // ANTI-VACUITY: prove we are genuinely inside the window before asserting anything about it.
+    // The marker was only ever written to the frame, so if it is already on disk the write-back has
+    // landed and this test would be checking nothing.
+    assert_ne!(
+        st.raw_page(victim)[8],
+        MARKER,
+        "the write-back for victim {victim} already landed, so the window this test is about was \
+         not open and its result means nothing"
+    );
+
+    // THE INVARIANT. Its dirty bytes are not on disk yet, so it must still be reachable in memory.
+    assert!(
+        bp.page_table.read().unwrap().contains_key(&victim),
+        "victim {victim} was removed from the page table while its dirty bytes were still only in \
+         its frame. A concurrent fetch now misses, reads the stale copy from disk, and that write \
+         is lost"
+    );
+
+    st.release();
+    let _ = faulting.join().unwrap();
+
+    // And once everything has settled the marker really did reach disk.
+    assert_eq!(
+        st.raw_page(victim)[8],
+        MARKER,
+        "victim {victim} was evicted without its dirty bytes ever reaching disk"
     );
 }
