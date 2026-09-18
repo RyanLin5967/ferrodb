@@ -1017,8 +1017,25 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // Under `logical` so it cannot interleave with the multi-key writers (`put`, `fork`,
         // `attach_child`), all of which also rewrite this span.
+        //
+        // **D33.** The first version of this wrote the key and returned. Every other mutating
+        // method here ends `let seq = self.stage()?; drop(_g); self.durable(seq)`, and skipping it
+        // cost two things, not one. The ARENA key was never fsynced -- and `stage()` is the ONLY
+        // caller of `publish_root()` (:331-333), so an `upsert` that happened to split the tree's
+        // root left the header page naming the OLD root, after which a reopen came back on a
+        // perfectly valid B+tree of an older state. Measured: 0 of 64 arenas survived a reopen.
+        //
+        // The generation check is the same story: `get_mut`-by-id alone let a STALE handle whose
+        // slot had been recycled attach an arena to the slot's new occupant.
         let _g = self.logical.lock().unwrap();
-        self.upsert(keys::arena(branch.id, arena.0), Vec::new())
+        let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
+        core.check_readable(branch)?;
+        self.upsert(keys::arena(branch.id, arena.0), Vec::new())?;
+        // Lock dropped BEFORE the fsync, so this joins the commit group rather than
+        // holding every other writer out for a disk round-trip. See `group_commit`.
+        let seq = self.stage()?;
+        drop(_g);
+        self.durable(seq)
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
