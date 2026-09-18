@@ -22,11 +22,14 @@
 //!      That is a claim about a DISTRIBUTION, and a distribution is not something one sample can
 //!      report. Hence this file.
 //!
-//! **A first hypothesis was written down and killed before either of those.** It said the queries
-//! that used to precede `live_count` warmed the buffer pool with every record page and no longer
-//! do, so the control had gone cold. It predicts a reproducible slowdown. Re-running the same
-//! binary gave 7.434 ms, so it is wrong, and it is recorded here because a mechanism that is
-//! plausible and untested is exactly the kind that survives into a ledger.
+//! **A first hypothesis was written down, killed, and then partly revived by this file.** It said
+//! the queries that used to precede `live_count` warmed the buffer pool with every record page and
+//! no longer do, so the control had gone cold. At 10^5 that is not supported — `cold` lands on top
+//! of the median — and it was declared wrong on that basis. At 10^6 this same instrument reports
+//! `cold` at 536 ms against a 48 ms median, so first-touch IS an order of magnitude there and the
+//! blanket "wrong" was too broad. Recorded because a plausible untested mechanism is exactly the
+//! kind that survives into a ledger, and because over-correcting one is the same class of error as
+//! over-claiming it. See `bench/d28_live_count.txt`.
 //!
 //! # What it measures
 //!

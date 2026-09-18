@@ -47,8 +47,37 @@ The tail is real and it is long: 99% of draws are under 10 ms and one in ten tho
 reaches 32 ms. The distribution is heavy-tailed, not merely noisy, and the p99 does not
 predict the max.
 
-    N=10^6, 2000 single draws:
-      -- see bench/d28_live_count_1e6.txt --
+    N=10^6, 2000 single draws (bench/d28_live_count_1e6.txt):
+      cold 536.614   repped mean 47.020
+      min 44.920   median 48.805   p95 56.472   p99 61.146   max 585.882   max/median 12.0x
+
+At 10^6 BOTH disputed cells sit inside the ordinary spread: 53.929 ms (before) is just
+above the median and 78.825 ms (after) is between p99 and the max. The 1.5x between them
+is not a regression, it is two draws from a distribution whose p99 is already 61 ms.
+
+And the cold draw is 536.614 ms -- ELEVEN TIMES the median, on the first call after the
+bulk forks.
+
+
+A SECOND CORRECTION, IN THE OTHER DIRECTION
+
+The first hypothesis recorded for the 10^5 cell was that the queries which used to precede
+`live_count` warmed the buffer pool with every record page and no longer do. It was
+declared "WRONG" on the strength of the 10^5 re-run, where cold (5.471, 8.016) sits on top
+of the median (5.158, 6.339) -- no warm-up worth the name.
+
+That declaration was too broad, and the 10^6 run above shows why: cold is 536.614 ms
+against a 48.805 ms median. A first-touch effect at 10^6 is real and it is an order of
+magnitude. So the correct statement is narrower than the one made:
+
+  * at 10^5, first-touch costs nothing measurable, and it does not explain that cell;
+  * at 10^6, first touch costs ~11x the median, and any harness taking ONE cold draw there
+    is measuring page-in, not the walk.
+
+Neither changes the D28 verdict -- the after-run's 10^6 cell is 78.8 ms, nowhere near a
+cold 536 ms, so that call was not cold -- but "WRONG" was the wrong word for a hypothesis
+that is merely inapplicable at the N where it was tested. Logged rather than quietly
+narrowed, because over-correcting a claim is the same class of error as over-claiming it.
 
 
 WHAT THIS DOES AND DOES NOT ESTABLISH
@@ -56,8 +85,12 @@ WHAT THIS DOES AND DOES NOT ESTABLISH
 Establishes:
   * `live_count` at 10^5 costs ~5-6 ms median, ~10 ms p99, on this catalog. The BEFORE
     cell (6.098 ms) is an ordinary median draw.
-  * Its single-draw distribution is heavy-tailed, reaching 5x the median within 10^4 draws.
-  * D28 cannot have changed it: zero production call sites (S20 verdict below).
+  * Its single-draw distribution is heavy-tailed at both N: 5x the median within 10^4 draws
+    at 10^5, 12x within 2x10^3 draws at 10^6.
+  * At 10^6 BOTH cells (53.929, 78.825) are ordinary draws. Only the 10^5 after-cell is
+    unreproduced.
+  * A cold first call at 10^6 costs 536 ms, 11x the median.
+  * D28 cannot have changed any of it: zero production call sites (S20 verdict below).
 
 Does NOT establish:
   * A 51.459 ms draw was never observed here. The longest seen is 32.176 ms, at load

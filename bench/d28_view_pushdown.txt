@@ -94,10 +94,16 @@ The part that is NOT an inference is that D28 cannot have caused it: `live_count
 production call sites -- see the S20 census in bench/d28_live_count.txt -- so nothing this
 change touches can reach it.
 
-A separate hypothesis was written down first and killed: that the queries which used to
-precede live_count warmed the buffer pool with every record page and no longer do. It
-predicts a reproducible slowdown; the re-run shows none. Recorded because a plausible
-untested mechanism is exactly the kind that survives into a ledger.
+At 10^6 the picture is cleaner still: BOTH cells (53.929 before, 78.825 after) sit inside
+the ordinary single-draw spread there -- median 48.805, p99 61.146, max 585.882 over 2000
+draws -- so the 1.5x is two draws from one distribution, not a change.
+
+A separate hypothesis was written down first, killed, and then partly revived: that the
+queries which used to precede live_count warmed the buffer pool and no longer do. At 10^5
+it is not supported (cold sits on the median) and it was called "wrong" on that basis. At
+10^6 a cold first call costs 536.614 ms against a 48.805 ms median, so first-touch is real
+and large there, and the blanket "wrong" was too broad. Both the claim and its
+over-correction are logged in bench/d28_live_count.txt.
 
 
 WHAT THE FIX IS
