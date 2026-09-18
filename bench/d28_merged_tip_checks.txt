@@ -1,0 +1,35 @@
+# D28 LANDING — the checks that stand in for re-certifying a four-file delta.
+#
+# D28's green recorded head=971407b. agent-isolation had moved to 07c34e1, so the merged tree is
+# NOT the certified tree and tools/staleness.sh said STALE-GREEN over 4 Rust files.
+#
+# The delta was enumerated rather than waived. `git diff 971407b <merge-tree>` is exactly:
+#   examples/branch_curve.rs
+#   examples/branch_curve_writes.rs
+#   examples/cow_scan_memory.rs
+#   examples/d27_fork_workspace_cost.rs
+# -- the Windows portability fix (07c34e1), and nothing else.
+#
+# REACHABILITY: no test spawns any of them. The only occurrence of any of those four names
+# anywhere under tests/ is a doc comment in tests/d27_fork_shares_without_leaking.rs line 4,
+# citing `bench/d27_fork_workspace_cost_*.txt` -- a citation, not a spawn.
+#
+# So the single path by which this delta could change a suite outcome is the
+# `cargo build --examples` step that verify-suite.sh runs before anything else. That step, and
+# both CI-equivalent checks, run here on the MERGED tip:
+
+cargo build --examples                                            EXIT=0
+RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" \
+  cargo check --all-targets                                       EXIT=0
+RUSTFLAGS="-D duplicate_macro_attributes -D dead_code" \
+  cargo check --all-targets --target x86_64-pc-windows-msvc       EXIT=0, 0 errors
+
+# WHAT THIS IS NOT. It is not a substitute for a certified suite in general, and it must not be
+# reached for when the delta touches src/ or tests/. It is admissible here for one reason: the
+# delta is four files, none of them reachable from any test, and the one step that consumes them
+# was re-run directly. Re-running 106 targets to cover a build step you can verify in five seconds
+# is ritual, not rigour -- but the exception is only available because the delta was enumerated
+# and the reachability checked, and both are written down above rather than asserted.
+#
+# The strict form still applies to D40 and S22, where head= equalled the landed tip and
+# `git merge-tree` produced a byte-identical tree oid. Prefer that whenever the base can be frozen.
