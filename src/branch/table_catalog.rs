@@ -651,9 +651,17 @@ impl TableBranchCatalog {
             // is the semantically correct one: a grandchild's root is the interior node's root at
             // fork time, which is the grandparent's root at *that* epoch.
             //
-            // Recursion is bounded by branch depth (`MAX_BRANCH_DEPTH = 8`, types.rs), not by the
-            // number of branches, so this stays O(1) in N and is NOT the global reachability walk
-            // that `mod.rs:13` forbids.
+            // ⛔ **COST, STATED CORRECTLY — an earlier version of this comment said "O(1) in N"
+            // and that was WRONG.** Recursion DEPTH is bounded by `MAX_BRANCH_DEPTH = 8`, but the
+            // WORK is not: `has_live_children` scans a node's whole CHILD span and recurses into
+            // every REAPED child, so this explores the reaped subtree breadth-first with an early
+            // exit on the first live descendant. A parent with 10^6 reaped children and one live
+            // child at the end of the span scans all 10^6.
+            //
+            // It is therefore O(explored reaped subtree), cheap in the common case (few reaped
+            // children, early exit) and NOT bounded by 8. It is still not the global reachability
+            // walk `mod.rs:13` forbids -- it never leaves this branch's own subtree -- but the
+            // honest bound is the subtree, not a constant.
             Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
@@ -998,6 +1006,19 @@ impl BranchCatalog for TableBranchCatalog {
         drop(_g);
         self.durable(seq)?;
         Ok(removed)
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        // **D20.** No read-modify-write at all: `hydrate` DERIVES `arenas` from exactly these
+        // ARENA keys, so owning an arena is one key. The racy shape this replaces was
+        // `get_raw` (unlocked) -> push -> `put` (locked) in `ArenaPageStore::alloc_arena`, where
+        // the unlocked read could traverse a tree another thread was splitting and come back with
+        // the wrong arena list -- which was then written back as truth.
+        //
+        // Under `logical` so it cannot interleave with the multi-key writers (`put`, `fork`,
+        // `attach_child`), all of which also rewrite this span.
+        let _g = self.logical.lock().unwrap();
+        self.upsert(keys::arena(branch.id, arena.0), Vec::new())
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

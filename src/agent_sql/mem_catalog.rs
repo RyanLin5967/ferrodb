@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use crate::branch::record::CoreRecord;
 use crate::branch::record::BranchRecord;
-use crate::branch::types::{BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
+use crate::branch::types::{ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId};
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
 
@@ -239,6 +239,16 @@ impl BranchCatalog for MemBranchCatalog {
         let mut records = self.records.lock().unwrap();
         let Some(prec) = records.get_mut(&parent_id) else { return Ok(false) };
         Ok(prec.remove_live_child(fork_epoch))
+    }
+
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError> {
+        let mut records = self.records.lock().unwrap();
+        if let Some(rec) = records.get_mut(&branch.id) {
+            if !rec.arenas.contains(&arena) {
+                rec.arenas.push(arena);
+            }
+        }
+        Ok(())
     }
 
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {

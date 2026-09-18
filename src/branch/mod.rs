@@ -191,6 +191,21 @@ pub trait BranchCatalog: Send + Sync {
     /// Silent, permanent, and invisible to every existing test. Hence a method with a return value.
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError>;
 
+    /// Record that `branch` owns `arena`, **atomically**.
+    ///
+    /// **D20.** This exists because `ArenaPageStore::alloc_arena` used to do it as
+    /// `get_raw` (UNLOCKED) -> push -> `put` (LOCKED) -- a read-modify-write whose READ raced
+    /// every concurrent writer. With no latch protocol under the B+tree, a reader descending
+    /// during a split returned a record with the wrong arena list, and that list was written
+    /// straight back; the reaper then freed exactly `record.arenas` and the rest leaked.
+    /// Measured: 0 pages leaked at 1 thread, 24 at 8 threads, 0 on the log catalog
+    /// (`bench/d20_race_control.txt`).
+    ///
+    /// The whole read-modify-write must happen inside the implementation's own lock. An
+    /// implementation that derives `arenas` from an index can satisfy this with a single key
+    /// write and no read at all.
+    fn add_arena(&self, branch: BranchId, arena: ArenaId) -> Result<(), FerroError>;
+
     /// Extend a lease. Purely advisory to the holder — expiry does not require cooperation.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError>;
 

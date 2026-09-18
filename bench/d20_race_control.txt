@@ -1,0 +1,23 @@
+D20: is the TableBranchCatalog page leak a LOGIC bug or a CONCURRENCY race?
+The control changes ONE variable -- thread count -- and holds workload, catalog and reaping fixed.
+
+[table-1t] threads=1 total=1000 reaped=1000 baseline=0 after=0  LEAK=0
+[table-8t] threads=8 total=1000 reaped=1000 baseline=0 after=24 LEAK=24
+[log-8t]   threads=8 total=1000 reaped=1000 baseline=0 after=0  LEAK=0
+
+READ IT THIS WAY:
+  1 thread, table catalog  -> 0   so it is NOT a logic bug in reclamation.
+  8 threads, table catalog -> 24  so it IS concurrency.
+  8 threads, log catalog   -> 0   so it is THIS implementation, not the workload or the reaper.
+  reaped=1000 in every arm -> every branch really was reaped; the leak is not unreaped branches.
+
+The log catalog holds an RwLock over its whole state. BPlusTreeManager holds NOTHING:
+  grep -cE 'Mutex|RwLock|latch|crab' src/storage/index.rs  ->  0
+
+This is the FIRST REPRODUCTION of D15, which until now was verified-by-inspection only and whose
+own recorded next step was "write a test that FAILS". It has now fired.
+
+Earlier, separate run: the same leak appeared as 19 pages in
+branch::reaper::tests::table_catalog::a_thousand_branches_forked_and_abandoned_concurrently_stay_consistent
+("pages did not return to baseline after 1000 concurrent branches: 19 vs 0"). 19 vs 24 across runs
+is the expected signature of a race, not of a deterministic miscount.
