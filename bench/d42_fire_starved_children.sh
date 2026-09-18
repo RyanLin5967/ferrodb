@@ -53,6 +53,22 @@ TEST_BOUND=${TEST_BOUND:-900}
 LOCK=/tmp/ferrodb-suite.lock
 STOPLOG=$(mktemp)
 
+# BREAK_PS=1 forces the THIRD verdict, CLASSIFIER-BROKEN, by putting a `ps` that always fails
+# earlier on PATH. The classifier calls `Command::new("ps")`, so this is the honest way to make the
+# instrument fail: the binary really is broken, rather than a flag telling the code to pretend.
+#
+# Why this arm exists at all: CLASSIFIER-BROKEN is a detector, and a detector nobody has made fire
+# is not a clean result. Without it, the whole third state would be unexercised code claiming to
+# cover the case where `ps` is present but useless — and the failure mode of an unfired refusal is
+# that it silently degrades to a one-signal verdict instead, which is exactly what it exists to
+# prevent. The required outcome here is a REFUSAL, not a verdict in either direction.
+FAKEBIN=""
+if [ "${BREAK_PS:-0}" = "1" ]; then
+    FAKEBIN=$(mktemp -d)
+    printf '#!/bin/sh\necho "d42 fire-check: ps is deliberately broken" >&2\nexit 1\n' > "$FAKEBIN/ps"
+    chmod +x "$FAKEBIN/ps"
+fi
+
 held=0; keeper=""
 kids() { pgrep -f "$PAT" 2>/dev/null; }
 cleanup() {
@@ -60,6 +76,7 @@ cleanup() {
     for p in $(kids); do kill -CONT "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
     [ "$held" = 1 ] && rm -rf "$LOCK"
     rm -f "$STOPLOG"
+    [ -n "$FAKEBIN" ] && rm -rf "$FAKEBIN"
     return 0
 }
 trap cleanup EXIT INT TERM
@@ -74,22 +91,31 @@ if [ -n "$(kids)" ]; then
     exit 1
 fi
 
-w=0
-while ! mkdir "$LOCK" 2>/dev/null; do
-    o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
-    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
-    [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
-    [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
-    sleep 15; w=$((w+15))
-done
-printf '%s %s %s\n' "$$" "d42-fire-children" "$(date -u +%FT%TZ)" > "$LOCK/owner"
-held=1
+# D42_NOLOCK=1 means an OUTER runner already holds the machine-wide suite lock and keeps holding it
+# for the whole batch (bench/d42_verify_all.sh). It is NOT a way to skip the lock. Taking the lock
+# per arm means queueing behind the fleet once per arm, and releasing it between arms lets another
+# suite start in the middle of a batch that is meant to be one measurement. Never set it by hand.
+if [ "${D42_NOLOCK:-0}" = "1" ]; then
+    echo "note: running under an outer suite-lock holder (D42_NOLOCK=1)" >&2
+else
+    w=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
+        if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+        [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
+        [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
+        sleep 15; w=$((w+15))
+    done
+    printf '%s %s %s\n' "$$" "d42-fire-children" "$(date -u +%FT%TZ)" > "$LOCK/owner"
+    held=1
+fi
 
 echo "D42 falsifier 1 (decisive arm) — starve the NODES, leave the test thread scheduled"
 echo "  when          : $(date -u +%FT%TZ)"
 echo "  head          : $(git log -1 --format=%h), $(git status --short | wc -l | tr -d ' ') dirty file(s)"
 echo "  tree          : $TREE"
 echo "  method        : SIGSTOP every node for ${HOLD}s once all three have said READY"
+[ -n "$FAKEBIN" ] && echo "  BREAK_PS      : a deliberately failing \`ps\` is first on PATH; the REQUIRED outcome\n                  is CLASSIFIER-BROKEN, i.e. a refusal, not a verdict"
 echo "  budget        : ELECTION_BUDGET is 45s, so the hold outlasts one full budget"
 echo "  predicted     : child CPU ~0 per node-wall-s — a stopped process consumes none. The"
 echo "                  threshold 0.00043 is itself 10% of the measured running rate 0.0043."
@@ -135,7 +161,11 @@ disown $keeper 2>/dev/null   # or bash prints the keeper's whole body when it re
 
 echo ""
 echo "---------------- cargo test --test integration_consensus_failover ----------------"
-OUT=$(timeout "$TEST_BOUND" cargo test --test integration_consensus_failover 2>&1)
+if [ -n "$FAKEBIN" ]; then
+    OUT=$(PATH="$FAKEBIN:$PATH" timeout "$TEST_BOUND" cargo test --test integration_consensus_failover 2>&1)
+else
+    OUT=$(timeout "$TEST_BOUND" cargo test --test integration_consensus_failover 2>&1)
+fi
 rc=$?
 kill -9 "$keeper" 2>/dev/null; keeper=""
 for p in $(kids); do kill -CONT "$p" 2>/dev/null; done
@@ -152,7 +182,22 @@ if ! grep -q 'STOPPED [1-9]' "$STOPLOG"; then
     echo "   run is not evidence in either direction."
     fails=$((fails+1))
 fi
-if grep -qF 'FERRODB-VERDICT: INCONCLUSIVE' <<<"$OUT"; then
+if [ -n "$FAKEBIN" ]; then
+    # BREAK_PS arm: the REQUIRED outcome is the refusal, not either verdict.
+    if grep -qF 'FERRODB-VERDICT: CLASSIFIER-BROKEN' <<<"$OUT"; then
+        echo "ok: a broken \`ps\` earned CLASSIFIER-BROKEN — the third state fires"
+    elif grep -qF 'FERRODB-VERDICT: INCONCLUSIVE' <<<"$OUT"; then
+        echo "⛔ with \`ps\` broken the run still claimed INCONCLUSIVE — it guessed instead of refusing."
+        fails=$((fails+1))
+    elif grep -q 'timed out after 45s' <<<"$OUT"; then
+        echo "⛔ with \`ps\` broken the run reported FAILED — it silently degraded to one signal,"
+        echo "   which is the exact trade this third state exists to refuse."
+        fails=$((fails+1))
+    else
+        echo "⛔ PRECONDITION NOT REACHED — no wait expired, so there was no verdict to classify."
+        fails=$((fails+1))
+    fi
+elif grep -qF 'FERRODB-VERDICT: INCONCLUSIVE' <<<"$OUT"; then
     echo "ok: the starved-children run earned INCONCLUSIVE — the classifier fired"
 elif grep -qF 'FERRODB-VERDICT: CLASSIFIER-BROKEN' <<<"$OUT"; then
     echo "⛔ the classifier refused rather than guessing, but this run does not show that it FIRES."
@@ -165,7 +210,8 @@ else
     echo "⛔ PRECONDITION NOT REACHED — no wait expired, so there was no verdict to classify."
     fails=$((fails+1))
 fi
-if grep -q 'self-schedule.*HEALTHY' <<<"$OUT"; then
+if [ -n "$FAKEBIN" ]; then :
+elif grep -q 'self-schedule.*HEALTHY' <<<"$OUT"; then
     echo "ok: self-scheduling read HEALTHY — signal C fired ALONE, covering B's known blind spot"
 elif grep -q 'self-schedule' <<<"$OUT"; then
     echo "note: self-scheduling also read STARVED, so this run does not isolate C from B"

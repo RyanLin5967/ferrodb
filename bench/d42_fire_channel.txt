@@ -1,0 +1,36 @@
+D42 channel fire-check — verify-suite.sh must REFUSE a starved run
+  when     : 2026-09-18T15:49:15Z
+  tree     : /Users/idide/wt/ferrodb-D42-channel-throwaway
+  head     : 2ba1ff7
+  parked   : 106 other tests/*.rs, leaving --lib + integration_consensus_failover
+  loadavg  : 25.90 43.25 169.56
+
+---------------- tools/verify-suite.sh d42-channel (per-target) ----------------
+d42-channel: queued behind a running suite (19823 D44 2026-09-18T15:47:34Z)
+d42-channel: acquired the suite lock after 420s
+d42-channel: REFUSING — a test classified its own wall-clock expiry as INCONCLUSIVE: it was
+  descheduled, or its child processes were, so the expiry is not evidence about the code.
+  FERRODB-VERDICT: INCONCLUSIVE — waiting for a first leader ran out of budget, but this run did not get the machine, so the expiry is not evidence about the cluster.
+  This run does not get to be a number in EITHER direction — not a pass, and not the red
+  it would have been reported as before. Re-run it on a quieter machine.
+  The run also recorded failed=1. Those are not dismissed; they are UNMEASURED until a
+  run that was not starved reports them.
+  evidence: /Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813/INCONCLUSIVE.txt
+  log: /Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813/suite-d42-channel.log
+---------------- exit 4 ----------------
+
+keeper log:
+   15:57:26 STOPPED 3 pid(s) (3 of 3 were listening): 63154 63404 63409 
+
+ok:   the keeper actually stopped node processes
+ok:   the marker really reached the suite log
+ok:   verify-suite.sh exited 4 (the reserved INCONCLUSIVE refusal)
+ok:   it printed no total
+ok:   it printed a refusal
+ok:   no SUMMARY.txt was written
+ok:   INCONCLUSIVE.txt was written: d42-channel: INCONCLUSIVE at 2026-09-18T15:58:14Z — head=2ba1ff7 log=/Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813/suite-d42-channel.log
+ok:   certify-head.sh refused the starved run: certify-head: REFUSING — '/Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813' holds INCONCLUSIVE.txt — the suite there was starved, not green.
+
+artifacts left at: /Users/idide/wt/ferrodb-D42-channel-throwaway/../d42-channel-out.44813
+CHANNEL FIRE-CHECK PASSED
+EXIT=0

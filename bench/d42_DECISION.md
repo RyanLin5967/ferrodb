@@ -150,8 +150,30 @@ budget, so a healthy ~3 s run never touches it.
 
 ## 8. Guards fire-checked
 
-`tools/verify-suite-selftest.sh` part 3 covers marker drift between the Rust constant and the shell
-literal, and `certify-head.sh` in BOTH directions (it must refuse an INCONCLUSIVE directory and
-still certify an honest green one — checking only the first half would pass for a guard that refuses
-unconditionally). The middle link — verify-suite.sh detecting a real marker in a real suite log —
-is forced end-to-end by `bench/d42_fire_channel.sh`; see `d42_fire_channel.txt`.
+Every detector added by this row has been forced to fire. The list is here because an unfired
+detector is indistinguishable from one that has quietly stopped existing.
+
+| detector | forced by | required outcome |
+|---|---|---|
+| signal C (child starvation) | `d42_fire_starved_children.sh` | INCONCLUSIVE |
+| the classifier NOT misfiring | `d42_fire_broken.sh` | FAILED, two-signal form |
+| CLASSIFIER-BROKEN | same script, `BREAK_PS=1` — a really-failing `ps` first on PATH | a REFUSAL, not a verdict |
+| verify-suite.sh's marker detection | `d42_fire_channel.sh` end to end | exit 4, no total, no `SUMMARY.txt` |
+| marker drift Rust ↔ shell | `verify-suite-selftest.sh` part 3 | both literals present |
+| `certify-head.sh`, BOTH directions | `verify-suite-selftest.sh` part 3 | refuses INCONCLUSIVE, still certifies an honest green |
+
+The `certify-head` check runs in both directions deliberately: checking only that it refuses would
+pass equally for a guard that refuses unconditionally.
+
+`BREAK_PS` breaks the instrument rather than setting a flag that tells the code to pretend the
+instrument is broken. The distinction matters — a flag would exercise a branch, not the failure.
+
+## 9. Running it
+
+`bench/d42_verify_all.sh <throwaway-worktree>` runs arms 1–5 under ONE acquisition of the
+machine-wide suite lock. Per-arm locking was the first shape and it is wrong on a box running an
+agent fleet: it queues behind another suite once per arm, and another suite can start BETWEEN two
+arms, so the arms get measured against different machine states while being reported as one result.
+
+Called without a throwaway worktree it reports arm 4 as SKIPPED and exits non-zero, rather than
+reporting the must-fire half alone — which would be a detector nobody had tried to make misfire.

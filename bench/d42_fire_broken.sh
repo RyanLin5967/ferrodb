@@ -69,16 +69,24 @@ cargo build --examples >/dev/null 2>&1 || { echo "REFUSING — cargo build --exa
 cargo test --no-run --test integration_consensus_failover >/dev/null 2>&1 \
     || { echo "REFUSING — the injected test does not build"; exit 1; }
 
-w=0
-while ! mkdir "$LOCK" 2>/dev/null; do
-    o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
-    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
-    [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
-    [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
-    sleep 15; w=$((w+15))
-done
-printf '%s %s %s\n' "$$" "d42-fire-broken" "$(date -u +%FT%TZ)" > "$LOCK/owner"
-held=1
+# D42_NOLOCK=1 means an OUTER runner already holds the machine-wide suite lock and keeps holding it
+# for the whole batch (bench/d42_verify_all.sh). It is NOT a way to skip the lock. Taking the lock
+# per arm means queueing behind the fleet once per arm, and releasing it between arms lets another
+# suite start in the middle of a batch that is meant to be one measurement. Never set it by hand.
+if [ "${D42_NOLOCK:-0}" = "1" ]; then
+    echo "note: running under an outer suite-lock holder (D42_NOLOCK=1)" >&2
+else
+    w=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        o=$(cat "$LOCK/owner" 2>/dev/null || echo unknown); p=${o%% *}
+        if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+        [ "$w" -ge 3600 ] && { echo "REFUSING — waited ${w}s for the suite lock held by: $o"; exit 3; }
+        [ "$w" -eq 0 ] && echo "queued behind a running suite ($o)" >&2
+        sleep 15; w=$((w+15))
+    done
+    printf '%s %s %s\n' "$$" "d42-fire-broken" "$(date -u +%FT%TZ)" > "$LOCK/owner"
+    held=1
+fi
 
 echo "D42 falsifier 2 — a genuinely broken cluster must earn FAILED, not INCONCLUSIVE"
 echo "  when          : $(date -u +%FT%TZ)"
