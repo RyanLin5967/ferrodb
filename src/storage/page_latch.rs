@@ -379,7 +379,24 @@ mod tests {
     // here. These use an IDLE page on purpose: without the assertion the inverted order below
     // would simply succeed (nothing holds the latch), so the test exercises the check itself
     // rather than hoping to catch a real deadlock.
+    //
+    // WHY THE NEXT FOUR ARE `#[cfg(debug_assertions)]`, and why that is a gating fix and not a
+    // weakened test. The subject they exercise DOES NOT EXIST in release: `mod order` is
+    // `#[cfg(not(debug_assertions))]` there, `pool_depth()` const-folds to 0, and the module doc
+    // above says so in its own words -- "every hook is a zero-sized no-op ... so the assertion
+    // below compiles away entirely". That is the design, documented before these tests were ever
+    // observed to fail, and it is the right one twice over: the tracker costs a thread-local RMW
+    // on every buffer-pool method, on a hit path D35 measured to be contention-bound by exactly
+    // that class of per-call work; and a detector that `panic!`s in production would convert a
+    // rare latent hang into a hard crash, which is a runtime-guard decision nobody has made.
+    //
+    // So these four assert the behaviour of a DEBUG-ONLY tool and are scoped to debug. The
+    // release half is not left unasserted -- see `release_is_a_documented_no_op` at the end of
+    // this module, which pins the other side. Change the `cfg` on `mod order` and that test
+    // fails, which is the point: it forces the design decision to be made deliberately instead
+    // of arriving as a side effect.
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "LOCK-ORDER INVERSION")]
     fn a_read_latch_taken_from_inside_the_pool_is_refused() {
@@ -388,6 +405,7 @@ mod tests {
         let _g = l.read(1); // must panic: `frame -> page latch` is the inverted order
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "LOCK-ORDER INVERSION")]
     fn a_write_latch_taken_from_inside_the_pool_is_refused() {
@@ -397,6 +415,7 @@ mod tests {
     }
 
     /// The other half: the CORRECT order must stay silent, or the detector is useless noise.
+    #[cfg(debug_assertions)]
     #[test]
     fn latching_first_and_then_entering_the_pool_is_allowed() {
         let l = PageLatches::new();
@@ -407,6 +426,7 @@ mod tests {
 
     /// The depth is a counter, not a flag, because pool methods nest (`free_page` ->
     /// `delete_page`). An inner section closing must not re-open the door.
+    #[cfg(debug_assertions)]
     #[test]
     fn nested_pool_sections_unwind_to_zero_and_not_below() {
         assert_eq!(pool_depth(), 0);
@@ -435,5 +455,35 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// The RELEASE half of the contract, so that neither profile carries an unasserted claim.
+    ///
+    /// The four `#[cfg(debug_assertions)]` tests above pin what the detector does when it exists.
+    /// This pins what release is documented to do instead: the tracker is compiled out, so
+    /// `pool_depth()` is 0 even inside a pool section, and the inverted order is NOT refused.
+    ///
+    /// This is deliberately not `#[should_panic]`-free by accident. If someone drops the `cfg` on
+    /// `mod order` and makes the tracker real in release, this test FAILS -- which is correct.
+    /// Turning a debug-time detector into a production guard that panics is a design decision
+    /// about crash-versus-hang in a live database; it must be made on purpose, with the module
+    /// doc updated in the same change, not arrive as a silent side effect of deleting an
+    /// attribute.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_is_a_documented_no_op() {
+        assert_eq!(pool_depth(), 0, "no pool section is open yet");
+        let _inside = enter_pool();
+        assert_eq!(
+            pool_depth(),
+            0,
+            "release compiles the depth tracker out; if this is now nonzero the `cfg` on \
+             `mod order` changed and the module doc must change with it"
+        );
+        // The inverted order. In debug this panics with LOCK-ORDER INVERSION; in release the
+        // assertion is compiled away and the latch is simply taken. Reaching the next line at
+        // all is the assertion.
+        let l = PageLatches::new();
+        let _g = l.read(1);
     }
 }
