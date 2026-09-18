@@ -278,10 +278,22 @@ if [ "${p:-0}" -eq 0 ]; then
     echo "$LABEL: REFUSING — zero tests collected (rc=$rc). That is a broken run, not a green one."
     echo "  log: $LOG"; exit 1
 fi
-echo "$LABEL: mode=$MODE rc=$rc passed=$p failed=$f build_errors=$be head=$h1 log=$LOG"
+summary="$LABEL: mode=$MODE rc=$rc passed=$p failed=$f build_errors=$be head=$h1 log=$LOG"
 if [ "$go_ran" = yes ]; then
-    echo "$LABEL: go rc=$gorc passed=$gp failed=$gf log=$GOLOG"
+    gosummary="$LABEL: go rc=$gorc passed=$gp failed=$gf log=$GOLOG"
 else
-    echo "$LABEL: go NOT RUN — no cdc-consumer/go.mod in this tree"
+    gosummary="$LABEL: go NOT RUN — no cdc-consumer/go.mod in this tree"
 fi
+# PERSIST THE VERDICT. A summary that exists only in a terminal buffer is not evidence, and `head=`
+# is the one field `tools/staleness.sh` structurally cannot check — it compares BRANCH to BASE,
+# never SUITE to BRANCH. That gap has produced the same defect three times here, once inside D40's
+# own evidence directory. The failure is always invisible to `git log`, because an amended commit
+# keeps its subject line. `tools/certify-head.sh` reads this file at land time.
+# Refuse if it cannot be written: a verdict that could not be recorded is not a verdict.
+if ! printf '%s\n%s\n' "$summary" "$gosummary" > "$OUT/SUMMARY.txt"; then
+    echo "$LABEL: REFUSING — cannot write $OUT/SUMMARY.txt; the verdict would exist only on screen."
+    exit 1
+fi
+echo "$summary"
+echo "$gosummary"
 [ "$f" = "0" ] && [ "$be" = "0" ] && [ "$rc" = "0" ] && [ "$gorc" = "0" ] && [ "$gf" = "0" ]
