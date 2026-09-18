@@ -408,7 +408,7 @@ impl Reaper for TwoTierReaper {
             .into());
         };
 
-        let mut rec = self.catalog.get(branch)?; // generation-guarded: never collapse a stale id
+        let rec = self.catalog.get(branch)?; // generation-guarded: never collapse a stale id
         if rec.branch_id.is_trunk() {
             return Err(BranchError::NotWritable(branch).into());
         }
@@ -438,18 +438,31 @@ impl Reaper for TwoTierReaper {
         // direction.
         self.catalog.attach_child(BranchId::TRUNK.id, new_fork_epoch, rec.branch_id.id)?;
 
+        // **RE-READ THE WHOLE RECORD; never write the pre-copy snapshot back.**
+        //
+        // The copy may have claimed several extents, each recorded against this branch inside
+        // `alloc_arena`'s atomic `add_arena`. Writing back `rec` as it stood before the copy drops
+        // every one of them from `record.arenas` — and `reap` frees exactly `record.arenas`, so
+        // those extents could never be reclaimed by anything: D20's read-modify-write arriving
+        // through `collapse` instead of through `alloc_arena`.
+        //
+        // The whole record rather than just `arenas`, because `arenas` is not the only field that
+        // moves during a copy that takes milliseconds: `lease_deadline` (a client keepalive),
+        // `envelope` (a `charge_row_writes` spend) and `root_page_id` (a concurrent `set_root`)
+        // all travel in the same record. Re-reading only the arena list would leave the window for
+        // those at the ENTIRE page copy.
+        //
+        // **Known-open, and narrowed rather than closed:** `put` is still a whole-record write,
+        // because `parent_id`, `depth` and `fork_epoch` have no narrower setter and must move
+        // together with the root. Anything landing between this re-read and the `put` below is
+        // still discarded. Closing it needs a narrow `reparent(branch, parent, epoch, root)`
+        // catalog operation each implementation makes atomic — the shape `add_arena` and
+        // `detach_child` already took, for this same reason — which is a catalog-trait change.
+        let mut rec = self.catalog.get(branch)?;
         rec.parent_id = Some(BranchId::TRUNK);
         rec.fork_epoch = new_fork_epoch;
         rec.depth = 1;
         rec.root_page_id = new_root;
-        // **Re-read the arena list; never write the pre-copy snapshot back.** `rec` was read
-        // before the copy began, and the copy claims extents as it rolls over — each one recorded
-        // against the branch by `alloc_arena` as it is taken. Putting this record's own stale
-        // `arenas` back would erase exactly those, and `reap` frees exactly `record.arenas`, so
-        // the erased extents would be charged to the branch durably and never freed: a silent
-        // leak for the lifetime of the database. Re-reading also picks up an extent claimed by
-        // any other path, which an accumulator local to the copy could not see.
-        rec.arenas = self.catalog.get_raw(rec.branch_id.id)?.arenas;
         self.catalog.put(&rec)?;
 
         // The old ancestors just lost a child, so their parked pages may now be free.
