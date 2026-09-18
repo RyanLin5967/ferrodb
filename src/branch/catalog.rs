@@ -597,25 +597,49 @@ impl BranchCatalog for LogBranchCatalog {
         LogBranchCatalog::release_id(self, id)
     }
 
+    /// **D45, sites 3 and 4** -- found by the D41 builder, not by my own sweep, which used a
+    /// hand-written method list and never looked at these two.
+    ///
+    /// Same shape as `set_root` and `renew_lease`: `get_raw` takes the read lock and drops it,
+    /// `put` takes the write lock, and the live-children array is rebuilt from a snapshot read
+    /// before whatever else landed. It is a worse loss than the other two, because
+    /// `has_live_children` is what `reap_expired` consults (`reaper.rs:185`, `:528`): **a lost
+    /// `attach_child` leaves a parent believing it is childless, and it is then reaped out from
+    /// under a live child.**
+    ///
+    /// Generation-blindness is PRESERVED, deliberately. `get_raw` exists so the reaper can read
+    /// the record of a branch mid-reap and consult an already-reaped parent's `live_children`;
+    /// adding `check_readable` here would break exactly the caller this method has.
     fn attach_child(
         &self,
         parent_id: u64,
         fork_epoch: Epoch,
         _child_id: u64,
     ) -> Result<(), FerroError> {
-        // The live set lives inside the parent's record here, and `_child_id` is not needed: the
-        // set is re-derived from the children themselves at replay, so the epoch is enough.
-        let mut prec = self.get_raw(parent_id)?;
+        let mut st = self.state.write().unwrap();
+        let prec = st
+            .records
+            .get_mut(&parent_id)
+            .ok_or_else(|| FerroError::from(BranchError::NotFound(BranchId::new(parent_id, 0))))?;
         prec.add_live_child(fork_epoch);
-        self.put(&prec)
+        let snapshot = prec.clone();
+        self.append(&[&snapshot])
     }
 
     /// The log catalog keeps the live set inside the record, so this is exactly what the reaper
     /// used to do inline.
+    /// **D45, the mirror of `attach_child`.** A lost `detach_child` strands a child epoch in the
+    /// parent's array, so `has_live_children` answers true forever and the parent is **never
+    /// reapable** -- a leak rather than a premature free, but unbounded.
+    ///
+    /// The missing-record case still returns `Ok(false)` rather than an error, unchanged: the
+    /// caller is the reaper walking up a chain whose parent may already be gone.
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
-        let Ok(mut prec) = self.get_raw(parent_id) else { return Ok(false) };
+        let mut st = self.state.write().unwrap();
+        let Some(prec) = st.records.get_mut(&parent_id) else { return Ok(false) };
         if prec.remove_live_child(fork_epoch) {
-            self.put(&prec)?;
+            let snapshot = prec.clone();
+            self.append(&[&snapshot])?;
             return Ok(true);
         }
         Ok(false)
