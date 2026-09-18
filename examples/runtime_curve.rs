@@ -71,6 +71,16 @@ impl Drop for ScratchDir {
 /// Liveness is decided by `kill(pid, 0)`, not by mtime. An mtime sweep cannot tell a long run from
 /// an abandoned one and would delete the catalog out from under a live 10^6 benchmark. Pid reuse
 /// can only make a dead run look alive, which skips a cleanup and is the safe direction.
+///
+/// ⚠ **UNIX ONLY, and gated rather than ported.** `kill` does not exist on Windows; linking against
+/// it there fails with `LNK2019: unresolved external symbol kill`, which is what kept CI's
+/// windows-latest job red for ten hours and was fixed for the other examples in `07c34e1`. This
+/// file was missed by that pass. `cargo check` CANNOT catch it -- it does not link -- so the gate
+/// is the only thing standing between this and a red Windows job.
+///
+/// On non-unix the sweep is a no-op: the scratch directory is still removed by `Drop` on every
+/// path except a signal, and leaving a stale directory is strictly safer than deleting a live one.
+#[cfg(unix)]
 fn sweep_stale_scratch() {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
@@ -91,24 +101,47 @@ fn sweep_stale_scratch() {
     }
 }
 
-fn peak_rss_bytes() -> u64 {
-    // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
-    #[repr(C)]
-    #[derive(Default)]
-    struct RUsage {
-        ru_utime: [i64; 2],
-        ru_stime: [i64; 2],
-        ru_maxrss: i64,
-        rest: [i64; 14],
+/// No liveness primitive without `kill`, and an mtime sweep would delete a live run's catalog.
+/// Doing nothing is the safe direction.
+#[cfg(not(unix))]
+fn sweep_stale_scratch() {}
+
+/// Peak resident set size, or `None` where the platform cannot answer.
+///
+/// Same gate and same reason as `sweep_stale_scratch` above, and the same shape `branch_curve.rs`,
+/// `cow_scan_memory.rs` and `d27_fork_workspace_cost.rs` already use since `07c34e1`. Returning
+/// `None` rather than `0` matters: `0` is a plausible measurement and would be averaged in.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // getrusage(RUSAGE_SELF).ru_maxrss; bytes on macOS, kilobytes on Linux.
+        #[repr(C)]
+        #[derive(Default)]
+        struct RUsage {
+            ru_utime: [i64; 2],
+            ru_stime: [i64; 2],
+            ru_maxrss: i64,
+            rest: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+        }
+        let mut u = RUsage::default();
+        if unsafe { getrusage(0, &mut u) } != 0 {
+            return None;
+        }
+        Some(if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 })
     }
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    #[cfg(not(unix))]
+    {
+        None
     }
-    let mut u = RUsage::default();
-    if unsafe { getrusage(0, &mut u) } != 0 {
-        return 0;
-    }
-    if cfg!(target_os = "macos") { u.ru_maxrss as u64 } else { u.ru_maxrss as u64 * 1024 }
+}
+
+/// `peak_rss_bytes()` in megabytes, or `NaN` where the platform cannot answer -- so the column
+/// keeps its position in the output while being impossible to mistake for a measurement.
+fn peak_rss_mb() -> f64 {
+    peak_rss_bytes().map_or(f64::NAN, |b| b as f64 / 1e6)
 }
 
 /// Everything a statement needs, wired exactly as `tests/integration_quarantine.rs` wires it, so
@@ -353,7 +386,7 @@ fn query_phase() {
         let (brall_ms, brall_rows) =
             time_ms(view_reps, || db.rows("SELECT * FROM ferro_branches;", &mut reader));
         assert!(brall_rows >= done, "ferro_branches returned {brall_rows} of {done} branches");
-        note!("  N={done}: ferro_branches (all) -> {brall_rows} rows in {brall_ms:.2} ms, peak RSS {:.1} MB", peak_rss_bytes() as f64 / 1e6);
+        note!("  N={done}: ferro_branches (all) -> {brall_rows} rows in {brall_ms:.2} ms, peak RSS {:.1} MB", peak_rss_mb());
 
         println!(
             "{:>9} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>12.2} {:>12.2} {:>12.2} {:>12.4} {:>12.4} {:>12.3} {:>10.1}",
@@ -368,7 +401,7 @@ fn query_phase() {
             act_ms,
             quar_ms,
             live_ms,
-            peak_rss_bytes() as f64 / 1e6,
+            peak_rss_mb(),
         );
 
         db.ok(&format!("ABANDON BRANCH {live_branch};"), &mut live);
@@ -609,7 +642,7 @@ fn session_phase() {
     );
 
     let mut done = 0usize;
-    let base_rss = peak_rss_bytes();
+    let base_rss = peak_rss_bytes();  // None on non-unix; every derived figure below becomes NaN
     // Held so the runtime's per-session state cannot be dropped behind the measurement's back.
     let mut held: Vec<ferrodb::agent_sql::session::AgentSession> = Vec::new();
 
@@ -687,8 +720,11 @@ fn session_phase() {
             done,
             actually as f64 / secs,
             stmt_ms,
-            rss as f64 / 1e6,
-            (rss.saturating_sub(base_rss)) as f64 / done as f64,
+            rss.map_or(f64::NAN, |b| b as f64 / 1e6),
+            match (rss, base_rss) {
+                (Some(r), Some(b)) => r.saturating_sub(b) as f64 / done as f64,
+                _ => f64::NAN,
+            },
             resolve_ms * 1000.0,
             forget_ms,
             act_ms,

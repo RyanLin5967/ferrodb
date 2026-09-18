@@ -117,13 +117,44 @@
 //! left standing rather than deleted because the next reader will otherwise re-derive it from the
 //! same real numbers.
 //!
-//! What actually holds the slope was in this file the whole time. The resident hit loop is
-//! `fetch_page` + `unpin_page`, and between them each iteration takes `page_table.read()` twice,
-//! `frames[i].read()` twice, and two atomic RMWs on the pin counter -- **four RwLock read
-//! acquisitions before `touch` is even reached.** A Rust `RwLock`'s reader count is one
-//! process-wide cache line that every reader atomically RMWs; it contends exactly like a mutex,
-//! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
-//! five, which is why removing it bought 33% and nothing else.
+//! The resident hit loop is `fetch_page` + `unpin_page`, and between them each iteration takes
+//! `page_table.read()` twice, `frames[i].read()` twice, and two atomic RMWs on the pin counter --
+//! four RwLock read acquisitions before `touch` is even reached. A Rust `RwLock`'s reader count is
+//! one cache line that every reader atomically RMWs; it contends exactly like a mutex, it is simply
+//! not spelled `Mutex`.
+//!
+//! ⚠ **CORRECTED 2026-09-18: only TWO of those four are SHARED, and the "floor" has never been
+//! measured under contention.** `examples/bufpool_fault_concurrency.rs` gives each thread a
+//! **disjoint** slice of the page space -- `slot = (t + k * threads) % ids.len()` with every thread
+//! count dividing the page count, and the harness says so in its own doc comment at `:205`. Disjoint
+//! pages mean disjoint FRAMES, so `frames[i].read()` and both pin-counter RMWs sit on THREAD-PRIVATE
+//! cache lines in every number this project owns. What is genuinely shared is the two
+//! `page_table.read()` acquisitions and the `arc_cache` mutex -- and the C1 mirror already removes
+//! the former. So "four RwLock acquisitions" is a correct count of the CODE and a wrong count of the
+//! CONTENTION.
+//!
+//! ⛔ **AND THE HARNESS CONTAINS THE CONSTRUCT UNDER TEST, INSIDE THE TIMED WINDOW.**
+//! `bufpool_fault_concurrency.rs:220` creates ONE `Arc<AtomicUsize>` and `:314` does
+//! `done.fetch_add(1, Ordering::Relaxed)` on it per operation, inside the measured section --
+//! ~9.6M contended RMWs on a single cache line per 16-thread point. `refused` and `wrong` are the
+//! same shape. That cannot explain the 2x2's ORDERING, because every arm carries it; what it plausibly
+//! IS is the ceiling every arm runs into. A standalone model measured the same code shape with
+//! per-thread padded counters at 203.5 M/s at 16T with a POSITIVE slope, and with one shared counter
+//! at 45.7 M/s -- within 2% of C1STUB's measured 44.7-45.4 M/s. **Unconfirmed** (synthetic, 2 reps,
+//! loaded machine), and being settled by re-running BASE and C1STUB with padded counters.
+//! ⇒ Until that lands, treat **×0.579 as the INSTRUMENT's ceiling, not the design's**, and treat
+//! D44's pre-registered bar as provisional.
+//!
+//! ⭐ This is D44's own lesson turned on the instrument: an arm that removes one of two serialised
+//! walls measures the other. A shared counter inside the timed window is a third wall present in
+//! EVERY arm including the control, which is exactly why it cancels in comparisons and survives as
+//! a ceiling nobody attributes to the harness.
+//!
+//! ⚠ One more serialising point sits ABOVE the pool and is named nowhere in D35 or D44:
+//! `PageLatches` is a `Mutex<HashMap<u32, Latch>>` (`page_latch.rs:194`) with `wake.notify_all()` on
+//! every release, taken twice per tree level per lookup. On the branch path that is plausibly larger
+//! than anything in this file, and removing the pool's RMWs underneath it would reproduce the same
+//! mistake at a larger scale.
 //!
 //! # ⛔ TWO SERIALISED WALLS, AND EVERY EARLIER SINGLE-ARM READING OF THEM WAS WRONG
 //!
@@ -136,27 +167,41 @@
 //!
 //! | | `touch` KEPT | `touch` DELETED |
 //! |---|---|---|
-//! | **no mirror** | BASE x0.107 | STUB x0.095 |
-//! | **mirror** | C1 x0.125 | **C1STUB x0.581**, rising monotonically 2T->16T |
+//! | **no mirror** | BASE x0.111 | STUB x0.080 |
+//! | **mirror** | C1 x0.121 | **C1STUB x0.579**, rising monotonically 2T->16T |
+//!
+//! ⭐ **Those are the ROTATED numbers, and the rotation is load-bearing — WAITING FOR A QUIET
+//! MACHINE WOULD NOT HAVE BEEN ENOUGH.** The first run of this factorial interleaved arms but kept
+//! their ORDER fixed, and loadavg drifted monotonically upward across it, so `C1STUB` sat at the
+//! highest load in every rep: a systematic POSITION bias, not noise. **Interleaving cancels only a
+//! bias that is constant in TIME; on this machine drift is the normal case.** The re-run rotates
+//! the four arms through a Latin square so each occupies each position exactly once, and the
+//! summariser now prints 1T throughput BY POSITION as the check — 38.4M / 38.8M / 38.6M / 38.6M,
+//! flat to within 1%. Load still rose 3.72 -> 13.14 DURING the re-run, with the suite lock free and
+//! no `cargo` on the process table, which is the proof that quiet was never the fix.
+//! Superseded raw data is kept, not deleted: `bench/d35_c1_factorial_SUPERSEDED_rising_load.txt`
+//! (biased against C1STUB) and `bench/d35_c1_pagetable_SUPERSEDED_fixed_order.txt` (against C1).
+//! Every cell moved by at most 0.015 and the ordering is identical — which is a RESULT of the
+//! re-run, not a reason it could have been skipped.
 //!
 //! Three cells collapse; only the fourth rises. **`touch` and the page table are two serialising
 //! points IN SERIES**, so removing either alone leaves the other binding. That is why STUB came
 //! out marginally worse than BASE, and why the gate's C1 arm looked like a shape change: it was
 //! built ON TOP OF its STUB arm, so it had BOTH removed and credited one cause with a two-cause
-//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.7M.
+//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.9M.
 //!
 //! ⭐ **The transferable form, which is worth more than the instance: an arm that removes one of
 //! two SERIALISED walls measures the OTHER wall, not the one it removed. Two "no effect" results
 //! in series are not evidence that neither is a wall.**
 //!
 //! **So neither half is a shape change alone.** A page-table mirror that RETAINS `touch` -- the
-//! only version that can ship -- is x0.125 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
+//! only version that can ship -- is x0.121 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
 //! the same order as the constant BP-Wrapper was rejected for being. It is **not** in this tree
 //! for that reason; it is on `ferrodb-D35-C1-pagetable` at `c0d07d2`, certified green, waiting to
 //! be built into the pair.
 //!
 //! **The candidate is the PAIR** -- the page table off the hit path **plus** a batched,
-//! ARC-preserving `touch` -- and it is judged against a **x0.581 ceiling, not against zero**. A
+//! ARC-preserving `touch` -- and it is judged against a **x0.579 ceiling, not against zero**. A
 //! scheme landing at x0.20 has recovered a sixth of the available headroom and is a MICRO wearing
 //! a shape change's clothes. See `SCALE-DESIGN.md` D44 for the pre-registered falsifiers.
 //!

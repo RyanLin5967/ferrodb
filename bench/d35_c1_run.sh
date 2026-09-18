@@ -22,6 +22,16 @@
 # The OVERSUBSCRIBED arm is here because the mirror's maintenance cost falls on the MISS path --
 # every eviction clears a slot and every fault publishes one -- and because it is the only arm that
 # reports a non-zero reads_per_fetch, which is the harness's window onto hit rate.
+#
+# ARM ORDER ALTERNATES over 4 reps, and that is a fix rather than a flourish. The first version of
+# this script ran BASE then C1 in a FIXED order, and the machine's load drifted monotonically
+# during the run -- so C1 sat at the higher load in every rep. Interleaving only cancels a bias
+# that is constant in time; against a DRIFT it leaves a systematic POSITION bias. Alternating the
+# order means each arm runs first twice and second twice, so a monotonic drift cancels to first
+# order. See bench/d35_c1_factorial_SUPERSEDED_rising_load.txt for the run that got this wrong.
+#
+# It also REFUSES to start while a live pid holds /tmp/ferrodb-suite.lock. An empty process table
+# is NOT proof of quiet: between targets a per-target suite is a bash script with no cargo child.
 set -uo pipefail
 cd "$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
@@ -31,9 +41,24 @@ C1_BIN=${C1_BIN:?set C1_BIN to a bufpool_fault_concurrency built at the C1 commi
 BASE_REF=${BASE_REF:-unknown}
 C1_REF=${C1_REF:-$(git rev-parse --short HEAD)}
 
+SUITE_LOCK=${SUITE_LOCK:-/tmp/ferrodb-suite.lock}
 for b in "$BASE_BIN" "$C1_BIN"; do
   [ -x "$b" ] || { echo "REFUSING: $b is not an executable" >&2; exit 2; }
 done
+
+quiet_or_refuse() {
+  if [ -d "$SUITE_LOCK" ]; then
+    local owner pid
+    owner=$(cat "$SUITE_LOCK/owner" 2>/dev/null || echo "unknown")
+    pid=${owner%% *}
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "REFUSING: a suite is running and holds $SUITE_LOCK ($owner)." >&2
+      echo "  Numbers taken beside a compiling, linking, TCP-binding test suite are not quotable." >&2
+      exit 3
+    fi
+  fi
+}
+quiet_or_refuse
 
 # Byte-identical to the RESIDENT arm header of bench/s22_bufpool_before_after.txt and of
 # bench/d35_gate_stubtouch.txt, so the three files are comparable.
@@ -57,25 +82,43 @@ OVERSUB_ARGS=(500 1,2,4,8,16 500 1)
 } > "$OUT"
 
 run_arm() {
-  local rep=$1 name=$2 bin=$3 label=$4
+  local rep=$1 pos=$2 name=$3 label=$4
   shift 4
+  local bin
+  case "$name" in BASE) bin=$BASE_BIN ;; C1) bin=$C1_BIN ;; *) echo "unknown arm $name" >&2; exit 2 ;; esac
   {
     echo "===== rep $rep | $name | $label ====="
+    echo "# position in rep: $pos of 2"
     echo "# loadavg at launch: $(uptime | sed 's/.*averages*: //')"
   } >> "$OUT"
   timeout 900 "$bin" "$@" >> "$OUT" 2>&1
-  echo "HARNESS_EXIT=$?" >> "$OUT"
-  echo >> "$OUT"
+  local rc=$?
+  {
+    echo "# loadavg at finish: $(uptime | sed 's/.*averages*: //')"
+    echo "HARNESS_EXIT=$rc"
+    echo
+  } >> "$OUT"
 }
 
-for rep in 1 2 3; do
-  run_arm "$rep" BASE "$BASE_BIN" "RESIDENT (every fetch is a cache HIT)" "${RESIDENT_ARGS[@]}"
-  run_arm "$rep" C1   "$C1_BIN"   "RESIDENT (every fetch is a cache HIT)" "${RESIDENT_ARGS[@]}"
+# Alternating order: each arm runs first twice and second twice.
+ORDERS=("BASE C1" "C1 BASE" "BASE C1" "C1 BASE")
+
+for rep in 1 2 3 4; do
+  quiet_or_refuse
+  pos=0
+  for arm in ${ORDERS[$((rep-1))]}; do
+    pos=$((pos+1))
+    run_arm "$rep" "$pos" "$arm" "RESIDENT (every fetch is a cache HIT)" "${RESIDENT_ARGS[@]}"
+  done
 done
 
-for rep in 1 2 3; do
-  run_arm "$rep" BASE "$BASE_BIN" "OVERSUBSCRIBED, MODELLED IO 500us per read" "${OVERSUB_ARGS[@]}"
-  run_arm "$rep" C1   "$C1_BIN"   "OVERSUBSCRIBED, MODELLED IO 500us per read" "${OVERSUB_ARGS[@]}"
+for rep in 1 2 3 4; do
+  quiet_or_refuse
+  pos=0
+  for arm in ${ORDERS[$((rep-1))]}; do
+    pos=$((pos+1))
+    run_arm "$rep" "$pos" "$arm" "OVERSUBSCRIBED, MODELLED IO 500us per read" "${OVERSUB_ARGS[@]}"
+  done
 done
 
 echo "WROTE $OUT"
