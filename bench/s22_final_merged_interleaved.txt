@@ -1,0 +1,21 @@
+# S22 FINAL — merged base at 0aa4b04, agent-isolation fully merged
+# BEFORE = this base with agent-isolation's buffer_pool.rs (pre-S22 pool). AFTER = with S22's.
+# Binaries cmp'd non-identical before use: 655344 vs 652224 bytes, differ at char 217.
+# FAULT ARM ONLY. Each thread sleeps a fixed 500us per modelled read, so the arm is
+# load-insensitive; loadavg is 28.45 36.47 26.51 from another project's C++ builds and a
+# resident-arm or bare faults/s figure taken now would NOT be trustworthy.
+# run at 2026-09-18T07:44:56Z
+
+pass  threads  before_faults_s  after_faults_s  speedup
+1     1        1308             1315            x1.01
+1     2        1313             2621            x2.00
+1     4        1277             5273            x4.13
+1     8        1315             10667           x8.11
+1     16       1314             21417           x16.30
+2     1        1320             1314            x1.00
+2     2        1319             2640            x2.00
+2     4        1319             5324            x4.04
+2     8        1304             10661           x8.18
+2     16       1317             21266           x16.15
+
+# loadavg at end: 21.39 34.00 25.96
