@@ -1,0 +1,71 @@
+S18 — what the PAGE as the unit of sharing costs. Recorded 2026-09-17, darwin/APFS, release build.
+Instruments: examples/storage_unit_cost.rs, storage_residency_cost.rs, storage_pool_lock.rs,
+storage_collapse_cost.rs (this branch). Predictions pre-registered before the residency run.
+
+--- A. write amplification: page granularity vs a 20-byte delta ---------------------------------
+trunk 2000 rows (30 pages). A fresh fork writing ONE row:
+  pages_allocated = 2   (8192 B of new physical pages)   logical delta = 20 B    => 410x
+  reserved_delta  = 256 pages (1 MiB), the whole extent
+Second single-row write on the same branch: pages_allocated = 1 (path now private, in-place).
+trunk 200000 rows (2977 pages): 3.00 private pages/branch. The floor is ceil(log_f N) * 4096 B.
+
+--- B. extent reservation per writing branch ----------------------------------------------------
+                       B=2000            B=4000
+  allocated pages      4000 (2.00/br)    8000 (2.00/br)
+  RESERVED pages       512000 (256.00)   1024000 (256.00)
+  extent utilisation   0.781%            0.781%
+  apparent file len    2,098,212,864 B   4,195,364,864 B   (1,048,841 B/branch)
+  on-disk blocks       1,702,060,032 B   4,211,089,408 B   (1,052,772 B/branch)
+`du -h` on the retained B=4000 file: 3.9G. stat blocks=8194904 (x512 = 4.196 GB) == apparent.
+CONTROL: a plain python pwrite of one 4 KB page per 1 MiB across 4 GiB also reports du=3.9G, so
+APFS on this machine does not hole-punch. The reservation is real disk here; on a hole-punching
+filesystem it would be address space only, and the u32 page id caps that at 2^32/256 branches.
+
+--- C. durable free-space map: full image rewritten + fsynced per extent claim ------------------
+  state_bytes()        137 B -> 96,137 B (B=2000)     137 B -> 192,137 B (B=4000)
+  marginal             48.0 B/branch                  48.0 B/branch          (linear)
+  TOTAL rewrite volume 96,273,839 B                   384,547,839 B
+  ratio for 2x B       3.994  => QUADRATIC to 0.15%
+Extrapolated to 10^6 writing branches: 48 MB image, ~24 TB rewritten, each via the four-step
+fsync idiom in storage/atomic_file.rs.
+
+--- D. read throughput vs CONCURRENTLY ACTIVE branches (1 thread, 1024-frame pool) -------------
+trunk 200000 rows = 2977 pages = 2.91x the pool. 2048 branches, one row each, 3.00 pages/branch.
+  active   1     2     4     8    16    32    64   128   256   512  1024  2048
+  reads/s 39336 28294 29547 39434 39352 37069 38635 38627 38264 38267 37501 36409
+NO KNEE. -7.4% over a 2048x range. PREDICTION P2/P3 (a knee between 128 and 512, a 10-50x drop)
+is FALSIFIED and recorded as wrong. Reason read from the code: a child's root IS the parent's
+root, so the read path never walks the parent chain.
+
+--- E. the one global buffer-pool mutex ---------------------------------------------------------
+ARM B, real tree.get, 4 active branches: 1t 38550/s, 2t 71277 (1.85x), 4t 90093 (2.34x),
+8t 101087 (2.62x). Amdahl serial fraction 0.293 => asymptotic ceiling 3.41x.
+ARM C, the narrowest possible workload — fetch_page/unpin_page on 8 RESIDENT pages, no disk,
+no tree code, 4,000,000 ops:
+  threads     1         2         4         8        16        32
+  ops/sec  21487941  15859037  5913111  3685493  4497519  4260881
+  speedup    1.00x     0.74x    0.28x    0.17x     0.21x     0.20x
+NEGATIVE SCALING: 5.8x SLOWER at 8 threads than at 1.
+ARM D control, same loop with an atomic increment instead of the pool: 1.00x, 1.08x, 3.02x,
+3.60x, 2.13x, 2.48x. The machine scales; the pool does not. PREDICTION P4 (<=1.3x at 8 threads
+on ARM B) was also FALSIFIED — the real number is 2.62x — but ARM C shows the lock is worse
+than predicted, not better.
+
+--- F. the depth wall: collapse refuses above ONE ARENA EXTENT ----------------------------------
+fork refuses above MAX_BRANCH_DEPTH=8. collapse is the only escape. Bracketed in both directions:
+  trunk rows   reachable pages   collapse
+       200            3          ok, 15.860 ms, copied 3
+      5000           71          ok, 351.013 ms, copied 71
+     12000          172          ok, 687.160 ms, copied 172
+     16000          228          ok, 489.473 ms, copied 228     <-- last success
+     20000          285          REFUSED, 1.101 s: "arena a11 is exhausted (256 pages);
+                                 ask arena_for for a fresh extent"
+    200000         2850          REFUSED, 735.732 ms, same error
+Every success copied EXACTLY the whole trunk page count: collapse is a full deep copy of the
+branch's entire reachable page graph (reaper.rs deep_copy), not of its own novel pages (1-3).
+MAX_COLLAPSE_PAGES = 1<<16 = 65536 (reaper.rs:63) is UNREACHABLE: collapse takes one arena via
+alloc_arena (reaper.rs:353) and deep_copy calls alloc_in_arena directly, which refuses at
+ARENA_EXTENT_PAGES=256 instead of rolling over through arena_for. The real budget is 256x smaller
+than the named one.
+Nothing in src/cli, src/agent_sql, src/pgwire or examples/pgserver.rs calls collapse, and nothing
+anywhere handles BranchError::DepthExceeded. On any database over 1 MiB, depth 8 is final.
