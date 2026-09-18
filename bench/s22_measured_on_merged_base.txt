@@ -1,0 +1,17 @@
+# S22 RE-MEASURED ON THE MERGED BASE (post D23 page latches, D27 workspace, D33 add_arena)
+# BEFORE = merged base with agent-isolation's buffer_pool.rs (pre-S22 pool, D23 instrumentation)
+# AFTER  = merged base with S22's pool. Same harness binary source, same params, interleaved.
+# run at 2026-09-18T04:49:45Z, loadavg: 24.43 14.29 14.47
+
+threads  before_faults_s  after_faults_s   speedup
+1        1571             1569             x1.00
+2        1563             3142             x2.01
+4        1571             6316             x4.02
+8        1566             12608            x8.05
+16       1568             25213            x16.08
+
+# second pass, to show the pair reproduces
+1        1573             1574             x1.00
+16       1569             25240            x16.09
+
+# loadavg at end: 24.13 14.74 14.63
