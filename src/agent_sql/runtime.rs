@@ -83,11 +83,43 @@ use crate::wal::txn::{ReadView, TxnManager};
 /// client to call anything (DESIGN.md exit criterion 8).
 pub const DEFAULT_LEASE_MILLIS: u64 = 15 * 60 * 1000;
 
-/// Everything the runtime needs to reach the shared tables.
+/// Everything the runtime needs to reach the shared tables, with the catalog EXCLUSIVELY.
+///
+/// A statement holding one of these is the only statement that may run, because the server hands
+/// it the `&mut Catalog` it gets from `pgwire::ServerContext::catalog()` — one process-wide mutex,
+/// taken outermost for the whole statement (`src/pgwire/mod.rs:100`). That is what D50 measured as
+/// a flat throughput curve: 52,187 -> 46,897 statements/s over 1 -> 16 threads.
 pub struct ExecCtx<'a> {
     pub catalog: &'a mut Catalog,
     pub bp: Arc<BufferPoolManager>,
     pub txn: Arc<TxnManager>,
+}
+
+/// The same thing with the catalog SHARED, for statements that only read it.
+///
+/// # Why this type exists rather than a bool or a convention
+///
+/// D51 asked the compiler whether a read needs a mutable catalog, by changing `ExecCtx.catalog`
+/// to `&Catalog` and reading the errors: **two sites in the entire crate, both writes**
+/// (`bench/d51_type_probe.txt`). So the serialization was never a property of what a read does —
+/// it was one type signature propagated from two write-side call sites to every statement.
+///
+/// Splitting the type rather than relaxing it means a read path **cannot** mutate the catalog by
+/// accident: there is no `&mut` to reach for, so the mistake is not expressible rather than
+/// forbidden by a comment. `ExecCtx::read` reborrows, so the exclusive path can call every
+/// read-only helper without duplicating one of them.
+pub struct ReadCtx<'a> {
+    pub catalog: &'a Catalog,
+    pub bp: Arc<BufferPoolManager>,
+    pub txn: Arc<TxnManager>,
+}
+
+impl<'a> ExecCtx<'a> {
+    /// Reborrow as a read context. Free, and it is what lets the exclusive path reuse the shared
+    /// helpers instead of growing a second copy of each.
+    pub fn read(&self) -> ReadCtx<'_> {
+        ReadCtx { catalog: self.catalog, bp: self.bp.clone(), txn: self.txn.clone() }
+    }
 }
 
 /// Table identity, derived from the table name (FNV-1a).
@@ -1216,7 +1248,7 @@ impl AgentRuntime {
     /// uncommitted buffer.
     fn visible_rows(
         &self,
-        ctx: &mut ExecCtx,
+        ctx: &ReadCtx,
         branch: Option<BranchId>,
         table: &str,
     ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
@@ -1254,7 +1286,7 @@ impl AgentRuntime {
     /// a scan retains a predicate summary (which is what gives phantom coverage).
     pub fn select(
         &self,
-        ctx: &mut ExecCtx,
+        ctx: &ReadCtx,
         branch: BranchId,
         stmt: &Stmt,
         reader: Option<BranchId>,
@@ -1648,7 +1680,7 @@ impl AgentRuntime {
             (bw, resolved)
         };
 
-        let rows = self.visible_rows(ctx, Some(branch), table)?;
+        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -1735,7 +1767,7 @@ impl AgentRuntime {
         }
         let rid = row_id_of(&row);
         let existing = self
-            .visible_rows(ctx, Some(branch), table)?
+            .visible_rows(&ctx.read(), Some(branch), table)?
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
@@ -1768,7 +1800,7 @@ impl AgentRuntime {
             Some(w) => Some(binder.bind_expr(w.clone(), &scope)?),
             None => None,
         };
-        let rows = self.visible_rows(ctx, Some(branch), table)?;
+        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -2485,7 +2517,7 @@ impl AgentRuntime {
                 continue;
             };
             schemas.insert(*t, entry.schema.clone());
-            for row in scan_table(name, ctx)? {
+            for row in scan_table(name, &ctx.read())? {
                 current.insert((*t, row_id_of(&row).0), row);
             }
         }
@@ -3253,7 +3285,7 @@ impl AgentRuntime {
             if ctx.catalog.get_table(name).is_none() {
                 continue;
             }
-            for row in scan_table(name, ctx)? {
+            for row in scan_table(name, &ctx.read())? {
                 current.insert((*t, row_id_of(&row).0), row);
             }
         }
@@ -3788,7 +3820,7 @@ impl AgentRuntime {
                 }
                 (kind, Some(col)) => {
                     let inverse = invert(kind, a.before.as_ref())?;
-                    let rows = scan_table(&a.table, ctx)?;
+                    let rows = scan_table(&a.table, &ctx.read())?;
                     let cur = rows
                         .into_iter()
                         .find(|r| row_id_of(r) == a.row)
@@ -4702,7 +4734,7 @@ fn apply_dml_in(
 }
 
 /// Every row of a table as the shared (merged) state has it.
-pub fn scan_table(table: &str, ctx: &mut ExecCtx) -> Result<Vec<Vec<Value>>, FerroError> {
+pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
     let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot(), txn_id: 0 });
     let stmt = Stmt::Select {
         from: TableRef::plain(table.to_string(), None),

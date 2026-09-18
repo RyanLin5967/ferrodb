@@ -486,7 +486,7 @@ pub fn run_agent_stmt(
             Ok(Outcome::Agent(AgentOutput::Simulation(Box::new(report))))
         }
         BoundAgentStmt::SelectAsOf { branch, stmt } => {
-            let rows = runtime.select(&mut ctx, branch, &stmt, current)?;
+            let rows = runtime.select(&ctx.read(), branch, &stmt, current)?;
             Ok(Outcome::Rows(rows))
         }
     }
@@ -511,7 +511,7 @@ pub fn run_in_session(
     let mut ctx = ExecCtx { catalog, bp, txn };
     match stmt {
         s @ Stmt::Select { .. } => {
-            let rows = runtime.select(&mut ctx, branch, &s, Some(branch))?;
+            let rows = runtime.select(&ctx.read(), branch, &s, Some(branch))?;
             Ok(Outcome::Rows(rows))
         }
         s => Ok(Outcome::Affected(runtime.write(&mut ctx, branch, s)?)),
