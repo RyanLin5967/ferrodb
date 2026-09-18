@@ -1,0 +1,74 @@
+D28 -- test targets run, and what the two failures were.
+
+Per-target rather than one `cargo test`, and written to a file as they landed: a full
+suite run on this machine gets SIGTERMed by the concurrent agent fleet part way through,
+and a run that died mid-suite reports as a pass.
+
+Targets chosen by grepping tests/ for anything that names a ferro_* view, `run_of`,
+`branches().scan` or `BranchCatalog` -- 32 files.
+
+adv_f5_probe :: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+adv_f6_dropped_capture :: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+d16_transitive_visibility :: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+d15_concurrent_fork_and_reap :: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.91s
+d18_reaper_asks_the_catalog :: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+d33_add_arena_must_be_durable :: test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+integration_arena_exclusivity :: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+agent_sql_surface :: test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+d19_leak_is_a_race :: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 375.00s
+integration_branch_pages :: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+integration_capability_envelope :: test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+integration_cluster_snapshot :: test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.65s
+integration_cluster_agents :: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.38s
+integration_cli_row_authorship_durability :: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.73s
+integration_cow_branch :: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+integration_cluster_grants :: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.12s
+integration_durable_tel :: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+integration_prompt_clause :: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+integration_fork_kill9 :: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+integration_run_identity_feed :: test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+integration_sql_on_durable_branches :: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+integration_quarantine :: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+integration_runtime_reattach :: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+integration_runtime_concurrency :: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+integration_simulate :: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+integration_system_views_wire :: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+integration_server_reaps :: test result: FAILED. 3 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s
+integration_system_views :: test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+integration_zero_copy_fork :: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+prop_cow_diff :: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.94s
+integration_trunk_tree_authority :: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+integration_view_pushdown :: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.96s
+
+-- integration_fork_kill9, integration_system_views_wire and integration_server_reaps
+   failed above for ONE reason: `cargo test` does not rebuild examples, and each spawns
+   one. Their own panic messages say `run: cargo build --examples`. After that:
+
+integration_fork_kill9 :: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+integration_system_views_wire :: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.14s
+integration_server_reaps :: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.37s
+
+-- re-run of the four most directly affected targets, last, after the doc-block move:
+
+integration_view_pushdown :: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.89s
+integration_system_views :: test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+integration_system_views_wire :: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+agent_sql_surface :: test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+-- integration_system_views_wire shows FAILED in the block directly above and ok below it.
+   Same cause both times: the staleness guard those tests carry refuses to run a pgserver
+   binary older than the source. Editing src/ after building examples re-arms it. Rebuilt
+   and re-run:
+
+integration_system_views_wire :: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.61s
+
+-- cargo test --release --lib :: ok. 1298 passed; 0 failed; 1 ignored.
+
+-- d33_add_arena_must_be_durable :: FAILED, 0 passed, 3 failed.
+   NOT D28. Verified by stashing all four source changes and running it against unmodified
+   HEAD, where it fails identically (0 passed, 3 failed). It is the deliberately-failing
+   test committed by 6a99906, "the D20 add_arena fix was never made durable".
+
+-- integration_cluster_snapshot :: FAILED once (8 passed, 1 failed), then ok (9 passed)
+   on an immediate re-run with no change in between. Flaky under load average 20-23, not
+   investigated further; it does not touch a path D28 changes.

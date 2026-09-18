@@ -953,6 +953,37 @@ impl AgentRuntime {
         self.prov_store.lookup(prov).ok()
     }
 
+    /// Every live branch's interned run, as `(id slot, run)`, in id-slot order — from **one** lock
+    /// acquisition.
+    ///
+    /// [`Self::run_of`] answered for one branch, so `ferro_runs` asked it per branch: it took an
+    /// `all_branches` snapshot and then probed the workspace map once for each record. At 10⁶
+    /// branches that is 10⁶ acquisitions of the runtime's single `Mutex` — the same one every
+    /// `INSERT`, `visible_rows` and `resolve_branch` takes — to return, typically, one row. Reading
+    /// a diagnostic view is not permitted to stall every other connection 10⁶ times, and no
+    /// predicate pushdown fixes that on its own: a genuinely unselective query brings every
+    /// acquisition straight back.
+    ///
+    /// **It is also the right row source and not merely the cheaper one.** `ferro_runs` has a row
+    /// exactly where a workspace exists, so the workspace map *is* the relation; branch records
+    /// were being enumerated to discover a subset of this map. The count is now bounded by open
+    /// sessions rather than by branches ever forked, which is the number the view is actually about.
+    ///
+    /// `BTreeMap` order is id-slot order, so the result needs no sort — the same order the
+    /// branch-id-ordered scan it replaces produced.
+    pub fn live_runs(&self) -> Vec<(u64, RunEntity)> {
+        // The guard is dropped before the store is touched, exactly as `run_of` does and for the
+        // same reason: every other path takes state -> store and never the reverse.
+        let slots: Vec<(u64, ProvId)> = {
+            let state = self.state.lock().unwrap();
+            state.workspaces.iter().map(|(id, ws)| (*id, ws.prov)).collect()
+        };
+        slots
+            .into_iter()
+            .filter_map(|(id, p)| self.prov_store.lookup(p).ok().map(|e| (id, e)))
+            .collect()
+    }
+
     /// Exit criterion 9: which agent + run + model wrote a given row.
     ///
     /// Answers for a row in the shared tables — that is, one some merge published — and keeps

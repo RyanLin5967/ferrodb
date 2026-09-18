@@ -1,0 +1,17 @@
+S20 / D28: the spread of a SINGLE `live_count` sample, on the durable catalog.
+
+N = 1000000 branches, 100 reps, 2000 independent single draws, 64 fork threads.
+
+  cold (one draw, what runtime_curve's live_cnt cell is) : 536.614 ms
+  repped mean over 100                                 : 47.020 ms
+
+  2000 single draws:
+    min    44.920 ms
+    median 48.805 ms
+    p95    56.472 ms
+    p99    61.146 ms
+    max    585.882 ms
+    max/median = 12.0x
+
+Read the max against the cell being questioned. A single draw is only evidence of a
+regression if the value sits OUTSIDE this spread.

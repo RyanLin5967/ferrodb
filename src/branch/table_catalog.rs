@@ -898,6 +898,33 @@ impl BranchCatalog for TableBranchCatalog {
         })))
     }
 
+    /// The narrowing form, served by the same descent machinery as [`Self::scan`] — literally the
+    /// same `range_scan` with tighter bounds and the same hydration, so the two cannot answer
+    /// differently about a record they both reach.
+    ///
+    /// `RECORD` keys are `[0x00][id big-endian]` and the tree compares keys as byte strings, so a
+    /// contiguous id range is a contiguous key range. See `tree_keys`' "why big-endian".
+    fn scan_ids(
+        &self,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+        if lo > hi {
+            // Never handed to the tree. An inverted range is an empty answer here, and asking a
+            // range scan for one is asking a question whose handling is a property of the scanner
+            // rather than of this range.
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let it = self
+            .tree
+            .range_scan(Bound::Included(keys::record(lo)), Bound::Included(keys::record(hi)))?;
+        Ok(Box::new(it.map(move |e| {
+            let (_, v) = e?;
+            let rec = BranchRecord::deserialize_core(&v).map_err(FerroError::from)?;
+            self.hydrate(rec)
+        })))
+    }
+
     fn max_live_child(&self, parent_id: u64) -> Result<Option<Epoch>, FerroError> {
         let (lo, hi) = keys::children_of(parent_id);
         // One descent: the CHILD key stores the complement of the fork epoch, so the newest child
