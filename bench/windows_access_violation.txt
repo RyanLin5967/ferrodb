@@ -1,0 +1,94 @@
+WINDOWS STATUS_ACCESS_VIOLATION — raw evidence, 2026-09-18
+==========================================================
+Provenance: every line below is [HERE] — read by this session from the CI logs and from
+the tree. Nothing in this file is second-hand.
+
+THE OBSERVATION
+---------------
+run 35391545783, head 0ee07fc, job "Test windows-latest":
+
+  process didn't exit successfully:
+  `D:\a\ferrodb\ferrodb\target\debug\deps\integration_cluster_agents-a50a5c1993fcbae7.exe`
+  (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+
+ubuntu-latest and macos-latest both passed on the same commit.
+
+⛔ CORRECTION TO THIS SESSION'S OWN EARLIER RECORD
+--------------------------------------------------
+I recorded "all 35 tests print ok, then the process dies at teardown". That is FALSE, and
+it sent three hypotheses (a use-after-free in the mirror, a production drain thread in the
+touch queue, unjoined fleet threads) at the wrong window.
+
+  binary declared:            running 35 tests
+  lines reporting "... ok":   34
+  summary line ("test result: ok. N passed"):  ABSENT
+
+The process died BEFORE libtest printed its summary and with one test unreported. Diffing
+the 34 reported names against the 35 `#[test]` fns at 0ee07fc names it exactly:
+
+  a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log
+
+That test is the heaviest in the file: 3 branches x 100 UPDATEs = 300 statements, each
+followed by fleet.pump_all() over a real 3-node TCP cluster, then 3 merges.
+
+So the fault is INSIDE a named test, not at teardown. Timeline from the log:
+  20:53:15.6657Z  last "... ok"   (on_three_real_nodes_only_the_merge_reaches_a_quorum)
+  20:53:17.5133Z  abnormal exit   (1.85 s later, no summary line)
+
+WHAT THIS RULES OUT
+-------------------
+src/buffer/ contains ZERO occurrences of `unsafe`:
+  grep -rn 'unsafe' src/buffer/ | wc -l   ->   0
+The compiled delta from the last windows-green (8aeae20) to the red (0ee07fc) is the D35-C1
++ D44 buffer work: page_table.rs (243 non-comment lines), touch_queue.rs (159),
+buffer_pool.rs (97), arena.rs (2), plus three test files. None of it contains unsafe, so
+memory corruption originating in that delta is not a available mechanism. What remains for
+safe Rust to reach 0xc0000005 is stack exhaustion or a libstd/OS interaction.
+
+The one thread_local! in the delta (touch_queue.rs:56) is `Cell<usize>`, which has no
+destructor, so the TLS-destructor route is closed too.
+
+SECOND SAMPLE: DESTROYED BY MY OWN PUSH
+---------------------------------------
+run 35394190730 on 5bb234b reached windows=in_progress and then CANCELLED. Cause, read from
+the tree: .github/workflows/tests.yml:20-22
+
+  concurrency:
+    group: ci-${{ github.event_name }}-${{ github.ref }}
+    cancel-in-progress: true
+
+I pushed 0aaffb4 at 21:16Z while the 20:57Z run was still in its windows job. The push
+cancelled it. This is the CI form of "never write into a tree while a run against it is in
+flight": a sample in flight is destroyed by the next push to the same ref.
+
+THIRD SAMPLE: GREEN
+-------------------
+run 35395893959, head 0aaffb4 (a strict superset of 0ee07fc):
+  success Test ubuntu-latest
+  success Test macos-latest
+  success Test windows-latest
+
+⚠ The asymmetry recorded before the sample still holds and must not be forgotten: a PASS is
+the LESS informative outcome here, because an intermittent fault passes most of the time.
+One green does not retire one red.
+
+LOCAL STRESS, macOS, 40 ITERATIONS: CLEAN
+-----------------------------------------
+The exact test, alone, 40 times, --test-threads=1:
+  40 iterations, 0 non-zero exits
+Collection verified rather than assumed — the per-iteration output reads
+  running 1 test
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 1.86s
+and the zero-collected trap was forced on purpose: `--exact no_such_test_exists` prints
+"running 0 tests" and still exits 0, so an rc-only check would have reported 40 clean runs
+of nothing.
+
+VERDICT
+-------
+UNRESOLVED. One occurrence, ever. Not reproduced in 40 local runs. The tip is green on all
+three platforms. The mechanism is unknown and the two D44-shaped explanations are closed by
+`unsafe`=0.
+
+The operational conclusion does not depend on the diagnosis: an unexplained access
+violation inside a test is not something to merge into main, because main's CI going
+intermittently red destroys the signal every other lane reads.
