@@ -1,6 +1,7 @@
 === D23 AFTER: the latched B+tree under concurrency ===
 date: 2026-09-18T03:20:17Z
-tree: 40e6fcdbfda256a92592d6c2b3f580a00f5c7bf7 + the lock-order + live-scanner work in this commit
+commit: a9bfc84 (measured on 40e6fcd plus the then-uncommitted lock-order, live-scanner and
+        tracked-accessor work that a9bfc84 committed; the source is byte-identical)
 cmd:  cargo test --test integration_btree_concurrency -- --test-threads=1 --nocapture
 
 NOTE: commit de980e2's message cited this path, but the file was never committed - only the
