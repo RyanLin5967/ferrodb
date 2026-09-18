@@ -144,6 +144,38 @@ pub struct BufferPoolManager {
     /// Where the next free-frame scan starts. A hint, never trusted: the scan re-checks every frame
     /// under its own write lock, so a stale hint costs a step and cannot hand out a taken frame.
     free_hint: AtomicUsize,
+
+    /// D35 CONTROL ONLY -- NOT FOR MERGE. A direct-mapped lock-free mirror of `page_table`,
+    /// `page_id -> frame_i + 1`, 0 meaning absent. It exists so the control arms can resolve a
+    /// page WITHOUT taking `page_table.read()`, whose reader count is a single process-wide cache
+    /// line that every hit must atomically RMW. Maintained at every page-table write site below.
+    /// Bounded, so a page id past the end simply falls back to the real table.
+    hot: Vec<AtomicUsize>,
+}
+
+/// D35 CONTROL: how many page ids the lock-free mirror covers.
+const HOT_MIRROR_PAGES: usize = 16384;
+
+/// D35 CONTROL ONLY -- MEASUREMENT SCAFFOLD, NEVER FOR MERGE.
+#[derive(Clone, Copy, PartialEq)]
+pub enum D35Arm {
+    /// Unmodified resolution; only the `touch` call is gone.
+    Stub,
+    /// Resolve through the lock-free mirror instead of `page_table.read()`. Still correct: the
+    /// frame latch and the pin are kept.
+    C1,
+    /// Mirror only, no frame latch, no pin. NOT correct — it is the instrument's ceiling.
+    C2,
+}
+
+/// Read once. A per-call `env::var` would itself dominate the hit path being measured.
+fn d35_arm() -> D35Arm {
+    static ARM: OnceLock<D35Arm> = OnceLock::new();
+    *ARM.get_or_init(|| match std::env::var("FERRO_D35_ARM").as_deref() {
+        Ok("c1") => D35Arm::C1,
+        Ok("c2") => D35Arm::C2,
+        _ => D35Arm::Stub,
+    })
 }
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
@@ -169,6 +201,14 @@ impl BufferPoolManager {
             in_transit: Mutex::new(HashSet::new()),
             transit_done: Condvar::new(),
             free_hint: AtomicUsize::new(0),
+            hot: (0..HOT_MIRROR_PAGES).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    /// D35 CONTROL ONLY. Publish/retract a page in the lock-free mirror.
+    fn hot_set(&self, page_id: u32, frame_i: Option<usize>) {
+        if let Some(slot) = self.hot.get(page_id as usize) {
+            slot.store(frame_i.map_or(0, |i| i + 1), Ordering::Release);
         }
     }
 
@@ -182,9 +222,13 @@ impl BufferPoolManager {
         for _attempt in 0..FETCH_ATTEMPTS {
             // ---- 1. Already resident? Verified at the frame latch, no pool-wide lock held. ----
             if let Some(frame_i) = self.try_pin_resident(page_id) {
-                // Policy only, and deliberately *after* the pin: the cache is a hint about what to
-                // evict next, and holding it here is what used to serialise even pure cache hits.
-                self.arc_cache.lock().unwrap().touch(page_id);
+                // D35 GATE STUB -- NOT A FIX, NOT FOR MERGE. The real `touch` call is:
+                //     self.arc_cache.lock().unwrap().touch(page_id);
+                // Removing it entirely is the UPPER BOUND on any batching scheme (BP-Wrapper or
+                // the per-frame stamp), because a real batcher still costs more than zero. If the
+                // slope does not go positive with this line gone, the mutex is not the binding
+                // constraint and no amount of batching it will change the shape. This build
+                // corrupts ARC's recency order and must never leave this branch.
                 return Ok(frame_i);
             }
 
@@ -242,13 +286,45 @@ impl BufferPoolManager {
     /// frame's write lock to relabel it. One of the two wins; the loser sees a label it did not
     /// expect and retries.
     fn try_pin_resident(&self, page_id: u32) -> Option<usize> {
-        let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
-        let frame = self.frames[frame_i].read().unwrap();
-        if frame.page_id != Some(page_id) {
-            return None;
+        // D35 CONTROL ARMS -- MEASUREMENT ONLY, NEVER FOR MERGE.
+        //   stub (default) = unmodified resolution; only `touch` is gone.
+        //   c1             = resolve via the lock-free mirror, so `page_table.read()` is not taken.
+        //                    Frame latch and pin kept, so this is still CORRECT.
+        //   c2             = mirror only: no frame latch, no pin. NOT correct; it is the
+        //                    instrument's ceiling, there to prove the harness can show a positive
+        //                    slope at all. Without it a flat curve cannot be told apart from a
+        //                    harness that could never have measured one.
+        match d35_arm() {
+            D35Arm::Stub => {
+                let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
+                let frame = self.frames[frame_i].read().unwrap();
+                if frame.page_id != Some(page_id) {
+                    return None;
+                }
+                frame.pin_counter.fetch_add(1, Ordering::Relaxed);
+                Some(frame_i)
+            }
+            D35Arm::C1 => {
+                let slot = self.hot.get(page_id as usize)?.load(Ordering::Acquire);
+                if slot == 0 {
+                    return None;
+                }
+                let frame_i = slot - 1;
+                let frame = self.frames[frame_i].read().unwrap();
+                if frame.page_id != Some(page_id) {
+                    return None;
+                }
+                frame.pin_counter.fetch_add(1, Ordering::Relaxed);
+                Some(frame_i)
+            }
+            D35Arm::C2 => {
+                let slot = self.hot.get(page_id as usize)?.load(Ordering::Acquire);
+                if slot == 0 {
+                    return None;
+                }
+                Some(slot - 1)
+            }
         }
-        frame.pin_counter.fetch_add(1, Ordering::Relaxed);
-        Some(frame_i)
     }
 
     /// Is `page_id` pinned? The predicate the replacement policy uses to skip a victim.
@@ -324,6 +400,7 @@ impl BufferPoolManager {
         // page's contents, which is the one failure a storage engine cannot apologise for.
         self.frames[frame_i].write().unwrap().data = data;
         self.page_table.write().unwrap().insert(page_id, frame_i);
+        self.hot_set(page_id, Some(frame_i)); // D35 CONTROL mirror
         Ok(Some(frame_i))
     }
 
@@ -409,6 +486,7 @@ impl BufferPoolManager {
             return Ok(None);
         }
         pt.remove(&victim);
+        self.hot_set(victim, None); // D35 CONTROL mirror
         frame.page_id = Some(incoming);
         frame.pin_counter = AtomicU16::new(1);
         frame.dirty_flag = AtomicBool::new(false);
@@ -417,9 +495,32 @@ impl BufferPoolManager {
 
     // decrement pin count, if page was modified, add dirty flag
     pub fn unpin_page(&self, page_id: u32, is_dirty: bool) {
-        let pt = self.page_table.read().unwrap();
-        let frame_i = pt[&page_id];
-        drop(pt);
+        // D35 CONTROL ARMS -- MEASUREMENT ONLY. The hit LOOP is fetch+unpin, and this half takes
+        // `page_table.read()` and a frame latch of its own, so an arm that bypassed them only in
+        // `try_pin_resident` would still pay them here and would understate its own effect.
+        let frame_i = match d35_arm() {
+            D35Arm::Stub => {
+                let pt = self.page_table.read().unwrap();
+                let i = pt[&page_id];
+                drop(pt);
+                i
+            }
+            D35Arm::C1 | D35Arm::C2 => {
+                match self.hot.get(page_id as usize).map(|s| s.load(Ordering::Acquire)) {
+                    Some(slot) if slot > 0 => slot - 1,
+                    _ => {
+                        let pt = self.page_table.read().unwrap();
+                        let i = pt[&page_id];
+                        drop(pt);
+                        i
+                    }
+                }
+            }
+        };
+        if matches!(d35_arm(), D35Arm::C2) {
+            // C2 never pinned, so there is nothing to give back and no dirty bit worth setting.
+            return;
+        }
 
         let frame = self.frames[frame_i].read().unwrap();
         if is_dirty {
@@ -527,6 +628,7 @@ impl BufferPoolManager {
         self.disk_manager.deallocate(page_id)?;
 
         pt.remove(&page_id);
+        self.hot_set(page_id, None); // D35 CONTROL mirror
         drop(pt);
 
         let mut frame = self.frames[frame_i].write().unwrap();
@@ -558,6 +660,7 @@ impl BufferPoolManager {
 
         if let Some(frame_i) = resident {
             pt.remove(&page_id);
+            self.hot_set(page_id, None); // D35 CONTROL mirror
             drop(pt);
             let mut frame = self.frames[frame_i].write().unwrap();
             frame.page_id = None;
