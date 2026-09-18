@@ -6,6 +6,14 @@
 //!
 //! 1. **Fork copies zero data pages.** `fork` writes one `BranchRecord` and appends one epoch to
 //!    the parent's `live_children`. Nothing else.
+//!
+//!    **And since `SCALE-DESIGN.md` D6 option 2 it need not write even those to DISK.**
+//!    `TableBranchCatalog` stages a fork's keys in memory and makes them durable at the branch's
+//!    FIRST WRITE, so a speculative fork that is reaped unwritten costs no fsync and no page. The
+//!    loss a crash can then cause is observably identical to a reap a moment later, which
+//!    invariants 4 and 5 below already permit. `LogBranchCatalog` still writes eagerly, and both
+//!    are correct implementations of this trait — which is the point of stating the invariant in
+//!    terms of PAGES COPIED rather than in terms of when the record reaches the disk.
 //! 2. **The read path never walks the parent chain.** The child's root *is* the parent's root at
 //!    fork time, so ordinary B+tree descent already reaches parent data. Any "not found here,
 //!    ask my parent" step is a spec violation (BranchBench, arXiv:2604.17180, measured that
@@ -27,6 +35,7 @@ pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};
 pub mod tree_keys;
 mod group_commit;
+mod staged_fork;
 pub mod table_catalog;
 pub use table_catalog::TableBranchCatalog;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
@@ -54,6 +63,13 @@ pub trait BranchCatalog: Send + Sync {
     fn current_epoch(&self) -> Epoch;
 
     /// Create a child of `parent`. Must copy **zero data pages**.
+    ///
+    /// **An implementation MAY defer durability to the branch's first write** (D6 option 2), so a
+    /// caller must not read a successful return as "this survives a crash". What it may read it as
+    /// is "this branch exists and every query in this trait will answer for it" — and, if the
+    /// branch goes on to write, that the fork is durable no later than that write. What no
+    /// implementation may do is leave PART of a fork behind a crash: an id with no record, a page,
+    /// or an index entry pointing at nothing.
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError>;
 
     /// Load a record. Returns `BranchError::Reaped` for a stale generation.

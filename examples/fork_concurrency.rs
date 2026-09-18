@@ -8,6 +8,12 @@
 //! is split there are none to batch. Measuring it against the serial harness would have produced
 //! x1.00 and been misread as a fact about batching rather than about a mutex.
 //!
+//! ⚠ SUPERSEDED FOR `TableBranchCatalog`, AND KEPT BECAUSE IT IS THE RECORD OF HOW D6 WAS
+//! MEASURED. Since D6 option 2 a fork issues no fsync at all until the branch writes, so this
+//! harness now measures the in-memory path and its forks/fsync column divides by zero. The
+//! successor is `examples/lazy_fork.rs`, which measures the speculative, the durable and the
+//! fork-and-reap paths separately; see `bench/lazy_fork_first_write.txt`.
+//!
 //! So: T threads, each forking N/T times from trunk, total wall time, forks/sec.
 //!
 //!   cargo run --release --example fork_concurrency -- [N] [T,T,T]

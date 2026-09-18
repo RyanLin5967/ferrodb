@@ -25,11 +25,13 @@
 
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::branch::group_commit::CommitGroup;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
+use crate::branch::staged_fork::{Merged, StagedForks};
 use crate::branch::tree_keys as keys;
+use crate::cow::WriteBufferEntry;
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
@@ -64,6 +66,37 @@ pub struct TableBranchCatalog {
     /// `logical` across the fsync, so 64 concurrent forkers produced no more throughput than one
     /// (measured x0.92, `bench/fork_concurrency_before.txt`).
     commit_group: CommitGroup,
+    /// Forks that have not written yet, and so are not on disk. See `staged_fork`.
+    ///
+    /// Lock order is `logical` then this, never the reverse. Every read path consults it through
+    /// `kv_search`/`kv_range`; nothing else may reach it.
+    staged: RwLock<StagedForks>,
+    /// `next_id` and `epoch` as last written to the header KEY, so `stage` refreshes it only when a
+    /// counter actually moved. Two exact atomics rather than one packed stamp: a false "unchanged"
+    /// here is a durability bug, and no hash is worth that.
+    ///
+    /// ⛔ NOT AN OPTIMISATION — IT CLOSES A WINDOW THAT WAS ALWAYS THERE AND THAT LAZY FORKS WIDEN.
+    /// `write_header` used to be called by `create` and by `fork`, so the durable epoch counter
+    /// advanced only when a fork did. A branch issuing epochs for page births between two forks
+    /// could already stamp a durable page with an epoch above the durable counter, and a crash
+    /// would then re-issue it — two pages with one birth epoch, which is precisely what the
+    /// interval rule cannot tell apart. With forks no longer writing the header at all the window
+    /// would have become unbounded, so the refresh moved to every durable operation instead.
+    published_next_id: AtomicU64,
+    published_epoch: AtomicU64,
+}
+
+/// Where a catalog mutation lands.
+///
+/// The fork path and the durable path produce **the same keys from the same code**; only the sink
+/// differs. That is the whole reason this type exists rather than a second key-writing routine
+/// beside `write_record`: two lists of keys drift, and a key a fork stages but never writes is a
+/// branch that silently loses its deadline index entry on materialisation.
+enum Sink<'a> {
+    /// The B+tree. Durable once the operation's fsync completes.
+    Tree,
+    /// A pending fork's staging buffer. Durable only when that branch first writes.
+    Stage(&'a mut StagedForks, u64),
 }
 
 /// Magic in the first four bytes of the header page, so opening the wrong page id is an error
@@ -287,7 +320,8 @@ impl TableBranchCatalog {
                 }
             }
             let old = cat.core(full.branch_id.id)?;
-            cat.write_record(&full, old.as_ref())?;
+            let existing_arenas = cat.arena_ids(full.branch_id.id)?;
+            cat.write_record(&mut Sink::Tree, &full, old.as_ref(), &existing_arenas)?;
         }
         for (parent, epoch, child) in children {
             cat.attach_child(parent, epoch, child)?;
@@ -325,12 +359,82 @@ impl TableBranchCatalog {
         self.commit_group.syncs()
     }
 
+    /// Forks that have not written yet, and so are not on disk.
+    ///
+    /// Exposed for the same reason `syncs_issued` is: it is the direct evidence that forks are
+    /// being deferred rather than merely being fast, and a benchmark that cannot see the
+    /// difference would report the same number for a change that silently went back to fsyncing.
+    pub fn pending_forks(&self) -> usize {
+        self.staged.read().unwrap().pending_count()
+    }
+
     /// Publish the root and take a commit ticket. **Call under the logical lock, after the LAST
     /// mutation** — the ticket's meaning is "everything up to here is in the pool", and taking it
     /// earlier would let the group's leader mark work durable whose pages were never written.
     fn stage(&self) -> Result<u64, FerroError> {
+        // Refresh the header key if either counter moved since it was last written. `fork` used to
+        // do this on every fork; it no longer writes anything, so the duty moved here, to the
+        // operations that DO reach the disk. See `published_next_id` for the window this closes.
+        if self.next_id.load(Ordering::SeqCst) != self.published_next_id.load(Ordering::SeqCst)
+            || self.epoch.load(Ordering::SeqCst) != self.published_epoch.load(Ordering::SeqCst)
+        {
+            self.write_header()?;
+        }
         self.publish_root()?;
         Ok(self.commit_group.ticket())
+    }
+
+    /// Land `branch`'s staged fork, and its pending ancestors', in the tree.
+    ///
+    /// **Call under `logical`, before the caller's own mutations and before its `stage()`** — the
+    /// caller's ticket then covers these writes too, so materialising costs no extra fsync. Returns
+    /// whether anything was written.
+    ///
+    /// Ancestors first, and that is not cosmetic: a record whose `parent_id` names a branch with no
+    /// record is a dangling pointer, and the `(parent, fork_epoch)` index entry beneath it is an
+    /// index over nothing. `live_child_at` resolves such an entry to "not a live child", so the
+    /// parent's pages would be freed underneath a child that can still read them.
+    ///
+    /// ⛔ ON A TREE ERROR PART-WAY THROUGH, this leaves a partial fork in the pool and the branch
+    /// gone from the stage, and returns the error. **That is the same exposure `write_record` has
+    /// always had** — four upserts with no atomic multi-key write underneath them — and the
+    /// consequence is identical: the caller is told the operation failed, and no fsync of ours
+    /// follows. Stated rather than machined around because the premise was checked: no caller in
+    /// the tree retries a failed `put` or `set_root`, so the one thing a retry would add here — a
+    /// second `tree.insert` of a key the first attempt landed, which `insert` does NOT replace —
+    /// cannot happen. If a retrying caller is ever added, this must become idempotent first.
+    fn materialize_locked(&self, branch: u64) -> Result<bool, FerroError> {
+        let chain = {
+            let g = self.staged.read().unwrap();
+            if !g.is_pending(branch) {
+                return Ok(false);
+            }
+            g.ancestors_first(branch)
+        };
+        let mut batches = Vec::with_capacity(chain.len());
+        {
+            let mut g = self.staged.write().unwrap();
+            for id in chain {
+                if let Some(b) = g.take(id) {
+                    batches.push(b);
+                }
+            }
+        }
+        let wrote = !batches.is_empty();
+        for (ops, minted) in batches {
+            for (key, entry) in ops {
+                match entry {
+                    // `minted` means the id came from `next_id`, so none of its keys can already
+                    // exist and the delete half of an upsert is a guaranteed miss (D10).
+                    WriteBufferEntry::Put(v) if minted => self.tree.insert(key, v)?,
+                    WriteBufferEntry::Put(v) => self.upsert(key, v)?,
+                    WriteBufferEntry::Delete => {
+                        self.remove_if_present(&key)?;
+                    }
+                }
+            }
+        }
+        Ok(wrote)
     }
 
     /// Wait until an fsync covering `seq` has completed. **Call after RELEASING the logical lock.**
@@ -394,6 +498,9 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            staged: RwLock::new(StagedForks::default()),
+            published_next_id: AtomicU64::new(0),
+            published_epoch: AtomicU64::new(0),
         };
         let trunk = BranchRecord::trunk(trunk_root, crate::branch::TRUNK_LEASE);
         cat.tree.insert(keys::record(trunk.branch_id.id), trunk.serialize_core())?;
@@ -417,6 +524,9 @@ impl TableBranchCatalog {
             header_page: std::sync::atomic::AtomicU32::new(0),
             commit_group: CommitGroup::default(),
             published_root: std::sync::atomic::AtomicU32::new(0),
+            staged: RwLock::new(StagedForks::default()),
+            published_next_id: AtomicU64::new(0),
+            published_epoch: AtomicU64::new(0),
         };
         let bytes = cat.tree.search(&keys::header())?.ok_or_else(|| {
             FerroError::Branch("branch catalog header key is missing; the tree root is wrong \
@@ -431,6 +541,10 @@ impl TableBranchCatalog {
         }
         cat.next_id.store(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), Ordering::SeqCst);
         cat.epoch.store(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), Ordering::SeqCst);
+        // What was just read IS what is published, so the next durable operation rewrites the
+        // header only if a counter has actually moved.
+        cat.published_next_id.store(cat.next_id.load(Ordering::SeqCst), Ordering::SeqCst);
+        cat.published_epoch.store(cat.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(cat)
     }
 
@@ -447,10 +561,17 @@ impl TableBranchCatalog {
     }
 
     fn write_header(&self) -> Result<(), FerroError> {
+        let next_id = self.next_id.load(Ordering::SeqCst);
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let mut v = Vec::with_capacity(HEADER_BYTES);
-        v.extend_from_slice(&self.next_id.load(Ordering::SeqCst).to_be_bytes());
-        v.extend_from_slice(&self.epoch.load(Ordering::SeqCst).to_be_bytes());
-        self.upsert(keys::header(), v)
+        v.extend_from_slice(&next_id.to_be_bytes());
+        v.extend_from_slice(&epoch.to_be_bytes());
+        self.upsert(keys::header(), v)?;
+        // Recorded AFTER the write, so a failed upsert leaves the counters looking unpublished and
+        // the next durable operation tries again.
+        self.published_next_id.store(next_id, Ordering::SeqCst);
+        self.published_epoch.store(epoch, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Replace a key's value.
@@ -477,6 +598,108 @@ impl TableBranchCatalog {
         }
     }
 
+    // ---- The two read primitives every query is built from. ------------------------------------
+    //
+    // A pending fork's keys live in `staged`, not in the tree (see `staged_fork`). Consulting the
+    // stage in exactly these two places is what makes every query below — the record span, the
+    // state span, the deadline span, the child span, the envelope span, the FREE_ID span — see a
+    // pending branch without any of them knowing that pending branches exist.
+
+    /// Point lookup. The stage shadows the tree, and a staged `Delete` means absent.
+    fn kv_search(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, FerroError> {
+        if let Some(entry) = self.staged.read().unwrap().probe(key) {
+            return Ok(match entry {
+                WriteBufferEntry::Put(v) => Some(v.clone()),
+                WriteBufferEntry::Delete => None,
+            });
+        }
+        self.tree.search(key)
+    }
+
+    /// Range scan, merged with the stage and still streaming.
+    ///
+    /// The staged snapshot is taken FIRST and the tree scanner created after it, deliberately: a
+    /// branch that materialises in that window is then in the snapshot, in the tree, or in both —
+    /// and the merge deduplicates. The other order would let it be in neither.
+    fn kv_range(
+        &self,
+        lo: Vec<u8>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Merged<crate::storage::range_scan::RangeScanner<Vec<u8>, Vec<u8>>>, FerroError> {
+        let snapshot = {
+            let g = self.staged.read().unwrap();
+            match &hi {
+                Bound::Included(h) => g.snapshot_range(Bound::Included(&lo), Bound::Included(&h[..])),
+                Bound::Excluded(h) => g.snapshot_range(Bound::Included(&lo), Bound::Excluded(&h[..])),
+                Bound::Unbounded => g.snapshot_range(Bound::Included(&lo), Bound::Unbounded),
+            }
+        };
+        let it = self.tree.range_scan(Bound::Included(lo), hi)?;
+        Ok(Merged::new(it, snapshot))
+    }
+
+    /// The arena ids in a branch's span. Read here rather than inside `write_record` so that
+    /// `write_record` performs no reads at all and can therefore run against the stage, whose lock
+    /// this call must not be holding.
+    fn arena_ids(&self, id: u64) -> Result<Vec<ArenaId>, FerroError> {
+        let (lo, hi) = keys::arenas_of(id);
+        let mut out = Vec::new();
+        for entry in self.kv_range(lo, Bound::Excluded(hi))? {
+            let (k, _) = entry?;
+            if k.len() == 13 {
+                out.push(ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap())));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply one key write to whichever sink the caller named.
+    ///
+    /// `provably_new` carries D10: `upsert` is delete-then-insert, and for a key that cannot exist
+    /// the delete is a guaranteed miss — a full descent whose only outcome is `KeyNotFound`,
+    /// measured at 56% of the upsert (`bench/serial_section_profile.txt`).
+    ///
+    /// ⓘ `Sink::Tree` with `provably_new` now has NO PRODUCTION CALLER, and that is not rot: the
+    /// only writer that knows its keys are new is `write_record_new`, which is the fork path, and
+    /// the fork path no longer writes to the tree at all. D10's saving moved with it — into
+    /// `materialize_locked`, which replays a `minted` branch's keys with `tree.insert`. The arm is
+    /// kept because the flag has to travel through a routine shared by both sinks, and it is
+    /// exercised by `d10_guard`.
+    fn sink_put(
+        &self,
+        sink: &mut Sink,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        provably_new: bool,
+    ) -> Result<(), FerroError> {
+        match sink {
+            Sink::Tree if provably_new => self.tree.insert(key, value),
+            Sink::Tree => self.upsert(key, value),
+            Sink::Stage(staged, branch) => {
+                staged.put(*branch, key, WriteBufferEntry::Put(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove a key through whichever sink the caller named.
+    ///
+    /// A staged removal is recorded as a `Delete` rather than by dropping the staged write, and
+    /// that is load-bearing for the FREE_ID span: the key it suppresses is in the TREE, so nothing
+    /// but a tombstone can hide it from the next forker.
+    fn sink_del(&self, sink: &mut Sink, key: Vec<u8>) -> Result<(), FerroError> {
+        match sink {
+            Sink::Tree => {
+                self.remove_if_present(&key)?;
+                Ok(())
+            }
+            Sink::Stage(staged, branch) => {
+                staged.put(*branch, key, WriteBufferEntry::Delete);
+                Ok(())
+            }
+        }
+    }
+
     /// A record with its unbounded fields filled in from their spans.
     ///
     /// `arenas` is populated because `ArenaPageStore` still mutates it and calls `put`, and a
@@ -485,27 +708,33 @@ impl TableBranchCatalog {
     /// queries first so that nothing reads it.
     fn hydrate(&self, core: CoreRecord) -> Result<BranchRecord, FerroError> {
         let id = core.branch_id().id;
-        let mut arenas = Vec::new();
-        let (lo, hi) = keys::arenas_of(id);
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
-            let (k, _) = entry?;
-            if k.len() == 13 {
-                arenas.push(ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap())));
-            }
-        }
+        let arenas = self.arena_ids(id)?;
         // The only call to `into_hydrated` in the codebase, and it is handed BOTH missing fields.
         Ok(core.into_hydrated(arenas, self.envelope_bytes(id)?))
     }
 
     fn envelope_bytes(&self, id: u64) -> Result<Option<CapabilityEnvelope>, FerroError> {
-        match self.tree.search(&keys::envelope(id))? {
+        match self.kv_search(&keys::envelope(id))? {
             Some(b) => Ok(Some(CapabilityEnvelope::deserialize(&b).map_err(FerroError::from)?)),
             None => Ok(None),
         }
     }
 
+    /// The generation an id slot must be re-minted at.
+    ///
+    /// Normally the reaped branch's own surviving record carries it — `mark_reaped` bumps it and
+    /// no path deletes a RECORD key. A slot whose PENDING occupant was discarded has no record to
+    /// carry anything, so the bump lives in `StagedForks::retired` instead, and the answer is the
+    /// higher of the two. Getting this wrong is not a lost id, it is a stale handle that reads as
+    /// current: the one thing generations exist to prevent.
+    fn slot_generation(&self, id: u64) -> Result<u32, FerroError> {
+        let from_record = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
+        let retired = self.staged.read().unwrap().retired_generation(id).unwrap_or(0);
+        Ok(from_record.max(retired))
+    }
+
     fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
-        match self.tree.search(&keys::record(id))? {
+        match self.kv_search(&keys::record(id))? {
             Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
             None => Ok(None),
         }
@@ -535,7 +764,7 @@ impl TableBranchCatalog {
     /// The precedent is eight lines away: `fork` already calls `self.tree.insert` directly for the
     /// child key, on exactly this reasoning. This extends it to the four keys that are new for the
     /// identical reason.
-    fn write_record_new(&self, rec: &BranchRecord) -> Result<(), FerroError> {
+    fn write_record_new(&self, sink: &mut Sink, rec: &BranchRecord) -> Result<(), FerroError> {
         // A real assert, not debug_assert. A record carrying arenas would have them silently
         // dropped here, and "silently dropped arenas" is precisely the defect that leaked pages
         // permanently once already (6e28372) while the obvious assertion passed. One `is_empty()`
@@ -546,13 +775,18 @@ impl TableBranchCatalog {
              span, so they would be silently dropped. Use write_record.",
             rec.arenas.len()
         );
-        self.tree.insert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.tree.insert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
+        self.sink_put(sink, keys::record(rec.branch_id.id), rec.serialize_core(), true)?;
+        self.sink_put(sink, keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new(), true)?;
         if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.tree.insert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+            self.sink_put(
+                sink,
+                keys::deadline(rec.lease_deadline.0, rec.branch_id.id),
+                Vec::new(),
+                true,
+            )?;
         }
         if let Some(e) = &rec.envelope {
-            self.tree.insert(keys::envelope(rec.branch_id.id), e.serialize())?;
+            self.sink_put(sink, keys::envelope(rec.branch_id.id), e.serialize(), true)?;
         }
         Ok(())
     }
@@ -563,48 +797,44 @@ impl TableBranchCatalog {
     /// signature implying the expensive one would be safer.
     fn write_record(
         &self,
+        sink: &mut Sink,
         rec: &BranchRecord,
         old: Option<&CoreRecord>,
+        existing_arenas: &[ArenaId],
     ) -> Result<(), FerroError> {
         if let Some(prev) = old {
-            self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
+            self.sink_del(sink, keys::state(prev.state().as_u8(), prev.branch_id().id))?;
             if Self::in_deadline_index(prev.state(), prev.branch_id()) {
-                self.remove_if_present(&keys::deadline(
-                    prev.lease_deadline().0,
-                    prev.branch_id().id,
-                ))?;
+                self.sink_del(
+                    sink,
+                    keys::deadline(prev.lease_deadline().0, prev.branch_id().id),
+                )?;
             }
         }
-        self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
-        self.upsert(keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new())?;
+        self.sink_put(sink, keys::record(rec.branch_id.id), rec.serialize_core(), false)?;
+        self.sink_put(sink, keys::state(rec.state.as_u8(), rec.branch_id.id), Vec::new(), false)?;
         if Self::in_deadline_index(rec.state, rec.branch_id) {
-            self.upsert(keys::deadline(rec.lease_deadline.0, rec.branch_id.id), Vec::new())?;
+            self.sink_put(
+                sink,
+                keys::deadline(rec.lease_deadline.0, rec.branch_id.id),
+                Vec::new(),
+                false,
+            )?;
         }
         match &rec.envelope {
-            Some(e) => self.upsert(keys::envelope(rec.branch_id.id), e.serialize())?,
-            None => {
-                self.remove_if_present(&keys::envelope(rec.branch_id.id))?;
-            }
+            Some(e) => self.sink_put(sink, keys::envelope(rec.branch_id.id), e.serialize(), false)?,
+            None => self.sink_del(sink, keys::envelope(rec.branch_id.id))?,
         }
-        // Arenas: the record is the authority, so the span is made to match it.
-        let (lo, hi) = keys::arenas_of(rec.branch_id.id);
-        let existing: Vec<Vec<u8>> = self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        for k in existing {
-            if k.len() == 13 {
-                let a = ArenaId(u32::from_be_bytes(k[9..13].try_into().unwrap()));
-                if !rec.arenas.contains(&a) {
-                    self.remove_if_present(&k)?;
-                }
+        // Arenas: the record is the authority, so the span is made to match it. `existing_arenas`
+        // is read by the CALLER — this routine performs no reads, which is what lets it run with
+        // the staging lock held.
+        for a in existing_arenas {
+            if !rec.arenas.contains(a) {
+                self.sink_del(sink, keys::arena(rec.branch_id.id, a.0))?;
             }
         }
         for a in &rec.arenas {
-            self.upsert(keys::arena(rec.branch_id.id, a.0), Vec::new())?;
+            self.sink_put(sink, keys::arena(rec.branch_id.id, a.0), Vec::new(), false)?;
         }
         Ok(())
     }
@@ -658,7 +888,7 @@ impl TableBranchCatalog {
     /// Ids of every entry in a span whose key ends with an 8-byte branch id.
     fn ids_in_span(&self, lo: Vec<u8>, hi: Vec<u8>) -> Result<Vec<u64>, FerroError> {
         let mut out = Vec::new();
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+        for entry in self.kv_range(lo, Bound::Excluded(hi))? {
             let (k, _) = entry?;
             let n = k.len();
             if n >= 8 {
@@ -695,53 +925,90 @@ impl BranchCatalog for TableBranchCatalog {
         Epoch(self.epoch.load(Ordering::SeqCst))
     }
 
+    /// **Durable at the branch's FIRST WRITE, not here.** (`SCALE-DESIGN.md` D6, option 2.)
+    ///
+    /// This used to perform six B+tree mutations and then wait on an fsync: 271 forks/sec serial,
+    /// ~4,400 concurrent, with the concurrent plateau set by the tree work under `logical` rather
+    /// than by the disk (`bench/fork_concurrency_after.txt`). Agents fork SPECULATIVELY and most
+    /// branches are reaped having written nothing, so almost all of that was paid for state that
+    /// was about to be deleted.
+    ///
+    /// A fork now writes its keys into `staged_fork::StagedForks` and returns. It touches no tree
+    /// page and issues no fsync. The keys land — through the same `write_record_new` that wrote
+    /// them before — at the branch's first durable operation, sharing that operation's fsync.
+    ///
+    /// ⛔ WHAT THIS GIVES UP, STATED PLAINLY: a fork that never wrote does not survive a crash.
+    /// That is admissible, and the reason is a premise check rather than a shrug — generations make
+    /// a stale handle a hard `BranchError::Reaped`, and reaping here is non-cooperative and
+    /// lease-driven, so a fork lost to a crash is observably identical to one reaped a moment
+    /// later, which the contract already permits. What is NOT given up is the absence of PARTIAL
+    /// state: no orphan id, no parked page, no index entry. `tests/integration_fork_lazy_durability`
+    /// SIGKILLs a process between fork and first write and requires the catalog file to be
+    /// byte-identical; `tests/integration_fork_kill9` requires a fork that DID write to survive.
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
         let fork_epoch = self.next_epoch();
-        // The lock covers every TREE MUTATION and nothing else. It is dropped before the fsync, so
-        // concurrent forkers share one disk round-trip instead of queueing for private ones. See
-        // `group_commit` for why the ticket is taken last.
-        let (child, seq) = {
+        // The lock still covers the whole logical operation, but the operation no longer touches
+        // the tree: a fork's writes go to the stage. The ticket and the fsync are gone with them.
+        let child = {
             let _g = self.logical.lock().unwrap();
 
-        // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
-        // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
-        // its envelope hands the child `None` - which is the UNGOVERNED default. The child of a
-        // governed branch would then be free to write anything: a capability escape.
-        //
-        // `core()` deliberately leaves the envelope empty because it lives in its own key span.
-        // That is exactly why reading a parent through it here was wrong.
-        let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
-        parent_core.check_readable(parent)?;
-        // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
-        // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the parent,
-        // x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope is still
-        // loaded, and that is not optional: a parent read without it hands the child `None`, which
-        // is the UNGOVERNED default and was a shipped capability escape (339e405).
-        let parent_envelope = self.envelope_bytes(parent.id)?;
+            // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
+            // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read
+            // WITHOUT its envelope hands the child `None` - which is the UNGOVERNED default. The
+            // child of a governed branch would then be free to write anything: a capability escape.
+            //
+            // `core()` deliberately leaves the envelope empty because it lives in its own key span.
+            // That is exactly why reading a parent through it here was wrong.
+            //
+            // The parent may itself be PENDING, and this reads it with no special case: `core` and
+            // `envelope_bytes` both go through `kv_search`, which consults the stage first.
+            let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
+            parent_core.check_readable(parent)?;
+            // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
+            // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the
+            // parent, x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope
+            // is still loaded, and that is not optional: a parent read without it hands the child
+            // `None`, which is the UNGOVERNED default and was a shipped capability escape (339e405).
+            let parent_envelope = self.envelope_bytes(parent.id)?;
 
-        // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
-        // generation comes from the slot's history, never from zero — a reused id whose generation
-        // restarted would make a stale handle look current.
-        let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
-        let recycled = self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .next()
-            .transpose()?
-            .and_then(|(k, _)| keys::free_id_from_key(&k));
+            // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
+            // generation comes from the slot's history, never from zero — a reused id whose
+            // generation restarted would make a stale handle look current.
+            //
+            // THREE sources now, cheapest first. The in-memory pool holds ids whose PENDING
+            // occupant was discarded: those slots own no tree key at all, so reusing one writes
+            // nothing, which is the whole fork/reap agent workload. The FREE_ID span holds slots
+            // retired by branches that DID write, and claiming one is a staged DELETE — a
+            // tombstone, because the key it has to hide from the next forker is in the tree, not
+            // in the stage.
+            let pooled = self.staged.write().unwrap().take_free_id();
+            let recycled = match pooled {
+                Some(id) => Some(id),
+                None => {
+                    let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
+                    self.kv_range(lo, Bound::Excluded(hi))?
+                        .next()
+                        .transpose()?
+                        .and_then(|(k, _)| keys::free_id_from_key(&k))
+                }
+            };
 
-        // `reused` decides which writer runs below, and it is the whole safety condition for
-        // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
-        // deadline keys, so its keys are NOT new.
-        let (child_num, generation, reused) = match recycled {
-            Some(id) => {
-                self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
-                (id, slot_gen, true)
-            }
-            None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
-        };
-        let child_id = BranchId::new(child_num, generation);
+            // `reused` decides which writer runs below, and it is the whole safety condition for
+            // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
+            // deadline keys, so its keys are NOT new. A slot from the in-memory pool is the
+            // opposite — its pending occupant never reached the tree — so it counts as minted.
+            let (child_num, generation, reused) = match recycled {
+                Some(id) if pooled == Some(id) => (id, self.slot_generation(id)?, false),
+                Some(id) => (id, self.slot_generation(id)?, true),
+                None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
+            };
+            let child_id = BranchId::new(child_num, generation);
+            // A recycled slot's arena span should be empty — `mark_reaped` clears `arenas` and the
+            // `put` that persisted it deleted the keys — but READ IT rather than assume it. The
+            // eager path read it too (inside `write_record`), and the failure mode if the
+            // assumption is ever wrong is not a leak: the new occupant would inherit an extent it
+            // does not own, and the reaper frees exactly `record.arenas`.
+            let stale_arenas = if reused { self.arena_ids(child_num)? } else { Vec::new() };
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
@@ -750,24 +1017,35 @@ impl BranchCatalog for TableBranchCatalog {
                 lease,
             )?;
 
+            // Everything below writes to the STAGE, not the tree. Same routines, same keys.
+            let mut staged = self.staged.write().unwrap();
+            staged.open(child_num, parent.id, generation, !reused);
+            let mut sink = Sink::Stage(&mut staged, child_num);
             if reused {
-                self.write_record(&child, None)?;
+                // The FREE_ID key is in the tree, so hiding it from the next forker takes a
+                // tombstone rather than dropping a staged write.
+                self.sink_del(&mut sink, keys::free_id(child_num))?;
+                self.write_record(&mut sink, &child, None, &stale_arenas)?;
             } else {
-                self.write_record_new(&child)?;
+                self.write_record_new(&mut sink, &child)?;
             }
-            // The child's entry in its parent's live set. A child that exists but is not listed in its
-        // parent is a GC correctness hole, which is why both happen under one logical lock.
-        // The VALUE is the child's branch id, so a reader can resolve the child and check
-        // whether it is still live. See `live_child_at` for why the entry is only a hint.
-            self.tree
-                .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
-            self.write_header()?;
-            // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
-            // point necessarily covers this fork.
-            (child, self.stage()?)
+            // The child's entry in its parent's live set. A child that exists but is not listed in
+            // its parent is a GC correctness hole, which is why both happen under one logical lock
+            // — and why the entry is staged against the CHILD, so the two land or vanish together.
+            // The VALUE is the child's branch id, so a reader can resolve the child and check
+            // whether it is still live. See `live_child_at` for why the entry is only a hint.
+            self.sink_put(
+                &mut sink,
+                keys::child(parent.id, fork_epoch.0),
+                child_num.to_be_bytes().to_vec(),
+                !reused,
+            )?;
+            // No `write_header`, no ticket, no fsync. The header is refreshed by `stage()` on the
+            // next durable operation, which records `next_id` and `epoch` at their high-water mark
+            // — so a crash can re-mint the ids of forks that never landed and can never re-mint one
+            // that did.
+            child
         };
-        // Durable before the caller is told the fork happened -- but shared, not private.
-        self.durable(seq)?;
         Ok(child)
     }
 
@@ -777,10 +1055,57 @@ impl BranchCatalog for TableBranchCatalog {
         self.hydrate(rec)
     }
 
+    /// A record write. **On a pending branch this decides whether the fork becomes durable.**
+    ///
+    /// Three cases, and the middle one is where the whole idea pays:
+    ///
+    /// - The record carries **arenas**, i.e. the branch owns pages. It has written; materialise.
+    ///   This is `ArenaPageStore`'s call when it hands a branch its first extent, so the fork is
+    ///   durable before a single data page exists, not after.
+    /// - The record is `Reaped`. The branch is being retired having never written, so there is
+    ///   nothing to make durable and nothing to undo: **discard the stage**. A fork-then-reap of a
+    ///   speculative branch therefore touches the disk exactly zero times, which is the agent
+    ///   workload D6 is about.
+    /// - Anything else — a state transition to `Reaping`, a lease change, a root that has not
+    ///   moved — is metadata about a branch that owns no page. It is exactly as losable as the
+    ///   fork itself, so it updates the stage and issues no fsync.
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
+        let id = record.branch_id.id;
         let _g = self.logical.lock().unwrap();
-        let old = self.core(record.branch_id.id)?;
-        self.write_record(record, old.as_ref())?;
+        // Read under `logical`, as the read inside `write_record` used to be. Bound to a local
+        // rather than left as a temporary in an `if`: a lock guard living one line longer than it
+        // looks is how this file would deadlock against its own `staged.write()` below.
+        let existing_arenas = self.arena_ids(id)?;
+        let pending = self.staged.read().unwrap().is_pending(id);
+
+        if pending {
+            let staged_now = self.core(id)?;
+            // "Has this branch written?" asked of the RECORD rather than of the caller, because
+            // `put` is a public trait method and a rule that holds only for today's callers is a
+            // rule the next caller breaks silently. Two ways to own durable state: pages of its
+            // own (arenas), or a root it did not inherit at fork. ARENAS ARE CHECKED FIRST, so a
+            // record that somehow carries both `Reaped` and arenas materialises rather than being
+            // dropped — silently discarded arenas leaked pages permanently once already (6e28372)
+            // and that class of defect does not get a second chance here.
+            let owns_durable_state = !record.arenas.is_empty()
+                || staged_now.as_ref().is_some_and(|r| r.root_page_id() != record.root_page_id);
+            if owns_durable_state {
+                self.materialize_locked(id)?;
+            } else if record.state == BranchState::Reaped {
+                // `mark_reaped` has already bumped the generation on this record; the slot is
+                // retired at that value so a stale handle stays a hard error with no record to
+                // carry the bump.
+                self.staged.write().unwrap().discard(id, record.generation);
+                return Ok(());
+            } else {
+                let mut staged = self.staged.write().unwrap();
+                let mut sink = Sink::Stage(&mut staged, id);
+                return self.write_record(&mut sink, record, staged_now.as_ref(), &existing_arenas);
+            }
+        }
+
+        let old = self.core(id)?;
+        self.write_record(&mut Sink::Tree, record, old.as_ref(), &existing_arenas)?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -801,12 +1126,18 @@ impl BranchCatalog for TableBranchCatalog {
         // The core is read FIRST and kept as `old`: `write_record` only ever consults an old
         // record for its state and deadline index keys, so cloning the hydrated record -- arenas
         // and all -- to hand it over was copying a vector nobody read.
+        // THE DURABILITY POINT. Publishing a root is the commit of shadow paging, so by definition
+        // this branch has written pages and its fork must reach the disk with them. Materialising
+        // BEFORE the mutations means the ticket taken below covers the fork's keys too: the fork
+        // becomes durable inside this operation's fsync rather than buying one of its own.
+        self.materialize_locked(branch.id)?;
+        let existing_arenas = self.arena_ids(branch.id)?;
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
         core.check_readable(branch)?;
         let old = core.clone();
         let mut rec = self.hydrate(core)?;
         rec.root_page_id = root;
-        self.write_record(&rec, Some(&old))?;
+        self.write_record(&mut Sink::Tree, &rec, Some(&old), &existing_arenas)?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -848,7 +1179,7 @@ impl BranchCatalog for TableBranchCatalog {
     fn scan(&self)
         -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
         let (lo, hi) = keys::whole_group(keys::tag::RECORD);
-        let it = self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))?;
+        let it = self.kv_range(lo, Bound::Excluded(hi))?;
         // Streaming: the scanner walks leaf by leaf, so a full system view or snapshot holds one
         // record at a time rather than a second copy of the catalog.
         //
@@ -875,7 +1206,7 @@ impl BranchCatalog for TableBranchCatalog {
         // consuming every child trunk has.
         // Entries are newest-first, so the first LIVE one is the maximum. Stale entries are
         // skipped rather than trusted; they are bounded by crashes and removed by the next reap.
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+        for entry in self.kv_range(lo, Bound::Excluded(hi))? {
             let (k, v) = entry?;
             if let Some(e) = self.live_child_at(&k, &v)? {
                 return Ok(Some(e));
@@ -894,7 +1225,7 @@ impl BranchCatalog for TableBranchCatalog {
             // An empty window pins nothing.
             return Ok(false);
         };
-        for entry in self.tree.range_scan(Bound::Included(klo), Bound::Included(khi))? {
+        for entry in self.kv_range(klo, Bound::Included(khi))? {
             let (k, v) = entry?;
             if self.live_child_at(&k, &v)?.is_some() {
                 return Ok(true);
@@ -905,7 +1236,7 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
         let (lo, hi) = keys::children_of(parent_id);
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+        for entry in self.kv_range(lo, Bound::Excluded(hi))? {
             let (k, v) = entry?;
             if self.live_child_at(&k, &v)?.is_some() {
                 return Ok(true);
@@ -959,6 +1290,22 @@ impl BranchCatalog for TableBranchCatalog {
         child_id: u64,
     ) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
+        // The entry belongs to the CHILD's fate, not the parent's: if the child is pending it must
+        // vanish with the child, or a crash would leave the parent listing a branch that does not
+        // exist. Staging it against the child is what makes them land or vanish together.
+        let child_pending = self.staged.read().unwrap().is_pending(child_id);
+        if child_pending {
+            let mut staged = self.staged.write().unwrap();
+            staged.put(
+                child_id,
+                keys::child(parent_id, fork_epoch.0),
+                WriteBufferEntry::Put(child_id.to_be_bytes().to_vec()),
+            );
+            return Ok(());
+        }
+        // A durable child under a pending parent would be that dangling pointer in the other
+        // direction, so the parent is landed first.
+        self.materialize_locked(parent_id)?;
         self.upsert(keys::child(parent_id, fork_epoch.0), child_id.to_be_bytes().to_vec())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -969,7 +1316,27 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn detach_child(&self, parent_id: u64, fork_epoch: Epoch) -> Result<bool, FerroError> {
         let _g = self.logical.lock().unwrap();
-        let removed = self.remove_if_present(&keys::child(parent_id, fork_epoch.0))?;
+        let key = keys::child(parent_id, fork_epoch.0);
+        // A staged entry was never on disk, so removing it is a memory operation and needs no
+        // fsync — and must not trigger one, because this is the reaper's path for a speculative
+        // branch, where the entire point is that nothing reaches the disk.
+        if self.staged.write().unwrap().remove_key(&key) {
+            return Ok(true);
+        }
+        let removed = self.remove_if_present(&key)?;
+        if !removed {
+            // ⛔ NOT A MICRO-OPTIMISATION. The reaper calls this for EVERY branch it retires, and
+            // for a branch that never wrote the entry has already gone with the stage — so without
+            // this, a fork-and-reap of a purely speculative branch still bought a private fsync
+            // and the whole change was worth nothing on the workload it exists for. Measured
+            // before this line: 400 speculative fork+reap cycles issued 400 fsyncs.
+            //
+            // Safe because the condition is "the tree did not change": there is no write of ours
+            // for a sync to cover. The header refresh `stage` performs is a safety net for the
+            // epoch counter, not a mutation this call made, and it lands on the next operation
+            // that does reach the disk.
+            return Ok(false);
+        }
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -978,8 +1345,14 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(removed)
     }
 
+    /// Extend a lease. **Does not make a pending fork durable**, and that is deliberate: a lease
+    /// is metadata about a branch that owns no page, so it is exactly as losable as the fork. The
+    /// alternative — materialising here — would hand every long-lived speculative branch back its
+    /// fsync through the lease thread's 30-second renewals, which is the cost this change removes.
     fn renew_lease(&self, branch: BranchId, lease: LeaseDeadline) -> Result<(), FerroError> {
         let _g = self.logical.lock().unwrap();
+        let existing_arenas = self.arena_ids(branch.id)?;
+        let pending = self.staged.read().unwrap().is_pending(branch.id);
         // Hydrated for the same reason as `set_root`: a core record has no arenas, and writing it
         // back would delete the branch's.
         let core = self.core(branch.id)?.ok_or(BranchError::NotFound(branch))?;
@@ -987,7 +1360,12 @@ impl BranchCatalog for TableBranchCatalog {
         let old = core.clone();
         let mut rec = self.hydrate(core)?;
         rec.lease_deadline = lease;
-        self.write_record(&rec, Some(&old))?;
+        if pending {
+            let mut staged = self.staged.write().unwrap();
+            let mut sink = Sink::Stage(&mut staged, branch.id);
+            return self.write_record(&mut sink, &rec, Some(&old), &existing_arenas);
+        }
+        self.write_record(&mut Sink::Tree, &rec, Some(&old), &existing_arenas)?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
         let seq = self.stage()?;
@@ -1017,6 +1395,20 @@ impl BranchCatalog for TableBranchCatalog {
             ))
         })?;
         env.charge(n)?;
+        // Same reasoning as `renew_lease`: a quota spent by a branch that owns no page is as
+        // losable as the fork, so a pending branch's charge stays in the stage. If the branch goes
+        // on to write, the charge lands with its fork; if it never does, the rows it was charged
+        // for were never durable either.
+        let pending = self.staged.read().unwrap().is_pending(branch.id);
+        if pending {
+            let mut staged = self.staged.write().unwrap();
+            staged.put(
+                branch.id,
+                keys::envelope(branch.id),
+                WriteBufferEntry::Put(env.serialize()),
+            );
+            return Ok(());
+        }
         self.upsert(keys::envelope(branch.id), env.serialize())?;
         // Lock dropped BEFORE the fsync, so this joins the commit group rather than
         // holding every other writer out for a disk round-trip. See `group_commit`.
@@ -1052,7 +1444,20 @@ mod d10_guard {
         let (cat, _p) = fresh_catalog();
         let mut rec = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
         rec.arenas.push(ArenaId(3));
-        cat.write_record_new(&rec).unwrap();
+        cat.write_record_new(&mut Sink::Tree, &rec).unwrap();
+    }
+
+    /// The same guard, against the sink a fork actually uses. It has to fire on BOTH: staging a
+    /// record whose arenas would be dropped is the identical defect one fsync later.
+    #[test]
+    #[should_panic(expected = "write_record_new was handed a record with")]
+    fn write_record_new_refuses_a_record_carrying_arenas_into_the_stage() {
+        let (cat, _p) = fresh_catalog();
+        let mut rec = cat.get_raw(BranchId::TRUNK.id).expect("trunk");
+        rec.arenas.push(ArenaId(3));
+        let mut staged = cat.staged.write().unwrap();
+        staged.open(rec.branch_id.id, 0, 0, true);
+        cat.write_record_new(&mut Sink::Stage(&mut staged, rec.branch_id.id), &rec).unwrap();
     }
 
     /// And it must NOT fire on the shape fork actually produces, or it is a guard that refuses the
@@ -1138,7 +1543,7 @@ mod serial_section_profile {
             cat.upsert(keys::state(child.state.as_u8(), child.branch_id.id), Vec::new()).unwrap();
         });
         let t_write_record = timed(N, || {
-            cat.write_record(&child, None).unwrap();
+            cat.write_record(&mut Sink::Tree, &child, None, &[]).unwrap();
         });
         // ⛔ `tree.insert`, NOT `upsert`. The first version of this profiler measured an upsert
         // here and reported 0.0228 ms / 19.8% for the child key -- but `fork` calls
@@ -1226,6 +1631,28 @@ mod tests {
         let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(f).unwrap())));
         let c = TableBranchCatalog::create(Arc::clone(&pool), 1).unwrap();
         (c, path, pool)
+    }
+
+    /// Fork **and write**, which is what "populate a catalog" means since D6 option 2 moved the
+    /// durability point to a branch's first write.
+    ///
+    /// ⛔ WHY THE FIXTURES BELOW CHANGED AND THEIR ASSERTIONS DID NOT. Several tests used a bare
+    /// `fork` as a cheap way to fill a catalog and then asserted something about REOPENING it —
+    /// that the counters survive, that the header page follows a root that moved, that a stale
+    /// child entry is resolved. Under the new contract a bare fork is deliberately not on disk, so
+    /// those fixtures were populating nothing and their assertions had become vacuous rather than
+    /// false. Publishing a root against each child restores the precondition they always meant;
+    /// every assertion is untouched. The contract those fixtures accidentally encoded — that a
+    /// fork alone is durable — is now tested on purpose, from both sides, by
+    /// `tests/integration_fork_kill9.rs` and `tests/integration_fork_lazy_durability.rs`.
+    fn fork_durable(
+        c: &TableBranchCatalog,
+        parent: BranchId,
+        lease: LeaseDeadline,
+    ) -> BranchRecord {
+        let child = c.fork(parent, lease).unwrap();
+        c.set_root(child.branch_id, 2).unwrap();
+        child
     }
 
     #[test]
@@ -1327,7 +1754,7 @@ mod tests {
     fn reopening_recovers_the_counters_without_replaying_anything() {
         let (c, p, pool) = cat("reopen");
         for _ in 0..8 {
-            c.fork(BranchId::TRUNK, LeaseDeadline(50)).unwrap();
+            fork_durable(&c, BranchId::TRUNK, LeaseDeadline(50));
         }
         let root = c.root_page_id();
         let next_id = c.next_id.load(Ordering::SeqCst);
@@ -1359,7 +1786,7 @@ mod tests {
         let (c, header_page) = TableBranchCatalog::create_with_header(Arc::clone(&pool), 1).unwrap();
         let first_root = c.root_page_id();
         for _ in 0..2000 {
-            c.fork(BranchId::TRUNK, LeaseDeadline(50)).unwrap();
+            fork_durable(&c, BranchId::TRUNK, LeaseDeadline(50));
         }
         let moved_root = c.root_page_id();
         assert_ne!(
@@ -1403,8 +1830,8 @@ mod tests {
     #[test]
     fn a_stale_child_entry_against_a_reaped_child_is_resolved_and_ignored() {
         let (c, p, _pool) = cat("stalechild");
-        let doomed = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
-        let survivor = c.fork(BranchId::TRUNK, LeaseDeadline(100)).unwrap();
+        let doomed = fork_durable(&c, BranchId::TRUNK, LeaseDeadline(100));
+        let survivor = fork_durable(&c, BranchId::TRUNK, LeaseDeadline(100));
         let t = BranchId::TRUNK.id;
 
         // Precondition: both are live and the newest is the survivor.
@@ -1506,7 +1933,7 @@ mod tests {
             let mut ids = Vec::new();
             // Enough to split the root, so the header page has to have tracked it.
             for _ in 0..2000 {
-                ids.push(c.fork(BranchId::TRUNK, LeaseDeadline(500)).unwrap().branch_id.id);
+                ids.push(fork_durable(&c, BranchId::TRUNK, LeaseDeadline(500)).branch_id.id);
             }
             c.pool.flush_all().expect("flush");
             ids
@@ -1535,7 +1962,7 @@ mod tests {
         {
             let c = TableBranchCatalog::open_sidecar(&path, 1).unwrap();
             for _ in 0..5 {
-                c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+                fork_durable(&c, BranchId::TRUNK, LeaseDeadline(1));
             }
             c.pool.flush_all().unwrap();
         }
@@ -1906,5 +2333,280 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(ids, sorted, "scan came back out of branch-id order");
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod lazy_durability {
+    //! The invariants that hold the lazy fork together. (`SCALE-DESIGN.md` D6, option 2)
+    //!
+    //! ⛔ EVERY TEST HERE WAS FIRE-CHECKED: the guard it names was broken on purpose, the test was
+    //! watched failing, and the guard was restored. A guard nobody has seen fire is a guard nobody
+    //! knows is connected, and this repo has had mutants survive a first attempt more than once.
+    //! The mutant each test kills is written above it, so the check can be repeated.
+    //!
+    //! The end-to-end halves of the contract live outside this module, because they need a real
+    //! process to kill: `tests/integration_fork_lazy_durability.rs` (a fork that never wrote leaves
+    //! NOTHING) and `tests/integration_fork_kill9.rs` (a fork that DID write survives).
+    use super::*;
+
+    fn cat(tag: &str) -> (TableBranchCatalog, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ferro-lazy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{tag}.branchcat"));
+        let _ = std::fs::remove_file(&path);
+        (TableBranchCatalog::open_sidecar(&path, 1).expect("open"), path)
+    }
+
+    /// Is this key actually ON DISK-BOUND TREE PAGES, as opposed to merely visible?
+    /// Every assertion about durability here goes through this rather than through `get`, because
+    /// `get` deliberately cannot tell the two apart — that is the whole feature.
+    fn in_tree(c: &TableBranchCatalog, key: &Vec<u8>) -> bool {
+        c.tree.search(key).unwrap().is_some()
+    }
+
+    const LEASE: LeaseDeadline = LeaseDeadline(u64::MAX);
+
+    /// A fork writes nothing, and is still a fully functional branch to every reader.
+    ///
+    /// MUTANT: make `fork` call `materialize_locked` on itself before returning. The record lands
+    /// in the tree and the first assertion fails.
+    #[test]
+    fn a_fork_is_invisible_on_disk_and_complete_in_every_query() {
+        let (c, _p) = cat("invisible");
+        let child = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let id = child.branch_id.id;
+
+        assert!(!in_tree(&c, &keys::record(id)), "a fork that wrote nothing reached the tree");
+        assert!(!in_tree(&c, &keys::state(BranchState::Live.as_u8(), id)), "state key reached the tree");
+        assert!(!in_tree(&c, &keys::child(BranchId::TRUNK.id, child.fork_epoch.0)), "child key reached the tree");
+        assert_eq!(c.syncs_issued(), 0, "a fork that wrote nothing issued an fsync");
+
+        // ...and yet every query answers as if it were there, which is what makes the stage safe.
+        assert_eq!(c.get(child.branch_id).unwrap().branch_id, child.branch_id);
+        assert_eq!(c.get_raw(id).unwrap().parent_id, Some(BranchId::TRUNK));
+        assert_eq!(BranchCatalog::live_count(&c), 2, "trunk plus the pending child");
+        assert_eq!(c.in_state(BranchState::Live).unwrap().len(), 2);
+        assert_eq!(c.max_live_child(BranchId::TRUNK.id).unwrap(), Some(child.fork_epoch));
+        assert!(c.has_live_children(BranchId::TRUNK.id).unwrap());
+        assert!(c
+            .live_child_in_epoch_range(
+                BranchId::TRUNK.id,
+                child.fork_epoch,
+                Epoch(child.fork_epoch.0 + 1)
+            )
+            .unwrap());
+        assert_eq!(c.scan().unwrap().count(), 2);
+        assert_eq!(c.pending_forks(), 1);
+
+        // The DEADLINE span too, which is the one the lease thread scans every thirty seconds. A
+        // pending branch that is invisible here is a branch nothing can ever reap, and since it is
+        // also not on disk, nothing would ever notice: it would simply hold memory for ever.
+        let doomed = c.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let expired = c.expired_before(5).unwrap();
+        assert_eq!(expired.len(), 1, "a pending branch with a dead lease was not reapable");
+        assert_eq!(expired[0].branch_id, doomed.branch_id);
+    }
+
+    /// Writing makes the whole pending ANCESTOR CHAIN durable, not just the writer.
+    ///
+    /// ⛔ THIS IS THE SHARPEST CORRECTNESS PROPERTY IN THE CHANGE. A record whose `parent_id`
+    /// names a branch with no record is a dangling pointer, and the `(parent, fork_epoch)` entry
+    /// beneath it is an index over nothing — `live_child_at` resolves such an entry to "not a live
+    /// child", so the parent's pages would be freed underneath a branch that can still read them.
+    ///
+    /// MUTANT: in `materialize_locked`, replace `g.ancestors_first(branch)` with `vec![branch]`.
+    /// The grandchild lands alone and the assertions on `a` and `b` fail.
+    #[test]
+    fn writing_a_grandchild_lands_its_pending_ancestors_too() {
+        let (c, _p) = cat("ancestors");
+        let a = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let b = c.fork(a.branch_id, LEASE).unwrap();
+        let d = c.fork(b.branch_id, LEASE).unwrap();
+        assert_eq!(c.pending_forks(), 3);
+
+        c.set_root(d.branch_id, 9).unwrap();
+
+        for (name, rec) in [("a", &a), ("b", &b), ("grandchild", &d)] {
+            assert!(
+                in_tree(&c, &keys::record(rec.branch_id.id)),
+                "{name} did not reach the tree, so the grandchild's parent chain dangles"
+            );
+        }
+        assert!(in_tree(&c, &keys::child(a.branch_id.id, b.fork_epoch.0)), "b's entry under a");
+        assert!(in_tree(&c, &keys::child(b.branch_id.id, d.fork_epoch.0)), "d's entry under b");
+        assert_eq!(c.pending_forks(), 0);
+    }
+
+    /// A pending branch that is reaped costs the disk NOTHING — and that is the agent workload.
+    ///
+    /// MUTANT: in `put`, drop the `state == Reaped` arm so a reap materialises instead. `syncs`
+    /// becomes non-zero and the record appears in the tree.
+    #[test]
+    fn reaping_a_branch_that_never_wrote_touches_no_disk_at_all() {
+        let (c, p) = cat("reapfree");
+        let before_len = std::fs::metadata(&p).unwrap().len();
+        let child = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let id = child.branch_id.id;
+
+        let mut rec = c.get_raw(id).unwrap();
+        rec.mark_reaped();
+        c.put(&rec).unwrap();
+        c.detach_child(BranchId::TRUNK.id, child.fork_epoch).unwrap();
+        c.release_id(id);
+
+        assert_eq!(c.syncs_issued(), 0, "a fork-and-reap of a never-written branch issued an fsync");
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), before_len, "the catalog file grew");
+        assert!(!in_tree(&c, &keys::record(id)), "a record reached the tree");
+        assert_eq!(BranchCatalog::live_count(&c), 1, "trunk alone");
+        assert!(!c.has_live_children(BranchId::TRUNK.id).unwrap(), "trunk still lists the reaped child");
+        assert_eq!(c.pending_forks(), 0);
+    }
+
+    /// Re-minting a slot whose PENDING occupant was reaped must not hand back a live-looking
+    /// handle to the branch that is gone.
+    ///
+    /// A reaped branch normally leaves its record behind carrying `generation + 1`, and that is
+    /// where a recycled slot reads its generation from. A branch that was never durable leaves no
+    /// record at all, so the bump has nowhere to live but `StagedForks::retired`.
+    ///
+    /// MUTANT: in `StagedForks::discard`, drop the `retired.insert(...)`. The re-minted branch
+    /// comes back at generation 0, the dead handle resolves to it, and the last assertion fails.
+    #[test]
+    fn a_slot_whose_pending_branch_was_reaped_is_re_minted_at_a_newer_generation() {
+        let (c, _p) = cat("regen");
+        let dead = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let mut rec = c.get_raw(dead.branch_id.id).unwrap();
+        rec.mark_reaped();
+        c.put(&rec).unwrap();
+        c.release_id(dead.branch_id.id);
+
+        let fresh = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        assert_eq!(fresh.branch_id.id, dead.branch_id.id, "fixture: the slot must be recycled");
+        assert!(
+            fresh.branch_id.generation > dead.branch_id.generation,
+            "the recycled slot came back at generation {}, the same one the dead handle names",
+            fresh.branch_id.generation
+        );
+        match c.get(dead.branch_id) {
+            Err(FerroError::Branch(msg)) => assert!(msg.contains("reaped"), "wrong refusal: {msg}"),
+            Err(e) => panic!("the dead handle was refused, but not as reaped: {e}"),
+            Ok(_) => panic!("a handle to a reaped branch resolved to the branch that replaced it"),
+        }
+    }
+
+    /// Two pending forks must never claim the same FREE_ID slot.
+    ///
+    /// The slot's key is in the TREE, so nothing but a staged tombstone can hide it from the next
+    /// forker — a stage that merely "remembered" the claim would not shadow the tree entry.
+    ///
+    /// MUTANT: in `fork`, delete the `sink_del(..., keys::free_id(child_num))` line. Both forks
+    /// scan the FREE_ID span, both find the same key, and the two ids come back equal.
+    #[test]
+    fn two_pending_forks_never_claim_the_same_recycled_slot() {
+        let (c, _p) = cat("freeid");
+        // A DURABLE branch, reaped, so the FREE_ID key really is in the tree.
+        let victim = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        c.set_root(victim.branch_id, 3).unwrap();
+        let mut rec = c.get_raw(victim.branch_id.id).unwrap();
+        rec.mark_reaped();
+        c.put(&rec).unwrap();
+        c.detach_child(BranchId::TRUNK.id, victim.fork_epoch).unwrap();
+        c.release_id(victim.branch_id.id);
+        assert!(in_tree(&c, &keys::free_id(victim.branch_id.id)), "fixture: no FREE_ID key to claim");
+
+        let one = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let two = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        assert_ne!(
+            one.branch_id.id, two.branch_id.id,
+            "two pending forks were handed the same id slot"
+        );
+        assert_eq!(one.branch_id.id, victim.branch_id.id, "fixture: the first should recycle");
+    }
+
+    /// The durable `next_id` must sit above every id ever handed out, or a crash re-mints an id a
+    /// surviving record already owns.
+    ///
+    /// Forks no longer write the header, so the duty moved to `stage()`, which refreshes it
+    /// whenever a counter has moved. Ids handed to forks that never landed are simply burned,
+    /// which costs nothing; an id handed to a fork that DID land must never come back.
+    ///
+    /// MUTANT: delete the `write_header` refresh from `stage()`. The reopened catalog comes back
+    /// with `next_id` at 1 and the assertion fails by naming a collision with a live record.
+    #[test]
+    fn the_header_records_the_id_high_water_whenever_anything_becomes_durable() {
+        let (c, p) = cat("highwater");
+        for _ in 0..5 {
+            c.fork(BranchId::TRUNK, LEASE).unwrap(); // pending, never durable
+        }
+        let durable = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        c.set_root(durable.branch_id, 4).unwrap();
+        let high = c.next_id.load(Ordering::SeqCst);
+        c.pool.flush_all().unwrap();
+        drop(c);
+
+        let re = TableBranchCatalog::open_sidecar(&p, 1).expect("reopen");
+        assert_eq!(
+            re.next_id.load(Ordering::SeqCst),
+            high,
+            "the durable next_id is below an id already handed out; a fork after a crash would \
+             collide with branch {} which DID survive",
+            durable.branch_id.id
+        );
+        // The branch that wrote is there; the five that did not are gone, and their ids are burned
+        // rather than reissued over a live record.
+        assert!(re.get_raw(durable.branch_id.id).is_ok(), "the written branch did not survive");
+        let fresh = re.fork(BranchId::TRUNK, LEASE).unwrap();
+        assert!(
+            fresh.branch_id.id >= high,
+            "a reopened catalog minted id {} below the high water mark {high}",
+            fresh.branch_id.id
+        );
+    }
+
+    /// A `put` that moves the root is a first write too, even with no arenas to give it away.
+    ///
+    /// `set_root` is not the only way a root moves — `put` takes a whole record, and `collapse`
+    /// already rewrites `root_page_id` through it. `collapse` happens to add an arena in the same
+    /// call, so an arenas-only test would pass while leaving the next caller of `put` to discover
+    /// this the hard way.
+    ///
+    /// MUTANT: in `put`, drop the `root_page_id() != record.root_page_id` clause from
+    /// `owns_durable_state`. The branch stays in memory and the first assertion fails.
+    #[test]
+    fn a_put_that_moves_the_root_makes_a_pending_fork_durable() {
+        let (c, _p) = cat("rootput");
+        let child = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        let mut rec = c.get_raw(child.branch_id.id).unwrap();
+        assert!(rec.arenas.is_empty(), "fixture: a fresh child must own no arenas");
+        rec.root_page_id += 1; // a root it did not inherit: this branch has written
+        c.put(&rec).unwrap();
+
+        assert!(
+            in_tree(&c, &keys::record(child.branch_id.id)),
+            "a branch that published a root of its own is still only in memory"
+        );
+        assert_eq!(c.syncs_issued(), 1, "and it did not reach the disk");
+    }
+
+    /// A pending branch's first write shares that write's fsync rather than buying its own.
+    ///
+    /// MUTANT: in `set_root`, move `materialize_locked` after the `durable(seq)` call (or give it
+    /// its own `stage`/`durable` pair). The count becomes 2 and this fails.
+    #[test]
+    fn materialising_a_fork_costs_no_extra_fsync() {
+        let (c, _p) = cat("onefsync");
+        let child = c.fork(BranchId::TRUNK, LEASE).unwrap();
+        assert_eq!(c.syncs_issued(), 0);
+        c.set_root(child.branch_id, 5).unwrap();
+        assert_eq!(
+            c.syncs_issued(),
+            1,
+            "the fork's keys and the root publication did not share one fsync"
+        );
     }
 }

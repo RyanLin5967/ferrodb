@@ -1,4 +1,16 @@
-//! An acknowledged fork must survive SIGKILL. (D6a)
+//! An acknowledged, WRITTEN fork must survive SIGKILL. (D6a, and D6 option 2)
+//!
+//! ⛔ THE WORD "WRITTEN" IS NEW AND IT IS A CONTRACT CHANGE, NOT A WEAKENING OF THIS TEST.
+//! `SCALE-DESIGN.md` D6 option 2 moved the durability point from `fork` to the branch's FIRST
+//! WRITE, on a premise check recorded there: a fork lost to a crash is observably identical to a
+//! branch reaped a moment later, which generations and non-cooperative leases already permit. So
+//! `examples/fork_kill9` now publishes a root against each child before printing its id, and every
+//! assertion below is unchanged and at full strength against that list. The half of the contract
+//! this file cannot see — that a fork which wrote NOTHING leaves NOTHING, no orphan id, no parked
+//! page, no index entry — is `tests/integration_fork_lazy_durability.rs`, which was watched failing
+//! (512 speculative forks parked 131,072 bytes) before the feature existed. Neither test is
+//! sufficient alone: this one would pass a catalog that fsynced on every fork, and that one would
+//! pass a catalog that never fsynced at all.
 //!
 //! Group commit moved the fsync out from under the logical lock and made it shared. The failure it
 //! can introduce is exact and silent: a leader advances the durable watermark past work whose pages
@@ -49,12 +61,16 @@ fn example_bin(name: &str) -> PathBuf {
         .expect("mtime");
     // Same staleness guard the other example-spawning tests use: `cargo test` does not rebuild
     // examples, and a stale victim would be testing yesterday's durability path.
-    if let Ok(src) = std::fs::metadata("src/branch/group_commit.rs").and_then(|m| m.modified()) {
-        assert!(
-            bin_time >= src,
-            "{} is older than src/branch/group_commit.rs — run: cargo build --examples",
-            out.display()
-        );
+    // Both files, because the durability decision now lives in two places: `group_commit` owns the
+    // shared fsync, and `table_catalog` owns WHEN a fork reaches it at all.
+    for src_path in ["src/branch/group_commit.rs", "src/branch/table_catalog.rs"] {
+        if let Ok(src) = std::fs::metadata(src_path).and_then(|m| m.modified()) {
+            assert!(
+                bin_time >= src,
+                "{} is older than {src_path} — run: cargo build --examples",
+                out.display()
+            );
+        }
     }
     out
 }

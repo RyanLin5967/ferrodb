@@ -5,9 +5,19 @@
 //! never written, a caller is told its fork succeeded and a crash loses it. That is worse than the
 //! slow version it replaced, and no throughput number can detect it.
 //!
-//! So: fork in several threads, and print each branch id ONLY after `fork` returned Ok, flushing
-//! immediately. Everything on stdout is therefore a fork the catalog ACKNOWLEDGED. The test kills
-//! this process with SIGKILL, reopens the catalog, and requires every acknowledged id to be there.
+//! So: fork in several threads, publish a root against the child — its FIRST WRITE — and print
+//! each branch id ONLY after that returned Ok, flushing immediately. Everything on stdout is
+//! therefore a branch the catalog ACKNOWLEDGED AS DURABLE. The test kills this process with
+//! SIGKILL, reopens the catalog, and requires every acknowledged id to be there.
+//!
+//! ⛔ THE `set_root` IS NOT DECORATION, AND IT IS WHY THIS FILE CHANGED. `SCALE-DESIGN.md` D6
+//! option 2 moved the durability point from `fork` to the branch's first write: a fork that never
+//! wrote is now allowed to vanish in a crash, because that loss is indistinguishable from a reap
+//! the contract already permits. Printing an id straight out of `fork` would therefore be
+//! asserting a guarantee the system deliberately no longer makes, and the test above it would be
+//! measuring the wrong contract rather than a weaker one. The branch that DID write must still
+//! survive, in full, and that is what stdout now lists. The other half — that a fork which wrote
+//! NOTHING leaves nothing at all — is `tests/integration_fork_lazy_durability.rs`.
 //!
 //! ⛔ AND IT MUST THEN GO QUIET. The first version of this victim forked in an infinite loop, and
 //! the test could not detect a deliberately broken commit ordering in three runs: with a sync every
@@ -38,7 +48,13 @@ fn main() {
         let cat = Arc::clone(&cat);
         handles.push(std::thread::spawn(move || {
             for _ in 0..per {
-                match cat.fork(BranchId::TRUNK, lease) {
+                match cat.fork(BranchId::TRUNK, lease).and_then(|child| {
+                    // THE FIRST WRITE. Publishing a root is the commit point of shadow paging, so
+                    // this is the moment the branch acquires durable state and the moment its fork
+                    // has to reach the disk with it.
+                    cat.set_root(child.branch_id, 2)?;
+                    Ok(child)
+                }) {
                     Ok(child) => {
                         // ACKNOWLEDGED. Write it down before doing anything else, and flush, so
                         // the record of what was promised survives the kill even though the

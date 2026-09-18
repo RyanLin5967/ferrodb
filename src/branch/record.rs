@@ -3,8 +3,12 @@
 //!
 //! Design authority: DESIGN.md section 1.
 //!
-//! Fork = one durable `BranchRecord` + append `fork_epoch` to the parent's sorted
-//! `live_children` array. No page is read, written, or refcounted, which is exit criterion 1.
+//! Fork = one `BranchRecord` + append `fork_epoch` to the parent's sorted `live_children` array.
+//! No page is read, written, or refcounted, which is exit criterion 1.
+//!
+//! That record is written DURABLY by `LogBranchCatalog`, and by `TableBranchCatalog` only when the
+//! branch first writes — see `branch::staged_fork` and `SCALE-DESIGN.md` D6 option 2. The record's
+//! shape is the same either way; only when it reaches the disk differs.
 
 use crate::branch::types::{
     ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
