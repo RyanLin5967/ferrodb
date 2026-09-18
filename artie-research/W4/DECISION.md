@@ -261,11 +261,19 @@ call itself — so the 91x/181x quoted above and the 99x/175x measured here are 
 and without the fix. The `stall` column really did move: `recon` at 10⁵ went 2 566 µs → 1 002 µs
 max, so the old maxima were carrying warm-up noise exactly as 14d796c said.
 
-Two honest limits recorded rather than smoothed over. Run A reports **1 blind fixture** at S=1 000
-`fast` — no probe acquisition overlapped a sweep that short — and exits **non-zero** because of it;
-run B at 5 µs resolves that cell (0 blind) and exits 0. And run B's idle control (396–455 ns) is
-comparable to run A's, which is what says the busier prober is not adding contention of its own; a
-tighter probe that inflated the idle arm would have bought sensitivity with bias.
+**The blind cell is a RESULT, not a limitation of the harness.** Run A reports 1 blind fixture at
+S=1 000 `fast` and exits non-zero because of it. Read that as the finding it is: at 50 µs spacing
+the prober cannot catch the fast arm's lock hold, *because that hold is around 100 µs and fits
+between two probes*. The harness saying "too short to see" is the claim this lane is making. A
+reader who gets `--` and a non-zero exit learns more than one handed a plausible number — which is
+exactly what the uncorrected instrument would have produced here, by crediting the sweep with
+warm-up it did not cause. Run B at 5 µs resolves the cell (0 blind, exit 0), and the two together
+say the hold is real but under ~100 µs, which no single spacing states on its own.
+
+Run B's idle control (396–455 ns) is comparable to run A's, and that check is what licenses the
+tighter probe: a 10× busier prober is itself contention, so a spacing that bought sensitivity by
+inflating the idle arm would have made the instrument into the thing it measures. The idle arm
+holding flat is the evidence that it did not.
 
 ### What this still does not fix
 
