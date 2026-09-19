@@ -250,8 +250,8 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                 continue 'restart;
             }
             let node = match BPlusTreePage::<K, V>::deserialize(page.data) {
-                Ok(n) => n,
-                Err(_) => continue 'restart,
+                Ok(n) if Self::header_page_id(&n) == root => n,
+                _ => continue 'restart,
             };
             match self.descend_optimistic(node, root, key, RIGHT_WALK)? {
                 Some(found) => return Ok(found),
@@ -269,6 +269,21 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// root snapshot taken BEFORE a split and asserts the moved key is still found — the
     /// interleaving the B-link walk exists for, which cannot be forced through `read_leaf_for`
     /// without pausing a writer mid-split. Not part of the API; nothing else may call it.
+
+    /// The page id a snapshot's own header claims. **A second, independent identity check.**
+///
+    /// The shadow's `label` says which page the frame's bytes are; this says which page the BYTES
+    /// say they are. They are written by different code at different times, so requiring both to
+    /// equal the page we asked for turns any future label lie — the kind a fresh-context review found
+    /// in D58's first version, where a relabelled frame published the outgoing page's bytes — from a
+    /// silently wrong answer into a restart. Costs one `u32` read of a buffer already in hand.
+    fn header_page_id(page: &BPlusTreePage<K, V>) -> u32 {
+        match page {
+            BPlusTreePage::Internal(n) => n.page_id,
+            BPlusTreePage::Leaf(l) => l.page_id,
+        }
+    }
+
     #[doc(hidden)]
     pub fn descend_optimistic(
         &self,
@@ -277,13 +292,30 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
         key: &K,
         right_walk: usize,
     ) -> Result<Option<(u32, BPlusTreeLeafPage<K, V>)>, FerroError> {
-        loop {
+        // Bounded like the walk, and for the same reason: a snapshot is a copy of bytes that may
+        // be mid-rewrite, so an internal node can point at a page that points back at it. A
+        // latched descent cannot loop (it holds the pages it passed); this one can, and "restart,
+        // then fall back to the latched path" is the honest answer. The bound is far above any
+        // real height — a 4 KB page holds >100 keys, so 32 levels is >10^64 rows.
+        const MAX_DEPTH: usize = 32;
+        for _ in 0..MAX_DEPTH {
             match node {
                 BPlusTreePage::Leaf(mut leaf) => {
                     // B-link repair: the key may have moved right in a split this descent did
-                    // not see. Walk while the leaf tops out below the key.
+                    // not see. Walk while the leaf cannot contain the key — it tops out below it,
+                    // **or it is empty.**
+                    //
+                    // The empty case is not hypothetical and `is_some_and` got it wrong: it is
+                    // false for an empty leaf, so the walk stopped there and returned it, and the
+                    // key read as absent. `BPlusTreeManager::delete` removes an entry and writes
+                    // the page back with no rebalance (`handle_underflow` is an honest refusal),
+                    // and `execution::insert`'s key reuse does exactly `delete(key)` then
+                    // `insert(key, rid)` — so a leaf holding one key is empty between those two
+                    // writes, and a concurrent optimistic reader walking past it saw the gap.
+                    // Found by a fresh-context review; `no_workload_drives_a_leaf_underfull` pins
+                    // occupancy for the SQL paths and says nothing about this window.
                     let mut hops = 0;
-                    while leaf.key_arr.last().is_some_and(|max| max < key) {
+                    while leaf.key_arr.last().is_none_or(|max| max < key) {
                         let Some(next) = leaf.next else { break };
                         hops += 1;
                         if hops > right_walk {
@@ -291,7 +323,7 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                         }
                         let Some(np) = self.buffer_pool.read_page_optimistic(next) else { return Ok(None) };
                         match BPlusTreePage::<K, V>::deserialize(np.data) {
-                            Ok(BPlusTreePage::Leaf(l)) => {
+                            Ok(BPlusTreePage::Leaf(l)) if l.page_id == next => {
                                 curr = next;
                                 leaf = l;
                             }
@@ -304,13 +336,14 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     let child = n.find_child(key);
                     let Some(cp) = self.buffer_pool.read_page_optimistic(child) else { return Ok(None) };
                     node = match BPlusTreePage::<K, V>::deserialize(cp.data) {
-                        Ok(n) => n,
-                        Err(_) => return Ok(None),
+                        Ok(n) if Self::header_page_id(&n) == child => n,
+                        _ => return Ok(None),
                     };
                     curr = child;
                 }
             }
         }
+        Ok(None)
     }
 
     /// The latched descent: read-crabbing from the root. Correct under every interleaving, and

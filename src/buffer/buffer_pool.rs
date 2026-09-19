@@ -351,9 +351,13 @@ impl FrameShadow {
         }
     }
 
-    /// Publish `frame` into the shadow. Called ONLY by [`FrameWriteGuard`]'s drop, while the
-    /// frame's write lock is still held, so two refreshes of one frame cannot interleave.
-    fn refresh(&self, frame: &Frame) {
+    /// Publish `frame` into the shadow under `label`. Called ONLY by [`FrameWriteGuard`]'s drop,
+    /// while the frame's write lock is still held, so two refreshes of one frame cannot interleave.
+    ///
+    /// `label` is the guard's decision, not `frame.page_id`: see
+    /// [`FrameWriteGuard::label_at_acquire`]. `NO_PAGE` means "these bytes belong to no page", and
+    /// every optimistic read of this frame then misses until a fill republishes it.
+    fn refresh(&self, frame: &Frame, label: u32) {
         let v = self.version.load(Ordering::Relaxed);
         debug_assert!(v & 1 == 0, "a shadow refresh found the version odd: two refreshers");
         self.version.store(v.wrapping_add(1), Ordering::Relaxed);
@@ -363,7 +367,7 @@ impl FrameShadow {
             word.copy_from_slice(&frame.data[i * 8..i * 8 + 8]);
             w.store(u64::from_ne_bytes(word), Ordering::Relaxed);
         }
-        self.label.store(frame.page_id.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.label.store(label, Ordering::Relaxed);
         self.version.store(v.wrapping_add(2), Ordering::Release);
     }
 }
@@ -563,6 +567,20 @@ pub struct FrameWriteGuard<'a> {
     guard: Option<RwLockWriteGuard<'a, Frame>>,
     shadow: &'a FrameShadow,
     touched: bool,
+    /// The frame's label when this guard was taken.
+    ///
+    /// **A relabel and a fill are two different writes, and only the fill's bytes belong to the
+    /// new page.** `evict_into` and `claim_free_frame` set `frame.page_id = Some(incoming)` while
+    /// `frame.data` still holds the VICTIM's bytes (or zeros); the pool then reads from disk and
+    /// assigns `data` in a second, separate `frame_write`. Publishing the new label with the old
+    /// bytes would hand an optimistic reader another page's contents under a stable version —
+    /// reachable by a reader holding a page-table hint from that page's PREVIOUS residency in the
+    /// same frame. So the guard compares: a write that CHANGED the label publishes `NO_PAGE`, and
+    /// the fill that follows (label unchanged) publishes the real one. Conservative in the safe
+    /// direction — a guard that both relabels and fills would cost readers one retry, never a
+    /// wrong page. Found by a fresh-context review of the first version, which published
+    /// `frame.page_id` unconditionally.
+    label_at_acquire: Option<u32>,
     _pool: PoolSection,
 }
 
@@ -584,7 +602,13 @@ impl Drop for FrameWriteGuard<'_> {
     fn drop(&mut self) {
         if self.touched {
             if let Some(frame) = self.guard.as_ref() {
-                self.shadow.refresh(frame);
+                // See `label_at_acquire`: bytes and label must be published together or not at all.
+                let label = if frame.page_id == self.label_at_acquire {
+                    frame.page_id.unwrap_or(NO_PAGE)
+                } else {
+                    NO_PAGE
+                };
+                self.shadow.refresh(frame, label);
             }
         }
         // Release the frame lock before the pool section closes (field order does the rest).
@@ -659,10 +683,13 @@ impl BufferPoolManager {
     /// this file, and this file has none.
     pub fn frame_write(&self, frame_i: usize) -> FrameWriteGuard<'_> {
         let _pool = enter_pool();
+        let guard = self.frames[frame_i].write().unwrap();
+        let label_at_acquire = guard.page_id;
         FrameWriteGuard {
-            guard: Some(self.frames[frame_i].write().unwrap()),
+            guard: Some(guard),
             shadow: &self.shadows[frame_i],
             touched: false,
+            label_at_acquire,
             _pool,
         }
     }
