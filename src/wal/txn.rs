@@ -931,8 +931,15 @@ impl TxnManager {
     }
 
     /// Read-only borrow of the active-transaction table. Bumps no version: see [`AttGuard`].
-    pub fn att_read(&self) -> MutexGuard<'_, HashMap<u64, TxnEntry>> {
-        self.att.lock().unwrap()
+    ///
+    /// Returns a `Deref`-ONLY guard, deliberately. A `MutexGuard` is `DerefMut`, so
+    /// `att_read().remove(&id)` would compile inside this module and change the active set
+    /// without moving `att_version` — the property this file rests on, reduced to a comment. A
+    /// review called that out while the guard still handed back the raw `MutexGuard`; now the
+    /// type says it. `TxnEntry`'s own interior mutability (`last_lsn`) is still reachable, which
+    /// is the point: that field is in no snapshot.
+    pub fn att_read(&self) -> AttReadGuard<'_> {
+        AttReadGuard { guard: self.att.lock().unwrap() }
     }
 
     /// Write borrow of the active-transaction table. **Every mutation goes through here** —
@@ -1036,6 +1043,19 @@ thread_local! {
     /// until the table changes. See [`TxnManager::read_snapshot_cached`].
     static SNAPSHOT_CACHE: std::cell::RefCell<Option<(u64, u64, Arc<Snapshot>)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// A read borrow of the active-transaction table: `Deref`, never `DerefMut`. See
+/// [`TxnManager::att_read`].
+pub struct AttReadGuard<'a> {
+    guard: MutexGuard<'a, HashMap<u64, TxnEntry>>,
+}
+
+impl std::ops::Deref for AttReadGuard<'_> {
+    type Target = HashMap<u64, TxnEntry>;
+    fn deref(&self) -> &HashMap<u64, TxnEntry> {
+        &self.guard
+    }
 }
 
 /// A write borrow of the active-transaction table that **cannot forget to publish the change**.

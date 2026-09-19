@@ -125,6 +125,12 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
                 } else {
                     t.abort(id).unwrap();
                 }
+                // **Also move the watermark WITHOUT touching the table** — recovery and a cluster
+                // TxnIdRange grant do exactly this, and it is the only writer of `high_water` the
+                // active set does not account for. Without it this detector cannot see the field.
+                if id % 3 == 0 {
+                    t.raise_next_txn_id(t.next_txn_id() + 1000);
+                }
                 churned.fetch_add(1, Ordering::Relaxed);
             }
         })
@@ -151,6 +157,15 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
                         "the version did not move ({v1}) but the cached snapshot disagrees with \
                          the locked one: cached {:?}, locked {:?}",
                         cached.active, locked.active
+                    );
+                    // BOTH fields. The first version of this test compared only `active` — the
+                    // half `att_version` obviously covers — so a `high_water` that went stale
+                    // (the writer above now forces that case) was invisible to it.
+                    assert_eq!(
+                        cached.high_water, locked.high_water,
+                        "the version did not move ({v1}) but the cached high_water is {} against \
+                         the locked {}",
+                        cached.high_water, locked.high_water
                     );
                     checked += 1;
                 }
@@ -262,4 +277,89 @@ fn two_managers_on_one_thread_do_not_share_a_cached_snapshot() {
     assert_eq!(a.read_snapshot_cached().active.len(), 2);
     a.commit(x).unwrap();
     a.commit(y).unwrap();
+}
+
+/// **After recovery, a thread's cached snapshot must agree with the locked one.**
+///
+/// `recover` reinstates every loser transaction so the undo pass can abort it — an addition to the
+/// active set from outside the ordinary begin/commit flow, and it used a raw `att.lock()` until a
+/// fresh-context review found it. That is fixed (it goes through `att_write()` now), and the class
+/// is prevented structurally: the field is private, `att_read` is `Deref`-only, and
+/// `lock_order_allowlist::only_the_att_accessors_may_lock_the_active_transaction_table` refuses a
+/// raw lock inside `txn.rs`.
+///
+/// ⚠ **This test does not fire-check that fix, and saying so is the point.** Planting the
+/// unguarded insert back leaves it GREEN: recovery aborts each loser immediately, and the abort's
+/// `remove` (and `raise_next_txn_id`) bump the version anyway, so the skipped bump is invisible
+/// from outside — the window opens and closes inside `recover`. What this pins is the end state:
+/// a thread that cached a snapshot before recovery must not keep it afterwards. A recovery that
+/// left the version behind ALTOGETHER fails here.
+#[test]
+fn recovery_moves_the_version_for_a_thread_that_already_cached_a_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    // A WAL with an un-ended transaction in it: open a manager, write a record, and drop it
+    // without committing. The next open's recovery has a loser to reinstate.
+    let id = {
+        let t = manager(&dir, "recov");
+        let id = t.begin().unwrap();
+        // A DDL record: it chains onto the transaction (so recovery sees the id) and recovery's
+        // undo pass walks past it without touching a heap page, which keeps this test about the
+        // ATT rather than about page replay. `TxnEnd` would be wrong — it ENDS the transaction,
+        // so there would be no loser and this test would pass vacuously. It did, until the
+        // mutant "insert without the guard" survived it.
+        t.append_chained(
+            id,
+            &ferrodb::wal::log::RecKind::Ddl {
+                op: ferrodb::wal::log::DdlOp::CreateTable,
+                table: "t".into(),
+                dir_root: 0,
+                time_travel_root: 0,
+                columns: Vec::new(),
+            },
+        )
+        .unwrap();
+        t.wal.flush().unwrap();
+        id
+    };
+
+    // A second manager over the SAME wal file, and a snapshot cached on this thread BEFORE
+    // recovery runs.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(dir.path().join("recov2.db"))
+        .unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let wal = Arc::new(WalManager::new(dir.path().join("recov.wal")).unwrap());
+    bp.attach_wal(wal.clone());
+    let t2 = Arc::new(TxnManager::new(wal, bp));
+
+    let before = t2.read_snapshot_cached();
+    let _warm = t2.read_snapshot_cached();
+    assert!(before.active.is_empty(), "the fresh manager started with active transactions");
+
+    let before_version = t2.att_version();
+    let _ = ferrodb::wal::recovery::recover(&t2);
+    // **The fixture must have given recovery something to do**, or this test proves nothing: it
+    // has to reinstate the loser (an ATT change) and raise the watermark past it.
+    assert!(
+        t2.att_version() > before_version,
+        "recovery changed nothing observable (version still {before_version}): the fixture left \
+         no loser transaction, so the path under test never ran"
+    );
+
+    // Whatever recovery did to the table, the cached read must agree with the locked one. That is
+    // the property; the loser's presence is the fixture's business, and asserting it directly
+    // would make this test depend on the undo pass's bookkeeping rather than on the cache.
+    let after = t2.read_snapshot_cached();
+    let locked = t2.read_snapshot();
+    assert_eq!(
+        after.active, locked.active,
+        "after recovery the cached snapshot disagrees with the locked one (cached {:?}, locked \
+         {:?}): recovery changed the active set without moving the version",
+        after.active, locked.active
+    );
+    assert_eq!(after.high_water, locked.high_water, "recovery raised the watermark unseen");
+    assert!(after.high_water > id, "the fixture's transaction {id} is not below the watermark");
 }

@@ -1,5 +1,4 @@
 use crate::{error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, tuple::{Tuple, VersionHeader}}, wal::txn::ReadView};
-use std::sync::Arc;
 
 pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
     let mut current = head;
@@ -30,6 +29,7 @@ mod tests {
     use super::*;
     use crate::wal::txn::Snapshot;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     /// A view for transaction `me`, with `active` still in flight and everything below
     /// `high_water` otherwise committed.
