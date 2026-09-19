@@ -95,9 +95,12 @@ pub fn recover(txn: &TxnManager) -> Result<bool, FerroError> {
     let mut losers: Vec<u64> = last_lsn.keys().copied().filter(|id| !ended.contains(id)).collect();
     losers.sort_unstable();
     for id in losers {
-        txn.att.lock().unwrap().insert(id, TxnEntry {
+        // Through the guard, not the raw lock: this ADDS to the active set, so it must move
+        // `att_version` or a cached snapshot taken before recovery would miss the losers.
+        // A fresh-context review found this site bypassing the funnel.
+        txn.att_write().insert(id, TxnEntry {
             status: TxnStatus::Aborting,
-            last_lsn: last_lsn[&id],
+            last_lsn: std::sync::atomic::AtomicU64::new(last_lsn[&id]),
             begin_lsn: first_lsn[&id],
             snapshot: None
         });

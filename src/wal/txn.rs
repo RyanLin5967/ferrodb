@@ -73,7 +73,11 @@ pub struct TxnManager {
     /// An address would not do: a dropped manager's address is reused, and the cache would then
     /// hand a new manager an old one's active set whenever the versions happened to agree.
     id: u64,
-    pub att: Mutex<HashMap<u64, TxnEntry>>,
+    /// **Private since D59.** Every borrow goes through [`TxnManager::att_read`] or
+    /// [`TxnManager::att_write`], because the snapshot cache is only sound while `att_version`
+    /// moves on every change to the active set — and a `pub` field let any module take the lock
+    /// and mutate without one, which a review found recovery already doing.
+    att: Mutex<HashMap<u64, TxnEntry>>,
     pub commits_since_checkpoint: AtomicU64,
     /// Every table's DDL, retained so a checkpoint can re-establish it at the head of the new log.
     ///
@@ -193,7 +197,15 @@ pub struct SnapshotHandoff {
 
 pub struct TxnEntry {
     pub status: TxnStatus,
-    pub last_lsn: u64,
+    /// **Atomic, and that is a D59 decision, not a concurrency flourish.**
+    ///
+    /// A snapshot is `(high_water, the SET of active ids)`; `last_lsn` is in neither. It is
+    /// rewritten by `append_chained` for **every WAL record a transaction writes**, and while it
+    /// lived behind a `&mut` borrow of the table, every one of those bumped `att_version` and
+    /// invalidated every reader's cached snapshot — a review measured that as "the cache
+    /// degenerates to the old behaviour under any concurrent writer". As an atomic it is updated
+    /// through a READ borrow, so the version moves only when the active set actually changes.
+    pub last_lsn: AtomicU64,
     /// LSN of this transaction's `Begin` record — its earliest record, and therefore the earliest
     /// point a reader would have to resume from in order to see everything it did.
     pub begin_lsn: u64,
@@ -250,7 +262,7 @@ impl TxnManager {
             txn_id,
             TxnEntry {
                 status: TxnStatus::Running,
-                last_lsn: lsn,
+                last_lsn: AtomicU64::new(lsn),
                 begin_lsn: lsn,
                 snapshot: Some(snapshot),
             },
@@ -380,7 +392,7 @@ impl TxnManager {
             let entry = att
                 .get(&txn_id)
                 .ok_or_else(|| FerroError::Txn(format!("txn {txn_id} is not active")))?;
-            entry.last_lsn != entry.begin_lsn
+            entry.last_lsn.load(Ordering::Acquire) != entry.begin_lsn
         };
         if wrote {
             self.abort(txn_id)?;
@@ -424,10 +436,13 @@ impl TxnManager {
     }
 
     pub fn append_chained(&self, txn_id: u64, kind: &RecKind) -> Result<u64, FerroError> {
-        let mut att = self.att_write();
-        let entry = att.get_mut(&txn_id).ok_or_else(|| FerroError::Wal("txn not active".into()))?;
-        let lsn = self.wal.append(txn_id,entry.last_lsn, kind)?;
-        entry.last_lsn = lsn;
+        // A READ borrow: this changes `last_lsn`, which is not part of any snapshot, so it must
+        // not move `att_version`. See `TxnEntry::last_lsn`. The entry itself cannot vanish while
+        // this guard is held, and `last_lsn` is only ever written by the transaction that owns it.
+        let att = self.att_read();
+        let entry = att.get(&txn_id).ok_or_else(|| FerroError::Wal("txn not active".into()))?;
+        let lsn = self.wal.append(txn_id, entry.last_lsn.load(Ordering::Acquire), kind)?;
+        entry.last_lsn.store(lsn, Ordering::Release);
         Ok(lsn)
     }
 
@@ -640,7 +655,7 @@ impl TxnManager {
             self.att_write().get_mut(&txn_id).unwrap().status = TxnStatus::Aborting;
         }
         let mut lsn = {
-            self.att_read().get(&txn_id).unwrap().last_lsn
+            self.att_read().get(&txn_id).unwrap().last_lsn.load(Ordering::Acquire)
         };
         loop {
             let (rec, _) = self.wal.read_record(lsn)?;
@@ -882,6 +897,13 @@ impl TxnManager {
     /// watermark says what was used, never what may be used.
     pub fn raise_next_txn_id(&self, at_least: u64) {
         self.txn_ids.raise_issued_through(at_least);
+        // **`high_water` is half of a snapshot and the ATT does not cover it.** `begin` issues an
+        // id and inserts into the table in one critical section, so ordinary operation moves the
+        // version anyway — but recovery and a cluster `TxnIdRange` grant raise the watermark with
+        // the table untouched, and a thread holding a cached snapshot would keep an old
+        // `high_water` for as long as no transaction began or ended. Found by a fresh-context
+        // review of D59's first version, which argued claim (c) instead of enforcing it.
+        self.att_version.fetch_add(1, Ordering::Release);
     }
 
     /// The id watermark: everything below it has been issued. Diagnostic and recovery-facing.

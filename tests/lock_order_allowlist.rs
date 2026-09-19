@@ -386,3 +386,62 @@ fn test_only_sources_are_cfg_test_gated() {
          with #[cfg(test)] or rename it so the guards count it."
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// D59 — the active-transaction table has one door
+// ---------------------------------------------------------------------------------------------
+
+/// **Every borrow of the active-transaction table goes through `att_read`/`att_write`.**
+///
+/// The snapshot cache (`TxnManager::read_snapshot_cached`) is sound only while `att_version`
+/// moves on every change to the set of active ids, and `AttGuard` is what makes that automatic.
+/// A raw `att.lock()` bypasses it: the table changes, the version does not, and every reader on
+/// that thread keeps a snapshot from before the change — a committed transaction stays invisible,
+/// or an active one reads as committed. A fresh-context review found `wal/recovery.rs` doing
+/// exactly that while the field was still `pub`.
+///
+/// The field is private now, so the compiler enforces this outside `src/wal/txn.rs`. Inside that
+/// file it cannot, which is where this test earns its place: only the two accessors may name the
+/// lock in production code.
+#[test]
+fn only_the_att_accessors_may_lock_the_active_transaction_table() {
+    let path = Path::new("src/wal/txn.rs");
+    let code = std::fs::read_to_string(path).expect("read src/wal/txn.rs");
+    // The test module at the bottom may use the raw lock: it is not a write path and it is not
+    // compiled into the library.
+    let prod = match code.find("\n#[cfg(test)]\nmod tests {") {
+        Some(i) => &code[..i],
+        None => &code[..],
+    };
+    let offenders: Vec<(usize, String)> = strip_line_comments(prod)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("att.lock("))
+        .map(|(i, l)| (i + 1, l.trim().to_string()))
+        .collect();
+    assert!(
+        offenders.len() <= 2,
+        "raw `att.lock()` outside the two accessors in src/wal/txn.rs: {offenders:#?}\n\
+         Use `att_read()` for a read and `att_write()` for a change — the write guard bumps \
+         `att_version` inside the critical section, which is what makes the snapshot cache safe."
+    );
+    // ...and the two that remain must BE the accessors, or the count above is satisfied by the
+    // wrong lines and this test has stopped watching anything.
+    assert_eq!(
+        offenders.len(),
+        2,
+        "expected exactly the two accessor bodies to lock `att` directly, found {}: {offenders:#?}",
+        offenders.len()
+    );
+    let fn_read = prod.find("pub fn att_read").expect("att_read is gone; update this test");
+    let fn_write = prod.find("pub fn att_write").expect("att_write is gone; update this test");
+    let line_of = |byte: usize| prod[..byte].matches('\n').count() + 1;
+    let (r, w) = (line_of(fn_read), line_of(fn_write));
+    for (line, text) in &offenders {
+        assert!(
+            (*line >= r && *line <= r + 4) || (*line >= w && *line <= w + 6),
+            "a raw `att.lock()` at line {line} ({text}) is not inside att_read (line {r}) or \
+             att_write (line {w})"
+        );
+    }
+}

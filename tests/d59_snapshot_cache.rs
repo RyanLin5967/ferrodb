@@ -175,3 +175,91 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
     assert!(checked > 1000, "only {checked} comparisons were made");
     assert!(skipped > 0, "no read ever overlapped a change ({checked} checked): not a race");
 }
+
+/// **`high_water` is the half of a snapshot the active-transaction table does not cover.**
+/// `begin` issues an id and inserts into the table in one critical section, so ordinary operation
+/// moves the version anyway — but recovery and a cluster `TxnIdRange` grant raise the watermark
+/// with the table untouched. A cached snapshot would then keep an old `high_water` for as long as
+/// no transaction began or ended, and `includes` would answer "not yet committed" for a
+/// transaction whose rows are on disk. Found by a fresh-context review of the first version, which
+/// argued this could not matter instead of enforcing it.
+#[test]
+fn raising_the_id_watermark_invalidates_a_cached_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = manager(&dir, "highwater");
+
+    let before = t.read_snapshot_cached();
+    let _warm = t.read_snapshot_cached();
+    let raised = before.high_water + 500;
+    t.raise_next_txn_id(raised);
+
+    let after = t.read_snapshot_cached();
+    assert!(
+        after.high_water >= raised,
+        "a cached snapshot kept high_water {} after the watermark was raised to {raised}: every \
+         transaction id in between reads as 'not yet committed' on this thread",
+        after.high_water
+    );
+    assert_eq!(after.high_water, t.read_snapshot().high_water);
+    // The consequence the number stands for: an id below the new watermark, with nothing active,
+    // must be included.
+    assert!(after.includes(raised - 1), "id {} is below the watermark and not active", raised - 1);
+}
+
+/// The whole-snapshot comparison, not just the active set: a cached snapshot must match the
+/// locked one in **both** fields. The first version of this file compared `active` only, which is
+/// the field `att_version` obviously covers — the one it does not cover went untested.
+#[test]
+fn a_cached_snapshot_matches_the_locked_one_in_high_water_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = manager(&dir, "bothfields");
+    for step in 0..8 {
+        let id = t.begin().unwrap();
+        if step % 2 == 0 {
+            t.commit(id).unwrap();
+        } else {
+            t.abort(id).unwrap();
+        }
+        t.raise_next_txn_id(t.next_txn_id() + 7);
+        let cached = t.read_snapshot_cached();
+        let locked = t.read_snapshot();
+        assert_eq!(cached.high_water, locked.high_water, "step {step}: high_water disagrees");
+        assert_eq!(cached.active, locked.active, "step {step}: active set disagrees");
+    }
+}
+
+/// Two managers on one thread must not share a cache entry. The entry is keyed by a per-manager
+/// id precisely because a dropped manager's address is reused and every test builds several; the
+/// check had no test, so it was an assertion rather than a property.
+#[test]
+fn two_managers_on_one_thread_do_not_share_a_cached_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = manager(&dir, "mgr_a");
+    let b = manager(&dir, "mgr_b");
+
+    // **Both managers must reach the SAME version with DIFFERENT content**, or the version check
+    // alone separates them and the manager id is never load-bearing. (The first version of this
+    // test left `a` at version 1 and `b` at 0, and the mutant "ignore the id" passed it.)
+    //   a: begin, begin   -> version 2, active {x, y}
+    //   b: begin, commit  -> version 2, active {}
+    let x = a.begin().unwrap();
+    let y = a.begin().unwrap();
+    let z = b.begin().unwrap();
+    b.commit(z).unwrap();
+    assert_eq!(a.att_version(), b.att_version(), "the fixture failed to align the two versions");
+
+    let sa = a.read_snapshot_cached();
+    assert_eq!(sa.active.len(), 2, "manager a lost its own transactions: {:?}", sa.active);
+    let sb = b.read_snapshot_cached();
+    assert!(
+        sb.active.is_empty(),
+        "manager b was handed manager a's active set ({:?}) at the same version: the cache is not \
+         keyed by manager",
+        sb.active
+    );
+    // The other direction too, so a cache that always misses one way cannot pass.
+    assert!(b.read_snapshot_cached().active.is_empty());
+    assert_eq!(a.read_snapshot_cached().active.len(), 2);
+    a.commit(x).unwrap();
+    a.commit(y).unwrap();
+}
