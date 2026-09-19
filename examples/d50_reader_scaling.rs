@@ -90,10 +90,11 @@ fn build(dir: &std::path::Path, n: usize) -> Server {
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
     let mut seed_cache = None;
-    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut Session::new(), &mut seed_cache);
+    let seed_slot = std::sync::atomic::AtomicBool::new(false);
+    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut Session::new(), &mut seed_cache, &seed_slot);
     let mut sess = Session::new();
     for i in 1..=ROWS {
-        exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut seed_cache);
+        exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut seed_cache, &seed_slot);
     }
     s
 }
@@ -110,6 +111,7 @@ fn exec(
     sql: &str,
     sess: &mut Session,
     cache: &mut Option<(u64, Arc<Catalog>)>,
+    slot: &std::sync::atomic::AtomicBool,
 ) -> usize {
     let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
     let mut parser = Parser::new(tokens);
@@ -117,9 +119,17 @@ fn exec(
     assert!(parser.errors.is_empty(), "parse failed for {sql}: {:?}", parser.errors);
     let stmt = stmts.remove(0);
     // The shared read path first: one relaxed load of the epoch, then a plain `&Catalog`.
+    //
+    // ⚠ The reader/writer handshake is included ON PURPOSE. It is a SeqCst store and a SeqCst
+    // load on every shared read, and leaving it out of the harness would measure a path the
+    // server does not run — the same way keeping the exclusive lock here would have.
     let outcome = {
         let shared = s.ctx.read_catalog(cache);
-        match try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), sess) {
+        let attempted = match s.ctx.begin_read(slot) {
+            Some(_pass) => try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), sess),
+            None => None,
+        };
+        match attempted {
             Some(read) => read,
             None => {
                 // THE LOCK. Still taken for anything that needs the catalog exclusively, which is
@@ -157,14 +167,17 @@ fn sweep_point(servers: &[Arc<Server>], shared: bool, threads: usize) -> (f64, u
             let mut sess = Session::new();
             // One cache per thread, because one connection has one cache.
             let mut cache: Option<(u64, Arc<Catalog>)> = None;
+            // One slot per thread, registered like a connection's.
+            let slot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            srv.ctx.register_reader(Arc::clone(&slot));
             let t0 = Instant::now();
             while t0.elapsed() < WARMUP {
-                exec(&srv, &sql, &mut sess, &mut cache);
+                exec(&srv, &sql, &mut sess, &mut cache, &slot);
             }
             start.wait();
             let (mut n, mut r) = (0u64, 0u64);
             while !stop.load(Ordering::Relaxed) {
-                r += exec(&srv, &sql, &mut sess, &mut cache) as u64;
+                r += exec(&srv, &sql, &mut sess, &mut cache, &slot) as u64;
                 n += 1;
             }
             total.fetch_add(n, Ordering::Relaxed);
