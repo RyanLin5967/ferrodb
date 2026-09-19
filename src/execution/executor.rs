@@ -93,9 +93,17 @@ pub fn try_run_read(
     match stmt {
         Stmt::Explain(s) => Some(explain((**s).clone(), catalog).map(Outcome::Explain)),
 
-        // An agent-session SELECT, including `AS OF BRANCH`. `AgentRuntime::select` takes a
+        // An agent-session SELECT of the session's OWN branch. `AgentRuntime::select` takes a
         // `ReadCtx` since D52, so this is a read all the way down.
-        Stmt::Select { .. } if session.agent.is_some() => {
+        //
+        // ⛔ `from.as_of.is_none()` is load-bearing and was missing. `run` routes an
+        // `AS OF BRANCH x` select through `run_agent_stmt`, whose `SelectAsOf` arm reads the
+        // **named** branch; without this guard the arm below caught those too and read
+        // `session.agent.branch` — the session's own branch — so `AS OF BRANCH x` silently
+        // answered from the wrong branch. `tests/d54_as_of_in_session.rs` fails without it.
+        // Letting `AS OF` fall through to `None` costs it the shared path and keeps `run` the
+        // single implementation of what `AS OF` means.
+        Stmt::Select { from, .. } if session.agent.is_some() && from.as_of.is_none() => {
             let runtime = session.runtime.clone();
             let branch = session.agent.as_ref().map(|a| a.branch)?;
             let ctx = crate::agent_sql::runtime::ReadCtx { catalog, bp, txn };
