@@ -247,7 +247,11 @@ impl FullTextSearch {
         }
 
         let tree = open_posting_tree(ft_root, bp.clone());
-        let primary_index = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+        // SHARED root cell (D53); see optimizer.rs for why a private one here is a hazard.
+        let primary_index = match catalog.root_cell(table, None) {
+            Some(cell) => BPlusTreeManager::<Value, RecordId>::open_shared(cell, bp.clone()),
+            None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
+        };
         let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
         let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
 

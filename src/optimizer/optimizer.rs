@@ -60,14 +60,26 @@ pub fn lower(plan: PhysicalPlan, catalog: &Catalog, bp: Arc<BufferPoolManager>, 
             let heap = HeapFileManager::open(entry.first_directory_page_id, bp.clone());
             let tt_heap = HeapFileManager::open(entry.time_travel_root, bp.clone());
             if column == 0 {
-                let tree = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp);
+                // SHARED root cell (D53). The point-lookup path every indexed read takes was
+                // missed when D53 wired plan::open_table: a private cell here means an index scan
+                // could descend from a root a concurrent split had already moved.
+                let tree = match catalog.root_cell(&table, None) {
+                    Some(cell) => BPlusTreeManager::<Value, RecordId>::open_shared(cell, bp),
+                    None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp),
+                };
                 let scanner = tree.range_scan(lower, upper)?;
                 return Ok(Box::new(IndexScan{heap, scanner, schema, tt_heap, view}))
             } 
             let col_name = schema.columns.get(column).ok_or(FerroError::Bind("unknown column".into()))?.name.clone();
             let sec_root = entry.indexes.iter().find(|i| i.column_name == col_name).ok_or(FerroError::Bind("no index found".into()))?.root_page_id;
-            let sec_tree = BPlusTreeManager::<(Value, Value), ()>::open(sec_root, bp.clone());
-            let primary_index = BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone());
+            let sec_tree = match catalog.root_cell(&table, Some(&col_name)) {
+                Some(cell) => BPlusTreeManager::<(Value, Value), ()>::open_shared(cell, bp.clone()),
+                None => BPlusTreeManager::<(Value, Value), ()>::open(sec_root, bp.clone()),
+            };
+            let primary_index = match catalog.root_cell(&table, None) {
+                Some(cell) => BPlusTreeManager::<Value, RecordId>::open_shared(cell, bp.clone()),
+                None => BPlusTreeManager::<Value, RecordId>::open(entry.primary_index_root, bp.clone()),
+            };
 
             let scan_lower = match lower {
                 Bound::Excluded(_) => return Err(FerroError::Bind("lower bound sec index isn't supported".into())),

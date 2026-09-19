@@ -290,6 +290,22 @@ fn main() {
     // D55_QUICK=1: the shared arm at staged=10 only -- the exact block the full baseline sweep
     // produced first, so a before/after on it is same-harness, same-mode. The full sweep is the
     // design-record artifact; this is the falsifier, and it runs in minutes rather than an hour.
+    // D55_FOCUS=1: hold ONE agent at staged=10 for ~25 s so a sampling profiler can attach and
+    // name where a 450 us statement actually spends its time -- the pushdown bought x1.44 where
+    // O(table)->O(log N) on 5000 rows should have bought an order of magnitude, so something
+    // else dominates and a stack is worth more than another hypothesis.
+    if std::env::var("D55_FOCUS").is_ok() {
+        println!("# FOCUS: shared arm, 1 agent, staged=10, pid {}", std::process::id());
+        let servers: Vec<Arc<Server>> = vec![Arc::new(build(&dir, 0))];
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(25) {
+            let (ops, _) = sweep_point(&servers, true, 1, 10);
+            println!("# hold: {ops:.0} stmt/s");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
     if std::env::var("D55_QUICK").is_ok() {
         println!("# QUICK: shared arm, staged=10 only");
         let a = run_arm(&dir, true, 10, "SHARED  (ONE ServerContext)");
