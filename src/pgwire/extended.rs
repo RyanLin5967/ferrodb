@@ -61,9 +61,18 @@ pub struct Connection {
     /// (`bench/d51_sharedword_probe.txt`: RwLock::read x0.121, Arc::clone x0.137, relaxed load
     /// x7.823 over 16 threads).
     catalog_cache: Option<(u64, Arc<Catalog>)>,
+    /// This connection's busy slot, written only by this connection. Registered with the
+    /// `ServerContext` once, at connection start.
+    read_slot: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Connection {
+    /// The busy slot, for `ServerContext::register_reader`. Cloning the `Arc` is what lets the
+    /// registry notice, by refcount, that this connection has gone away.
+    pub fn read_slot(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.read_slot)
+    }
+
     pub fn new(session: Session) -> Self {
         Connection {
             session,
@@ -72,6 +81,7 @@ impl Connection {
             portals: HashMap::new(),
             failed: false,
             catalog_cache: None,
+            read_slot: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -319,9 +329,26 @@ impl Statement {
                 // could disagree with it. Fields are destructured because `session` and
                 // `catalog_cache` are borrowed at once and they are disjoint.
                 let outcome = {
-                    let Connection { session, catalog_cache, .. } = &mut *conn;
+                    let Connection { session, catalog_cache, read_slot, .. } = &mut *conn;
+                    // Refresh the snapshot FIRST. This is the only place the read path can take
+                    // the catalog mutex, and it must not happen while the slot is busy: a writer
+                    // draining would wait for this slot while this reader waited for the mutex.
                     let shared = ctx.read_catalog(catalog_cache);
-                    match try_run_read(&stmt, shared, ctx.bp.clone(), ctx.txn.clone(), session) {
+                    // The pass lives only for the attempt. If `try_run_read` answers `None` the
+                    // pass is already dropped by the time the exclusive path runs, which is what
+                    // keeps that same deadlock out of the write path too.
+                    let attempted = {
+                        match ctx.begin_read(read_slot) {
+                            Some(_pass) => {
+                                try_run_read(&stmt, shared, ctx.bp.clone(), ctx.txn.clone(), session)
+                            }
+                            // A writer is announced. Standing down is correct, not a failure:
+                            // the exclusive path below blocks on the mutex and is what every
+                            // statement did before this line existed.
+                            None => None,
+                        }
+                    };
+                    match attempted {
                         Some(read) => read?,
                         None => {
                             // **The catalog lock, held for exactly one statement.** See

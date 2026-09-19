@@ -70,6 +70,23 @@ pub struct ServerContext {
     /// apart in absolute terms. It is also why this is an epoch mirror and not an `RwLock<Catalog>`:
     /// D49 measured turso collapsing to x0.308 on exactly that shape, in a real engine.
     epoch: std::sync::atomic::AtomicU64,
+    /// Set while an EXCLUSIVE catalog borrow is outstanding.
+    ///
+    /// Half of a two-flag handshake with the per-connection busy slots below. `DROP TABLE` frees
+    /// heap, time-travel, primary and secondary pages **immediately**
+    /// (`Catalog::drop_table`), and once a read stopped taking the outermost lock there was
+    /// nothing left to stop it descending those pages as they were freed. The epoch cannot fix
+    /// that: it is bumped *after* the pages are gone, and a statement already in flight never
+    /// re-reads it.
+    writer_active: std::sync::atomic::AtomicBool,
+    /// One busy slot per live connection, each written only by its owner.
+    ///
+    /// Per-connection rather than a shared reader count on purpose: a count is one word every
+    /// reader RMWs, which is exactly the wall this whole line removed — measured at x0.137 for
+    /// `Arc::clone` and x0.121 for `RwLock::read` against a relaxed load's x7.823
+    /// (`bench/d51_sharedword_probe.txt`). This is the same shape as D44's per-thread touch
+    /// shards, which this project already shipped.
+    readers: Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
     pub bp: Arc<BufferPoolManager>,
     pub txn: Arc<TxnManager>,
     /// **Shared by every connection, deliberately.** A runtime per connection would give each
@@ -94,6 +111,8 @@ impl ServerContext {
         ServerContext {
             catalog: Mutex::new(catalog),
             epoch: std::sync::atomic::AtomicU64::new(e),
+            writer_active: std::sync::atomic::AtomicBool::new(false),
+            readers: Mutex::new(Vec::new()),
             bp,
             txn,
             runtime,
@@ -111,7 +130,67 @@ impl ServerContext {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        CatalogGuard { inner, epoch: &self.epoch }
+        // EVERY exclusive borrow drains the readers, not only the ones that free pages.
+        // Deciding here which statements will free pages would be a second predicate that can
+        // drift from what the executor actually does — the same trap `try_run_read` avoids by
+        // returning `Option` instead of exposing `is_read()`. Draining unconditionally is
+        // strictly stronger and costs nothing when no read is in flight, which is the common
+        // case: the scan is N atomic loads over live connections.
+        self.drain_readers();
+        CatalogGuard { inner, epoch: &self.epoch, writer_active: &self.writer_active }
+    }
+
+    /// Register a connection's busy slot. Called once per connection, never on a statement.
+    pub fn register_reader(&self, slot: Arc<std::sync::atomic::AtomicBool>) {
+        let mut v = match self.readers.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Self-cleaning: a slot only the registry still holds belongs to a connection that has
+        // gone away, so the list cannot grow without bound across a server's life.
+        v.retain(|s| Arc::strong_count(s) > 1);
+        v.push(slot);
+    }
+
+    /// Announce a writer and wait until no reader is inside a shared-path statement.
+    fn drain_readers(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.writer_active.store(true, SeqCst);
+        // Copy the list and release the registry lock BEFORE spinning, so a connection opening
+        // right now is not blocked behind a drain it has nothing to do with.
+        let slots: Vec<Arc<std::sync::atomic::AtomicBool>> = match self.readers.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        for s in slots {
+            while s.load(SeqCst) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Enter a shared-path read, or `None` if a writer is announced.
+    ///
+    /// **`SeqCst` on both sides is what makes this sound**, and it is the whole argument: with a
+    /// single total order over the store here and the load in `drain_readers`, either the writer
+    /// observes this slot busy and waits, or this reader observes `writer_active` and stands
+    /// down. Both can happen; neither can be missed. Relaxed or Acquire/Release would permit the
+    /// store-buffering case where each misses the other, which is precisely a reader descending
+    /// pages a writer is freeing.
+    ///
+    /// Standing down is not a failure: the caller falls back to the exclusive path, which blocks
+    /// on the mutex and is correct. It happens only while DDL is actually in flight.
+    pub fn begin_read<'a>(
+        &self,
+        slot: &'a std::sync::atomic::AtomicBool,
+    ) -> Option<ReadPass<'a>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        slot.store(true, SeqCst);
+        if self.writer_active.load(SeqCst) {
+            slot.store(false, SeqCst);
+            return None;
+        }
+        Some(ReadPass { slot })
     }
 
     /// The catalog for a READ statement, as a per-connection cached snapshot.
@@ -149,6 +228,19 @@ impl ServerContext {
 pub struct CatalogGuard<'a> {
     inner: std::sync::MutexGuard<'a, Catalog>,
     epoch: &'a std::sync::atomic::AtomicU64,
+    writer_active: &'a std::sync::atomic::AtomicBool,
+}
+
+/// Proof that a shared-path read is in flight. Clears its slot on drop, including on a panic or
+/// an early `?`, which is why it is a guard and not a pair of calls.
+pub struct ReadPass<'a> {
+    slot: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ReadPass<'_> {
+    fn drop(&mut self) {
+        self.slot.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl std::ops::Deref for CatalogGuard<'_> {
@@ -169,6 +261,8 @@ impl Drop for CatalogGuard<'_> {
         // Release, paired with the Acquire load in `read_catalog`: a reader that observes the new
         // epoch must also observe everything this statement wrote to the catalog.
         self.epoch.store(self.inner.epoch(), std::sync::atomic::Ordering::Release);
+        // Released after the epoch, so a reader that stands down and retries sees the new one.
+        self.writer_active.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -262,6 +356,9 @@ pub fn handle(mut stream: TcpStream, ctx: &Arc<ServerContext>) -> std::io::Resul
     // No authentication: this is a local demonstration server, and pretending otherwise by
     // sending AuthenticationCleartextPassword and then accepting anything would be worse.
     let mut conn = Connection::new(Session::with_runtime(Arc::clone(&ctx.runtime)));
+    // Registered once, here, rather than on each statement: a per-statement registration would be
+    // a write to shared state on the read path, which is the wall this whole line removed.
+    ctx.register_reader(conn.read_slot());
     for (k, v) in startup_params {
         conn.session_params.apply_startup(&k, &v);
     }
