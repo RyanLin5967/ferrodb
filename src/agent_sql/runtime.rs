@@ -237,15 +237,26 @@ struct Workspace {
     /// has nothing to diff against.
     fork_root: PageId,
     rows: PersistentMap<(u32, u64), RowState>,
-    /// **D57.** How many times a `Present` row was staged under a key that is NOT `row_id_of` of
-    /// its own column 0. On a branch an UPDATE may assign the primary key (trunk refuses it;
-    /// `integration_escrow` relies on the staged row keeping its ORIGINAL key so a PK move cannot
-    /// leave an escrow pool), and after one the read path's probe -- "only the entry for `k` can
-    /// affect `pk = k`" -- is unsound for this workspace. Monotone and conservative: it is
-    /// incremented at the single site that writes `rows`, inherited by a forked child (which
-    /// shares the entries), never decremented, and `visible_rows_where` walks instead of probing
-    /// whenever it is non-zero. A guard on the resulting state, not on the statement that caused it.
-    moved_keys: u64,
+    /// **D57.** How many `Present` rows were staged in a state the read path's probe cannot see
+    /// through. The probe -- "only the overlay entry at `row_id_of(k)` can affect `pk = k`" -- is
+    /// sound only while every staged row (a) sits under the key its own column 0 derives, and
+    /// (b) holds column 0 in the column's DECLARED variant, so that `=` and `row_id_of` agree.
+    /// Both can be false on a branch, and neither is refused there:
+    ///
+    /// * an UPDATE may assign the primary key (trunk refuses it in `execution::update`;
+    ///   `integration_escrow` relies on the staged row KEEPING its original key so a PK move
+    ///   cannot leave an escrow pool), breaking (a);
+    /// * an INSERT/UPDATE stages a literal as the variant it was written in -- `21.0` into an
+    ///   INTEGER column stays `Float`, keyed by the hash of its bits -- because a page-backed
+    ///   branch does not run the tuple encoder's width check (`agent_sql_surface` documents this),
+    ///   breaking (b).
+    ///
+    /// Monotone and conservative: counted at the single site that writes `rows`, inherited by a
+    /// forked child (which shares the entries), never decremented; `visible_rows_where` walks
+    /// instead of probing whenever it is non-zero. A guard on the resulting state, not on the
+    /// statement that caused it -- all three of these were found by a fresh-context review after
+    /// the probe first shipped, and the first fix (a counter for (a) alone) missed (b).
+    unprobeable_rows: u64,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
@@ -974,8 +985,8 @@ impl AgentRuntime {
         // descent of the child's own tree with no parent pointer anywhere to walk. Both are tested
         // directly in `tests/d27_fork_shares_without_leaking.rs`, the second against an ancestor
         // chain abandoned out from under the child.
-        let (rows, base_rows, tables, moved_keys) = match state.workspaces.get(&parent.id) {
-            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone(), p.moved_keys),
+        let (rows, base_rows, tables, unprobeable_rows) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone(), p.unprobeable_rows),
             None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new(), 0),
         };
         let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
@@ -1003,7 +1014,7 @@ impl AgentRuntime {
                 fork_seq,
                 fork_root: record.root_page_id,
                 rows,
-                moved_keys,
+                unprobeable_rows,
                 base_rows,
                 tables,
                 inherited,
@@ -1365,19 +1376,25 @@ impl AgentRuntime {
             //
             // 1. The map is SNAPSHOTTED under the lock — `PersistentMap::clone` is one `Arc`
             //    bump, which is the whole reason that structure exists — and the lock is released
-            //    before any work. Safe because the map is immutable-with-sharing and a session
-            //    cannot write its own workspace concurrently with its own read.
+            //    before any work. What makes that safe is NOT that nobody else writes this
+            //    workspace: another connection can hold the same branch (`AS OF BRANCH` reads a
+            //    live workspace by name, and pgwire is a thread per connection). It is that the
+            //    clone is taken under the lock and the nodes are immutable — `ins` never mutates
+            //    one and `Arc::make_mut` is never used on `rows` — so the snapshot is exactly the
+            //    map at one instant, which is what the walk under the lock also observed. Do not
+            //    hoist the clone out of the lock: that would be a torn read of the root.
             // 2. A predicate with a `pk = literal` conjunct PROBES the one entry that can affect
-            //    the result. Every staged row carries its own primary key in column 0, so any
-            //    other entry fails that conjunct whatever the rest of the predicate says.
+            //    the result, PROVIDED every staged row sits under its own column 0's key in the
+            //    declared variant — `Workspace::unprobeable_rows` counts the rows for which that
+            //    is not so, and the walk is taken while it is non-zero.
             // 3. Every other predicate walks only THIS table's prefix of the key space, which is
             //    the honest floor for a non-key predicate — the same reason the base table needs
             //    an index for one.
             let staged = {
                 let state = self.state.lock().unwrap();
-                state.workspaces.get(&b.id).map(|ws| (ws.rows.clone(), ws.moved_keys))
+                state.workspaces.get(&b.id).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
             };
-            if let Some((staged, moved_keys)) = staged {
+            if let Some((staged, unprobeable_rows)) = staged {
                 let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
                         RowState::Present(v) => {
@@ -1401,8 +1418,9 @@ impl AgentRuntime {
                 };
                 let pk_type = ctx.catalog.get_table(table).map(|e| e.schema.columns[0].data_type.clone());
                 // The probe is sound only while every staged row sits under its own column 0's
-                // key. `moved_keys` says whether that has ever stopped being true here.
-                let probe = if moved_keys == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
+                // key AND holds column 0 in the declared variant; `unprobeable_rows` says whether
+                // either has ever stopped being true here (see `Workspace`).
+                let probe = if unprobeable_rows == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
                 match probe {
                     Some(row) => {
                         if let Some(st) = staged.get(&(tbl.0, row)) {
@@ -1872,7 +1890,7 @@ impl AgentRuntime {
             bound_where.as_ref(),
         )?;
         let touched = staged.len();
-        self.stage_all(branch, tbl, table, staged)?;
+        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
         Ok(touched)
     }
 
@@ -1921,7 +1939,7 @@ impl AgentRuntime {
             )));
         }
         let op = Op::new(tbl, rid, None, OpKind::RowCreate(row.clone()));
-        self.stage(branch, tbl, table, rid, None, RowState::Present(row), vec![op], None)?;
+        self.stage(branch, tbl, table, &schema.columns[0].data_type, rid, None, RowState::Present(row), vec![op], None)?;
         Ok(1)
     }
 
@@ -1978,7 +1996,7 @@ impl AgentRuntime {
             bound_where.as_ref(),
         )?;
         let n = staged.len();
-        self.stage_all(branch, tbl, table, staged)?;
+        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
         Ok(n)
     }
 
@@ -1992,13 +2010,14 @@ impl AgentRuntime {
         branch: BranchId,
         tbl: TableId,
         table: &str,
+        pk_type: &DataType,
         row: RowId,
         before: Option<Vec<Value>>,
         after: RowState,
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
+        self.stage_all(branch, tbl, table, pk_type, vec![Staged { row, before, after, ops, guard }])
     }
 
     // ---- the capability envelope ------------------------------------------------------------
@@ -2077,6 +2096,7 @@ impl AgentRuntime {
         branch: BranchId,
         tbl: TableId,
         table: &str,
+        pk_type: &DataType,
         items: Vec<Staged>,
     ) -> Result<(), FerroError> {
         // ---- decide -------------------------------------------------------------------------
@@ -2190,8 +2210,10 @@ impl AgentRuntime {
                 let key = Workspace::key(tbl, item.row);
                 ws.base_rows.insert_if_absent(key, item.before);
                 if let RowState::Present(v) = &item.after {
-                    if row_id_of(v) != item.row {
-                        ws.moved_keys += 1;
+                    let probeable = row_id_of(v) == item.row
+                        && v.first().is_some_and(|c0| literal_matches(c0, pk_type));
+                    if !probeable {
+                        ws.unprobeable_rows += 1;
                     }
                 }
                 ws.rows.insert(key, item.after.clone());
@@ -5153,7 +5175,7 @@ mod tests {
             // read by `txn_refs_of`, which is why the index survived that change untouched — only
             // this fixture's spelling had to follow.
             rows: PersistentMap::new(),
-            moved_keys: 0,
+            unprobeable_rows: 0,
             base_rows: PersistentMap::new(),
             inherited: inherited.iter().map(|t| TxnId(*t)).collect(),
             tables: PersistentMap::new(),

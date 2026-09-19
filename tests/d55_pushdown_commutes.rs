@@ -137,7 +137,9 @@ fn pushdown_agrees_with_filter_afterwards_on_every_overlay_case() {
     assert!(ids.contains(&1), "case: untouched passing base row -> must be PRESENT");
     assert!(!ids.contains(&12), "case: untouched failing base row (120) -> must be ABSENT");
 
-    // A point predicate on the key too, which is the shape the planner turns into an index probe.
+    // A point predicate on the key too, which is the shape the planner turns into an index probe --
+    // and, since D57, the shape the overlay answers by a single PROBE rather than the walk the
+    // predicate above exercises. These two lines pin the probe path; `v < 100` pins the walk.
     let point = db.pairs("SELECT id, v FROM t WHERE id = 15;", &mut a);
     assert_eq!(point, BTreeSet::from([(15, 50)]), "point lookup must see the STAGED version");
     let gone = db.pairs("SELECT id, v FROM t WHERE id = 3;", &mut a);
