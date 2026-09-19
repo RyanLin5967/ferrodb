@@ -417,10 +417,33 @@ use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, exec
     #[test]
     fn test_cost_secondary_over_primary() {
         let (mut catalog, bp, txn) = setup();
-        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone(), txn);
-        let primary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
-        let secondary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 1, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
+        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone(), txn.clone());
+        let point = |col: usize, catalog: &Catalog| cost(&PhysicalPlan::IndexScan { table: "t".into(), column: col, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, catalog);
+
+        // Without statistics. This used to assert `primary.stats.rows == secondary.stats.rows`,
+        // which pinned the defect D56 removes: the primary key's equality is a FACT (one row,
+        // because column 0 is unique by construction) and the secondary column's is an ESTIMATE
+        // (`DEFAULT_TABLE_ROWS / DEFAULT_DISTINCT`), so they are not equal and must not be.
+        let primary = point(0, &catalog);
+        let secondary = point(1, &catalog);
+        assert_eq!(primary.stats.rows, 1.0, "a unique-key equality is one row, statistics or not");
+        assert!(secondary.stats.rows > primary.stats.rows, "a non-unique column is still an estimate");
+        assert!(secondary.cost > primary.cost);
+
+        // The per-row comparison the old assertion was reaching for, with the confound removed
+        // properly: make `b` unique in the DATA so ANALYZE gives both columns the same distinct
+        // count and both lookups estimate one row. The secondary must STILL cost more, because
+        // each of its matches is a primary lookup on top of the descent.
+        let mut sql = String::new();
+        for i in 0..500 {
+            sql.push_str(&format!("INSERT INTO t VALUES ({i}, {i});"));
+        }
+        exec(&sql, &mut catalog, bp.clone(), txn.clone());
+        exec("ANALYZE t;", &mut catalog, bp, txn);
+        let primary = point(0, &catalog);
+        let secondary = point(1, &catalog);
         assert_eq!(primary.stats.rows, secondary.stats.rows);
+        assert_eq!(primary.stats.rows, 1.0);
         assert!(secondary.cost > primary.cost);
     }
 
