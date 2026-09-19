@@ -81,6 +81,13 @@ fn newest_under(dir: &str) -> Option<std::time::SystemTime> {
         let mut newest = None;
         for e in std::fs::read_dir(p).ok()?.flatten() {
             let path = e.path();
+            // A `src/**/tests_*.rs` file is `#[cfg(test)]` and does not link into an example binary,
+            // so editing one cannot make it stale; counting them fired this guard on a fresh tree
+            // (53 tests, then 11 more in the spellings this walker uses). Enforced by
+            // `lock_order_allowlist::test_only_sources_are_cfg_test_gated`, not assumed.
+            if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")) {
+                continue;
+            }
             let t = if path.is_dir() {
                 walk(&path)
             } else {
