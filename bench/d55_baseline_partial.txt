@@ -1,0 +1,111 @@
+D55-AGENT-READ-PATH — BASELINE (before the pushdown fix)
+========================================================
+[HERE] 2026-09-19, this session, 18-core box, release. Started at 1-min load 5.40 after waiting
+for the post-reboot Spotlight storm (load 35) to pass; the box was in interactive use (Chrome)
+during the run.
+
+⛔ INCOMPLETE BY MY OWN HAND: the run was killed at 33 of 60 points by the `timeout 2400` I
+wrapped it in — 40 minutes, and the staged=4000 half is slow by construction (each point stages
+threads x 4000 rows through the exclusive path). Not a crash, not a guard: a timeout I chose
+too short. What is here is COMPLETE for staged=10 (both arms, 3 rounds, rotated) and PARTIAL for
+staged=4000 (three points of the shared arm, round 0 only). The partial points are not medians
+and are not quoted as results.
+
+THE PREDICTION, AND IT IS WRONG
+-------------------------------
+SCALE-NEXT said: "N agents reading their own branches should stay FLAT ... because AgentRuntime
+holds one Mutex<State>". Measured at staged=10:
+
+  threads   SHARED total_vs_1T   CONTROL total_vs_1T   SHARED abs   CONTROL abs
+        1              1.000                 1.000         1543          1264
+        2              1.923                 2.194         2968          2774
+        4              3.608                 4.411         5568          5576
+        8              6.066                 7.623         9363          9636
+       16              9.273                10.913        14312         13796
+
+The shared arm SCALES to x9.273 and at 16 threads is within 4% of the control that removes every
+shared structure (14312 vs 13796). The state lock is NOT the wall on this path at this workspace
+size. Recorded as a falsified prediction, not defended.
+
+THE REAL WALL, WHICH THE ABSOLUTES POINT AT
+-------------------------------------------
+1543 stmt/s at ONE thread for an agent-session point read, against 50600 for the identical plain
+SELECT in D54 on this box: ~33x slower per statement. src/agent_sql/runtime.rs scan_table builds
+`SELECT * FROM t` with where_clause: None and materialises every row; visible_rows overlays the
+branch; only then does select apply the statement's WHERE. O(table) per agent read, 5000 rows
+here. Same shape as D28 (system views materialise, then filter), at the site every
+branch-per-agent read goes through.
+
+THE WORKSPACE WALK, FROM THE PARTIAL AXIS (NOT A MEDIAN)
+--------------------------------------------------------
+shared 1T at staged=10: 1543 stmt/s.  shared 1T at staged=4000, round 0 only: 973 stmt/s.
+So 4000 staged rows cost roughly 37% at one thread -- visible, secondary to the 5000-row base
+scan, and to be re-measured to completion before anything is decided about
+PersistentMap::range (SCALE-DESIGN D55 option 3).
+
+=================== RAW ===================
+# D55-AGENT-READ-PATH  rows=5000 warmup=300ms measure=1s rounds=3
+# PREDICTION (before the run): the shared arm stays FLAT, because AgentRuntime holds
+# one Mutex<State> and visible_rows walks the whole workspace under it. If it scales
+# anyway, the prediction is wrong and the ledger says so rather than defending it.
+# staged rows per branch: [10, 4000] -- the upper figure is D27's measured 4000.
+
+=== ARM SHARED  (ONE ServerContext)  staged=10 ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 1608 stmt/s (slowest thread 1616)
+#   2T -> 2648 stmt/s (slowest thread 1320)
+#   4T -> 5853 stmt/s (slowest thread 1454)
+#   8T -> 9205 stmt/s (slowest thread 1148)
+#   16T -> 13527 stmt/s (slowest thread 829)
+# round 1 order: 2 4 8 16 1
+#   2T -> 2968 stmt/s (slowest thread 1487)
+#   4T -> 5568 stmt/s (slowest thread 1384)
+#   8T -> 9479 stmt/s (slowest thread 1180)
+#   16T -> 17115 stmt/s (slowest thread 1048)
+#   1T -> 1482 stmt/s (slowest thread 1489)
+# round 2 order: 4 8 16 1 2
+#   4T -> 4975 stmt/s (slowest thread 1240)
+#   8T -> 9363 stmt/s (slowest thread 1171)
+#   16T -> 14312 stmt/s (slowest thread 880)
+#   1T -> 1543 stmt/s (slowest thread 1547)
+#   2T -> 2998 stmt/s (slowest thread 1501)
+
+threads   total_stmt_s   per_thread   total_vs_1T
+      1           1543         1543         1.000
+      2           2968         1484         1.923
+      4           5568         1392         3.608
+      8           9363         1170         6.066
+     16          14312          895         9.273
+
+=== ARM PRIVATE (N ServerContexts) -- the CONTROL  staged=10 ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 1186 stmt/s (slowest thread 1192)
+#   2T -> 2774 stmt/s (slowest thread 1385)
+#   4T -> 5576 stmt/s (slowest thread 1395)
+#   8T -> 9636 stmt/s (slowest thread 1201)
+#   16T -> 13796 stmt/s (slowest thread 841)
+# round 1 order: 2 4 8 16 1
+#   2T -> 2635 stmt/s (slowest thread 1322)
+#   4T -> 5124 stmt/s (slowest thread 1281)
+#   8T -> 9991 stmt/s (slowest thread 1246)
+#   16T -> 16947 stmt/s (slowest thread 985)
+#   1T -> 1573 stmt/s (slowest thread 1581)
+# round 2 order: 4 8 16 1 2
+#   4T -> 5785 stmt/s (slowest thread 1438)
+#   8T -> 9550 stmt/s (slowest thread 1139)
+#   16T -> 12991 stmt/s (slowest thread 795)
+#   1T -> 1264 stmt/s (slowest thread 1266)
+#   2T -> 2908 stmt/s (slowest thread 1453)
+
+threads   total_stmt_s   per_thread   total_vs_1T
+      1           1264         1264         1.000
+      2           2774         1387         2.194
+      4           5576         1394         4.411
+      8           9636         1205         7.623
+     16          13796          862        10.913
+
+=== ARM SHARED  (ONE ServerContext)  staged=4000 ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 973 stmt/s (slowest thread 978)
+#   2T -> 1816 stmt/s (slowest thread 905)
+#   4T -> 3379 stmt/s (slowest thread 835)
