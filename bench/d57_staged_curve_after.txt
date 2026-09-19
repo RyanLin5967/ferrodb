@@ -1,0 +1,143 @@
+D57 — AFTER: agent point-read throughput vs STAGED ROWS, same harness, the probe path (65287c2).
+[HERE] 2026-09-19T03:12:39Z  examples/d56_plan_curve.rs at 145d6c0 (D57 built), D56_ARM=agent
+visible_rows_where (runtime.rs:1305) walks EVERY staged row on the branch under the State mutex
+per read; O(W) shows as ~1/W across this axis. If it is flat, the premise is FALSE and D57 closes
+as NOT JUSTIFIED without building. The 4000 point is D27's measured real workspace size.
+Order: forward, reverse, forward (point-rotation; one arm, so no between-arm bias to cancel).
+
+# round=1 load=6.70 10.13 9.81
+r1  arm=agent  rows=5000  staged=10  analyze=false  median=155256 stmt/s  rounds=[156193, 154810, 155256]
+# round=1 load=6.01 9.75 9.68
+r1  arm=agent  rows=5000  staged=100  analyze=false  median=151410 stmt/s  rounds=[151410, 146695, 154481]
+# round=1 load=5.83 9.46 9.57
+r1  arm=agent  rows=5000  staged=1000  analyze=false  median=150850 stmt/s  rounds=[149427, 152905, 150850]
+# round=1 load=5.32 9.04 9.42
+r1  arm=agent  rows=5000  staged=4000  analyze=false  median=152590 stmt/s  rounds=[147904, 152590, 153755]
+# round=2 load=5.11 8.69 9.28
+r2  arm=agent  rows=5000  staged=4000  analyze=false  median=152441 stmt/s  rounds=[152629, 151066, 152441]
+# round=2 load=6.34 8.68 9.26
+r2  arm=agent  rows=5000  staged=1000  analyze=false  median=152345 stmt/s  rounds=[152345, 149110, 153414]
+# round=2 load=6.23 8.46 9.16
+r2  arm=agent  rows=5000  staged=100  analyze=false  median=146323 stmt/s  rounds=[149427, 146323, 143305]
+# round=2 load=8.58 8.82 9.27
+r2  arm=agent  rows=5000  staged=10  analyze=false  median=144994 stmt/s  rounds=[144994, 141240, 145675]
+# round=3 load=13.50 9.86 9.62
+r3  arm=agent  rows=5000  staged=10  analyze=false  median=153065 stmt/s  rounds=[154728, 153065, 151040]
+# round=3 load=13.10 10.12 9.73
+r3  arm=agent  rows=5000  staged=100  analyze=false  median=153115 stmt/s  rounds=[151205, 153115, 153324]
+# round=3 load=13.27 10.30 9.80
+r3  arm=agent  rows=5000  staged=1000  analyze=false  median=142709 stmt/s  rounds=[140470, 146152, 142709]
+# round=3 load=11.67 10.15 9.76
+r3  arm=agent  rows=5000  staged=4000  analyze=false  median=150306 stmt/s  rounds=[150306, 152689, 146196]
+# DONE 2026-09-19T03:17:25Z load=11.86 10.33 9.84
+# plain reference round=1 load=11.86 10.33 9.84
+p1  arm=plain  rows=5000  staged=10  analyze=false  median=167473 stmt/s  rounds=[167473, 165825, 167604]
+# plain reference round=2 load=10.64 10.19 9.80
+p2  arm=plain  rows=5000  staged=10  analyze=false  median=172515 stmt/s  rounds=[172515, 173475, 171803]
+# plain reference round=3 load=10.03 10.11 9.79
+p3  arm=plain  rows=5000  staged=10  analyze=false  median=169934 stmt/s  rounds=[170626, 169934, 168185]
+# 16-thread falsifier: D55 quick sweep, shared arm, staged=4000 (d55_agent_read_scaling at 145d6c0)
+# D55-AGENT-READ-PATH  rows=5000 warmup=300ms measure=1s rounds=3
+# PREDICTION (before the run): the shared arm stays FLAT, because AgentRuntime holds
+# one Mutex<State> and visible_rows walks the whole workspace under it. If it scales
+# anyway, the prediction is wrong and the ledger says so rather than defending it.
+# staged rows per branch: [10, 4000] -- the upper figure is D27's measured 4000.
+# QUICK: shared arm, staged=4000 only
+
+=== ARM SHARED  (ONE ServerContext)  staged=4000 ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 147176 stmt/s (slowest thread 147914)
+#   2T -> 231866 stmt/s (slowest thread 116343)
+#   4T -> 371205 stmt/s (slowest thread 92202)
+#   8T -> 361705 stmt/s (slowest thread 44842)
+#   16T -> 419608 stmt/s (slowest thread 25501)
+# round 1 order: 2 4 8 16 1
+#   2T -> 230187 stmt/s (slowest thread 114969)
+#   4T -> 278590 stmt/s (slowest thread 68961)
+#   8T -> 362462 stmt/s (slowest thread 45053)
+#   16T -> 399170 stmt/s (slowest thread 24891)
+#   1T -> 142609 stmt/s (slowest thread 142975)
+# round 2 order: 4 8 16 1 2
+#   4T -> 383562 stmt/s (slowest thread 95258)
+#   8T -> 422773 stmt/s (slowest thread 52513)
+#   16T -> 416067 stmt/s (slowest thread 25639)
+#   1T -> 157044 stmt/s (slowest thread 157831)
+#   2T -> 229289 stmt/s (slowest thread 114835)
+
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         147176       147176         1.000
+      2         230187       115094         1.564
+      4         371205        92801         2.522
+      8         362462        45308         2.463
+     16         416067        26004         2.827
+
+threads   shared_vs_1T   shared_abs
+      1          1.000       147176
+      2          1.564       230187
+      4          2.522       371205
+      8          2.463       362462
+     16          2.827       416067
+# ALL DONE 2026-09-19T03:29:22Z load=4.34 5.96 7.61
+
+# CONTROL for the 16-thread point: same binary (145d6c0), staged=10, run immediately after, load=4.08 5.88 7.57
+# round 0 order: 1 2 4 8 16
+#   1T -> 158800 stmt/s (slowest thread 159384)
+#   2T -> 230717 stmt/s (slowest thread 115744)
+#   4T -> 385981 stmt/s (slowest thread 96783)
+#   8T -> 367833 stmt/s (slowest thread 45257)
+#   16T -> 421429 stmt/s (slowest thread 26286)
+# round 1 order: 2 4 8 16 1
+#   2T -> 229474 stmt/s (slowest thread 115103)
+#   4T -> 378095 stmt/s (slowest thread 94441)
+#   8T -> 354298 stmt/s (slowest thread 44048)
+#   16T -> 415557 stmt/s (slowest thread 25961)
+#   1T -> 155038 stmt/s (slowest thread 155815)
+# round 2 order: 4 8 16 1 2
+#   4T -> 374510 stmt/s (slowest thread 94014)
+#   8T -> 418465 stmt/s (slowest thread 52072)
+#   16T -> 394400 stmt/s (slowest thread 24536)
+#   1T -> 154622 stmt/s (slowest thread 154885)
+#   2T -> 228834 stmt/s (slowest thread 114934)
+threads   total_stmt_s   per_thread   total_vs_1T
+threads   shared_vs_1T   shared_abs
+      1          1.000       155038
+      2          1.480       229474
+      4          2.439       378095
+      8          2.373       367833
+     16          2.680       415557
+# CONTROL DONE 2026-09-19T03:34:13Z load=4.61 5.20 6.76
+
+=== REDUCTION (median of three rounds; 12/12 agent cells + 3 plain + two 16-thread sweeps) ===
+plain reference at rows=5000, staged=10: median 169934 stmt/s (167473 / 172515 / 169934)
+
+staged   after (r1,r2,r3)                median    before    after/before   after/plain
+    10   [155256, 144994, 153065]        153065    151521    x1.01          0.901
+   100   [151410, 146323, 153115]        151410    133799    x1.13          0.891
+  1000   [150850, 152345, 142709]        150850     56507    x2.67          0.888
+  4000   [152590, 152441, 150306]        152441     18985    x8.03          0.897
+
+FALSIFIER 1 (pre-registered: flat across 10 -> 4000 within ~10%, and within ~15% of the plain arm):
+PASSED. 4000/10 = 0.996 -- flat to within 0.4%, against 0.125 before. Every point sits at 0.89-0.90
+of the plain arm, i.e. the agent path's remaining cost over a plain read is ~10% and no longer
+depends on the workspace at all. The x8.03 at 4000 is the whole O(W) term, removed.
+
+FALSIFIER 2 (pre-registered: the 16-thread shared arm must not fall back toward flat, because
+contention x W is gone with the snapshot):
+PASSED, and the control is the point. Same binary, back to back, load 4.3-5.2 throughout:
+
+  threads     staged=4000 (total stmt/s, vs 1T)     staged=10 CONTROL (total stmt/s, vs 1T)
+        1     147176   1.000                        155038   1.000
+        2     230187   1.564                        229474   1.480
+        4     371205   2.522                        378095   2.439
+        8     362462   2.463                        367833   2.373
+       16     416067   2.827                        415557   2.680
+
+The two columns are the same curve: at 16 threads a branch holding 4000 staged rows and one holding
+10 now read at 416067 vs 415557 stmt/s -- a 0.1% difference. Workspace size has stopped being a
+variable in the read path, which is the claim. (The 4x -> 8x dip is present in BOTH arms and is the
+machine, not the change; D55's harness shows it too.)
+
+⚠ NOT a claim: the 2.8x at 16 threads is NOT a scaling result -- the shared arm's ceiling is a
+different wall (D54's territory), it is measured here only to show that staged size no longer moves
+it. And these are ferrodb's own numbers: the SHAPE that transfers is "consult the write set by the
+key the base access used, never scan it" -- true of any engine with an overlay.
