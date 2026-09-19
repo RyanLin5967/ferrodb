@@ -1,0 +1,2 @@
+D56-statsless-b: mode=per-target rc=0 passed=2105 failed=0 build_errors=0 head=444f88d log=/Users/idide/wt/artie-research/verify-out-d56b/suite-D56-statsless-b.log
+D56-statsless-b: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d56b/suite-D56-statsless-b.go.log
