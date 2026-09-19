@@ -99,6 +99,26 @@ fn allocated_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+
+/// Free bytes on the filesystem holding `path`, via `df -k`.
+///
+/// **A shared-machine guard, not a tuning knob — D61.** The byte budget below refuses to let this
+/// run's own database grow past a size; it says nothing about what else is on the disk. Another
+/// session on this machine tripped a disk monitor twice on 2026-09-19 while this repo held three
+/// worktree targets, and an ENOSPC in someone else's lane reads exactly like a real test failure.
+/// So the run also stops when the DISK is low, whatever its own database weighs.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df").arg("-k").arg(path).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().nth(1)?;
+    let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb * 1024)
+}
+
+/// Stop if the filesystem drops below this, whatever this run's own budget says. See
+/// [`free_bytes`]. 20 GiB leaves a working margin for every other lane on a shared machine.
+const FREE_FLOOR: u64 = 20 * (1u64 << 30);
+
 fn main() {
     let checkpoints: Vec<usize> = std::env::args()
         .nth(1)
@@ -192,6 +212,19 @@ fn main() {
         if data >= budget {
             stopped_early = Some((done, data));
             break;
+        }
+        // The disk, not just this run's share of it. See `free_bytes`.
+        if let Some(free) = free_bytes(&main_path) {
+            if free < FREE_FLOOR {
+                println!(
+                    "  STOPPING: {:.1} GiB free, floor is {:.0} GiB. Not this run's budget -- the \
+                     DISK. Reported as a stop, not a result.",
+                    free as f64 / (1u64 << 30) as f64,
+                    FREE_FLOOR as f64 / (1u64 << 30) as f64,
+                );
+                stopped_early = Some((done, data));
+                break;
+            }
         }
     }
 
