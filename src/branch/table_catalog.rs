@@ -40,6 +40,49 @@ use crate::storage::index::BPlusTreeManager;
 /// Header payload: `next_id` then `epoch`, both big-endian.
 const HEADER_BYTES: usize = 16;
 
+/// A branch record read straight from the RECORD span, with its unbounded fields still empty.
+///
+/// **Exists so that writing one back cannot compile.** `set_root` and `renew_lease` used to read a
+/// record this way, change one field and hand it to `write_record` — which makes the arena span
+/// match the record it is given, so both silently deleted every arena the branch owned. The reaper
+/// frees precisely `record.arenas`, so a reaped branch returned nothing: a permanent page leak,
+/// growing with every abandoned agent.
+///
+/// An audit found no other instance. That is the wrong kind of comfort — an audit is a snapshot and
+/// the next read-modify-write has nothing stopping it. The standing rule is to make the dangerous
+/// state unrepresentable rather than documented, so the whole record is reachable only through
+/// [`TableBranchCatalog::hydrate`], and `write_record` takes a `&BranchRecord`.
+///
+/// Deliberately **no** `Deref` and no `into_inner`: either would hand back the footgun.
+pub struct CoreRecord(BranchRecord);
+
+impl CoreRecord {
+    /// Fields that live IN the core record, for callers that need one and should not pay to
+    /// hydrate. If a caller needs something not here, it needs the whole record — say so by
+    /// hydrating rather than by widening this list.
+    pub fn state(&self) -> BranchState {
+        self.0.state
+    }
+    pub fn generation(&self) -> u32 {
+        self.0.generation
+    }
+    pub fn branch_id(&self) -> BranchId {
+        self.0.branch_id
+    }
+    pub fn lease_deadline(&self) -> LeaseDeadline {
+        self.0.lease_deadline
+    }
+    /// Whether this record belongs in the DEADLINE index. Core-only by construction: it reads
+    /// `state` and trunk-ness and nothing else.
+    pub fn in_deadline_index(&self) -> bool {
+        self.0.state == BranchState::Live && !self.0.branch_id.is_trunk()
+    }
+    /// The generation guard, which reads only core fields.
+    pub fn check_readable(&self, branch: BranchId) -> Result<(), BranchError> {
+        self.0.check_readable(branch)
+    }
+}
+
 pub struct TableBranchCatalog {
     tree: BPlusTreeManager<Vec<u8>, Vec<u8>>,
     /// Serialises **logical** operations, each of which touches several keys.
@@ -453,7 +496,8 @@ impl TableBranchCatalog {
     /// record that came back empty would delete every arena on the next write. `live_children` is
     /// deliberately left EMPTY — it is unbounded, and every caller was moved onto the indexed
     /// queries first so that nothing reads it.
-    fn hydrate(&self, mut rec: BranchRecord) -> Result<BranchRecord, FerroError> {
+    fn hydrate(&self, core: CoreRecord) -> Result<BranchRecord, FerroError> {
+        let mut rec = core.0;
         let (lo, hi) = keys::arenas_of(rec.branch_id.id);
         for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
             let (k, _) = entry?;
@@ -472,9 +516,9 @@ impl TableBranchCatalog {
         }
     }
 
-    fn core(&self, id: u64) -> Result<Option<BranchRecord>, FerroError> {
+    fn core(&self, id: u64) -> Result<Option<CoreRecord>, FerroError> {
         match self.tree.search(&keys::record(id))? {
-            Some(b) => Ok(Some(BranchRecord::deserialize_core(&b)?)),
+            Some(b) => Ok(Some(CoreRecord(BranchRecord::deserialize_core(&b)?))),
             None => Ok(None),
         }
     }
@@ -486,12 +530,18 @@ impl TableBranchCatalog {
     fn write_record(
         &self,
         rec: &BranchRecord,
-        old: Option<&BranchRecord>,
+        // `&CoreRecord`, not `&BranchRecord`: the previous record is used ONLY to remove the index
+        // entries derived from it, and those derive from core fields. Taking the whole record here
+        // would invite a caller to pass an un-hydrated one, which is the bug this type prevents.
+        old: Option<&CoreRecord>,
     ) -> Result<(), FerroError> {
         if let Some(prev) = old {
-            self.remove_if_present(&keys::state(prev.state.as_u8(), prev.branch_id.id))?;
-            if Self::in_deadline_index(prev) {
-                self.remove_if_present(&keys::deadline(prev.lease_deadline.0, prev.branch_id.id))?;
+            self.remove_if_present(&keys::state(prev.state().as_u8(), prev.branch_id().id))?;
+            if prev.in_deadline_index() {
+                self.remove_if_present(&keys::deadline(
+                    prev.lease_deadline().0,
+                    prev.branch_id().id,
+                ))?;
             }
         }
         self.upsert(keys::record(rec.branch_id.id), rec.serialize_core())?;
@@ -554,7 +604,7 @@ impl TableBranchCatalog {
         }
         let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
         match self.core(child_id)? {
-            Some(rec) if rec.state != BranchState::Reaped => {
+            Some(rec) if rec.state() != BranchState::Reaped => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
             // Reaped, or gone entirely: a stale hint. Not a live child.
@@ -616,8 +666,13 @@ impl BranchCatalog for TableBranchCatalog {
         let fork_epoch = self.next_epoch();
         let _g = self.logical.lock().unwrap();
 
-        let parent_rec = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
-        parent_rec.check_readable(parent)?;
+        // HYDRATED, and this is the one place the falsifier expected not to be. `fork_child`
+        // inherits the parent's `envelope`, which lives in its own key span, so a core record
+        // would silently hand every child an ungoverned envelope. The type system surfaced it;
+        // the previous code read a core record here and was wrong in exactly that way.
+        let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
+        parent_core.check_readable(parent)?;
+        let parent_rec = self.hydrate(parent_core)?;
 
         // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
         // generation comes from the slot's history, never from zero — a reused id whose generation
@@ -633,7 +688,7 @@ impl BranchCatalog for TableBranchCatalog {
         let (child_num, generation) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
-                let slot_gen = self.core(id)?.map(|r| r.generation).unwrap_or(0);
+                let slot_gen = self.core(id)?.map(|r| r.generation()).unwrap_or(0);
                 (id, slot_gen)
             }
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0),
@@ -694,7 +749,7 @@ impl BranchCatalog for TableBranchCatalog {
                 // The index holds only Live non-trunk branches, so this re-check is belt and
                 // braces against an index entry that outlived its record rather than a filter the
                 // query depends on.
-                if Self::in_deadline_index(&rec) && rec.lease_deadline.is_expired_at(now_millis) {
+                if rec.in_deadline_index() && rec.lease_deadline().is_expired_at(now_millis) {
                     out.push(self.hydrate(rec)?);
                 }
             }
