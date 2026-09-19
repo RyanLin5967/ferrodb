@@ -314,8 +314,11 @@ fn main() {
     }
 
     if std::env::var("D55_QUICK").is_ok() {
-        println!("# QUICK: shared arm, staged=10 only");
-        let a = run_arm(&dir, true, 10, "SHARED  (ONE ServerContext)");
+        // D55_QUICK_STAGED (default 10): D57's 16-thread falsifier runs this at 4000, D27's
+        // measured real workspace, where the walk used to sit inside the State mutex.
+        let staged: usize = std::env::var("D55_QUICK_STAGED").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        println!("# QUICK: shared arm, staged={staged} only");
+        let a = run_arm(&dir, true, staged, "SHARED  (ONE ServerContext)");
         println!();
         println!("threads   shared_vs_1T   shared_abs");
         for (i, &t) in POINTS.iter().enumerate() {
