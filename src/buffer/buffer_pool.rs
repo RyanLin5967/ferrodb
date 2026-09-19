@@ -283,6 +283,7 @@ use crate::buffer::arc::ArcResult;
 use crate::buffer::page_table::PageTable;
 use crate::buffer::touch_queue::TouchQueue;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64};
 
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
@@ -309,8 +310,76 @@ enum Evicted {
     Gone,
 }
 
+/// **D58 — a seqlock'd copy of the frame's page for readers that take nothing.**
+///
+/// The profile of 16 agent readers (`bench/d58_profile_16T_read_window.sample.txt`) put 47k of
+/// ~80k thread-samples in the page-latch table, and D51 measured why no latch can fix it: a
+/// shared-word RMW at 16 threads is the ×0.12 class, a relaxed load the ×7.8 class. So the point-
+/// read descent must WRITE NOTHING SHARED — no latch, no pin, no frame lock — and read a page as
+/// pure loads. It cannot read `frame.data` that way: a writer holding the frame's `RwLock` writes
+/// it non-atomically, and a concurrent plain read of the same bytes is a data race in Rust's model
+/// however carefully fenced. Hence the shadow: a second copy of the page held as atomics, refreshed
+/// by the frame's write guard on drop under a seqlock version, and read by relaxed loads. Optimistic
+/// readers never touch `frame.data`; locked readers never touch the shadow; there is no mixed access.
+///
+/// Orderings are `crossbeam`'s `SeqLock`: the refresher stores an odd version then a `Release`
+/// fence, stores the bytes, and publishes the even version with `Release`; the reader loads the
+/// version with `Acquire`, copies, fences `Acquire`, and re-loads. A version that moved, or that
+/// was odd, means the copy may be torn and the reader retries or falls back to the latched path.
+/// Eviction and reload are frame writes, so a frame reused for another page is a version change
+/// too — and `label` says which page the shadow currently is, so a stale page-table hint is caught.
+///
+/// The cost: 4 KB per frame (4 MB for the pool) and one 4 KB copy per page WRITE, against the
+/// WAL fsync that write already pays. Nothing on the read.
+pub struct FrameShadow {
+    /// Even while stable, odd while being refreshed. Only the frame's write guard moves it.
+    version: AtomicU64,
+    /// The page this shadow is a copy of, or `NO_PAGE`.
+    label: AtomicU32,
+    bytes: Box<[AtomicU64]>,
+}
+
+const NO_PAGE: u32 = u32::MAX;
+const SHADOW_WORDS: usize = PAGE_SIZE / 8;
+
+impl FrameShadow {
+    fn new() -> Self {
+        FrameShadow {
+            version: AtomicU64::new(0),
+            label: AtomicU32::new(NO_PAGE),
+            bytes: (0..SHADOW_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Publish `frame` into the shadow. Called ONLY by [`FrameWriteGuard`]'s drop, while the
+    /// frame's write lock is still held, so two refreshes of one frame cannot interleave.
+    fn refresh(&self, frame: &Frame) {
+        let v = self.version.load(Ordering::Relaxed);
+        debug_assert!(v & 1 == 0, "a shadow refresh found the version odd: two refreshers");
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (i, w) in self.bytes.iter().enumerate() {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&frame.data[i * 8..i * 8 + 8]);
+            w.store(u64::from_ne_bytes(word), Ordering::Relaxed);
+        }
+        self.label.store(frame.page_id.unwrap_or(NO_PAGE), Ordering::Relaxed);
+        self.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// A page read that took nothing: the bytes, and the `(frame, version)` stamp that
+/// [`BufferPoolManager::shadow_still`] re-checks.
+pub struct OptimisticPage {
+    pub data: [u8; PAGE_SIZE],
+    pub frame_i: usize,
+    pub version: u64,
+}
+
 pub struct BufferPoolManager {
     pub frames: Vec<RwLock<Frame>>,
+    /// One [`FrameShadow`] per frame, index-aligned with `frames`.
+    shadows: Vec<FrameShadow>,
     /// `page_id -> frame index`. A `HashMap` under an `RwLock`, **plus a lock-free mirror in front
     /// of it** that the resident hit path resolves through instead. See
     /// [`crate::buffer::page_table`] for why, and for why the map is private to that type.
@@ -487,11 +556,49 @@ impl<G: DerefMut<Target = Frame>> DerefMut for FrameGuard<G> {
     }
 }
 
+/// The frame write guard: [`FrameGuard`] over the write lock, plus the shadow refresh on drop.
+/// See [`BufferPoolManager::frame_write`] and [`FrameShadow`].
+pub struct FrameWriteGuard<'a> {
+    // `Option` so `drop` can refresh the shadow while the lock is still held and then release it.
+    guard: Option<RwLockWriteGuard<'a, Frame>>,
+    shadow: &'a FrameShadow,
+    touched: bool,
+    _pool: PoolSection,
+}
+
+impl Deref for FrameWriteGuard<'_> {
+    type Target = Frame;
+    fn deref(&self) -> &Frame {
+        self.guard.as_ref().expect("frame write guard used after drop")
+    }
+}
+
+impl DerefMut for FrameWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Frame {
+        self.touched = true;
+        self.guard.as_mut().expect("frame write guard used after drop")
+    }
+}
+
+impl Drop for FrameWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.touched {
+            if let Some(frame) = self.guard.as_ref() {
+                self.shadow.refresh(frame);
+            }
+        }
+        // Release the frame lock before the pool section closes (field order does the rest).
+        self.guard = None;
+    }
+}
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
+        let shadows: Vec<FrameShadow> = (0..MAX_BUFFER_POOL_PAGES).map(|_| FrameShadow::new()).collect();
         BufferPoolManager {
             frames,
+            shadows,
             page_table: PageTable::new(MAX_BUFFER_POOL_PAGES * MIRROR_SLOTS_PER_FRAME),
             disk_manager,
             arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)),
@@ -544,10 +651,53 @@ impl BufferPoolManager {
         FrameGuard { guard: self.frames[frame_i].read().unwrap(), _pool }
     }
 
-    /// Write-lock a frame, tracked for lock ordering. See [`FrameGuard`].
-    pub fn frame_write(&self, frame_i: usize) -> FrameGuard<RwLockWriteGuard<'_, Frame>> {
+    /// Write-lock a frame, tracked for lock ordering, **and the only way a frame may be written.**
+    ///
+    /// The guard refreshes the frame's [`FrameShadow`] on drop if it was dereferenced mutably, so
+    /// an optimistic reader sees every write. A raw `frames[i].write()` bypasses that and leaves
+    /// the shadow stale for ever — `tests/lock_order_allowlist.rs` refuses one anywhere outside
+    /// this file, and this file has none.
+    pub fn frame_write(&self, frame_i: usize) -> FrameWriteGuard<'_> {
         let _pool = enter_pool();
-        FrameGuard { guard: self.frames[frame_i].write().unwrap(), _pool }
+        FrameWriteGuard {
+            guard: Some(self.frames[frame_i].write().unwrap()),
+            shadow: &self.shadows[frame_i],
+            touched: false,
+            _pool,
+        }
+    }
+
+    /// **D58.** Read `page_id` taking nothing shared — no latch, no pin, no lock: a page-table
+    /// hint, a version load, a copy by relaxed loads, a version re-load. `None` means the page is
+    /// not resident under that hint, or a refresh overlapped the copy; the caller retries or falls
+    /// back to [`BufferPoolManager::fetch_page`], which is always correct. The returned stamp lets
+    /// the caller ask later whether the page it read is still the page in that frame.
+    pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
+        let frame_i = self.page_table.lookup(page_id)?;
+        let shadow = &self.shadows[frame_i];
+        let v1 = shadow.version.load(Ordering::Acquire);
+        if v1 & 1 == 1 {
+            return None;
+        }
+        if shadow.label.load(Ordering::Relaxed) != page_id {
+            return None;
+        }
+        let mut data = [0u8; PAGE_SIZE];
+        for (i, w) in shadow.bytes.iter().enumerate() {
+            data[i * 8..i * 8 + 8].copy_from_slice(&w.load(Ordering::Relaxed).to_ne_bytes());
+        }
+        fence(Ordering::Acquire);
+        if shadow.version.load(Ordering::Relaxed) != v1 {
+            return None;
+        }
+        Some(OptimisticPage { data, frame_i, version: v1 })
+    }
+
+    /// Is the shadow in `frame_i` still at `version` — i.e. has the page a reader copied been
+    /// neither rewritten nor evicted since?
+    pub fn shadow_still(&self, frame_i: usize, version: u64) -> bool {
+        fence(Ordering::Acquire);
+        self.shadows[frame_i].version.load(Ordering::Relaxed) == version
     }
 
     /// Return the frame holding `page_id`, faulting it in if it is not resident, and pin it.
@@ -789,7 +939,7 @@ impl BufferPoolManager {
         // Bytes first, mapping second. A reader that reached this frame through the page table must
         // never find the label already updated and the bytes not yet — that is serving another
         // page's contents, which is the one failure a storage engine cannot apologise for.
-        self.frames[frame_i].write().unwrap().data = data;
+        self.frame_write(frame_i).data = data;
         self.page_table.write().unwrap().insert(page_id, frame_i);
         Ok(Some(frame_i))
     }
@@ -811,7 +961,7 @@ impl BufferPoolManager {
         let start = self.free_hint.load(Ordering::Relaxed) % n;
         for step in 0..n {
             let i = (start + step) % n;
-            let mut frame = self.frames[i].write().unwrap();
+            let mut frame = self.frame_write(i);
             if frame.page_id.is_none() {
                 frame.page_id = Some(incoming);
                 frame.pin_counter = AtomicU16::new(1);
@@ -834,7 +984,7 @@ impl BufferPoolManager {
         // depends on the CALLER having opened it stops holding the moment someone adds a caller.
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -897,7 +1047,7 @@ impl BufferPoolManager {
         // have been fetched, dirtied and unpinned again in between; `dirty` is checked as well as
         // the pin because that whole cycle can complete and leave the count back at zero.
         let mut pt = self.page_table.write().unwrap();
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         if frame.page_id != Some(victim) {
             return Ok(Evicted::Gone);
         }
@@ -1107,7 +1257,7 @@ impl BufferPoolManager {
         pt.remove(&page_id);
         drop(pt);
 
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -1140,7 +1290,7 @@ impl BufferPoolManager {
         if let Some(frame_i) = resident {
             pt.remove(&page_id);
             drop(pt);
-            let mut frame = self.frames[frame_i].write().unwrap();
+            let mut frame = self.frame_write(frame_i);
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
@@ -1215,7 +1365,7 @@ impl BufferPoolManager {
         let resident: Vec<(u32, usize)> = pt.iter().map(|(id, i)| (*id, *i)).collect();
         pt.clear();
         for (page_id, frame_i) in resident {
-            let mut frame = self.frames[frame_i].write().unwrap();
+            let mut frame = self.frame_write(frame_i);
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
@@ -1297,7 +1447,7 @@ mod tests {
 
         // Dirty the page and do NOT flush: memory is now the only copy of this byte.
         let frame_i = bp.fetch_page(page).unwrap();
-        bp.frames[frame_i].write().unwrap().data[100] = 0xAB;
+        bp.frame_write(frame_i).data[100] = 0xAB;
         bp.unpin_page(page, true);
 
         let err = bp.delete_page(page);
@@ -1326,7 +1476,7 @@ mod tests {
         let (bp, page, path) = pool_with_arena_floor("free");
 
         let frame_i = bp.fetch_page(page).unwrap();
-        bp.frames[frame_i].write().unwrap().data[100] = 0xCD;
+        bp.frame_write(frame_i).data[100] = 0xCD;
         bp.unpin_page(page, true);
 
         let err = bp.free_page(page);

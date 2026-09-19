@@ -366,7 +366,7 @@ impl TableBranchCatalog {
         }
         let frame_i = self.pool.fetch_page(header_page)?;
         {
-            let mut f = self.pool.frames[frame_i].write().unwrap();
+            let mut f = self.pool.frame_write(frame_i);
             f.data = [0u8; crate::storage::disk_manager::PAGE_SIZE];
             f.data[0..4].copy_from_slice(&HEADER_PAGE_MAGIC.to_be_bytes());
             f.data[4..8].copy_from_slice(&root.to_be_bytes());

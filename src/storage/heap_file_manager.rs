@@ -22,7 +22,7 @@ impl HeapFileManager {
         let dir_page_id = buffer_pool_manager.new_page()?;
         buffer_pool_manager.unpin_page(dir_page_id, false);
         let frame_i = buffer_pool_manager.fetch_page(dir_page_id)?;
-        let mut frame = buffer_pool_manager.frames[frame_i].write().unwrap();
+        let mut frame = buffer_pool_manager.frame_write(frame_i);
         let empty_dir = PageDirectory::new(dir_page_id);
         frame.data = empty_dir.serialize();
         drop(frame);
@@ -69,7 +69,7 @@ impl HeapFileManager {
         let new_page_id = self.buffer_pool_manager.new_page()?;
         self.buffer_pool_manager.unpin_page(new_page_id, false);
         let frame_i = self.buffer_pool_manager.fetch_page(new_page_id)?;
-        let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+        let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let empty_page = Page::empty(new_page_id);
         frame.data = empty_page.serialize()?;
         drop(frame);
@@ -153,7 +153,7 @@ impl HeapFileManager {
     /// Write `tuple` into `page_id`, which the caller has already established can hold it.
     fn insert_into(&self, page_id: u32, tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(page_id)?;
-        let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+        let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let mut page = Page::deserialize(frame.data)?;
         let tuple_bytes = tuple.data.clone();
         let slot_num = page.insert(tuple)?;
@@ -171,7 +171,7 @@ impl HeapFileManager {
     // fetch page, try in place page update first, if page returns NotEnoughSpace, delete from this page and insert elsewhere
     pub fn update(&self, record_id: RecordId, new_tuple: Tuple) -> Result<RecordId, FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
-        let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+        let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let mut page = Page::deserialize(frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         let new_bytes = new_tuple.data.clone();
@@ -238,7 +238,7 @@ impl HeapFileManager {
                 let dest = self.find_or_make_page(new_bytes.len())?;
 
                 let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
-                let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+                let mut frame = self.buffer_pool_manager.frame_write(frame_i);
                 let mut page = Page::deserialize(frame.data)?;
                 page.delete(record_id.slot_num as usize)?;
                 if let Some(txn) = &self.txn {
@@ -271,7 +271,7 @@ impl HeapFileManager {
     // fetches page, mark slot dead, unpin
     pub fn delete(&self, record_id: RecordId) -> Result<(), FerroError> {
         let frame_i = self.buffer_pool_manager.fetch_page(record_id.page_id)?;
-        let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+        let mut frame = self.buffer_pool_manager.frame_write(frame_i);
         let mut page = Page::deserialize(frame.data)?;
         let old_bytes = page.read(record_id.slot_num as usize)?.data;
         page.delete(record_id.slot_num as usize)?;
@@ -315,7 +315,7 @@ impl HeapFileManager {
         let mut dir_page_id = self.first_directory_page_id;
         loop {
             let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
-            let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+            let mut frame = self.buffer_pool_manager.frame_write(frame_i);
             let mut dir = PageDirectory::deserialize(frame.data);
 
             match dir.add_entry(new_page_id, free_space) {
@@ -332,7 +332,7 @@ impl HeapFileManager {
 
                         dir.next_page_directory = new_dir_id;                   // dir is a local copy, still valid
                         {
-                            let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+                            let mut frame = self.buffer_pool_manager.frame_write(frame_i);
                             frame.data = dir.serialize();
                         }
                         self.buffer_pool_manager.unpin_page(dir_page_id, true);
@@ -340,7 +340,7 @@ impl HeapFileManager {
                         let mut new_dir = PageDirectory::new(new_dir_id);
                         new_dir.add_entry(new_page_id, free_space)?;
                         {
-                            let mut new_frame = self.buffer_pool_manager.frames[new_frame_i].write().unwrap();
+                            let mut new_frame = self.buffer_pool_manager.frame_write(new_frame_i);
                             new_frame.data = new_dir.serialize();
                         }
                         self.buffer_pool_manager.unpin_page(new_dir_id, true);
@@ -360,7 +360,7 @@ impl HeapFileManager {
 
         loop {
             let frame_i = self.buffer_pool_manager.fetch_page(dir_page_id)?;
-            let mut frame = self.buffer_pool_manager.frames[frame_i].write().unwrap();
+            let mut frame = self.buffer_pool_manager.frame_write(frame_i);
             let mut dir = PageDirectory::deserialize(frame.data);
 
             match dir.update_entry(target_page_id, new_free_space) {

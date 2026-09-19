@@ -310,7 +310,7 @@ mod tests {
         for i in 0..pages {
             let id = p.bp.new_page().unwrap();
             let frame_i = p.bp.fetch_page(id).unwrap();
-            p.bp.frames[frame_i].write().unwrap().data[0] = i as u8 + 1;
+            p.bp.frame_write(frame_i).data[0] = i as u8 + 1;
             p.bp.unpin_page(id, true);
         }
         p.bp.flush_all().unwrap();

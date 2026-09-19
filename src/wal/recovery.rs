@@ -138,7 +138,7 @@ fn redo_one(bp: &Arc<BufferPoolManager>, lsn: u64, kind: &RecKind) -> Result<(),
         _ => return Ok(())
     };
     let frame_i = bp.fetch_page(page_id)?;
-    let mut frame = bp.frames[frame_i].write().unwrap();
+    let mut frame = bp.frame_write(frame_i);
     let stored_id = u32::from_be_bytes(frame.data[1..5].try_into().unwrap());
     let mut page = if stored_id != page_id {
         Page::empty(page_id)

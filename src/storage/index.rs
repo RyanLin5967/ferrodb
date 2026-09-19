@@ -660,7 +660,7 @@ mod tests {
         let root_id = tree.root_page_id.load(Ordering::Relaxed);
 
         let frame_i = tree.buffer_pool.fetch_page(root_id).unwrap();
-        let mut frame = tree.buffer_pool.frames[frame_i].write().unwrap();
+        let mut frame = tree.buffer_pool.frame_write(frame_i);
         let mut leaf = BPlusTreeLeafPage::<Value, Value>::deserialize(frame.data).unwrap();
         let key = Value::Integer(69);
         let val = Value::Integer(6767);

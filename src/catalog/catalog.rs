@@ -46,7 +46,7 @@ impl Catalog {
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let page_id = buffer_pool.new_page()?; // = 1 on a fresh DB
         let frame_i = buffer_pool.fetch_page(page_id)?;
-        let mut frame = buffer_pool.frames[frame_i].write().unwrap();
+        let mut frame = buffer_pool.frame_write(frame_i);
         let page = CatalogPage::new(page_id);
         frame.data = page.serialize()?;
         drop(frame);
@@ -421,7 +421,7 @@ impl Catalog {
                     // accept all-zeroes, which would let a genuinely corrupt page through.
                     let frame_i = self.buffer_pool.fetch_page(new_id)?;
                     {
-                        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+                        let mut frame = self.buffer_pool.frame_write(frame_i);
                         frame.data = CatalogPage::new(new_id).serialize()?;
                     }
                     self.buffer_pool.unpin_page(new_id, true);
@@ -435,7 +435,7 @@ impl Catalog {
             let next = page.next_catalog_page;
 
             {
-                let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+                let mut frame = self.buffer_pool.frame_write(frame_i);
                 frame.data = page.serialize()?;
             }
             self.buffer_pool.unpin_page(curr_page_id, true);
