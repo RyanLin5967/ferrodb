@@ -151,6 +151,13 @@ fn build(dir: &std::path::Path, n: usize) -> Server {
     for i in 1..=ROWS {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut cache, &slot);
     }
+    // D55_ANALYZE=1 is D56's CEILING ARM, not a speedup: with statistics the planner already chose
+    // the index (`bench/d55_explain_before_after_analyze.txt`), so this arm measures the best this
+    // harness can do on the plan D56 is trying to reach WITHOUT an operator running a maintenance
+    // command. D56 is right only if the un-ANALYZEd number reaches this one.
+    if std::env::var("D55_ANALYZE").is_ok() {
+        exec(&s, "ANALYZE t;", &mut sess, &mut cache, &slot);
+    }
     s
 }
 
