@@ -49,7 +49,7 @@ use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::executor::{run, try_run_read, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
@@ -89,26 +89,49 @@ fn build(dir: &std::path::Path, n: usize) -> Server {
     let runtime = Arc::new(AgentRuntime::with_catalog(cat as Arc<dyn BranchCatalog>));
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
-    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut Session::new());
+    let mut seed_cache = None;
+    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut Session::new(), &mut seed_cache);
     let mut sess = Session::new();
     for i in 1..=ROWS {
-        exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess);
+        exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut seed_cache);
     }
     s
 }
 
-/// One statement through the server's own path: parse, then `run` under the catalog mutex.
-fn exec(s: &Server, sql: &str, sess: &mut Session) -> usize {
+/// One statement through the server's own path.
+///
+/// ⚠ **This must mirror `pgwire::extended`'s dispatch exactly.** If the harness kept taking the
+/// exclusive lock while the server had stopped, arm A would measure the OLD path and every number
+/// below would be a lie about the change. So it does what a connection does: try the shared read
+/// path against a per-"connection" cached snapshot, and fall back to the exclusive lock only for
+/// statements `try_run_read` refuses.
+fn exec(
+    s: &Server,
+    sql: &str,
+    sess: &mut Session,
+    cache: &mut Option<(u64, Arc<Catalog>)>,
+) -> usize {
     let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
     let mut parser = Parser::new(tokens);
     let mut stmts = parser.parse();
     assert!(parser.errors.is_empty(), "parse failed for {sql}: {:?}", parser.errors);
     let stmt = stmts.remove(0);
-    // THE LOCK UNDER TEST. `ServerContext::catalog()` is what a connection thread calls, and the
-    // guard derefs to the `&mut Catalog` that `run` demands. Taken outermost, held for the whole
-    // statement, exactly as src/pgwire/mod.rs documents.
-    let mut cat = s.ctx.catalog();
-    match run(stmt, &mut cat, s.bp.clone(), s.txn.clone(), sess) {
+    // The shared read path first: one relaxed load of the epoch, then a plain `&Catalog`.
+    let outcome = {
+        let shared = s.ctx.read_catalog(cache);
+        match try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), sess) {
+            Some(read) => read,
+            None => {
+                // THE LOCK. Still taken for anything that needs the catalog exclusively, which is
+                // what makes the write path's behaviour unchanged.
+                let mut cat = s.ctx.catalog();
+                let o = run(stmt, &mut cat, s.bp.clone(), s.txn.clone(), sess);
+                drop(cat);
+                o
+            }
+        }
+    };
+    match outcome {
         Ok(Outcome::Rows(r)) => r.len(),
         Ok(Outcome::Table(t)) => t.rows.len(),
         Ok(_) => 0,
@@ -132,14 +155,16 @@ fn sweep_point(servers: &[Arc<Server>], shared: bool, threads: usize) -> (f64, u
         handles.push(std::thread::spawn(move || {
             let sql = format!("SELECT v FROM t WHERE id = {key};");
             let mut sess = Session::new();
+            // One cache per thread, because one connection has one cache.
+            let mut cache: Option<(u64, Arc<Catalog>)> = None;
             let t0 = Instant::now();
             while t0.elapsed() < WARMUP {
-                exec(&srv, &sql, &mut sess);
+                exec(&srv, &sql, &mut sess, &mut cache);
             }
             start.wait();
             let (mut n, mut r) = (0u64, 0u64);
             while !stop.load(Ordering::Relaxed) {
-                r += exec(&srv, &sql, &mut sess) as u64;
+                r += exec(&srv, &sql, &mut sess, &mut cache) as u64;
                 n += 1;
             }
             total.fetch_add(n, Ordering::Relaxed);

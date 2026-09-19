@@ -62,6 +62,14 @@ pub struct ServerContext {
     /// `executor::run` takes `&mut Catalog`, and a `MutexGuard` derefs to exactly that, so the
     /// executor's signature is unchanged by this. See [`serve`] for the lock ordering rule.
     pub catalog: Mutex<Catalog>,
+    /// A lock-free mirror of `catalog.epoch()`, for readers.
+    ///
+    /// **One relaxed-order load is the entire per-statement cost of the shared read path.** That
+    /// is not a guess: `bench/d51_sharedword_probe.txt` measured a shared relaxed load scaling to
+    /// x7.823 over 16 threads while `RwLock::read` reached x0.121 and `Arc::clone` x0.137 — 490x
+    /// apart in absolute terms. It is also why this is an epoch mirror and not an `RwLock<Catalog>`:
+    /// D49 measured turso collapsing to x0.308 on exactly that shape, in a real engine.
+    epoch: std::sync::atomic::AtomicU64,
     pub bp: Arc<BufferPoolManager>,
     pub txn: Arc<TxnManager>,
     /// **Shared by every connection, deliberately.** A runtime per connection would give each
@@ -82,7 +90,14 @@ impl ServerContext {
         txn: Arc<TxnManager>,
         runtime: Arc<crate::agent_sql::runtime::AgentRuntime>,
     ) -> Self {
-        ServerContext { catalog: Mutex::new(catalog), bp, txn, runtime }
+        let e = catalog.epoch();
+        ServerContext {
+            catalog: Mutex::new(catalog),
+            epoch: std::sync::atomic::AtomicU64::new(e),
+            bp,
+            txn,
+            runtime,
+        }
     }
 
     /// The catalog, for the duration of one statement.
@@ -91,11 +106,69 @@ impl ServerContext {
     /// this lock would otherwise take every *other* connection down with it on their next
     /// statement. The data behind the lock is the on-disk catalog, which is reloadable, so the
     /// surviving connections are better served by continuing.
-    pub fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
-        match self.catalog.lock() {
+    pub fn catalog(&self) -> CatalogGuard<'_> {
+        let inner = match self.catalog.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
+        };
+        CatalogGuard { inner, epoch: &self.epoch }
+    }
+
+    /// The catalog for a READ statement, as a per-connection cached snapshot.
+    ///
+    /// The common path is **one relaxed load and a comparison** — no lock, and no `Arc::clone`,
+    /// which is why this returns a borrow out of the caller's cache rather than an `Arc`: cloning
+    /// an `Arc` per statement is an atomic RMW on one refcount, measured at x0.137 over 16 threads
+    /// (`bench/d51_sharedword_probe.txt`), which would have reintroduced the wall one level down.
+    ///
+    /// A snapshot may be stale about a tree's recorded `primary_index_root` and that is safe:
+    /// since D53 the root cell is SHARED, so `plan::open_table` descends from the live cell. What
+    /// a stale snapshot would get wrong is the SCHEMA, and the epoch moves on exactly that.
+    pub fn read_catalog<'c>(&self, cache: &'c mut Option<(u64, Arc<Catalog>)>) -> &'c Catalog {
+        let now = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let stale = match cache.as_ref() {
+            Some((cached, _)) => *cached != now,
+            None => true,
+        };
+        if stale {
+            // Taking the exclusive lock here is correct and rare: only on first use and after a
+            // schema change. It is the one place the read path can block, and it cannot livelock
+            // because `now` is re-read on the next statement, not spun on.
+            let snapshot = Arc::new(self.catalog().clone());
+            *cache = Some((now, snapshot));
         }
+        &cache.as_ref().expect("just populated").1
+    }
+}
+
+/// An exclusive catalog borrow that republishes the schema epoch when it is released.
+///
+/// Correct by construction rather than by discipline: every exclusive acquisition goes through
+/// `ServerContext::catalog()`, so there is no path that can mutate the catalog and forget to tell
+/// the readers. A caller that took the lock and changed nothing simply stores the same number.
+pub struct CatalogGuard<'a> {
+    inner: std::sync::MutexGuard<'a, Catalog>,
+    epoch: &'a std::sync::atomic::AtomicU64,
+}
+
+impl std::ops::Deref for CatalogGuard<'_> {
+    type Target = Catalog;
+    fn deref(&self) -> &Catalog {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for CatalogGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Catalog {
+        &mut self.inner
+    }
+}
+
+impl Drop for CatalogGuard<'_> {
+    fn drop(&mut self) {
+        // Release, paired with the Acquire load in `read_catalog`: a reader that observes the new
+        // epoch must also observe everything this statement wrote to the catalog.
+        self.epoch.store(self.inner.epoch(), std::sync::atomic::Ordering::Release);
     }
 }
 

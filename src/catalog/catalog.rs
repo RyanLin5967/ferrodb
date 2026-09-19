@@ -12,6 +12,7 @@ use crate::storage::index_fulltext::{indexed_text, post_tokens};
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
+#[derive(Clone)]
 pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
     pub buffer_pool: Arc<BufferPoolManager>,
@@ -30,6 +31,15 @@ pub struct Catalog {
     /// Keyed `(table, None)` for the primary index and `(table, Some(column))` for a secondary or
     /// full-text one.
     roots: HashMap<(String, Option<String>), Arc<AtomicU32>>,
+    /// Bumped by every change to the SCHEMA — and deliberately **not** by a root move.
+    ///
+    /// A reader caches a snapshot of this catalog and re-takes it only when this number changes.
+    /// Before D53 a root move had to invalidate every snapshot, because `primary_index_root` was
+    /// the authoritative pointer a reader descended from; now the registry above hands out a
+    /// SHARED cell that a split updates in place, so a snapshot whose recorded root is stale is
+    /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
+    /// write statement no longer invalidates every reader's cache.
+    epoch: u64,
 }
 
 impl Catalog {
@@ -41,11 +51,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), roots: HashMap::new()})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), roots: HashMap::new(), epoch: 0})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), roots: HashMap::new()};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), roots: HashMap::new(), epoch: 0};
         catalog.load()?;
         Ok(catalog)
     }
@@ -56,6 +66,19 @@ impl Catalog {
     /// `&mut self` paths, so a reader holding only `&Catalog` does a plain hash lookup.
     pub fn root_cell(&self, table: &str, column: Option<&str>) -> Option<Arc<AtomicU32>> {
         self.roots.get(&(table.to_string(), column.map(|c| c.to_string()))).cloned()
+    }
+
+    /// The schema epoch. A reader compares this with one relaxed load and re-snapshots only when
+    /// it moves. See the field's own doc for why a root move does not move it.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Bump the schema epoch from another module in this crate (the ALTER path lives in
+    /// `catalog::alter`). `pub(crate)` on purpose: nothing outside the catalog may invalidate
+    /// every reader's snapshot.
+    pub(crate) fn epoch_bump(&mut self) {
+        self.epoch += 1;
     }
 
     /// Ensure every tree named in `tables` has a shared root cell.
@@ -125,8 +148,10 @@ impl Catalog {
         };
         self.tables.insert(name, entry);
         self.persist()?;
-        // The set of trees changed, so seed (or retire) their shared root cells.
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -195,8 +220,10 @@ impl Catalog {
         entry.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
         self.persist()?;
-        // The set of trees changed, so seed (or retire) their shared root cells.
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -257,8 +284,10 @@ impl Catalog {
         entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
         self.persist()?;
-        // The set of trees changed, so seed (or retire) their shared root cells.
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -302,8 +331,10 @@ impl Catalog {
         self.tables.remove(name);
         self.stats.remove(name);
         self.persist()?;
-        // The set of trees changed, so seed (or retire) their shared root cells.
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
         self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -449,6 +480,8 @@ impl Catalog {
         }
         // Seed the shared root cells from the records just loaded.
         self.sync_root_cells();
+        // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.
+        self.epoch += 1;
         Ok(())
     }
 
@@ -481,6 +514,8 @@ impl Catalog {
             ColumnStats {distinct: vals.len(), nulls: nulls[i], min, max}
         }).collect();
         self.stats.insert(table.to_string(), TableStats { row_count, columns});
+        // Stats feed the planner, so a reader's cached snapshot must be told.
+        self.epoch += 1;
         Ok(())
     }
 

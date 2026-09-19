@@ -693,6 +693,9 @@ impl Catalog {
             .cloned()
             .ok_or_else(|| FerroError::Internal(format!("a plan for '{table}' held no shape")))?;
         self.finish(&table, new_schema, primary_root_now, carried)?;
+        // ALTER changed the schema, so every cached reader snapshot is stale. Root moves do NOT
+        // bump this (D53 made the root cell shared); a column change must.
+        self.epoch_bump();
         Ok(shapes[1..].iter().map(shape_of).collect())
     }
 
