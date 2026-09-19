@@ -84,18 +84,6 @@ pub struct BPlusTreeManager<K, V> {
     pub marker: PhantomData<(K, V)>
 }
 
-/// The latches a writer holds while it modifies one leaf on the fast path.
-///
-/// Both fields exist only to be dropped at the right moment: `parent` is what stops the leaf being
-/// split while `leaf` is what stops it being written. Named rather than `_`-prefixed tuple members
-/// because the *parent* one is the non-obvious half of the protocol.
-struct LeafWriteLatch<'a> {
-    #[allow(dead_code)]
-    parent: Option<PageReadGuard<'a>>,
-    #[allow(dead_code)]
-    leaf: PageWriteGuard<'a>,
-}
-
 impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeManager<K,V> {
 
     pub fn new(root_page_id: AtomicU32, buffer_pool: Arc<BufferPoolManager>) -> Self{
@@ -227,7 +215,11 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     ///
     /// When the leaf IS the root there is no parent, and the only thing that can reshape it is a
     /// root split — which changes `root_page_id`, so that is re-checked instead.
-    fn latch_leaf_for_write(&self, key: &K) -> Result<(u32, LeafWriteLatch<'_>), FerroError> {
+    ///
+    /// Returns the leaf's write guard alone. The parent's is dropped before returning: it is
+    /// needed only until the leaf latch is in hand, and holding it longer would block every
+    /// splitter under that parent for the whole of this insert.
+    fn latch_leaf_for_write(&self, key: &K) -> Result<(u32, PageWriteGuard<'_>), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
             let mut parent: Option<PageReadGuard<'_>> = None;
@@ -250,14 +242,19 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
                     }
                 }
             };
-            // Release the leaf's READ latch, keep the parent's, and take the leaf's WRITE latch.
+            // Release the leaf's READ latch, KEEP the parent's, and take the leaf's WRITE latch.
+            // The parent latch covers exactly this gap and not one instruction more: once the leaf
+            // is write-latched, a splitter needs that same latch and is excluded by it, so the
+            // parent is released immediately below rather than held for the whole modification.
+            // Fire-checked - see bench/d23_fire_check.txt, BREAK B.
             drop(guard);
             let leaf = self.latches().write(leaf_id);
             if parent.is_none() && self.root_page_id.load(Ordering::Acquire) != leaf_id {
                 // The root was a leaf and has since split. Nothing written; start again.
                 continue;
             }
-            return Ok((leaf_id, LeafWriteLatch { parent, leaf }));
+            drop(parent);
+            return Ok((leaf_id, leaf));
         }
     }
 
