@@ -226,7 +226,8 @@ fn siblings_forked_from_one_parent_cannot_see_each_other() {
 /// Invariant 2: a read answers from the branch's OWN workspace, never by walking up to an
 /// ancestor's.
 ///
-/// The chain is built to `MAX_BRANCH_DEPTH`, the deepest the runtime allows.
+/// The chain is built far past where the old depth cap stood — there is no deepest chain since
+/// D60 — because a read that consulted ancestors would show at 64 levels where 8 might hide it.
 /// Every ancestor is abandoned, which removes its workspace from the runtime entirely
 /// (`seal` -> `state.workspaces.remove`). If a read consulted the parent chain, the deepest
 /// child's inherited rows would vanish with them. They must not.

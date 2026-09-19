@@ -676,7 +676,7 @@ impl TableBranchCatalog {
             // fork time, which is the grandparent's root at *that* epoch.
             //
             // ⛔ **COST, STATED CORRECTLY — an earlier version of this comment said "O(1) in N"
-            // and that was WRONG.** Recursion DEPTH is bounded by `MAX_BRANCH_DEPTH = 8`, but the
+            // and that was WRONG.** Recursion depth WAS bounded by the cap D60 removed, but the
             // WORK is not: `has_live_children` scans a node's whole CHILD span and recurses into
             // every REAPED child, so this explores the reaped subtree breadth-first with an early
             // exit on the first live descendant. A parent with 10^6 reaped children and one live

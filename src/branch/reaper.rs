@@ -169,6 +169,12 @@ impl TwoTierReaper {
     /// Remove this branch's fork epoch from its parent's live-children array. This is the single
     /// event that can make a parked page reclaimable, which is why `reap` always follows it with
     /// a `drain_pending`.
+    /// **Iterative since D60.** This walked strictly up the parent chain by calling itself, and
+    /// its termination argument was the chain's length being "capped at `MAX_BRANCH_DEPTH`" —
+    /// a cap D60 removed. Three fresh-context reviewers found it in the same pass: the recursion
+    /// in `table_catalog::has_live_children` was fixed and this one, which the cap bounded in
+    /// exactly the same way, was not. A chain of reaped ancestors is precisely what the cascade
+    /// below walks, and precisely what MCTS pruning produces.
     fn detach_from_parent(&self, rec: &BranchRecord) -> Result<(), FerroError> {
         // **D16 — DO NOT DETACH A BRANCH THAT STILL HAS LIVE CHILDREN.**
         //
@@ -182,31 +188,33 @@ impl TwoTierReaper {
         // Reproduced single-threaded and deterministically in `tests/s18_transitive_visibility.rs`.
         // This is the operation MCTS performs -- pruning an interior node -- so a flat fanout
         // never exercises it, which is why every benchmark here missed it.
-        if self.catalog.has_live_children(rec.branch_id.id)? {
-            return Ok(());
-        }
-        let Some(parent) = rec.parent_id else { return Ok(()) };
-        // One call rather than get/mutate/put. The old shape silently did nothing against any
-        // catalog that keeps the live set in an index instead of inside the record - see
-        // `BranchCatalog::detach_child`.
-        self.catalog.detach_child(parent.id, rec.fork_epoch)?;
-
-        // CASCADE. The parent may itself be a reaped branch that was pinned open only by the
-        // child just removed. Without this the pin is permanent: the grandparent would keep
-        // seeing a live child for ever and its pages could never be reclaimed -- trading a
-        // correctness bug for an unbounded space leak, which is not a trade worth making.
+        // CASCADE, as a loop. The parent may itself be a reaped branch that was pinned open only
+        // by the child just removed. Without following that up, the pin is permanent: the
+        // grandparent would keep seeing a live child for ever and its pages could never be
+        // reclaimed -- trading a correctness bug for an unbounded space leak.
         //
-        // Terminates because each step moves strictly up the parent chain, whose length is capped
-        // at `MAX_BRANCH_DEPTH`. Note the STEPS are bounded (<= 8); the WORK per step is not --
-        // each one asks `has_live_children`, which scans a CHILD span and recurses into reaped
-        // children. See the cost note in `table_catalog.rs::live_child_at`, which corrects an
-        // earlier "O(1) in N" claim of mine that was simply wrong.
-        if let Ok(prec) = self.catalog.get_raw(parent.id) {
-            if prec.state == BranchState::Reaped {
-                self.detach_from_parent(&prec)?;
+        // **Terminates because each step moves strictly up the parent chain**, and a parent id is
+        // written once at fork and never changed, so the chain cannot contain a cycle. The STEPS
+        // are now bounded by the chain's length rather than by a constant (D60 removed the cap);
+        // the WORK per step was never bounded -- each asks `has_live_children`, which scans a
+        // child span and explores reaped children. See the cost note in
+        // `table_catalog.rs::child_liveness`.
+        let mut cur = rec.clone();
+        loop {
+            if self.catalog.has_live_children(cur.branch_id.id)? {
+                return Ok(());
+            }
+            let Some(parent) = cur.parent_id else { return Ok(()) };
+            // One call rather than get/mutate/put. The old shape silently did nothing against any
+            // catalog that keeps the live set in an index instead of inside the record - see
+            // `BranchCatalog::detach_child`.
+            self.catalog.detach_child(parent.id, cur.fork_epoch)?;
+
+            match self.catalog.get_raw(parent.id) {
+                Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
+                _ => return Ok(()),
             }
         }
-        Ok(())
     }
 
     /// Catalog descents the extent sweep has made since this reaper was built.
@@ -406,7 +414,7 @@ impl TwoTierReaper {
     /// deliberately refuses to grow an extent: its error says "ask `arena_for` for a fresh extent"
     /// and nothing here ever did. A tree larger than `ARENA_EXTENT_PAGES` (256 pages, ~1MB)
     /// therefore could not be collapsed at all -- and since `collapse` is the only escape from
-    /// `MAX_BRANCH_DEPTH`, the ninth fork of any database over ~1MiB was a dead end.
+    /// the depth cap D60 removed, the ninth fork of any database over ~1MiB was a dead end.
     ///
     /// `arena_for` is what every other page allocator in the engine already uses (`cow_page`, all
     /// four B+tree split paths): it returns the branch's current extent while it has room and
@@ -1640,7 +1648,7 @@ mod tests {
     /// `arena_for` for a fresh extent" — so the copy died the moment the materialised tree
     /// crossed `ARENA_EXTENT_PAGES` (256 pages, ~1MB at 4KB pages).
     ///
-    /// That is not a corner: `collapse` is the ONLY escape from `MAX_BRANCH_DEPTH`, so the ninth
+    /// That was not a corner while the depth cap stood: `collapse` was its only escape, so the ninth
     /// fork of any database over ~1MiB was a dead end — the fork is refused, and the one operation
     /// that clears the refusal cannot run. Every existing collapse test copies a 1–3 page tree,
     /// which is why the whole suite stayed green through it.

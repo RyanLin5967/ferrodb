@@ -377,6 +377,12 @@ pub trait Reaper: Send + Sync {
     fn drain_pending(&self) -> Result<u32, FerroError>;
 
     /// Materialise a branch's visible state to a fresh root and re-parent it to trunk, resetting
-    /// depth to 1. Invoked when a fork would exceed `MAX_BRANCH_DEPTH`.
+    /// depth to 1.
+    ///
+    /// **Nothing invokes it — D60.** It was documented as what happens "when a fork would exceed
+    /// `MAX_BRANCH_DEPTH`", but that cap never had a production caller for this, and the cap is
+    /// gone: fork and read are flat across depth (`bench/d60_depth_premise.txt`). It remains a
+    /// legitimate operation — materialising a chain's tree shortens reclamation work — and a
+    /// caller that wants it must ask for it.
     fn collapse(&self, branch: BranchId) -> Result<BranchRecord, FerroError>;
 }

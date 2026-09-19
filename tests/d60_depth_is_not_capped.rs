@@ -106,6 +106,33 @@ fn a_chain_far_past_the_old_cap_forks_and_still_reads_what_the_root_wrote() {
         Outcome::Rows(r) => assert_eq!(r[0][0], Value::Integer(900001), "level 1's write is not inherited"),
         _ => panic!("expected rows"),
     }
+
+    // **Isolation, which every assertion above would pass without.** A review pointed out that
+    // this test never looked outside the chain: an implementation with no branch isolation at all
+    // — every write landing on trunk — satisfies "the leaf sees everything". So: trunk must see
+    // NONE of the 64 levels' writes, and a sibling forked from trunk must not either.
+    let mut trunk = Session::with_runtime(db.runtime.clone());
+    for level in [1usize, DEPTH / 2, DEPTH] {
+        match db.exec(&format!("SELECT v FROM t WHERE id = {level};"), &mut trunk) {
+            Outcome::Rows(r) => assert_eq!(
+                r[0][0],
+                Value::Integer((level * 10) as i32),
+                "trunk sees level {level}'s write: the chain is not isolated from main"
+            ),
+            _ => panic!("expected rows"),
+        }
+    }
+    let sibling = db.runtime.begin_session("sibling", Some("s1"), BranchId::TRUNK).unwrap();
+    let mut sib = Session::with_runtime(db.runtime.clone());
+    sib.agent = Some(sibling);
+    match db.exec(&format!("SELECT v FROM t WHERE id = {DEPTH};"), &mut sib) {
+        Outcome::Rows(r) => assert_eq!(
+            r[0][0],
+            Value::Integer((DEPTH * 10) as i32),
+            "a sibling of the chain's root sees the chain's writes"
+        ),
+        _ => panic!("expected rows"),
+    }
 }
 
 /// D16's rule — a reaped interior node with a live descendant is a PIN — over a chain far longer
@@ -191,6 +218,174 @@ fn a_core_record_written_with_a_one_byte_depth_still_loads() {
     let wide = BranchRecord::deserialize_core(&r.serialize_core()).expect("round trip");
     assert_eq!(wide.depth(), 100_000);
 
-    // A length that is neither is still refused, rather than being read as one of them.
-    assert!(BranchRecord::deserialize_core(&current[..CORE_BYTES - 1]).is_err());
+    // A length that is neither is refused rather than read as one of them. 53 bytes is the
+    // interesting case and the one a review asked for: it is one byte short of the new record and
+    // two long for the old, i.e. exactly the shape a half-migrated writer would produce.
+    for short_by in [1usize, 2] {
+        assert!(
+            BranchRecord::deserialize_core(&current[..CORE_BYTES - short_by]).is_err(),
+            "a record {short_by} byte(s) short of the current core was accepted"
+        );
+    }
+    // And one byte longer than the current core, which no writer produces either.
+    let mut too_long = current.clone();
+    too_long.push(0);
+    assert!(BranchRecord::deserialize_core(&too_long).is_err(), "an over-long core was accepted");
+}
+
+/// **A FULL record written by a pre-D60 build must decode exactly — and D60's first version broke
+/// this while its checksum still passed.**
+///
+/// `depth` sits in the middle of the variable-length record, before `arena_len`, `child_len` and
+/// the envelope. Writing it as four bytes shifted every one of those. A fresh-context review
+/// traced the result byte by byte: a depth-3 branch decoded as depth 50,331,648, the arena count
+/// came from bytes that were not it, and `child_len` was read out of the CHECKSUM — so the record
+/// either failed with a bogus "truncated" error or drove a `Vec::with_capacity` sized from noise
+/// (8.86 GB for a branch owning 900 arenas, an allocation abort rather than an error). The CRC
+/// covers the body's bytes, which were unchanged, so it could not catch any of it.
+///
+/// That format is reachable: `LogBranchCatalog::replay` reads it, and the CLI and pgserver reach
+/// it through `TableBranchCatalog::default_for_database`, the one-time migration of a legacy
+/// `{db}.branches` log — a file that by construction only an older build wrote.
+///
+/// The fix is the module's own additive discipline: the byte stays where it was, and the exact
+/// depth is appended after every field an older build knows. This test builds the old bytes.
+#[test]
+fn a_full_record_written_before_the_depth_widened_still_decodes() {
+    fn old_bytes(r: &BranchRecord) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(&r.branch_id.id.to_be_bytes());
+        b.extend_from_slice(&r.branch_id.generation.to_be_bytes());
+        b.extend_from_slice(&r.generation.to_be_bytes());
+        match r.parent_id {
+            Some(p) => {
+                b.push(1);
+                b.extend_from_slice(&p.id.to_be_bytes());
+                b.extend_from_slice(&p.generation.to_be_bytes());
+            }
+            None => {
+                b.push(0);
+                b.extend_from_slice(&0u64.to_be_bytes());
+                b.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+        b.extend_from_slice(&r.fork_epoch.0.to_be_bytes());
+        b.extend_from_slice(&r.root_page_id.to_be_bytes());
+        b.extend_from_slice(&r.lease_deadline.0.to_be_bytes());
+        b.push(r.state.as_u8());
+        b.push(r.depth as u8); // ONE byte: the whole point
+        b.extend_from_slice(&(r.arenas.len() as u32).to_be_bytes());
+        for a in &r.arenas {
+            b.extend_from_slice(&a.0.to_be_bytes());
+        }
+        b.extend_from_slice(&(r.live_children.len() as u32).to_be_bytes());
+        for c in &r.live_children {
+            b.extend_from_slice(&c.0.to_be_bytes());
+        }
+        b.push(0); // envelope tag: none. Old builds that had envelopes wrote this too.
+        let crc = ferrodb::wal::log::crc32(&b);
+        b.extend_from_slice(&crc.to_be_bytes());
+        b
+    }
+
+    // The two shapes the review named: a plain child, and one owning arenas and live children —
+    // the second is where a shifted `arena_len` turned into a multi-gigabyte allocation.
+    let mut plain = BranchRecord::trunk(1, LeaseDeadline(77));
+    plain.parent_id = Some(BranchId::new(4, 0));
+    plain.fork_epoch = Epoch(9);
+    plain.depth = 3;
+
+    let mut heavy = plain.clone();
+    heavy.depth = 8;
+    heavy.arenas = (1..=900).map(ferrodb::branch::types::ArenaId).collect();
+    heavy.live_children = (1..=17).map(Epoch).collect();
+
+    for (name, r) in [("plain", &plain), ("with arenas and children", &heavy)] {
+        let decoded = BranchRecord::deserialize(&old_bytes(r))
+            .unwrap_or_else(|e| panic!("a pre-D60 {name} record did not load: {e}"));
+        assert_eq!(decoded.depth, r.depth, "{name}: depth misread");
+        assert_eq!(decoded.arenas.len(), r.arenas.len(), "{name}: arena count misread");
+        assert_eq!(decoded.live_children, r.live_children, "{name}: live children misread");
+        assert_eq!(decoded.branch_id, r.branch_id);
+        assert_eq!(decoded.parent_id, r.parent_id);
+        assert_eq!(decoded.lease_deadline, r.lease_deadline);
+    }
+
+    // And today's format round-trips a depth no byte could hold.
+    let mut deep = plain.clone();
+    deep.depth = 100_000;
+    let back = BranchRecord::deserialize(&deep.serialize()).expect("round trip");
+    assert_eq!(back.depth, 100_000, "the full record cannot carry a depth past a byte");
+    // An old READER of that record sees the saturated byte rather than nonsense: byte at the
+    // offset it has always been at, value clamped, everything after it where it expects.
+    let wire = deep.serialize();
+    assert_eq!(wire[50], u8::MAX, "the compatibility byte is not where an older build reads it");
+}
+
+/// **The REAPER down a deep chain — the path the test above does not take.**
+///
+/// `reclamation_walks_a_long_reaped_chain_without_recursing_per_level` asks the catalog directly.
+/// `TwoTierReaper::detach_from_parent` has its own walk up the parent chain, and its termination
+/// argument was, verbatim, "whose length is capped at `MAX_BRANCH_DEPTH`" — the cap D60 deleted.
+/// It was still recursive; three fresh-context reviewers found it in one pass, and no test here
+/// could have, because none of them ran a reap over a deep chain. This one does.
+#[test]
+fn the_reaper_cascades_up_a_deep_chain_of_reaped_ancestors() {
+    use ferrodb::branch::arena::ArenaPageStore;
+    use ferrodb::branch::reaper::TwoTierReaper;
+    use ferrodb::branch::Reaper;
+    use ferrodb::storage::disk_manager::DiskManager as Dm;
+
+    // Same sizing argument as the catalog test: double the depth at which the recursive form was
+    // measured to die (500 survives, 1,000 stack-overflows).
+    const DEPTH: usize = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
+        .open(dir.path().join("reap.db")).unwrap();
+    let pool = Arc::new(BufferPoolManager::new(Arc::new(Dm::new(file).unwrap())));
+    let catalog: Arc<dyn BranchCatalog> =
+        Arc::new(TableBranchCatalog::open_sidecar(&dir.path().join("reap.branchcat"), 1).unwrap());
+    let base = pool.disk_manager.high_water().unwrap();
+    let store = Arc::new(ArenaPageStore::new(pool, Arc::clone(&catalog), base).unwrap());
+    let reaper = TwoTierReaper::new(Arc::clone(&catalog), Arc::clone(&store));
+
+    let mut chain = Vec::with_capacity(DEPTH);
+    let mut cur = BranchId::TRUNK;
+    for level in 1..=DEPTH {
+        cur = catalog
+            .fork(cur, LeaseDeadline::from_now(600_000))
+            .unwrap_or_else(|e| panic!("fork at depth {level} refused: {e}"))
+            .branch_id;
+        chain.push(cur);
+    }
+
+    // Reap top-down: every level but the last finds its own children still live, so it is marked
+    // Reaped and stays attached. The LAST reap then has to cascade through all 1,999 reaped
+    // ancestors above it in one call — which is the walk under test.
+    //
+    // **Run on a 512 KB stack, deliberately.** The recursive form does not overflow at 2,000 —
+    // measured: it survives 2,000 on a normal test stack and dies at 12,000 — and a 12,000-level
+    // chain costs minutes to build, which is not a price every suite run should pay to prove
+    // this. A small stack amplifies the hazard the way oversubscription amplifies a race: the
+    // iterative walk uses O(1) stack and does not care, the recursive one dies. Measured both
+    // ways before this was written.
+    let worker = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            for (i, b) in chain.iter().enumerate() {
+                reaper
+                    .reap(*b)
+                    .unwrap_or_else(|e| panic!("reap of level {} failed: {e}", i + 1));
+            }
+        })
+        .expect("spawn");
+    worker.join().expect("the reap cascade died — a stack overflow aborts, so a failure here is a panic");
+
+    // Everything is gone, and trunk is no longer pinned by any of it — which is what the cascade
+    // exists to make true.
+    assert!(
+        !catalog.has_live_children(BranchId::TRUNK.id).unwrap(),
+        "after reaping all {DEPTH} levels, trunk still reads as having a live child: the cascade \
+         stopped short"
+    );
 }

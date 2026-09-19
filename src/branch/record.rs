@@ -448,7 +448,19 @@ impl BranchRecord {
         b.extend_from_slice(&self.root_page_id.to_be_bytes());
         b.extend_from_slice(&self.lease_deadline.0.to_be_bytes());
         b.push(self.state.as_u8());
-        b.extend_from_slice(&self.depth.to_be_bytes());
+        // **The depth byte stays exactly where it has always been, and the exact value is
+        // APPENDED at the tail.** D60 widened `depth` to `u32` and first wrote it here, four
+        // bytes in the MIDDLE of a variable-length record — so every field after it shifted, and
+        // a record written by an older build decoded with a huge depth, a wrong arena count and
+        // a `Vec::with_capacity` sized from the checksum's bytes, all while its CRC still passed.
+        // A fresh-context review traced it byte by byte through the legacy `{db}.branches`
+        // migration, which is wired in the CLI and pgserver.
+        //
+        // This is the module's own additive discipline instead: old readers see the byte they
+        // always saw, old records are read the way they were written, and the exact value rides
+        // in the tail where appending is safe. The byte SATURATES for the benefit of a reader
+        // that only knows it — such a reader came from a build whose cap was 8.
+        b.push(self.depth.min(u8::MAX as u32) as u8);
         b.extend_from_slice(&(self.arenas.len() as u32).to_be_bytes());
         for a in &self.arenas {
             b.extend_from_slice(&a.0.to_be_bytes());
@@ -464,6 +476,10 @@ impl BranchRecord {
                 b.extend_from_slice(&e.serialize());
             }
         }
+        // **D60's exact depth, appended after every field an older build knows.** A reader that
+        // stops at the envelope simply never sees it; this build reads it when it is there and
+        // falls back to the byte above when it is not. See `serialize`'s comment on the byte.
+        b.extend_from_slice(&self.depth.to_be_bytes());
         let crc = crc32(&b);
         b.extend_from_slice(&crc.to_be_bytes());
         b
@@ -495,7 +511,7 @@ impl BranchRecord {
         let root_page_id = c.u32()?;
         let lease_deadline = LeaseDeadline(c.u64()?);
         let state = BranchState::from_u8(c.u8()?)?;
-        let depth = c.u32()?;
+        let depth_byte = c.u8()? as u32;
         let arena_len = c.u32()? as usize;
         let mut arenas = Vec::with_capacity(arena_len);
         for _ in 0..arena_len {
@@ -524,6 +540,11 @@ impl BranchRecord {
                 }
             }
         };
+        // **The exact depth, if this record was written by a build that has it.** Same tolerant
+        // read as the envelope above and for the same reason: absent means "written before this
+        // field existed", and the byte at its old offset is then the answer.
+        let depth = if c.at >= body_len { depth_byte } else { c.u32()? };
+
         if c.at != body_len {
             // Trailing bytes inside a body that checksums mean this record was written by
             // something whose format this build does not know. Refuse rather than act on the part
@@ -1464,7 +1485,12 @@ mod tests {
         b.extend_from_slice(&r.root_page_id.to_be_bytes());
         b.extend_from_slice(&r.lease_deadline.0.to_be_bytes());
         b.push(r.state.as_u8());
-        b.extend_from_slice(&r.depth.to_be_bytes());
+        // **A BYTE, because that is what the old build wrote.** D60 changed this helper to the new
+        // width in the same commit that widened the field — which silently disabled the one
+        // cross-version test in this module: it started writing today's bytes and could no longer
+        // catch a decoder that had stopped reading yesterday's. A fresh-context review found the
+        // regression this hid. A helper that builds OLD bytes must keep building old bytes.
+        b.push(r.depth.min(u8::MAX as u32) as u8);
         b.extend_from_slice(&(r.arenas.len() as u32).to_be_bytes());
         for a in &r.arenas {
             b.extend_from_slice(&a.0.to_be_bytes());
@@ -1648,8 +1674,10 @@ mod tests {
             Some(CapabilityEnvelope::new(Verb::ALL, 10).allow(T, vec![ColumnCapability::floored(1, 5)]));
         let bytes = r.serialize();
 
-        // The floor tag is the 9th byte from the end of the body: |col u32|tag u8|floor i64|crc u32|
-        let tag_at = bytes.len() - 4 - 8 - 1;
+        // |col u32|tag u8|floor i64| ... |depth u32|crc u32|. The trailing `depth` is D60's, and
+        // this offset moved when it was appended — which this test's own anti-vacuity assertion
+        // below caught, as it is there to.
+        let tag_at = bytes.len() - 4 - 4 - 8 - 1;
         assert_eq!(bytes[tag_at], 1, "the byte being corrupted is not the floor tag");
         let mut broken = bytes.clone();
         broken[tag_at] = 2;
