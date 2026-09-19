@@ -283,6 +283,58 @@ fn run_arm(dir: &std::path::Path, shared: bool, staged: usize, label: &str) -> V
     meds
 }
 
+/// `sweep_point` with the sessions built once and one long window; prints `# hold:` when the
+/// window opens so an external sampler can attach to the READ phase only.
+fn sweep_point_held(servers: &[Arc<Server>], threads: usize, staged: usize, window: Duration) -> (f64, u64) {
+    let start = Arc::new(Barrier::new(threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let total = Arc::new(AtomicU64::new(0));
+    let rows = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let srv = servers[0].clone();
+        let (start, stop) = (start.clone(), stop.clone());
+        let (total, rows) = (total.clone(), rows.clone());
+        handles.push(std::thread::spawn(move || {
+            let mut sess = Session::new();
+            let mut cache: Option<(u64, Arc<Catalog>)> = None;
+            let slot = Arc::new(AtomicBool::new(false));
+            srv.ctx.register_reader(Arc::clone(&slot));
+            exec(&srv, &format!("BEGIN AGENT SESSION AS 'a{t}' RUN 'r{t}';"), &mut sess, &mut cache, &slot);
+            for i in 0..staged {
+                let id = (i as i64) % ROWS + 1;
+                exec(&srv, &format!("UPDATE t SET v = {} WHERE id = {id};", 900000 + i), &mut sess, &mut cache, &slot);
+            }
+            let key = ROWS - (t as i64 % 8);
+            let sql = format!("SELECT v FROM t WHERE id = {key};");
+            start.wait();
+            let (mut n, mut r) = (0u64, 0u64);
+            while !stop.load(Ordering::Relaxed) {
+                r += exec(&srv, &sql, &mut sess, &mut cache, &slot) as u64;
+                n += 1;
+            }
+            total.fetch_add(n, Ordering::Relaxed);
+            rows.fetch_add(r, Ordering::Relaxed);
+        }));
+    }
+    start.wait();
+    println!("# hold: window open, {threads} threads reading");
+    let t0 = Instant::now();
+    std::thread::sleep(window);
+    stop.store(true, Ordering::Relaxed);
+    let elapsed = t0.elapsed();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let n = total.load(Ordering::Relaxed);
+    let r = rows.load(Ordering::Relaxed);
+    if n == 0 || r != n {
+        eprintln!("GUARD: {n} statements, {r} rows");
+        std::process::exit(2);
+    }
+    (n as f64 / elapsed.as_secs_f64(), n)
+}
+
 fn main() {
     let dir = std::env::temp_dir().join(format!("ferrodb-d55-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -307,11 +359,13 @@ fn main() {
         let threads: usize = std::env::var("D55_FOCUS_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         println!("# FOCUS: shared arm, {threads} agent(s), staged=10, pid {}", std::process::id());
         let servers: Vec<Arc<Server>> = vec![Arc::new(build(&dir, 0))];
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(25) {
-            let (ops, _) = sweep_point(&servers, true, threads, 10);
-            println!("# hold: {ops:.0} stmt/s");
-        }
+        // ONE measurement window of ~25 s, with the sessions created and staged ONCE before it.
+        // The first profile of this mode looped `sweep_point`, which re-creates every session
+        // and re-stages every row per call, so the sample was dominated by the setup's exclusive
+        // catalog writes and named the wrong wall. `# hold:` is printed AFTER the window opens,
+        // so a sampler that waits for it sees only reads.
+        let (ops, _) = sweep_point_held(&servers, threads, 10, Duration::from_secs(25));
+        println!("# hold total: {ops:.0} stmt/s over 25 s");
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
