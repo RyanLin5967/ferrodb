@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}}};
 
 use crate::catalog::column::DataType;
 use crate::cluster::GrantedCounter;
@@ -53,6 +53,26 @@ pub struct TxnManager {
     /// [`crate::consensus::Command::TxnIdRange`] and **refuses** when it holds none. See
     /// [`crate::cluster`].
     pub txn_ids: GrantedCounter,
+    /// **D59 — how many times the active-transaction table has CHANGED.**
+    ///
+    /// A snapshot is `(high_water, the set of active ids)`, and `read_snapshot` used to rebuild
+    /// that set — one `HashMap` walk and a `HashSet` allocation — under `att`'s mutex, once per
+    /// statement. Measured with 16 agent readers after D58 took the page latch off the read path
+    /// (`bench/d58_profile_16T_after.sample.txt`): 17.4k of ~80k thread-samples were in
+    /// `read_snapshot`, the single remaining blocking site, holding the arm at ×5.68 against a
+    /// private-runtime control's ×10.
+    ///
+    /// This counter is Postgres 14's `xactCompletionCount` (Freund's GetSnapshotData scalability
+    /// work) and D54's catalog `epoch` in this repo: a reader that already holds a snapshot taken
+    /// at version V, and reads V again, **knows its snapshot is still exact** and takes no lock
+    /// and allocates nothing. It is bumped by [`AttGuard`] on drop, INSIDE the critical section
+    /// that changed the table — a bump after the unlock would let a reader cache a snapshot it
+    /// took before a change under a version it read after one.
+    att_version: AtomicU64,
+    /// This manager's identity, for [`TxnManager::read_snapshot_cached`]'s thread-local cache.
+    /// An address would not do: a dropped manager's address is reused, and the cache would then
+    /// hand a new manager an old one's active set whenever the versions happened to agree.
+    id: u64,
     pub att: Mutex<HashMap<u64, TxnEntry>>,
     pub commits_since_checkpoint: AtomicU64,
     /// Every table's DDL, retained so a checkpoint can re-establish it at the head of the new log.
@@ -188,18 +208,22 @@ pub enum TxnStatus {
 
 #[derive(Debug, Clone)]
 pub struct ReadView {
-    pub snapshot: Snapshot,
+    /// **`Arc` since D59**, so a read that reuses a cached snapshot allocates nothing: the old
+    /// `Snapshot` by value meant every statement copied the active-id set even when the set had
+    /// not changed. Cloning the `Arc` is one refcount bump per statement against a `HashSet`
+    /// allocation and fill; the pointer is shared, never mutated.
+    pub snapshot: Arc<Snapshot>,
     pub txn_id: u64,
 }
 
 impl TxnManager {
     pub fn new(wal: Arc<WalManager>, bp: Arc<BufferPoolManager>) -> Self {
         let start = wal.header_txn_id;
-        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
+        Self { wal, bp, txn_ids: GrantedCounter::new("txn-id", start, SELF_GRANT_TXN_IDS), att_version: AtomicU64::new(0), id: NEXT_TXN_MANAGER_ID.fetch_add(1, Ordering::Relaxed), att: Mutex::new(HashMap::new()), commits_since_checkpoint: AtomicU64::new(0), schema_log: Mutex::new(Vec::new()), run_log: Mutex::new(Vec::new()), run_bindings: Mutex::new(HashMap::new()) }
     }
 
     pub fn begin(&self) -> Result<u64, FerroError> {
-        let mut att = self.att.lock().unwrap();
+        let mut att = self.att_write();
         Self::begin_locked(&self.txn_ids, &self.wal, &mut att)
     }
 
@@ -259,7 +283,7 @@ impl TxnManager {
     /// The caller must finish with [`TxnManager::end_read_only`].
     pub fn begin_snapshot_read(&self) -> Result<SnapshotHandoff, FerroError> {
         let (txn_id, snapshot, resume_lsn) = {
-            let mut att = self.att.lock().unwrap();
+            let mut att = self.att_write();
             let txn_id = Self::begin_locked(&self.txn_ids, &self.wal, &mut att)?;
             // Includes this reader's own `Begin`, which is the answer when nothing else is in
             // flight: there is then nothing below it that the snapshot does not already contain.
@@ -334,7 +358,7 @@ impl TxnManager {
     fn abandon_reader(&self, txn_id: u64) {
         // The ordinary close first, so the common case still records its `TxnEnd` in the log.
         let _ = self.end_read_only(txn_id);
-        self.att.lock().unwrap().remove(&txn_id);
+        self.att_write().remove(&txn_id);
     }
 
     /// Close a transaction that only read.
@@ -352,7 +376,7 @@ impl TxnManager {
     /// reader at all.
     pub fn end_read_only(&self, txn_id: u64) -> Result<(), FerroError> {
         let wrote = {
-            let att = self.att.lock().unwrap();
+            let att = self.att_read();
             let entry = att
                 .get(&txn_id)
                 .ok_or_else(|| FerroError::Txn(format!("txn {txn_id} is not active")))?;
@@ -382,7 +406,7 @@ impl TxnManager {
         // place the day `append` does any IO - a bounded buffer that flushes when full, a direct
         // write - because then the failure is real and its cost is the whole database.
         let appended = self.append_chained(txn_id, &RecKind::TxnEnd);
-        self.att.lock().unwrap().remove(&txn_id);
+        self.att_write().remove(&txn_id);
         appended?;
         Ok(())
     }
@@ -400,7 +424,7 @@ impl TxnManager {
     }
 
     pub fn append_chained(&self, txn_id: u64, kind: &RecKind) -> Result<u64, FerroError> {
-        let mut att = self.att.lock().unwrap();
+        let mut att = self.att_write();
         let entry = att.get_mut(&txn_id).ok_or_else(|| FerroError::Wal("txn not active".into()))?;
         let lsn = self.wal.append(txn_id,entry.last_lsn, kind)?;
         entry.last_lsn = lsn;
@@ -481,7 +505,7 @@ impl TxnManager {
                 )));
             }
         }
-        if !self.att.lock().unwrap().contains_key(&txn_id) {
+        if !self.att_read().contains_key(&txn_id) {
             return Err(FerroError::Txn(format!(
                 "cannot bind a run to txn {txn_id}: it is not active, so no identity record would \
                  ever be written for it"
@@ -577,7 +601,7 @@ impl TxnManager {
         let commit_lsn = self.append_chained(txn_id, &RecKind::Commit)?;
         self.wal.flush_up_to(commit_lsn)?;
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
-        self.att.lock().unwrap().remove(&txn_id);
+        self.att_write().remove(&txn_id);
         self.run_bindings.lock().unwrap().remove(&txn_id);
         // **F4: the automatic checkpoint is a node-local decision, and on a cluster it is wrong.**
         //
@@ -602,7 +626,7 @@ impl TxnManager {
         // here would refuse DDL on a cluster member for a reason that does not apply.
         let due = self.commits_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1
             >= checkpoint_interval()
-            && self.att.lock().unwrap().is_empty();
+            && self.att_read().is_empty();
         if due && !crate::cluster::is_clustered() {
             self.checkpoint()?;
         }
@@ -613,10 +637,10 @@ impl TxnManager {
         let abort_lsn = self.append_chained(txn_id, &RecKind::Abort)?;
         let _ = abort_lsn;
         {
-            self.att.lock().unwrap().get_mut(&txn_id).unwrap().status = TxnStatus::Aborting;
+            self.att_write().get_mut(&txn_id).unwrap().status = TxnStatus::Aborting;
         }
         let mut lsn = {
-            self.att.lock().unwrap().get(&txn_id).unwrap().last_lsn
+            self.att_read().get(&txn_id).unwrap().last_lsn
         };
         loop {
             let (rec, _) = self.wal.read_record(lsn)?;
@@ -658,7 +682,7 @@ impl TxnManager {
             lsn = rec.prev_lsn;
         }
         let _ = self.append_chained(txn_id, &RecKind::TxnEnd)?;
-        self.att.lock().unwrap().remove(&txn_id);
+        self.att_write().remove(&txn_id);
         // The run bound to this transaction described work that has been rolled back. No identity
         // record was written — they are only written at commit — so there is nothing in the log to
         // retract, only a binding that must not outlive its transaction id.
@@ -765,7 +789,7 @@ impl TxnManager {
         // runs, which is exactly what this function did before `ddl_checkpointed` existed. Every
         // existing caller therefore keeps its old concurrency behaviour; only the DDL path below
         // needs the answer to stay true while it is acted on, and only it pays for that.
-        if !self.att.lock().unwrap().is_empty() {
+        if !self.att_read().is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
         self.checkpoint_locked()
@@ -797,7 +821,7 @@ impl TxnManager {
         &self,
         f: impl FnOnce() -> Result<T, FerroError>,
     ) -> Result<T, FerroError> {
-        let att = self.att.lock().unwrap();
+        let att = self.att_read();
         if !att.is_empty() {
             return Err(FerroError::Wal("checkpoint with active txns".into()));
         }
@@ -827,7 +851,7 @@ impl TxnManager {
     }
 
     pub fn snapshot_of(&self, txn_id: u64) -> Result<Snapshot, FerroError> {
-        self.att.lock().unwrap().get(&txn_id).and_then(|e| e.snapshot.clone()).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
+        self.att_read().get(&txn_id).and_then(|e| e.snapshot.clone()).ok_or_else(|| FerroError::Txn("no snapshot for txn".into()))
     }
 
     /// Apply a committed [`crate::consensus::Command::TxnIdRange`].
@@ -884,8 +908,68 @@ impl TxnManager {
         self.commits_since_checkpoint.load(Ordering::SeqCst) >= checkpoint_interval()
     }
 
+    /// Read-only borrow of the active-transaction table. Bumps no version: see [`AttGuard`].
+    pub fn att_read(&self) -> MutexGuard<'_, HashMap<u64, TxnEntry>> {
+        self.att.lock().unwrap()
+    }
+
+    /// Write borrow of the active-transaction table. **Every mutation goes through here** —
+    /// see [`AttGuard`] and `tests/d59_snapshot_cache.rs`.
+    pub fn att_write(&self) -> AttGuard<'_> {
+        AttGuard { guard: Some(self.att.lock().unwrap()), version: &self.att_version, dirty: false }
+    }
+
+    /// The active-transaction table's version. See [`TxnManager::att_version`].
+    pub fn att_version(&self) -> u64 {
+        self.att_version.load(Ordering::Acquire)
+    }
+
+    /// **D59 — a snapshot without the lock when nothing has changed.**
+    ///
+    /// On a hit — the active-transaction table has not changed since this thread last built a
+    /// snapshot of THIS manager — no lock is taken and nothing is allocated: one `Acquire` load,
+    /// which is D51's ×7.8 class rather than the mutex's ×0.12. On a miss it does exactly what
+    /// [`TxnManager::read_snapshot`] does, and remembers the result.
+    ///
+    /// **A thread-local rather than a per-connection field** because the cached value is not
+    /// connection-specific: a snapshot is `(high_water, active set)`, a global fact about the
+    /// manager at a version, so any thread may reuse any snapshot labelled with the version it
+    /// observes. No call site has to thread a cache through `ReadCtx`, and a server that moves a
+    /// connection between threads cannot desynchronise anything.
+    ///
+    /// The version is read FIRST and stored with the snapshot it labels; `AttGuard` publishes the
+    /// bump inside the critical section, so a snapshot labelled V reflects every change up to V.
+    /// A cache that is behind simply misses and rebuilds — the failure direction is a slow read,
+    /// never a stale one.
+    pub fn read_snapshot_cached(&self) -> Arc<Snapshot> {
+        let v = self.att_version();
+        let hit = SNAPSHOT_CACHE.with(|c| match &*c.borrow() {
+            Some((id, cached_v, snap)) if *id == self.id && *cached_v == v => Some(Arc::clone(snap)),
+            _ => None,
+        });
+        if let Some(snap) = hit {
+            return snap;
+        }
+        // **A PRECISION step, not a guard — and it was documented as a guard until its mutant
+        // survived.** The safety comes from `AttGuard` bumping INSIDE the critical section that
+        // changed the table, so a label can never be newer than the content it names; that is the
+        // only direction that could serve a stale snapshot, and moving the bump after the unlock
+        // fails `d59_snapshot_cache`'s race test. Re-reading the version here only avoids
+        // labelling this snapshot with a version a writer has already moved past, which would cost
+        // the next reader a needless miss. Slower without it, never wrong.
+        let att = self.att_read();
+        let v = self.att_version.load(Ordering::Acquire);
+        let snap = Arc::new(Snapshot {
+            high_water: self.txn_ids.issued_through(),
+            active: att.keys().copied().collect(),
+        });
+        drop(att);
+        SNAPSHOT_CACHE.with(|c| *c.borrow_mut() = Some((self.id, v, Arc::clone(&snap))));
+        snap
+    }
+
     pub fn read_snapshot(&self) -> Snapshot {
-        let att = self.att.lock().unwrap();
+        let att = self.att_read();
         // A read of the watermark, not a take: a snapshot's high water is "everything below this
         // was issued", which the watermark answers without consuming anything and therefore
         // without ever refusing. That is why `read_snapshot` stays infallible.
@@ -920,6 +1004,57 @@ where F: FnOnce(&mut Page) -> Result<(), FerroError> {
     drop(frame);
     bp.unpin_page(page_id, true);
     Ok(())
+}
+
+/// Hands every `TxnManager` a distinct id; see [`TxnManager::read_snapshot_cached`].
+static NEXT_TXN_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// `(manager id, att version, snapshot)` — the last snapshot this thread built, reusable
+    /// until the table changes. See [`TxnManager::read_snapshot_cached`].
+    static SNAPSHOT_CACHE: std::cell::RefCell<Option<(u64, u64, Arc<Snapshot>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A write borrow of the active-transaction table that **cannot forget to publish the change**.
+///
+/// D59's snapshot cache is only sound while `att_version` moves on every mutation of the table.
+/// There are sixteen production `att.lock()` sites in this file and more outside it, so "remember
+/// to bump the counter" is the kind of discipline that has failed in this repo before (the page
+/// latch's ordering contract, `stage_all`'s single funnel). Instead: `att_write()` hands out this
+/// guard, `DerefMut` marks it dirty, and `Drop` bumps the version **while the lock is still
+/// held** — so a reader cannot observe the new version with the old table, or the old version
+/// with the new table. A read-only borrow goes through [`TxnManager::att_read`] and bumps nothing.
+///
+/// Same shape as D58's `FrameWriteGuard`, for the same reason.
+pub struct AttGuard<'a> {
+    guard: Option<MutexGuard<'a, HashMap<u64, TxnEntry>>>,
+    version: &'a AtomicU64,
+    dirty: bool,
+}
+
+impl std::ops::Deref for AttGuard<'_> {
+    type Target = HashMap<u64, TxnEntry>;
+    fn deref(&self) -> &HashMap<u64, TxnEntry> {
+        self.guard.as_ref().expect("att guard used after drop")
+    }
+}
+
+impl std::ops::DerefMut for AttGuard<'_> {
+    fn deref_mut(&mut self) -> &mut HashMap<u64, TxnEntry> {
+        self.dirty = true;
+        self.guard.as_mut().expect("att guard used after drop")
+    }
+}
+
+impl Drop for AttGuard<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            // Release: a reader that sees this version also sees the table that produced it.
+            self.version.fetch_add(1, Ordering::Release);
+        }
+        self.guard = None;
+    }
 }
 
 impl ReadView {
@@ -1618,7 +1753,7 @@ use super::*;
         assert!(snapshot.includes(9), "the transaction below the mark was reported as excluded");
 
         // Through a view whose own id is not the mark, so the `ts == txn_id` branch cannot mask it.
-        let view = ReadView { snapshot, txn_id: 0 };
+        let view = ReadView { snapshot: Arc::new(snapshot), txn_id: 0 };
         let h = |b, e| VersionHeader { begin_ts: b, end_ts: e, prev_page: 0, prev_slot: 0 };
         assert!(
             !view.visible(&h(10, 0)),
@@ -1629,7 +1764,7 @@ use super::*;
 
     #[test]
     fn test_visibility_matrix() {
-        let view = ReadView { snapshot: Snapshot { high_water: 10, active: HashSet::from([7])}, txn_id: 10};
+        let view = ReadView { snapshot: Arc::new(Snapshot { high_water: 10, active: HashSet::from([7])}), txn_id: 10};
         let h = |b, e| VersionHeader { begin_ts: b, end_ts: e, prev_page: 0, prev_slot: 0};
         assert!(view.visible(&h(10, 0)));
         assert!(view.visible(&h(5, 0)));

@@ -163,7 +163,7 @@ fn every_committed_row_arrives_exactly_once_with_writers_running_throughout() {
         // **The cutover**, taken while all four writers are still running. The handoff arrives
         // already pinned, so there is no separate pin to take here.
         let handoff = txn.begin_snapshot_read().unwrap();
-        let view = ReadView { snapshot: handoff.snapshot.clone(), txn_id: handoff.txn_id };
+        let view = ReadView { snapshot: Arc::new(handoff.snapshot.clone()), txn_id: handoff.txn_id };
         let snap_ids: Vec<i32> = {
             let _g = heap_lock.lock().unwrap();
             HeapFileManager::open(dir_root, Arc::clone(&bp))

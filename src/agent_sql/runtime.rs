@@ -4892,7 +4892,7 @@ fn apply_dml_in(
     author: Author,
 ) -> Result<usize, FerroError> {
     let snapshot = ctx.txn.snapshot_of(txn_id)?;
-    let view = Arc::new(ReadView { snapshot, txn_id });
+    let view = Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id });
     match plan(stmt, ctx.catalog, ctx.bp.clone(), Some((ctx.txn.clone(), txn_id)), view)? {
         Plan::Write(mut op) => {
             if let Some((prov, id)) = author {
@@ -4932,7 +4932,9 @@ pub fn scan_table_where(
     where_clause: Option<&Expr>,
     ctx: &ReadCtx,
 ) -> Result<Vec<Vec<Value>>, FerroError> {
-    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot(), txn_id: 0 });
+    // D59: the cached snapshot — one Acquire load when no transaction has begun or ended
+    // since this thread last asked. `read_snapshot` remains the uncached truth.
+    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot_cached(), txn_id: 0 });
     let stmt = Stmt::Select {
         from: TableRef::plain(table.to_string(), alias.map(|a| a.to_string())),
         columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],

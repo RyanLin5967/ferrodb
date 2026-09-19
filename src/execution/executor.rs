@@ -115,10 +115,10 @@ pub fn try_run_read(
         Stmt::Select { from, .. } if from.as_of.is_none() => {
             let view = Arc::new(match session.current {
                 Some(txn_id) => match txn.snapshot_of(txn_id) {
-                    Ok(snapshot) => ReadView { snapshot, txn_id },
+                    Ok(snapshot) => ReadView { snapshot: Arc::new(snapshot), txn_id },
                     Err(e) => return Some(Err(e)),
                 },
-                None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 },
+                None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 },
             });
             match plan(stmt.clone(), catalog, bp, None, view) {
                 Ok(Plan::Read(mut root)) => {
@@ -227,8 +227,8 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 ));
             }
             let view = Arc::new(match session.current {
-                Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id },
-                None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+                Some(txn_id) => ReadView { snapshot: Arc::new(txn.snapshot_of(txn_id)?), txn_id },
+                None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 }
             });
             let mut op = FullTextSearch::open(catalog, &table, &column_name, &query, top_k, bp.clone(), view)?;
             let mut rows = Vec::new();
@@ -400,8 +400,8 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
         dml => {
             if matches!(dml, Stmt::Select { .. }) {
                 let view = Arc::new(match session.current {
-                    Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id},
-                    None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+                    Some(txn_id) => ReadView { snapshot: Arc::new(txn.snapshot_of(txn_id)?), txn_id},
+                    None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 }
                 });
                 match plan(dml, catalog, bp.clone(), None, view)? {
                     Plan::Read(mut root) => {
@@ -424,7 +424,7 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     None => (txn.begin()?, true)
                 };
                 let view = match txn.snapshot_of(txn_id) {
-                    Ok(snapshot) => Arc::new(ReadView { snapshot, txn_id }),
+                    Ok(snapshot) => Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id }),
                     Err(e) => {
                         txn.abort(txn_id)?;
                         session.current = None;

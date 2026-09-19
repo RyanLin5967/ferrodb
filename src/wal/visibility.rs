@@ -1,4 +1,5 @@
 use crate::{error::FerroError, storage::{heap_file_manager::{HeapFileManager, RecordId}, tuple::{Tuple, VersionHeader}}, wal::txn::ReadView};
+use std::sync::Arc;
 
 pub fn resolve_visibility(view: &ReadView, tt_heap: &HeapFileManager, head: Tuple) -> Result<Option<Tuple>, FerroError> {
     let mut current = head;
@@ -34,7 +35,7 @@ mod tests {
     /// `high_water` otherwise committed.
     fn view(me: u64, active: &[u64], high_water: u64) -> ReadView {
         ReadView {
-            snapshot: Snapshot { high_water, active: active.iter().copied().collect::<HashSet<_>>() },
+            snapshot: Arc::new(Snapshot { high_water, active: active.iter().copied().collect::<HashSet<_>>() }),
             txn_id: me,
         }
     }

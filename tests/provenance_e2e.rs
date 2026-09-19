@@ -56,7 +56,7 @@ impl Db {
     }
 
     fn view(&self) -> Arc<ReadView> {
-        Arc::new(ReadView { snapshot: self.txn.read_snapshot(), txn_id: 0 })
+        Arc::new(ReadView { snapshot: Arc::new(self.txn.read_snapshot()), txn_id: 0 })
     }
 
     fn heap(&self, table: &str) -> HeapFileManager {

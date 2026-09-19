@@ -92,7 +92,7 @@ impl Db {
 
     /// The physical slot currently holding the row with this surrogate id.
     fn rid_of(&self, table: &str, id: i32) -> RecordId {
-        let view = Arc::new(ReadView { snapshot: self.txn.read_snapshot(), txn_id: 0 });
+        let view = Arc::new(ReadView { snapshot: Arc::new(self.txn.read_snapshot()), txn_id: 0 });
         let mut exec =
             lower(PhysicalPlan::SeqScan { table: table.into() }, &self.catalog, self.bp.clone(), view)
                 .unwrap();
