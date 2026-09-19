@@ -317,12 +317,26 @@ fn main() {
         // D55_QUICK_STAGED (default 10): D57's 16-thread falsifier runs this at 4000, D27's
         // measured real workspace, where the walk used to sit inside the State mutex.
         let staged: usize = std::env::var("D55_QUICK_STAGED").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
-        println!("# QUICK: shared arm, staged={staged} only");
+        // D55_QUICK_ARM=both adds the PRIVATE control (N runtimes, nothing shared) -- D58's premise
+        // is the gap between the two at 16 threads, and a shared-only number cannot show a gap.
+        let both = std::env::var("D55_QUICK_ARM").map(|v| v == "both").unwrap_or(false);
+        println!("# QUICK: {} staged={staged} only", if both { "shared then private" } else { "shared arm" });
         let a = run_arm(&dir, true, staged, "SHARED  (ONE ServerContext)");
+        let b = if both { Some(run_arm(&dir, false, staged, "PRIVATE (N ServerContexts) -- the CONTROL")) } else { None };
         println!();
-        println!("threads   shared_vs_1T   shared_abs");
-        for (i, &t) in POINTS.iter().enumerate() {
-            println!("{t:>7}   {:>12.3}   {:>10.0}", a[i] / a[0], a[i]);
+        match &b {
+            Some(b) => {
+                println!("threads   shared_vs_1T   shared_abs   private_vs_1T   private_abs   shared/private");
+                for (i, &t) in POINTS.iter().enumerate() {
+                    println!("{t:>7}   {:>12.3}   {:>10.0}   {:>13.3}   {:>11.0}   {:>14.3}", a[i] / a[0], a[i], b[i] / b[0], b[i], a[i] / b[i]);
+                }
+            }
+            None => {
+                println!("threads   shared_vs_1T   shared_abs");
+                for (i, &t) in POINTS.iter().enumerate() {
+                    println!("{t:>7}   {:>12.3}   {:>10.0}", a[i] / a[0], a[i]);
+                }
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
         return;
