@@ -63,7 +63,9 @@ use crate::error::FerroError;
 use crate::execution::executor::evaluate;
 use crate::parser::parser::{Expr, Stmt, TableRef};
 use crate::parser::scanner::TokenType;
-use crate::planner::plan::{plan, Plan};
+use crate::planner::plan::{plan, predicate_to_bounds, Plan};
+use crate::optimizer::optimizer::split_and;
+use crate::catalog::column::DataType;
 use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
@@ -166,6 +168,41 @@ pub fn row_id_of(row: &[Value]) -> RowId {
         Some(Value::Timestamp(ms)) => RowId(*ms as u64),
         Some(Value::Null) | None => RowId(0),
     }
+}
+
+/// **D57.** The one overlay key a predicate can touch, if it has a `pk = literal` conjunct.
+///
+/// Uses the planner's own `split_and` + `predicate_to_bounds` — the extraction `build_index_scan`
+/// uses to pick the base access — so the overlay is probed by the same key the base scan probed.
+///
+/// The literal's variant must match the primary key column's declared type. `row_id_of` maps an
+/// `Integer` to its value but a `Float` to a hash of its bits, so `id = 5.0` against an INTEGER
+/// key would probe a key no staged row was ever stored under and MISS a staged version — the one
+/// wrong answer. On any mismatch this returns `None` and the caller walks the table prefix, which
+/// is always correct.
+fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u64> {
+    let pk_type = pk_type?;
+    let mut conjuncts = Vec::new();
+    split_and(bound.clone(), &mut conjuncts);
+    conjuncts.iter().find_map(|c| match predicate_to_bounds(c) {
+        Some((0, std::ops::Bound::Included(lo), std::ops::Bound::Included(hi))) if lo == hi && literal_matches(&lo, pk_type) => {
+            Some(row_id_of(std::slice::from_ref(&lo)).0)
+        }
+        _ => None,
+    })
+}
+
+fn literal_matches(v: &Value, t: &DataType) -> bool {
+    matches!(
+        (v, t),
+        (Value::Integer(_), DataType::Integer)
+            | (Value::BigInt(_), DataType::BigInt)
+            | (Value::Varchar(_), DataType::Varchar(_))
+            | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::Decimal(_), DataType::Decimal)
+            | (Value::Float(_), DataType::Float)
+            | (Value::Boolean(_), DataType::Boolean)
+    )
 }
 
 /// The state of one row on a branch.
@@ -1300,12 +1337,29 @@ impl AgentRuntime {
             rows.insert(row_id_of(&r).0, r);
         }
         if let Some(b) = branch {
-            let state = self.state.lock().unwrap();
-            if let Some(ws) = state.workspaces.get(&b.id) {
-                for ((t, row), st) in &ws.rows {
-                    if *t != tbl.0 {
-                        continue;
-                    }
+            // **D57.** This used to hold the State mutex and iterate EVERY staged row on the
+            // branch — all tables — per statement: ~11.5 ns per staged row per read, ×8 at D27's
+            // measured 4,000 staged rows (`bench/d57_staged_curve_before.txt`), and the whole
+            // walk inside a process-wide critical section. Three things change, none of which
+            // alters a result (the D55 commutation argument is untouched; `tests/d57_overlay_probe`
+            // pins every case against a hand-derived truth AND against the walk):
+            //
+            // 1. The map is SNAPSHOTTED under the lock — `PersistentMap::clone` is one `Arc`
+            //    bump, which is the whole reason that structure exists — and the lock is released
+            //    before any work. Safe because the map is immutable-with-sharing and a session
+            //    cannot write its own workspace concurrently with its own read.
+            // 2. A predicate with a `pk = literal` conjunct PROBES the one entry that can affect
+            //    the result. Every staged row carries its own primary key in column 0, so any
+            //    other entry fails that conjunct whatever the rest of the predicate says.
+            // 3. Every other predicate walks only THIS table's prefix of the key space, which is
+            //    the honest floor for a non-key predicate — the same reason the base table needs
+            //    an index for one.
+            let staged = {
+                let state = self.state.lock().unwrap();
+                state.workspaces.get(&b.id).map(|ws| ws.rows.clone())
+            };
+            if let Some(staged) = staged {
+                let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
                         RowState::Present(v) => {
                             let keep = match bound {
@@ -1313,15 +1367,29 @@ impl AgentRuntime {
                                 None => true,
                             };
                             if keep {
-                                rows.insert(*row, v.clone());
+                                rows.insert(row, v.clone());
                             } else {
                                 // The staged version is what this branch sees, and it fails
                                 // the predicate -- so the base version that passed must go.
-                                rows.remove(row);
+                                rows.remove(&row);
                             }
                         }
                         RowState::Deleted => {
-                            rows.remove(row);
+                            rows.remove(&row);
+                        }
+                    }
+                    Ok(())
+                };
+                let pk_type = ctx.catalog.get_table(table).map(|e| e.schema.columns[0].data_type.clone());
+                match bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) {
+                    Some(row) => {
+                        if let Some(st) = staged.get(&(tbl.0, row)) {
+                            apply(row, st)?;
+                        }
+                    }
+                    None => {
+                        for ((_, row), st) in staged.range(&(tbl.0, 0), &(tbl.0, u64::MAX)) {
+                            apply(*row, st)?;
                         }
                     }
                 }
