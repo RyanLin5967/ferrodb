@@ -1,0 +1,2 @@
+D54-asof-fix: mode=per-target rc=0 passed=2100 failed=0 build_errors=0 head=79004da log=/Users/idide/wt/artie-research/verify-out-d54fix/suite-D54-asof-fix.log
+D54-asof-fix: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d54fix/suite-D54-asof-fix.go.log
