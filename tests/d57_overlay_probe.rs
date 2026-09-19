@@ -260,3 +260,76 @@ fn a_literal_of_another_type_falls_back_instead_of_missing_the_staged_row() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Two cases a fresh-context review found AFTER the probe shipped (`65287c2`), both real, both
+// regressions the walk never had. Each was fire-checked: written first, run against `65287c2`,
+// and seen to fail there before the fix existed.
+// ---------------------------------------------------------------------------------------------
+
+/// A DECIMAL key's identity is its digit TEXT (`row_id_of` hashes the bytes) while `=` on decimals
+/// is NUMERIC (`decimal_cmp`): `1.50` and `1.5` are equal values with different overlay keys. A
+/// probe keyed on the literal's spelling misses the staged row the walk found. Decimal must never
+/// be probed.
+#[test]
+fn a_decimal_key_is_never_probed_because_its_identity_is_finer_than_its_equality() {
+    let mut db = Db::new();
+    let mut setup = db.session();
+    db.ok("CREATE TABLE p (amt DECIMAL NOT NULL, note VARCHAR(10));", &mut setup);
+    db.ok("INSERT INTO p VALUES (1.50, 'base');", &mut setup);
+    db.ok("INSERT INTO p VALUES (2.50, 'base');", &mut setup);
+    let mut a = db.session();
+    db.ok("BEGIN AGENT SESSION AS 'agent-p' RUN 'r1';", &mut a);
+    db.ok("UPDATE p SET note = 'staged' WHERE amt = 1.50;", &mut a);
+    db.ok("DELETE FROM p WHERE amt = 2.50;", &mut a);
+    db.ok("INSERT INTO p VALUES (3.50, 'new');", &mut a);
+
+    let notes = |db: &mut Db, a: &mut Session, lit: &str| -> Vec<String> {
+        db.rows(&format!("SELECT note FROM p WHERE amt = {lit};"), a)
+            .into_iter()
+            .map(|r| match &r[0] { Value::Varchar(s) => s.clone(), o => panic!("{o:?}") })
+            .collect()
+    };
+    // Same spelling as stored, and a different spelling of the same number: identical answers.
+    assert_eq!(notes(&mut db, &mut a, "1.50"), vec!["staged"]);
+    assert_eq!(notes(&mut db, &mut a, "1.5"), vec!["staged"], "a re-spelled decimal literal MISSED the staged version");
+    assert_eq!(notes(&mut db, &mut a, "1.500"), vec!["staged"]);
+    assert!(notes(&mut db, &mut a, "2.5").is_empty(), "a re-spelled decimal literal resurrected a staged DELETE");
+    assert_eq!(notes(&mut db, &mut a, "3.5"), vec!["new"], "a re-spelled decimal literal hid a staged INSERT");
+}
+
+/// On a branch, an UPDATE may assign column 0 (trunk refuses this; the branch path does not, and
+/// `tests/integration_escrow.rs` relies on the staged row KEEPING its original key so a PK move
+/// cannot escape an escrow pool). So a staged row's column 0 can differ from the key it sits under,
+/// and the probe's premise -- "every staged row carries its own primary key in column 0" -- is
+/// false for that workspace. The read path must notice and walk.
+#[test]
+fn a_workspace_that_moved_a_primary_key_is_walked_not_probed() {
+    let mut db = Db::new();
+    let mut a = staged_branch(&mut db);
+    // Hand-derived, from what the walk did: `staged_branch` already staged v = 999 on row 5, so
+    // the entry at key 5 becomes Present([99, 999]) ...
+    db.ok("UPDATE t SET id = 99 WHERE id = 5;", &mut a);
+    // ... so `id = 99` sees it (base has no 99), and `id = 5` sees nothing (the staged version of
+    // row 5 fails `id = 5`, and the staged version is what this branch sees).
+    assert_eq!(db.pairs("SELECT id, v FROM t WHERE id = 99;", &mut a), BTreeSet::from([(99, 999)]), "the moved row was MISSED by a probe on its new key");
+    assert!(db.pairs("SELECT id, v FROM t WHERE id = 5;", &mut a).is_empty(), "the old key still shows the pre-move row");
+    // Everything else on the branch is unaffected by the fallback.
+    assert_eq!(db.pairs("SELECT id, v FROM t WHERE id = 15;", &mut a), BTreeSet::from([(15, 50)]));
+    assert!(db.pairs("SELECT id, v FROM t WHERE id = 3;", &mut a).is_empty());
+    // And the two paths still agree on every key -- including a move ONTO an existing key, whose
+    // answer (two rows with one id, on the branch) is the walk's and is not pinned here.
+    db.ok("UPDATE t SET id = 6 WHERE id = 8;", &mut a);
+    let all = db.pairs("SELECT id, v FROM t;", &mut a);
+    for id in [1, 3, 5, 6, 7, 8, 15, 25, 26, 99] {
+        let probe = db.pairs(&format!("SELECT id, v FROM t WHERE id = {id};"), &mut a);
+        let walked: BTreeSet<(i32, i32)> = all.iter().copied().filter(|(k, _)| *k == id).collect();
+        assert_eq!(probe, walked, "key {id} after a PK move");
+    }
+    // A child forked from this branch inherits the moved row, so it must inherit the fallback too.
+    let parent_branch = a.agent.as_ref().unwrap().branch;
+    let child = db.runtime.begin_session("child", Some("r2"), parent_branch).unwrap();
+    let mut reader = db.session();
+    let seen = db.pairs(&format!("SELECT id, v FROM t AS OF BRANCH {} WHERE id = 99;", child.branch_name), &mut reader);
+    assert_eq!(seen, BTreeSet::from([(99, 999)]), "the child lost the moved row");
+}

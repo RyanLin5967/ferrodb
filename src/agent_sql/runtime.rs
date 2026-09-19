@@ -192,6 +192,16 @@ fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u6
     })
 }
 
+/// A literal may be probed only when `row_id_of` is exactly as fine as `=` for its variant --
+/// equal values MUST land on one key, or the probe misses a staged row the walk would have found.
+///
+/// `Integer`/`BigInt`/`Timestamp` map to their value; `Varchar` and `Boolean` hash the same bytes
+/// `Value::cmp` compares; `Float` hashes its bits and `cmp` is `total_cmp`, which is also
+/// bit-exact. **`Decimal` is deliberately absent:** `row_id_of` hashes the digit TEXT (`"1.50"`)
+/// while `decimal_cmp` is numeric (`Decimal("1.50") == Decimal("1.5")`), so a re-spelled literal
+/// passes the variant check and probes a key no staged row was stored under. Found by a
+/// fresh-context review after the probe first shipped; `hash_join.rs` canonicalises a decimal
+/// before hashing for the same reason. A DECIMAL key walks the table prefix instead.
 fn literal_matches(v: &Value, t: &DataType) -> bool {
     matches!(
         (v, t),
@@ -199,7 +209,6 @@ fn literal_matches(v: &Value, t: &DataType) -> bool {
             | (Value::BigInt(_), DataType::BigInt)
             | (Value::Varchar(_), DataType::Varchar(_))
             | (Value::Timestamp(_), DataType::Timestamp)
-            | (Value::Decimal(_), DataType::Decimal)
             | (Value::Float(_), DataType::Float)
             | (Value::Boolean(_), DataType::Boolean)
     )
@@ -228,6 +237,15 @@ struct Workspace {
     /// has nothing to diff against.
     fork_root: PageId,
     rows: PersistentMap<(u32, u64), RowState>,
+    /// **D57.** How many times a `Present` row was staged under a key that is NOT `row_id_of` of
+    /// its own column 0. On a branch an UPDATE may assign the primary key (trunk refuses it;
+    /// `integration_escrow` relies on the staged row keeping its ORIGINAL key so a PK move cannot
+    /// leave an escrow pool), and after one the read path's probe -- "only the entry for `k` can
+    /// affect `pk = k`" -- is unsound for this workspace. Monotone and conservative: it is
+    /// incremented at the single site that writes `rows`, inherited by a forked child (which
+    /// shares the entries), never decremented, and `visible_rows_where` walks instead of probing
+    /// whenever it is non-zero. A guard on the resulting state, not on the statement that caused it.
+    moved_keys: u64,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
@@ -956,9 +974,9 @@ impl AgentRuntime {
         // descent of the child's own tree with no parent pointer anywhere to walk. Both are tested
         // directly in `tests/d27_fork_shares_without_leaking.rs`, the second against an ancestor
         // chain abandoned out from under the child.
-        let (rows, base_rows, tables) = match state.workspaces.get(&parent.id) {
-            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
-            None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new()),
+        let (rows, base_rows, tables, moved_keys) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone(), p.moved_keys),
+            None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new(), 0),
         };
         let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
             Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
@@ -985,6 +1003,7 @@ impl AgentRuntime {
                 fork_seq,
                 fork_root: record.root_page_id,
                 rows,
+                moved_keys,
                 base_rows,
                 tables,
                 inherited,
@@ -1356,9 +1375,9 @@ impl AgentRuntime {
             //    an index for one.
             let staged = {
                 let state = self.state.lock().unwrap();
-                state.workspaces.get(&b.id).map(|ws| ws.rows.clone())
+                state.workspaces.get(&b.id).map(|ws| (ws.rows.clone(), ws.moved_keys))
             };
-            if let Some(staged) = staged {
+            if let Some((staged, moved_keys)) = staged {
                 let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
                         RowState::Present(v) => {
@@ -1381,7 +1400,10 @@ impl AgentRuntime {
                     Ok(())
                 };
                 let pk_type = ctx.catalog.get_table(table).map(|e| e.schema.columns[0].data_type.clone());
-                match bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) {
+                // The probe is sound only while every staged row sits under its own column 0's
+                // key. `moved_keys` says whether that has ever stopped being true here.
+                let probe = if moved_keys == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
+                match probe {
                     Some(row) => {
                         if let Some(st) = staged.get(&(tbl.0, row)) {
                             apply(row, st)?;
@@ -2167,6 +2189,11 @@ impl AgentRuntime {
             for item in items {
                 let key = Workspace::key(tbl, item.row);
                 ws.base_rows.insert_if_absent(key, item.before);
+                if let RowState::Present(v) = &item.after {
+                    if row_id_of(v) != item.row {
+                        ws.moved_keys += 1;
+                    }
+                }
                 ws.rows.insert(key, item.after.clone());
                 for op in item.ops {
                     ws.frame.push_op(op);
@@ -5126,6 +5153,7 @@ mod tests {
             // read by `txn_refs_of`, which is why the index survived that change untouched — only
             // this fixture's spelling had to follow.
             rows: PersistentMap::new(),
+            moved_keys: 0,
             base_rows: PersistentMap::new(),
             inherited: inherited.iter().map(|t| TxnId(*t)).collect(),
             tables: PersistentMap::new(),
