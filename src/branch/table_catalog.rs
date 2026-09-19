@@ -31,7 +31,7 @@ use crate::branch::group_commit::CommitGroup;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
-    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
 use crate::branch::BranchCatalog;
 use crate::buffer::buffer_pool::BufferPoolManager;
@@ -627,6 +627,30 @@ impl TableBranchCatalog {
     /// writes would make a MISSING entry possible for a live child, which is the unsafe direction —
     /// the parent would look childless and its pages would be freed underneath a branch that can
     /// still read them.
+    /// What a child entry means for its parent's liveness, WITHOUT deciding it recursively.
+    ///
+    /// **D60 split this out of `live_child_at`.** The recursion used to live in the arm below:
+    /// a reaped child asked `has_live_children(child)`, so the call depth was the length of a
+    /// reaped chain. This returns the reaped child's id instead and lets the caller's explicit
+    /// stack explore it, which is the same answer with no stack growth. `live_child_at` is kept
+    /// as the one-entry answer its other callers want, now written in terms of this.
+    fn child_liveness(&self, key: &[u8], value: &[u8]) -> Result<ChildLiveness, FerroError> {
+        if value.len() != 8 {
+            // An entry written before the value carried an id. There is no id to resolve, so it
+            // cannot be verified; treat it as LIVE, which is the parking (safe) direction.
+            return Ok(ChildLiveness::Live);
+        }
+        let child_id = u64::from_be_bytes(value[0..8].try_into().unwrap());
+        let _ = key;
+        Ok(match self.core(child_id)? {
+            Some(rec) if rec.state() != BranchState::Reaped => ChildLiveness::Live,
+            // **D16 — a reaped branch that still has live children is a PIN, not a stale hint.**
+            // Its subtree is explored by the caller (see `has_live_children`), not from here.
+            Some(_) => ChildLiveness::ReapedWithSubtree(child_id),
+            None => ChildLiveness::Gone,
+        })
+    }
+
     fn live_child_at(&self, key: &[u8], value: &[u8]) -> Result<Option<Epoch>, FerroError> {
         if value.len() != 8 {
             // An entry written before the value carried an id. There is no id to resolve, so it
@@ -662,6 +686,9 @@ impl TableBranchCatalog {
             // children, early exit) and NOT bounded by 8. It is still not the global reachability
             // walk `mod.rs:13` forbids -- it never leaves this branch's own subtree -- but the
             // honest bound is the subtree, not a constant.
+            // The subtree walk is `has_live_children`'s now (iterative, D60), and this arm asks it
+            // for the one entry it was handed — so a single-entry answer keeps the D16 rule while
+            // the depth-unbounded exploration happens on a heap stack, not the call stack.
             Some(_) if BranchCatalog::has_live_children(self, child_id)? => {
                 Ok(keys::child_epoch_from_key(key).map(Epoch))
             }
@@ -846,9 +873,6 @@ impl BranchCatalog for TableBranchCatalog {
             .ok_or(BranchError::NotFound(parent))?
             .depth()
             .saturating_add(1);
-        if depth > MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch, depth }.into());
-        }
         let old = core.clone();
         // HYDRATED, for `set_root`'s reason: `write_record` makes the arena span match the record
         // it is given, so writing back a core record would delete every extent the branch owns —
@@ -1087,12 +1111,32 @@ impl BranchCatalog for TableBranchCatalog {
         Ok(false)
     }
 
+    /// Does `parent_id` have a live descendant reachable through reaped interior nodes?
+    ///
+    /// **Iterative, with an explicit stack — D60.** This was mutually recursive with
+    /// `live_child_at`: a reaped child sent it back into `has_live_children`, so its RECURSION
+    /// depth was the length of a chain of reaped interior nodes. That was bounded only by
+    /// `MAX_BRANCH_DEPTH = 8`, and removing the cap (SCALE-DESIGN D60 — fork and read are flat
+    /// across depth 1..250, so the cap protects nothing on either path) makes that chain
+    /// unbounded. MCTS prunes interior nodes, which is exactly how a long reaped chain forms, so
+    /// the recursion had to go before the cap could.
+    ///
+    /// The cost is unchanged and is still not O(1): `live_child_at` returns `None` for a reaped
+    /// node so that its own children are explored here instead, and the walk is breadth-first over
+    /// the reaped subtree with an early exit on the first live descendant.
     fn has_live_children(&self, parent_id: u64) -> Result<bool, FerroError> {
-        let (lo, hi) = keys::children_of(parent_id);
-        for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
-            let (k, v) = entry?;
-            if self.live_child_at(&k, &v)?.is_some() {
-                return Ok(true);
+        let mut pending = vec![parent_id];
+        while let Some(id) = pending.pop() {
+            let (lo, hi) = keys::children_of(id);
+            for entry in self.tree.range_scan(Bound::Included(lo), Bound::Excluded(hi))? {
+                let (k, v) = entry?;
+                match self.child_liveness(&k, &v)? {
+                    ChildLiveness::Live => return Ok(true),
+                    // A reaped child is not itself a pin, but anything live BELOW it is — D16.
+                    // Explored here rather than by recursing, so the stack cannot grow with depth.
+                    ChildLiveness::ReapedWithSubtree(child) => pending.push(child),
+                    ChildLiveness::Gone => {}
+                }
             }
         }
         Ok(false)
@@ -2153,3 +2197,15 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// See [`TableBranchCatalog::child_liveness`].
+enum ChildLiveness {
+    /// A live child: its parent is pinned by it.
+    Live,
+    /// A reaped child that may still have live descendants (D16). Carries its id so the caller
+    /// can explore it without recursing.
+    ReapedWithSubtree(u64),
+    /// No record at all — a stale hint, pinning nothing.
+    Gone,
+}
+

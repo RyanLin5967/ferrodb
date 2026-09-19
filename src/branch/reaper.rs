@@ -1506,18 +1506,18 @@ mod tests {
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
 
+        // **D60 removed the depth cap**, so this no longer builds "the deepest chain the catalog
+        // allows" — there is no such thing. It builds a chain far past the old cap and checks the
+        // ninth fork SUCCEEDS, which is the property that replaced the refusal this asserted.
         let mut cur = BranchId::TRUNK;
-        use crate::branch::types::MAX_BRANCH_DEPTH;
-        for _ in 0..MAX_BRANCH_DEPTH {
-            cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
+        for i in 1..=12u32 {
+            cur = h
+                .catalog
+                .fork(cur, LeaseDeadline::from_now(LEASE_MS))
+                .unwrap_or_else(|e| panic!("fork at depth {i} refused: {e}"))
+                .branch_id;
         }
-        assert_eq!(h.catalog.get(cur).unwrap().depth, MAX_BRANCH_DEPTH);
-
-        let err = h
-            .catalog
-            .fork(cur, LeaseDeadline::from_now(LEASE_MS))
-            .expect_err("the ninth fork must be refused");
-        assert!(err.to_string().contains("depth"), "got {err}");
+        assert_eq!(h.catalog.get(cur).unwrap().depth, 12);
 
         // Give the chain a real root before collapsing. A branch that has never written still
         // carries the trunk's placeholder root id, which is not an allocated page — collapse then
@@ -1666,15 +1666,16 @@ mod tests {
         let baseline_live = h.store.live_page_count().unwrap();
         let baseline_reserved = h.store.reserved_page_count();
 
-        // A chain sitting exactly where the depth guard leaves one.
+        // A deep chain. Before D60 this sat exactly at the cap and asserted the next fork was
+        // REFUSED — "collapse is the only way forward". There is no cap now, and `collapse` is a
+        // way to shorten a chain rather than the only escape from one, so the test builds the
+        // same shape and keeps everything below it: what it is really about is that collapse
+        // materialises a deep chain's tree correctly.
         let mut cur = BranchId::TRUNK;
-        for _ in 0..crate::branch::types::MAX_BRANCH_DEPTH {
+        for _ in 0..8 {
             cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
         }
-        assert!(
-            h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).is_err(),
-            "the chain is not at the ceiling, so collapse is not the only way forward"
-        );
+        assert_eq!(h.catalog.get(cur).unwrap().depth, 8);
 
         // Build its tree. Note `arena_for` per page rather than one captured `alloc_arena` id:
         // the store could ALREADY roll over, and a normal writer gets it for free. Collapse was

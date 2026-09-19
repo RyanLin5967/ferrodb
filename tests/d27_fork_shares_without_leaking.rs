@@ -22,7 +22,7 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::branch::types::{BranchId, MAX_BRANCH_DEPTH};
+use ferrodb::branch::types::BranchId;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
@@ -239,12 +239,11 @@ fn siblings_forked_from_one_parent_cannot_see_each_other() {
 #[test]
 fn a_read_on_a_deep_child_does_not_consult_its_ancestors() {
     const W: i32 = 200;
-    // The deepest legal chain, derived from the constant rather than hard-coded: the runtime
-    // refuses a fork past `MAX_BRANCH_DEPTH` ("branch b8@g0 is at ancestry depth 9, max is 8"),
-    // and the root session already sits at depth 1. Deriving it means this test keeps exercising
-    // the deepest chain the system allows if that constant ever moves, instead of silently
-    // testing a shallower one.
-    let depth = (MAX_BRANCH_DEPTH as usize) - 1;
+    // **There is no deepest legal chain since D60** — the cap this used to derive from is gone,
+    // and fork and read were measured flat to depth 250 (`bench/d60_depth_premise.txt`). So this
+    // goes far past where the old ceiling was: if a read ever started consulting ancestors, a
+    // 64-deep chain shows it where an 8-deep one might not.
+    let depth = 64usize;
     let mut db = Db::new();
     db.seed(W);
 
@@ -264,7 +263,7 @@ fn a_read_on_a_deep_child_does_not_consult_its_ancestors() {
         cur = s.branch;
         ancestors.push(cur);
     }
-    assert_eq!(ancestors.len(), MAX_BRANCH_DEPTH as usize, "the chain is not at maximum depth");
+    assert_eq!(ancestors.len(), depth + 1, "the chain is not as deep as this test claims");
     let deepest = ancestors.pop().expect("the chain has a deepest branch");
     let deepest_name = format!("b_{}", deepest.id);
 

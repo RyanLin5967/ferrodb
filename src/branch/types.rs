@@ -257,9 +257,13 @@ impl BranchState {
     }
 }
 
-/// Maximum ancestry depth before a branch is collapsed (materialised to a fresh root and
-/// re-parented to trunk). Cheap because ancestry lives only in branch metadata.
-pub const MAX_BRANCH_DEPTH: u8 = 8;
+// **There is no maximum ancestry depth — D60.** `MAX_BRANCH_DEPTH = 8` used to live here, with
+// `collapse` named as the escape and no production caller, so the ninth fork of any chain simply
+// failed. Measured before removing it (`bench/d60_depth_premise.txt`): fork and read are FLAT from
+// depth 1 to 250, because a branch's root is its parent's root at fork (CoW) and a read never
+// walks ancestry. The one thing the cap did protect was the recursion depth of
+// `has_live_children` over a chain of reaped interior nodes, which is iterative now
+// (`table_catalog.rs`). See `SCALE-DESIGN.md` D60.
 
 /// **Largest** arena extent size in pages (~1MB at 4KB pages).
 ///
@@ -314,8 +318,6 @@ pub enum BranchError {
     UnexpectedState { branch: BranchId, expected: BranchState, actual: BranchState },
     /// The lease expired; the branch is eligible for non-cooperative reaping.
     LeaseExpired { branch: BranchId, deadline: LeaseDeadline, now_millis: u64 },
-    /// Forking here would exceed `MAX_BRANCH_DEPTH`; collapse first.
-    DepthExceeded { branch: BranchId, depth: u8 },
     /// A write was attempted against a read-only or already-merged branch.
     NotWritable(BranchId),
     /// On-disk branch metadata failed to parse or failed its checksum.
@@ -344,11 +346,6 @@ impl Display for BranchError {
                 f,
                 "lease on branch {} expired at {} (now {})",
                 branch, deadline.0, now_millis
-            ),
-            BranchError::DepthExceeded { branch, depth } => write!(
-                f,
-                "branch {} is at ancestry depth {}, max is {}",
-                branch, depth, MAX_BRANCH_DEPTH
             ),
             BranchError::NotWritable(b) => write!(f, "branch {} is not writable", b),
             BranchError::Corrupt(s) => write!(f, "corrupt branch metadata: {}", s),

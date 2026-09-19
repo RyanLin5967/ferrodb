@@ -7,7 +7,7 @@
 //! `live_children` array. No page is read, written, or refcounted, which is exit criterion 1.
 
 use crate::branch::types::{
-    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
 use crate::catalog::column::Value;
 use crate::error::FerroError;
@@ -38,8 +38,13 @@ pub struct BranchRecord {
     /// Fork epochs of this branch's **live** children, kept sorted ascending. The reclamation
     /// rule is a range-emptiness query over this array: O(log k).
     pub live_children: Vec<Epoch>,
-    /// Ancestry depth; 0 for trunk. Collapse when this would exceed `MAX_BRANCH_DEPTH`.
-    pub depth: u8,
+    /// Ancestry depth; 0 for trunk.
+    ///
+    /// **`u32` since D60**, which removed the depth cap. It was a `u8` because a cap of 8 made
+    /// anything wider pointless — but `ferro_branches` publishes this column and `reap_expired`
+    /// orders by it, so a byte that saturated at 255 would have made a system view lie about a
+    /// deeper chain. See `serialize_core` for how a record written as a byte still loads.
+    pub depth: u32,
     /// **What this branch is permitted to write.** `None` means no envelope was ever installed,
     /// which is the pre-envelope shape and is ungoverned — see [`CapabilityEnvelope`] for why
     /// that is the compatibility default rather than "deny everything".
@@ -52,7 +57,7 @@ pub struct BranchRecord {
 
 /// Exact width of [`BranchRecord::serialize_core`]. Named so the encoder and the decoder cannot
 /// drift: both assert against it.
-pub const CORE_BYTES: usize = 51;
+pub const CORE_BYTES: usize = 54;
 
 /// A branch record as it is **stored**: the fixed-width core, with `arenas` empty and `envelope`
 /// `None` because both live in their own key spans and loading them costs a range scan.
@@ -121,7 +126,7 @@ impl CoreRecord {
     pub fn lease_deadline(&self) -> LeaseDeadline {
         self.0.lease_deadline
     }
-    pub fn depth(&self) -> u8 {
+    pub fn depth(&self) -> u32 {
         self.0.depth
     }
     pub fn fork_epoch(&self) -> Epoch {
@@ -214,7 +219,7 @@ impl BranchRecord {
     fn fork_child_parts(
         parent_branch_id: BranchId,
         parent_state: BranchState,
-        parent_depth: u8,
+        parent_depth: u32,
         parent_root_page_id: PageId,
         parent_envelope: Option<&CapabilityEnvelope>,
         child_id: BranchId,
@@ -224,10 +229,12 @@ impl BranchRecord {
         if parent_state != BranchState::Live {
             return Err(BranchError::NotWritable(parent_branch_id));
         }
-        let depth = parent_depth + 1;
-        if depth > MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch: parent_branch_id, depth });
-        }
+        // **No cap — D60.** Fork and read are flat across depth 1..250 (`bench/d60_depth_premise.txt`),
+        // so a limit here bought nothing and cost the objective: BranchBench's finding is about
+        // behaviour as branches DEEPEN, and a tree-search agent forks from its own children.
+        // `saturating_add` rather than `+` because a u32 that wrapped would report depth 0 for a
+        // branch 4 billion deep, and a wrong answer is worse than a large one.
+        let depth = parent_depth.saturating_add(1);
         Ok(BranchRecord {
             branch_id: child_id,
             generation: child_id.generation,
@@ -316,7 +323,7 @@ impl BranchRecord {
     //
     // |branch_id.id u64|branch_id.generation u32|generation u32|has_parent u8|
     // |parent.id u64|parent.generation u32|fork_epoch u64|root_page_id u32|
-    // |lease_deadline u64|state u8|depth u8|arena_len u32|arenas..u32|
+    // |lease_deadline u64|state u8|depth u32|arena_len u32|arenas..u32|
     // |child_len u32|children..u64|<envelope>|crc32 u32|
     // All integers big-endian, matching the rest of ferrodb's on-disk encodings.
     //
@@ -368,7 +375,7 @@ impl BranchRecord {
         b.extend_from_slice(&self.root_page_id.to_be_bytes());
         b.extend_from_slice(&self.lease_deadline.0.to_be_bytes());
         b.push(self.state.as_u8());
-        b.push(self.depth);
+        b.extend_from_slice(&self.depth.to_be_bytes());
         debug_assert_eq!(b.len(), CORE_BYTES);
         b
     }
@@ -381,9 +388,17 @@ impl BranchRecord {
     /// disk do not contain `arenas` or `envelope`, so the value this produces is not a whole
     /// record and must not be usable as one. See [`CoreRecord`].
     pub fn deserialize_core(bytes: &[u8]) -> Result<CoreRecord, BranchError> {
-        if bytes.len() != CORE_BYTES {
+        // **Two accepted lengths, and that is the same tolerant-read discipline this module
+        // already uses for the envelope — D60.** `depth` was the last field and one byte wide
+        // while the cap was 8; it is a `u32` now, so a record written before this change is
+        // exactly three bytes short. Reading its byte is the whole migration: no version tag, no
+        // rewrite pass, and a catalog written by an older build keeps loading. Pinned by
+        // `a_core_record_written_with_a_one_byte_depth_still_loads`.
+        const CORE_BYTES_U8_DEPTH: usize = CORE_BYTES - 3;
+        if bytes.len() != CORE_BYTES && bytes.len() != CORE_BYTES_U8_DEPTH {
             return Err(BranchError::Corrupt(format!(
-                "core branch record must be exactly {CORE_BYTES} bytes, got {}",
+                "core branch record must be {CORE_BYTES} bytes (or {CORE_BYTES_U8_DEPTH} from a \
+                 build before the depth field widened), got {}",
                 bytes.len()
             )));
         }
@@ -401,7 +416,11 @@ impl BranchRecord {
             root_page_id: u32_at(37),
             lease_deadline: LeaseDeadline(u64_at(41)),
             state: BranchState::from_u8(bytes[49])?,
-            depth: bytes[50],
+            depth: if bytes.len() == CORE_BYTES {
+                u32::from_be_bytes(bytes[50..54].try_into().unwrap())
+            } else {
+                bytes[50] as u32
+            },
             arenas: Vec::new(),
             live_children: Vec::new(),
             envelope: None,
@@ -429,7 +448,7 @@ impl BranchRecord {
         b.extend_from_slice(&self.root_page_id.to_be_bytes());
         b.extend_from_slice(&self.lease_deadline.0.to_be_bytes());
         b.push(self.state.as_u8());
-        b.push(self.depth);
+        b.extend_from_slice(&self.depth.to_be_bytes());
         b.extend_from_slice(&(self.arenas.len() as u32).to_be_bytes());
         for a in &self.arenas {
             b.extend_from_slice(&a.0.to_be_bytes());
@@ -476,7 +495,7 @@ impl BranchRecord {
         let root_page_id = c.u32()?;
         let lease_deadline = LeaseDeadline(c.u64()?);
         let state = BranchState::from_u8(c.u8()?)?;
-        let depth = c.u8()?;
+        let depth = c.u32()?;
         let arena_len = c.u32()? as usize;
         let mut arenas = Vec::with_capacity(arena_len);
         for _ in 0..arena_len {
@@ -1321,12 +1340,27 @@ mod tests {
         assert!(child.arenas.is_empty());
     }
 
+    /// **Replaces `depth_guard_fires_at_eight`, which D60 removed the guard for.** What is left
+    /// to pin is that depth keeps counting past the old cap and past the byte the field used to
+    /// be, and that it saturates rather than wrapping — a wrapped depth would report 0 for a very
+    /// deep branch, and `ferro_branches` publishes this column.
     #[test]
-    fn depth_guard_fires_at_eight() {
+    fn depth_counts_past_the_old_cap_and_saturates_instead_of_wrapping() {
         let mut r = BranchRecord::trunk(1, LeaseDeadline(0));
-        r.depth = MAX_BRANCH_DEPTH;
-        let err = BranchRecord::fork_child(&r, BranchId::new(2, 0), Epoch(1), LeaseDeadline(0));
-        assert!(matches!(err, Err(BranchError::DepthExceeded { .. })));
+        r.depth = 8;
+        let child = BranchRecord::fork_child(&r, BranchId::new(2, 0), Epoch(1), LeaseDeadline(0))
+            .expect("the ninth fork is allowed since D60");
+        assert_eq!(child.depth, 9);
+
+        r.depth = 300;
+        let deep = BranchRecord::fork_child(&r, BranchId::new(3, 0), Epoch(1), LeaseDeadline(0))
+            .expect("depth past a byte is allowed");
+        assert_eq!(deep.depth, 301, "the depth field no longer counts past 255");
+
+        r.depth = u32::MAX;
+        let capped = BranchRecord::fork_child(&r, BranchId::new(4, 0), Epoch(1), LeaseDeadline(0))
+            .expect("fork at the top of the range");
+        assert_eq!(capped.depth, u32::MAX, "depth wrapped instead of saturating");
     }
 
     #[test]
@@ -1430,7 +1464,7 @@ mod tests {
         b.extend_from_slice(&r.root_page_id.to_be_bytes());
         b.extend_from_slice(&r.lease_deadline.0.to_be_bytes());
         b.push(r.state.as_u8());
-        b.push(r.depth);
+        b.extend_from_slice(&r.depth.to_be_bytes());
         b.extend_from_slice(&(r.arenas.len() as u32).to_be_bytes());
         for a in &r.arenas {
             b.extend_from_slice(&a.0.to_be_bytes());

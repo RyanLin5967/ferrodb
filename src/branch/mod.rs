@@ -37,7 +37,7 @@ pub use record::{CoreRecord,
 };
 pub use types::{
     ArenaId, BranchError, BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId,
-    ARENA_EXTENT_PAGES, MAX_BRANCH_DEPTH,
+    ARENA_EXTENT_PAGES,
 };
 
 use crate::error::FerroError;
