@@ -129,3 +129,41 @@ fn a_shared_root_cell_lets_the_split_retry_fire() {
         );
     }
 }
+
+/// The wiring, not the mechanism.
+///
+/// The two tests above prove a shared cell behaves correctly. They say nothing about whether a
+/// *statement* ever gets one — and that gap is exactly where a fix silently stops working, because
+/// `open_table` falls back to a private cell for any tree the catalog has not registered. So this
+/// asserts the registry hands out the SAME cell twice, by pointer.
+#[test]
+fn the_catalog_hands_every_statement_the_same_root_cell() {
+    use ferrodb::catalog::catalog::Catalog;
+    use ferrodb::catalog::column::{Column, DataType};
+    use ferrodb::catalog::schema::Schema;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool(&dir, "registry.db");
+    let mut catalog = Catalog::create(bp.clone()).unwrap();
+    let schema = Schema::new(vec![Column {
+        name: "id".into(),
+        data_type: DataType::Integer,
+        nullable: false,
+    }]);
+    catalog.create_table("t".into(), schema).unwrap();
+
+    let a = catalog.root_cell("t", None).expect("the primary root cell must be registered");
+    let b = catalog.root_cell("t", None).expect("the primary root cell must be registered");
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "two lookups returned different cells, so two statements would hold independent root \
+         pointers and the split retry would be dormant again"
+    );
+
+    // And a tree the catalog never registered must be absent rather than silently fabricated —
+    // `open_table`'s private-cell fallback is only correct because this returns None.
+    assert!(
+        catalog.root_cell("no_such_table", None).is_none(),
+        "the registry invented a cell for a table that does not exist"
+    );
+}
