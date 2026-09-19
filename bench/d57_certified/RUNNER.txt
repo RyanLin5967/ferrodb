@@ -1,0 +1,2 @@
+D57-overlay-c: mode=per-target rc=0 passed=2115 failed=0 build_errors=0 head=7c1e6d8 log=/Users/idide/wt/artie-research/verify-out-d57c/suite-D57-overlay-c.log
+D57-overlay-c: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d57c/suite-D57-overlay-c.go.log
