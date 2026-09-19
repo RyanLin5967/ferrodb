@@ -317,3 +317,72 @@ fn only_the_pool_may_write_lock_a_frame_directly() {
          searches for no longer matches the code, so it is passing by finding nothing"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The convention the stale-example guards now rely on
+// ---------------------------------------------------------------------------------------------
+
+/// **Every `src/**/tests_*.rs` is `#[cfg(test)]`-gated, so it does not link into a binary.**
+///
+/// Thirteen integration tests refuse to run against an example binary older than `src/`, because
+/// `cargo test` does not rebuild examples and a stale binary silently tests the code from before
+/// the change. Those guards now SKIP `tests_*.rs`, because editing one cannot make an example
+/// stale — `cargo build --examples` correctly does not rebuild for it, and counting it failed 53
+/// tests across 5 targets on a tree whose examples were fresh.
+///
+/// That skip is only sound while the convention holds. If a `tests_*.rs` were ever compiled into
+/// the library proper, the guards would stop noticing a real staleness — the silent direction.
+/// So the convention is checked here rather than trusted: every such file must be declared under
+/// a `#[cfg(test)]`, in either spelling the tree uses (`mod tests_x;` or `#[path = "tests_x.rs"]`).
+#[test]
+fn test_only_sources_are_cfg_test_gated() {
+    let src = Path::new("src");
+    let mut files = Vec::new();
+    rust_files(src, &mut files);
+    let test_only: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")))
+        .cloned()
+        .collect();
+    assert!(
+        test_only.len() >= 8,
+        "found only {} `tests_*.rs` files under src/; the guards' skip pattern may no longer match \
+         anything, which would make this check pass by finding nothing",
+        test_only.len()
+    );
+
+    let mut ungated = Vec::new();
+    for path in &test_only {
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let dir = path.parent().unwrap();
+        let mut gated = false;
+        for sibling in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let sp = sibling.path();
+            if sp == *path || sp.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let code = std::fs::read_to_string(&sp).unwrap_or_default();
+            let decl_plain = format!("mod {stem};");
+            let decl_path = format!("path = \"{stem}.rs\"");
+            for (i, line) in code.lines().enumerate() {
+                if line.contains(&decl_plain) || line.contains(&decl_path) {
+                    // The gate sits on one of the two lines above the declaration.
+                    let start = i.saturating_sub(2);
+                    if code.lines().skip(start).take(i - start + 1).any(|l| l.contains("cfg(test)")) {
+                        gated = true;
+                    }
+                }
+            }
+        }
+        if !gated {
+            ungated.push(path.to_string_lossy().to_string());
+        }
+    }
+    assert!(
+        ungated.is_empty(),
+        "these `tests_*.rs` files are compiled into the library, not just its tests: {ungated:?}\n\
+         The stale-example guards in tests/ skip files named `tests_*`, so a change to one of \
+         these would leave every example binary stale WITHOUT any guard noticing. Either gate it \
+         with #[cfg(test)] or rename it so the guards count it."
+    );
+}
