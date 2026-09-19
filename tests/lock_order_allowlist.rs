@@ -255,3 +255,65 @@ fn the_scanner_catches_a_pool_method_missing_its_marker() {
     let parsed = methods_of(marked);
     assert!(takes_a_pool_lock(&parsed[0].1) && parsed[0].1.contains("enter_pool()"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// D58 — every frame WRITE goes through `frame_write`, and this is what keeps that true
+// ---------------------------------------------------------------------------------------------
+
+/// The one file that may take a frame's write lock directly: it defines `frame_write`, whose
+/// guard refreshes the frame's seqlock shadow on drop.
+const FRAME_WRITE_OWNER: &str = "src/buffer/buffer_pool.rs";
+
+/// Spellings of a raw frame write lock. A raw lock skips the shadow refresh, and an optimistic
+/// reader (`read_page_optimistic`) would then read a page that was rewritten as if it were not —
+/// silently, for ever, with a stable even version. That is a wrong row with no error anywhere,
+/// so it is refused at the source rather than found in production.
+fn raw_frame_write_sites(code: &str) -> Vec<String> {
+    code.lines()
+        .filter(|l| {
+            let l = l.trim();
+            (l.contains("frames[") && (l.contains("].write()") || l.contains("].try_write()") || l.contains("].get_mut()")))
+                || l.contains("frames.get_mut(")
+                || l.contains("frames.iter_mut(")
+        })
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+#[test]
+fn only_the_pool_may_write_lock_a_frame_directly() {
+    let src = Path::new("src");
+    let mut files = Vec::new();
+    rust_files(src, &mut files);
+    assert!(!files.is_empty());
+
+    let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
+    let mut owner_sites = 0usize;
+    for path in &files {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let code = strip_line_comments(&std::fs::read_to_string(path).expect("read source"));
+        let sites = raw_frame_write_sites(&code);
+        if sites.is_empty() {
+            continue;
+        }
+        if rel == FRAME_WRITE_OWNER {
+            owner_sites += sites.len();
+        } else {
+            offenders.push((rel, sites));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "raw frame write locks outside {FRAME_WRITE_OWNER}: {offenders:#?}\n\
+         Use `BufferPoolManager::frame_write(i)`: its guard refreshes the frame's shadow on drop, \
+         which is the only way an optimistic reader ever sees the write (D58, \
+         `FrameShadow` in buffer_pool.rs)."
+    );
+    // The detector must be able to fire: the owner takes the raw lock exactly where the guard is
+    // built. Zero matches everywhere would mean the spelling changed and this test went blind.
+    assert!(
+        owner_sites >= 1,
+        "no raw frame write lock found even in {FRAME_WRITE_OWNER}; the pattern this guard \
+         searches for no longer matches the code, so it is passing by finding nothing"
+    );
+}

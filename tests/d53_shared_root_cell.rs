@@ -86,19 +86,42 @@ fn a_private_root_cell_makes_the_split_retry_dormant() {
         "the two handles must disagree about the root; that disagreement IS the defect"
     );
 
-    // And the consequence: descending from a stale root cannot see every key. We assert the
-    // OUTCOME, not just the pointer, because a pointer difference that changed no answer would
-    // not be worth a fix.
-    let mut missed = 0;
+    // And the consequence. We assert the OUTCOME, not just the pointer, because a pointer
+    // difference that changed no answer would not be worth a fix.
+    //
+    // ⚠ D58 moved WHERE the outcome shows. This used to assert that a point READ from the stale
+    // root misses keys, and it did: the stale root is the left half of the tree. Since D58 the
+    // read descent takes no latch and repairs a stale descent the B-link way — it walks the leaf
+    // chain right while the leaf tops out below the key — so a stale ROOT no longer changes a
+    // point-read answer at all, and that assertion became vacuous. The design entry (D53, D58
+    // addendum) records this. The hazard is unchanged on the WRITE descent, which is latched and
+    // has no walk: an insert through the stale root lands the key in the left half's last leaf,
+    // above that leaf's separator, where a descent from the TRUE root cannot find it.
+    let mut found_by_stale_read = 0;
     for k in 1..=n {
-        if reader.search(&Value::Integer(k)).unwrap().is_none() {
-            missed += 1;
+        if reader.search(&Value::Integer(k)).unwrap().is_some() {
+            found_by_stale_read += 1;
+        }
+    }
+    assert_eq!(
+        found_by_stale_read, n,
+        "the latch-free read descent no longer repairs a stale root: D58's B-link walk is broken"
+    );
+    let extra = 40;
+    for k in (n + 1)..=(n + extra) {
+        reader.insert(Value::Integer(k), Value::Integer(k)).unwrap();
+    }
+    let mut missed_by_true_root = 0;
+    for k in (n + 1)..=(n + extra) {
+        if writer.search(&Value::Integer(k)).unwrap().is_none() {
+            missed_by_true_root += 1;
         }
     }
     assert!(
-        missed > 0,
-        "a handle on a stale private root found all {n} keys, so the stale pointer changed no \
-         answer -- D53's premise would be wrong and the design entry must be corrected"
+        missed_by_true_root > 0,
+        "{extra} keys inserted through a stale private root were all found from the true root, so \
+         the stale pointer changed no answer -- D53's premise would be wrong and the design entry \
+         must be corrected"
     );
 }
 

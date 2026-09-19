@@ -674,6 +674,17 @@ impl BufferPoolManager {
     /// the caller ask later whether the page it read is still the page in that frame.
     pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
         let frame_i = self.page_table.lookup(page_id)?;
+        self.read_frame_optimistic(frame_i, page_id)
+    }
+
+    /// The second half of [`Self::read_page_optimistic`]: read `frame_i`'s shadow as `page_id`,
+    /// or `None` if the frame does not (stably) hold that page. Split out and hidden because it
+    /// is a TEST SEAM: the page-table hint can be stale by the time the shadow is read — the
+    /// frame evicted and reused for another page in between — and that interleaving is nanoseconds
+    /// wide, so `tests/d58_latch_free_descent.rs` forces it by taking the hint, churning the
+    /// frame, and then calling this. The `label` check is what makes it return `None` there.
+    #[doc(hidden)]
+    pub fn read_frame_optimistic(&self, frame_i: usize, page_id: u32) -> Option<OptimisticPage> {
         let shadow = &self.shadows[frame_i];
         let v1 = shadow.version.load(Ordering::Acquire);
         if v1 & 1 == 1 {

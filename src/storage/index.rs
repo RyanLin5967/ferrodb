@@ -215,7 +215,108 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// answer sound: a split of the child has to write-latch the parent, so while this thread
     /// holds the parent in read mode the child cannot be split away from under the pointer it
     /// just read.
+    /// The point-read descent, **taking nothing shared** — D58.
+    ///
+    /// The latched crabbing below (`read_leaf_for_latched`) is correct and was the wall: the
+    /// latch table is one mutex for every page, and even a per-page latch writes the root's word
+    /// once per read, which D51 measured as the ×0.12 class at 16 threads
+    /// (`bench/d51_sharedword_probe.txt`; `bench/d58_profile_16T_read_window.sample.txt`). This
+    /// path reads each page as a torn-free snapshot through the frame's seqlock shadow
+    /// (`BufferPoolManager::read_page_optimistic`) — loads only — and repairs a stale descent the
+    /// way Lehman & Yao's B-link tree does: a split writes the new right sibling first, then the
+    /// halved leaf with its `next` set, then the parent, so a reader that descended through a
+    /// parent from before the split lands on a leaf to the LEFT of the key's true leaf, and walks
+    /// `next` while the leaf's largest key is below the key. Internal nodes have no `next`, but a
+    /// stale internal node sends the reader down its LAST child, whose subtree tops out below the
+    /// key, and the leaf chain is global across the level — so the leaf walk repairs a stale
+    /// descent at any height. Nothing here validates the parent, and nothing needs to.
+    ///
+    /// Both loops are bounded; past the bound, or on any page that is not resident under its
+    /// hint, the latched path answers. It is always correct, only slow.
+    ///
+    /// What makes a snapshot safe to descend: leaves never go underfull (nothing frees a tree
+    /// page except `free_all`, under the exclusive catalog lock with readers drained), so a page
+    /// this reader copied cannot have been reused as something else mid-descent.
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
+        const RESTARTS: usize = 16;
+        const RIGHT_WALK: usize = 64;
+        'restart: for _ in 0..RESTARTS {
+            let root = self.root_page_id.load(Ordering::Acquire);
+            let Some(page) = self.buffer_pool.read_page_optimistic(root) else { continue 'restart };
+            // A root split moved the root cell; the page read was the OLD root, which is now an
+            // ordinary child — descending it would still be repaired by the leaf walk, but it is
+            // cheaper to start again from the new root than to walk half the level.
+            if self.root_page_id.load(Ordering::Acquire) != root {
+                continue 'restart;
+            }
+            let node = match BPlusTreePage::<K, V>::deserialize(page.data) {
+                Ok(n) => n,
+                Err(_) => continue 'restart,
+            };
+            match self.descend_optimistic(node, root, key, RIGHT_WALK)? {
+                Some(found) => return Ok(found),
+                None => continue 'restart,
+            }
+        }
+        self.read_leaf_for_latched(key)
+    }
+
+    /// The body of [`Self::read_leaf_for`] from an already-copied starting page: descend by
+    /// snapshots, then walk right at the leaf. `Ok(None)` means "restart" — a page was not
+    /// resident under its hint, a snapshot tore, or the walk exceeded `right_walk` hops.
+    ///
+    /// Public and hidden because it is a TEST SEAM: `tests/d58_latch_free_descent.rs` hands it a
+    /// root snapshot taken BEFORE a split and asserts the moved key is still found — the
+    /// interleaving the B-link walk exists for, which cannot be forced through `read_leaf_for`
+    /// without pausing a writer mid-split. Not part of the API; nothing else may call it.
+    #[doc(hidden)]
+    pub fn descend_optimistic(
+        &self,
+        mut node: BPlusTreePage<K, V>,
+        mut curr: u32,
+        key: &K,
+        right_walk: usize,
+    ) -> Result<Option<(u32, BPlusTreeLeafPage<K, V>)>, FerroError> {
+        loop {
+            match node {
+                BPlusTreePage::Leaf(mut leaf) => {
+                    // B-link repair: the key may have moved right in a split this descent did
+                    // not see. Walk while the leaf tops out below the key.
+                    let mut hops = 0;
+                    while leaf.key_arr.last().is_some_and(|max| max < key) {
+                        let Some(next) = leaf.next else { break };
+                        hops += 1;
+                        if hops > right_walk {
+                            return Ok(None);
+                        }
+                        let Some(np) = self.buffer_pool.read_page_optimistic(next) else { return Ok(None) };
+                        match BPlusTreePage::<K, V>::deserialize(np.data) {
+                            Ok(BPlusTreePage::Leaf(l)) => {
+                                curr = next;
+                                leaf = l;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    return Ok(Some((curr, leaf)));
+                }
+                BPlusTreePage::Internal(n) => {
+                    let child = n.find_child(key);
+                    let Some(cp) = self.buffer_pool.read_page_optimistic(child) else { return Ok(None) };
+                    node = match BPlusTreePage::<K, V>::deserialize(cp.data) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(None),
+                    };
+                    curr = child;
+                }
+            }
+        }
+    }
+
+    /// The latched descent: read-crabbing from the root. Correct under every interleaving, and
+    /// the fallback for [`Self::read_leaf_for`] when a page is not resident or a snapshot keeps
+    /// tearing. See the ordering discipline in `page_latch.rs`.
+    fn read_leaf_for_latched(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
             let mut guard = self.latches().read(root);
