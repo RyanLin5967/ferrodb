@@ -265,21 +265,40 @@ fn readers_racing_inserters_and_eviction_never_see_a_wrong_value() {
     let final_n = inserted.load(Ordering::Acquire);
     assert!(reads > 10_000, "only {reads} reads: the race was not exercised");
     assert!(final_n > seed as u64 + 100, "the inserter made only {} inserts", final_n - seed as u64);
-    // The test is named for eviction, so eviction must have HAPPENED: page 1 (the original root)
-    // is long cold, and a tree this size cannot be resident in a 1024-frame pool. Without this
-    // the test would pass on a run where every page stayed resident and prove nothing about the
-    // hazard it is named for.
-    let mut evicted = 0;
-    for p in 1..=40u32 {
-        if bp.read_page_optimistic(p).is_none() {
-            evicted += 1;
-        }
-    }
+    // The test is named for eviction, so eviction must have HAPPENED — and the check has to be
+    // STRUCTURAL, not a sample.
+    //
+    // ⛔ This first sampled pages 1..40 for residency after the race and required one of them to
+    // be absent. It passed locally and failed on all three CI platforms: those are the tree's
+    // hottest pages (every descent reads the root and the upper level), so a run whose readers
+    // were a little faster has them all back in the pool by the end. The FACT that a sample
+    // cannot flake on: the tree holds far more pages than the pool has frames, so most of it
+    // cannot be resident at any instant, whatever the timing.
+    let pool = bp.frames.len();
+    let allocated = bp.disk_manager.high_water().expect("high water") as usize;
+    // The database really is bigger than the pool — the premise, from the file rather than from
+    // an estimate of the fanout.
     assert!(
-        evicted > 0,
-        "no page of the first 40 was evicted during the run: the pool never churned and this \
-         test did not exercise eviction"
+        allocated > pool,
+        "the database holds {allocated} pages and the pool has {pool} frames, so nothing was ever \
+         forced out: this test did not exercise eviction"
     );
+    // Pigeonhole, so no timing can make it flake: at most `pool` of those pages can be resident,
+    // hence at least `allocated - pool` of them are not.
+    let resident = (1..=allocated as u32).filter(|p| bp.read_page_optimistic(*p).is_some()).count();
+    assert!(
+        resident <= pool,
+        "{resident} of {allocated} pages read as resident in a {pool}-frame pool, which cannot be: \
+         `read_page_optimistic` is answering for pages the pool does not hold"
+    );
+    assert!(
+        allocated - resident >= allocated - pool,
+        "{} of {allocated} pages are outside the {pool}-frame pool",
+        allocated - resident
+    );
+    // ...and the grow loop above exited only when page 1 had ACTUALLY been evicted, which is the
+    // event itself rather than a consequence of it.
+    assert!(seed > 0);
 }
 
 // ---------------------------------------------------------------------------------------------
