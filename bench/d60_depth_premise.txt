@@ -1,0 +1,67 @@
+D60 — PREMISE: fork and read cost vs branch DEPTH, with MAX_BRANCH_DEPTH raised to 255 (probe branch only).
+[HERE] 2026-09-19T20:37:05Z examples/d60_depth_probe.rs, load=49.49 41.89 32.08 (another session's builds are running; the reading is the SLOPE)
+First run's depth-250 panic was the probe reading id 200, which level 199 writes; fixed to id 300.
+
+## run 1
+# D60 depth probe. max_depth=250. read = SELECT of a ROOT row at the chain's leaf.
+depth   fork_us(med)   read_us(med)   rows
+    1           46.2            9.4   1
+    2           44.0            9.7   1
+    4            8.3            7.7   1
+    8            3.4            9.5   1
+   16            2.4            9.6   1
+   32            2.2            9.6   1
+   64            1.9            9.2   1
+  128            2.6            9.2   1
+  250            3.5            9.2   1
+# chain reached depth 250 with every fork admitted.
+# rc=0
+
+## run 2
+# D60 depth probe. max_depth=250. read = SELECT of a ROOT row at the chain's leaf.
+depth   fork_us(med)   read_us(med)   rows
+    1           10.3            7.5   1
+    2            8.5            7.8   1
+    4            6.0            7.8   1
+    8            1.4            7.7   1
+   16            2.9            7.5   1
+   32            1.2            7.4   1
+   64            1.8            7.5   1
+  128            2.4            9.3   1
+  250            2.6            7.2   1
+# chain reached depth 250 with every fork admitted.
+# rc=0
+
+## run 3
+# D60 depth probe. max_depth=250. read = SELECT of a ROOT row at the chain's leaf.
+depth   fork_us(med)   read_us(med)   rows
+    1           18.2            9.8   1
+    2           13.8            8.1   1
+    4            6.4            9.5   1
+    8            1.8            8.7   1
+   16            3.5            9.5   1
+   32            2.2            9.3   1
+   64            1.8            9.5   1
+  128            2.6            9.4   1
+  250            3.5            9.4   1
+# chain reached depth 250 with every fork admitted.
+# rc=0
+
+
+=== READING ===
+Premises 1 and 2 of SCALE-DESIGN D60, three runs, depth 1 -> 250 (31x past the cap of 8):
+
+  read of a ROOT row at the chain's leaf:   9.4 -> 9.2 us, 7.5 -> 7.2 us, 9.8 -> 9.4 us   FLAT
+  fork (median of every fork since the last checkpoint): ~2-3.5 us from depth 8 to 250    FLAT
+      (depths 1-4 are warm-up: the first forks pay allocator and cache cold-start)
+
+So the design entry's hypothesis holds on the two paths that would make a depth limit legitimate:
+a read is one descent of the leaf's OWN root (CoW), and a fork copies no ancestry. This is ZFS,
+not qcow2 -- a qcow2 backing chain costs a probe per level on every read, which is exactly the
+case where a depth limit (and `qemu-img commit`) is the right answer. Here it is not.
+
+Premise 3 (the one depth-dependent recursion, has_live_children over a chain of reaped interior
+nodes) is not measured by this probe: its recursion depth is the length of a reaped chain, which
+the u8 depth field and the cap bound today. It is answered by the fix itself -- the recursion is
+made iterative, and a test drives a reaped chain far past 255 that must neither overflow nor
+answer wrongly.
