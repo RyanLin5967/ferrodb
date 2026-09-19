@@ -23,7 +23,9 @@
 //! * `plain` — the same SELECT with no agent session.
 //!
 //! Env: `D56_ROWS` (default 5000), `D56_ANALYZE=1` (the ceiling arm: the plan the engine already
-//! trusted), `D56_ARM=agent|plain|both`, `D56_LABEL`.
+//! trusted), `D56_ARM=agent|plain|both`, `D56_LABEL`, and `D56_STAGED` (default 10) — the rows the
+//! agent branch stages before reading. D57 sweeps THIS axis at a fixed table size: `visible_rows_where`
+//! walks every staged row under the State mutex per read, so O(W) shows as ~1/W across it.
 //!
 //! Refuses rather than reporting: zero iterations, or a statement that did not return exactly one
 //! row — a read that found nothing would otherwise look like a very fast read.
@@ -50,7 +52,6 @@ use ferrodb::wal::txn::TxnManager;
 const WARMUP: Duration = Duration::from_millis(300);
 const MEASURE: Duration = Duration::from_millis(1000);
 const ROUNDS: usize = 3;
-const STAGED: usize = 10;
 
 struct Server {
     ctx: Arc<ServerContext>,
@@ -138,7 +139,7 @@ fn build(dir: &std::path::Path, rows: i64, analyze: bool) -> Server {
 
 /// stmt/s for one point, as the MEDIAN of `ROUNDS` timed windows. Refuses on a window that did no
 /// work, or on a statement that did not return exactly one row.
-fn measure(s: &Server, agent: bool, rows: i64) -> (f64, Vec<f64>) {
+fn measure(s: &Server, agent: bool, rows: i64, staged: usize) -> (f64, Vec<f64>) {
     let mut sess = Session::new();
     let mut cache: Option<(u64, Arc<Catalog>)> = None;
     let slot = Arc::new(AtomicBool::new(false));
@@ -146,7 +147,11 @@ fn measure(s: &Server, agent: bool, rows: i64) -> (f64, Vec<f64>) {
 
     if agent {
         exec(s, "BEGIN AGENT SESSION AS 'a0' RUN 'r0';", &mut sess, &mut cache, &slot);
-        for i in 0..STAGED {
+        assert!(
+            (staged as i64) < rows,
+            "REFUSING: staged={staged} would stage the key under test (rows={rows}); the read must hit the base table"
+        );
+        for i in 0..staged {
             let id = (i as i64) % rows + 1;
             exec(
                 s,
@@ -189,6 +194,7 @@ fn main() {
     let rows: i64 = std::env::var("D56_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
     let analyze = std::env::var("D56_ANALYZE").is_ok();
     let arm = std::env::var("D56_ARM").unwrap_or_else(|_| "both".into());
+    let staged: usize = std::env::var("D56_STAGED").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     let label = std::env::var("D56_LABEL").unwrap_or_else(|_| "unlabelled".into());
     let dir = std::env::temp_dir().join(format!("ferrodb-d56-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -198,10 +204,10 @@ fn main() {
             continue;
         }
         let s = build(&dir, rows, analyze);
-        let (median, per_round) = measure(&s, is_agent, rows);
+        let (median, per_round) = measure(&s, is_agent, rows, staged);
         let detail: Vec<String> = per_round.iter().map(|v| format!("{v:.0}")).collect();
         println!(
-            "{label}  arm={name}  rows={rows}  analyze={analyze}  median={median:.0} stmt/s  rounds=[{}]",
+            "{label}  arm={name}  rows={rows}  staged={staged}  analyze={analyze}  median={median:.0} stmt/s  rounds=[{}]",
             detail.join(", ")
         );
     }
