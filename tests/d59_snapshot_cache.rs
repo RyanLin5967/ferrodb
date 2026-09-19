@@ -363,3 +363,42 @@ fn recovery_moves_the_version_for_a_thread_that_already_cached_a_snapshot() {
     assert_eq!(after.high_water, locked.high_water, "recovery raised the watermark unseen");
     assert!(after.high_water > id, "the fixture's transaction {id} is not below the watermark");
 }
+
+/// **Deterministic companion to the race test above.** That test caught the unlocked
+/// raise-then-bump ordering once in a full suite run, and when measured against the mutant it
+/// fired in 3 of 8 runs — a detector that misses a real bug most of the time. The outcome it
+/// guards is "(watermark, version) change as one fact", and the mechanism that makes that
+/// certain is that a raise happens INSIDE the table's critical section. So: hold the table lock
+/// on this thread, raise on another, and the watermark must not move until the lock is dropped.
+/// The mutant (raise outside the lock) fails this every time.
+#[test]
+fn a_watermark_raise_waits_for_the_table_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = manager(&dir, "raiselock");
+    let before = t.next_txn_id();
+    let target = before + 500;
+
+    let held = t.att_read();
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let raiser = {
+        let (t, started) = (t.clone(), started.clone());
+        std::thread::spawn(move || {
+            started.wait();
+            t.raise_next_txn_id(target);
+        })
+    };
+    started.wait();
+    // Give an unlocked raise every chance to complete. A locked one blocks until `held` drops,
+    // however long this is; an unlocked one finishes in microseconds.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        t.next_txn_id(),
+        before,
+        "the id watermark moved from {before} while another thread held the transaction table's \
+         lock: the raise is not inside the critical section that bumps the version, so a reader \
+         can see the new watermark at the old version"
+    );
+    drop(held);
+    raiser.join().unwrap();
+    assert!(t.next_txn_id() >= target, "the raise never happened");
+}

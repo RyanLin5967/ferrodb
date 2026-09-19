@@ -896,13 +896,23 @@ impl TxnManager {
     /// holds no range and still refuses to begin a transaction until the leader grants one — the
     /// watermark says what was used, never what may be used.
     pub fn raise_next_txn_id(&self, at_least: u64) {
+        // **`high_water` is half of a snapshot and the ATT does not cover it**, so a raise must
+        // move the version — and it must move it ATOMICALLY with the watermark, under the same
+        // lock `read_snapshot_cached`'s miss path reads the watermark under.
+        //
+        // The first fix raised the watermark and then bumped the version, unlocked. The
+        // strengthened race test caught it on the next suite run: a reader loaded version V, hit
+        // its cache (high_water H), and between the raise and the bump the locked read already
+        // saw H+1000 while the version still said V — "the version did not move (3758) but the
+        // cached high_water is 626254 against the locked 627254". Bumping first is wrong the other
+        // way (a miss at V+1 can read the watermark before the raise and cache it as V+1). Only
+        // doing both inside one critical section makes (watermark, version) a single fact.
+        //
+        // The only other writer of the watermark is `begin`, which `take`s an id inside the
+        // `att_write` critical section that also inserts it — already atomic by construction.
+        // `apply_txn_id_grant` moves the ACCEPTED range, never `issued`.
+        let _att = self.att_read();
         self.txn_ids.raise_issued_through(at_least);
-        // **`high_water` is half of a snapshot and the ATT does not cover it.** `begin` issues an
-        // id and inserts into the table in one critical section, so ordinary operation moves the
-        // version anyway — but recovery and a cluster `TxnIdRange` grant raise the watermark with
-        // the table untouched, and a thread holding a cached snapshot would keep an old
-        // `high_water` for as long as no transaction began or ended. Found by a fresh-context
-        // review of D59's first version, which argued claim (c) instead of enforcing it.
         self.att_version.fetch_add(1, Ordering::Release);
     }
 
