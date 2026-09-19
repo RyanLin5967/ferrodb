@@ -1375,16 +1375,12 @@ impl AgentRuntime {
             where_clause.as_ref(),
             bound_where.as_ref(),
         )?;
-        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
-        for (rid, row) in rows {
-            let keep = match &bound_where {
-                Some(p) => matches!(evaluate(p, &row)?, Value::Boolean(true)),
-                None => true,
-            };
-            if keep {
-                matched.push((rid, row));
-            }
-        }
+        // `visible_rows_where` is the SINGLE authority for the predicate: it pushed it into the
+        // base scan and applied it to the staged overlay. This used to re-evaluate every returned
+        // row, and that second filter masked a broken first one — a mutant that forgot to filter
+        // the overlay survived `tests/d55_pushdown_commutes.rs` because this loop caught what it
+        // let through. Two filters is one you cannot test.
+        let matched: Vec<(RowId, Vec<Value>)> = rows;
 
         // Record the read-set against the *reading* session, if there is one.
         if let Some(reader_branch) = reader {
