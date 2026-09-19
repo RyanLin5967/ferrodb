@@ -286,6 +286,22 @@ fn main() {
     println!("# staged rows per branch: {STAGED:?} -- the upper figure is D27's measured 4000.");
 
     let rev = std::env::var("D55_ARM_ORDER").map(|v| v == "BA").unwrap_or(false);
+
+    // D55_QUICK=1: the shared arm at staged=10 only -- the exact block the full baseline sweep
+    // produced first, so a before/after on it is same-harness, same-mode. The full sweep is the
+    // design-record artifact; this is the falsifier, and it runs in minutes rather than an hour.
+    if std::env::var("D55_QUICK").is_ok() {
+        println!("# QUICK: shared arm, staged=10 only");
+        let a = run_arm(&dir, true, 10, "SHARED  (ONE ServerContext)");
+        println!();
+        println!("threads   shared_vs_1T   shared_abs");
+        for (i, &t) in POINTS.iter().enumerate() {
+            println!("{t:>7}   {:>12.3}   {:>10.0}", a[i] / a[0], a[i]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
     let mut out: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
     for &staged in STAGED.iter() {
         let (a, b) = if rev {

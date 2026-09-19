@@ -1252,7 +1252,48 @@ impl AgentRuntime {
         branch: Option<BranchId>,
         table: &str,
     ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
-        let base = scan_table(table, ctx)?;
+        self.visible_rows_where(ctx, branch, table, None, None, None)
+    }
+
+    /// The rows of `table` satisfying a predicate, as `branch` sees them.
+    ///
+    /// `raw` goes to the planner (so the base scan can use an index); `bound` is applied to the
+    /// staged overlay. They must be the SAME predicate in two forms, and the caller binds it once.
+    ///
+    /// # Why applying the predicate to both sides is correct
+    ///
+    /// The unfiltered form computes `filter(pred, base ⊕ staged)` where `⊕` is a per-key overlay:
+    /// a staged `Present` replaces the base row, a staged `Deleted` removes it. This computes
+    /// `filter(pred, base) ⊕' filter(pred, staged)`, and the two are equal because the overlay is
+    /// per-KEY and the predicate is per-ROW:
+    ///
+    /// * key in both — staged wins, so only `pred(staged_version)` matters → the staged version
+    ///   is inserted if it passes and the key is REMOVED if it fails (a base row that passed must
+    ///   not survive its own staged replacement failing)
+    /// * key in base only — `pred(base_version)`, which the planner already applied
+    /// * key staged only (a branch INSERT) — `pred(staged_version)`
+    /// * staged `Deleted` — removed on both sides
+    ///
+    /// ⚠ That equality holds for ROW predicates only. A predicate that reads across rows does not
+    /// commute with the overlay and must never be pushed here. `select` refuses joins before it
+    /// gets this far, and there is no aggregate on this path, so the boundary holds by
+    /// construction today — it is stated so the next reader does not widen it silently.
+    fn visible_rows_where(
+        &self,
+        ctx: &ReadCtx,
+        branch: Option<BranchId>,
+        table: &str,
+        alias: Option<&str>,
+        raw: Option<&Expr>,
+        bound: Option<&BoundExpr>,
+    ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
+        debug_assert_eq!(
+            raw.is_some(),
+            bound.is_some(),
+            "raw and bound must be the same predicate in two forms, or the two sides of the \
+             overlay are filtered differently"
+        );
+        let base = scan_table_where(table, alias, raw, ctx)?;
         let tbl = table_id(table);
         let mut rows: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         for r in base {
@@ -1267,7 +1308,17 @@ impl AgentRuntime {
                     }
                     match st {
                         RowState::Present(v) => {
-                            rows.insert(*row, v.clone());
+                            let keep = match bound {
+                                Some(p) => matches!(evaluate(p, v)?, Value::Boolean(true)),
+                                None => true,
+                            };
+                            if keep {
+                                rows.insert(*row, v.clone());
+                            } else {
+                                // The staged version is what this branch sees, and it fails
+                                // the predicate -- so the base version that passed must go.
+                                rows.remove(row);
+                            }
                         }
                         RowState::Deleted => {
                             rows.remove(row);
@@ -1316,17 +1367,20 @@ impl AgentRuntime {
         };
         let (proj, _out) = binder.bind_projection(columns.clone(), &scope)?;
 
-        let rows = self.visible_rows(ctx, Some(branch), &from.name)?;
-        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
-        for (rid, row) in rows {
-            let keep = match &bound_where {
-                Some(p) => matches!(evaluate(p, &row)?, Value::Boolean(true)),
-                None => true,
-            };
-            if keep {
-                matched.push((rid, row));
-            }
-        }
+        let rows = self.visible_rows_where(
+            ctx,
+            Some(branch),
+            &from.name,
+            from.alias.as_deref(),
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
+        // `visible_rows_where` is the SINGLE authority for the predicate: it pushed it into the
+        // base scan and applied it to the staged overlay. This used to re-evaluate every returned
+        // row, and that second filter masked a broken first one — a mutant that forgot to filter
+        // the overlay survived `tests/d55_pushdown_commutes.rs` because this loop caught what it
+        // let through. Two filters is one you cannot test.
+        let matched: Vec<(RowId, Vec<Value>)> = rows;
 
         // Record the read-set against the *reading* session, if there is one.
         if let Some(reader_branch) = reader {
@@ -4734,12 +4788,38 @@ fn apply_dml_in(
 }
 
 /// Every row of a table as the shared (merged) state has it.
+/// Every row of `table`, unfiltered. The callers that diff, merge and sweep want exactly that.
 pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
+    scan_table_where(table, None, None, ctx)
+}
+
+/// The rows of `table` that satisfy `where_clause`, with the predicate PUSHED INTO THE PLANNER.
+///
+/// # Why this exists
+///
+/// `scan_table` built `SELECT * FROM t` with `where_clause: None` and materialised every row,
+/// and `visible_rows` only applied the statement's own `WHERE` afterwards. So an agent-session
+/// `SELECT … WHERE id = k` read the ENTIRE table to keep one row — O(table) per statement,
+/// where the plain path for the identical query is O(log N) through the B+tree. D55 measured
+/// the gap on this box before this change; `bench/d55_*` holds the numbers. This is the same
+/// shape as D28 (system views materialise, then filter), at the site every branch-per-agent
+/// read goes through.
+///
+/// Passing the predicate here is what lets the planner do what it already does for the plain
+/// path: bind it, and pick the index. Nothing is invented; the predicate was simply never
+/// handed over. `alias` must match the statement's, or the planner cannot bind a qualified
+/// column reference in the predicate.
+pub fn scan_table_where(
+    table: &str,
+    alias: Option<&str>,
+    where_clause: Option<&Expr>,
+    ctx: &ReadCtx,
+) -> Result<Vec<Vec<Value>>, FerroError> {
     let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot(), txn_id: 0 });
     let stmt = Stmt::Select {
-        from: TableRef::plain(table.to_string(), None),
+        from: TableRef::plain(table.to_string(), alias.map(|a| a.to_string())),
         columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],
-        where_clause: None,
+        where_clause: where_clause.cloned(),
         joins: Vec::new(),
     };
     match plan(stmt, ctx.catalog, ctx.bp.clone(), None, view)? {
