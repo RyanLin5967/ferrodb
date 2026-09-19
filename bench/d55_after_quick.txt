@@ -1,0 +1,65 @@
+D55 — AFTER the predicate pushdown, quick mode (shared arm, staged=10). ⛔ NOT WHAT WAS CLAIMED.
+=================================================================================================
+[HERE] 2026-09-19, this session, same box, same harness block as the baseline.
+
+  threads   BEFORE abs   AFTER abs   after/before   BEFORE vs_1T   AFTER vs_1T
+        1        1543        2216         x1.44          1.000         1.000
+        2        2968        4704         x1.58          1.923         2.123
+        4        5568        8529         x1.53          3.608         3.849
+        8        9363       16017         x1.71          6.066         7.228
+       16       14312       27359         x1.91          9.273        12.347
+
+THE HONEST READING
+------------------
+Commit b53e80e's subject says "O(table) becomes O(log N) per read". On 5000 rows that should be
+an order of magnitude at one thread. It is x1.44. So EITHER the pushdown did not happen (the
+planner did not turn `id = k` into an index probe on this table -- the correct-but-slow mutant the
+commutation test explicitly cannot see) OR it happened and the base scan was never the dominant
+cost: 2216 stmt/s is ~451 us per statement, and something else is spending most of that.
+
+Under the project's bar this is MICRO until proven otherwise, and the commit subject over-claims.
+That is corrected in the ledger and design record in the same pass, not left standing. The
+pushdown is still correct (tests/d55_pushdown_commutes.rs, mutant killed) and is kept; what is
+withdrawn is the complexity-class claim, pending a profile.
+
+=================== RAW ===================
+# D55-AGENT-READ-PATH  rows=5000 warmup=300ms measure=1s rounds=3
+# PREDICTION (before the run): the shared arm stays FLAT, because AgentRuntime holds
+# one Mutex<State> and visible_rows walks the whole workspace under it. If it scales
+# anyway, the prediction is wrong and the ledger says so rather than defending it.
+# staged rows per branch: [10, 4000] -- the upper figure is D27's measured 4000.
+# QUICK: shared arm, staged=10 only
+
+=== ARM SHARED  (ONE ServerContext)  staged=10 ===
+# round 0 order: 1 2 4 8 16
+#   1T -> 2216 stmt/s (slowest thread 2227)
+#   2T -> 4734 stmt/s (slowest thread 2376)
+#   4T -> 8529 stmt/s (slowest thread 2102)
+#   8T -> 15299 stmt/s (slowest thread 1906)
+#   16T -> 27359 stmt/s (slowest thread 1681)
+# round 1 order: 2 4 8 16 1
+#   2T -> 4372 stmt/s (slowest thread 2194)
+#   4T -> 8233 stmt/s (slowest thread 2044)
+#   8T -> 16017 stmt/s (slowest thread 1982)
+#   16T -> 29153 stmt/s (slowest thread 1797)
+#   1T -> 2445 stmt/s (slowest thread 2457)
+# round 2 order: 4 8 16 1 2
+#   4T -> 9948 stmt/s (slowest thread 2376)
+#   8T -> 16709 stmt/s (slowest thread 2074)
+#   16T -> 26444 stmt/s (slowest thread 1625)
+#   1T -> 2196 stmt/s (slowest thread 2205)
+#   2T -> 4704 stmt/s (slowest thread 2357)
+
+threads   total_stmt_s   per_thread   total_vs_1T
+      1           2216         2216         1.000
+      2           4704         2352         2.123
+      4           8529         2132         3.849
+      8          16017         2002         7.228
+     16          27359         1710        12.347
+
+threads   shared_vs_1T   shared_abs
+      1          1.000         2216
+      2          2.123         4704
+      4          3.849         8529
+      8          7.228        16017
+     16         12.347        27359
