@@ -302,11 +302,14 @@ fn main() {
     // O(table)->O(log N) on 5000 rows should have bought an order of magnitude, so something
     // else dominates and a stack is worth more than another hypothesis.
     if std::env::var("D55_FOCUS").is_ok() {
-        println!("# FOCUS: shared arm, 1 agent, staged=10, pid {}", std::process::id());
+        // D55_FOCUS_THREADS (default 1): D58 profiles the SHARED arm at 16, where it sits at
+        // x2.7 against the private control's x10.5, to name the section before designing.
+        let threads: usize = std::env::var("D55_FOCUS_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        println!("# FOCUS: shared arm, {threads} agent(s), staged=10, pid {}", std::process::id());
         let servers: Vec<Arc<Server>> = vec![Arc::new(build(&dir, 0))];
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(25) {
-            let (ops, _) = sweep_point(&servers, true, 1, 10);
+            let (ops, _) = sweep_point(&servers, true, threads, 10);
             println!("# hold: {ops:.0} stmt/s");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -321,8 +324,16 @@ fn main() {
         // is the gap between the two at 16 threads, and a shared-only number cannot show a gap.
         let both = std::env::var("D55_QUICK_ARM").map(|v| v == "both").unwrap_or(false);
         println!("# QUICK: {} staged={staged} only", if both { "shared then private" } else { "shared arm" });
-        let a = run_arm(&dir, true, staged, "SHARED  (ONE ServerContext)");
-        let b = if both { Some(run_arm(&dir, false, staged, "PRIVATE (N ServerContexts) -- the CONTROL")) } else { None };
+        // Arm order honours D55_ARM_ORDER=BA here too: private first, then shared.
+        let (a, b) = if both && rev {
+            let b = run_arm(&dir, false, staged, "PRIVATE (N ServerContexts) -- the CONTROL");
+            let a = run_arm(&dir, true, staged, "SHARED  (ONE ServerContext)");
+            (a, Some(b))
+        } else {
+            let a = run_arm(&dir, true, staged, "SHARED  (ONE ServerContext)");
+            let b = if both { Some(run_arm(&dir, false, staged, "PRIVATE (N ServerContexts) -- the CONTROL")) } else { None };
+            (a, b)
+        };
         println!();
         match &b {
             Some(b) => {

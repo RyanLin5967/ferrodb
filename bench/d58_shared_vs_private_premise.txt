@@ -1,0 +1,71 @@
+D58 — PREMISE: is the agent read's 16-thread ceiling a SHARED structure? shared vs PRIVATE control.
+[HERE] 2026-09-19T07:54:19Z  examples/d55_agent_read_scaling at 831d4d7 (D56+D57 landed), D55_QUICK=1 D55_QUICK_ARM=both, staged=10, rows=5000
+SHARED = 16 threads on ONE ServerContext/AgentRuntime (one State mutex, one captures map).
+PRIVATE = 16 threads on 16 ServerContexts: nothing shared but the machine. The harness's own control.
+PRE-REGISTERED: if private scales like shared (~x2.8 at 16T) the wall is the box or the harness and D58 closes
+NOT JUSTIFIED. If private >> shared, the wall is in the shared State and gets PROFILED before it is designed.
+Run twice, arm order rotated (D55_ARM_ORDER=BA reverses), because D50 found a 2.2x between-arm bias.
+
+# order=AB load=8.01 6.64 6.10
+# round 0 order: 1 2 4 8 16
+#   1T -> 146739 stmt/s (slowest thread 148208)
+#   2T -> 203039 stmt/s (slowest thread 102487)
+#   4T -> 288005 stmt/s (slowest thread 71610)
+#   8T -> 352440 stmt/s (slowest thread 43542)
+#   16T -> 406413 stmt/s (slowest thread 24728)
+# round 1 order: 2 4 8 16 1
+#   2T -> 212112 stmt/s (slowest thread 106507)
+#   4T -> 297191 stmt/s (slowest thread 74605)
+#   8T -> 365898 stmt/s (slowest thread 45486)
+#   16T -> 409817 stmt/s (slowest thread 25462)
+#   1T -> 148012 stmt/s (slowest thread 148464)
+# round 2 order: 4 8 16 1 2
+#   4T -> 362683 stmt/s (slowest thread 91301)
+#   8T -> 367275 stmt/s (slowest thread 45903)
+#   16T -> 403917 stmt/s (slowest thread 25096)
+#   1T -> 154167 stmt/s (slowest thread 155421)
+#   2T -> 228270 stmt/s (slowest thread 115122)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         148012       148012         1.000
+      2         212112       106056         1.433
+      4         297191        74298         2.008
+      8         365898        45737         2.472
+     16         406413        25401         2.746
+# round 0 order: 1 2 4 8 16
+#   1T -> 155068 stmt/s (slowest thread 156182)
+#   2T -> 250039 stmt/s (slowest thread 125482)
+#   4T -> 439556 stmt/s (slowest thread 109520)
+#   8T -> 927000 stmt/s (slowest thread 115207)
+#   16T -> 1623164 stmt/s (slowest thread 96663)
+# round 1 order: 2 4 8 16 1
+#   2T -> 277939 stmt/s (slowest thread 140128)
+#   4T -> 531806 stmt/s (slowest thread 132992)
+#   8T -> 915828 stmt/s (slowest thread 113923)
+#   16T -> 1642341 stmt/s (slowest thread 99659)
+#   1T -> 152512 stmt/s (slowest thread 154039)
+# round 2 order: 4 8 16 1 2
+#   4T -> 523633 stmt/s (slowest thread 131322)
+#   8T -> 921148 stmt/s (slowest thread 114233)
+
+# order=BA load=4.84 5.81 5.34
+# round 0 order: 1 2 4 8 16
+#   1T -> 158120 stmt/s (slowest thread 158564)
+#   2T -> 226600 stmt/s (slowest thread 114047)
+#   4T -> 352342 stmt/s (slowest thread 88657)
+#   8T -> 356106 stmt/s (slowest thread 44305)
+#   16T -> 398213 stmt/s (slowest thread 24971)
+# round 1 order: 2 4 8 16 1
+#   2T -> 224665 stmt/s (slowest thread 111708)
+#   4T -> 376721 stmt/s (slowest thread 94807)
+#   
+# ⛔ PARTIAL. The AB pass was killed by its own `timeout 1800` (rc=124) inside round 2 of the PRIVATE
+# arm -- the private arm builds N full servers per point, which is slower than the timeout assumed --
+# so it printed NO summary table; and the BA pass, started by the loop, did not actually reverse the
+# arms (the QUICK path ignored D55_ARM_ORDER in this binary) and was stopped by hand. Not a crash.
+# Completed cells are quoted as what they are; no median over 3 rounds is claimed for the private arm.
+#   SHARED  16T: 406413 / 409817 / 403917  (three rounds; table above)   x2.746 vs 1T
+#   PRIVATE 16T: 1623164 / 1642341         (two rounds)                   ~x10.5 vs 1T (152-158k)
+#   PRIVATE  8T:  927000 /  915828 / 921148
+#   PRIVATE  4T:  439556 /  531806 / 523633
+# The premise holds on what completed -- shared/private ~= 0.25 at 16T -- and the run is REPEATED
+# with the fixed binary and a 3600 s bound in bench/d58_shared_vs_private_premise_2.txt.
