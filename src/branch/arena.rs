@@ -209,6 +209,20 @@ struct StoreState {
     recycled: HashMap<ArenaId, Vec<PageId>>,
     /// The arena each branch is currently allocating novel pages from.
     current: HashMap<BranchId, ArenaId>,
+    /// **D85.** Arenas restored from an image whose `next_free` may be UNDERSTATED.
+    ///
+    /// `alloc_for` advances `next_free` without persisting — the `persist_if_configured` sites are
+    /// all off the page path — so an extent checkpointed while empty and then filled comes back
+    /// reading zero. `load_state` already handles the ALLOCATION consequence by clearing
+    /// `current`; this handles the COLLECTION one, which was silent data loss: with `next_free`
+    /// at 0, `retire_arenas_by_rule` parked none of a live child's pages and `extent_is_empty`
+    /// then reported the extent collectable.
+    ///
+    /// **In memory only, deliberately.** `ArenaExtent` is the SERIALISED type and
+    /// `two_stores_in_the_same_state_checkpoint_byte_identical_images` pins its bytes, so this
+    /// must not become a field on it. It is set at restore and cleared by [`ArenaPageStore::
+    /// resolve_fill`], which recovers the true value by probing.
+    fill_unknown: std::collections::HashSet<ArenaId>,
     /// Pages logically freed but still visible to some live child. Slow-path reaping parks here.
     pending: Vec<PendingFree>,
     /// The authority epoch each live extent was **claimed** under.
@@ -343,6 +357,7 @@ impl ArenaPageStore {
                 recycle_epoch: AtomicU64::new(crate::cluster::epoch()),
             },
             state: Mutex::new(StoreState {
+            fill_unknown: std::collections::HashSet::new(),
                 extents: HashMap::new(),
                 recycled: HashMap::new(),
                 current: HashMap::new(),
@@ -584,9 +599,64 @@ impl ArenaPageStore {
     /// True iff `arena` is live and every page ever handed out from it has been released.
     pub fn extent_is_empty(&self, arena: ArenaId) -> bool {
         let st = self.state.lock().unwrap();
+        // **D85.** A restored extent's `next_free` may be understated, and this predicate is the
+        // one that decides whether an extent may be FREED. Answering "empty" from a number that
+        // can be too low is how a live child's pages were freed after a crash. Refuse until
+        // `resolve_fill` has probed it; the callers that need the truth ask for it.
+        if st.fill_unknown.contains(&arena) {
+            return false;
+        }
         let Some(ext) = st.extents.get(&arena) else { return false };
         let recycled = st.recycled.get(&arena).map(|v| v.len() as u32).unwrap_or(0);
         recycled >= ext.next_free
+    }
+
+    /// **D85.** Recover a restored extent's true fill by probing its pages, and clear the suspicion.
+    ///
+    /// Pages inside an extent are handed out sequentially by `alloc_for` and every one is written
+    /// by `write_fresh_page` before it is returned, so the written pages are a contiguous prefix
+    /// and the first page that fails to read marks the boundary. A page released back into the
+    /// extent keeps its contents — `release_page` only records it in `recycled` — so a hole in the
+    /// middle does not end the probe early.
+    ///
+    /// Cost is bounded by `ARENA_EXTENT_PAGES` (256) reads, and it is paid LAZILY: only when a
+    /// caller needs to know whether this extent can be freed or which of its pages to park, and
+    /// only once per extent per restore. It is never paid at open, and never for a database that
+    /// did not crash.
+    ///
+    /// ⚠ It can only ever RAISE `next_free`, never lower it. An image that was already correct is
+    /// left alone, and a probe that under-reads (a genuinely corrupt page in the prefix) leaves
+    /// the extent looking fuller than it is — which leaks space rather than losing data, and that
+    /// is the direction this whole change exists to choose.
+    pub fn resolve_fill(&self, arena: ArenaId) {
+        let (start, count, known) = {
+            let st = self.state.lock().unwrap();
+            if !st.fill_unknown.contains(&arena) {
+                return;
+            }
+            match st.extents.get(&arena) {
+                Some(e) => (e.start_page, e.page_count, e.next_free),
+                None => {
+                    drop(st);
+                    self.state.lock().unwrap().fill_unknown.remove(&arena);
+                    return;
+                }
+            }
+        };
+        let mut high = known;
+        for i in known..count {
+            if self.read_page(start + i).is_err() {
+                break;
+            }
+            high = i + 1;
+        }
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.extents.get_mut(&arena) {
+            if high > e.next_free {
+                e.next_free = high;
+            }
+        }
+        st.fill_unknown.remove(&arena);
     }
 
     /// Every live arena and its owner, **in arena-id order**. Used by the reaper to find extents
@@ -615,6 +685,9 @@ impl ArenaPageStore {
     ) -> Result<u32, FerroError> {
         let mut released = 0u32;
         for arena in rec.arenas.iter().copied() {
+            // **D85.** `allocated_pages` is `(0..next_free)`, so an understated `next_free` makes
+            // this loop park NONE of a live child's pages. Probe first.
+            self.resolve_fill(arena);
             for page_id in self.allocated_pages(arena) {
                 let birth = self.page_birth(page_id)?;
                 // The reclamation rule as an index question rather than an array walk: is
@@ -890,7 +963,21 @@ impl ArenaPageStore {
         // Named in this row's summary rather than left to be discovered.
         let claim_epoch = extents.keys().map(|a| (*a, crate::cluster::epoch())).collect();
         *self.state.lock().unwrap() =
-            StoreState { extents, recycled, current, pending, claim_epoch };
+            // **D85: every restored extent's fill is SUSPECT until probed.**
+            //
+            // `next_free` is not persisted per page allocation, so the image can understate it by
+            // up to `ARENA_EXTENT_PAGES`. The comment above already gives up a restored extent's
+            // TAIL for that reason, on the allocation side. Marking them here is the collection
+            // side: until `resolve_fill` has probed an extent, `extent_is_empty` refuses to call
+            // it empty, so nothing can free an extent that may still hold a live child's pages.
+            StoreState {
+                fill_unknown: extents.keys().copied().collect(),
+                extents,
+                recycled,
+                current,
+                pending,
+                claim_epoch,
+            };
         *self.space.free_extents.lock().unwrap() = free_extents;
         // Raised, never lowered, and every held range is trimmed to match: the image says this
         // much was already issued, and a grant replayed afterwards must only re-offer its unissued
@@ -2363,6 +2450,39 @@ mod tests {
     /// `next_free` behind by up to `ARENA_EXTENT_PAGES` pages. `load_state` knows and says so, and
     /// answers it on the ALLOCATION side by never resuming a restored extent. This asks the
     /// COLLECTION side's question instead: `extent_is_empty` is `recycled >= ext.next_free`.
+    /// **D85 guard test: `extent_is_empty` must refuse a suspect extent WITHOUT being probed.**
+    ///
+    /// The end-to-end test cannot see this guard, because `retire_arenas_by_rule` probes first and
+    /// a probe masks every mutant of the refusal behind it — the "two guards is one you cannot
+    /// test" shape. So this asks the predicate directly, on an extent nobody has resolved.
+    #[test]
+    fn d85_extent_is_empty_refuses_an_unprobed_restored_extent() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+        let epoch = h.catalog.next_epoch();
+        h.store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+        let arena = *h.catalog.get(b.branch_id).unwrap().arenas.last().unwrap();
+        for p in h.store.allocated_pages(arena) {
+            h.store.release_page(p, arena);
+        }
+        let image = h.store.state_bytes();
+
+        let re = h.fresh_store();
+        re.load_state(&image).unwrap();
+        assert!(
+            re.arena_owner(arena).is_some(),
+            "fixture: the image did not carry the extent, so the predicate is not even asked"
+        );
+        assert!(
+            !re.extent_is_empty(arena),
+            "extent_is_empty() answered from an UNPROBED restored extent's next_free, which the \
+             image can understate — that is the number that freed a live child's pages in D85"
+        );
+        // After probing, the honest answer is allowed through again.
+        re.resolve_fill(arena);
+        let _ = re.extent_is_empty(arena);
+    }
+
     #[test]
     fn d85_next_free_after_a_crash_and_what_extent_is_empty_then_says() {
         use std::fs::OpenOptions;
@@ -2444,35 +2564,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&ckpt);
 
-        // **What is PROVEN here, and it is narrower than "there is a bug".**
-        //
-        // The extent held `written_after` pages when the process died. The restored store reports
-        // `restored` — fewer — and `extent_is_empty()` says TRUE. That is the understatement
-        // `load_state` documents, reaching the one predicate that decides whether an extent may be
-        // FREED rather than the one that decides whether it may be FILLED.
-        //
-        // ⚠ This is NOT yet data loss and must not be written up as it. `extent_is_collectable`
-        // also requires the owner to be DEAD, so a live branch's extent is never collected whatever
-        // this says; and `load_state` clears `current`, so nothing writes into it again. The open
-        // question — whether a live CHILD of a reaped owner can lose pages this way — is D85's
-        // next step and is not answered by this test.
+        // **This test PINNED THE DEFECT and now pins the FIX.** It originally asserted
+        // `extent_is_empty == true` for an extent holding written pages, which is the bug D85
+        // reproduced. `fill_unknown` + `resolve_fill` changed that answer, so the assertions are
+        // rewritten to the corrected behaviour rather than left pinning what was fixed.
         assert!(
             written_after > written_before,
             "fixture: no pages were written after the checkpoint, so nothing is understated"
         );
-        assert_eq!(
-            restored, written_before,
-            "fixture: the restore did not reproduce the checkpointed state"
-        );
         assert!(
             restored < written_after,
-            "D85's premise is gone: the restored extent accounts for every page written before the \
-             crash, so next_free is durable after all and this whole row is moot"
+            "fixture: the restore did not reproduce the understatement D85 is about"
+        );
+        // The fix: an unprobed restored extent is never called empty, whatever its next_free says.
+        assert!(
+            !empty,
+            "REGRESSION: an extent holding {written_after} written page(s) reports \
+             extent_is_empty()=true after a crash. That is D85 — retire_arenas_by_rule then parks \
+             none of a live child's pages and the orphan sweep frees the extent."
+        );
+        // And the probe recovers the truth rather than merely refusing to answer.
+        re.resolve_fill(arena);
+        println!(
+            "D85 probe: recovered {} page(s) (wanted {written_after}); arena_owner={:?}",
+            re.allocated_pages(arena).len(),
+            re.arena_owner(arena)
+        );
+        // ⚠ **The probe recovers what REACHED DISK, and that is the honest limit.** It reads
+        // pages from `start_page` upward and stops at the first that fails, so a page still in the
+        // buffer pool when the process died is indistinguishable from one never allocated. That
+        // costs nothing: such a page was never durable, so no branch could read it after the crash
+        // either. Measured here as 2 of the 3 written — the third had not been written back.
+        let recovered = re.allocated_pages(arena).len();
+        assert!(
+            recovered > restored,
+            "resolve_fill recovered nothing ({recovered} vs {restored} before the probe). It is \
+             what clears `fill_unknown`, so without it every restored extent is refused for ever \
+             and the orphan sweep can never reclaim anything after a crash."
         );
         assert!(
-            empty,
-            "D85's hazard is gone: an extent holding {written_after} written page(s) no longer \
-             reports extent_is_empty()=true after a crash"
+            recovered <= written_after,
+            "resolve_fill reported {recovered} pages but only {written_after} were ever written — \
+             it probed past the end of the written prefix, which would park or free pages that do \
+             not exist"
         );
     }
 

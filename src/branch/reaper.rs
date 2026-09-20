@@ -245,7 +245,16 @@ impl TwoTierReaper {
             Ok(rec) => rec.generation != owner.generation || rec.state == BranchState::Reaped,
             Err(_) => true,
         };
-        owner_gone && self.store.extent_is_empty(arena)
+        if !owner_gone {
+            return false;
+        }
+        // **D85.** Only now — the probe costs up to `ARENA_EXTENT_PAGES` reads, and asking it for
+        // every live arena would turn the sweep into exactly the kind of O(N x pages) scan D40
+        // removed. A live owner's extent is never collectable whatever its fill says, so the
+        // question only has to be answered for dead owners: at most once per extent per restore,
+        // and never at all for a database that did not crash.
+        self.store.resolve_fill(arena);
+        self.store.extent_is_empty(arena)
     }
 
     /// Free the extents that **this drain just emptied**. Freeing them is what returns the
@@ -1861,17 +1870,18 @@ mod tests {
     /// `allocated_pages(arena)` = `(0..ext.next_free)` (`arena.rs:618`), so with `next_free = 0` it
     /// parks NOTHING — and then the extent sits empty-looking and owned by a dead branch, which is
     /// precisely `extent_is_collectable`'s pair of conditions.
-    /// ⛔ **FAILS TODAY — THIS IS THE BUG, NOT A BROKEN TEST.** `#[ignore]`d with its reason, the
-    /// same way D29's reproduction was carried until D41 closed it. Run it with
-    /// `cargo test -- --ignored d85_a_live_childs` and it reproduces on BOTH catalogs, including
-    /// `TableBranchCatalog`, which is the one that ships.
+    /// **D85 regression test. It reproduced silent data loss and now pins the fix.**
+    ///
+    /// It was carried `#[ignore]`d — the way D29's reproduction was until D41 closed it — and
+    /// failed on BOTH catalogs including `TableBranchCatalog`, which is the one that ships. The
+    /// fix is `fill_unknown` + `resolve_fill`: a restored extent's `next_free` is treated as
+    /// suspect until probed, so neither `extent_is_empty` nor `retire_arenas_by_rule` acts on a
+    /// number that can be too low.
     ///
     /// It refuses to pass vacuously: the fixture asserts pages were written after the checkpoint
     /// and that the parent actually has a live child, so a green line cannot come from the
     /// interval rule never being consulted.
     #[test]
-    #[ignore = "D85: reproduces silent data loss — a live child's pages are freed after a crash \
-                because the restored next_free is 0. Un-ignore when the fix lands."]
     fn d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free() {
         let (h, reaper) = setup();
         let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
