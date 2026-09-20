@@ -1842,7 +1842,35 @@ impl AgentRuntime {
             (bw, resolved)
         };
 
-        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
+        // **D71: PUSH THE PREDICATE, exactly as the READ path already does.**
+        //
+        // This was `visible_rows(..)` — the UNPREDICATED form — which is
+        // `visible_rows_where(.., None, None, None)` and therefore `scan_table_where(table, alias,
+        // None, ctx)`: it materialises EVERY row of the table into a `Vec<Vec<Value>>` and the
+        // loop below then throws away all but the matches. O(table) per statement.
+        //
+        // `scan_table_where`'s own doc comment describes this defect and credits D55 with fixing
+        // it — *"an agent-session `SELECT … WHERE id = k` read the ENTIRE table to keep one row —
+        // O(table) per statement, where the plain path for the identical query is O(log N)"*. D55
+        // pushed the predicate through the READ path and left all three WRITE paths on the old
+        // form, so the fix was there to be copied, one call away, for however long.
+        //
+        // Measured before this change (`bench/d71_point_update_curve.txt`): a staged UPDATE is
+        // 0.185 -> 2.385 ms across 16x the rows (12.91x, ms-per-1000-rows FLAT at ~0.17), while
+        // the identical plain statement is 4.032 -> 5.396 ms (1.34x, ms-per-1000-rows FALLING).
+        //
+        // ⚠ The filter below STAYS, and that is deliberate rather than redundant: pushdown is a
+        // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
+        // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
+        // between the two paths. What changes is how many rows reach it, never which ones pass.
+        let rows = self.visible_rows_where(
+            &ctx.read(),
+            Some(branch),
+            table,
+            None,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -1962,7 +1990,35 @@ impl AgentRuntime {
             Some(w) => Some(binder.bind_expr(w.clone(), &scope)?),
             None => None,
         };
-        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
+        // **D71: PUSH THE PREDICATE, exactly as the READ path already does.**
+        //
+        // This was `visible_rows(..)` — the UNPREDICATED form — which is
+        // `visible_rows_where(.., None, None, None)` and therefore `scan_table_where(table, alias,
+        // None, ctx)`: it materialises EVERY row of the table into a `Vec<Vec<Value>>` and the
+        // loop below then throws away all but the matches. O(table) per statement.
+        //
+        // `scan_table_where`'s own doc comment describes this defect and credits D55 with fixing
+        // it — *"an agent-session `SELECT … WHERE id = k` read the ENTIRE table to keep one row —
+        // O(table) per statement, where the plain path for the identical query is O(log N)"*. D55
+        // pushed the predicate through the READ path and left all three WRITE paths on the old
+        // form, so the fix was there to be copied, one call away, for however long.
+        //
+        // Measured before this change (`bench/d71_point_update_curve.txt`): a staged UPDATE is
+        // 0.185 -> 2.385 ms across 16x the rows (12.91x, ms-per-1000-rows FLAT at ~0.17), while
+        // the identical plain statement is 4.032 -> 5.396 ms (1.34x, ms-per-1000-rows FALLING).
+        //
+        // ⚠ The filter below STAYS, and that is deliberate rather than redundant: pushdown is a
+        // CONSERVATIVE HINT — the planner may narrow the scan or ignore the predicate entirely —
+        // so `evaluate` remains the sole authority on what matches and the semantics cannot drift
+        // between the two paths. What changes is how many rows reach it, never which ones pass.
+        let rows = self.visible_rows_where(
+            &ctx.read(),
+            Some(branch),
+            table,
+            None,
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
