@@ -1,33 +1,46 @@
-//! D64 — a client cannot nest an expression deep enough to take the server down.
+//! D64 / D64b — a client cannot nest or chain its way into taking the server down.
 //!
-//! ⚠ These tests CANNOT prove the bug, and must not be read as though they did. The failure they
-//! guard against is a `SIGABRT`, which would take the whole test process with it rather than fail
-//! an assertion — a test that reproduced it would destroy every other test's result. The proof is
-//! in `bench/d64_nesting_probe.txt`, measured one depth per process: before the guard, release
-//! aborted at 8,000 levels and debug at 1,000.
+//! ⚠ These tests CANNOT reproduce the bug and must not be read as though they did. The failure is
+//! a `SIGABRT`, which would take the whole test process with it rather than fail an assertion — a
+//! test that reproduced it would destroy every other test's result. The proof is in
+//! `bench/d64_nesting_probe.txt`, measured one depth per process on a 2 MiB thread.
 //!
-//! What these tests DO pin is the boundary and the refusal, which is what a regression would move.
-use ferrodb::parser::parser::{Parser, MAX_EXPR_DEPTH};
+//! What these tests pin is the BOUNDARY, the REFUSAL, and that a shape just under the limit still
+//! produces a real parse tree. The boundary numbers below are measured, not derived: see the
+//! comment on `PARENS_MAX`.
+use ferrodb::parser::parser::{Parser, Stmt, MAX_EXPR_DEPTH, MAX_TREE_DEPTH};
 use ferrodb::parser::scanner::Scanner;
 
-/// The three shapes that each add a level of tree depth by a DIFFERENT recursion. `Not` and `Neg`
-/// recurse into themselves and never re-enter `Parser::expression`, so a guard kept only there does
-/// not see them — which is exactly how the first version of this guard was walked around.
-#[derive(Clone, Copy)]
+/// The four shapes that reach the parser by DIFFERENT routes. Each was, at some point in D64's
+/// history, a shape an earlier version of the guard did not see.
+#[derive(Clone, Copy, Debug)]
 enum Shape {
+    /// `((((1))))` — re-enters `Parser::expression`.
     Parens,
+    /// `NOT NOT NOT 1` — `Parser::not` recurses into itself.
     Not,
+    /// `- - - 1` — `Parser::unary` recurses into itself.
     Neg,
+    /// `EXPLAIN EXPLAIN … SELECT` — `parse_explain` re-enters `parse_statement`. STATEMENT-level
+    /// recursion, which the first two versions of this guard did not charge at all.
+    Explain,
+    /// `1 + 1 + 1 + …` — parsed by a `while` loop, so the PARSER never recurses; the tree is
+    /// left-deep and the recursion is in whatever walks or drops it.
+    Chain,
 }
 
-/// The paren shape, which is the one the original probe measured.
-fn parse_nested(levels: usize) -> Result<usize, String> {
-    parse_nested_shape(levels, Shape::Parens)
-}
-
-fn parse_nested_shape(levels: usize, shape: Shape) -> Result<usize, String> {
-    let mut sql = String::with_capacity(levels * 6 + 24);
-    sql.push_str("SELECT ");
+fn sql_for(levels: usize, shape: Shape) -> String {
+    let mut sql = String::with_capacity(levels * 8 + 32);
+    match shape {
+        Shape::Explain => {
+            for _ in 0..levels {
+                sql.push_str("EXPLAIN ");
+            }
+            sql.push_str("SELECT 1 FROM t;");
+            return sql;
+        }
+        _ => sql.push_str("SELECT "),
+    }
     match shape {
         Shape::Not => {
             for _ in 0..levels {
@@ -41,6 +54,12 @@ fn parse_nested_shape(levels: usize, shape: Shape) -> Result<usize, String> {
             }
             sql.push('1');
         }
+        Shape::Chain => {
+            sql.push('1');
+            for _ in 0..levels {
+                sql.push_str(" + 1");
+            }
+        }
         Shape::Parens => {
             for _ in 0..levels {
                 sql.push('(');
@@ -50,8 +69,20 @@ fn parse_nested_shape(levels: usize, shape: Shape) -> Result<usize, String> {
                 sql.push(')');
             }
         }
+        Shape::Explain => unreachable!("handled above"),
     }
     sql.push_str(" FROM t;");
+    sql
+}
+
+/// Returns the parsed statements, NOT a count.
+///
+/// ⚠ An earlier version of this helper returned `stmts.len()` and dropped the tree, so `Ok(1)`
+/// pinned "no error, exactly one statement" and NOTHING about what was built — it would have
+/// passed against a parser that returned an empty or wrong statement. Returning the tree is what
+/// lets the assertions below check that a shape under the limit really parsed.
+fn parse_shape(levels: usize, shape: Shape) -> Result<Vec<Stmt>, String> {
+    let sql = sql_for(levels, shape);
     let tokens = Scanner::new(sql.chars().collect(), Vec::new())
         .scan_tokens()
         .map_err(|e| e.to_string())?;
@@ -59,49 +90,112 @@ fn parse_nested_shape(levels: usize, shape: Shape) -> Result<usize, String> {
     let stmts = p.parse();
     match p.errors.first() {
         Some(e) => Err(e.to_string()),
-        None => Ok(stmts.len()),
+        None => Ok(stmts),
     }
 }
 
-#[test]
-fn an_expression_just_under_the_limit_still_parses() {
-    // One `expression()` frame is spent on the top-level expression itself, so `MAX_EXPR_DEPTH`
-    // frames means `MAX_EXPR_DEPTH - 1` nested parentheses. Pinning the boundary from BOTH sides
-    // is the point: a guard that refuses everything would pass a one-sided test.
-    assert_eq!(parse_nested(MAX_EXPR_DEPTH - 1), Ok(1));
-}
+/// The deepest nesting each shape actually accepts, MEASURED against the built binary rather than
+/// derived from the constant.
+///
+/// It is not `MAX_EXPR_DEPTH - 1`, and the difference is the point: `parse_statement` charges a
+/// frame too (D64b), so a `SELECT` spends one level before its expression starts. A test that
+/// computed these from the constant would encode the same arithmetic the code does and could not
+/// catch an off-by-one in it.
+///
+/// ⚠ `EXPLAIN_MAX` coinciding with `PARENS_MAX` is a MEASURED fact, not an assumption. An earlier
+/// version of this constant said 57, taken from a probe whose EXPLAIN generator appended a stray
+/// second `FROM t` — so the boundary it found was that syntax error, not the guard. The probe was
+/// fixed (`examples/d64_nesting_probe.rs`, `whole_statement`) and both shapes re-measured at 62.
+const PARENS_MAX: usize = 62;
+const EXPLAIN_MAX: usize = 62;
 
 #[test]
-fn an_expression_past_the_limit_is_refused_and_says_so() {
-    let err = parse_nested(MAX_EXPR_DEPTH).expect_err("must refuse");
-    assert!(
-        err.contains("nests deeper") && err.contains(&MAX_EXPR_DEPTH.to_string()),
-        "the refusal must name the limit so a client can act on it; got: {err}"
-    );
-}
-
-#[test]
-fn a_depth_that_used_to_abort_the_process_is_now_just_an_error() {
-    // 2,000 is where a 2 MiB connection thread aborted in release with no guard; 50,000 is where
-    // the self-recursive NOT/unary shapes did. See bench/d64_nesting_probe.txt.
-    for shape in [Shape::Parens, Shape::Not, Shape::Neg] {
-        for levels in [2_000, 50_000] {
-            let err = parse_nested_shape(levels, shape).expect_err("must refuse");
-            assert!(err.contains("nests deeper"), "at {levels} levels, got: {err}");
+fn a_shape_just_under_the_limit_parses_and_produces_a_real_statement() {
+    for (shape, max) in [
+        (Shape::Parens, PARENS_MAX),
+        (Shape::Not, PARENS_MAX),
+        (Shape::Neg, PARENS_MAX),
+        (Shape::Explain, EXPLAIN_MAX),
+        (Shape::Chain, MAX_TREE_DEPTH),
+    ] {
+        let stmts = parse_shape(max, shape)
+            .unwrap_or_else(|e| panic!("{shape:?} at {max} should parse, got: {e}"));
+        assert_eq!(stmts.len(), 1, "{shape:?} at {max} produced {} statements", stmts.len());
+        // Not just "one statement": the RIGHT KIND of statement, so an empty or wrong parse
+        // cannot satisfy this.
+        match (shape, &stmts[0]) {
+            (Shape::Explain, Stmt::Explain(_)) => {}
+            (Shape::Explain, other) => panic!("EXPLAIN nesting produced {other:?}"),
+            (_, Stmt::Select { .. }) => {}
+            (_, other) => panic!("{shape:?} produced {other:?}, expected a Select"),
         }
     }
 }
 
-/// The guard must cover every recursion that adds a level, not just the one in `expression`.
 #[test]
-fn every_recursion_shape_is_bounded_at_the_same_depth() {
-    for shape in [Shape::Parens, Shape::Not, Shape::Neg] {
-        assert_eq!(
-            parse_nested_shape(MAX_EXPR_DEPTH - 1, shape),
-            Ok(1),
-            "one level under the limit must still parse"
+fn one_level_past_the_limit_is_refused_and_the_message_names_the_limit() {
+    for (shape, max, expect) in [
+        (Shape::Parens, PARENS_MAX, "nests deeper"),
+        (Shape::Not, PARENS_MAX, "nests deeper"),
+        (Shape::Neg, PARENS_MAX, "nests deeper"),
+        (Shape::Explain, EXPLAIN_MAX, "nests deeper"),
+        (Shape::Chain, MAX_TREE_DEPTH, "chains more than"),
+    ] {
+        let err = parse_shape(max + 1, shape)
+            .expect_err("{shape:?} one past the limit must be refused");
+        assert!(
+            err.contains(expect),
+            "{shape:?} at {} refused with the wrong message: {err}",
+            max + 1
         );
-        let err = parse_nested_shape(MAX_EXPR_DEPTH, shape).expect_err("must refuse at the limit");
-        assert!(err.contains("nests deeper"), "got: {err}");
     }
+}
+
+/// The depths that ABORTED THE PROCESS before the guard existed, from bench/d64_nesting_probe.txt.
+/// Each must now be an ordinary error.
+#[test]
+fn depths_that_used_to_abort_the_process_are_now_errors() {
+    let cases = [
+        (Shape::Parens, 2_000usize),
+        (Shape::Not, 50_000),
+        (Shape::Neg, 50_000),
+        (Shape::Explain, 5_000),
+        (Shape::Chain, 25_600),
+    ];
+    for (shape, levels) in cases {
+        let err = parse_shape(levels, shape).expect_err("must refuse");
+        assert!(
+            err.contains("nests deeper") || err.contains("chains more than"),
+            "{shape:?} at {levels}: {err}"
+        );
+    }
+}
+
+/// The two limits bound DIFFERENT quantities and must not be collapsed into one.
+///
+/// If a future change makes the binary loops charge the frame counter instead, a chain of 100
+/// operators starts failing — which is legal SQL a generator emits — and this test says so.
+#[test]
+fn a_long_operator_chain_is_not_bounded_by_the_frame_limit() {
+    let levels = MAX_EXPR_DEPTH * 4;
+    assert!(levels < MAX_TREE_DEPTH, "fixture must sit between the two limits");
+    let stmts = parse_shape(levels, Shape::Chain)
+        .unwrap_or_else(|e| panic!("a {levels}-operator chain must still parse, got: {e}"));
+    assert_eq!(stmts.len(), 1);
+}
+
+/// Depth must not leak across statements in one batch.
+#[test]
+fn a_batch_of_many_shallow_statements_does_not_accumulate_depth() {
+    let one = sql_for(PARENS_MAX, Shape::Parens);
+    let many = one.repeat(50);
+    let tokens = Scanner::new(many.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let stmts = p.parse();
+    assert!(
+        p.errors.is_empty(),
+        "50 statements each at the limit must all parse; first error: {:?}",
+        p.errors.first().map(|e| e.to_string())
+    );
+    assert_eq!(stmts.len(), 50);
 }

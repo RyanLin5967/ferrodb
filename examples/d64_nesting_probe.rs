@@ -39,6 +39,7 @@ fn run(depth: usize, stage: &str) {
     //   neg    -> Parser::unary, which recurses into ITSELF
     let shape = std::env::var("D64_SHAPE").unwrap_or_else(|_| "parens".to_string());
     let mut sql = String::with_capacity(depth * 6 + 24);
+    let mut whole_statement = false;
     sql.push_str("SELECT ");
     match shape.as_str() {
         "not" => {
@@ -46,6 +47,30 @@ fn run(depth: usize, stage: &str) {
                 sql.push_str("NOT ");
             }
             sql.push('1');
+        }
+        "chain" => {
+            // `1 + 1 + 1 + ...`: parsed by a WHILE LOOP, not recursion, so the parser never
+            // recurses — but the tree it builds is LEFT-DEEP, one level per operator. Whatever
+            // walks or drops that tree recurses, so this shape measures the WALKERS, not the
+            // parser. It is the shape D64's first guard did not bound at all.
+            sql.push('1');
+            for _ in 0..depth {
+                sql.push_str(" + 1");
+            }
+        }
+        "explain" => {
+            // Statement-level recursion: parse_statement <-> parse_explain, one frame pair per
+            // keyword, charged by nothing before D64b.
+            // EARLY RETURN via a flag: this shape is a whole STATEMENT, not an expression, so it
+            // must not receive the " FROM t;" the other shapes append. The first version of this
+            // arm fell through and produced "... SELECT 1 FROM t FROM t;", whose syntax error the
+            // probe faithfully reported as REFUSED_CLEANLY — a boundary that measured the typo.
+            sql.clear();
+            for _ in 0..depth {
+                sql.push_str("EXPLAIN ");
+            }
+            sql.push_str("SELECT 1 FROM t;");
+            whole_statement = true;
         }
         "neg" => {
             for _ in 0..depth {
@@ -63,7 +88,9 @@ fn run(depth: usize, stage: &str) {
             }
         }
     }
-    sql.push_str(" FROM t;");
+    if !whole_statement {
+        sql.push_str(" FROM t;");
+    }
 
     let tokens = match Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens() {
         Ok(t) => t,

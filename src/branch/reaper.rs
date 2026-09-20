@@ -447,13 +447,12 @@ impl TwoTierReaper {
     /// claims a fresh one when it does not, recording each fresh one against the branch inside
     /// `alloc_arena`'s atomic `add_arena`. That last part is why `collapse` must RE-READ the
     /// record before its final write; see there.
-    /// One frame of [`TwoTierReaper::deep_copy`]'s explicit stack: exactly what the recursive
-    /// version kept in a call frame, moved to the heap where depth is not a guard page.
+    /// Copies the reachable page graph, iteratively.
     ///
-    /// `data` is read ONCE, when the frame is opened, and the children are derived from that same
-    /// image — preserving the recursive version's property that a page's bytes and its child list
-    /// always come from the same read. Re-reading the page at emit time would have been cheaper in
-    /// memory and would have opened a window for the two to disagree.
+    /// Each page is read ONCE, when its [`CopyFrame`] is opened, and its child list comes from
+    /// that same image — preserving the recursive version's property that a page's bytes and its
+    /// children never come from two different reads. Re-reading at emit time would have been
+    /// cheaper in memory and would have opened a window for the two to disagree.
     fn deep_copy(
         &self,
         root: PageId,

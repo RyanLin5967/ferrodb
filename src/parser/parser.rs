@@ -4,28 +4,53 @@ pub struct Parser {
     pub tokens: Vec<Token>,
     pub current: usize,
     pub errors: Vec<FerroError>,
-    /// How many [`Parser::expression`] frames are currently on the stack. See [`MAX_EXPR_DEPTH`].
+    /// How many parser frames are currently on the stack. See [`MAX_EXPR_DEPTH`].
     depth: usize,
+    /// How deep the left-deep tree being built currently is. See [`MAX_TREE_DEPTH`].
+    chain: usize,
 }
 
-/// How deeply one expression may nest before the parser refuses it — **D64**.
+/// How many PARSER FRAMES may be on the stack before a statement is refused — **D64/D64b**.
 ///
-/// Every stage downstream walks the tree this produces with its own recursion
-/// (`binder::bind_expr`, `execution::executor::evaluate`), so a tree that is shallow enough to
-/// build here is shallow enough for all of them. That is why the limit lives in the parser and
-/// exactly once: a second copy in the binder could only disagree with this one, and per the
-/// project's own rule a redundant downstream check masks every mutant of the check in front of it.
+/// This bounds parser RE-ENTRY. It does NOT bound the height of the tree that comes out: the
+/// binary-operator loops build a left-deep tree iteratively and are bounded by [`MAX_TREE_DEPTH`]
+/// instead. Those are different quantities with thresholds two orders of magnitude apart, which is
+/// why there are two constants and not one.
 ///
-/// **Measured, not guessed** (`bench/d64_nesting_probe.txt`): `SELECT ((((1)))) FROM t` with no
-/// limit parsed at 750 levels and ABORTED THE PROCESS at 1,000 in a debug build, and parsed at
-/// 4,000 and aborted at 8,000 in release — `fatal runtime error: stack overflow`, SIGABRT. The
-/// limit has to sit under the DEBUG threshold or the test suite is the thing that crashes, which
-/// rules out SQLite's `SQLITE_MAX_EXPR_DEPTH` default of 1,000 for this codebase.
+/// Charged at every door that re-enters the parser, and a door that is missed is a door that is
+/// open:
+/// * [`Parser::expression`] — grouping, function arguments, `IN` lists, subquery predicates.
+/// * [`Parser::not`] and [`Parser::unary`] — both recurse into THEMSELVES.
+/// * [`Parser::parse_statement`] — `parse_explain` and `parse_simulate` call back into it, so
+///   `EXPLAIN EXPLAIN …` and nested `SIMULATE … CANDIDATE ( … )` are statement-level recursion.
 ///
-/// 256 is also what `tel::log`'s `MAX_GUARD_DEPTH` already picked for the same shape arriving off
-/// a disk, and its note records that "a WHERE clause of 256 nested operators has never been seen
-/// here". One number, one rationale, two places that enforce it on their own inputs.
+/// ⚠ **The first two versions of this guard each claimed to be complete and were not.** v1 counted
+/// only in `expression` and `NOT NOT NOT …` walked around it. v2 added `not`/`unary` and its
+/// comment called those "the three DISTINCT ways this parser adds a level" — a fresh-context
+/// review then found both statement doors uncharged and the binary loops unbounded. The lesson is
+/// in the wording: a guard that asserts its own completeness stops the next reader from checking.
+///
+/// **Measured on the stack the server actually uses** (`bench/d64_nesting_probe.txt`): a 2 MiB
+/// connection thread — `src/pgwire/mod.rs:290` is a bare `std::thread::spawn` and `stack_size`
+/// appears nowhere in `src/`. With the limit lifted, a DEBUG build survived 100 nested parens and
+/// aborted at 200; `EXPLAIN` nesting survived 200 and aborted at 400. Debug binds because its
+/// frames are largest, so 64 sits roughly 3x under the tighter of the two.
 pub const MAX_EXPR_DEPTH: usize = 64;
+
+/// How deep a left-deep operator chain may get before the parser refuses it — **D64b**.
+///
+/// `1 + 1 + 1 + …` and `a AND b AND c AND …` are parsed by `while` loops, NOT by recursion, so the
+/// parser's own stack never grows and [`MAX_EXPR_DEPTH`] never fires. The TREE is left-deep all the
+/// same, one level per operator, and everything that later walks it recurses: `binder::bind_expr`,
+/// `execution::executor::evaluate`, and `Expr`'s own derived `Drop`. The overflow does not
+/// disappear, it moves downstream of the parser — which is exactly what D64's original doc got
+/// wrong when it claimed the parser limit transitively bounded those walkers.
+///
+/// **Measured** (`bench/d64_nesting_probe.txt`, 2 MiB thread, limit lifted): a chain survived
+/// 12,800 levels and aborted at 25,600 in a DEBUG build. 4,096 is a little over 3x under that, and
+/// leaves room for machine-generated SQL — a `WHERE` with a few thousand `AND` terms still parses,
+/// where a single shared limit of 64 would have refused it.
+pub const MAX_TREE_DEPTH: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct TableRef {
@@ -331,13 +356,16 @@ pub enum AdmitSpec {
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self{
-        Self {tokens, current: 0, errors: Vec::new(), depth: 0}
+        Self {tokens, current: 0, errors: Vec::new(), depth: 0, chain: 0}
     }
 
     pub fn parse(&mut self) -> Vec<Stmt> {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
+            // Each top-level statement starts from zero. Without this a long script of shallow
+            // statements could accumulate charge and refuse a perfectly valid later one.
+            self.depth = 0;
             match self.parse_statement() {
                 Ok(stmt) => statements.push(stmt),
                 Err(err) => {
@@ -348,7 +376,21 @@ impl Parser {
         }
         statements
     }
+    /// Charges one level, then parses. **Statement nesting is parser recursion too — D64b.**
+    ///
+    /// `parse_explain` and `parse_simulate` both call back into this function, so `EXPLAIN EXPLAIN
+    /// EXPLAIN …` and nested `SIMULATE … CANDIDATE ( … )` descend through native recursion at one
+    /// keyword per level. D64's first guard charged only `expression`, `not` and `unary` and its
+    /// comment claimed those were "the three distinct ways this parser adds a level", which was
+    /// false: neither statement door was charged, and both are reachable from any pgwire client.
     pub fn parse_statement(&mut self) -> Result<Stmt, FerroError>{
+        self.enter()?;
+        let parsed = self.parse_statement_inner();
+        self.leave();
+        parsed
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Stmt, FerroError>{
         if self.match_token(&[TokenType::Select]) {
             return self.parse_select()
         } else if self.match_token(&[TokenType::Insert]) {
@@ -1155,28 +1197,19 @@ impl Parser {
     /// arrives over a socket, which takes every other session on the server with it. See
     /// [`MAX_EXPR_DEPTH`].
     pub fn expression(&mut self ) -> Result<Expr, FerroError>{
+        // The frame counter is a matched enter/leave. The CHAIN counter is restored in bulk: the
+        // binary loops charge one level per ITERATION and never pair it with a release, because a
+        // left-deep chain really is that deep, and that depth belongs to this expression.
+        let chain_entry = self.chain;
         self.enter()?;
         let parsed = self.or();
         self.leave();
+        self.chain = chain_entry;
         return parsed;
     }
 
-    /// Charge one level of expression nesting, or refuse. See [`MAX_EXPR_DEPTH`].
-    ///
-    /// **Three call sites, and all three are needed — this is not belt and braces.** They are not
-    /// redundant checks of one path; they are the three DISTINCT ways this parser adds a level to
-    /// the tree, and the first version of this guard covered only the first and was walked around
-    /// by the other two:
-    ///
-    /// * [`Parser::expression`] — grouping, function arguments, `IN` lists, subquery predicates.
-    /// * [`Parser::not`] — `NOT NOT NOT …`, which recurses into ITSELF and never re-enters
-    ///   `expression`, so a counter kept only there never sees it.
-    /// * [`Parser::unary`] — `- - - …` and `! ! ! …`, same shape, same blind spot.
-    ///
-    /// Bounding the TREE rather than the parser is the point: the depth limit also bounds what
-    /// `binder::bind_expr` and `executor::evaluate` later walk, and what `Expr`'s own recursive
-    /// `Drop` has to unwind — an iterative parser that still built a 100,000-deep tree would
-    /// merely move the overflow to whoever dropped it.
+    /// Charge one parser frame, or refuse. See [`MAX_EXPR_DEPTH`] for where this is charged and
+    /// for the two earlier versions of this guard that were walked around.
     fn enter(&mut self) -> Result<(), FerroError> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
@@ -1194,9 +1227,30 @@ impl Parser {
         self.depth -= 1;
     }
 
+    /// Charge one level of left-deep TREE depth, or refuse. See [`MAX_TREE_DEPTH`].
+    ///
+    /// Released in bulk by [`Parser::expression`], which restores the counter it entered with: a
+    /// chain's levels are not individually unwound because the chain really is that deep, and the
+    /// depth belongs to the whole expression rather than to any one iteration.
+    fn enter_chain(&mut self) -> Result<(), FerroError> {
+        self.chain += 1;
+        if self.chain > MAX_TREE_DEPTH {
+            self.chain -= 1;
+            return Err(FerroError::SqlParseError(format!(
+                "expression chains more than {} operators deep; refusing to parse it",
+                MAX_TREE_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
     pub fn or(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.and()?;
         while self.match_token(&[TokenType::Or]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.and()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1207,6 +1261,10 @@ impl Parser {
     pub fn and(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.not()?;
         while self.match_token(&[TokenType::And]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.not()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1229,6 +1287,10 @@ impl Parser {
     pub fn equality(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.comparison()?;
         while self.match_token(&[TokenType::BangEqual, TokenType::Equal]){
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.comparison()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1239,6 +1301,10 @@ impl Parser {
     pub fn comparison(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.term()?;
         while self.match_token(&[TokenType::Greater, TokenType::GreaterEqual, TokenType::Less, TokenType::LessEqual]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.term()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1249,6 +1315,10 @@ impl Parser {
     pub fn term(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.factor()?;
         while self.match_token(&[TokenType::Minus, TokenType::Plus]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.factor()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1259,6 +1329,10 @@ impl Parser {
     pub fn factor(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.unary()?;
         while self.match_token(&[TokenType::Slash, TokenType::Star]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.unary()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
