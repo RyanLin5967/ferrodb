@@ -145,9 +145,22 @@ fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
     let s = Server { ctx, bp, txn };
 
     let mut sess = Session::new();
-    exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
-    for i in 1..=nrows {
-        exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
+    // D68_KEY=varchar exercises the key type D69's point lookups lean on hardest: `row_id_of` is a
+    // ONE-WAY FNV for Varchar, so the lookup MUST go through the key value and re-bind the literal.
+    // If that literal stops being a recognisable column-0 equality the planner falls back to a seq
+    // scan PER LOOKUP — O(delta x table), worse than the scan D69 removed — and no correctness
+    // test can see it. Only this curve can.
+    let varchar_key = std::env::var("D68_KEY").map(|k| k == "varchar").unwrap_or(false);
+    if varchar_key {
+        exec(&s, "CREATE TABLE t (id VARCHAR(32) NOT NULL, v INTEGER);", &mut sess).unwrap();
+        for i in 1..=nrows {
+            exec(&s, &format!("INSERT INTO t VALUES ('k{i}', {});", i * 7), &mut sess).unwrap();
+        }
+    } else {
+        exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
+        for i in 1..=nrows {
+            exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
+        }
     }
     s
 }
@@ -166,7 +179,12 @@ fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
             1 + (w as i64) % 16
         };
         let v = (seq % 1000) as i64;
-        if exec(s, &format!("UPDATE t SET v = {v} WHERE id = {id};"), &mut sess).is_err() {
+        let pred = if std::env::var("D68_KEY").map(|k| k == "varchar").unwrap_or(false) {
+            format!("UPDATE t SET v = {v} WHERE id = 'k{id}';")
+        } else {
+            format!("UPDATE t SET v = {v} WHERE id = {id};")
+        };
+        if exec(s, &pred, &mut sess).is_err() {
             return false;
         }
     }
