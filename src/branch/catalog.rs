@@ -335,11 +335,27 @@ impl LogBranchCatalog {
     }
 
     /// Number of branches in state `Live`, trunk included.
-    /// **S20: O(1), maintained by [`CatalogState::install`].**
+    /// **S20: O(1), maintained by [`CatalogState::install`]. ⚠ AND IT WAS NEVER A WALL.**
     ///
     /// This iterated every record and filtered on `Live` — O(TOTAL branches, reaped included) for
-    /// one integer, measured 0.664 -> 59.234 ms across 100x N. The objective is 10^6 branches, so
-    /// a count that walks them is a wall on the thing being counted.
+    /// one integer, measured 0.664 -> 59.234 ms across 100x N.
+    ///
+    /// ⛔ **I BUILT THIS AS "the branch-count wall the 10^6 objective is about". THAT WAS WRONG,
+    /// and the check that would have caught it before the work took one grep.** `live_count` has
+    /// **ZERO production callers**: every call site in `src/` is an `assert_eq!` inside a test
+    /// module, and every other caller is in `examples/` (benchmark harnesses and the demo). The
+    /// 59 ms is real and nothing on any statement, reap or startup path pays it.
+    ///
+    /// ⚠ **And the wrong TYPE was optimised first.** The 59 ms was measured by
+    /// `examples/live_count_reps.rs` against [`TableBranchCatalog`] — the system-table catalog D1
+    /// chose as production — not against this one. I read a ledger row naming "live_count", found
+    /// a `live_count`, and fixed it, without checking which of the two implementations the
+    /// measurement had used.
+    ///
+    /// The change is kept because it is correct, fire-checked, and makes the benchmark honest;
+    /// the CLAIM attached to it is retracted. `TableBranchCatalog::live_count` is deliberately
+    /// left alone — an O(N) count that nothing calls is not worth a maintained counter, and a
+    /// counter there would have to survive restart without regressing D65's flat-to-10^6 reopen.
     pub fn live_count(&self) -> usize {
         self.state.read().unwrap().live
     }
