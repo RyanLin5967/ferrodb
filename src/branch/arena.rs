@@ -611,6 +611,17 @@ impl ArenaPageStore {
         recycled >= ext.next_free
     }
 
+    /// Test-only: force an extent's recorded fill, to construct the no-lower-bound case D87 would
+    /// create by rebuilding `extents` from the catalog rather than from an image.
+    #[cfg(test)]
+    pub fn debug_set_next_free(&self, arena: ArenaId, to: u32) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.extents.get_mut(&arena) {
+            e.next_free = to;
+        }
+        st.fill_unknown.insert(arena);
+    }
+
     /// **D85.** Recover a restored extent's true fill by probing its pages, and clear the suspicion.
     ///
     /// Pages inside an extent are handed out sequentially by `alloc_for` and every one is written
@@ -2450,6 +2461,53 @@ mod tests {
     /// `next_free` behind by up to `ARENA_EXTENT_PAGES` pages. `load_state` knows and says so, and
     /// answers it on the ALLOCATION side by never resuming a restored extent. This asks the
     /// COLLECTION side's question instead: `extent_is_empty` is `recycled >= ext.next_free`.
+    /// **D87 falsifier 2, checked BEFORE any of D87 is built.**
+    ///
+    /// D85's probe was only ever asked about extents restored from an IMAGE, which gives it a
+    /// lower bound (`next_free` as of the checkpoint) to start from. D87 proposes rebuilding
+    /// `extents` from the catalog instead, where there is NO lower bound — the probe would start
+    /// at 0. If it cannot then tell a never-allocated page from an allocated one, a rebuilt extent
+    /// misreports its fill and D85's data loss returns by another door.
+    ///
+    /// This asks exactly that: probe an extent from zero and see whether the answer matches what
+    /// was actually written.
+    #[test]
+    fn d87_probing_an_extent_from_zero_reports_the_pages_actually_written() {
+        let h = Harness::new();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+        let epoch = h.catalog.next_epoch();
+        // Enough to land in an extent with room to spare, so there ARE unwritten pages after the
+        // written prefix for the probe to run past if it is going to.
+        for _ in 0..6 {
+            h.store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+        }
+        let arena = *h.catalog.get(b.branch_id).unwrap().arenas.last().unwrap();
+        let truth = h.store.allocated_pages(arena).len();
+        h.store.flush().unwrap();
+        let image = h.store.state_bytes();
+
+        let re = h.fresh_store();
+        re.load_state(&image).unwrap();
+        // Force the no-lower-bound case D87 would create: zero the fill before probing.
+        re.debug_set_next_free(arena, 0);
+        assert_eq!(re.allocated_pages(arena).len(), 0, "fixture: the fill was not zeroed");
+        re.resolve_fill(arena);
+        let probed = re.allocated_pages(arena).len();
+
+        println!("D87 falsifier2: truth={truth} probed-from-zero={probed}");
+        assert!(
+            probed <= truth,
+            "D87 FALSIFIER 2 FIRED: probing from zero reported {probed} pages where only {truth} \
+             were written. A rebuilt extent would claim pages it does not own, so the catalog \
+             derivation D87 rests on cannot be trusted without a lower bound."
+        );
+        assert_eq!(
+            probed, truth,
+            "probing from zero under-reports ({probed} of {truth}); a rebuilt extent would look \
+             emptier than it is, which is exactly D85's data loss arriving by another door"
+        );
+    }
+
     /// **D85 guard test: `extent_is_empty` must refuse a suspect extent WITHOUT being probed.**
     ///
     /// The end-to-end test cannot see this guard, because `retire_arenas_by_rule` probes first and

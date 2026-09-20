@@ -1,0 +1,72 @@
+D86 — A MERGE GETS SLOWER THE MORE MERGES HAVE ALREADY HAPPENED. Within-run, with a control.
+
+[HERE] `examples/d68_merge_is_o_table.rs` with a first-decile vs last-decile comparison added.
+`D68_SIZES=2000 D68_MERGES=400 D68_DELTA=4`, one thread.
+
+  merge latency:  first 40 = 4.949 ms,  last 40 = 7.929 ms   -> **1.60x drift**
+  CONTROL writes: first 40 = 0.086 ms,  last 40 = 0.070 ms   -> 0.82x drift
+
+⇒ **Across 400 merges the merge got 1.60x slower while the UPDATEs in the same cycles got 18%
+FASTER.** The comparison is WITHIN one run, so a shared box cannot produce it — and the control
+says the machine was, if anything, quieter at the end than at the start. A rising-load explanation
+would have to make one phase slower and the other faster in the same process at the same moment.
+
+=== THE MECHANISM, read from source =================================================
+
+`State::applied` is a `Vec<AppliedOp>` (`runtime.rs:345`) that is **never pruned** — the only
+`clear()` in the file is on a different `applied`, belonging to a per-row report (`:3098`). Every
+merge pushes one entry per changed cell (`:3734`).
+
+`concurrent_op` (`:3686-3692`) then answers a KEYED question with a LINEAR SCAN:
+
+    state.applied.iter()
+        .filter(|a| a.seq > fork_seq && a.tbl == tbl && a.row == row && a.col == Some(col))
+
+once **per changed cell**. So merge number k costs O(k x delta) and merging N branches is O(N^2).
+At 400 merges the log holds ~1,600 entries and the cost is already visible at 1.6x.
+
+⚠ **Extrapolation, arithmetic not measurement:** at the 10^6-branch objective the log holds ~4x10^6
+entries and every merge scans all of them once per cell.
+
+=== WHAT THIS IS NOT ================================================================
+
+⛔ Not the D68/D69 table-size question, which is closed: merge is O(delta) in TABLE size
+(`bench/d69_fsync_counted.txt`, WAL bytes = 229 + 206·delta, exact over 32x). This is a different
+axis — cost in the number of merges ALREADY DONE — and no previous run varied it. D69's harness
+did 25-40 merges, where the log is ~100 entries and the effect is inside the noise.
+
+⇒ The fix is the one rule 1c names: **re-index the question rather than recompute the answer.** The
+filter predicate is already a key — `(tbl, row, col)` — and nothing indexes it.
+
+=== THE FIX, AND WHY THE FIRST HALF OF IT DID NOT CLEAR THE BAR ======================
+
+**Attempt 1 — index by `(tbl, row, col)`.** The predicate's first three conjuncts are a key, so the
+scan became a map lookup into a per-cell position list.
+
+    drift across 400 merges:  1.60x -> 1.25x       median merge: 7.869 -> 5.618 ms (1.40x)
+
+⛔ **1.40x IS A MICRO AND THE RESIDUAL DRIFT SAID SO.** The measurement refused to go flat, which
+is the useful part: an agent workload writes the SAME cells over and over — this harness updates
+four fixed row ids every cycle — so a cell's own history grows by one entry per merge and
+`O(ops for this cell)` is the same order as `O(applied)` for exactly the case that matters.
+Shipping here would have been a constant-factor win dressed as a fix.
+
+**Attempt 2 — binary search the remaining range.** The surviving filter is `seq > fork_seq`, a
+RANGE over a key that is ALREADY SORTED: `push_applied` appends in increasing `seq`, so each cell's
+position list is increasing in both position and seq. `partition_point` finds the boundary.
+
+  merges   first decile   last decile   drift   control drift
+     400       3.936 ms      3.921 ms   1.00x           1.18x
+    1200      13.890 ms     13.936 ms   1.00x           1.03x
+
+⇒ ✅ **THE DRIFT IS GONE AT BOTH COUNTS.** At 400 the control moved 1.18x — the machine got BUSIER
+— while the merge stayed flat, which is the direction that cannot be faked. Confirming at 1,200
+merges is what makes this a complexity claim rather than a number: cost per cell went **O(k) ->
+O(log k)**, and merging N branches stopped being O(N^2).
+
+⚠ The absolutes differ between the two rows (3.9 ms vs 13.9 ms) because a full verification suite
+was running during the second. The DRIFT column is the result; it is computed within a single run
+and both runs agree on it.
+
+⚠ The 2.0x median improvement at 400 merges is incidental and is NOT the claim. The claim is the
+shape: a merge no longer costs more because earlier merges happened.

@@ -324,7 +324,25 @@ fn main() {
             continue;
         }
         let n = tot.len() as u64;
+        // **D86: does a merge get slower the more merges have already happened?**
+        //
+        // `State::applied` is a never-pruned Vec, and `concurrent_op` scans ALL of it once per
+        // changed cell (`runtime.rs:3688`, filtering on tbl/row/col/seq). If that is the cost,
+        // merge k pays O(k) and merging N branches is O(N^2). Comparing the FIRST decile of this
+        // run against the LAST is a within-run comparison, so machine load cannot produce it.
+        let decile = (mg.len() / 10).max(1);
+        let mut first_d: Vec<f64> = mg[..decile].to_vec();
+        let mut last_d: Vec<f64> = mg[mg.len() - decile..].to_vec();
+        // **THE CONTROL.** The UPDATEs in each cycle do not touch `applied`, so their latency must
+        // NOT drift within the run. If both drift, it is the machine; if only the merge does, it is
+        // the applied log. Without this the comparison is worthless — rising load fakes it exactly.
+        let mut first_w: Vec<f64> = wr[..decile].to_vec();
+        let mut last_w: Vec<f64> = wr[wr.len() - decile..].to_vec();
+        let (fw, lw) = (med(&mut first_w), med(&mut last_w));
+        let (f_med, l_med) = (med(&mut first_d), med(&mut last_d));
         let (mt, mb, mw, mm) = (med(&mut tot), med(&mut beg), med(&mut wr), med(&mut mg));
+        println!("           merge latency: first {decile} = {f_med:.3} ms, last {decile} = {l_med:.3} ms  -> {:.2}x drift", l_med / f_med.max(1e-9));
+        println!("           CONTROL writes: first {decile} = {fw:.3} ms, last {decile} = {lw:.3} ms  -> {:.2}x drift (this one must stay ~1.0 or the machine moved)", lw / fw.max(1e-9));
         println!("  {rows:>6} {:>4}   {mt:>8.3} | {mb:>8.3}  {:>9.3}  {mm:>8.3} | {:>12.2}  {:>11.1}",
                  n, mw, fs as f64 / n as f64,
                  if fs == 0 { 0.0 } else { fb as f64 / fs as f64 });
