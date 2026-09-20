@@ -155,7 +155,7 @@ fn main() {
     // Two space columns on purpose. `data MB` is FILE LENGTH; `alloc MB` is blocks*512, what the
     // filesystem actually gave out. A reservation scheme can inflate length far past allocation, and
     // quoting only length would overstate the wall. Both are reported so neither can be cherry-picked.
-    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms");
+    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   reopen min");
 
     let mut done = 0usize;
     let mut stopped_early: Option<(usize, u64)> = None;
@@ -205,21 +205,29 @@ fn main() {
         //
         // S4's O(1)-reopen claim has only ever been checked by `examples/branch_curve.rs`, which is
         // FORK-ONLY: no branch in it calls `arena_for` or `alloc_in_arena`, so it reopens a catalog
-        // whose branches own no pages. This harness is the one that writes, and it did not measure
-        // reopen at all — and it deletes its database at the end, so D61 could not answer this
-        // after the fact. The timing block is `branch_curve.rs`'s own, reused rather than rewritten.
+        // whose branches own no pages. This harness is the one that writes.
         //
-        // Reported PER CHECKPOINT on purpose: one reopen number at 10^6 cannot separate O(1) from
-        // O(log N) from a small O(N). The column across the decade is the measurement; a single
-        // cell is an anecdote.
+        // ⚠ **k SAMPLES, REPORTING MEDIAN AND MIN — not one wall-clock sample.** D65 runs 1 and 2
+        // took a single sample per checkpoint on a shared box and DISAGREED ABOUT THE DIRECTION at
+        // the same two sizes (100k: 1.144 vs 0.856 ms; 250k: 1.184 vs 1.729 ms). One sample cannot
+        // separate a real cost from a scheduling artifact. MIN is reported because contention can
+        // only make a reopen SLOWER, never faster, so it is the least contaminated estimate
+        // available: a flat MIN column is strong evidence, and a climbing MIN is hard to dismiss.
+        const REOPEN_SAMPLES: usize = 5;
         let root = cat_concrete.root_page_id();
-        let t_reopen = Instant::now();
-        let re = TableBranchCatalog::open_sidecar(&cat_path, root).expect("reopen");
-        let reopen_ms = t_reopen.elapsed().as_secs_f64() * 1000.0;
-        drop(re);
+        let mut samples = Vec::with_capacity(REOPEN_SAMPLES);
+        for _ in 0..REOPEN_SAMPLES {
+            let t_reopen = Instant::now();
+            let re = TableBranchCatalog::open_sidecar(&cat_path, root).expect("reopen");
+            samples.push(t_reopen.elapsed().as_secs_f64() * 1000.0);
+            drop(re);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let reopen_min = samples[0];
+        let reopen_ms = samples[samples.len() / 2];
 
         println!(
-            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}   {:>9.3}",
+            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}   {:>9.3}   {:>9.3}",
             done,
             actually as f64 / secs,
             data as f64 / 1e6,
@@ -229,6 +237,7 @@ fn main() {
             cbytes as f64 / done as f64,
             store.live_page_count().unwrap_or(0),
             reopen_ms,
+            reopen_min,
         );
 
         if data >= budget {
