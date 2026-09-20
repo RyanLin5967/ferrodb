@@ -603,6 +603,44 @@ fn a_candidate_is_scored_by_the_same_gate_a_production_merge_uses() {
 // Vacuity: an assertion that examined nothing is not a pass.
 // -------------------------------------------------------------------------------------------
 
+/// **The SILENT PASS — D69's uncovered half.** An assertion must be scored over the WHOLE table,
+/// not over the rows the candidate happened to touch.
+///
+/// D69 narrowed the row set `evaluate_assertions` scores to the branch's own touched rows. The
+/// sibling test below caught the LOUD half of that (an assertion over an untouched table examined
+/// zero rows and hard-rejected). This is the half NOTHING caught, and it is the dangerous
+/// direction: a violating row the candidate never touched becomes INVISIBLE, the gate finds no
+/// violation, and the simulation ADMITS AND PUBLISHES a merge whose declared invariant is false on
+/// the target.
+///
+/// Row 2 holds `qty = -5` and no candidate touches it. `qty >= 0` is false on the target and must
+/// stay false: the candidate must NOT be admitted, and row 1 must be left alone.
+///
+/// ⚠ Every other ASSERT test in this file has the candidate write the same row the violation lands
+/// on, which is exactly why the suite stayed green through the defect — `[[fixtures-share-the-
+/// assumption]]`. This one deliberately separates them.
+#[test]
+fn an_assertion_is_scored_over_rows_the_candidate_never_touched() {
+    let mut db = Db::new();
+    db.seed();
+    {
+        let mut s = db.session();
+        // Row 2 starts already violating. Nothing in the candidate goes near it.
+        db.ok("UPDATE inventory SET qty = -5 WHERE id = 2;", &mut s);
+    }
+
+    let mut plan = SimulationPlan::new("a");
+    plan = plan.candidate("take-8", stmts("UPDATE inventory SET qty = qty - 8 WHERE id = 1;"));
+    let plan = plan.assert_on("inventory", predicate("qty >= 0")).admit(AdmitPolicy::All);
+    let report = db.simulate(&plan).expect("simulate should run");
+
+    assert!(
+        report.admitted().is_empty(),
+        "a candidate was admitted while `qty >= 0` is false on row 2, which it never touched"
+    );
+    assert_eq!(db.qty(1), 20, "nothing should have published, but row 1 moved off 20");
+}
+
 /// **Breaking shape:** an assertion over a table with no rows in it — the empty audit table nobody
 /// has written to yet. Every predicate holds over the empty set, so every candidate scores 1.00
 /// and the simulation admits work that nothing checked.
