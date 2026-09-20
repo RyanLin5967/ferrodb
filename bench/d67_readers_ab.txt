@@ -67,3 +67,18 @@ already exists, which clears the bar by a factor of nearly five — and unlike a
 the bound was established BEFORE any mechanism was proposed, so it cannot be reverse-engineered to
 flatter one.
 ===========================================================================================
+
+=== PRIVATE CURVE — the ceiling at every thread count, not one point ===
+[HERE] 2026-09-20T15:43:50Z. The 47x above rests on ONE private measurement at 16T.
+A single ratio cannot distinguish 'the lock costs 47x' from 'the private arm got lucky'.
+PRE-REGISTERED: the private arm RISES with threads (it has nothing shared to contend on)
+while the shared arm falls. If the private arm ALSO falls, the 47x is partly this box and
+the claim must shrink to whatever the two curves' gap actually supports.
+  shared, for comparison:  1T 159.6 | 2T 118.8 | 4T 70.3 | 8T 41.4 | 16T 12.5
+load before: 18.13 20.59 16.17
+  private 1  T -> 0.0 merges/sec (0 in 10.0s)
+  private 2  T -> 0.0 merges/sec (0 in 10.0s)
+  private 4  T -> 0.0 merges/sec (0 in 10.1s)
+  private 8  T -> 365.5 merges/sec (3665 in 10.0s)
+  private 16 T -> PRIVATE CONTROL: 16 threads, 16 ServerContexts, 10s
+load after: 17.15 17.61 16.20

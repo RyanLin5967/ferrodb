@@ -1,0 +1,30 @@
+D67-RECOUNT-LONG — the curve with ENOUGH EVENTS TO TRUST, corrected counter, medians of 3.
+
+WHY THIS EXISTS: the first recount used 2-second windows and produced 38-142 events per point and
+a NON-MONOTONE curve (1T 70.9, 2T 43.0, 4T 60.9, 8T 24.4, 16T 19.0). A 42% swing between 2T and 4T
+is well outside Poisson on those counts, so the window was too short once the counter stopped
+crediting quarantined merges. Applied merges are far rarer than Ok ones.
+
+⛔ WHAT THIS RUN IS CHECKING, AND IT IS MY OWN HEADLINE: the originally reported collapse was
+x0.08 at 16T, measured with the is_ok counter. The corrected 2-second recount says ~x0.27. This
+run decides which, with 12-second windows and the median of 3 rounds per point.
+
+PRE-REGISTERED: the direction (down) is not in doubt — the 93.8%-blocked profile does not depend
+on how completions are counted. What is in doubt is the MAGNITUDE, and therefore the 47x prize
+that was derived from it. If the median curve lands near x0.27, the claim becomes "16 threads do a
+quarter the work of one" and the prize shrinks accordingly; both get corrected in place.
+[HERE] 2026-09-20T15:52:18Z at a8fc8e6
+load before: 17.44 17.66 16.24
+
+  disjoint 1  T rounds: 
+  disjoint 2  T rounds: 
+  disjoint 4  T rounds: 
+  disjoint 8  T rounds: 
+  disjoint 16 T rounds: 
+
+  private  1  T rounds: 
+  private  16 T rounds: 
+load after: 17.44 17.66 16.24
+tidy directory. Nothing in either file should be quoted.
+The live measurement of merge cost is bench/d68_merge_is_o_table.txt.
+===========================================================================================
