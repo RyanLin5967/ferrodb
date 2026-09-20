@@ -1,0 +1,88 @@
+D67 — DOES CONCURRENT BRANCH MANAGEMENT SCALE? merges/sec against thread count.
+[HERE] 2026-09-20T15:28:03Z  examples/d67_merge_contention at 3cd3034
+load before: 21.83 13.31 8.84
+
+D67 — CONCURRENT BRANCH MANAGEMENT: merges/sec against thread count.
+PREDICTION, recorded before the numbers: FLAT in both arms, because every MERGE takes
+the one `Mutex<Catalog>` at pgwire/mod.rs:64 and drains readers on the way in.
+⚠ merges/sec is a FLOOR on a shared box; the SHAPE against thread count is the result.
+
+  disjoint    1T ->     159.6 merges/sec  (320 in 2.01s)
+  disjoint    2T ->     118.8 merges/sec  (238 in 2.00s)
+  disjoint    4T ->      70.3 merges/sec  (141 in 2.01s)
+  disjoint    8T ->      41.4 merges/sec  (83 in 2.01s)
+  disjoint   16T ->      12.5 merges/sec  (25 in 2.01s)
+
+  shared      1T ->     157.1 merges/sec  (315 in 2.01s)
+  shared      2T ->     141.4 merges/sec  (283 in 2.00s)
+  shared      4T ->     103.4 merges/sec  (207 in 2.00s)
+  shared      8T ->      84.3 merges/sec  (169 in 2.01s)
+  shared     16T ->     136.2 merges/sec  (273 in 2.00s)
+
+threads   disjoint/sec   vs 1T      shared/sec   vs 1T
+      1          159.6    1.00x         157.1    1.00x
+      2          118.8    0.74x         141.4    0.90x
+      4           70.3    0.44x         103.4    0.66x
+      8           41.4    0.26x          84.3    0.54x
+     16           12.5    0.08x         136.2    0.87x
+
+VERDICT at 16T: disjoint x0.08, shared x0.87
+FLAT. Concurrent branch management does not scale, and the disjoint arm rules out
+conflict detection as the cause: no two branches touched the same row. The wall is
+something SHARED AND SERIAL on the merge path. Which one is the next run.
+# rc=0
+load after: 16.93 15.26 10.19
+
+=== READING ===============================================================================
+[HERE] reduced by this session from the table above. rc=0, both arms complete.
+
+CONCURRENT BRANCH MANAGEMENT DOES NOT MERELY FAIL TO SCALE — IT COLLAPSES.
+  disjoint: 159.6 -> 118.8 -> 70.3 -> 41.4 -> 12.5 merges/sec across 1,2,4,8,16 threads.
+  Monotone, every step down, ending at x0.08 — SIXTEEN THREADS DO ONE THIRTEENTH THE WORK OF ONE.
+  The prediction in this file's header said FLAT. Flat would have been the good outcome.
+
+⛔ THE PREDICTION WAS WRONG IN THE DIRECTION THAT MATTERS, and that is recorded rather than
+smoothed: a global lock alone predicts FLAT (serialised, no worse than one thread). A monotone
+COLLAPSE is the signature of a convoy — threads queueing, each acquisition paying for the queue —
+or of work whose cost grows with the number of concurrent participants. Flat and collapsing are
+different mechanisms and only one of them was predicted.
+
+THE CONFOUND THAT WOULD HAVE KILLED THIS ROW, EXCLUDED BY THE COUNTS THEMSELVES
+  More threads create more branches, and this repo has KNOWN O(open sessions) and
+  O(removed x sessions) paths on the merge/reap side (ledger row W4). So the 16T point could have
+  been slow because of accumulated branches rather than concurrency — the classic case of the
+  harness being the wall. It is not, and the raw counts say so:
+      1T  completed 320 cycles in the window   -> ~320 branches accumulated
+     16T  completed  25 cycles in the window   -> ~25 branches accumulated
+  The FASTEST point carried THIRTEEN TIMES MORE accumulated state than the slowest. Accumulation
+  cannot explain a collapse that runs the other way. No extra control run was needed; the
+  measurement already contained its own.
+
+OVERSUBSCRIPTION IS ALSO EXCLUDED AS THE MAIN TERM. 16 harness threads plus ~17 of other load on
+18 cores is roughly 2x oversubscribed, which costs about 0.5x. The observed 0.08x is fifteen times
+past what that explains.
+
+⚠ THE SHARED ARM IS NOT A RESULT, AND ITS "RECOVERY" IS A HARNESS FLAW I AM NAMING RATHER THAN
+QUOTING. shared goes 1.00 -> 0.90 -> 0.66 -> 0.54 -> 0.87, recovering at 16T. A merge that is
+QUARANTINED returns Ok, and this harness counts `exec("MERGE;").is_ok()` — so at 16 threads, where
+every agent writes the same 16 ids, merges increasingly quarantine INSTEAD of applying, and a fast
+refusal is counted as a completed cycle. The shared column measures how quickly merges can fail.
+⇒ DO NOT QUOTE THE SHARED ARM. The disjoint arm is the clean one: there, merges genuinely apply.
+⇒ Fixing it means counting `report.applied_to_target`, not `is_ok()`. Next revision of the harness.
+
+WHAT THIS LOCALISES, AND WHAT IT DOES NOT
+  ✓ It is not conflict detection: the disjoint arm has no two branches touching the same row.
+  ✓ It is not branch accumulation: excluded above, by the counts.
+  ✓ It is not oversubscription: off by fifteen.
+  ⇒ It is something SHARED AND SERIAL on the merge path whose cost RISES with concurrency.
+  ⛔ The obvious suspect is `pgwire/mod.rs:64` `Mutex<Catalog>`, which every `&mut Catalog` taker
+     acquires and which DRAINS THE READERS on the way in — but that is a HYPOTHESIS READ OFF THE
+     SOURCE, not a measurement. A profile of the 16T disjoint point is what names it, and until
+     that exists the honest statement is "shared and serial", not "the catalog mutex".
+
+WHY THIS ROW MATTERS MORE THAN THE ONES ABOVE IT: D56-D59 took the READ path to x8.12 at 16
+threads. D61 measured per-branch SPACE to 10^6. D65 measured REOPEN to 10^6. Those are the three
+places this project has looked, and all three are healthy. BranchBench's finding names "concurrent
+branch management", and this is the first time that has been measured here. It is the only
+structural wall currently on the board.
+===========================================================================================
