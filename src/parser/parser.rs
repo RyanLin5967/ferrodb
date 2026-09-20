@@ -72,8 +72,23 @@ pub const MAX_EXPR_DEPTH: usize = 64;
 /// descend the same tree with fatter frames and are **UNMEASURED**. 1,024 is 25x under the one
 /// threshold that was measured, and that margin is deliberately standing in for the thresholds
 /// that were not: a limit 3x under the LIGHTEST walker would have been justified by a number that
-/// does not describe the walkers it is protecting. A `WHERE` with a thousand `AND` terms still
-/// parses, which covers machine-generated SQL.
+/// does not describe the walkers it is protecting.
+///
+/// ⚠ **WHAT 1,024 BUYS IN REAL SQL IS ABOUT HALF THAT, and an earlier version of this comment got
+/// it wrong.** The budget counts CHARGES, not terms, and an ordinary predicate spends two per
+/// term: `a = 1 AND b = 2 AND …` charges once in `and()` for the `AND` and once in `equality()`
+/// for the `=`. So the real ceiling is roughly 512 AND-ed comparisons, not a thousand. A bare
+/// chain like `1 + 1 + 1 …` spends one per operator and does get 1,024. Stating the generous
+/// number was the same error as the rest of this row: a claim about the guard that the guard does
+/// not support.
+///
+/// ⚠ **IT ALSO DOES NOT AGREE WITH `tel::log::MAX_GUARD_DEPTH` (256), DELIBERATELY.** A TEL guard
+/// predicate that this parser accepts at 300 operators is refused later by the durable-log
+/// encoder, which is a worse failure than refusing it here — it fails after the statement looks
+/// accepted. They are not unified because they bound different things (this one, any expression
+/// in any statement; that one, what can be round-tripped through a log record), and collapsing
+/// them would drag every `WHERE` in the system down to a limit that exists for the TEL log. The
+/// interaction is recorded rather than hidden; it is a real rough edge, not a resolved one.
 pub const MAX_TREE_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]

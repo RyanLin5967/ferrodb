@@ -184,20 +184,43 @@ fn a_long_operator_chain_is_not_bounded_by_the_frame_limit() {
     assert_eq!(stmts.len(), 1);
 }
 
-/// Depth must not leak across statements in one batch.
+/// Neither counter may leak across statements in one batch.
+///
+/// ⚠ **Uses an OPERATOR shape on purpose.** The first version used nested parens, which charge the
+/// FRAME counter and never touch the chain counter — so `parse`'s `self.chain = 0` reset, the
+/// other line D64c added, was pinned by nothing and could be deleted silently. Each statement here
+/// spends most of the tree budget, so a missing reset makes the second statement fail.
 #[test]
-fn a_batch_of_many_shallow_statements_does_not_accumulate_depth() {
-    let one = sql_for(PARENS_MAX, Shape::Parens);
-    let many = one.repeat(50);
+fn neither_counter_leaks_across_statements_in_a_batch() {
+    let per_statement = MAX_TREE_DEPTH - 1;
+    let mut one = String::from("SELECT 1");
+    for _ in 0..per_statement {
+        one.push_str(" + 1");
+    }
+    one.push_str(" FROM t;");
+    let many = one.repeat(20);
+    assert!(
+        per_statement * 20 > MAX_TREE_DEPTH,
+        "the batch must exceed the budget in total, or a missing reset would not show"
+    );
+
     let tokens = Scanner::new(many.chars().collect(), Vec::new()).scan_tokens().unwrap();
     let mut p = Parser::new(tokens);
     let stmts = p.parse();
     assert!(
         p.errors.is_empty(),
-        "50 statements each at the limit must all parse; first error: {:?}",
+        "20 statements each just under the budget must all parse; first error: {:?}",
         p.errors.first().map(|e| e.to_string())
     );
-    assert_eq!(stmts.len(), 50);
+    assert_eq!(stmts.len(), 20);
+
+    // And the frame counter too, with the shape that charges it.
+    let nested = sql_for(PARENS_MAX, Shape::Parens).repeat(20);
+    let tokens = Scanner::new(nested.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let stmts = p.parse();
+    assert!(p.errors.is_empty(), "frame counter leaked: {:?}", p.errors.first().map(|e| e.to_string()));
+    assert_eq!(stmts.len(), 20);
 }
 
 /// **The hole three review passes took to find: COMPOSING two shapes.**
@@ -250,11 +273,17 @@ fn nesting_cannot_renew_the_chain_budget() {
 
 /// Joins are charged too: the parser keeps them in a flat `Vec`, but the planner folds them into
 /// an N-deep `LogicalPlan::Join` tree that several walkers descend recursively.
+///
+/// ⚠ **`ON 1`, NOT `ON 1 = 1`, and that is the whole test.** The first version of this used
+/// `ON 1 = 1`, whose `=` spends a charge in `equality()` all by itself — so the budget ran out
+/// either way and the test passed with the join charge DELETED. It could not tell the guard from
+/// its absence. `ON 1` is a bare literal costing zero, so the only thing that can refuse this is
+/// the charge in the join loop.
 #[test]
 fn a_join_list_longer_than_the_tree_budget_is_refused() {
     let mut sql = String::from("SELECT 1 FROM t0");
-    for i in 1..=(MAX_TREE_DEPTH + 10) {
-        sql.push_str(&format!(" JOIN t{i} ON 1 = 1"));
+    for i in 1..=(MAX_TREE_DEPTH + 1) {
+        sql.push_str(&format!(" JOIN t{i} ON 1"));
     }
     sql.push(';');
     let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
@@ -262,6 +291,26 @@ fn a_join_list_longer_than_the_tree_budget_is_refused() {
     let _ = p.parse();
     let err = p.errors.first().map(|e| e.to_string()).expect("must be refused");
     assert!(err.contains("chains more than"), "got: {err}");
+}
+
+/// The other side of that boundary: exactly the budget in zero-cost joins must still parse, so an
+/// off-by-one in the join charge is caught as well as its deletion.
+#[test]
+fn exactly_the_tree_budget_in_zero_cost_joins_still_parses() {
+    let mut sql = String::from("SELECT 1 FROM t0");
+    for i in 1..=MAX_TREE_DEPTH {
+        sql.push_str(&format!(" JOIN t{i} ON 1"));
+    }
+    sql.push(';');
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let stmts = p.parse();
+    assert!(
+        p.errors.is_empty(),
+        "exactly {MAX_TREE_DEPTH} joins must parse; got {:?}",
+        p.errors.first().map(|e| e.to_string())
+    );
+    assert_eq!(stmts.len(), 1);
 }
 
 /// ...and a join list a real query might contain still parses.

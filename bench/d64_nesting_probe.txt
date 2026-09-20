@@ -62,8 +62,15 @@ TWO LIMITS, BECAUSE THEY BOUND TWO QUANTITIES 100x APART
 ---------------------------------------------------------
   MAX_EXPR_DEPTH = 64    parser RE-ENTRY: expression, not, unary, parse_statement.
                          Binding case is parens in debug (abort at 200), so ~3x margin.
-  MAX_TREE_DEPTH = 1024  total operator/join levels PER STATEMENT, bounding tree depth
+  MAX_TREE_DEPTH = 1024  total operator/join CHARGES per statement, bounding tree depth
                          conservatively (depth <= total charges). See the scope correction.
+                         ⚠ CHARGES, NOT TERMS: `a = 1 AND b = 2 AND ...` spends TWO per term (the
+                         AND in and(), the = in equality()), so the real ceiling for an ordinary
+                         predicate is ~512 terms, not 1,024. A bare `1 + 1 + 1 ...` chain spends
+                         one per operator and does get 1,024.
+                         ⚠ It does NOT agree with tel::log::MAX_GUARD_DEPTH (256): a TEL guard
+                         predicate accepted here at 300 operators is refused later by the durable
+                         -log encoder. Recorded as a rough edge, not resolved.
   Collapsing these into one constant would either refuse a 200-term AND chain — legal SQL that
   generators emit — or leave the expensive shapes unsafe. They are different quantities, not a
   guard and a spare.
@@ -71,7 +78,10 @@ TWO LIMITS, BECAUSE THEY BOUND TWO QUANTITIES 100x APART
 AFTER, with the guard in place (release, 2 MiB thread) — boundaries measured, not derived
 -------------------------------------------------------------------------------------------
   parens / not / neg / explain   last OK 62, refuses at 63
-  chain                          last OK 4,096, refuses at 4,097
+  chain                          [v3 figure, SUPERSEDED: last OK 4,096, refuses at 4,097 — the
+                                 constant is 1,024 now, so the v4 boundary is 1,024 / 1,025 and
+                                 the v3 numbers below this line describe code that no longer
+                                 exists. Kept, marked, rather than quietly rewritten.]
   Nothing aborts at any depth tried, up to 100,000, on any of the five shapes.
   The refusals name their limit: "expression nests deeper than 64 levels" /
   "expression chains more than 4096 operators deep".
