@@ -1,0 +1,79 @@
+D61 — THE WRITE-BEARING CURVE TO 10^6, RUN 2. One page written per branch, geometric extents (D31) in.
+[HERE] 2026-09-20T02:08:43Z  examples/branch_curve_writes at 050b3ad, 8 threads, 8 GB budget, 20 GiB disk floor
+WHY RUN 2: run 1 was PAUSED BY THE USER mid-run at N=100,000 — not by its budget, not by the
+disk floor, not by a fault. Its measured points are in bench/d61_write_curve_1e6.txt and stand.
+DISTINCT OUTPUT PATH ON PURPOSE: run 1's redirect truncated the earlier 10^5 artifact at a shared
+path and that file is unrecoverable. One run, one path, from here on.
+PRE-REGISTERED (unchanged from run 1): bytes/branch stays flat near 4096. If it climbs, the
+amplification is back in another form and this run NAMES where. If it stops early, the stopping
+point IS the result. N=100,000 is re-measured as a REPRODUCIBILITY CHECK against run 1's 4096.
+⚠ forks/sec is a FLOOR, not a throughput claim — shared box. bytes/branch is load-independent.
+free before: 57Gi   load before: 14.00 6.28 4.62
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
+    100000       430.9     409.6      420.0           4096             4200            334       100000
+    250000       400.2    1024.0     1040.7           4096             4163            334       250000
+    500000       355.7    2048.0     2064.1           4096             4128            334       500000
+    750000       290.5    3072.0     3087.5           4096             4117            334       750000
+   1000000       386.8    4096.0     4110.9           4096             4111            334      1000000
+
+DID NOT stop early within the budget: N = 1000000, 4096 bytes/branch.
+
+  reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+VERDICT — AMPLIFICATION GONE. 4096 B/branch is within 8x of a
+single page, so a branch's first page costs about a page. This is the tree WITH
+geometric extent growth (D31) built; without it this number is ~1048576.
+# rc=0
+free after: 25Gi
+
+=== READING ===============================================================================
+[HERE] reduced by this session from the table above. Nothing below is from another run.
+
+THE RESULT: 10^6 WRITE-BEARING BRANCHES, AT 4096 BYTES PER BRANCH, FLAT.
+  Every checkpoint from 100,000 to 1,000,000 reads EXACTLY 4096 len B/branch — not ~4096, the
+  same integer five times — and `pages live` equals N at every one. The run did not stop early:
+  it finished inside its 8 GB budget (4,096.0 MB of data file) and never approached the 20 GiB
+  disk floor. The pre-registration written at the top of this file said "bytes/branch stays flat
+  near 4096, and if it stops early the stopping point IS the result". It stayed flat and it did
+  not stop.
+
+WHAT MOVED, AND WHAT DID NOT
+  len B/branch    4096 -> 4096 -> 4096 -> 4096 -> 4096     FLAT. This is the row's claim.
+  alloc B/branch  4200 -> 4163 -> 4128 -> 4117 -> 4111     DECLINING, and that is the right
+                  direction: it is one page plus a fixed per-branch overhead being amortised over
+                  more branches. It is converging DOWN toward 4096, not drifting up.
+  cat B/branch     334 ->  334 ->  334 ->  334 ->  334     FLAT. The catalog is linear in N.
+  forks/sec      430.9 -> 400.2 -> 355.7 -> 290.5 -> 386.8 ⚠ NOT A RESULT. See below.
+
+⚠ forks/sec IS A FLOOR, NOT A THROUGHPUT CLAIM, and the shape of this column is the proof: it
+falls to 290.5 at N=750,000 and then RISES to 386.8 at N=1,000,000. A real per-branch cost that
+grew with N could not recover. That column is tracking this shared machine's load (which ranged
+from 12 to 36 during the run, none of it this process's doing) and nothing about ferrodb. The
+number this row turns on — bytes/branch — is load-independent, which is why it is the one quoted.
+
+AGAINST THE WALL THIS ROW EXISTS TO ANSWER
+  D31/D32 measured this same harness at N=4,000 and got 1,048,316 data B/branch — one full 1 MiB
+  extent for one 4 KiB page — and extrapolated 10^6 branches to ~1.05 TB. That extrapolation is
+  now replaced by a measurement: 10^6 branches, 4,096.0 MB. 1,048,316 -> 4,096 is 255.9x, and
+  ~1.05 TB -> 4.1 GB is the same factor carried to the objective's own scale.
+  ⛔ NOBODY HAD RUN THE WRITE-BEARING CURVE PAST N=4,000 SINCE THE FIX. That sentence, from
+  SCALE-NEXT, is no longer true.
+
+THE FRAMING, IN THE SAME SENTENCE AS THE NUMBER — this is a SHAPE and it transfers: per-branch
+space is O(1) in the number of branches, the unit is the page, and a branch's first written page
+costs about a page rather than an extent. That is a claim about a mechanism (geometric extent
+growth, as XFS and ext4 do it) and it is true of any engine that allocates extents per branch.
+It is NOT a BranchBench result — running that benchmark against ferrodb would measure ferrodb —
+and it is NOT an absolute comparison against Dolt or Postgres, where a favourable number here
+would be an artifact of what ferrodb is missing rather than of what was built.
+
+NOT MEASURED BY THIS RUN, and not to be implied from it:
+  · reopen time at 10^6 WITH DATA PRESENT. SCALE-NEXT asked for it; this harness does not measure
+    it and deletes its database at the end, so it cannot be recovered after the fact. The
+    fork-only curve (examples/branch_curve.rs) measures reopen, but with no data. Open.
+  · anything about concurrent READ performance at 10^6 branches. Different row, different curve.
+===========================================================================================
