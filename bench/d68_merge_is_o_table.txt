@@ -1,0 +1,76 @@
+D68 — IS A MERGE O(TABLE) OR O(DELTA)? The falsifiable test of D67's successor claim.
+[HERE] 2026-09-20T15:54:27Z at a8fc8e6
+Harness uses AgentRuntime::with_storage (real arenas) — D67's configuration bug is fixed.
+load before: 80.44 38.76 24.67
+
+D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).
+One thread: no contention, so the slope is the merge's own cost.
+PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.
+
+  table rows   merges   median ms   ms per 1000 rows
+        1000       25       6.000             6.0000
+        2000       25       7.149             3.5743
+             ^ 2.0x the rows, 1.19x the merge time
+        4000       25      10.566             2.6416
+             ^ 4.0x the rows, 1.76x the merge time
+        8000       25      17.050             2.1312
+             ^ 8.0x the rows, 2.84x the merge time
+       16000       25      32.003             2.0002
+             ^ 16.0x the rows, 5.33x the merge time
+
+READ THE LAST COLUMN: flat ms-per-1000-rows means LINEAR in table size (O(table)).
+A falling ms-per-1000-rows means sublinear; a flat MEDIAN MS column means O(1).
+# rc=0
+load after: 74.46 55.39 33.99
+
+=== READING ================================================================================
+[HERE] reduced by this session. rc=0, all five points reached, one thread, fixed delta of 4 rows.
+
+**MERGE IS O(TABLE). CONFIRMED, AND CONFIRMED BY PREDICTION RATHER THAN BY FITTING.**
+
+  rows     median ms   ms/1000 rows   time for a doubling
+  1000       6.000        6.00          —
+  2000       7.149        3.57         1.19x
+  4000      10.566        2.64         1.48x
+  8000      17.050        2.13         1.61x
+ 16000      32.003        2.00         1.88x
+
+Two independent readings of the same curve, both saying linear:
+  * ms-per-1000-rows CONVERGES to 2.00 and stops falling. A flat ms-per-unit column IS linearity;
+    the early fall is a fixed cost being amortised, not sublinear growth.
+  * The cost of a DOUBLING converges to 2.00x: 1.19 -> 1.48 -> 1.61 -> 1.88. That is the same
+    statement from the other side.
+
+FIT, and the reason it is not curve-fitting: on the 1k and 4k points alone this session fitted
+t = 4.5 ms + 1.52 us/row and PREDICTED 16.7 ms at 8,000 rows BEFORE that point was measured. It
+measured 17.050 — 2% out. Refitting on the tail (8k, 16k) gives the asymptote:
+
+    t  ~=  2.1 ms  +  1.87 us/row
+
+WHAT THAT COEFFICIENT MEANS AT THE OBJECTIVE'S SCALE, by arithmetic and labelled as such:
+    100,000-row table  ->  ~190 ms per merge
+  1,000,000-row table  ->  ~1.9 SECONDS per merge
+...to write FOUR ROWS, and while holding the global catalog mutex the whole time.
+
+THE MECHANISM, verified in source before this run, not inferred from it:
+  * runtime.rs:2691, in `evaluate_merge`  — `for row in scan_table(name, &ctx.read())?`
+  * runtime.rs:3459, in `fingerprint_tables` (from `publish_evaluation_as`) — the SAME scan again
+  * runtime.rs:4317, `fingerprint_rows` — hashes EVERY ROW to build `base_fingerprint`
+  A merge reads the whole table TWICE and hashes it once, regardless of how little it changed.
+  1.87 us/row over two scans plus a hash is the right order for that work.
+
+⚠ WHY NOBODY SAW IT: at 1,000 rows the scan is a quarter of the merge and reads as overhead; the
+fixed ~2-4 ms hides it. Only the SIZE AXIS separates a constant from a class
+([[measure-the-slope-not-the-ratio]]), and every prior ferrodb fixture is small.
+
+⚠ ABSOLUTES ARE INFLATED — load was 74-80 throughout, from other sessions. That scales all five
+points together and cannot manufacture a convergence to 2.00x per doubling, which is why the
+SLOPE is quoted and the milliseconds are not.
+
+⚠ WHAT THIS IS NOT: not a BranchBench result, not a comparison against Dolt or Postgres. It is a
+SHAPE — "merge cost is independent of how much the branch changed" — and it transfers to any
+engine that validates a merge by fingerprinting the target rather than the delta.
+
+NEXT: make merge O(delta). The falsifier for that fix is this exact curve run again — the
+ms/1000-rows column must FALL toward zero instead of converging to 2.00.
+===========================================================================================

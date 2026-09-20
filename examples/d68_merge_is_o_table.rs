@@ -102,7 +102,7 @@ fn exec(s: &Server, sql: &str, sess: &mut Session) -> Result<Outcome, String> {
     out.map_err(|e| e.to_string())
 }
 
-fn build(dir: &std::path::Path, tag: &str) -> Server {
+fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
     let d = dir.join(tag);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -146,7 +146,7 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
 
     let mut sess = Session::new();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
-    for i in 1..=ROWS {
+    for i in 1..=nrows {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
     }
     s
@@ -218,179 +218,61 @@ fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
     }
 }
 
-fn sweep(dir: &std::path::Path, disjoint: bool) -> Vec<(usize, f64)> {
-    let arm = if disjoint { "disjoint" } else { "shared" };
-    let mut out = Vec::new();
-    for &threads in POINTS.iter() {
-        let s = Arc::new(build(dir, &format!("{arm}_{threads}")));
-        let start = Arc::new(Barrier::new(threads + 1));
-        let stop = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicU64::new(0));
 
-        let mut hs = Vec::new();
-        for tid in 0..threads {
-            let (s, start, stop, done) = (s.clone(), start.clone(), stop.clone(), done.clone());
-            hs.push(std::thread::spawn(move || {
-                let mut seq = 0u64;
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    if one_cycle(&s, tid, seq, disjoint) {
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    seq += 1;
-                }
-            }));
-        }
-        start.wait();
-        std::thread::sleep(WARMUP);
-        done.store(0, Ordering::Relaxed);
-        let t0 = Instant::now();
-        std::thread::sleep(MEASURE);
-        let n = done.load(Ordering::Relaxed);
-        let secs = t0.elapsed().as_secs_f64();
-        stop.store(true, Ordering::Relaxed);
-        for h in hs {
-            let _ = h.join();
-        }
-        let rate = n as f64 / secs;
-        println!("  {arm:<9} {threads:>3}T -> {rate:>9.1} merges/sec  ({n} in {secs:.2}s)");
-        out.push((threads, rate));
-    }
-    out
-}
-
+/// D68 — IS MERGE O(TABLE) OR O(DELTA)? One thread, fixed delta, growing table.
+///
+/// D67 found merges serialising on the global catalog mutex. Reviewing what the lock HOLDER does
+/// found something larger: `evaluate_merge` (runtime.rs:2691) scans every row of each touched
+/// table, and `fingerprint_tables` (runtime.rs:3459) scans it AGAIN, with `fingerprint_rows`
+/// hashing every row to build `base_fingerprint`. A merge that writes four rows would then read
+/// the whole table twice — which is a COMPLEXITY CLASS, not a locking constant, and no amount of
+/// lock engineering touches it.
+///
+/// This run is ONE THREAD on purpose. With a single thread there is no contention, so whatever
+/// slope appears is the merge's own cost against table size and nothing else.
+///
+/// PRE-REGISTERED: merge latency grows LINEARLY with table size at fixed delta. If it is FLAT,
+/// the O(table) reading is WRONG — the scans exist but something prunes them — and D68 is closed
+/// as a misreading of the source.
 fn main() {
-    let dir = std::env::temp_dir().join(format!("ferrodb-d67-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ferrodb-d68-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let sizes: Vec<i64> = std::env::var("D68_SIZES")
+        .unwrap_or_else(|_| "1000,2000,4000,8000,16000".to_string())
+        .split(',').filter_map(|v| v.parse().ok()).collect();
+    let merges: usize = std::env::var("D68_MERGES").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
 
-    // D67_POINT=16 D67_SECONDS=30 runs ONE point for a long time, so a sampling profiler has a
-    // steady state to look at. The sweep's 2-second windows are too short to profile and the
-    // build/teardown between points would dominate the sample.
-    // D67_PRIVATE=1 gives every thread its OWN ServerContext and its own database — the CONTROL
-    // d55 used for reads, applied to writes. It removes every shared structure, so it measures
-    // what this machine can do if the global catalog lock simply were not there. The gap between
-    // it and the shared arm is the PRIZE: how much is actually on the table, as opposed to how
-    // bad the shared arm looks.
-    //
-    // ⚠ It is a CEILING, not a proposal. N private databases are not one database, and nothing
-    // that must stay consistent across agents can be built this way. Quoting it as an achievable
-    // number would be dishonest; quoting it as an upper bound is the point.
-    if std::env::var("D67_PRIVATE").is_ok() {
-        let threads: usize = std::env::var("D67_POINT").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-        let secs: u64 = std::env::var("D67_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
-        println!("PRIVATE CONTROL: {threads} threads, {threads} ServerContexts, {secs}s");
-        let mut servers = Vec::new();
-        for t in 0..threads {
-            servers.push(Arc::new(build(&dir, &format!("priv{t}"))));
-        }
-        let start = Arc::new(Barrier::new(threads + 1));
-        let stop = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicU64::new(0));
-        let mut hs = Vec::new();
-        for (tid, sv) in servers.into_iter().enumerate() {
-            let (start, stop, done) = (start.clone(), stop.clone(), done.clone());
-            hs.push(std::thread::spawn(move || {
-                let mut seq = 0u64;
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    if one_cycle(&sv, tid, seq, true) {
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    seq += 1;
-                }
-            }));
-        }
-        start.wait();
-        let t0 = Instant::now();
-        std::thread::sleep(Duration::from_secs(secs));
-        let n = done.load(Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
-        for h in hs { let _ = h.join(); }
-        println!("{:.1} merges/sec ({} in {:.1}s)", n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64());
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    }
-
-    if let Ok(n) = std::env::var("D67_POINT") {
-        let threads: usize = n.parse().expect("D67_POINT must be a number");
-        let secs: u64 = std::env::var("D67_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
-        let disjoint = std::env::var("D67_ARM").map(|a| a != "shared").unwrap_or(true);
-        println!("SINGLE POINT: {threads} threads, {secs}s, arm={}", if disjoint { "disjoint" } else { "shared" });
-        let s = Arc::new(build(&dir, "profile"));
-        let start = Arc::new(Barrier::new(threads + 1));
-        let stop = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicU64::new(0));
-        let mut hs = Vec::new();
-        for tid in 0..threads {
-            let (s, start, stop, done) = (s.clone(), start.clone(), stop.clone(), done.clone());
-            hs.push(std::thread::spawn(move || {
-                let mut seq = 0u64;
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    if one_cycle(&s, tid, seq, disjoint) {
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    seq += 1;
-                }
-            }));
-        }
-        // D67_READERS=N adds N REGISTERED reader connections. They are not counted in the merge
-        // rate; they exist so `drain_readers` has something to drain.
-        let nreaders: usize = std::env::var("D67_READERS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let reads = Arc::new(AtomicU64::new(0));
-        let mut rh = Vec::new();
-        for _ in 0..nreaders {
-            let (s, stop, reads) = (s.clone(), stop.clone(), reads.clone());
-            rh.push(std::thread::spawn(move || reader_thread(s, stop, reads)));
-        }
-        start.wait();
-        println!("pid {} running with {nreaders} registered readers — profile now", std::process::id());
-        let t0 = Instant::now();
-        std::thread::sleep(Duration::from_secs(secs));
-        let n = done.load(Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
-        for h in hs { let _ = h.join(); }
-        for h in rh { let _ = h.join(); }
-        println!("{:.1} merges/sec ({} in {:.1}s), readers did {} reads",
-                 n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64(),
-                 reads.load(Ordering::Relaxed));
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
-    }
-
-    println!("D67 — CONCURRENT BRANCH MANAGEMENT: merges/sec against thread count.");
-    println!("PREDICTION, recorded before the numbers: FLAT in both arms, because every MERGE takes");
-    println!("the one `Mutex<Catalog>` at pgwire/mod.rs:64 and drains readers on the way in.");
-    println!("⚠ merges/sec is a FLOOR on a shared box; the SHAPE against thread count is the result.");
+    println!("D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).");
+    println!("One thread: no contention, so the slope is the merge's own cost.");
+    println!("PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.");
     println!();
-
-    let disjoint = sweep(&dir, true);
-    println!();
-    let shared = sweep(&dir, false);
-
-    println!();
-    println!("threads   disjoint/sec   vs 1T      shared/sec   vs 1T");
-    let d1 = disjoint[0].1.max(1e-9);
-    let s1 = shared[0].1.max(1e-9);
-    for i in 0..POINTS.len() {
-        println!(
-            "{:>7}   {:>12.1}   {:>5.2}x   {:>11.1}   {:>5.2}x",
-            disjoint[i].0,
-            disjoint[i].1,
-            disjoint[i].1 / d1,
-            shared[i].1,
-            shared[i].1 / s1
-        );
+    println!("  table rows   merges   median ms   ms per 1000 rows");
+    let mut first: Option<(i64, f64)> = None;
+    for &rows in &sizes {
+        let s = build_sized(&dir, &format!("d68_{rows}"), rows);
+        let mut samples = Vec::new();
+        for i in 0..merges {
+            let t = Instant::now();
+            let ok = one_cycle(&s, 0, i as u64, true);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if ok { samples.push(ms); }
+        }
+        if samples.is_empty() {
+            println!("  {rows:>10}   {:>6}   NO MERGE APPLIED — not a result", 0);
+            continue;
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = samples[samples.len() / 2];
+        println!("  {rows:>10}   {:>6}   {med:>9.3}   {:>16.4}", samples.len(), med / (rows as f64 / 1000.0));
+        if first.is_none() { first = Some((rows, med)); }
+        if let Some((r0, m0)) = first {
+            if rows != r0 {
+                println!("             ^ {:.1}x the rows, {:.2}x the merge time", rows as f64 / r0 as f64, med / m0);
+            }
+        }
     }
-    let dscale = disjoint[POINTS.len() - 1].1 / d1;
     println!();
-    println!("VERDICT at 16T: disjoint x{:.2}, shared x{:.2}", dscale, shared[POINTS.len() - 1].1 / s1);
-    if dscale < 1.5 {
-        println!("FLAT. Concurrent branch management does not scale, and the disjoint arm rules out");
-        println!("conflict detection as the cause: no two branches touched the same row. The wall is");
-        println!("something SHARED AND SERIAL on the merge path. Which one is the next run.");
-    } else {
-        println!("IT SCALES — the prediction was WRONG. Record that before doing anything else.");
-    }
+    println!("READ THE LAST COLUMN: flat ms-per-1000-rows means LINEAR in table size (O(table)).");
+    println!("A falling ms-per-1000-rows means sublinear; a flat MEDIAN MS column means O(1).");
     let _ = std::fs::remove_dir_all(&dir);
 }
