@@ -317,3 +317,71 @@ fn a_stale_merge_is_refused_for_a_varchar_key() { a_stale_merge_is_refused("VARC
 
 #[test]
 fn a_stale_merge_is_refused_for_a_bigint_key() { a_stale_merge_is_refused("BIGINT", "9007199254740993"); }
+
+/// **D71: a duplicate primary key must still be REFUSED when the check is a point lookup.**
+///
+/// `branch_insert`'s duplicate-key check stopped materialising the table and now probes
+/// `pk = <literal>` built from the row being inserted. If that probe MISSES, the table looks empty
+/// at that key and the duplicate is ADMITTED — a silent constraint violation that leaves two rows
+/// sharing a primary key, and no error anywhere to say so.
+///
+/// That is the same failure direction as the stale-merge tests above and it needs the same
+/// treatment: one case per key type that `row_id_of` maps one-way, because those are the ones the
+/// probe leans on hardest.
+fn a_duplicate_key_is_refused(decl: &str, key: &str) {
+    let mut db = Db::new();
+    let mut s = Session::new();
+    db.ok(&format!("CREATE TABLE t (id {decl} NOT NULL, v INTEGER);"), &mut s);
+    db.ok(&format!("INSERT INTO t VALUES ({key}, 1);"), &mut s);
+
+    let mut a = Session::new();
+    db.ok("BEGIN AGENT SESSION AS 'dup';", &mut a);
+    // `Outcome` does not implement Debug, so this matches rather than using expect_err.
+    let err = match db.exec(&format!("INSERT INTO t VALUES ({key}, 2);"), &mut a) {
+        Err(e) => e,
+        Ok(_) => panic!(
+            "{decl} key {key}: a duplicate primary key was ADMITTED — the point lookup missed \
+             the existing row, so the table looked empty at that key"
+        ),
+    };
+    assert!(
+        err.to_string().contains("duplicate primary key"),
+        "{decl} key {key}: refused, but not as a duplicate: {err}"
+    );
+}
+
+#[test]
+fn a_duplicate_varchar_key_is_refused_in_a_branch() {
+    a_duplicate_key_is_refused("VARCHAR(32)", "'agent-7'");
+}
+
+#[test]
+fn a_duplicate_float_key_is_refused_in_a_branch() {
+    a_duplicate_key_is_refused("FLOAT", "0.1");
+}
+
+#[test]
+fn a_duplicate_decimal_key_is_refused_in_a_branch() {
+    a_duplicate_key_is_refused("DECIMAL", "10.50");
+}
+
+#[test]
+fn a_duplicate_bigint_key_is_refused_in_a_branch() {
+    a_duplicate_key_is_refused("BIGINT", "9007199254740993");
+}
+
+#[test]
+fn a_distinct_key_is_still_admitted_in_a_branch() {
+    // The control. Without it, a probe that matched EVERYTHING would refuse every insert and pass
+    // all four tests above — a constraint that always fires is not a constraint, it is an outage.
+    let mut db = Db::new();
+    let mut s = Session::new();
+    db.ok("CREATE TABLE t (id VARCHAR(32) NOT NULL, v INTEGER);", &mut s);
+    db.ok("INSERT INTO t VALUES ('agent-7', 1);", &mut s);
+    let mut a = Session::new();
+    db.ok("BEGIN AGENT SESSION AS 'dup';", &mut a);
+    db.ok("INSERT INTO t VALUES ('agent-8', 2);", &mut a);
+    db.ok("MERGE;", &mut a);
+    let rows = db.rows("SELECT v FROM t WHERE id = 'agent-8';", &mut s);
+    assert_eq!(rows.len(), 1, "a distinct key was refused or lost");
+}

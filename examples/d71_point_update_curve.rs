@@ -88,6 +88,8 @@ fn main() {
         .split(',').filter_map(|v| v.parse().ok()).collect();
     let n: usize = std::env::var("D71_N").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     let staged = std::env::var("D71_ARM").map(|a| a == "staged").unwrap_or(false);
+    // `D71_OP=insert` times branch_insert's duplicate-key check instead of an UPDATE.
+    let insert_arm = std::env::var("D71_OP").map(|o| o == "insert").unwrap_or(false);
     println!("arm = {}, {n} updates per size\n", if staged { "STAGED (inside an agent session)" } else { "PLAIN" });
     println!("  table rows   median ms   ms per 1000 rows   fsyncs/update");
     let mut first: Option<(i64, f64)> = None;
@@ -106,7 +108,13 @@ fn main() {
             // this measurement wrong.
             let id = 1 + (i as i64 * 7919) % rows;
             let t = Instant::now();
-            db.exec(&format!("UPDATE t SET v = {i} WHERE id = {id};"), sess);
+            if insert_arm {
+                // Fresh keys ABOVE the built range, so every insert is a genuine non-duplicate and
+                // the duplicate-key CHECK is what is being timed, not an early refusal.
+                db.exec(&format!("INSERT INTO t VALUES ({}, {i});", rows + 1 + i as i64), sess);
+            } else {
+                db.exec(&format!("UPDATE t SET v = {i} WHERE id = {id};"), sess);
+            }
             samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         let (f1, _) = fsync_counters();
