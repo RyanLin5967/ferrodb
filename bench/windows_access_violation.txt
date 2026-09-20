@@ -92,3 +92,37 @@ three platforms. The mechanism is unknown and the two D44-shaped explanations ar
 The operational conclusion does not depend on the diagnosis: an unexplained access
 violation inside a test is not something to merge into main, because main's CI going
 intermittently red destroys the signal every other lane reads.
+
+
+=== 2026-09-20 — THE SAME TEST FAILED ON WINDOWS AGAIN, THIS TIME WITH A DIAGNOSABLE CAUSE ======
+⛔ THIS DOES NOT EXPLAIN THE ACCESS VIOLATION. A panic is not a 0xc0000005 and no mechanism links
+them. What it adds is the first REPRODUCIBLE Windows-only failure this test has ever produced.
+
+CI run 35499141131, windows-latest, head cc399de (D64c). ubuntu and macos both SUCCESS.
+  test a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_the_log FAILED
+  test result: FAILED. 34 passed; 1 failed.
+  panicked at tests\integration_cluster_agents.rs:1467:72:
+  "branch 3: not the leader, and this node does not currently know who is - an election is in
+   progress or this node is partitioned from the cluster. Retry shortly; do not treat this as the
+   leader being down."
+
+WHAT IS NOW KNOWN, and it is worth more than the diagnosis:
+  · The SAME TEST, and the SAME 34-passed/1-failed SPLIT as the 2026-09-18 access violation. That
+    earlier run died before libtest printed its summary with exactly one test unreported, and the
+    diff of reported names identified THIS test. Two Windows failures, one test.
+  · The mechanism here is timing: `hold_leader` establishes leadership and waits for every replica
+    to agree, but NOTHING PUMPS HEARTBEATS between that call and the merge four lines later, so on
+    a slow runner the lease lapses and a follower starts an election in the gap.
+  · So this test is TIMING-SENSITIVE ON WINDOWS in a way it is not on the other two platforms —
+    which is the property a hunt for the access violation should start from. It is the heaviest
+    test in the file (3 branches x 100 UPDATEs, each followed by pump_all over a real 3-node TCP
+    cluster, then 3 merges), and Windows is where the wall-clock gaps are longest.
+
+FIXED by a bounded retry on `NotLeader` ONLY (a7f40e2), fire-checked by forcing the first attempt
+to return it. Any other error still fails immediately.
+
+⚠ THE OPERATIONAL CONCLUSION IS UNCHANGED: agent-isolation still must not merge to main. The
+access violation remains UNEXPLAINED, one occurrence, never reproduced. Fixing a timing flake in
+the same test does not retire it — and if anything this makes the case stronger that the test is
+where to look, not weaker.
+================================================================================================
