@@ -1,0 +1,46 @@
+D80 — D61'S OWN HARNESS, PERSISTENCE OFF vs ON. 4.3x at N=500, and the space claim survives intact.
+
+[HERE] `examples/branch_curve_writes.rs` — **the harness that produced D61's published 10^6 curve**
+— with a `CURVE_PERSIST` axis added. 4 threads, 0.5 GB budget, back to back on one box.
+⚠ Default is OFF so that re-running this file reproduces the historical numbers rather than
+silently replacing them with different ones under the same name.
+
+=== RESULT, AT THE ONE POINT THE DISK ALLOWED ========================================
+
+         N   forks/sec   len B/branch   alloc B/branch   cat B/branch   reopen ms
+  OFF  500       105.9           4104             4276            344       1.128
+  ON   500        24.5           4104             4309            344       0.830
+
+⇒ **4.32x fewer forks per second with the free-space map persisted**, at only 500 branches — and
+D79 measured the penalty GROWING with branch count (1.88x at L=500 to 3.29x at L=4,000), because
+the image rewritten on each new branch is 48 bytes longer than the last one.
+
+⇒ ✅ **AND `len B/branch` IS IDENTICAL: 4104 BOTH WAYS.** This is the half that survives. D61's
+claim was about SPACE, and the free-space map is a separate file; turning its durability on does
+not move the per-branch cost of the data file by one byte. `alloc B/branch` moves 4276 -> 4309
+(0.8%), which is the map's own blocks.
+
+⇒ So the correction to D61 is precise and narrow: **its space result stands; nothing it implies
+about time or write volume at 10^6 does.**
+
+=== WHAT STOPPED THIS, AND IT IS NOT A FAILURE =======================================
+
+Both arms stopped at the FIRST checkpoint, on the harness's own disk guard:
+
+      STOPPING: 19.2 GiB free, floor is 20 GiB. Not this run's budget -- the DISK.
+      Reported as a stop, not a result.
+
+`FREE_FLOOR = 20 GiB` (`branch_curve_writes.rs:120`) exists so a curve cannot fill a shared
+machine. The box sat at 18-20 GiB throughout because a full test suite, a 21-agent fan-out and a
+Turso fork build were all running. **The guard was not lowered to get a number** — a floor that
+protects the machine is not a knob, and editing one to produce a result is the failure this
+project's rules name explicitly.
+
+⇒ **The curve OFF vs ON above N=500 is UNMEASURED, and it is the interesting part.** Re-run on a
+quiet box with >25 GiB free:
+      CURVE_PERSIST=0 ./branch_curve_writes 1000,5000,25000,100000 4 8
+      CURVE_PERSIST=1 ./branch_curve_writes 1000,5000,25000,100000 4 8
+The pre-registered question is where the ON arm stops — on the budget, or on wall-clock.
+
+⚠ One point per arm is one point per arm. It agrees with D79's independent measurement on a
+different harness, which is why it is recorded; on its own it would be an anecdote.

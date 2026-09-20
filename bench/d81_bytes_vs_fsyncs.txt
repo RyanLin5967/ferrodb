@@ -1,0 +1,60 @@
+D81 — THE FALSIFIER FIRED AGAINST MY OWN PREFERRED FIX. The cost is FSYNCS, not BYTES.
+
+D81's design pre-registered this before any code: *"if the 4.3x is dominated by the FSYNC COUNT
+rather than the BYTES, then appending 24 B instead of 24 KB buys nothing, because both cost one
+fsync... and the row becomes 'this cannot be fixed without changing what durability means here'."*
+
+[HERE] `examples/d75_live_branch_scaling.rs`, `D75_PERSIST=1`, built at 697eb8979aa5 (+DIRTY — the
+counters were uncommitted at run time; they are committed with this file). Counters added to
+`replace_atomically` (`storage/atomic_file.rs`), because a latency number cannot separate one slow
+write from several fast ones and an integer can.
+
+  live L   median ms/cycle   map bytes   replaces(cum)   bytes/replace(cum avg)
+     500           253.909       27929             580                    14033
+    1000           190.326       51929            1660                    21840
+    2000           172.922       99929            3740                    37519
+    4000           133.158      195929            7820                    69091
+
+=== WHAT THE COUNTERS SAY, AND THEY ARE INTEGERS SO LOAD CANNOT TOUCH THEM ============
+
+**Replaces per phase: 580, 1080, 2080, 4080 — exactly L + 80.** One `replace_atomically` per new
+branch, plus one per measured cycle. **CONSTANT IN L.** And each replace is TWO fsyncs, not one:
+`replace_atomically` (`atomic_file.rs:93-99`) does write -> `sync_file` -> rename -> `sync_dir`,
+under a process-wide `REPLACE_LOCK`.
+
+**Bytes per replace: 14033 -> 69091, roughly doubling as L doubles.** LINEAR IN L.
+
+⇒ total fsyncs over a run = **O(N)**; total bytes = **O(N²)**.
+
+=== ⛔ AND THE MEDIAN DOES NOT TRACK THE BYTES ========================================
+
+Across this run the image grew **7x** (27,929 -> 195,929 B) while the median went **DOWN**,
+253.909 -> 133.158 ms. D79's ON arm on the same code went the other way (184 -> 242 ms). The two
+runs disagree in DIRECTION, which is the honest statement that **the per-cycle median is not
+measuring the map at these sizes at all** — 196 KB is nothing, and what the cycle pays is the fixed
+cost of the replace: two fsyncs plus a global lock.
+
+⇒ **THE FALSIFIER FIRED. A delta/append scheme — the option D81 was leaning toward — would remove
+the O(N²) BYTES and leave the measured penalty exactly where it is**, because it does not remove a
+single fsync. At these scales it buys nothing.
+
+=== WHAT THAT REDIRECTS THE ROW TO ===================================================
+
+The cost is one synchronous, doubly-fsynced whole-file replace per new branch, and it is that way
+because **the map is the source of truth for extent allocation** (`arena.rs:1011-1014`: a claim not
+written down lets the next open hand out the same range). Making it cheaper therefore requires
+changing WHAT IS DURABLE, not how it is written:
+
+⇒ **The question to answer next is whether an extent claim is RECONSTRUCTIBLE from the branch
+catalog.** `TableBranchCatalog::add_arena` already records branch -> arena durably, in one upsert,
+in the catalog's own commit group (`table_catalog.rs:1232`). If `(start_page, page_count)` can be
+derived from the arena id — extent sizing IS deterministic, `ARENA_FIRST_EXTENT_PAGES = 1` doubling
+to `ARENA_EXTENT_PAGES = 256` (`types.rs:271,281,299-300`) — then the map becomes a CACHE, the
+synchronous write per claim disappears, and batching becomes safe because losing the map loses
+nothing.
+⚠ The hard part is the parts that are NOT derivable: `free_extents`, `recycled`, and `pending`.
+Freeing makes `start_page` non-derivable from a cumulative sum. **That is the real question and it
+is not answered here.**
+
+⚠ **Scope:** L <= 4,000 and one box. At 10^6 the image is ~48 MB and bytes plainly WOULD dominate;
+the crossover is unmeasured and everything above about where it sits is arithmetic, not data.
