@@ -3,8 +3,29 @@ use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::{sca
 pub struct Parser {
     pub tokens: Vec<Token>,
     pub current: usize,
-    pub errors: Vec<FerroError>
+    pub errors: Vec<FerroError>,
+    /// How many [`Parser::expression`] frames are currently on the stack. See [`MAX_EXPR_DEPTH`].
+    depth: usize,
 }
+
+/// How deeply one expression may nest before the parser refuses it — **D64**.
+///
+/// Every stage downstream walks the tree this produces with its own recursion
+/// (`binder::bind_expr`, `execution::executor::evaluate`), so a tree that is shallow enough to
+/// build here is shallow enough for all of them. That is why the limit lives in the parser and
+/// exactly once: a second copy in the binder could only disagree with this one, and per the
+/// project's own rule a redundant downstream check masks every mutant of the check in front of it.
+///
+/// **Measured, not guessed** (`bench/d64_nesting_probe.txt`): `SELECT ((((1)))) FROM t` with no
+/// limit parsed at 750 levels and ABORTED THE PROCESS at 1,000 in a debug build, and parsed at
+/// 4,000 and aborted at 8,000 in release — `fatal runtime error: stack overflow`, SIGABRT. The
+/// limit has to sit under the DEBUG threshold or the test suite is the thing that crashes, which
+/// rules out SQLite's `SQLITE_MAX_EXPR_DEPTH` default of 1,000 for this codebase.
+///
+/// 256 is also what `tel::log`'s `MAX_GUARD_DEPTH` already picked for the same shape arriving off
+/// a disk, and its note records that "a WHERE clause of 256 nested operators has never been seen
+/// here". One number, one rationale, two places that enforce it on their own inputs.
+pub const MAX_EXPR_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct TableRef {
@@ -310,7 +331,7 @@ pub enum AdmitSpec {
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self{
-        Self {tokens, current: 0, errors: Vec::new()}
+        Self {tokens, current: 0, errors: Vec::new(), depth: 0}
     }
 
     pub fn parse(&mut self) -> Vec<Stmt> {
@@ -1126,8 +1147,51 @@ impl Parser {
         Err(Parser::error(self.peek(), message.to_string()))
     }
 
+    /// The single entry to the precedence chain — and therefore the single place expression
+    /// nesting is bounded. Grouping (`primary`'s `(` branch), function arguments, `IN` lists and
+    /// subquery predicates all re-enter the chain HERE, so one counter sees every level.
+    ///
+    /// Refuses rather than faults: without this, deep nesting is a `SIGABRT` from a query that
+    /// arrives over a socket, which takes every other session on the server with it. See
+    /// [`MAX_EXPR_DEPTH`].
     pub fn expression(&mut self ) -> Result<Expr, FerroError>{
-        return self.or();
+        self.enter()?;
+        let parsed = self.or();
+        self.leave();
+        return parsed;
+    }
+
+    /// Charge one level of expression nesting, or refuse. See [`MAX_EXPR_DEPTH`].
+    ///
+    /// **Three call sites, and all three are needed — this is not belt and braces.** They are not
+    /// redundant checks of one path; they are the three DISTINCT ways this parser adds a level to
+    /// the tree, and the first version of this guard covered only the first and was walked around
+    /// by the other two:
+    ///
+    /// * [`Parser::expression`] — grouping, function arguments, `IN` lists, subquery predicates.
+    /// * [`Parser::not`] — `NOT NOT NOT …`, which recurses into ITSELF and never re-enters
+    ///   `expression`, so a counter kept only there never sees it.
+    /// * [`Parser::unary`] — `- - - …` and `! ! ! …`, same shape, same blind spot.
+    ///
+    /// Bounding the TREE rather than the parser is the point: the depth limit also bounds what
+    /// `binder::bind_expr` and `executor::evaluate` later walk, and what `Expr`'s own recursive
+    /// `Drop` has to unwind — an iterative parser that still built a 100,000-deep tree would
+    /// merely move the overflow to whoever dropped it.
+    fn enter(&mut self) -> Result<(), FerroError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(FerroError::SqlParseError(format!(
+                "expression nests deeper than {} levels; refusing to parse it",
+                MAX_EXPR_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
+    /// Release one level charged by [`Parser::enter`].
+    fn leave(&mut self) {
+        self.depth -= 1;
     }
 
     pub fn or(&mut self) -> Result<Expr, FerroError>{
@@ -1153,8 +1217,11 @@ impl Parser {
     pub fn not(&mut self) -> Result<Expr, FerroError>{
         if self.match_token(&[TokenType::Not]) {
             let operator = self.previous().token_type;
-            let right = self.not()?;
-            return Ok(Expr::UnaryOp { operator, right: Box::new(right) });
+            // Recurses into ITSELF, not through `expression`, so it charges its own level.
+            self.enter()?;
+            let right = self.not();
+            self.leave();
+            return Ok(Expr::UnaryOp { operator, right: Box::new(right?) });
         }
         self.equality()
     }
@@ -1202,8 +1269,11 @@ impl Parser {
     pub fn unary(&mut self) -> Result<Expr, FerroError>{
         if self.match_token(&[TokenType::Bang, TokenType::Minus]) {
             let operator = self.previous().token_type;
-            let right = self.unary()?;
-            return  Ok(Expr::UnaryOp { operator, right: Box::new(right) });
+            // Same self-recursion as `not`, same reason it must charge its own level.
+            self.enter()?;
+            let right = self.unary();
+            self.leave();
+            return  Ok(Expr::UnaryOp { operator, right: Box::new(right?) });
         }
         self.primary()
 
