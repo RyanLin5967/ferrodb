@@ -99,6 +99,26 @@ fn allocated_bytes(path: &std::path::Path) -> Option<u64> {
     }
 }
 
+
+/// Free bytes on the filesystem holding `path`, via `df -k`.
+///
+/// **A shared-machine guard, not a tuning knob — D61.** The byte budget below refuses to let this
+/// run's own database grow past a size; it says nothing about what else is on the disk. Another
+/// session on this machine tripped a disk monitor twice on 2026-09-19 while this repo held three
+/// worktree targets, and an ENOSPC in someone else's lane reads exactly like a real test failure.
+/// So the run also stops when the DISK is low, whatever its own database weighs.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df").arg("-k").arg(path).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().nth(1)?;
+    let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb * 1024)
+}
+
+/// Stop if the filesystem drops below this, whatever this run's own budget says. See
+/// [`free_bytes`]. 20 GiB leaves a working margin for every other lane on a shared machine.
+const FREE_FLOOR: u64 = 20 * (1u64 << 30);
+
 fn main() {
     let checkpoints: Vec<usize> = std::env::args()
         .nth(1)
@@ -118,8 +138,11 @@ fn main() {
     let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(mf).unwrap())));
     let cat_path = dir.join("branches.branchcat");
     let _ = std::fs::remove_file(&cat_path);
-    let cat: Arc<dyn BranchCatalog> =
-        Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("open catalog"));
+    // Two handles to ONE catalog, deliberately: `root_page_id` is on the concrete type and not on
+    // the `BranchCatalog` trait, and D65's reopen needs the CURRENT root rather than the 1 this
+    // was opened with — reopening at a stale root would time the wrong thing.
+    let cat_concrete = Arc::new(TableBranchCatalog::open_sidecar(&cat_path, 1).expect("open catalog"));
+    let cat: Arc<dyn BranchCatalog> = cat_concrete.clone();
     let base = pool.disk_manager.high_water().unwrap();
     let store = Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap());
     let lease = LeaseDeadline(u64::MAX);
@@ -132,7 +155,7 @@ fn main() {
     // Two space columns on purpose. `data MB` is FILE LENGTH; `alloc MB` is blocks*512, what the
     // filesystem actually gave out. A reservation scheme can inflate length far past allocation, and
     // quoting only length would overstate the wall. Both are reported so neither can be cherry-picked.
-    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live");
+    println!("         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms");
 
     let mut done = 0usize;
     let mut stopped_early: Option<(usize, u64)> = None;
@@ -177,8 +200,26 @@ fn main() {
         let data = md.as_ref().map(|m| m.len()).unwrap_or(0);
         let alloc = allocated_bytes(&main_path).unwrap_or(0);
         let cbytes = std::fs::metadata(&cat_path).map(|m| m.len()).unwrap_or(0);
+
+        // D65 — reopen the catalog from disk, WITH DATA PRESENT.
+        //
+        // S4's O(1)-reopen claim has only ever been checked by `examples/branch_curve.rs`, which is
+        // FORK-ONLY: no branch in it calls `arena_for` or `alloc_in_arena`, so it reopens a catalog
+        // whose branches own no pages. This harness is the one that writes, and it did not measure
+        // reopen at all — and it deletes its database at the end, so D61 could not answer this
+        // after the fact. The timing block is `branch_curve.rs`'s own, reused rather than rewritten.
+        //
+        // Reported PER CHECKPOINT on purpose: one reopen number at 10^6 cannot separate O(1) from
+        // O(log N) from a small O(N). The column across the decade is the measurement; a single
+        // cell is an anecdote.
+        let root = cat_concrete.root_page_id();
+        let t_reopen = Instant::now();
+        let re = TableBranchCatalog::open_sidecar(&cat_path, root).expect("reopen");
+        let reopen_ms = t_reopen.elapsed().as_secs_f64() * 1000.0;
+        drop(re);
+
         println!(
-            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}",
+            "  {:>8}   {:>9.1}   {:>7.1}   {:>8.1}   {:>12.0}   {:>14.0}   {:>12.0}   {:>10}   {:>9.3}",
             done,
             actually as f64 / secs,
             data as f64 / 1e6,
@@ -187,11 +228,25 @@ fn main() {
             alloc as f64 / done as f64,
             cbytes as f64 / done as f64,
             store.live_page_count().unwrap_or(0),
+            reopen_ms,
         );
 
         if data >= budget {
             stopped_early = Some((done, data));
             break;
+        }
+        // The disk, not just this run's share of it. See `free_bytes`.
+        if let Some(free) = free_bytes(&main_path) {
+            if free < FREE_FLOOR {
+                println!(
+                    "  STOPPING: {:.1} GiB free, floor is {:.0} GiB. Not this run's budget -- the \
+                     DISK. Reported as a stop, not a result.",
+                    free as f64 / (1u64 << 30) as f64,
+                    FREE_FLOOR as f64 / (1u64 << 30) as f64,
+                );
+                stopped_early = Some((done, data));
+                break;
+            }
         }
     }
 
