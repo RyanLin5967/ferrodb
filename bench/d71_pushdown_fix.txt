@@ -1,0 +1,58 @@
+D71 FIX — THE AGENT WRITE PATH GOES FROM O(table) TO A DESCENT. A/B, INTERLEAVED, 3 PAIRS.
+
+[HERE] `examples/d71_point_update_curve.rs`, staged arm, 60 updates per size, keys spread across
+the whole table (a scan that always hits row 1 looks O(1), which is the obvious way to get this
+measurement wrong). BEFORE = `src/agent_sql/runtime.rs` at `729c2a3`; AFTER = the same file with
+the predicate pushed through `branch_update` and `branch_delete`. Arm order ALTERNATES each pair so
+load drift cannot favour one side.
+
+  arm      1000 rows    16000 rows    ratio over 16x the rows    load at start
+  AFTER       0.013         0.016                     1.23       58.38
+  BEFORE      0.185         2.907                    15.71       81.09
+  BEFORE      0.187         2.919                    15.61       66.32
+  AFTER       0.016         0.016                     1.00       72.85
+  AFTER       0.015         0.019                     1.27       69.23
+  BEFORE      0.191         2.856                    14.95       80.95
+
+  BEFORE: 15.71 / 15.61 / 14.95   -> LINEAR in table size. mean 15.42
+  AFTER :  1.23 /  1.00 /  1.27   -> FLAT.                 mean 1.17
+
+⇒ **A COMPLEXITY-CLASS CHANGE: O(table) -> a descent, at 16x the rows.** At 16,000 rows the median
+staged UPDATE goes 2.894 ms -> 0.017 ms, **~170x**. It clears the project's >=10x bar, but the
+number is not the point and should not be quoted on its own — the RATIO COLUMN is, because it is
+computed WITHIN a single run and is therefore load-independent, which the milliseconds are not.
+
+**That the ratios held at loads 58, 66, 69, 73, 81 — while the absolutes moved — is the evidence
+that this is a complexity claim and not a timing one.** Three BEFORE ratios within 0.8 of each
+other across a 15-point load spread cannot be a load artifact.
+
+=== THE MECHANISM, AND WHY IT SAT THERE ==============================================
+
+`branch_update` and `branch_delete` called the UNPREDICATED `visible_rows`, i.e.
+`visible_rows_where(.., None, None, None)` -> `scan_table_where(table, alias, None, ctx)`, which
+materialises EVERY row into a `Vec<Vec<Value>>`; the loop below then discards all but the matches.
+
+`scan_table_where`'s own doc comment describes this defect **and says it was fixed**: *"an
+agent-session `SELECT … WHERE id = k` read the ENTIRE table to keep one row — O(table) per
+statement, where the plain path for the identical query is O(log N)."* **D55 pushed the predicate
+through the READ path and left all three WRITE paths on the old call.** The fix was one argument
+list away, under a comment explaining why it mattered, for however long it has been there.
+
+⚠ **The post-filter loop STAYS.** Pushdown is a CONSERVATIVE HINT — the planner may narrow the scan
+or ignore the predicate entirely — so `evaluate` remains the sole authority on what matches and the
+semantics cannot drift between the agent path and the plain one. What changed is how many rows
+reach it, never which ones pass.
+
+=== CORRECTNESS ======================================================================
+  --lib                           1354 passed; 0 failed; 1 ignored
+  agent_sql_surface                 32 passed; 0 failed
+  integration_cli_agent_isolation    6 passed; 0 failed
+  d69_key_types                     14 passed; 0 failed
+  integration_simulate              25 passed; 0 failed
+
+=== WHAT IS NOT FIXED ================================================================
+`branch_insert` (`runtime.rs:1932`) still materialises the whole table — but for a different
+reason, so it needs a different fix: it is looking up ONE row by primary key for a duplicate-key
+check, which wants a point lookup (the shape D69 built for `evaluate_merge`), not a predicate. It
+was left rather than bundled, because a fix whose mechanism differs from the one measured here
+would ride in on this evidence without having any of its own.
