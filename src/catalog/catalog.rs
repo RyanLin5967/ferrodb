@@ -15,6 +15,29 @@ use crate::catalog::schema::Schema;
 #[derive(Clone)]
 pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
+    /// **Monotone change counter per table — D69. Deliberately NOT serialized**, like
+    /// `root_cells` below: it exists to detect movement WITHIN a process, between the moment a
+    /// merge is scored and the moment it is published, and a value that survived a restart would
+    /// be comparing against a base that no longer exists anyway.
+    ///
+    /// # Why a counter and not the fingerprint it replaces
+    ///
+    /// `agent_sql::runtime` used to answer "did the base move?" by SCANNING every row of every
+    /// touched table and hashing it — twice per merge, once at scoring and once at publication
+    /// (`evaluate_merge` and `fingerprint_tables`). Measured at 1.87 us/row (D68,
+    /// `bench/d68_merge_is_o_table.txt`): ~1.9 SECONDS per merge against a million-row table, to
+    /// write four rows. Comparing two `u64`s is O(1) and answers the same question.
+    ///
+    /// It is also STRICTLY STRONGER than the hash it replaces. A fingerprint cannot see a change
+    /// that was reverted before it looked; a monotone counter can, because it never goes back.
+    ///
+    /// ⚠ **Every committed row change must bump it, not only agent merges.** The hash it replaces
+    /// was computed by scanning the real table, so it saw ordinary `INSERT`/`UPDATE`/`DELETE` as
+    /// well. A counter bumped only on the agent path would miss direct writes and weaken the
+    /// staleness check silently — which is worse than the cost it removes. Keyed by
+    /// `agent_sql::runtime::table_id`'s FNV-1a hash of the name, so both sides agree without the
+    /// catalog minting ids.
+    table_versions: HashMap<u32, u64>,
     pub buffer_pool: Arc<BufferPoolManager>,
     pub first_catalog_page_id: u32,
     pub stats: HashMap<String, TableStats>,
@@ -51,11 +74,11 @@ impl Catalog {
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), roots: HashMap::new(), epoch: 0})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), roots: HashMap::new(), epoch: 0};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
         catalog.load()?;
         Ok(catalog)
     }
@@ -374,6 +397,36 @@ impl Catalog {
             cell.store(new_root, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Record that `table` changed. Called from every committed write path.
+    ///
+    /// Takes the table NAME and hashes it the same way `agent_sql::runtime::table_id` does, so the
+    /// merge path can look the counter up without the catalog minting ids.
+    pub fn bump_table_version(&mut self, table: &str) {
+        let id = Self::table_version_key(table);
+        *self.table_versions.entry(id).or_insert(0) += 1;
+    }
+
+    /// The current change counter for a table id, or 0 if it has never been written.
+    ///
+    /// 0 for "never written" is correct rather than convenient: a table nobody has written cannot
+    /// have moved, and two reads of 0 compare equal exactly as two reads of any other value do.
+    pub fn table_version(&self, id: u32) -> u64 {
+        self.table_versions.get(&id).copied().unwrap_or(0)
+    }
+
+    /// FNV-1a over the name — byte for byte what `agent_sql::runtime::table_id` computes.
+    ///
+    /// Duplicated rather than imported because `catalog` must not depend on `agent_sql`; the
+    /// duplication is pinned by a test that asserts the two agree, so it cannot drift silently.
+    pub fn table_version_key(table: &str) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in table.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
     }
 
     pub fn persist(&self) -> Result<(), FerroError> {
