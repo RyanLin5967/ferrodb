@@ -1,0 +1,80 @@
+D69-VERIFY — is merge actually O(delta) now? The same curve D68 ran, against the fix.
+
+⛔ THE ROW IS NOT CLOSED BY THIS FILE EXISTING. D69 landed the mechanism; until this runs, every
+claim about it is a claim about the CODE, not about its behaviour.
+
+BEFORE (bench/d68_merge_is_o_table.txt, same harness, same fixed delta of 4 rows):
+   1000 rows  6.000 ms   (6.00 ms per 1000 rows)
+   2000 rows  7.149 ms   (3.57)
+   4000 rows 10.566 ms   (2.64)
+   8000 rows 17.050 ms   (2.13)
+  16000 rows 32.003 ms   (2.00)   -> t ~= 2.1 ms + 1.87 us/row, asymptotically LINEAR
+
+PRE-REGISTERED, unchanged from the design entry written before any code existed:
+  * `ms per 1000 rows` must FALL TOWARD ZERO instead of converging to 2.00.
+  * the cost of a doubling must stop converging to 2.0x.
+  * If the curve is UNCHANGED the fix does not work — the point lookups are in `evaluate_merge`
+    but something else still scans — and D69 REOPENS rather than being explained.
+  * ⚠ A WORSE curve is a live possibility and must be reported as one: if the planner picks a seq
+    scan per point lookup, the fix is O(delta x table) — worse than the scan it replaced.
+⚠ Shared box: absolutes are inflated. The SHAPE is the result, as in D61, D65 and D68.
+[HERE] 2026-09-20T16:27:03Z at b116ba3
+load before: 54.03 34.45 34.34
+
+D68 — merge latency against TABLE SIZE at FIXED DELTA (4 rows written per branch).
+One thread: no contention, so the slope is the merge's own cost.
+PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.
+
+  table rows   merges   median ms   ms per 1000 rows
+        1000       25       5.057             5.0566
+        2000       25      26.106            13.0530
+             ^ 2.0x the rows, 5.16x the merge time
+        4000       25      11.392             2.8479
+             ^ 4.0x the rows, 2.25x the merge time
+        8000       25      16.896             2.1121
+             ^ 8.0x the rows, 3.34x the merge time
+       16000       25      32.023             2.0014
+             ^ 16.0x the rows, 6.33x the merge time
+
+READ THE LAST COLUMN: flat ms-per-1000-rows means LINEAR in table size (O(table)).
+A falling ms-per-1000-rows means sublinear; a flat MEDIAN MS column means O(1).
+# rc=0
+load after: 61.95 49.64 41.17
+
+=== READING ===============================================================================
+⛔ **THE FALSIFIER FIRED. D69 DID NOT CHANGE THE COMPLEXITY. THE ROW REOPENS.**
+
+                    BEFORE (D68)        AFTER (D69)
+  1000 rows          6.000 ms            5.057 ms        (6.00 -> 5.06 ms per 1000)
+  2000 rows          7.149 ms           26.106 ms        (3.57 -> 13.05)  <- outlier, see below
+  4000 rows         10.566 ms           11.392 ms        (2.64 -> 2.85)
+  8000 rows         17.050 ms           16.896 ms        (2.13 -> 2.11)
+ 16000 rows         32.003 ms           32.023 ms        (2.00 -> 2.00)
+
+At 16,000 rows: **32.003 ms before, 32.023 ms after.** ms-per-1000-rows still converges to 2.00.
+The 2,000-row point (26.1 ms) is a load outlier on a box that has been at 20-80 all day; every
+other point is within noise of the pre-fix curve, and the CONVERGENCE — the thing this file
+pre-registered — is identical.
+
+This file's header, written before the code: *"If the curve is UNCHANGED the fix does not work —
+the point lookups are in `evaluate_merge` but something else still scans — and D69 REOPENS rather
+than being explained."* It is unchanged. D69 reopens.
+
+WHAT D69 DID ACHIEVE, so the row is not written off wholesale:
+  * `fingerprint_tables` no longer rescans and rehashes every row at publish (step 2), and the two
+    sides of the staleness check are now one call rather than two implementations.
+  * `evaluate_merge` no longer scans for tables no assertion ranges over (step 3).
+  * A per-table monotone counter exists and is strictly stronger than the hash it replaced.
+  * ⚠ And it caused a real regression — assertions scored over touched rows instead of whole
+    tables — fixed at 68c966d, with the premise that caused it retracted at fca27e0.
+
+WHAT IT DID NOT ACHIEVE: the measured cost. Something else on the merge path is still linear in
+table size, and D68's mechanism reading (two scans in evaluate_merge and fingerprint_tables) was
+therefore INCOMPLETE — it identified two real scans that were not the whole cost.
+
+⚠ AND MY FIRST ATTEMPT TO FIND THE REMAINDER WAS A BAD MEASUREMENT, recorded so it is not repeated:
+a profile of `D68_SIZES=16000 D68_MERGES=400` put 97.8% of samples in `WalManager::flush`. That is
+the BUILD phase — 16,000 INSERTs, each with a WAL commit — not the merges. Profiling a fixture and
+calling it a profile of the subject is the same error class as the `is_ok` counter and the
+`pgrep -f` self-match earlier in this row. The re-run samples only after the build completes.
+===========================================================================================
