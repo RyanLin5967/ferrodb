@@ -145,6 +145,22 @@ fn main() {
     let cat: Arc<dyn BranchCatalog> = cat_concrete.clone();
     let base = pool.disk_manager.high_water().unwrap();
     let store = Arc::new(ArenaPageStore::new(Arc::clone(&pool), Arc::clone(&cat), base).unwrap());
+    // **D79: this harness did NOT persist the free-space map, and the shipped binary does.**
+    //
+    // `ArenaPageStore` writes the map only if `checkpoint_to` has been called (`arena.rs:914`).
+    // `cli.rs:120` calls it; this file never did — so D61's published 10^6 curve, and every other
+    // 10^6 result in this repo, measured a configuration production does not run. The map is
+    // exactly 48 bytes per live branch and is re-serialised and re-fsynced IN FULL on every new
+    // branch's first page write, which is `sum(48i) = 24N^2` bytes over a run: ~24 TB at 10^6.
+    //
+    // `CURVE_PERSIST=1` turns it on so the two curves can be compared. It is OFF by default so
+    // that re-running this file reproduces the historical numbers rather than silently replacing
+    // them with different ones under the same name.
+    let persist = std::env::var("CURVE_PERSIST").map(|v| v == "1").unwrap_or(false);
+    if persist {
+        store.checkpoint_to(dir.join("main.db.arena"));
+    }
+    println!("free-space map persistence: {}", if persist { "ON (as cli.rs:120 ships)" } else { "OFF (historical default)" });
     let lease = LeaseDeadline(u64::MAX);
 
     println!("D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. {threads} threads.");
