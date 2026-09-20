@@ -30,7 +30,7 @@ mod group_commit;
 pub mod table_catalog;
 pub use table_catalog::TableBranchCatalog;
 pub use lease_thread::{CatalogLock, LeaseStats, LeaseThread, RuntimeLock};
-pub use reaper::{PageLinks, TwoTierReaper};
+pub use reaper::TwoTierReaper;
 pub use record::{CoreRecord, 
     changed_columns, reclaimable, ArenaExtent, BranchRecord, CapabilityEnvelope,
     CapabilityRefusal, ColumnCapability, PendingFree, RowEffect, RowImage, TableCapability, Verb,
@@ -86,21 +86,28 @@ pub trait BranchCatalog: Send + Sync {
 
     /// Move `branch` under a new parent, publishing its new root in the same atomic write.
     ///
-    /// **D41, site 1: `collapse`.** The four fields move together or not at all — `parent_id`,
-    /// `fork_epoch`, `depth` and `root_page_id` describe one position in the tree, and a reader
-    /// that saw three of them would see a branch whose root belongs to an ancestry it no longer
-    /// has. `depth` is not a parameter: it is `parent.depth + 1` by definition, and a caller
-    /// permitted to state it could contradict the tree it just asked for.
+    /// **NO PRODUCTION CALLER — D63.** Its only one was `collapse`, which D63 deleted; what
+    /// remains is this narrow operation and the D41 tests that pin it
+    /// (`tests/d41_narrow_ops_close_the_window.rs`). It is kept rather than deleted because the
+    /// narrowness is the point: any future re-parent must move these four fields this way, and
+    /// re-deriving that is how D20/D29/D33/D34 happened. Treat the paragraphs below as the
+    /// contract a caller would have to meet, not as a description of one that exists.
+    ///
+    /// **D41, site 1.** The four fields move together or not at all — `parent_id`, `fork_epoch`,
+    /// `depth` and `root_page_id` describe one position in the tree, and a reader that saw three
+    /// of them would see a branch whose root belongs to an ancestry it no longer has. `depth` is
+    /// not a parameter: it is `parent.depth + 1` by definition, and a caller permitted to state
+    /// it could contradict the tree it just asked for.
     ///
     /// **UNCONDITIONAL, not a compare-and-swap, and that is a decision rather than an omission.**
     /// The standard answer to a lost update is a version check and a caller retry (ZooKeeper's
     /// `BadVersionException`, etcd's `Compare(ModRevision)`, a conditional write). Its premise is
-    /// that the caller *can* retry, and `collapse`'s caller cannot: by the time it reaches here it
-    /// has copied up to `MAX_COLLAPSE_PAGES` (65,536 pages, 256 MiB) into fresh extents, and a
-    /// refusal leaves it the choice of copying a quarter-gigabyte again or abandoning the extents
-    /// it already claimed. So this write wins, and it wins **narrowly**: it touches four fields
-    /// and reads nothing else, so a lease renewal, an envelope charge or an arena claimed during
-    /// the copy survives it untouched. That is the whole difference from the `put` it replaces.
+    /// that the caller *can* retry. `collapse`'s could not: by the time it reached here it had
+    /// copied up to 65,536 pages (256 MiB) into fresh extents, and a refusal left it the choice of
+    /// copying a quarter-gigabyte again or abandoning the extents it had already claimed. So this
+    /// write wins, and it wins **narrowly**: it touches four fields and reads nothing else, so a
+    /// lease renewal, an envelope charge or an arena claimed concurrently survives it untouched.
+    /// That is the whole difference from the `put` it replaced.
     ///
     /// Returns the record as written, because the caller needs it and the implementation has just
     /// built it — a second `get` would be a second chance to read something else.
@@ -291,12 +298,16 @@ pub trait BranchCatalog: Send + Sync {
 
     /// Add one child to `parent_id`'s live set.
     ///
-    /// The counterpart of [`Self::detach_child`], and it exists for the same reason: `collapse`
-    /// re-parents a branch with `trunk.add_live_child(epoch)` followed by `put(&trunk)`, which is a
-    /// RECORD mutation. A catalog that keeps children in an index does not write the child span
-    /// from `put` — it cannot, because the records it hands out carry an empty live set — so the
-    /// re-parented branch would never appear among trunk's children and trunk's pages would look
-    /// unreferenced by it.
+    /// The counterpart of [`Self::detach_child`], and it exists for the same reason. The case that
+    /// forced it was the since-deleted `collapse` (D63), which re-parented a branch with
+    /// `trunk.add_live_child(epoch)` followed by `put(&trunk)` — a RECORD mutation. A catalog that
+    /// keeps children in an index does not write the child span from `put` — it cannot, because
+    /// the records it hands out carry an empty live set — so the re-parented branch would never
+    /// appear among trunk's children and trunk's pages would look unreferenced by it.
+    ///
+    /// Its live caller today is `TableBranchCatalog::migrate_from` (verified by
+    /// `grep -rn '\.attach_child(' src` after D63). `fork` does NOT come through here — each
+    /// catalog writes the child entry inside its own fork path.
     ///
     /// `child_id` is stored so a reader can resolve the child and check whether it is still live;
     /// see the implementations for why an entry is a hint rather than an answer.
@@ -375,14 +386,4 @@ pub trait Reaper: Send + Sync {
     /// Re-examine the pending-free log against current `live_children` arrays and release what
     /// has since become reclaimable.
     fn drain_pending(&self) -> Result<u32, FerroError>;
-
-    /// Materialise a branch's visible state to a fresh root and re-parent it to trunk, resetting
-    /// depth to 1.
-    ///
-    /// **Nothing invokes it — D60.** It was documented as what happens "when a fork would exceed
-    /// `MAX_BRANCH_DEPTH`", but that cap never had a production caller for this, and the cap is
-    /// gone: fork and read are flat across depth (`bench/d60_depth_premise.txt`). It remains a
-    /// legitimate operation — materialising a chain's tree shortens reclamation work — and a
-    /// caller that wants it must ask for it.
-    fn collapse(&self, branch: BranchId) -> Result<BranchRecord, FerroError>;
 }

@@ -14,7 +14,7 @@ use crate::branch::TableBranchCatalog;
 use crate::branch::lease_thread::{scan_interval_from_env, CatalogLock, LeaseThread, RuntimeLock};
 use crate::branch::reaper::TwoTierReaper;
 use crate::branch::{BranchCatalog, Reaper};
-use crate::cow::{CowPageLinks, PageStore};
+use crate::cow::PageStore;
 use crate::storage::db_lock::DbLock;
 use crate::tel::DurableEffectLog;
 const FIRST_CATALOG_PAGE_ID: u32 = 1;
@@ -121,13 +121,7 @@ pub fn run_cli(db_path: &str) -> Result<(), FerroError> {
 
     // F11 - the reaper, built over the SAME branch catalog and page store as the runtime. That is
     // the contract `with_reaper` states and cannot check, so it is satisfied here by construction.
-    //
-    // `CowPageLinks` is supplied because `TwoTierReaper::collapse` refuses without a page-layout
-    // walker rather than re-parent a branch onto ancestor-owned pages the interval rule would then
-    // be free to reclaim, and this is the tree these branches are on.
-    let reaper = Arc::new(
-        TwoTierReaper::new(branches.clone(), store.clone()).with_links(Arc::new(CowPageLinks)),
-    );
+    let reaper = Arc::new(TwoTierReaper::new(branches.clone(), store.clone()));
 
     // Provenance on disk, not in this process. Without this the runtime interns runs into a
     // `MemProvenanceStore`, so `who_wrote_row` and `ferro_row_authors` answer correctly for as long

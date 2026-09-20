@@ -876,8 +876,9 @@ impl BranchCatalog for TableBranchCatalog {
         let old = core.clone();
         // HYDRATED, for `set_root`'s reason: `write_record` makes the arena span match the record
         // it is given, so writing back a core record would delete every extent the branch owns —
-        // including the ones `deep_copy` just claimed, which is the leak D13b's re-read exists to
-        // prevent and this method inherits the duty of.
+        // including any a concurrent writer claimed, which is the leak D13b's re-read existed to
+        // prevent and this method inherits the duty of. (D13b's caller was `collapse`, deleted by
+        // D63; the duty is a property of this write, not of that caller.)
         let mut rec = self.hydrate(core)?;
         rec.parent_id = Some(parent);
         rec.fork_epoch = fork_epoch;
@@ -1712,10 +1713,12 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
-    /// `attach_child` is what `collapse` uses to re-parent a branch onto trunk. It had NO test
-    /// against this catalog, and a mutant that made it a no-op survived the whole suite: a
-    /// re-parented branch would simply be absent from its new parent's live set, and that parent's
-    /// pages would look unreferenced by it.
+    /// `attach_child` is how a branch enters a parent's live set. It had NO test against this
+    /// catalog, and a mutant that made it a no-op survived the whole suite: an attached branch
+    /// would simply be absent from its new parent's live set, and that parent's pages would look
+    /// unreferenced by it. (The case that first forced it was `collapse` re-parenting onto trunk;
+    /// D63 deleted `collapse`, leaving `migrate_from` as the only production caller. `fork` does
+    /// not come through here — it writes the child entry inside its own path.)
     #[test]
     fn attach_child_puts_a_branch_into_a_parents_live_set_and_detach_takes_it_out() {
         let (c, p, _pool) = cat("attach");
@@ -1725,7 +1728,7 @@ mod tests {
         assert!(c.detach_child(t, child.fork_epoch).unwrap(), "fixture: detach removed nothing");
         assert!(!c.has_live_children(t).unwrap(), "fixture: trunk should now look childless");
 
-        // Re-attach at a NEW epoch, which is what collapse does.
+        // Re-attach at a NEW epoch — the shape a re-parent takes.
         let new_epoch = c.next_epoch();
         c.attach_child(t, new_epoch, child.branch_id.id).unwrap();
         assert!(c.has_live_children(t).unwrap(), "attach_child wrote nothing");
@@ -2126,16 +2129,16 @@ mod tests {
         );
         c.set_state(child.branch_id, BranchState::Quarantined, BranchState::Live).unwrap();
         // `reparent` is the one whose predecessor leaked 664 of 664 copied pages by writing back a
-        // record that had lost its extents (D13b mutant D). Re-parenting onto trunk is what
-        // `collapse` does.
+        // record that had lost its extents (D13b mutant D). Re-parenting onto trunk was what
+        // `collapse` did before D63 deleted it; the write itself still has to preserve arenas.
         let moved = c
             .reparent(child.branch_id, BranchId::TRUNK, c.next_epoch(), 321)
             .expect("reparent");
         assert_eq!(moved.arenas, owned, "reparent returned a record with no arenas");
         assert_eq!(
             c.get_raw(child.branch_id.id).unwrap().arenas, owned,
-            "reparent deleted the branch's arenas — the extents copied into during a collapse are \
-             exactly the ones at risk here, and nothing else would ever free them"
+            "reparent deleted the branch's arenas — a branch's extents are exactly what is at risk \
+             in a whole-record write, and nothing else would ever free them"
         );
         assert_eq!(c.get_raw(child.branch_id.id).unwrap().root_page_id, 321, "reparent lost root");
 

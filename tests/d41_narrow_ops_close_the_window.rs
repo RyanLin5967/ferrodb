@@ -1,8 +1,11 @@
 //! **D41 — the two reproductions for the sites that had none.**
 //!
-//! `collapse`'s window was already reproduced in-crate
-//! (`branch::reaper::tests::*::collapse_discards_a_lease_renewal_that_lands_on_its_re_read`).
-//! The other two exposed read-modify-writes on a branch record had nothing driving them:
+//! `collapse`'s window (ledger row D29) was reproduced in-crate by
+//! `branch::reaper::tests::*::collapse_discards_a_lease_renewal_that_lands_on_its_re_read`, which
+//! D41 fixed and D63 then deleted along with `collapse` itself. The two reproductions below are
+//! what remains driving the narrow ops, and they are the reason `reparent` is still worth having
+//! without a production caller. The other two exposed read-modify-writes on a branch record had
+//! nothing driving them:
 //!
 //! * **Site 2 — `AgentRuntime::restrict_branch`.** `get` -> [`BranchRecord::restrict`] -> `put`
 //!   compared the new envelope against a SNAPSHOT and then wrote the whole record back. Two
