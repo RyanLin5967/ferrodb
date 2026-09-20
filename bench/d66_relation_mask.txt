@@ -1,0 +1,45 @@
+D66 — THE PLANNER'S RELATION BITMASKS ALIASED, AND IN RELEASE THAT IS A WRONG ANSWER.
+[HERE] every line is this session's own run at the commit named.
+
+THE DEFECT
+  `optimizer::search_algorithm` tracks which base relations a predicate touches as a BITMASK:
+  `*out |= 1 << relation_of(..)` (search_algorithm.rs, `relations_of`). Those masks were `u32`.
+  With 32 or more relations in one query the shift amount reaches the width of the type:
+    debug   -> panic, "attempt to shift left with overflow"
+    release -> SILENT. `1u32 << 32` wraps to `1`, so relation 32 shares a bit with relation 0,
+               the join-order search treats two distinct relations as one, and the query returns
+               a cross product or quietly drops a predicate. A WRONG ANSWER, not a crash.
+  `relations_of` runs BEFORE the `MAX_DP_RELATIONS = 12` fallback, so the cheap left-deep path is
+  affected as well — the fallback does not protect it.
+
+FOUND BY: the fourth adversarial review pass on the D64 diff, which was looking for uncharged
+recursion and found this instead. It is unrelated to D64 except that D64's new per-join charge is
+what makes a 1,000-join query parse far enough to reach the planner at all.
+
+THE FIX, and why not just a wider integer
+  Masks are `u64`, AND the relation count is refused above `MAX_JOIN_RELATIONS = 63` with an error
+  that names the limit. Widening alone only moves the cliff: every fixed-width mask has one, and a
+  silently aliased bit is not something a caller can act on. `MAX_DP_RELATIONS` (12) is a separate
+  limit for a separate reason — past it the exhaustive DP is abandoned for a left-deep plan, which
+  is a plan-QUALITY decision, not a correctness one. The two are not merged.
+
+FIRE-CHECK — the tests were shown to FAIL against the old code, at HEAD with the masks reverted to
+`u32` and the refusal lifted so the aliasing could be reached:
+
+    test relation_thirty_two_does_not_alias_onto_relation_zero ... FAILED
+    test a_join_at_the_relation_limit_still_plans ... FAILED
+    test more_relations_than_the_mask_can_hold_is_refused_by_name ... FAILED
+    panicked at src/optimizer/search_algorithm.rs:138:41: attempt to shift left with overflow
+    test result: FAILED. 0 passed; 3 failed.   EXIT=101
+
+  With the fix: 3 passed, 0 failed.
+  ⚠ The panic above is the DEBUG symptom. A release build does not panic there; it computes a
+  wrong mask and returns wrong rows, which no assertion in the suite would have caught before
+  these tests existed.
+
+⚠ MY OWN FIXTURE WAS WRONG FIRST, and would have passed against the bug: it inserted `id = i` into
+every table while joining on `r0.id = rN.id`, so every join was EMPTY — and nought rows is nought
+rows whether the masks alias or not. Every table now carries the same key, so the correct answer is
+exactly one row and a cross product is visibly different.
+
+NOT MEASURED: whether any real workload joins 32+ relations. The bug is reachable, not common.
