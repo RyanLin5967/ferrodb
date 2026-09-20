@@ -1,0 +1,71 @@
+D65 RUN 2 — reopen to 10^6 WITH DATA. Run 1 was stopped by the DISK guard at N=250,000.
+[HERE] 2026-09-20T07:19:12Z  at af8ebbe, 8 threads, 8 GB budget, 20 GiB floor UNCHANGED.
+Launched automatically once free space rose above 26 GiB; the floor was never lowered.
+PRE-REGISTERED (unchanged from run 1): reopen ms is FLAT across the decade. If it CLIMBS that
+is a new wall at the scale D61 reached and worth more than the flat result. THE COLUMN is the
+measurement, never a single cell. len B/branch must still read 4096 or this disagrees with D61.
+Run 1's two points, for comparison: 100000 -> 1.144 ms, 250000 -> 1.184 ms.
+free before: 32Gi   load before: 60.71 57.76 39.66
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms
+    100000       272.8     409.6      420.4           4096             4204            334       100000       0.856
+    250000       206.7    1024.0     1024.4           4096             4098            334       250000       1.729
+  STOPPING: 18.4 GiB free, floor is 20 GiB. Not this run's budget -- the DISK. Reported as a stop, not a result.
+
+Allocated (blocks*512) rather than merely addressed: 4098 B/branch, 1.02 GB total.
+  -> 10^6 branches x 4098 allocated B = 0.00 TB actually on disk.
+STOPPED EARLY ON SPACE at N = 250000, data file 1.02 GB (4096 bytes/branch).
+Extrapolated (ARITHMETIC, NOT MEASURED) to the objective:
+  10^6 branches x 4096 B = 0.00 TB of data file.
+bench/curve_to_1e6.txt was reached fork-only, on the one workload that does not
+pay this. Fix is geometric extent growth (SCALE-DESIGN D31 option 1), NOT
+lowering ARENA_EXTENT_PAGES -- reclamation is per-extent on purpose.
+
+  reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+VERDICT — AMPLIFICATION GONE. 4096 B/branch is within 8x of a
+single page, so a branch's first page costs about a page. This is the tree WITH
+geometric extent growth (D31) built; without it this number is ~1048576.
+# rc=0
+free after: 18Gi   load after: 57.45 50.87 46.15
+
+=== READING ===============================================================================
+⛔ ALSO INCOMPLETE, AND THE INSTRUMENT IS THE PROBLEM, NOT JUST THE DISK.
+
+Stopped by the same floor guard at N=250,000: free space fell 32 GiB -> 18.4 GiB DURING the run,
+with load reaching 57. Launched automatically when disk rose above 26 GiB; the floor was never
+lowered.
+
+THE FOUR REOPEN POINTS ACROSS BOTH RUNS, AT THE SAME TWO SIZES:
+              N = 100,000      N = 250,000
+  run 1          1.144 ms         1.184 ms      (ratio 1.03 — reads as flat)
+  run 2          0.856 ms         1.729 ms      (ratio 2.02 — reads as a climb)
+
+The two runs disagree by 34% at N=100,000 and 46% at N=250,000, and they disagree about the
+DIRECTION. Run 2's apparent doubling is not evidence of O(N): run 1 measured the same two sizes
+and found flat. ⛔ NOTHING about reopen's complexity class can be extracted from this, and
+quoting run 2's 2x would be reporting this machine's load as a property of the catalog.
+
+THE FAULT IS THE INSTRUMENT. `reopen_ms` is a SINGLE wall-clock sample per checkpoint on a shared,
+heavily loaded box. One sample cannot distinguish a real cost from a scheduling artifact, which is
+the same lesson as [[a-benchmark-harness-can-be-the-wall]] in a different guise — and this file's
+own pre-registration anticipated it ("noisy upward; a single high cell is load until the shape says
+otherwise"). It was right, and one sample per point was not enough to act on it.
+
+WHAT THE NEXT RUN MUST CHANGE, both of them, before any reopen number is quoted again:
+  1. REPEAT the reopen k times per checkpoint and report MEDIAN and MIN, not one sample. The MIN
+     is the least load-contaminated estimate available — a reopen cannot be made faster by
+     contention, only slower — so a flat MIN column is much stronger evidence than a flat single
+     sample, and a climbing MIN is much harder to dismiss.
+  2. SHRINK THE SPAN TO WHAT THE DISK ALLOWS. 10k..250k is a 25x span for ~1 GB of data, which
+     fits inside the floor with room to spare, and 25x across five points answers the
+     complexity-class question far better than two points at 10^6 ever could
+     ([[measure-the-slope-not-the-ratio]]). Extending to 10^6 is then a separate, larger run for
+     when the machine is quiet.
+
+WHAT IS NOT IN DOUBT: len B/branch reads 4096 at both checkpoints in both runs, agreeing with
+D61's five-point decade. The space result stands; only reopen is unmeasured.
+===========================================================================================
