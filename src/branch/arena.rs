@@ -2355,4 +2355,125 @@ mod tests {
         );
         assert_eq!(rec.live_children.last().copied(), Some(Epoch(25)), "array is not sorted");
     }
+    /// **D85 diagnostic.** Is `next_free` understated after a crash, and does `extent_is_empty`
+    /// then report an extent that still holds pages as empty?
+    ///
+    /// `alloc_for` advances `ext.next_free` (`arena.rs`) and does NOT persist. The four
+    /// `persist_if_configured` sites are all off the page path, so a crash can leave the image's
+    /// `next_free` behind by up to `ARENA_EXTENT_PAGES` pages. `load_state` knows and says so, and
+    /// answers it on the ALLOCATION side by never resuming a restored extent. This asks the
+    /// COLLECTION side's question instead: `extent_is_empty` is `recycled >= ext.next_free`.
+    #[test]
+    fn d85_next_free_after_a_crash_and_what_extent_is_empty_then_says() {
+        use std::fs::OpenOptions;
+        use crate::storage::disk_manager::DiskManager;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("ferro-d85-{}.db", std::process::id()));
+        let ckpt = dir.join(format!("ferro-d85-{}.ckpt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ckpt);
+        let open = || OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+
+        let (arena, written_before, written_after) = {
+            let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+            let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+            let base = pool.disk_manager.high_water().unwrap();
+            let store = ArenaPageStore::new(
+                Arc::clone(&pool),
+                Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+                base,
+            ).unwrap();
+
+            let b = catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+            let epoch = catalog.next_epoch();
+            // Enough pages to outgrow the 1-page first extent and land in a bigger one, so there
+            // is a tail to understate.
+            for _ in 0..6 {
+                store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+            }
+            // **The dangerous shape, constructed exactly.** An understated `next_free` is only
+            // hazardous when it restores to <= `recycled`, i.e. to ZERO for a fresh extent. That
+            // happens when the extent is created, the image is written, and only THEN are pages
+            // put in it. So: fill the current extent until a NEW one appears, checkpoint while it
+            // is still empty, and write into it afterwards.
+            let mut arena = *catalog.get(b.branch_id).unwrap().arenas.last().unwrap();
+            for _ in 0..64 {
+                store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+                let now = *catalog.get(b.branch_id).unwrap().arenas.last().unwrap();
+                if now != arena && store.allocated_pages(now).len() <= 1 {
+                    arena = now;
+                    break;
+                }
+                arena = now;
+            }
+            // Drain this extent's pages back so the image records it as empty, which is the state
+            // a crash right after `alloc_arena` leaves behind.
+            for p in store.allocated_pages(arena) {
+                store.release_page(p, arena);
+            }
+            let before = store.allocated_pages(arena).len();
+
+            // The crash line: everything above is in the image, everything below is not.
+            store.checkpoint(&ckpt).unwrap();
+
+            // Now put live pages into that extent. None of this reaches the image.
+            for _ in 0..3 {
+                store.alloc_for(b.branch_id, PageType::BTreeLeaf, epoch).unwrap();
+            }
+            let after = store.allocated_pages(arena).len();
+            store.flush().unwrap();
+            (arena, before, after)
+        };
+
+        // ...and the restart, reading only what the checkpoint durably held.
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(open()).unwrap())));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let re = ArenaPageStore::reopen_from_checkpoint(
+            Arc::clone(&pool),
+            Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+            &ckpt,
+        ).unwrap();
+
+        let restored = re.allocated_pages(arena).len();
+        let empty = re.extent_is_empty(arena);
+        println!(
+            "D85: arena {arena:?}  pages before checkpoint={written_before}  after more writes={written_after}  \
+             after restore={restored}  extent_is_empty={empty}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ckpt);
+
+        // **What is PROVEN here, and it is narrower than "there is a bug".**
+        //
+        // The extent held `written_after` pages when the process died. The restored store reports
+        // `restored` — fewer — and `extent_is_empty()` says TRUE. That is the understatement
+        // `load_state` documents, reaching the one predicate that decides whether an extent may be
+        // FREED rather than the one that decides whether it may be FILLED.
+        //
+        // ⚠ This is NOT yet data loss and must not be written up as it. `extent_is_collectable`
+        // also requires the owner to be DEAD, so a live branch's extent is never collected whatever
+        // this says; and `load_state` clears `current`, so nothing writes into it again. The open
+        // question — whether a live CHILD of a reaped owner can lose pages this way — is D85's
+        // next step and is not answered by this test.
+        assert!(
+            written_after > written_before,
+            "fixture: no pages were written after the checkpoint, so nothing is understated"
+        );
+        assert_eq!(
+            restored, written_before,
+            "fixture: the restore did not reproduce the checkpointed state"
+        );
+        assert!(
+            restored < written_after,
+            "D85's premise is gone: the restored extent accounts for every page written before the \
+             crash, so next_free is durable after all and this whole row is moot"
+        );
+        assert!(
+            empty,
+            "D85's hazard is gone: an extent holding {written_after} written page(s) no longer \
+             reports extent_is_empty()=true after a crash"
+        );
+    }
+
 }
