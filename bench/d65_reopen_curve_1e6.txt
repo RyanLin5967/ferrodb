@@ -1,0 +1,80 @@
+D65 — DOES CATALOG REOPEN STAY FLAT TO 10^6 *WITH DATA PRESENT*?
+[HERE] 2026-09-20T07:02:30Z  examples/branch_curve_writes at 63236eb, 8 threads, 8 GB budget, 20 GiB disk floor
+
+WHY: S4's O(1)-reopen claim has only ever been checked by examples/branch_curve.rs, which is
+FORK-ONLY — no branch in it calls arena_for or alloc_in_arena — so it reopens a catalog whose
+branches own NO PAGES. This harness is the one that writes. D61 proved space is flat to 10^6
+(4096 B/branch, bench/d61_write_curve_1e6_run2.txt) but could not answer reopen: it did not
+measure it and deletes its database at the end. A system that REACHES 10^6 branches but cannot
+RESTART at 10^6 has not reached it in any sense a user would accept.
+
+PRE-REGISTERED, before the first number exists: reopen ms is FLAT across the decade.
+If it CLIMBS, that is a new wall at exactly the scale D61 just reached, it is a SHAPE (catalog
+reopen is linear in branch count), and it is worth MORE than the flat result.
+⚠ THE COLUMN IS THE MEASUREMENT, NOT ANY ONE CELL. One reopen number at 10^6 cannot separate
+O(1) from O(log N) from a small O(N) — only the slope across five checkpoints can.
+⚠ reopen ms is WALL CLOCK on a SHARED box, so it is noisy upward; a climb must be monotone
+and large to count, and a single high cell is load until the shape says otherwise.
+⚠ forks/sec remains a FLOOR, not throughput (D61's own column fell to 290.5 then rose to 386.8).
+Pre-registration also records: len B/branch must still read 4096, or this run disagrees with
+D61 and BOTH are suspect until reconciled.
+
+free before: 39Gi   load before: 2.14 2.49 2.41
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms
+    100000       492.5     409.6      419.5           4096             4195            334       100000       1.144
+    250000       456.4    1024.0     1040.3           4096             4161            334       250000       1.184
+  STOPPING: 18.4 GiB free, floor is 20 GiB. Not this run's budget -- the DISK. Reported as a stop, not a result.
+
+Allocated (blocks*512) rather than merely addressed: 4161 B/branch, 1.04 GB total.
+  -> 10^6 branches x 4161 allocated B = 0.00 TB actually on disk.
+STOPPED EARLY ON SPACE at N = 250000, data file 1.02 GB (4096 bytes/branch).
+Extrapolated (ARITHMETIC, NOT MEASURED) to the objective:
+  10^6 branches x 4096 B = 0.00 TB of data file.
+bench/curve_to_1e6.txt was reached fork-only, on the one workload that does not
+pay this. Fix is geometric extent growth (SCALE-DESIGN D31 option 1), NOT
+lowering ARENA_EXTENT_PAGES -- reclamation is per-extent on purpose.
+
+  reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+VERDICT — AMPLIFICATION GONE. 4096 B/branch is within 8x of a
+single page, so a branch's first page costs about a page. This is the tree WITH
+geometric extent growth (D31) built; without it this number is ~1048576.
+# rc=0
+free after: 18Gi   load after: 28.96 39.77 22.99
+
+=== READING ===============================================================================
+[HERE] reduced by this session. ⛔ THIS RUN IS INCOMPLETE AND IS NOT A RESULT FOR THE ROW.
+
+WHY IT STOPPED, and it was not ferrodb: the harness's own disk guard fired —
+  "STOPPING: 18.4 GiB free, floor is 20 GiB. Not this run's budget -- the DISK."
+Free space on this shared machine went from 39 GiB at launch to 18.4 GiB EIGHT MINUTES LATER;
+this run's own database accounted for ~1 GB of that. The other ~20 GiB was other sessions. The
+run did not exceed its 8 GB byte budget, did not fault, and did not find anything about ferrodb.
+The FREE_FLOOR guard did exactly what it was added for: it refused rather than filling a disk
+that other lanes are using. Reported as a stop, not a result — which is the guard's own wording.
+
+WHAT WAS MEASURED BEFORE THE STOP (2 points, and 2 points are not a slope)
+         N    reopen ms    len B/branch    cat B/branch
+    100000        1.144            4096             334
+    250000        1.184            4096             334
+
+  · reopen is ~1.1 ms at both, +3.5% across a 2.5x range. That is CONSISTENT with flat and
+    consistent with a very shallow slope; it cannot distinguish them. The pre-registration in
+    this file says so in advance: "THE COLUMN IS THE MEASUREMENT, NOT ANY ONE CELL. One reopen
+    number cannot separate O(1) from O(log N) from a small O(N)." Two cells is barely better
+    than one. NOTHING about reopen's complexity class is claimed from this.
+  · len B/branch reads 4096 at both points, AGREEING with D61's five-point decade. The
+    pre-registered reconciliation check passes: this run does not contradict D61.
+
+STATUS: D65 is BLOCKED ON DISK, not on anything about the system under test. The machine is at
+99% capacity and the free space is owned by other sessions. Re-running needs ~4.1 GB of data plus
+headroom above the 20 GiB floor, i.e. roughly 25 GiB free.
+
+⛔ WHAT WAS NOT DONE, AND WILL NOT BE: the floor was NOT lowered to make the run fit. Lowering a
+safety guard to obtain a number is how a measurement becomes a story about the machine, and this
+guard's whole purpose is that another lane's ENOSPC reads exactly like a real test failure.
+===========================================================================================
