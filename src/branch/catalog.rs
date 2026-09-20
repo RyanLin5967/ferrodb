@@ -42,9 +42,53 @@ pub const TRUNK_LEASE: LeaseDeadline = LeaseDeadline(u64::MAX);
 struct CatalogState {
     /// Current record per id slot. A reaped slot keeps its record: its `live_children` array is
     /// still the authority for any page parked in the pending-free log under its name.
+    ///
+    /// ⚠ **Never `insert` into this directly — use [`CatalogState::install`].** `live` is derived
+    /// from it and the two must move together; see `install` for why that is a rule about the
+    /// CALL and not about remembering.
     records: HashMap<u64, BranchRecord>,
     /// Id slots whose reaped record no longer pins anything and may be handed out again.
     free_ids: Vec<u64>,
+    /// **S20.** How many records are `Live`, maintained rather than counted.
+    ///
+    /// `live_count` used to iterate every record and filter — O(TOTAL branches, reaped ones
+    /// included) to answer one integer, measured 0.664 -> 59.234 ms across 100x N
+    /// (`bench/curve_to_1e6.txt`). That is a branch-count wall, and the objective is 10^6 branches.
+    live: usize,
+}
+
+impl CatalogState {
+    /// Install a record **and keep `live` in step, in the same call**.
+    ///
+    /// # Why this is a method and not a convention
+    ///
+    /// A maintained counter is a second source of truth, and the usual way it rots is that someone
+    /// adds a new write to `records` and does not know about the counter. Putting the adjustment
+    /// in the only call that inserts makes the two impossible to update separately — there is no
+    /// order of operations to get wrong, because there is one operation.
+    ///
+    /// It reads the PREVIOUS record rather than trusting the caller to say what changed, so a
+    /// whole-record replace (`put`) is handled by the same three lines as a state transition
+    /// (`set_state`), and neither caller has to think about the counter at all.
+    fn install(&mut self, rec: BranchRecord) {
+        let was_live = self
+            .records
+            .get(&rec.branch_id.id)
+            .is_some_and(|r| r.state == BranchState::Live);
+        let is_live = rec.state == BranchState::Live;
+        match (was_live, is_live) {
+            (false, true) => self.live += 1,
+            (true, false) => self.live -= 1,
+            _ => {}
+        }
+        self.records.insert(rec.branch_id.id, rec);
+    }
+
+    /// Count from scratch. Used only when the map is built at open/replay, where the O(N) is
+    /// already being paid to read the records in the first place.
+    fn recount(records: &HashMap<u64, BranchRecord>) -> usize {
+        records.values().filter(|r| r.state == BranchState::Live).count()
+    }
 }
 
 /// Append-only, crash-replayable branch catalog.
@@ -63,7 +107,7 @@ impl LogBranchCatalog {
         let mut records = HashMap::new();
         records.insert(0u64, BranchRecord::trunk(trunk_root, TRUNK_LEASE));
         LogBranchCatalog {
-            state: RwLock::new(CatalogState { records, free_ids: Vec::new() }),
+            state: RwLock::new(CatalogState { live: CatalogState::recount(&records), records, free_ids: Vec::new() }),
             epoch: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             sink: None,
@@ -84,7 +128,7 @@ impl LogBranchCatalog {
         let (records, free_ids, max_id, max_epoch) = Self::index(existing, trunk_root);
 
         Ok(LogBranchCatalog {
-            state: RwLock::new(CatalogState { records, free_ids }),
+            state: RwLock::new(CatalogState { live: CatalogState::recount(&records), records, free_ids }),
             epoch: AtomicU64::new(max_epoch),
             next_id: AtomicU64::new(max_id + 1),
             sink: Some(Mutex::new(file)),
@@ -291,14 +335,13 @@ impl LogBranchCatalog {
     }
 
     /// Number of branches in state `Live`, trunk included.
+    /// **S20: O(1), maintained by [`CatalogState::install`].**
+    ///
+    /// This iterated every record and filtered on `Live` — O(TOTAL branches, reaped included) for
+    /// one integer, measured 0.664 -> 59.234 ms across 100x N. The objective is 10^6 branches, so
+    /// a count that walks them is a wall on the thing being counted.
     pub fn live_count(&self) -> usize {
-        self.state
-            .read()
-            .unwrap()
-            .records
-            .values()
-            .filter(|r| r.state == BranchState::Live)
-            .count()
+        self.state.read().unwrap().live
     }
 
     /// Durably replace a whole record. **Inherent and private — D41 removed this from
@@ -335,7 +378,7 @@ impl LogBranchCatalog {
     #[cfg(test)]
     fn put(&self, record: &BranchRecord) -> Result<(), FerroError> {
         self.append(&[record])?;
-        self.state.write().unwrap().records.insert(record.branch_id.id, record.clone());
+        self.state.write().unwrap().install(record.clone());
         Ok(())
     }
 }
@@ -384,8 +427,12 @@ impl BranchCatalog for LogBranchCatalog {
         // is still updated below, because live readers use it without replaying.
         self.append(&[&child])?;
 
-        st.records.insert(parent.id, new_parent);
-        st.records.insert(child_num, child.clone());
+        st.install(new_parent);
+        debug_assert_eq!(
+            child.branch_id.id, child_num,
+            "install() keys by the record's own id; a differing key would file the child elsewhere"
+        );
+        st.install(child.clone());
         Ok(child)
     }
 
@@ -430,7 +477,7 @@ impl BranchCatalog for LogBranchCatalog {
         rec.depth = depth;
         rec.root_page_id = root;
         self.append(&[&rec])?;
-        st.records.insert(branch.id, rec.clone());
+        st.install(rec.clone());
         Ok(rec)
     }
 
@@ -448,7 +495,7 @@ impl BranchCatalog for LogBranchCatalog {
         let mut rec = rec.clone();
         rec.restrict(envelope)?;
         self.append(&[&rec])?;
-        st.records.insert(branch.id, rec);
+        st.install(rec);
         Ok(())
     }
 
@@ -492,7 +539,7 @@ impl BranchCatalog for LogBranchCatalog {
             rec.state = to;
         }
         self.append(&[&rec])?;
-        st.records.insert(branch.id, rec);
+        st.install(rec);
         Ok(())
     }
 
@@ -733,7 +780,7 @@ impl BranchCatalog for LogBranchCatalog {
             }
         }
         self.append(&[&rec])?;
-        st.records.insert(branch.id, rec);
+        st.install(rec);
         Ok(())
     }
 }
