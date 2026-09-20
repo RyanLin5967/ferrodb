@@ -537,6 +537,59 @@ mod tests {
         assert_eq!(n.all_children().unwrap(), vec![10, 20, 30]);
     }
 
+    /// **The refusal `all_children` owes its three callers — restored by D63.**
+    ///
+    /// `walk_pages` (btree.rs), `diff` (btree.rs) and the internal split path all spell
+    /// `n.all_children()?`. An undecodable internal node must therefore ERROR rather than come
+    /// back as "no children": a silent empty answer makes `walk_pages` under-report a subtree and
+    /// makes `diff` call changed pages unchanged, with no failure anywhere to say so.
+    ///
+    /// This behaviour used to be pinned ONLY through `CowPageLinks::child_pages` — the branch
+    /// reaper's page walker — in `cow::btree::cow_page_links_tests` (LEDGER row S5). D63 deleted
+    /// `collapse`, and the walker existed only to serve it, so both tests went with it and left
+    /// these three live callers unpinned. The refusal is a property of `Node`, not of the walker,
+    /// so it is tested directly here and no longer depends on anything collapse-related.
+    ///
+    /// `internal_child_routing_uses_the_leftmost_slot_for_small_keys` above is the positive
+    /// control: it asserts a well-formed internal node still answers `vec![10, 20, 30]`, so these
+    /// two cannot pass by making `all_children` refuse everything.
+    #[test]
+    fn all_children_refuses_a_cell_that_overruns_the_page() {
+        let mut page = [0u8; PAGE_SIZE];
+        let p = PAGE_HEADER_SIZE;
+        // One slot...
+        page[p + OFF_COUNT..p + OFF_COUNT + 4].copy_from_slice(&1u32.to_be_bytes());
+        // ...whose cell starts near the end of the payload and runs off it.
+        let slot = p + SLOT_BASE;
+        page[slot..slot + 4].copy_from_slice(&((PAYLOAD_LEN - 2) as u32).to_be_bytes());
+        page[slot + 4..slot + 8].copy_from_slice(&100u32.to_be_bytes());
+
+        let got = Node::new(&page).all_children();
+        assert!(
+            got.is_err(),
+            "a cell running off the payload reported {:?} children instead of refusing",
+            got.map(|v| v.len())
+        );
+    }
+
+    /// The other half of the same refusal: the slot is well formed, the cell body is not a
+    /// 4-byte page id. `child` must say so rather than hand back whatever it decoded.
+    #[test]
+    fn all_children_refuses_a_cell_whose_body_is_not_a_child_pointer() {
+        let mut p = blank();
+        {
+            let mut n = NodeMut::new(&mut p);
+            // A well-formed cell whose body is one byte, not a page id.
+            n.insert_cell_at(0, &leaf_cell(b"k", b"v")).unwrap();
+        }
+        let got = Node::new(&p).all_children();
+        assert!(
+            got.is_err(),
+            "a cell body that is not 4 bytes reported {:?} children instead of refusing",
+            got.map(|v| v.len())
+        );
+    }
+
     #[test]
     fn split_point_keeps_both_halves_non_empty() {
         assert_eq!(split_point(&[10, 10]), 1);

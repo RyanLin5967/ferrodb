@@ -86,12 +86,30 @@ pub trait BranchCatalog: Send + Sync {
 
     /// Move `branch` under a new parent, publishing its new root in the same atomic write.
     ///
-    /// **NO PRODUCTION CALLER — D63.** Its only one was `collapse`, which D63 deleted; what
-    /// remains is this narrow operation and the D41 tests that pin it
-    /// (`tests/d41_narrow_ops_close_the_window.rs`). It is kept rather than deleted because the
-    /// narrowness is the point: any future re-parent must move these four fields this way, and
-    /// re-deriving that is how D20/D29/D33/D34 happened. Treat the paragraphs below as the
-    /// contract a caller would have to meet, not as a description of one that exists.
+    /// **NO PRODUCTION CALLER, AND THINLY TESTED — D63.** Its only caller was `collapse`, which
+    /// D63 deleted. It is kept because the narrowness is the point: any future re-parent must move
+    /// these four fields this way, and re-deriving that is how D20/D29/D33/D34 happened. Treat
+    /// what follows as the contract a caller would have to meet, not a description of one that
+    /// exists.
+    ///
+    /// ⚠ **What actually covers it, measured — not what you might assume.**
+    /// `grep -rn '\.reparent(' src tests examples` returns one real invocation
+    /// (`table_catalog.rs`, a `TableBranchCatalog` unit test) plus three trait forwards that no
+    /// test drives. `tests/d41_narrow_ops_close_the_window.rs` does **not** call `reparent` — its
+    /// two reproductions are `restrict_envelope` and `charge_row_writes`, and its `reparent` is a
+    /// bare forward satisfying the trait. `LogBranchCatalog::reparent` lost its only driver when
+    /// D63 deleted the collapse suite, which `reaper_suite!(log_catalog, …)` had run against it;
+    /// `catalog.rs`'s `reparent_moves_the_four_position_fields_and_nothing_else` was added by D63
+    /// to replace it. Do not assume more coverage than those two tests.
+    ///
+    /// **A RE-PARENT IS MORE THAN THIS CALL, and the rest lives only here now.** On
+    /// `TableBranchCatalog` — what production opens — this write goes through `write_record`,
+    /// which rewrites the record, state, deadline, envelope and arena keys and **never touches the
+    /// children index**. So a caller must also detach the branch from its old parent and
+    /// `attach_child` it to the new one; `collapse` did exactly that around this call. A caller
+    /// that follows only the paragraphs below gets a branch missing from its new parent's live set
+    /// and still listed under its old one: the new parent reads as childless, the interval rule
+    /// frees pages the branch is still reading, and the old parent is pinned for ever.
     ///
     /// **D41, site 1.** The four fields move together or not at all — `parent_id`, `fork_epoch`,
     /// `depth` and `root_page_id` describe one position in the tree, and a reader that saw three

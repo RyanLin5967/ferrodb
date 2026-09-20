@@ -50,7 +50,7 @@ fn env(tag: &str) -> Env {
 }
 
 /// Enough keys to force at least one internal level, so the fork below shares a real multi-level
-/// tree rather than a single leaf.
+/// tree rather than a single leaf. The test asserts that premise rather than trusting this line.
 const N: u32 = 400;
 
 fn key(i: u32) -> Vec<u8> {
@@ -74,6 +74,23 @@ fn the_cow_btree_runs_on_the_arena_store_and_a_child_sees_the_parents_data_witho
     e.catalog.set_root(BranchId::TRUNK, root).unwrap();
     let pages_before = e.store.live_page_count().unwrap();
     assert!(pages_before > 1, "expected a multi-page tree, got {}", pages_before);
+
+    // CHECK THE PREMISE `N` CLAIMS, rather than leaving it in a comment. `live_page_count` counts
+    // every live page in the store, so it cannot tell a multi-level tree from a single leaf beside
+    // some catalog pages — it would stay green if a change to `N`, the node fanout or the key and
+    // value widths quietly degraded this fixture to one leaf, and then "a child inherits a real
+    // tree" would be testing a fork of nothing. The collapse test deleted by D63 was what used to
+    // assert this shape; the assertion outlived the feature because this test needs it too.
+    let levels = tree.walk_pages(root).unwrap();
+    assert!(levels.len() > 1, "tree is a single page; the fork below would share nothing");
+    let internal = levels
+        .iter()
+        .filter(|p| {
+            e.store.read_page(**p).unwrap().header().unwrap().page_type
+                == ferrodb::cow::PageType::BTreeInternal
+        })
+        .count();
+    assert!(internal > 0, "tree has no internal node, so N no longer forces a level");
 
     // Fork copies zero data pages, and the child reads the parent's data by ordinary descent.
     let child = e.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();

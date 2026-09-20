@@ -791,9 +791,10 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
         )
         .unwrap(),
     );
-    let reaper = Arc::new(
-        TwoTierReaper::new(Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store)),
-    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
+        Arc::clone(&store),
+    ));
 
     // Built while standalone: on a cluster member `alloc_arena` refuses without a leader grant, and
     // this test is about the clock, not about grants.

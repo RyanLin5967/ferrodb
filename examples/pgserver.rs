@@ -102,9 +102,10 @@ fn main() {
 
     // F11 — the reaper, built over the SAME catalog and page store as the runtime, which is the
     // contract `with_reaper` states and cannot check.
-    let reaper = Arc::new(
-        TwoTierReaper::new(branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, store.clone()),
-    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
+        store.clone(),
+    ));
 
     let runtime = Arc::new(
         if arena_exists {
