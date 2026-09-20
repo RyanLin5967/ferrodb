@@ -60,7 +60,33 @@ pub trait PageLinks: Send + Sync {
     fn rewrite_child(&self, page: &mut [u8; PAGE_SIZE], old: PageId, new: PageId);
 }
 
-/// Guard against a cyclic or pathologically deep page graph during collapse.
+/// One page in flight during a [`TwoTierReaper::deep_copy`] — see that function. Holds only what
+/// the recursive version held in a call frame, so the memory profile is unchanged for the wide,
+/// shallow graphs that are the normal case: the live set is the current PATH, not the whole tree.
+struct CopyFrame {
+    page_type: PageType,
+    data: Box<[u8; PAGE_SIZE]>,
+    children: Vec<PageId>,
+    /// How many of `children` have been copied and folded into `rewrites`.
+    next: usize,
+    rewrites: Vec<(PageId, PageId)>,
+}
+
+/// Bounds the number of pages one `collapse` may copy. **It bounds PAGES, not DEPTH — D62.**
+///
+/// This comment used to claim the constant guarded "a cyclic or pathologically deep page graph",
+/// and exactly one of those was true. Three separate guards cover three separate failures, and
+/// conflating them is what let the third go unimplemented for so long:
+///
+/// * **cyclic** — the `seen` set in [`TwoTierReaper::deep_copy`]. Nothing to do with this budget.
+/// * **too much work** — this constant. 65,536 pages, 256 MiB, checked once per page visited.
+/// * **too deep** — the explicit stack in `deep_copy`. A page image declares its own child list
+///   (`child_pages` reads the count straight out of the bytes), so depth is a property of what is
+///   on disk, not of an invariant this code enforces: 65,536 single-child levels are within this
+///   budget. While the walk was recursive each level also parked a 4 KiB page image in its stack
+///   frame, so the stack was exhausted at a depth of roughly (stack bytes / 4 KiB) — orders below
+///   the page budget, and lower again on a thread with a smaller stack. The walk is iterative now,
+///   so depth costs heap, which is bounded by the budget rather than by a guard page.
 const MAX_COLLAPSE_PAGES: usize = 1 << 16;
 
 /// How rarely the crash-orphan collector may run off the background lease tick.
@@ -421,15 +447,72 @@ impl TwoTierReaper {
     /// claims a fresh one when it does not, recording each fresh one against the branch inside
     /// `alloc_arena`'s atomic `add_arena`. That last part is why `collapse` must RE-READ the
     /// record before its final write; see there.
+    /// One frame of [`TwoTierReaper::deep_copy`]'s explicit stack: exactly what the recursive
+    /// version kept in a call frame, moved to the heap where depth is not a guard page.
+    ///
+    /// `data` is read ONCE, when the frame is opened, and the children are derived from that same
+    /// image — preserving the recursive version's property that a page's bytes and its child list
+    /// always come from the same read. Re-reading the page at emit time would have been cheaper in
+    /// memory and would have opened a window for the two to disagree.
     fn deep_copy(
         &self,
-        page: PageId,
+        root: PageId,
         branch: BranchId,
         epoch: Epoch,
         links: &dyn PageLinks,
         seen: &mut HashSet<PageId>,
         budget: &mut usize,
     ) -> Result<PageId, FerroError> {
+        // Post-order over the page graph, iteratively. A parent may only be written once every
+        // child has a new id to point at, which is the whole reason this is post-order and not a
+        // plain DFS. `completed` carries the id the just-finished child produced back to its
+        // parent, taking the place of the recursive call's return value.
+        let mut stack: Vec<CopyFrame> = vec![self.open_copy_frame(root, links, seen, budget)?];
+        let mut completed: Option<PageId> = None;
+
+        loop {
+            if let Some(new_child) = completed.take() {
+                let top = stack
+                    .last_mut()
+                    .expect("completed is only set when a parent frame remains");
+                let old = top.children[top.next];
+                top.rewrites.push((old, new_child));
+                top.next += 1;
+            }
+
+            let next_child = {
+                let top = stack.last().expect("the loop returns when the stack empties");
+                (top.next < top.children.len()).then(|| top.children[top.next])
+            };
+
+            match next_child {
+                Some(child) => {
+                    let frame = self.open_copy_frame(child, links, seen, budget)?;
+                    stack.push(frame);
+                }
+                None => {
+                    let frame = stack.pop().expect("checked non-empty above");
+                    let new_id = self.emit_copy(frame, branch, epoch, links)?;
+                    match stack.is_empty() {
+                        true => return Ok(new_id),
+                        false => completed = Some(new_id),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Charge one page against the budget, reject a revisit, and read the page once.
+    ///
+    /// The order of the two refusals is load-bearing and matches the recursive version exactly: a
+    /// budget already at zero is reported as the budget, not as a revisit.
+    fn open_copy_frame(
+        &self,
+        page: PageId,
+        links: &dyn PageLinks,
+        seen: &mut HashSet<PageId>,
+        budget: &mut usize,
+    ) -> Result<CopyFrame, FerroError> {
         if *budget == 0 {
             return Err(BranchError::Arena(format!(
                 "collapse exceeded {} pages; the page graph is cyclic or larger than a branch",
@@ -450,23 +533,33 @@ impl TwoTierReaper {
             let handle = self.store.read_page(page)?;
             (handle.header()?.page_type, handle.read().data)
         };
-
         let children = links.child_pages(page_type, &data)?;
-        let mut rewrites = Vec::with_capacity(children.len());
-        for child in children {
-            let new_child = self.deep_copy(child, branch, epoch, links, seen, budget)?;
-            rewrites.push((child, new_child));
-        }
+        Ok(CopyFrame {
+            page_type,
+            data: Box::new(data),
+            children,
+            next: 0,
+            rewrites: Vec::new(),
+        })
+    }
 
-        let new_id = self.store.alloc_for(branch, page_type, epoch)?;
+    /// Write one page's copy, repointing it at the copies its children became.
+    fn emit_copy(
+        &self,
+        frame: CopyFrame,
+        branch: BranchId,
+        epoch: Epoch,
+        links: &dyn PageLinks,
+    ) -> Result<PageId, FerroError> {
+        let new_id = self.store.alloc_for(branch, frame.page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
-            let mut frame = handle.write();
-            frame.data[PAGE_HEADER_SIZE..].copy_from_slice(&data[PAGE_HEADER_SIZE..]);
-            for (old, new) in rewrites {
-                links.rewrite_child(&mut frame.data, old, new);
+            let mut fresh = handle.write();
+            fresh.data[PAGE_HEADER_SIZE..].copy_from_slice(&frame.data[PAGE_HEADER_SIZE..]);
+            for (old, new) in frame.rewrites {
+                links.rewrite_child(&mut fresh.data, old, new);
             }
-            crate::cow::stamp_checksum(&mut frame.data);
+            crate::cow::stamp_checksum(&mut fresh.data);
         }
         Ok(new_id)
     }
@@ -1639,6 +1732,67 @@ mod tests {
         h.catalog.set_root(b.branch_id, p1).unwrap();
         let err = reaper.collapse(b.branch_id).unwrap_err();
         assert!(err.to_string().contains("not a tree"), "got {}", err);
+    }
+
+    /// **D62 — a single-child chain must not be bounded by the STACK.**
+    ///
+    /// `MAX_COLLAPSE_PAGES` bounds PAGES COPIED and never bounded depth. While `deep_copy` was
+    /// recursive, each level also parked a 4 KiB page image in its call frame, so the stack was
+    /// exhausted at roughly (stack bytes / 4 KiB) levels — orders below the 65,536-page budget. A
+    /// page declares its own child list (`child_pages` reads the count out of the bytes), so the
+    /// depth is whatever is on disk, not something this code enforces.
+    ///
+    /// The chain below is thousands of levels deep and stays well inside the page budget, so it
+    /// can only fail on depth. ⚠ Against the RECURSIVE implementation this test does not fail an assertion —
+    /// it aborts the whole test process with a stack overflow. That is the proof it tests what it
+    /// names; a version of this fixture that merely passes on both implementations tests nothing.
+    #[test]
+    fn collapse_survives_a_page_chain_far_deeper_than_a_call_stack() {
+        const CHAIN: usize = 8_000;
+        assert!(
+            CHAIN < MAX_COLLAPSE_PAGES,
+            "fixture must stay INSIDE the page budget, or a refusal would prove the budget \
+             rather than the depth"
+        );
+
+        let h = Harness::new_with($table);
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_links(Arc::new(ToyLinks));
+
+        // The chain is owned by an ancestor, exactly as the wide-tree test does it, so the branch
+        // being collapsed inherits pages it does not own and `deep_copy` has to walk all of them.
+        let anc = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let e = h.catalog.next_epoch();
+        let leaf = h.store.alloc_for(anc.branch_id, PageType::BTreeLeaf, e).unwrap();
+        let mut child = leaf;
+        for _ in 0..CHAIN {
+            let p = h.store.alloc_for(anc.branch_id, PageType::BTreeInternal, e).unwrap();
+            let handle = h.store.read_page(p).unwrap();
+            {
+                let mut f = handle.write();
+                ToyLinks::write(&mut f.data, &[child]);
+                stamp_checksum(&mut f.data);
+            }
+            child = p;
+        }
+        let root = child;
+
+        let mut cur = anc.branch_id;
+        for _ in 0..6 {
+            cur = h.catalog.fork(cur, LeaseDeadline(0)).unwrap().branch_id;
+        }
+        h.catalog.set_root(cur, root).unwrap();
+        let live_before = h.store.live_page_count().unwrap();
+
+        let collapsed = reaper.collapse(cur).unwrap();
+
+        assert_eq!(collapsed.depth, 1);
+        assert_ne!(collapsed.root_page_id, root, "the chain was materialised, not aliased");
+        assert_eq!(
+            h.store.live_page_count().unwrap(),
+            live_before + CHAIN as u32 + 1,
+            "every page of the chain was copied exactly once"
+        );
     }
 
     /// **D13b — `collapse` must roll over extents, or it cannot collapse a real database.**
