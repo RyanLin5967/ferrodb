@@ -1956,8 +1956,44 @@ impl AgentRuntime {
             )));
         }
         let rid = row_id_of(&row);
+        // **D71: the duplicate-key check is a POINT LOOKUP, not a table scan.**
+        //
+        // This was `visible_rows(..)`, which materialises every row of the table and then keeps
+        // the one whose `RowId` matches — O(table) to answer "does this one key already exist".
+        //
+        // It is the third of the three agent write paths that did this, and the only one that
+        // could NOT be fixed by passing a statement predicate, because an INSERT has no `WHERE`.
+        // What it has is the key itself, so the predicate is BUILT from the row: `pk = <literal>`,
+        // as an AST via `value_expr`, exactly as D69 does for `evaluate_merge`'s base lookups.
+        // Building it as an AST rather than rendering SQL text is what makes it safe for every key
+        // type — a key containing a quote cannot break a tree the way it breaks a query string.
+        //
+        // ⚠ The `find(|(r, _)| *r == rid)` below STAYS, for the same reason the post-filter stays
+        // in `branch_update`: pushdown is a conservative hint and the planner may return a wider
+        // set, so the `RowId` comparison remains the sole authority on what counts as a duplicate.
+        // Narrowing what is read must never narrow what is checked.
+        let pk_pred = Expr::BinaryOp {
+            left: Box::new(Expr::ColumnRef {
+                table: None,
+                column: schema.columns[0].name.clone(),
+            }),
+            operator: TokenType::Equal,
+            right: Box::new(value_expr(&row[0])),
+        };
+        // Bind before scanning: the binder borrows the catalog, and the scan needs it too.
+        let bound_pk = {
+            let scope = table_scope(table, &schema)?;
+            Binder::new(ctx.catalog).bind_expr(pk_pred.clone(), &scope)?
+        };
         let existing = self
-            .visible_rows(&ctx.read(), Some(branch), table)?
+            .visible_rows_where(
+                &ctx.read(),
+                Some(branch),
+                table,
+                None,
+                Some(&pk_pred),
+                Some(&bound_pk),
+            )?
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
