@@ -1,0 +1,39 @@
+D69 KEY TYPES — THE FIRE-CHECK. Do these tests catch a broken point lookup, or only describe one?
+
+Three mutants, each applied to the real source, whole file run, then `git checkout --` restored
+(index verified clean before starting, so the restore could not eat an uncommitted fix).
+
+THE SITES. D69 builds its point-lookup predicate as an AST in three places:
+  runtime.rs:2757  `evaluate_merge`  — the BASE FINGERPRINT read (is the branch's base still current?)
+  runtime.rs:4914  `into_stmt`       — the APPLY path (turn a staged change into a statement)
+  runtime.rs:4932  `into_stmt`       — same, second arm
+
+  mutant                                              | tests fired
+  ----------------------------------------------------|---------------------------------------
+  1. wrong column, `evaluate_merge` ONLY              |  2 of 10  -> 6 of 14 after the new tests
+  2. wrong column, ALL THREE sites                    |  6 of 10  (every end-to-end merge test)
+  3. constant key (-999999), ALL THREE sites          |  6 of 10  (every end-to-end merge test)
+
+⛔ **MUTANT 1 IS THE ONE WORTH READING, AND IT IS WHY THIS FILE EXISTS.** Breaking ONLY the base
+read left FLOAT, DECIMAL, BIGINT and INTEGER passing, while VARCHAR and BOOLEAN failed. They passed
+for a reason no amount of adding key types would have fixed: **"the lookup found nothing" and
+"there is no base row" are the same observation** to an assertion that only asks whether the merge
+APPLIED. With no conflicting base in the fixture, both readings admit.
+
+That is the silent-correctness direction — a merge whose base moved gets ADMITTED and publishes
+over a concurrent write, looking exactly like a healthy merge on the way through. Four
+`a_stale_merge_is_refused_for_*` tests now stage that directly: write in a branch, move the same
+row in the trunk, require a refusal AND require the trunk's value to still be standing afterwards.
+Under mutant 1 all four fire, including the three types that previously could not.
+
+WHAT DOES NOT FIRE, AND WHY THAT IS CORRECT. The four `*_round_trips*` tests fire on NO mutant.
+They go through SQL TEXT — render a literal into a query string, re-parse it — and D69's lookups
+never do that; they build `Expr::BinaryOp { ColumnRef, Equal, value_expr(&key) }` directly, so
+there is no rendering and no escaping hazard. Those four are a weaker proxy and the file already
+says so in place. They are kept because they pin the literal/round-trip property cheaply, not
+because they verify D69.
+
+⚠ WHAT IS STILL NOT COVERED: the SLOW failure mode. A predicate that stops being a recognisable
+equality on column 0 still returns the right answer while the planner falls back to a seq scan per
+lookup — O(delta x table), worse than the scan D69 removed, and every test here stays green. Only
+a curve can see that, and the curve is INTEGER-keyed only. See bench/d69_fsync_counted.txt.

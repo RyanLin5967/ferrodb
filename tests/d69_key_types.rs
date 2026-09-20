@@ -252,3 +252,68 @@ fn a_merge_on_a_negative_integer_keyed_table_finds_its_base_row() {
     // is a different AST shape from every other integer case here.
     merge_finds_base("INTEGER", "-42", "-43");
 }
+
+/// **THE DANGEROUS DIRECTION, and the one the tests above do not cover.**
+///
+/// Mutation-testing the tests above turned up an asymmetry worth a test of its own. Breaking the
+/// point lookup in `evaluate_merge` ALONE (leaving the apply path in `into_stmt` intact) made the
+/// VARCHAR and BOOLEAN cases fail — and FLOAT, DECIMAL, BIGINT and INTEGER still passed. They
+/// passed because "the lookup found nothing" and "there is no base row" are the same observation
+/// to a caller that only asks whether the merge APPLIED: with no conflicting base in the fixture,
+/// both readings admit, and the assertion never sees the difference.
+///
+/// That is the silent failure this file's header warns about, stated as a test instead of a
+/// comment: a merge that must be REFUSED because its base moved will instead be ADMITTED if the
+/// point lookup misses, and it will look exactly like a healthy merge on the way through.
+///
+/// So this stages a write in a branch, moves the same row underneath it in the trunk, and asserts
+/// the merge is refused. A lookup that misses reports an unchanged base and admits — publishing
+/// over a concurrent write, which is the one outcome the whole merge gate exists to prevent.
+fn a_stale_merge_is_refused(decl: &str, key: &str) {
+    let mut db = Db::new();
+    let mut s = Session::new();
+    db.ok(&format!("CREATE TABLE t (id {decl} NOT NULL, v INTEGER);"), &mut s);
+    db.ok(&format!("INSERT INTO t VALUES ({key}, 100);"), &mut s);
+
+    let mut a = Session::new();
+    db.ok("BEGIN AGENT SESSION AS 'stale';", &mut a);
+    db.ok(&format!("UPDATE t SET v = 111 WHERE id = {key};"), &mut a);
+
+    // The trunk moves the SAME row after the branch read it. The branch's view of the base is now
+    // stale, and the gate must say so.
+    db.ok(&format!("UPDATE t SET v = 222 WHERE id = {key};"), &mut s);
+
+    let out = db.ok("MERGE;", &mut a);
+    let applied = match out {
+        Outcome::Agent(ref ag) => format!("{ag:?}").contains("applied_to_target: true"),
+        _ => false,
+    };
+    assert!(
+        !applied,
+        "{decl} key {key}: a merge whose base moved underneath it was ADMITTED. Either the point \
+         lookup missed the base row and reported it unchanged, or the staleness check did not \
+         consult it. Both publish over a concurrent write."
+    );
+
+    // And the trunk's write must still be standing. A refusal that still mutated the row would be
+    // the same data loss wearing an error message.
+    let rows = db.rows(&format!("SELECT v FROM t WHERE id = {key};"), &mut s);
+    assert_eq!(rows.len(), 1, "{decl}: the row vanished");
+    assert_eq!(
+        rows[0][0],
+        Value::Integer(222),
+        "{decl}: the merge was refused but the trunk's concurrent write was overwritten anyway"
+    );
+}
+
+#[test]
+fn a_stale_merge_is_refused_for_a_float_key() { a_stale_merge_is_refused("FLOAT", "0.1"); }
+
+#[test]
+fn a_stale_merge_is_refused_for_a_decimal_key() { a_stale_merge_is_refused("DECIMAL", "10.50"); }
+
+#[test]
+fn a_stale_merge_is_refused_for_a_varchar_key() { a_stale_merge_is_refused("VARCHAR(32)", "'agent-7'"); }
+
+#[test]
+fn a_stale_merge_is_refused_for_a_bigint_key() { a_stale_merge_is_refused("BIGINT", "9007199254740993"); }
