@@ -1,3 +1,27 @@
+D69-REOPEN — WHY A MERGE IS LINEAR IN TABLE SIZE.
+
+⛔⛔ **SUPERSEDED THE SAME DAY BY bench/d69_fsync_counted.txt. READ THAT FIRST.** Two defects:
+
+**(1) THIS FILE NAMED NO COMMIT, AND THE RUN WAS ON PRE-D69 CODE.** It ran in the worktree
+`ferrodb-D69-keytypes`, which sits at `26627a7` — BEFORE `f949add` ("D69 steps 2+3"). So it
+measured the merge WITH its full-table scans still in place, not the fixed one. The file beside it,
+`d69_mergephase_profile.txt`, recorded "source at 26627a7" and this one recorded nothing, which is
+the whole defect: 120 of 151 files in this directory name no commit, so provenance is a thing each
+author remembers or does not.
+
+**(2) ITS CONCLUSION WAS WRONG ANYWAY, AND FOR A REASON THE INSTRUMENT COULD NOT SEE.** It read
+"constant WAL bytes + growing time" as "the fsync itself scales with database volume". A
+file-size delta cannot separate ONE slow fsync from SEVERAL fast ones, and a profile aggregate
+cannot either — both produce the identical reading. A COUNTER can, and the counted answer is that
+a merge does exactly **1.00 fsync of 1053 bytes at every table size**, while the four UPDATEs
+sharing its timer are the part that grows 10.4x. The timer wrapped six commits and the file called
+the result "merge latency".
+
+⇒ The 1053-bytes-per-merge figure below SURVIVES and is confirmed by the counter. Everything this
+file concluded FROM it does not.
+
+[original 2026-09-20 text follows, unchanged:]
+
 D69-REOPEN — WHY A MERGE IS LINEAR IN TABLE SIZE. The measurement that answers it.
 
 [HERE] `D68_SIZES=1000,4000,16000 D68_MERGES=40`, one thread, fixed delta of 4 rows, harness
