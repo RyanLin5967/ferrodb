@@ -1,0 +1,38 @@
+D69-REOPEN — WHERE A MERGE ACTUALLY SPENDS ITS TIME. The profile that overturned D68's mechanism.
+
+[HERE] `sample` over 30 s of `D68_SIZES=16000 D68_MERGES=3000`, sampling started 75 s after launch
+so the BUILD phase is excluded. Raw profile beside this file as d69_mergephase_profile.sample.txt.
+
+  executor::run                          99.9%
+  wal::txn::TxnManager::commit           99.4%
+  wal::log::WalManager::flush            98.2%   <-- the merge's cost
+  wal::log::pwrite_all                   14.7%
+  TxnManager::checkpoint_locked           2.0%
+  execution::insert::Insert::execute      0.3%   <-- proof the build is excluded
+  ...no scan frame appears at all.
+
+⛔ **THIS CONTRADICTS D68'S STATED MECHANISM.** D68 attributed the 1.87 us/row slope to two full
+table scans (`evaluate_merge` and `fingerprint_tables`). Those scans were REAL — they are in the
+source at 26627a7 and D69 removed them — but they are NOT where the time goes. A merge is
+FSYNC-BOUND, not scan-bound, and removing the scans left the curve unchanged
+(`d69_verify_curve.txt`: 32.023 ms after against 32.003 ms before at 16,000 rows).
+
+So the slope against table size is real and reproducible, and its CAUSE is still unknown. D68
+identified two genuine scans and wrongly concluded they were the cost; that is a lesson about
+reading a profile aggregate rather than a call tree, and about a mechanism that is plausible,
+verified present in the source, and still not the answer.
+
+⚠ MY FIRST ATTEMPT AT THIS PROFILE WAS INVALID and is recorded so it is not repeated: with
+`D68_MERGES=400` at 16,000 rows, 97.8% of samples were also in `WalManager::flush` — but that was
+the BUILD phase (16,000 INSERTs, each with a WAL commit), not the merges. `Insert::execute` at
+0.3% in this run is what establishes the build is excluded; the earlier run had no such check.
+
+WHAT IS STILL OPEN, stated as two candidates rather than one guess:
+  (a) the fsync itself scales with the database/dirty-page volume, so a bigger table costs more per
+      commit even for identical work; or
+  (b) a merge writes more WAL on a bigger table.
+The measurement for (b) is bytes appended per merge — under way, with the caveat that the log is
+TRUNCATED at checkpoints so a file-size delta undercounts and can even go negative (the 1,000-row
+point reported the log SHRINKING, 42,273 -> 17,027).
+The orthogonal measurement is delta at FIXED table size: if cost is flat in delta, it is a
+per-merge constant that depends on the TABLE, not on the work — which points at (a).
