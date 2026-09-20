@@ -1,0 +1,17 @@
+D42 orphan fire-check — a burner must not be able to outlive its parent
+  when   : 2026-09-18T16:43:42Z
+  head   : f830ae4
+  shape  : 8 burners, self-terminating after 20s, tagged d42-orphan-firecheck-94294
+
+  spawned: 22 process(es) matching the tag
+bench/d42_fire_orphans.sh: line 100: 94359 Killed: 9               "/tmp/$TAG-parent.sh" > /dev/null 2>&1
+
+  A. anti-vacuity — orphans at ppid=1 right after the kills: 8
+     ok: the incident state was really reproduced, so direction B means something
+
+  waiting 20s + 8s for the burners' own deadline to pass...
+
+  B. the fix — burners still alive after their own deadline: 0
+     ok: every orphan terminated itself with no parent, no timeout and no trap
+
+ORPHAN FIRE-CHECK PASSED

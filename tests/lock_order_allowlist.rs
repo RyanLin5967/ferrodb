@@ -255,3 +255,193 @@ fn the_scanner_catches_a_pool_method_missing_its_marker() {
     let parsed = methods_of(marked);
     assert!(takes_a_pool_lock(&parsed[0].1) && parsed[0].1.contains("enter_pool()"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// D58 — every frame WRITE goes through `frame_write`, and this is what keeps that true
+// ---------------------------------------------------------------------------------------------
+
+/// The one file that may take a frame's write lock directly: it defines `frame_write`, whose
+/// guard refreshes the frame's seqlock shadow on drop.
+const FRAME_WRITE_OWNER: &str = "src/buffer/buffer_pool.rs";
+
+/// Spellings of a raw frame write lock. A raw lock skips the shadow refresh, and an optimistic
+/// reader (`read_page_optimistic`) would then read a page that was rewritten as if it were not —
+/// silently, for ever, with a stable even version. That is a wrong row with no error anywhere,
+/// so it is refused at the source rather than found in production.
+fn raw_frame_write_sites(code: &str) -> Vec<String> {
+    code.lines()
+        .filter(|l| {
+            let l = l.trim();
+            (l.contains("frames[") && (l.contains("].write()") || l.contains("].try_write()") || l.contains("].get_mut()")))
+                || l.contains("frames.get_mut(")
+                || l.contains("frames.iter_mut(")
+        })
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+#[test]
+fn only_the_pool_may_write_lock_a_frame_directly() {
+    let src = Path::new("src");
+    let mut files = Vec::new();
+    rust_files(src, &mut files);
+    assert!(!files.is_empty());
+
+    let mut offenders: Vec<(String, Vec<String>)> = Vec::new();
+    let mut owner_sites = 0usize;
+    for path in &files {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let code = strip_line_comments(&std::fs::read_to_string(path).expect("read source"));
+        let sites = raw_frame_write_sites(&code);
+        if sites.is_empty() {
+            continue;
+        }
+        if rel == FRAME_WRITE_OWNER {
+            owner_sites += sites.len();
+        } else {
+            offenders.push((rel, sites));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "raw frame write locks outside {FRAME_WRITE_OWNER}: {offenders:#?}\n\
+         Use `BufferPoolManager::frame_write(i)`: its guard refreshes the frame's shadow on drop, \
+         which is the only way an optimistic reader ever sees the write (D58, \
+         `FrameShadow` in buffer_pool.rs)."
+    );
+    // The detector must be able to fire: the owner takes the raw lock exactly where the guard is
+    // built. Zero matches everywhere would mean the spelling changed and this test went blind.
+    assert!(
+        owner_sites >= 1,
+        "no raw frame write lock found even in {FRAME_WRITE_OWNER}; the pattern this guard \
+         searches for no longer matches the code, so it is passing by finding nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The convention the stale-example guards now rely on
+// ---------------------------------------------------------------------------------------------
+
+/// **Every `src/**/tests_*.rs` is `#[cfg(test)]`-gated, so it does not link into a binary.**
+///
+/// Thirteen integration tests refuse to run against an example binary older than `src/`, because
+/// `cargo test` does not rebuild examples and a stale binary silently tests the code from before
+/// the change. Those guards now SKIP `tests_*.rs`, because editing one cannot make an example
+/// stale — `cargo build --examples` correctly does not rebuild for it, and counting it failed 53
+/// tests across 5 targets on a tree whose examples were fresh.
+///
+/// That skip is only sound while the convention holds. If a `tests_*.rs` were ever compiled into
+/// the library proper, the guards would stop noticing a real staleness — the silent direction.
+/// So the convention is checked here rather than trusted: every such file must be declared under
+/// a `#[cfg(test)]`, in either spelling the tree uses (`mod tests_x;` or `#[path = "tests_x.rs"]`).
+#[test]
+fn test_only_sources_are_cfg_test_gated() {
+    let src = Path::new("src");
+    let mut files = Vec::new();
+    rust_files(src, &mut files);
+    let test_only: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")))
+        .cloned()
+        .collect();
+    assert!(
+        test_only.len() >= 8,
+        "found only {} `tests_*.rs` files under src/; the guards' skip pattern may no longer match \
+         anything, which would make this check pass by finding nothing",
+        test_only.len()
+    );
+
+    let mut ungated = Vec::new();
+    for path in &test_only {
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let dir = path.parent().unwrap();
+        let mut gated = false;
+        for sibling in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let sp = sibling.path();
+            if sp == *path || sp.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let code = std::fs::read_to_string(&sp).unwrap_or_default();
+            let decl_plain = format!("mod {stem};");
+            let decl_path = format!("path = \"{stem}.rs\"");
+            for (i, line) in code.lines().enumerate() {
+                if line.contains(&decl_plain) || line.contains(&decl_path) {
+                    // The gate sits on one of the two lines above the declaration.
+                    let start = i.saturating_sub(2);
+                    if code.lines().skip(start).take(i - start + 1).any(|l| l.contains("cfg(test)")) {
+                        gated = true;
+                    }
+                }
+            }
+        }
+        if !gated {
+            ungated.push(path.to_string_lossy().to_string());
+        }
+    }
+    assert!(
+        ungated.is_empty(),
+        "these `tests_*.rs` files are compiled into the library, not just its tests: {ungated:?}\n\
+         The stale-example guards in tests/ skip files named `tests_*`, so a change to one of \
+         these would leave every example binary stale WITHOUT any guard noticing. Either gate it \
+         with #[cfg(test)] or rename it so the guards count it."
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// D59 — the active-transaction table has one door
+// ---------------------------------------------------------------------------------------------
+
+/// **Every borrow of the active-transaction table goes through `att_read`/`att_write`.**
+///
+/// The snapshot cache (`TxnManager::read_snapshot_cached`) is sound only while `att_version`
+/// moves on every change to the set of active ids, and `AttGuard` is what makes that automatic.
+/// A raw `att.lock()` bypasses it: the table changes, the version does not, and every reader on
+/// that thread keeps a snapshot from before the change — a committed transaction stays invisible,
+/// or an active one reads as committed. A fresh-context review found `wal/recovery.rs` doing
+/// exactly that while the field was still `pub`.
+///
+/// The field is private now, so the compiler enforces this outside `src/wal/txn.rs`. Inside that
+/// file it cannot, which is where this test earns its place: only the two accessors may name the
+/// lock in production code.
+#[test]
+fn only_the_att_accessors_may_lock_the_active_transaction_table() {
+    let path = Path::new("src/wal/txn.rs");
+    let code = std::fs::read_to_string(path).expect("read src/wal/txn.rs");
+    // The test module at the bottom may use the raw lock: it is not a write path and it is not
+    // compiled into the library.
+    let prod = match code.find("\n#[cfg(test)]\nmod tests {") {
+        Some(i) => &code[..i],
+        None => &code[..],
+    };
+    let offenders: Vec<(usize, String)> = strip_line_comments(prod)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("att.lock("))
+        .map(|(i, l)| (i + 1, l.trim().to_string()))
+        .collect();
+    assert!(
+        offenders.len() <= 2,
+        "raw `att.lock()` outside the two accessors in src/wal/txn.rs: {offenders:#?}\n\
+         Use `att_read()` for a read and `att_write()` for a change — the write guard bumps \
+         `att_version` inside the critical section, which is what makes the snapshot cache safe."
+    );
+    // ...and the two that remain must BE the accessors, or the count above is satisfied by the
+    // wrong lines and this test has stopped watching anything.
+    assert_eq!(
+        offenders.len(),
+        2,
+        "expected exactly the two accessor bodies to lock `att` directly, found {}: {offenders:#?}",
+        offenders.len()
+    );
+    let fn_read = prod.find("pub fn att_read").expect("att_read is gone; update this test");
+    let fn_write = prod.find("pub fn att_write").expect("att_write is gone; update this test");
+    let line_of = |byte: usize| prod[..byte].matches('\n').count() + 1;
+    let (r, w) = (line_of(fn_read), line_of(fn_write));
+    for (line, text) in &offenders {
+        assert!(
+            (*line >= r && *line <= r + 4) || (*line >= w && *line <= w + 6),
+            "a raw `att.lock()` at line {line} ({text}) is not inside att_read (line {r}) or \
+             att_write (line {w})"
+        );
+    }
+}

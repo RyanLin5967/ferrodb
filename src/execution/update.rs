@@ -155,6 +155,13 @@ impl Modify for Update {
         }
         sync_roots(&self.table, &self.schema, &self.primary_index, &self.secondary_indexes, catalog)?;
         sync_fulltext_roots(&self.table, &self.fulltext_indexes, catalog)?;
+        // D69 — record that this table changed, on the SAME path as the write that
+        // changed it. The merge staleness check reads this counter instead of
+        // rescanning and rehashing every row (see Catalog::bump_table_version). It must
+        // be bumped here and not only on the agent-merge path: the hash it replaces was
+        // computed by scanning the real table, so it saw ordinary DML too.
+        catalog.bump_table_version(&self.table);
+
         Ok(count)
     }
 }

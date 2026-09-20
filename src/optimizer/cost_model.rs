@@ -241,12 +241,41 @@ fn apply_equalities(cols: &mut [ColumnStats], expr: &BoundExpr) {
 }
 
 fn base_stats(table: &String, catalog: &Catalog) -> RelStats {
-    match catalog.table_stats(table) {
+    let mut stats = match catalog.table_stats(table) {
         Some(s) => RelStats { rows: s.row_count as f64, columns: s.columns.clone() },
         None => {
             let n = catalog.get_table(table).map(|e| e.schema.columns.len()).unwrap_or(0);
             RelStats {rows: DEFAULT_TABLE_ROWS as f64, columns: vec![ColumnStats {distinct: DEFAULT_DISTINCT, nulls: 0, min: None, max: None}; n]}
         }
+    };
+    apply_unique_key_fact(&mut stats);
+    stats
+}
+
+/// **D56 — column 0 is the primary key and is UNIQUE, so its distinct count IS the row count.**
+///
+/// This is a schema fact, not a statistic, and it is the one thing the estimate above is not
+/// allowed to override. `execution::insert` refuses a second row with an existing `vals[0]`, so
+/// `id = k` matches at most one row whether or not anybody has run `ANALYZE`.
+///
+/// Without it the stats-less path invented BOTH numbers — 1,000 rows and 100 distinct values —
+/// and the arithmetic preferred a sequential scan: index `2*4 + 1 + 10*4 = 49` against
+/// seq+filter `8 + 1000*0.01 + 10 = 28`. Measured in `bench/d55_explain_before_after_analyze.txt`:
+/// a point lookup on a 5,000-row table read all 5,000 rows until an operator ran `ANALYZE`. With
+/// the fact the index side is `2*4 + 1 + 1*4 = 13` and wins at every table width, because
+/// seq+filter cannot go below `1 + 10 + 10 = 21` even for a one-page table.
+///
+/// Postgres does the same thing through `get_variable_numdistinct` (a unique index ⇒ ndistinct =
+/// row count) and SQLite and MySQL resolve a unique-key equality without statistics too; this is
+/// standard practice, not an invention.
+///
+/// It applies to column 0 only, and through `distinct` only — so a RANGE on the primary key still
+/// costs through `bound_selectivity`'s range arm, and a non-unique secondary column keeps whatever
+/// `ANALYZE` measured. `tests/d56_statsless_point_lookup.rs` pins both halves of that scope.
+fn apply_unique_key_fact(stats: &mut RelStats) {
+    let rows = stats.rows.ceil().max(1.0) as usize;
+    if let Some(pk) = stats.columns.get_mut(0) {
+        pk.distinct = rows;
     }
 }
 
@@ -388,10 +417,33 @@ use crate::{binder::binder::Binder, buffer::buffer_pool::BufferPoolManager, exec
     #[test]
     fn test_cost_secondary_over_primary() {
         let (mut catalog, bp, txn) = setup();
-        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone(), txn);
-        let primary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 0, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
-        let secondary = cost(&PhysicalPlan::IndexScan { table: "t".into(), column: 1, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, &catalog);
+        exec("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER);", &mut catalog, bp.clone(), txn.clone());
+        let point = |col: usize, catalog: &Catalog| cost(&PhysicalPlan::IndexScan { table: "t".into(), column: col, lower: Bound::Included(Value::Integer(5)), upper: Bound::Included(Value::Integer(5)) }, catalog);
+
+        // Without statistics. This used to assert `primary.stats.rows == secondary.stats.rows`,
+        // which pinned the defect D56 removes: the primary key's equality is a FACT (one row,
+        // because column 0 is unique by construction) and the secondary column's is an ESTIMATE
+        // (`DEFAULT_TABLE_ROWS / DEFAULT_DISTINCT`), so they are not equal and must not be.
+        let primary = point(0, &catalog);
+        let secondary = point(1, &catalog);
+        assert_eq!(primary.stats.rows, 1.0, "a unique-key equality is one row, statistics or not");
+        assert!(secondary.stats.rows > primary.stats.rows, "a non-unique column is still an estimate");
+        assert!(secondary.cost > primary.cost);
+
+        // The per-row comparison the old assertion was reaching for, with the confound removed
+        // properly: make `b` unique in the DATA so ANALYZE gives both columns the same distinct
+        // count and both lookups estimate one row. The secondary must STILL cost more, because
+        // each of its matches is a primary lookup on top of the descent.
+        let mut sql = String::new();
+        for i in 0..500 {
+            sql.push_str(&format!("INSERT INTO t VALUES ({i}, {i});"));
+        }
+        exec(&sql, &mut catalog, bp.clone(), txn.clone());
+        exec("ANALYZE t;", &mut catalog, bp, txn);
+        let primary = point(0, &catalog);
+        let secondary = point(1, &catalog);
         assert_eq!(primary.stats.rows, secondary.stats.rows);
+        assert_eq!(primary.stats.rows, 1.0);
         assert!(secondary.cost > primary.cost);
     }
 

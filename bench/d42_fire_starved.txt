@@ -1,0 +1,2545 @@
+queued behind a running suite (66848 D44-harness 2026-09-18T16:25:35Z)
+D42 falsifier 1 — the classifier must fire when the run is starved
+  when            : 2026-09-18T16:38:45Z
+  head            : 422135d, 4 dirty file(s)
+  cpus            : 18
+  shape           : nice -n 20, 28x oversubscription = 504 pure-CPU spinners
+  loadavg before  : 52.10 59.88 81.64
+  loadavg loaded  : 236.00 102.00 96.17
+
+---------------- nice -n 20 cargo test --test integration_consensus_failover ----------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running tests/integration_consensus_failover.rs (target/debug/deps/integration_consensus_failover-0d7574daea388bc4)
+
+running 1 test
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.02s
+---------------- exit 0 ----------------
+  loadavg after   : 304.28 121.00 102.97
+
+⛔ FALSIFIER 1 DID NOT REACH ITS PRECONDITION — no wait expired, so there was no verdict
+   to classify. Raise FACTOR or NICE; this run proves nothing in either direction.
+
+FALSIFIER 1 FAILED — 1 check(s) did not hold.
+bench/d42_fire_starved.sh: line 50: 94485 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94486 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94487 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94488 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94489 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94492 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94493 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94495 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94496 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94499 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94500 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94502 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94503 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94504 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94505 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94508 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94509 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94511 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94513 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94514 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94517 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94519 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94523 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94526 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94527 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94528 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94529 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94530 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94532 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94533 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94534 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94536 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94541 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94542 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94543 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94546 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94548 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94549 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94551 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94552 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94553 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94554 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94555 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94558 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94560 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94561 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94563 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94565 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94567 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94568 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94570 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94571 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94574 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94575 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94577 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94578 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94582 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94583 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94584 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94585 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94587 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94589 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94591 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94593 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94595 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94596 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94598 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94601 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94603 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94606 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94607 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94609 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94613 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94614 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94617 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94618 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94619 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94621 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94624 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94626 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94630 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94631 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94632 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94634 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94637 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94640 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94642 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94645 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94647 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94649 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94653 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94656 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94658 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94661 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94663 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94665 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94666 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94670 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94672 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94673 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94677 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94680 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94684 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94686 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94689 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94693 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94699 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94700 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94702 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94705 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94709 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94711 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94714 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94717 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94720 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94724 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94726 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94727 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94730 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94731 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94733 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94735 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94736 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94741 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94743 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94746 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94749 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94751 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94754 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94756 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94759 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94763 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94765 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94769 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94771 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94775 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94776 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94778 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94780 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94781 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94785 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94788 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94789 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94791 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94792 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94796 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94797 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94800 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94802 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94805 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94806 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94809 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94813 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94816 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94820 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94822 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94827 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94828 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94830 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94832 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94833 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94834 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94843 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94849 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94852 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94855 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94859 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94863 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94865 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94870 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94872 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94875 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94878 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94881 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94883 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94884 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94887 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94889 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94891 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94892 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94893 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94894 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94896 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94900 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94903 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94906 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94909 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94910 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94912 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94913 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94916 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94918 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94921 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94928 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94933 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94939 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94942 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94946 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94947 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94950 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94955 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94956 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94959 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94961 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94964 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94965 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94969 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94972 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94975 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94980 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94982 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94983 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94984 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94987 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94989 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94991 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94992 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94994 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94995 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94998 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 94999 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95003 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95009 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95010 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95014 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95015 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95017 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95020 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95027 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95028 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95029 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95031 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95032 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95037 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95038 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95040 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95051 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95055 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95060 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95064 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95066 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95069 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95071 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95075 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95080 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95082 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95084 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95086 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95090 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95092 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95093 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95096 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95097 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95098 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95100 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95101 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95104 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95105 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95107 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95110 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95112 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95116 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95119 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95123 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95129 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95132 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95133 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95134 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95135 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95137 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95138 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95139 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95140 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95142 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95143 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95145 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95155 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95156 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95164 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95170 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95178 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95181 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95185 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95187 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95189 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95192 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95195 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95199 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95200 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95203 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95204 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95205 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95206 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95207 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95211 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95212 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95213 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95214 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95216 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95221 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95224 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95228 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95234 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95237 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95240 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95244 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95246 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95250 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95251 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95252 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95253 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95255 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95257 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95258 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95259 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95261 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95263 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95264 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95265 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95267 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95269 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95272 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95273 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95274 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95275 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95276 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95278 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95279 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95282 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95283 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95284 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95286 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95287 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95289 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95290 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95293 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95294 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95297 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95299 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95301 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95306 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95307 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95311 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95314 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95320 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95326 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95327 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95330 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95340 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95346 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95349 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95352 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95354 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95357 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95358 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95362 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95364 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95368 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95369 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95373 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95377 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95379 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95381 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95382 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95384 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95387 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95388 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95391 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95393 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95395 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95398 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95400 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95403 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95407 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95409 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95417 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95420 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95421 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95424 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95428 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95430 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95436 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95438 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95440 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95441 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95442 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95445 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95446 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95447 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95449 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95450 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95453 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95454 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95455 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95456 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95460 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95462 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95463 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95465 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95468 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95474 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95476 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95477 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95480 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95483 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95484 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95488 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95490 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95491 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95493 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95494 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95496 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95499 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95503 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95506 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95509 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95513 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95516 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95520 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95525 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95526 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95530 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95532 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95537 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95540 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95541 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95544 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95545 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95546 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95548 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95554 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95557 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95558 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95562 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95564 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95566 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95570 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95571 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95572 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95578 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95582 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95584 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95586 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95588 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95589 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95590 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95592 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95594 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95597 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95599 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95600 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95603 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95604 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95608 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95611 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95612 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95615 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95617 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95619 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95622 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95623 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95628 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95632 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95634 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95635 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95637 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95640 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95642 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95644 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95648 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95653 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95655 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95657 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95662 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95663 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95664 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95665 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95668 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95669 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95670 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95671 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95672 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95673 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95675 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95678 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95679 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95680 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95681 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95682 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95683 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95685 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95686 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95687 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95688 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95049 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95073 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95291 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95316 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95385 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95432 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95443 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95660 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95676 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+bench/d42_fire_starved.sh: line 50: 95677 Killed: 9               timeout "$SPIN_BOUND" sh -c ': '"$BURN_TAG"'
+        end=$(( $(date +%s) + '"$SPIN_BOUND"' ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            i=0; while [ "$i" -lt 200000 ]; do i=$((i+1)); done
+        done' > /dev/null 2>&1
+EXIT=1

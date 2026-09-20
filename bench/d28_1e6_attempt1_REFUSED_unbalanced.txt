@@ -1,0 +1,72 @@
+# D28 at N=1000000: system-view generator hint ON (arm A) vs OFF (arm B), matched binary base
+# generated 2026-09-18T11:58:51-04:00
+# tip: 0cfec24   bench(D28): the 10^5 calibration — it reproduces W1 and it SPLITS W2 i
+# host: 18 cores; loadavg at start: 26.84 26.08 96.81
+# suite lock at start: none held
+# free at start: 82780308 KiB on /tmp/d28_1e6
+# load ceiling: 36 on 18 cores
+#
+# arm A = hinted   (Pushdown::On,  as it ships)   956ada8ccefed1c5af8ebad2de89d05905eaf5e4f8e8f219fa8a9d8e9029fcf3
+# arm B = unhinted (Pushdown::Off, SCAFFOLD)      6efbf5550e2775c01646d546f580fa66278338155d0a5bf487200075a003c039
+# harness: examples/runtime_curve.rs phase 'query', identical source in both arms;
+#          the arms differ by exactly one line in src/catalog/system_views.rs.
+#
+# ARM ORDER ROTATES A B / B A. Interleaving alone cancels only a bias constant in time,
+# and this box drifts (D35: 3.72 -> 13.14 within one run). The summariser prints br_all
+# by POSITION as the check the rotation worked; br_all is unchanged in both arms.
+
+===== rep 1 | arm A | N=1000000 =====
+# position in rep: 1 of 2
+# loadavg at launch: 26.84 26.08 96.81
+# free at launch: 83487000 KiB
+# started: 2026-09-18T11:58:51-04:00
+# loadavg at finish: 37.50 30.63 79.19
+# free at finish: 80466592 KiB
+# wall: 277 s
+HARNESS_EXIT=0
+DATA rep=1 pos=1 arm=A n=1000000 br_1row=0.07 br_all=22122.65 runs=0.04 live_cnt=66.191 rss=1096.2 load=37.50
+
+===== rep 1 | arm B | N=1000000 =====
+# position in rep: 2 of 2
+# loadavg at launch: 37.50 30.63 79.19
+# free at launch: 80408696 KiB
+# started: 2026-09-18T12:03:28-04:00
+# loadavg at finish: 47.90 33.93 61.01
+# free at finish: 70806336 KiB
+# wall: 430 s
+HARNESS_EXIT=0
+DATA rep=1 pos=2 arm=B n=1000000 br_1row=30806.13 br_all=21224.04 runs=0.34 live_cnt=1414.512 rss=877.1 load=47.90
+
+
+==== SUMMARISER VERDICT ====
+data rows=2  void/failed blocks=0
+N as the HARNESS reports it: 1,000,000 (branches actually forked, not the argument)
+
+column          unhinted (B)        hinted (A)           B/A
+br_1row        30,806.130 ms          0.070 ms    440,087.6x
+br_all         21,224.040 ms     22,122.650 ms          1.0x   <- control, flat BY DESIGN
+runs                0.340 ms          0.040 ms          8.5x
+live_cnt        1,414.512 ms         66.191 ms         21.4x   <- S20 column
+
+  raw, sorted:
+    br_1row   A [0.07]
+    br_1row   B [30806.13]
+    br_all    A [22122.65]
+    br_all    B [21224.04]
+    runs      A [0.04]
+    runs      B [0.34]
+    live_cnt  A [66.191]
+    live_cnt  B [1414.512]
+
+  CONTROL SPREAD: br_all across BOTH arms 21,224.0 - 22,122.7 ms (1.04x on an identical code path).
+  Any column moving less than that is load, not the hint.
+
+  loadavg at launch: min 26.84 max 37.50 first 26.84 last 37.50
+  loadavg at finish: min 37.50 max 47.90 first 37.50 last 47.90
+  block wall time: min 277s max 430s total 707s
+  br_all by POSITION (pooled over arms; the rotation should flatten this):
+    pos 1: median     22,122.7 ms  (arms: A)
+    pos 2: median     21,224.0 ms  (arms: B)
+    -> UNBALANCED: positions do not each hold every arm, so a monotonic load drift is
+       NOT cancelled and the per-arm medians carry a position bias. Re-run whole reps.
+SUMMARY_EXIT=3

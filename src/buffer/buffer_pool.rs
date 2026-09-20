@@ -111,121 +111,167 @@
 //! a constant-factor win lands harder at 1 thread than at 16. That is the signature of a curve
 //! contention-bound by something else. **BP-Wrapper here is a constant, not a shape.**
 //!
-//! ⛔ **THE SENTENCE ABOVE IS RETRACTED — 2026-09-18, see the 2x2 below.** The measurement it
-//! rests on is sound; the inference is not. That STUB arm deleted `touch` **with the page table
-//! still on the hit path**, so it could not have shown a policy win even if one existed. It is
-//! left standing rather than deleted because the next reader will otherwise re-derive it from the
-//! same real numbers.
+//! What actually holds the slope was in this file the whole time. The resident hit loop is
+//! `fetch_page` + `unpin_page`, and between them each iteration takes `page_table.read()` twice,
+//! `frames[i].read()` twice, and two atomic RMWs on the pin counter -- **four RwLock read
+//! acquisitions before `touch` is even reached.** A Rust `RwLock`'s reader count is one
+//! process-wide cache line that every reader atomically RMWs; it contends exactly like a mutex,
+//! it is simply not spelled `Mutex`. The `arc_cache` mutex was one synchronisation point out of
+//! five, which is why removing it bought 33% and nothing else.
 //!
-//! The resident hit loop is `fetch_page` + `unpin_page`, and between them each iteration takes
-//! `page_table.read()` twice, `frames[i].read()` twice, and two atomic RMWs on the pin counter --
-//! four RwLock read acquisitions before `touch` is even reached. A Rust `RwLock`'s reader count is
-//! one cache line that every reader atomically RMWs; it contends exactly like a mutex, it is simply
-//! not spelled `Mutex`.
+//! ⚠ **CORRECTED 2026-09-18: on the RESIDENT arm only TWO of those four are SHARED, and the
+//! "floor" has never been measured under contention.**
+//! `examples/bufpool_fault_concurrency.rs` gives each thread a **disjoint** slice of the page
+//! space — `slot = (t + k * threads) % ids.len()`, then `ids[(slot * 4099) % len]`, and 4099 is
+//! coprime with both page counts so the second step is a bijection. On the RESIDENT arm 512 pages
+//! sit in a 1024-frame pool and nothing is ever evicted, so disjoint pages mean disjoint FRAMES
+//! for the whole run: `frames[i].read()` and both pin-counter RMWs are on **thread-private cache
+//! lines**. What is genuinely shared there is the two `page_table.read()` acquisitions and the
+//! `arc_cache` mutex — and C1 removes the former, D44 the latter. So "four RwLock acquisitions" is
+//! a correct count of the CODE and a wrong count of the CONTENTION.
 //!
-//! ⚠ **CORRECTED 2026-09-18: only TWO of those four are SHARED, and the "floor" has never been
-//! measured under contention.** `examples/bufpool_fault_concurrency.rs` gives each thread a
-//! **disjoint** slice of the page space -- `slot = (t + k * threads) % ids.len()` with every thread
-//! count dividing the page count, and the harness says so in its own doc comment at `:205`. Disjoint
-//! pages mean disjoint FRAMES, so `frames[i].read()` and both pin-counter RMWs sit on THREAD-PRIVATE
-//! cache lines in every number this project owns. What is genuinely shared is the two
-//! `page_table.read()` acquisitions and the `arc_cache` mutex -- and the C1 mirror already removes
-//! the former. So "four RwLock acquisitions" is a correct count of the CODE and a wrong count of the
-//! CONTENTION.
+//! Two limits on that, because the first draft of this correction did not carry them:
 //!
-//! ⛔ **AND THE HARNESS CONTAINS THE CONSTRUCT UNDER TEST, INSIDE THE TIMED WINDOW.**
-//! `bufpool_fault_concurrency.rs:220` creates ONE `Arc<AtomicUsize>` and `:314` does
-//! `done.fetch_add(1, Ordering::Relaxed)` on it per operation, inside the measured section --
-//! ~9.6M contended RMWs on a single cache line per 16-thread point. `refused` and `wrong` are the
-//! same shape. That cannot explain the 2x2's ORDERING, because every arm carries it; what it plausibly
-//! IS is the ceiling every arm runs into. A standalone model measured the same code shape with
-//! per-thread padded counters at 203.5 M/s at 16T with a POSITIVE slope, and with one shared counter
-//! at 45.7 M/s -- within 2% of C1STUB's measured 44.7-45.4 M/s. **Unconfirmed** (synthetic, 2 reps,
-//! loaded machine), and being settled by re-running BASE and C1STUB with padded counters.
-//! ⇒ Until that lands, treat **×0.579 as the INSTRUMENT's ceiling, not the design's**, and treat
-//! D44's pre-registered bar as provisional.
+//! * **It is the RESIDENT arm's property, not the harness's.** The OVERSUBSCRIBED arm runs 8192
+//!   pages through 1024 frames and evicts continuously, so frames are handed between threads and
+//!   `frames[i].read()` there *is* shared. The hit-path numbers this lane quotes are all RESIDENT,
+//!   so the correction applies to them — but "in every number this project owns" would be wrong.
+//! * **Disjointness holds only while `threads` divides the page count.** Thread `t` reaches the
+//!   slots congruent to `t` modulo `gcd(threads, len)`, so 1/2/4/8/16 over 512 or 8192 are
+//!   disjoint and **3, 5, 6 or 12 are not** — two threads would silently share pages while the
+//!   harness's own doc comment still claimed they did not. Thread counts are a command-line
+//!   argument, so that was reachable; `sweep_point` now refuses rather than measuring the other
+//!   thing.
 //!
-//! ⭐ This is D44's own lesson turned on the instrument: an arm that removes one of two serialised
-//! walls measures the other. A shared counter inside the timed window is a third wall present in
-//! EVERY arm including the control, which is exactly why it cancels in comparisons and survives as
-//! a ceiling nobody attributes to the harness.
+//! The remaining floor beneath the pair is unmeasured either way.
 //!
-//! ⚠ One more serialising point sits ABOVE the pool and is named nowhere in D35 or D44:
-//! `PageLatches` is a `Mutex<HashMap<u32, Latch>>` (`page_latch.rs:194`) with `wake.notify_all()` on
-//! every release, taken twice per tree level per lookup. On the branch path that is plausibly larger
-//! than anything in this file, and removing the pool's RMWs underneath it would reproduce the same
-//! mistake at a larger scale.
+//! # D35 C1, which is what this file now does
 //!
-//! # ⛔ TWO SERIALISED WALLS, AND EVERY EARLIER SINGLE-ARM READING OF THEM WAS WRONG
+//! **The page table is off the hit path.** `page_id -> frame` resolves through a lock-free,
+//! direct-mapped, tagged mirror in both `fetch_page` and `unpin_page` — see
+//! [`crate::buffer::page_table`] — and the map is consulted only when the mirror misses. The frame
+//! latch and the pin are KEPT, so this is correct and not a ceiling: the mirror produces the same
+//! *candidate* the map produced, and every caller still re-checks `frame.page_id` under the
+//! frame's own latch before using it. `touch` is KEPT as well; the stub that deleted it was a
+//! measurement scaffold and deleting it degrades ARC's recency for a constant-factor win.
 //!
-//! A paragraph here once named **taking the page table off the hit path** as "the candidate that
-//! measures as a shape change", on the strength of a gate arm reporting x0.936. **Both that claim
-//! and the BP-Wrapper claim above are retracted, and they fall to the same confound.**
-//! `bench/d35_c1_factorial.txt` (branch `ferrodb-D35-C1-pagetable`, `c0d07d2`) settles it by
-//! running all four cells instead of arguing -- same harness, same parameters, interleaved,
-//! 3 reps, per-rep slopes agreeing to within 0.01. Throughput at 16 threads relative to 1:
+//! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
+//! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror indexed
+//! directly by page id, which is O(max page id) and therefore a 32 GiB allocation in the limit.
+//! Only `bench/d35_gate_stubtouch.txt` from that branch is citable. This implementation is built
+//! on the current tip, retains `touch`, and tags its mirror slots so the table is a fixed size.
+//!
+//! # ⛔ AND IT IS NOT THE SHAPE CHANGE ON ITS OWN. MEASURED, AND IT CONTRADICTS THE ENTRY ABOVE.
+//!
+//! The paragraph this replaced predicted the slope would change sign. **It does not.** A C1 that
+//! RETAINS `touch` — the only C1 that can ship — leaves the curve collapsing exactly as before.
+//! `bench/d35_c1_pagetable.txt`, RESIDENT arm, medians over 4 reps: BASE **x0.110** at 16 threads
+//! relative to 1, C1 **x0.123**. The design entry's own falsifier was "the 16T/1T ratio does not
+//! clear x0.5 on a merge-ready implementation", and x0.123 does not clear it. What C1 buys is a
+//! **constant of roughly 1.2-1.5x**, which is the same order as the constant the entry rejected
+//! BP-Wrapper for being.
+//!
+//! **Why the gate saw x0.936 and this sees x0.123**, measured rather than argued —
+//! `bench/d35_c1_factorial.txt` runs all four cells of {mirror} x {`touch`}, same harness, same
+//! parameters, 4 reps, and the per-rep slopes agree to within 0.01:
 //!
 //! | | `touch` KEPT | `touch` DELETED |
 //! |---|---|---|
 //! | **no mirror** | BASE x0.111 | STUB x0.080 |
-//! | **mirror** | C1 x0.121 | **C1STUB x0.579**, rising monotonically 2T->16T |
+//! | **mirror** | C1 x0.121 | C1STUB **x0.579**, rising monotonically 2T->16T |
 //!
-//! ⭐ **Those are the ROTATED numbers, and the rotation is load-bearing — WAITING FOR A QUIET
-//! MACHINE WOULD NOT HAVE BEEN ENOUGH.** The first run of this factorial interleaved arms but kept
-//! their ORDER fixed, and loadavg drifted monotonically upward across it, so `C1STUB` sat at the
-//! highest load in every rep: a systematic POSITION bias, not noise. **Interleaving cancels only a
-//! bias that is constant in TIME; on this machine drift is the normal case.** The re-run rotates
-//! the four arms through a Latin square so each occupies each position exactly once, and the
-//! summariser now prints 1T throughput BY POSITION as the check — 38.4M / 38.8M / 38.6M / 38.6M,
-//! flat to within 1%. Load still rose 3.72 -> 13.14 DURING the re-run, with the suite lock free and
-//! no `cargo` on the process table, which is the proof that quiet was never the fix.
-//! Superseded raw data is kept, not deleted: `bench/d35_c1_factorial_SUPERSEDED_rising_load.txt`
-//! (biased against C1STUB) and `bench/d35_c1_pagetable_SUPERSEDED_fixed_order.txt` (against C1).
-//! Every cell moved by at most 0.015 and the ordering is identical — which is a RESULT of the
-//! re-run, not a reason it could have been skipped.
+//! ⚠ **Both files ROTATE the arm order, and that is load-bearing rather than tidy.** The first
+//! versions of both ran a FIXED arm order while this shared machine's load drifted monotonically
+//! upward, which leaves a systematic POSITION bias: the arm that always ran last always ran at
+//! the highest load. Interleaving cancels only a bias that is constant in time. Both now rotate
+//! (a Latin square over the four arms; alternation for the two), and both print 1-thread
+//! throughput by position as a check — flat to within 1% in the factorial, against a real 16%
+//! position effect visible in the two-arm run, which is the drift being cancelled rather than
+//! wished away. The superseded runs are kept and banded:
+//! `bench/d35_c1_factorial_SUPERSEDED_rising_load.txt` and
+//! `bench/d35_c1_pagetable_SUPERSEDED_fixed_order.txt`. Their cell ORDERING was the same, so the
+//! conclusion did not move -- but that is a result of the re-run, not a reason to have skipped it.
 //!
-//! Three cells collapse; only the fourth rises. **`touch` and the page table are two serialising
-//! points IN SERIES**, so removing either alone leaves the other binding. That is why STUB came
-//! out marginally worse than BASE, and why the gate's C1 arm looked like a shape change: it was
-//! built ON TOP OF its STUB arm, so it had BOTH removed and credited one cause with a two-cause
-//! effect. The two agree where they should -- gate C1 at 16 threads 44.9M, this C1STUB 44.9M.
+//! **`touch` and the page table are two serialising points IN SERIES.** Removing either one alone
+//! leaves the other binding, which is why STUB alone was marginally WORSE than BASE and why C1
+//! alone is a constant. Removing BOTH is what produces the shape change. The gate's C1 arm was
+//! built on top of its STUB arm, so it measured "both removed" and attributed the result to the
+//! page table alone. Its 16-thread throughput (44.9M) and this C1STUB's (44.7M) agree closely;
+//! the ratio differs only because this machine's 1-thread number was higher under lighter load,
+//! and 16T/1T is most sensitive at the point that is most load-sensitive.
 //!
-//! ⭐ **The transferable form, which is worth more than the instance: an arm that removes one of
-//! two SERIALISED walls measures the OTHER wall, not the one it removed. Two "no effect" results
-//! in series are not evidence that neither is a wall.**
+//! **So `arc_cache` on the hit path is now the binding constraint, and BP-Wrapper is no longer
+//! "a constant".** The entry above rejected it on the STUB measurement, which was taken with the
+//! page table still in the way — a correct reading of a measurement that could not see past the
+//! other wall. That verdict was re-taken against THIS file, and it is D44 below.
 //!
-//! **So neither half is a shape change alone.** A page-table mirror that RETAINS `touch` -- the
-//! only version that can ship -- is x0.121 against a pre-registered x0.5 bar: a 1.2-1.5x constant,
-//! the same order as the constant BP-Wrapper was rejected for being. It is **not** in this tree
-//! for that reason; it is on `ferrodb-D35-C1-pagetable` at `c0d07d2`, certified green, waiting to
-//! be built into the pair.
+//! C1 is a prerequisite and not the win. Deleting `touch` without it is *worse* than doing
+//! nothing, and `touch` cannot simply be deleted — it degrades ARC's recency, which
+//! `bench/d35_c1_evictiontrace.txt` shows outright: the eviction sequence changes.
 //!
-//! **The candidate is the PAIR** -- the page table off the hit path **plus** a batched,
-//! ARC-preserving `touch` -- and it is judged against a **x0.579 ceiling, not against zero**. A
-//! scheme landing at x0.20 has recovered a sixth of the available headroom and is a MICRO wearing
-//! a shape change's clothes. See `SCALE-DESIGN.md` D44 for the pre-registered falsifiers.
+//! # D44 — the PAIR, and the slope finally changes sign
 //!
-//! ⛔ **`C1STUB` is a scaffold and can never ship.** Deleting `touch` degrades ARC's recency, and
-//! that is measured, not assumed: `bench/d35_c1_evictiontrace.txt` shows the eviction sequence
-//! changes outright, 7899 -> 7896 evictions in a different order. Reproduce it with
-//! `examples/d35_eviction_trace.rs`, which is in this tree.
+//! Both walls off the hit path at once: the page table through the mirror, and the policy update
+//! through a per-thread batch (BP-Wrapper, [`crate::buffer::touch_queue`]) that keeps `touch`.
+//! `bench/d44_batchsize.txt`, RESIDENT arm, 8 reps, arm order rotated as a Latin square, taken
+//! holding the machine-wide suite lock:
 //!
-//! ⚠ **And if the pair cannot clear x0.5, the diagnosis in this comment is wrong** -- the wall is
-//! then the four `RwLock` read acquisitions plus two atomic RMWs per hit named above, and the
-//! answer is a different data structure, not a lock fix.
+//! ⚠ Those runs were taken on a harness that capped them, and the table below is the re-take.
+//! `examples/bufpool_fault_concurrency.rs` used to increment ONE shared `AtomicUsize` per fetch
+//! *inside its timed window* — the same construct this file is being measured for. Every arm
+//! carried it, so it cancelled in comparisons and surfaced only as a ceiling. Fixed in `ec0c53c`;
+//! `bench/d44_harness_counter.txt` is the A/B that proved it was a ceiling and nothing else
+//! (BASE's slope x0.144 → x0.147, unmoved; the ceiling arm x0.740 → x2.630).
 //!
-//! Quote the SLOPE, never a multiplier to more than two significant figures: medians are over
-//! 3 reps with a BASE spread of 18.1M-23.6M at one thread under loadavg 16-33, and the two reps of
-//! `s22_bufpool_before_after.txt` disagree 40% on multipliers under fleet load. What reproduces in
-//! every rep is the sign of the slope.
+//! `bench/d44_corrected.txt`, all four arms on the fixed harness, 8 reps, rotated, under the lock:
 //!
-//! ⚠ The `buffer_pool.rs` edits on `D35-gate-stubtouch` are a MEASUREMENT SCAFFOLD and must never
-//! be merged: they carry a `FERRO_D35_ARM` switch, a deleted `touch`, and a mirror sized for a
-//! benchmark.
+//! | arm | 16T/1T | 16T absolute | vs BASE at 16T |
+//! |---|---|---|---|
+//! | BASE | x0.203 | 3.16M | 1.0x |
+//! | C1 (mirror only) | x0.198 | 4.53M | 1.4x |
+//! | **PAIR (mirror + batched `touch`)** | **x1.024** | **22.3M** | **7.1x** |
+//! | `touch` deleted outright (unshippable ceiling) | x3.187 | 163.0M | 51.5x |
+//!
+//! **The sign changes.** The pair's throughput at 16 threads EQUALS its throughput at one, and the
+//! curve rises monotonically from 2 threads — 11.3M, 15.9M, 20.6M, 22.3M — where BASE goes 8.4M,
+//! 5.2M, 4.0M, 3.2M. All eight reps ≥ x0.83.
+//!
+//! ⛔ **Judged against the real ceiling it recovers 28% of the slope headroom, and 14% of the
+//! ceiling's absolute 16-thread throughput.** An earlier version of this comment said 51%, which
+//! was arithmetic against the instrument's ceiling rather than the design's; it is withdrawn.
+//! Roughly three quarters of the headroom is still on the table. The obvious suspect is the
+//! batching machinery's own per-hit cost — one uncontended shard mutex plus a `Vec` push that the
+//! ceiling arm does not pay — and that is a hypothesis, **not** a measurement.
+//!
+//! ⭐ **The first batch size tried was eight times too small, and that is the substance rather
+//! than a tuning note.** At 64 the PAIR measured x0.384 and did NOT clear the bar. The run above
+//! exists to decide between two readings of that: either the residual cost is the *work* done
+//! under the policy lock — batching reduces how OFTEN the lock is taken, never how long it is
+//! HELD, so the serialised fraction would be unchanged — or it is acquisition overhead and the
+//! batch was simply too small. **The measurement chose the second, against the hypothesis going
+//! in.** Anyone re-deriving "BP-Wrapper is a constant" from a single small batch size is repeating
+//! the mistake this lane has now made twice, in two different places.
+//!
+//! **Judged against the ceiling and not against zero**, which is the honest framing and the one
+//! that moved most when the instrument was fixed: on the capped harness the pair looked like half
+//! the ceiling; it is actually a seventh of it. Keeping ARC exactly is worth paying for, but the
+//! size of what it costs was misstated until `bench/d44_corrected.txt`.
+//!
+//! **Hit rate is untouched, as an equality**: the eviction trace is byte-identical to BASE at both
+//! batch sizes, sha256 and all. See [`TOUCH_BATCH`] for why no batch size can make ARC's decisions
+//! staler — every decision is preceded by a full drain, so a backlog is never observable by one.
+//!
+//! # Hit rate: an equality assertion, and it holds
+//!
+//! ARC is not modified by C1 at all, so the eviction sequence must be **bit-identical**, not
+//! merely close. It is: `bench/d35_c1_evictiontrace.txt`, a fixed 16,192-step single-threaded
+//! trace over 4096 pages, 7899 evictions, byte-identical output and equal sha256 before and after.
+//! The gate is forced to fire in the same file (deleting `touch` changes the sequence), so
+//! "identical" is a result rather than an instrument that cannot see anything.
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, atomic::AtomicU16, atomic::AtomicUsize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use crate::error::FerroError;
 use crate::storage::disk_manager::{DiskManager, PAGE_SIZE};
 use crate::buffer::arc::ArcCache;
@@ -234,7 +280,10 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use crate::buffer::arc::ArcResult;
+use crate::buffer::page_table::PageTable;
+use crate::buffer::touch_queue::TouchQueue;
 use crate::storage::page_latch::{PageLatches, PoolSection, enter_pool};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64};
 
 pub struct Frame {
     pub data: [u8; PAGE_SIZE],
@@ -261,11 +310,94 @@ enum Evicted {
     Gone,
 }
 
+/// **D58 — a seqlock'd copy of the frame's page for readers that take nothing.**
+///
+/// The profile of 16 agent readers (`bench/d58_profile_16T_read_window.sample.txt`) put 47k of
+/// ~80k thread-samples in the page-latch table, and D51 measured why no latch can fix it: a
+/// shared-word RMW at 16 threads is the ×0.12 class, a relaxed load the ×7.8 class. So the point-
+/// read descent must WRITE NOTHING SHARED — no latch, no pin, no frame lock — and read a page as
+/// pure loads. It cannot read `frame.data` that way: a writer holding the frame's `RwLock` writes
+/// it non-atomically, and a concurrent plain read of the same bytes is a data race in Rust's model
+/// however carefully fenced. Hence the shadow: a second copy of the page held as atomics, refreshed
+/// by the frame's write guard on drop under a seqlock version, and read by relaxed loads. Optimistic
+/// readers never touch `frame.data`; locked readers never touch the shadow; there is no mixed access.
+///
+/// Orderings are `crossbeam`'s `SeqLock`: the refresher stores an odd version then a `Release`
+/// fence, stores the bytes, and publishes the even version with `Release`; the reader loads the
+/// version with `Acquire`, copies, fences `Acquire`, and re-loads. A version that moved, or that
+/// was odd, means the copy may be torn and the reader retries or falls back to the latched path.
+/// Eviction and reload are frame writes, so a frame reused for another page is a version change
+/// too — and `label` says which page the shadow currently is, so a stale page-table hint is caught.
+///
+/// The cost: 4 KB per frame (4 MB for the pool) and one 4 KB copy per page WRITE, against the
+/// WAL fsync that write already pays. Nothing on the read.
+pub struct FrameShadow {
+    /// Even while stable, odd while being refreshed. Only the frame's write guard moves it.
+    version: AtomicU64,
+    /// The page this shadow is a copy of, or `NO_PAGE`.
+    label: AtomicU32,
+    bytes: Box<[AtomicU64]>,
+}
+
+const NO_PAGE: u32 = u32::MAX;
+const SHADOW_WORDS: usize = PAGE_SIZE / 8;
+
+impl FrameShadow {
+    fn new() -> Self {
+        FrameShadow {
+            version: AtomicU64::new(0),
+            label: AtomicU32::new(NO_PAGE),
+            bytes: (0..SHADOW_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Publish `frame` into the shadow under `label`. Called ONLY by [`FrameWriteGuard`]'s drop,
+    /// while the frame's write lock is still held, so two refreshes of one frame cannot interleave.
+    ///
+    /// `label` is the guard's decision, not `frame.page_id`: see
+    /// [`FrameWriteGuard::label_at_acquire`]. `NO_PAGE` means "these bytes belong to no page", and
+    /// every optimistic read of this frame then misses until a fill republishes it.
+    fn refresh(&self, frame: &Frame, label: u32) {
+        let v = self.version.load(Ordering::Relaxed);
+        debug_assert!(v & 1 == 0, "a shadow refresh found the version odd: two refreshers");
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (i, w) in self.bytes.iter().enumerate() {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&frame.data[i * 8..i * 8 + 8]);
+            w.store(u64::from_ne_bytes(word), Ordering::Relaxed);
+        }
+        self.label.store(label, Ordering::Relaxed);
+        self.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// A page read that took nothing: the bytes, and the `(frame, version)` stamp that
+/// [`BufferPoolManager::shadow_still`] re-checks.
+pub struct OptimisticPage {
+    pub data: [u8; PAGE_SIZE],
+    pub frame_i: usize,
+    pub version: u64,
+}
+
 pub struct BufferPoolManager {
     pub frames: Vec<RwLock<Frame>>,
-    pub page_table: RwLock<HashMap<u32, usize>>, // page_id -> frame index
+    /// One [`FrameShadow`] per frame, index-aligned with `frames`.
+    shadows: Vec<FrameShadow>,
+    /// `page_id -> frame index`. A `HashMap` under an `RwLock`, **plus a lock-free mirror in front
+    /// of it** that the resident hit path resolves through instead. See
+    /// [`crate::buffer::page_table`] for why, and for why the map is private to that type.
+    pub page_table: PageTable,
     pub disk_manager: Arc<DiskManager>,
     pub arc_cache: Mutex<ArcCache>,
+
+    /// Hit-path policy updates that have not reached [`BufferPoolManager::arc_cache`] yet.
+    ///
+    /// **Never read this directly and never take `arc_cache` directly.** Go through
+    /// [`BufferPoolManager::arc_locked`], which drains this into the cache as part of acquiring
+    /// it — that is what keeps a batched `touch` from changing which page ARC evicts. See
+    /// [`crate::buffer::touch_queue`].
+    pub touch_queue: TouchQueue,
     pub wal: OnceLock<Arc<WalManager>>,
 
     /// Pages with IO in flight: being read in, or being written back out of a frame.
@@ -309,6 +441,62 @@ pub struct BufferPoolManager {
 
 const MAX_BUFFER_POOL_PAGES: usize = 1024;
 
+/// How many slots the page table's lock-free mirror gets, as a multiple of the frame count.
+///
+/// At most `MAX_BUFFER_POOL_PAGES` pages can be resident at once, so this is the load factor of a
+/// direct-mapped cache: eight slots per possible resident page. A collision costs one page its
+/// fast path and never returns a wrong answer (see [`crate::buffer::page_table`]), so this trades
+/// 64 KiB of memory against how often the hit path falls back to the map — it is a throughput
+/// knob, not a correctness one.
+const MIRROR_SLOTS_PER_FRAME: usize = 8;
+
+/// How many cache hits one thread accumulates before it must apply them to the replacement policy.
+///
+/// The factor by which the hit path's policy-lock acquisitions are reduced: one per `TOUCH_BATCH`
+/// hits rather than one per hit.
+///
+/// # 512 is measured, and the first value tried was eight times too small
+///
+/// `bench/d44_batchsize.txt`, RESIDENT arm, 8 reps, arm order rotated as a Latin square, taken
+/// while holding the machine-wide suite lock. Throughput at 16 threads relative to 1:
+///
+/// | arm | 16T/1T | 16T absolute | vs BASE |
+/// |---|---|---|---|
+/// | BASE (no mirror, eager `touch`) | x0.138 | 2.45M | 1.0x |
+/// | `TOUCH_BATCH` = 64 | x0.384 | 7.86M | 3.2x |
+/// | **`TOUCH_BATCH` = 512** | **x0.838** | **22.6M** | **9.3x** |
+/// | `touch` deleted outright (unshippable ceiling) | x0.676 | 44.7M | 18.3x |
+///
+/// ⚠ Those are CAPPED-harness figures (see the module doc's D44 section). They are kept because
+/// the comparison BETWEEN batch sizes is what this constant rests on and the cap applied equally
+/// to both arms. The absolute numbers and the ceiling are superseded by `bench/d44_corrected.txt`,
+/// and 512 has not been re-swept against 64 on the fixed harness.
+///
+/// That run was built to decide between two explanations of why 64 fell short of D44's
+/// pre-registered x0.5 bar: either the residual cost was the *work* done under the policy lock —
+/// in which case raising the batch changes nothing, because BP-Wrapper reduces how OFTEN the lock
+/// is taken and not how long it is HELD — or it was acquisition overhead, in which case the batch
+/// was simply too small. **The measurement chose the second**, and the first was the hypothesis
+/// going in.
+///
+/// # Why a large batch does not make ARC's decisions any staler
+///
+/// The obvious objection is that `TOUCH_BATCH * threads` updates in flight against a 1024-frame
+/// pool leaves the recency order badly stale. It does not, and the reason is the
+/// drain-before-decide rule rather than the size of the number: **every ARC decision is preceded
+/// by a full drain of every shard**, because the only way to reach the cache is
+/// [`BufferPoolManager::arc_locked`], which drains as part of acquiring. `request` — the sole
+/// decision — therefore always runs against a cache that has just been brought fully up to date,
+/// at any batch size. A backlog is only ever observable by a decision, and no decision can see one.
+///
+/// What a larger batch does cost is the length of one critical section: a thread that fills its
+/// shard applies 512 updates under the lock instead of 64, so the lock is held longer and less
+/// often. That is a latency-variance trade, not a policy one.
+///
+/// **Unmeasured, and stated rather than assumed:** the knee between 64 and 512 — the two points
+/// that were measured — and anything above 512.
+const TOUCH_BATCH: usize = 512;
+
 /// How many times `fetch_page` will re-verify before giving up.
 ///
 /// Every retry in `fetch_page` follows a *verified* change of state — a frame relabelled under its
@@ -335,6 +523,30 @@ pub struct FrameGuard<G> {
     _pool: PoolSection,
 }
 
+/// A guard over the replacement policy that also records, for its whole lifetime, that this thread
+/// is holding a buffer-pool lock — the same job [`FrameGuard`] does for a frame.
+///
+/// Only [`BufferPoolManager::arc_locked`] can produce one, so holding this is proof the pending
+/// hit-path updates have already been applied.
+pub struct ArcGuard<'a> {
+    // Declared first so the cache lock is released BEFORE the pool section closes.
+    guard: std::sync::MutexGuard<'a, ArcCache>,
+    _pool: PoolSection,
+}
+
+impl Deref for ArcGuard<'_> {
+    type Target = ArcCache;
+    fn deref(&self) -> &ArcCache {
+        &self.guard
+    }
+}
+
+impl DerefMut for ArcGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ArcCache {
+        &mut self.guard
+    }
+}
+
 impl<G: Deref<Target = Frame>> Deref for FrameGuard<G> {
     type Target = Frame;
     fn deref(&self) -> &Frame {
@@ -348,14 +560,76 @@ impl<G: DerefMut<Target = Frame>> DerefMut for FrameGuard<G> {
     }
 }
 
+/// The frame write guard: [`FrameGuard`] over the write lock, plus the shadow refresh on drop.
+/// See [`BufferPoolManager::frame_write`] and [`FrameShadow`].
+pub struct FrameWriteGuard<'a> {
+    // `Option` so `drop` can refresh the shadow while the lock is still held and then release it.
+    guard: Option<RwLockWriteGuard<'a, Frame>>,
+    shadow: &'a FrameShadow,
+    touched: bool,
+    /// The frame's label when this guard was taken.
+    ///
+    /// **A relabel and a fill are two different writes, and only the fill's bytes belong to the
+    /// new page.** `evict_into` and `claim_free_frame` set `frame.page_id = Some(incoming)` while
+    /// `frame.data` still holds the VICTIM's bytes (or zeros); the pool then reads from disk and
+    /// assigns `data` in a second, separate `frame_write`. Publishing the new label with the old
+    /// bytes would hand an optimistic reader another page's contents under a stable version —
+    /// reachable by a reader holding a page-table hint from that page's PREVIOUS residency in the
+    /// same frame. So the guard compares: a write that CHANGED the label publishes `NO_PAGE`, and
+    /// the fill that follows (label unchanged) publishes the real one. Conservative in the safe
+    /// direction — a guard that both relabels and fills would cost readers one retry, never a
+    /// wrong page. Found by a fresh-context review of the first version, which published
+    /// `frame.page_id` unconditionally.
+    label_at_acquire: Option<u32>,
+    _pool: PoolSection,
+}
+
+impl Deref for FrameWriteGuard<'_> {
+    type Target = Frame;
+    fn deref(&self) -> &Frame {
+        self.guard.as_ref().expect("frame write guard used after drop")
+    }
+}
+
+impl DerefMut for FrameWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Frame {
+        self.touched = true;
+        self.guard.as_mut().expect("frame write guard used after drop")
+    }
+}
+
+impl Drop for FrameWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.touched {
+            if let Some(frame) = self.guard.as_ref() {
+                // See `label_at_acquire`: bytes and label must be published together or not at all.
+                let label = if frame.page_id == self.label_at_acquire {
+                    frame.page_id.unwrap_or(NO_PAGE)
+                } else {
+                    NO_PAGE
+                };
+                self.shadow.refresh(frame, label);
+            }
+        }
+        // Release the frame lock before the pool section closes (field order does the rest).
+        self.guard = None;
+    }
+}
+
 impl BufferPoolManager {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self{
         let frames: Vec<RwLock<Frame>> = (0..MAX_BUFFER_POOL_PAGES).map(|_| RwLock::new(Frame::new())).collect();
+        let shadows: Vec<FrameShadow> = (0..MAX_BUFFER_POOL_PAGES).map(|_| FrameShadow::new()).collect();
         BufferPoolManager {
             frames,
-            page_table: RwLock::new(HashMap::new()),
+            shadows,
+            page_table: PageTable::new(MAX_BUFFER_POOL_PAGES * MIRROR_SLOTS_PER_FRAME),
             disk_manager,
             arc_cache: Mutex::new(ArcCache::new(MAX_BUFFER_POOL_PAGES)),
+            touch_queue: TouchQueue::new(
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) * 4,
+                TOUCH_BATCH,
+            ),
             wal: OnceLock::new(),
             in_transit: Mutex::new(HashSet::new()),
             transit_done: Condvar::new(),
@@ -364,16 +638,104 @@ impl BufferPoolManager {
         }
     }
 
+    /// Lock the replacement policy, **applying every pending hit first**.
+    ///
+    /// This is the only way this file reaches `arc_cache`, and that is the whole correctness
+    /// argument for batching the hit path. A cache hit no longer calls `touch` directly; it
+    /// appends to [`BufferPoolManager::touch_queue`] and returns. Those updates have to land
+    /// before ARC is asked anything, or a delayed `touch` could change which page it picks as a
+    /// victim — which would make this a policy change wearing a concurrency fix's clothes, the
+    /// exact thing D35 rejected "replace ARC with CLOCK" for being.
+    ///
+    /// Draining *as part of acquiring* is what makes that structural rather than a rule to
+    /// remember: there is no path to the cache that skips it. Single-threaded, ARC therefore sees
+    /// the identical sequence of operations it saw unbatched, which is why
+    /// `bench/d35_c1_evictiontrace.txt` can assert byte-identical output rather than a tolerance.
+    ///
+    /// Lock order: `arc_cache -> touch shard`. The drain takes shard locks while holding the
+    /// policy lock. The hit path takes a shard lock alone and never reaches for the policy lock
+    /// while holding one — see [`crate::buffer::touch_queue::TouchQueue::record`].
+    pub fn arc_locked(&self) -> ArcGuard<'_> {
+        let _pool = enter_pool();
+        let mut guard = self.arc_cache.lock().unwrap();
+        let mut pending = Vec::new();
+        self.touch_queue.drain_into(&mut pending);
+        for page_id in pending {
+            // `touch` is a no-op for a page that is no longer resident, which is the right answer
+            // for an update that was overtaken by an eviction: the hit happened, the page has
+            // since gone, and there is nothing left to promote.
+            guard.touch(page_id);
+        }
+        ArcGuard { guard, _pool }
+    }
+
     /// Read-lock a frame, tracked for lock ordering. See [`FrameGuard`].
     pub fn frame_read(&self, frame_i: usize) -> FrameGuard<RwLockReadGuard<'_, Frame>> {
         let _pool = enter_pool();
         FrameGuard { guard: self.frames[frame_i].read().unwrap(), _pool }
     }
 
-    /// Write-lock a frame, tracked for lock ordering. See [`FrameGuard`].
-    pub fn frame_write(&self, frame_i: usize) -> FrameGuard<RwLockWriteGuard<'_, Frame>> {
+    /// Write-lock a frame, tracked for lock ordering, **and the only way a frame may be written.**
+    ///
+    /// The guard refreshes the frame's [`FrameShadow`] on drop if it was dereferenced mutably, so
+    /// an optimistic reader sees every write. A raw `frames[i].write()` bypasses that and leaves
+    /// the shadow stale for ever — `tests/lock_order_allowlist.rs` refuses one anywhere outside
+    /// this file, and this file has none.
+    pub fn frame_write(&self, frame_i: usize) -> FrameWriteGuard<'_> {
         let _pool = enter_pool();
-        FrameGuard { guard: self.frames[frame_i].write().unwrap(), _pool }
+        let guard = self.frames[frame_i].write().unwrap();
+        let label_at_acquire = guard.page_id;
+        FrameWriteGuard {
+            guard: Some(guard),
+            shadow: &self.shadows[frame_i],
+            touched: false,
+            label_at_acquire,
+            _pool,
+        }
+    }
+
+    /// **D58.** Read `page_id` taking nothing shared — no latch, no pin, no lock: a page-table
+    /// hint, a version load, a copy by relaxed loads, a version re-load. `None` means the page is
+    /// not resident under that hint, or a refresh overlapped the copy; the caller retries or falls
+    /// back to [`BufferPoolManager::fetch_page`], which is always correct. The returned stamp lets
+    /// the caller ask later whether the page it read is still the page in that frame.
+    pub fn read_page_optimistic(&self, page_id: u32) -> Option<OptimisticPage> {
+        let frame_i = self.page_table.lookup(page_id)?;
+        self.read_frame_optimistic(frame_i, page_id)
+    }
+
+    /// The second half of [`Self::read_page_optimistic`]: read `frame_i`'s shadow as `page_id`,
+    /// or `None` if the frame does not (stably) hold that page. Split out and hidden because it
+    /// is a TEST SEAM: the page-table hint can be stale by the time the shadow is read — the
+    /// frame evicted and reused for another page in between — and that interleaving is nanoseconds
+    /// wide, so `tests/d58_latch_free_descent.rs` forces it by taking the hint, churning the
+    /// frame, and then calling this. The `label` check is what makes it return `None` there.
+    #[doc(hidden)]
+    pub fn read_frame_optimistic(&self, frame_i: usize, page_id: u32) -> Option<OptimisticPage> {
+        let shadow = &self.shadows[frame_i];
+        let v1 = shadow.version.load(Ordering::Acquire);
+        if v1 & 1 == 1 {
+            return None;
+        }
+        if shadow.label.load(Ordering::Relaxed) != page_id {
+            return None;
+        }
+        let mut data = [0u8; PAGE_SIZE];
+        for (i, w) in shadow.bytes.iter().enumerate() {
+            data[i * 8..i * 8 + 8].copy_from_slice(&w.load(Ordering::Relaxed).to_ne_bytes());
+        }
+        fence(Ordering::Acquire);
+        if shadow.version.load(Ordering::Relaxed) != v1 {
+            return None;
+        }
+        Some(OptimisticPage { data, frame_i, version: v1 })
+    }
+
+    /// Is the shadow in `frame_i` still at `version` — i.e. has the page a reader copied been
+    /// neither rewritten nor evicted since?
+    pub fn shadow_still(&self, frame_i: usize, version: u64) -> bool {
+        fence(Ordering::Acquire);
+        self.shadows[frame_i].version.load(Ordering::Relaxed) == version
     }
 
     /// Return the frame holding `page_id`, faulting it in if it is not resident, and pin it.
@@ -392,7 +754,20 @@ impl BufferPoolManager {
             if let Some(frame_i) = self.try_pin_resident(page_id) {
                 // Policy only, and deliberately *after* the pin: the cache is a hint about what to
                 // evict next, and holding it here is what used to serialise even pure cache hits.
-                self.arc_cache.lock().unwrap().touch(page_id);
+                //
+                // D44: this no longer takes the policy lock. It appends to a per-thread shard and
+                // returns, and the backlog is applied by whoever next acquires the cache -- see
+                // `arc_locked` and `crate::buffer::touch_queue`. Only the thread that FILLS its
+                // shard pays for the lock, one hit in TOUCH_BATCH.
+                if let Some(batch) = self.touch_queue.record(page_id) {
+                    // `arc_locked` has already drained what was pending when it took the lock;
+                    // this batch left the shard before that, so it is applied after, which is the
+                    // order the hits happened in.
+                    let mut cache = self.arc_locked();
+                    for id in batch {
+                        cache.touch(id);
+                    }
+                }
                 return Ok(frame_i);
 
             }
@@ -450,6 +825,15 @@ impl BufferPoolManager {
     /// own lock makes the pin and the check one step against the evictor, which takes the same
     /// frame's write lock to relabel it. One of the two wins; the loser sees a label it did not
     /// expect and retries.
+    ///
+    /// **D35: the lookup comes from the lock-free mirror first**, and the map only if that misses.
+    /// The re-check below is untouched and is what makes that sound — the mirror produces the same
+    /// *candidate* by a cheaper route, and a candidate is all this method has ever had. A mirror
+    /// entry that has gone stale is rejected here exactly like a stale map entry was.
+    ///
+    /// The fallback to the map is not optional. A mirror miss means "a collision took the slot",
+    /// never "not resident": returning `None` on it would send a resident page down the fault path,
+    /// where `fetch_page`'s re-check under the transit lock finds it resident and loops.
     fn try_pin_resident(&self, page_id: u32) -> Option<usize> {
         // Lock-order: takes a pool lock, so page latches are forbidden from here down. Reachable
         // only from `fetch_page`, which already opens a section -- the marker is here anyway
@@ -457,7 +841,27 @@ impl BufferPoolManager {
         // depends on the CALLER having opened it stops holding the moment someone adds a caller.
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
+
+        // The hit path: one Acquire load, no lock. This is the whole of D35's C1 on this side.
+        if let Some(frame_i) = self.page_table.lookup(page_id) {
+            if let Some(i) = self.pin_if_labelled(frame_i, page_id) {
+                return Some(i);
+            }
+            // The mirror named a frame the page has since left. The MAP may still hold a current,
+            // different entry for it, so fall through rather than reporting a miss -- that is what
+            // the unmirrored code did with a stale candidate and it must stay true.
+        }
+
         let frame_i = self.page_table.read().unwrap().get(&page_id).copied()?;
+        self.pin_if_labelled(frame_i, page_id)
+    }
+
+    /// Pin frame `frame_i` if it really is holding `page_id`. The re-check and the pin under one
+    /// acquisition of that frame's latch; see [`BufferPoolManager::try_pin_resident`].
+    fn pin_if_labelled(&self, frame_i: usize, page_id: u32) -> Option<usize> {
+        // Lock-order: takes a frame lock, so page latches are forbidden from here down. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
         if frame.page_id != Some(page_id) {
             return None;
@@ -499,7 +903,7 @@ impl BufferPoolManager {
         let _pool = enter_pool();
         // The verdict. `arc_cache` is held for this and dropped before any syscall.
         let verdict = {
-            let mut cache = self.arc_cache.lock().unwrap();
+            let mut cache = self.arc_locked();
             cache.request(page_id, &|id| self.is_pinned(id))
         };
 
@@ -509,7 +913,7 @@ impl BufferPoolManager {
                 // step 2 held the transit lock while checking, so no loader can have published
                 // since. The cache is carrying a false claim -- drop it and re-decide rather than
                 // trusting either side.
-                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                let _ = self.arc_locked().remove(page_id);
                 return Ok(None);
             }
             ArcResult::PoolFull => return Err(FerroError::NotEnoughSpace),
@@ -517,7 +921,7 @@ impl BufferPoolManager {
                 Some(i) => i,
                 None => {
                     // Every frame filled between the verdict and the scan. Real under concurrency.
-                    let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                    let _ = self.arc_locked().remove(page_id);
                     return Err(FerroError::NotEnoughSpace);
                 }
             },
@@ -527,7 +931,7 @@ impl BufferPoolManager {
                 // frame is never reclaimable again.
                 let outcome = self.evict_into(victim, page_id);
                 let give_back = |declined: bool| {
-                    let mut cache = self.arc_cache.lock().unwrap();
+                    let mut cache = self.arc_locked();
                     if declined {
                         cache.reinstate(victim);
                     }
@@ -565,7 +969,7 @@ impl BufferPoolManager {
                 // claim: the frame, and the cache's belief that this page is now resident. Leaving
                 // the latter is what made a second probe of an absent page panic.
                 self.release_frame(frame_i);
-                let _ = self.arc_cache.lock().unwrap().remove(page_id);
+                let _ = self.arc_locked().remove(page_id);
                 return Err(e);
             }
         };
@@ -573,7 +977,7 @@ impl BufferPoolManager {
         // Bytes first, mapping second. A reader that reached this frame through the page table must
         // never find the label already updated and the bytes not yet — that is serving another
         // page's contents, which is the one failure a storage engine cannot apologise for.
-        self.frames[frame_i].write().unwrap().data = data;
+        self.frame_write(frame_i).data = data;
         self.page_table.write().unwrap().insert(page_id, frame_i);
         Ok(Some(frame_i))
     }
@@ -595,7 +999,7 @@ impl BufferPoolManager {
         let start = self.free_hint.load(Ordering::Relaxed) % n;
         for step in 0..n {
             let i = (start + step) % n;
-            let mut frame = self.frames[i].write().unwrap();
+            let mut frame = self.frame_write(i);
             if frame.page_id.is_none() {
                 frame.page_id = Some(incoming);
                 frame.pin_counter = AtomicU16::new(1);
@@ -618,7 +1022,7 @@ impl BufferPoolManager {
         // depends on the CALLER having opened it stops holding the moment someone adds a caller.
         // See src/storage/page_latch.rs.
         let _pool = enter_pool();
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
@@ -681,7 +1085,7 @@ impl BufferPoolManager {
         // have been fetched, dirtied and unpinned again in between; `dirty` is checked as well as
         // the pin because that whole cycle can complete and leave the count back at zero.
         let mut pt = self.page_table.write().unwrap();
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         if frame.page_id != Some(victim) {
             return Ok(Evicted::Gone);
         }
@@ -697,22 +1101,87 @@ impl BufferPoolManager {
         Ok(Evicted::Took(frame_i))
     }
 
-    // decrement pin count, if page was modified, add dirty flag
+    /// Decrement the pin count, and mark the frame dirty if the caller wrote to it.
+    ///
+    /// **D35: resolved through the lock-free mirror**, with the map as the fallback. This is the
+    /// other half of the resident hit loop — `fetch_page` + `unpin_page` took `page_table.read()`
+    /// once each, and an `RwLock`'s reader count is one process-wide cache line that every reader
+    /// atomically RMWs, so those two acquisitions contended exactly like a mutex.
+    ///
+    /// # Why the mirror is safe here, which is a different argument from `fetch_page`'s
+    ///
+    /// `fetch_page` may act on a stale candidate because it re-checks the frame's label before
+    /// pinning. `unpin_page` has no such retry to fall back on: acting on the wrong frame would
+    /// decrement somebody else's pin count and, worse, set somebody else's dirty flag.
+    ///
+    /// The structural argument is that it cannot get a stale candidate at all: **a pinned page
+    /// cannot be evicted.** Every path that would unmap it refuses while `pin_counter > 0` —
+    /// `evict_into` returns `Declined`, `delete_page` and `free_page` return `PagePinned`,
+    /// `invalidate_all` refuses the whole sweep, and `branch::arena::evict` leaves it. So between
+    /// the pin this call is undoing and this call, the mapping cannot have changed.
+    ///
+    /// That argument is sound and it is not what this code relies on, because it rests on every
+    /// one of five call sites staying correct. **The frame's label is re-checked instead**, on
+    /// both resolution paths — the frame latch is being taken anyway, so it is one comparison.
+    ///
+    /// # The re-check is on the MAP path too, which is a change
+    ///
+    /// The unmirrored version of this method resolved through the map and then acted on whatever
+    /// frame it named, with no re-check, so it had the same exposure. Adding the check to the fast
+    /// path and not the fallback would leave the two halves of one method with different
+    /// guarantees, which is the kind of seam that becomes a bug the next time somebody edits one
+    /// of them. So both check, and the contract is uniform: **`unpin_page` acts only on a frame
+    /// that actually holds the page.**
+    ///
+    /// The choice it makes when neither path finds such a frame is to do nothing, and that is
+    /// deliberate. The alternative is to act anyway, which sets another page's dirty flag — and a
+    /// wrongly-set dirty flag on the wrong frame means the page that IS dirty gets written under
+    /// somebody else's id. A frame that stays pinned and therefore unevictable is a leak; serving
+    /// or persisting the wrong bytes is not recoverable. Neither state is reachable while the
+    /// pinned-page invariant above holds; this decides which one to be wrong in if it ever does
+    /// not.
     pub fn unpin_page(&self, page_id: u32, is_dirty: bool) {
         // Lock-order: this method takes one of the pool's locks, so page latches are
         // forbidden from here down. See src/storage/page_latch.rs.
         let _pool = enter_pool();
+
+        // The hit path: one Acquire load, no lock.
+        if let Some(frame_i) = self.page_table.lookup(page_id) {
+            if self.release_pin_if_labelled(frame_i, page_id, is_dirty) {
+                return;
+            }
+            // A mirror miss is a collision and lands below. Getting HERE instead means the mirror
+            // named a frame the page has left, which the pinned-page invariant says cannot happen.
+            // Ask the authority rather than act on it.
+        }
+
         let pt = self.page_table.read().unwrap();
         let frame_i = pt[&page_id];
         drop(pt);
+        self.release_pin_if_labelled(frame_i, page_id, is_dirty);
+    }
 
+    /// Drop one pin on `frame_i` **if that frame holds `page_id`**, and mark it dirty if asked.
+    /// Returns whether it did. Shared by [`BufferPoolManager::unpin_page`]'s two resolution paths
+    /// so they cannot drift apart.
+    ///
+    /// `fetch_update` and not `fetch_sub`: an unpin of an already-unpinned frame must be a no-op
+    /// rather than an underflow to `u16::MAX`, which would make the frame permanently unevictable.
+    fn release_pin_if_labelled(&self, frame_i: usize, page_id: u32, is_dirty: bool) -> bool {
+        // Lock-order: takes a frame lock, so page latches are forbidden from here down. See
+        // src/storage/page_latch.rs.
+        let _pool = enter_pool();
         let frame = self.frames[frame_i].read().unwrap();
+        if frame.page_id != Some(page_id) {
+            return false;
+        }
         if is_dirty {
             frame.dirty_flag.store(true, Ordering::Relaxed);
         }
         let _ = frame.pin_counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
             if val > 0 {Some(val-1)} else {None}
         });
+        true
     }
 
     // allocate new page on disk using disk manager, load into a frame, return page id
@@ -826,14 +1295,14 @@ impl BufferPoolManager {
         pt.remove(&page_id);
         drop(pt);
 
-        let mut frame = self.frames[frame_i].write().unwrap();
+        let mut frame = self.frame_write(frame_i);
         frame.page_id = None;
         frame.data = [0u8; PAGE_SIZE];
         frame.pin_counter = AtomicU16::new(0);
         frame.dirty_flag = AtomicBool::new(false);
         drop(frame);
 
-        self.arc_cache.lock().unwrap().remove(page_id)?;
+        self.arc_locked().remove(page_id)?;
         Ok(())
     }
 
@@ -859,13 +1328,13 @@ impl BufferPoolManager {
         if let Some(frame_i) = resident {
             pt.remove(&page_id);
             drop(pt);
-            let mut frame = self.frames[frame_i].write().unwrap();
+            let mut frame = self.frame_write(frame_i);
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
             drop(frame);
-            self.arc_cache.lock().unwrap().remove(page_id)?;
+            self.arc_locked().remove(page_id)?;
         }
         Ok(())
     }
@@ -913,7 +1382,7 @@ impl BufferPoolManager {
             return Err(FerroError::PagePinned);
         }
 
-        let mut cache = self.arc_cache.lock().unwrap();
+        let mut cache = self.arc_locked();
         let mut pt = self.page_table.write().unwrap();
 
         // Every frame is checked before any is touched: a partial invalidation leaves the pool
@@ -934,7 +1403,7 @@ impl BufferPoolManager {
         let resident: Vec<(u32, usize)> = pt.iter().map(|(id, i)| (*id, *i)).collect();
         pt.clear();
         for (page_id, frame_i) in resident {
-            let mut frame = self.frames[frame_i].write().unwrap();
+            let mut frame = self.frame_write(frame_i);
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
@@ -1016,7 +1485,7 @@ mod tests {
 
         // Dirty the page and do NOT flush: memory is now the only copy of this byte.
         let frame_i = bp.fetch_page(page).unwrap();
-        bp.frames[frame_i].write().unwrap().data[100] = 0xAB;
+        bp.frame_write(frame_i).data[100] = 0xAB;
         bp.unpin_page(page, true);
 
         let err = bp.delete_page(page);
@@ -1045,7 +1514,7 @@ mod tests {
         let (bp, page, path) = pool_with_arena_floor("free");
 
         let frame_i = bp.fetch_page(page).unwrap();
-        bp.frames[frame_i].write().unwrap().data[100] = 0xCD;
+        bp.frame_write(frame_i).data[100] = 0xCD;
         bp.unpin_page(page, true);
 
         let err = bp.free_page(page);

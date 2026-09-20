@@ -189,15 +189,46 @@ impl Latch {
 }
 
 /// One latch per page id, created on demand and dropped when the page goes idle.
-#[derive(Default)]
+///
+/// **D58 — the table is STRIPED by page id.** It was one `Mutex<HashMap>` + one `Condvar` for
+/// every page in the process: every latch acquire and every release took that one mutex, and
+/// every release `notify_all`ed every waiter on every page. Profiled at 16 agent readers
+/// (`bench/d58_profile_16T_read_window.sample.txt`): 47k of ~80k thread-samples were in
+/// `PageLatches::read` / `PageReadGuard::drop` waiting on it. Striping the TABLE is not the
+/// striping the module doc rejects below — that was striping the LATCHES, where two pages on one
+/// stripe would share a latch and crabbing would self-block. Here each page keeps its own
+/// `Latch` entry; only the map that holds it, and the condvar its waiters park on, are per-stripe,
+/// and the stripe mutex is never held while a page latch is held, so a parent and a child on the
+/// same stripe cannot deadlock. A waiter on stripe `s` may wake spuriously for another page on
+/// `s`; it re-checks and sleeps again, exactly as before.
 pub struct PageLatches {
+    stripes: Vec<Stripe>,
+}
+
+#[derive(Default)]
+struct Stripe {
     table: Mutex<HashMap<u32, Latch>>,
     wake: Condvar,
+}
+
+/// A power of two so the modulo is a mask; 64 stripes for a pool whose hot set at 16 readers is
+/// a handful of pages spreads them with high probability, and a collision costs a spurious wake,
+/// never correctness.
+const STRIPES: usize = 64;
+
+impl Default for PageLatches {
+    fn default() -> Self {
+        PageLatches { stripes: (0..STRIPES).map(|_| Stripe::default()).collect() }
+    }
 }
 
 impl PageLatches {
     pub fn new() -> Self {
         PageLatches::default()
+    }
+
+    fn stripe(&self, page_id: u32) -> &Stripe {
+        &self.stripes[(page_id as usize) & (STRIPES - 1)]
     }
 
     /// Shared access to `page_id`. Blocks while a writer holds or is waiting for it.
@@ -207,14 +238,15 @@ impl PageLatches {
     #[track_caller]
     pub fn read(&self, page_id: u32) -> PageReadGuard<'_> {
         assert_page_latch_is_above_the_pool("read", page_id);
-        let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.stripe(page_id);
+        let mut table = st.table.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             let l = table.entry(page_id).or_default();
             if !l.writer && l.writers_waiting == 0 {
                 l.readers += 1;
                 return PageReadGuard { latches: self, page_id };
             }
-            table = self.wake.wait(table).unwrap_or_else(|p| p.into_inner());
+            table = st.wake.wait(table).unwrap_or_else(|p| p.into_inner());
         }
     }
 
@@ -225,7 +257,8 @@ impl PageLatches {
     #[track_caller]
     pub fn write(&self, page_id: u32) -> PageWriteGuard<'_> {
         assert_page_latch_is_above_the_pool("write", page_id);
-        let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.stripe(page_id);
+        let mut table = st.table.lock().unwrap_or_else(|p| p.into_inner());
         table.entry(page_id).or_default().writers_waiting += 1;
         loop {
             let l = table.entry(page_id).or_default();
@@ -234,36 +267,38 @@ impl PageLatches {
                 l.writer = true;
                 return PageWriteGuard { latches: self, page_id };
             }
-            table = self.wake.wait(table).unwrap_or_else(|p| p.into_inner());
+            table = st.wake.wait(table).unwrap_or_else(|p| p.into_inner());
         }
     }
 
     fn release_read(&self, page_id: u32) {
-        let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.stripe(page_id);
+        let mut table = st.table.lock().unwrap_or_else(|p| p.into_inner());
         if let Entry::Occupied(mut e) = table.entry(page_id) {
             e.get_mut().readers -= 1;
             if e.get().idle() {
                 e.remove();
             }
         }
-        self.wake.notify_all();
+        st.wake.notify_all();
     }
 
     fn release_write(&self, page_id: u32) {
-        let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
+        let st = self.stripe(page_id);
+        let mut table = st.table.lock().unwrap_or_else(|p| p.into_inner());
         if let Entry::Occupied(mut e) = table.entry(page_id) {
             e.get_mut().writer = false;
             if e.get().idle() {
                 e.remove();
             }
         }
-        self.wake.notify_all();
+        st.wake.notify_all();
     }
 
     /// Latches currently held or queued. Test-only introspection: a non-zero value after an
     /// operation returns means a guard leaked.
     pub fn outstanding(&self) -> usize {
-        self.table.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.stripes.iter().map(|st| st.table.lock().unwrap_or_else(|p| p.into_inner()).len()).sum()
     }
 }
 

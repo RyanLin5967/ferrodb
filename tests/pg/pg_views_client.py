@@ -57,7 +57,11 @@ EXPECTED_FIELDS = {
         ("fork_epoch", INT8),
         ("root_page_id", INT8),
         ("state", TEXT),
-        ("depth", INT4),
+        # BIGINT since D60 removed the depth cap: the record field is a u32, and an i32 column
+        # would report a negative depth rather than a large one. A client-visible type change,
+        # pinned here deliberately — this assertion is what forced it to be justified rather than
+        # slipped in.
+        ("depth", INT8),
         ("arenas", INT4),
         ("live_children", INT4),
         ("lease_deadline", NUMERIC),

@@ -1,0 +1,92 @@
+D50-FERRODB-SNAPSHOT-COST — THREADED CLIENT RUN: ⛔ VOID, NOT A FERRODB NUMBER
+==============================================================================
+[HERE] 2026-09-18T22:36:10Z, this session.
+
+WHY THIS FILE IS VOID, AND WHY IT IS KEPT ANYWAY
+------------------------------------------------
+The two arms are INDISTINGUISHABLE — 0.90x to 1.00x apart at every point — and both
+plateau together at about x1.35. Arm B gives every client its OWN SERVER on its own
+database file, which removes the Mutex<Catalog> entirely. If that lock were the wall,
+arm B would separate. It does not move at all.
+
+Two arms that plateau TOGETHER share their ceiling, and the only thing these two arms
+share is the client: 16 Python THREADS behind one GIL, doing per-statement wire parsing
+in Python bytecode. This repo's own note already names the shape — 'a benchmark harness
+can BE the wall: shared state in the timed loop cancels in every comparison and shows
+only as a ceiling; A/B it and watch the CONTROL's slope.' The control's slope is the
+evidence, and it says the harness.
+
+⛔ So no number below may be quoted as a property of ferrodb. The run is refused, not
+caveated. It is committed because the raw artifact of a refused run is what stops the
+next pass re-running it, and because the control arm doing its job is the point.
+
+The discriminator is bench/d50_procs.sh: the same clients as separate PROCESSES, so the
+GIL is no longer shared. If the total rises, the threaded harness was the ceiling.
+
+# 16 servers up on ports 50451,50452,50453,50454,50455,50456,50458,50457,50459,50460,50461,50462,50463,50465,50464,50466
+# seeded and verified: every server answers the probe query with exactly 1 row
+# D50-FERRODB-SNAPSHOT-COST  host=127.0.0.1 ports=[50451, 50452, 50453, 50454, 50455, 50456, 50458, 50457, 50459, 50460, 50461, 50462, 50463, 50465, 50464, 50466] rows=200 warmup=0.3s measure=1.0s rounds=3
+
+=== ARM SHARED  (N clients, ONE server, one Mutex<Catalog>) ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1C -> 17567 stmt/s (slowest client 17684)
+#   2C -> 29690 stmt/s (slowest client 14941)
+#   4C -> 25550 stmt/s (slowest client 6436)
+#   8C -> 17756 stmt/s (slowest client 2215)
+#   16C -> 16002 stmt/s (slowest client 990)
+# round 1 order: 2 4 8 16 1
+#   2C -> 21007 stmt/s (slowest client 10604)
+#   4C -> 25290 stmt/s (slowest client 6339)
+#   8C -> 17971 stmt/s (slowest client 2248)
+#   16C -> 18367 stmt/s (slowest client 1128)
+#   1C -> 13040 stmt/s (slowest client 13107)
+# round 2 order: 4 8 16 1 2
+#   4C -> 28171 stmt/s (slowest client 7042)
+#   8C -> 18100 stmt/s (slowest client 2259)
+#   16C -> 17581 stmt/s (slowest client 1075)
+#   1C -> 12262 stmt/s (slowest client 12293)
+#   2C -> 25540 stmt/s (slowest client 12789)
+
+ clients   total_stmt_s    per_client   total_vs_1C  per_client_vs_1C
+       1          13040         13040         1.000             1.000
+       2          25540         12770         1.959             0.979
+       4          25550          6388         1.959             0.490
+       8          17971          2246         1.378             0.172
+      16          17581          1099         1.348             0.084
+
+=== ARM PRIVATE (N clients, N servers) -- the CONTROL ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1C -> 15382 stmt/s (slowest client 15446)
+#   2C -> 26658 stmt/s (slowest client 13044)
+#   4C -> 25520 stmt/s (slowest client 6332)
+#   8C -> 15581 stmt/s (slowest client 1938)
+#   16C -> 12337 stmt/s (slowest client 750)
+# round 1 order: 2 4 8 16 1
+#   2C -> 16322 stmt/s (slowest client 8040)
+#   4C -> 19720 stmt/s (slowest client 4890)
+#   8C -> 16256 stmt/s (slowest client 1997)
+#   16C -> 16365 stmt/s (slowest client 1012)
+#   1C -> 12120 stmt/s (slowest client 12215)
+# round 2 order: 4 8 16 1 2
+#   4C -> 26532 stmt/s (slowest client 6608)
+#   8C -> 18691 stmt/s (slowest client 2310)
+#   16C -> 16433 stmt/s (slowest client 1007)
+#   1C -> 11589 stmt/s (slowest client 11658)
+#   2C -> 23888 stmt/s (slowest client 11766)
+
+ clients   total_stmt_s    per_client   total_vs_1C  per_client_vs_1C
+       1          12120         12120         1.000             1.000
+       2          23888         11944         1.971             0.986
+       4          25520          6380         2.106             0.526
+       8          16256          2032         1.341             0.168
+      16          16365          1023         1.350             0.084
+
+ clients   shared_vs_1C   private_vs_1C     apart
+       1          1.000           1.000      0.93x
+       2          1.959           1.971      0.94x
+       4          1.959           2.106      1.00x
+       8          1.378           1.341      0.90x
+      16          1.348           1.350      0.93x
+# cleanup: 16 servers started, 0 still alive after SIGTERM

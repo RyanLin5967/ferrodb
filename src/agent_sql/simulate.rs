@@ -468,7 +468,7 @@ impl AgentRuntime {
                     Stmt::Select { .. } => {
                         // Reads are executed and their read-set retained, because the read-set is
                         // what the read-premise check at admission is about.
-                        self.select(ctx, session.branch, stmt, Some(session.branch))
+                        self.select(&ctx.read(), session.branch, stmt, Some(session.branch))
                             .map(|r| (0, r.len()))
                     }
                     other => self.write(ctx, session.branch, other.clone()).map(|n| (n, 0)),

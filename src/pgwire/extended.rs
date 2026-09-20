@@ -33,7 +33,7 @@ use crate::binder::binder::{Binder, BoundColumn};
 use crate::catalog::catalog::Catalog;
 use crate::catalog::column::Value;
 use crate::error::FerroError;
-use crate::execution::executor::{run, Outcome};
+use crate::execution::executor::{run, Outcome, try_run_read};
 use crate::execution::session::Session;
 use crate::parser::parser::{Parser, Stmt};
 use crate::parser::scanner::{Scanner, TokenType};
@@ -54,9 +54,25 @@ pub struct Connection {
     /// Set by any failure inside an extended-protocol sequence, cleared by `Sync`. See the module
     /// note: without it, the `Execute` that was pipelined behind a failed `Bind` runs anyway.
     failed: bool,
+    /// This connection's cached catalog snapshot, `(epoch, snapshot)`.
+    ///
+    /// Per-connection rather than shared on purpose: a shared cache would need a lock or a
+    /// refcount bump on every statement, and both were measured as the wall this exists to remove
+    /// (`bench/d51_sharedword_probe.txt`: RwLock::read x0.121, Arc::clone x0.137, relaxed load
+    /// x7.823 over 16 threads).
+    catalog_cache: Option<(u64, Arc<Catalog>)>,
+    /// This connection's busy slot, written only by this connection. Registered with the
+    /// `ServerContext` once, at connection start.
+    read_slot: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Connection {
+    /// The busy slot, for `ServerContext::register_reader`. Cloning the `Arc` is what lets the
+    /// registry notice, by refcount, that this connection has gone away.
+    pub fn read_slot(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.read_slot)
+    }
+
     pub fn new(session: Session) -> Self {
         Connection {
             session,
@@ -64,6 +80,8 @@ impl Connection {
             statements: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
+            catalog_cache: None,
+            read_slot: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -303,18 +321,47 @@ impl Statement {
             Kind::Session(cmd) => run_session(cmd, conn),
             Kind::Sql { stmt, verb } => {
                 let stmt = params::substitute(stmt, args).map_err(FerroError::Bind)?;
-                // **The catalog lock, held for exactly one statement.** See `pgwire::serve` for
-                // why this is the outermost lock and why holding it for longer would rebuild the
-                // sequential server this replaced.
-                let mut catalog = ctx.catalog();
-                let outcome = run(
-                    stmt,
-                    &mut catalog,
-                    ctx.bp.clone(),
-                    ctx.txn.clone(),
-                    &mut conn.session,
-                )?;
-                drop(catalog);
+
+                // **The shared read path, tried first.** A statement that only reads runs against
+                // a per-connection catalog SNAPSHOT and takes no process-wide lock at all, so N
+                // readers do not serialise. `try_run_read` answers `None` for anything needing the
+                // catalog exclusively, and there is no separate "is this a read?" predicate that
+                // could disagree with it. Fields are destructured because `session` and
+                // `catalog_cache` are borrowed at once and they are disjoint.
+                let outcome = {
+                    let Connection { session, catalog_cache, read_slot, .. } = &mut *conn;
+                    // Refresh the snapshot FIRST. This is the only place the read path can take
+                    // the catalog mutex, and it must not happen while the slot is busy: a writer
+                    // draining would wait for this slot while this reader waited for the mutex.
+                    let shared = ctx.read_catalog(catalog_cache);
+                    // The pass lives only for the attempt. If `try_run_read` answers `None` the
+                    // pass is already dropped by the time the exclusive path runs, which is what
+                    // keeps that same deadlock out of the write path too.
+                    let attempted = {
+                        match ctx.begin_read(read_slot) {
+                            Some(_pass) => {
+                                try_run_read(&stmt, shared, ctx.bp.clone(), ctx.txn.clone(), session)
+                            }
+                            // A writer is announced. Standing down is correct, not a failure:
+                            // the exclusive path below blocks on the mutex and is what every
+                            // statement did before this line existed.
+                            None => None,
+                        }
+                    };
+                    match attempted {
+                        Some(read) => read?,
+                        None => {
+                            // **The catalog lock, held for exactly one statement.** See
+                            // `pgwire::serve` for why this is the outermost lock and why holding
+                            // it for longer would rebuild the sequential server this replaced.
+                            let mut catalog = ctx.catalog();
+                            let o =
+                                run(stmt, &mut catalog, ctx.bp.clone(), ctx.txn.clone(), session)?;
+                            drop(catalog);
+                            o
+                        }
+                    }
+                };
                 Ok(match outcome {
                     Outcome::Rows(rows) => {
                         let n = rows.len();

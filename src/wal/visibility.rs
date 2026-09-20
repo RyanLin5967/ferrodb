@@ -29,12 +29,13 @@ mod tests {
     use super::*;
     use crate::wal::txn::Snapshot;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     /// A view for transaction `me`, with `active` still in flight and everything below
     /// `high_water` otherwise committed.
     fn view(me: u64, active: &[u64], high_water: u64) -> ReadView {
         ReadView {
-            snapshot: Snapshot { high_water, active: active.iter().copied().collect::<HashSet<_>>() },
+            snapshot: Arc::new(Snapshot { high_water, active: active.iter().copied().collect::<HashSet<_>>() }),
             txn_id: me,
         }
     }

@@ -79,7 +79,22 @@ use std::sync::atomic::Ordering;
 use std::ops::Bound;
 
 pub struct BPlusTreeManager<K, V> {
-    pub root_page_id: AtomicU32,
+    /// The tree's current root page, **shared** with every other handle on the same tree.
+    ///
+    /// # Why this is an `Arc` and not a plain `AtomicU32`
+    ///
+    /// `read_leaf_for` opens every descent with a root-split retry — load the root, latch it,
+    /// re-load and restart if it moved. That guard is correct and it was **DORMANT**: `open()`
+    /// wrapped the catalog's recorded root in a *fresh private* atomic, so two statements over one
+    /// table held two independent root pointers and the retry compared a private value against
+    /// itself. It could never fire. The global catalog mutex was the only thing actually providing
+    /// the safety, which meant removing that mutex for concurrency would have ACTIVATED a latent
+    /// defect rather than merely exposing a stale value. See `SCALE-DESIGN` D53.
+    ///
+    /// Sharing the cell — rather than sharing the whole manager — is what lets every existing
+    /// call site keep building a cheap per-statement handle: `.load()` and `.store()` deref
+    /// through the `Arc` unchanged.
+    pub root_page_id: Arc<AtomicU32>,
     pub buffer_pool: Arc<BufferPoolManager>,
     pub marker: PhantomData<(K, V)>
 }
@@ -87,22 +102,43 @@ pub struct BPlusTreeManager<K, V> {
 impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeManager<K,V> {
 
     pub fn new(root_page_id: AtomicU32, buffer_pool: Arc<BufferPoolManager>) -> Self{
-        BPlusTreeManager {root_page_id, buffer_pool, marker: PhantomData}
+        BPlusTreeManager {root_page_id: Arc::new(root_page_id), buffer_pool, marker: PhantomData}
+    }
+
+    /// Open a handle that SHARES `root` with every other handle built from the same cell.
+    ///
+    /// This is the constructor a statement should use, so a root split performed by one statement
+    /// is seen by another's descent and the retry in `read_leaf_for` can fire. `open` below keeps
+    /// the private-cell behaviour for callers that genuinely own the tree alone — recovery, and
+    /// one-shot page-freeing.
+    pub fn open_shared(root: Arc<AtomicU32>, buffer_pool: Arc<BufferPoolManager>) -> Self {
+        Self { root_page_id: root, buffer_pool, marker: PhantomData }
+    }
+
+    /// The shared root cell, for registering this tree so later handles can share it.
+    pub fn root_cell(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.root_page_id)
     }
 
     // allocates empty root leaf
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let root_page_id = buffer_pool.new_page()?;
         let root_node = BPlusTreeLeafPage::<K, V>::new(root_page_id);
-        let tree = Self {root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData};
+        let tree = Self {root_page_id: Arc::new(AtomicU32::new(root_page_id)), buffer_pool, marker: PhantomData};
         let guard = tree.latches().write(root_page_id);
         tree.write_page(root_page_id, root_node.serialize()?)?;
         drop(guard);
         Ok(tree)
     }
 
+    /// Open a handle with a **private** root cell.
+    ///
+    /// ⚠ Two handles opened this way over one tree do NOT see each other's root splits, and the
+    /// retry in `read_leaf_for` cannot fire between them. That is correct only for a caller that
+    /// owns the tree alone for the duration — recovery, and one-shot page-freeing. Everything on
+    /// a statement path wants [`open_shared`].
     pub fn open(root_page_id: u32, buffer_pool: Arc<BufferPoolManager>) -> Self{
-        Self { root_page_id: AtomicU32::new(root_page_id), buffer_pool, marker: PhantomData }
+        Self { root_page_id: Arc::new(AtomicU32::new(root_page_id)), buffer_pool, marker: PhantomData }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -179,7 +215,141 @@ impl<K: Ord + Clone + BTreeSerialize,V: Clone + BTreeSerialize + Ord> BPlusTreeM
     /// answer sound: a split of the child has to write-latch the parent, so while this thread
     /// holds the parent in read mode the child cannot be split away from under the pointer it
     /// just read.
+    /// The point-read descent, **taking nothing shared** — D58.
+    ///
+    /// The latched crabbing below (`read_leaf_for_latched`) is correct and was the wall: the
+    /// latch table is one mutex for every page, and even a per-page latch writes the root's word
+    /// once per read, which D51 measured as the ×0.12 class at 16 threads
+    /// (`bench/d51_sharedword_probe.txt`; `bench/d58_profile_16T_read_window.sample.txt`). This
+    /// path reads each page as a torn-free snapshot through the frame's seqlock shadow
+    /// (`BufferPoolManager::read_page_optimistic`) — loads only — and repairs a stale descent the
+    /// way Lehman & Yao's B-link tree does: a split writes the new right sibling first, then the
+    /// halved leaf with its `next` set, then the parent, so a reader that descended through a
+    /// parent from before the split lands on a leaf to the LEFT of the key's true leaf, and walks
+    /// `next` while the leaf's largest key is below the key. Internal nodes have no `next`, but a
+    /// stale internal node sends the reader down its LAST child, whose subtree tops out below the
+    /// key, and the leaf chain is global across the level — so the leaf walk repairs a stale
+    /// descent at any height. Nothing here validates the parent, and nothing needs to.
+    ///
+    /// Both loops are bounded; past the bound, or on any page that is not resident under its
+    /// hint, the latched path answers. It is always correct, only slow.
+    ///
+    /// What makes a snapshot safe to descend: leaves never go underfull (nothing frees a tree
+    /// page except `free_all`, under the exclusive catalog lock with readers drained), so a page
+    /// this reader copied cannot have been reused as something else mid-descent.
     fn read_leaf_for(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
+        const RESTARTS: usize = 16;
+        const RIGHT_WALK: usize = 64;
+        'restart: for _ in 0..RESTARTS {
+            let root = self.root_page_id.load(Ordering::Acquire);
+            let Some(page) = self.buffer_pool.read_page_optimistic(root) else { continue 'restart };
+            // A root split moved the root cell; the page read was the OLD root, which is now an
+            // ordinary child — descending it would still be repaired by the leaf walk, but it is
+            // cheaper to start again from the new root than to walk half the level.
+            if self.root_page_id.load(Ordering::Acquire) != root {
+                continue 'restart;
+            }
+            let node = match BPlusTreePage::<K, V>::deserialize(page.data) {
+                Ok(n) if Self::header_page_id(&n) == root => n,
+                _ => continue 'restart,
+            };
+            match self.descend_optimistic(node, root, key, RIGHT_WALK)? {
+                Some(found) => return Ok(found),
+                None => continue 'restart,
+            }
+        }
+        self.read_leaf_for_latched(key)
+    }
+
+    /// The body of [`Self::read_leaf_for`] from an already-copied starting page: descend by
+    /// snapshots, then walk right at the leaf. `Ok(None)` means "restart" — a page was not
+    /// resident under its hint, a snapshot tore, or the walk exceeded `right_walk` hops.
+    ///
+    /// Public and hidden because it is a TEST SEAM: `tests/d58_latch_free_descent.rs` hands it a
+    /// root snapshot taken BEFORE a split and asserts the moved key is still found — the
+    /// interleaving the B-link walk exists for, which cannot be forced through `read_leaf_for`
+    /// without pausing a writer mid-split. Not part of the API; nothing else may call it.
+
+    /// The page id a snapshot's own header claims. **A second, independent identity check.**
+///
+    /// The shadow's `label` says which page the frame's bytes are; this says which page the BYTES
+    /// say they are. They are written by different code at different times, so requiring both to
+    /// equal the page we asked for turns any future label lie — the kind a fresh-context review found
+    /// in D58's first version, where a relabelled frame published the outgoing page's bytes — from a
+    /// silently wrong answer into a restart. Costs one `u32` read of a buffer already in hand.
+    fn header_page_id(page: &BPlusTreePage<K, V>) -> u32 {
+        match page {
+            BPlusTreePage::Internal(n) => n.page_id,
+            BPlusTreePage::Leaf(l) => l.page_id,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn descend_optimistic(
+        &self,
+        mut node: BPlusTreePage<K, V>,
+        mut curr: u32,
+        key: &K,
+        right_walk: usize,
+    ) -> Result<Option<(u32, BPlusTreeLeafPage<K, V>)>, FerroError> {
+        // Bounded like the walk, and for the same reason: a snapshot is a copy of bytes that may
+        // be mid-rewrite, so an internal node can point at a page that points back at it. A
+        // latched descent cannot loop (it holds the pages it passed); this one can, and "restart,
+        // then fall back to the latched path" is the honest answer. The bound is far above any
+        // real height — a 4 KB page holds >100 keys, so 32 levels is >10^64 rows.
+        const MAX_DEPTH: usize = 32;
+        for _ in 0..MAX_DEPTH {
+            match node {
+                BPlusTreePage::Leaf(mut leaf) => {
+                    // B-link repair: the key may have moved right in a split this descent did
+                    // not see. Walk while the leaf cannot contain the key — it tops out below it,
+                    // **or it is empty.**
+                    //
+                    // The empty case is not hypothetical and `is_some_and` got it wrong: it is
+                    // false for an empty leaf, so the walk stopped there and returned it, and the
+                    // key read as absent. `BPlusTreeManager::delete` removes an entry and writes
+                    // the page back with no rebalance (`handle_underflow` is an honest refusal),
+                    // and `execution::insert`'s key reuse does exactly `delete(key)` then
+                    // `insert(key, rid)` — so a leaf holding one key is empty between those two
+                    // writes, and a concurrent optimistic reader walking past it saw the gap.
+                    // Found by a fresh-context review; `no_workload_drives_a_leaf_underfull` pins
+                    // occupancy for the SQL paths and says nothing about this window.
+                    let mut hops = 0;
+                    while leaf.key_arr.last().is_none_or(|max| max < key) {
+                        let Some(next) = leaf.next else { break };
+                        hops += 1;
+                        if hops > right_walk {
+                            return Ok(None);
+                        }
+                        let Some(np) = self.buffer_pool.read_page_optimistic(next) else { return Ok(None) };
+                        match BPlusTreePage::<K, V>::deserialize(np.data) {
+                            Ok(BPlusTreePage::Leaf(l)) if l.page_id == next => {
+                                curr = next;
+                                leaf = l;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    return Ok(Some((curr, leaf)));
+                }
+                BPlusTreePage::Internal(n) => {
+                    let child = n.find_child(key);
+                    let Some(cp) = self.buffer_pool.read_page_optimistic(child) else { return Ok(None) };
+                    node = match BPlusTreePage::<K, V>::deserialize(cp.data) {
+                        Ok(n) if Self::header_page_id(&n) == child => n,
+                        _ => return Ok(None),
+                    };
+                    curr = child;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The latched descent: read-crabbing from the root. Correct under every interleaving, and
+    /// the fallback for [`Self::read_leaf_for`] when a page is not resident or a snapshot keeps
+    /// tearing. See the ordering discipline in `page_latch.rs`.
+    fn read_leaf_for_latched(&self, key: &K) -> Result<(u32, BPlusTreeLeafPage<K, V>), FerroError> {
         loop {
             let root = self.root_page_id.load(Ordering::Acquire);
             let mut guard = self.latches().read(root);
@@ -624,7 +794,7 @@ mod tests {
         let root_id = tree.root_page_id.load(Ordering::Relaxed);
 
         let frame_i = tree.buffer_pool.fetch_page(root_id).unwrap();
-        let mut frame = tree.buffer_pool.frames[frame_i].write().unwrap();
+        let mut frame = tree.buffer_pool.frame_write(frame_i);
         let mut leaf = BPlusTreeLeafPage::<Value, Value>::deserialize(frame.data).unwrap();
         let key = Value::Integer(69);
         let val = Value::Integer(6767);

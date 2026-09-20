@@ -119,6 +119,15 @@ fn walk_newest(dir: &Path) -> Option<std::time::SystemTime> {
     let mut newest = None;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
+        // **A `src/**/tests_*.rs` file does not link into an example binary**, so editing one
+        // cannot make that binary stale — and `cargo build --examples` correctly does not rebuild
+        // for it, because those modules are `#[cfg(test)]` and are not part of the lib's non-test
+        // fingerprint. Counting them made this guard fire on a tree whose examples WERE fresh:
+        // one edit to `src/consensus/tests_transport.rs` failed 53 tests across 5 targets.
+        // The convention is enforced, not assumed — see `test_only_sources_are_cfg_test_gated`.
+        if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")) {
+            continue;
+        }
         let t = if p.is_dir() {
             walk_newest(&p)
         } else {

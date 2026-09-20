@@ -29,7 +29,7 @@ use std::sync::{Mutex, RwLock};
 
 use crate::branch::record::{CoreRecord, BranchRecord, CapabilityEnvelope};
 use crate::branch::types::{
-    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId, MAX_BRANCH_DEPTH,
+    ArenaId, BranchError, BranchId, BranchState, Epoch, LeaseDeadline, PageId,
 };
 use crate::branch::BranchCatalog;
 use crate::error::FerroError;
@@ -424,9 +424,6 @@ impl BranchCatalog for LogBranchCatalog {
             .ok_or(BranchError::NotFound(parent))?
             .depth
             .saturating_add(1);
-        if depth > MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch, depth }.into());
-        }
         let mut rec = rec.clone();
         rec.parent_id = Some(parent);
         rec.fork_epoch = fork_epoch;
@@ -744,7 +741,6 @@ impl BranchCatalog for LogBranchCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branch::types::MAX_BRANCH_DEPTH;
 
     fn cat() -> LogBranchCatalog {
         LogBranchCatalog::in_memory(1)
@@ -945,15 +941,22 @@ mod tests {
     }
 
     #[test]
-    fn depth_guard_refuses_the_ninth_fork() {
+    fn a_chain_far_past_the_old_cap_forks_and_reports_its_depth() {
+        // **This asserted the opposite until D60**, when the cap was removed: it forked eight
+        // times, checked `depth == MAX_BRANCH_DEPTH`, and required the ninth fork to fail. The
+        // requirement changed (fork and read are flat to depth 250 — `bench/d60_depth_premise.txt`),
+        // so the test asserts the new one: a chain goes far past eight and every record knows its
+        // own depth, including past 255 where the field used to be a byte.
         let c = cat();
         let mut cur = BranchId::TRUNK;
-        for _ in 0..MAX_BRANCH_DEPTH {
-            cur = c.fork(cur, LeaseDeadline(1)).unwrap().branch_id;
+        const DEEP: u32 = 300;
+        for i in 1..=DEEP {
+            cur = c.fork(cur, LeaseDeadline(1_000_000)).unwrap_or_else(|e| {
+                panic!("fork at depth {i} refused: {e}")
+            }).branch_id;
+            assert_eq!(c.get(cur).unwrap().depth, i, "depth at level {i}");
         }
-        assert_eq!(c.get(cur).unwrap().depth, MAX_BRANCH_DEPTH);
-        let err = c.fork(cur, LeaseDeadline(1)).unwrap_err();
-        assert!(err.to_string().contains("depth"), "got {}", err);
+        assert_eq!(c.get(cur).unwrap().depth, DEEP);
     }
 
     #[test]

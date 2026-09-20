@@ -57,6 +57,94 @@ pub enum Outcome {
     Ok,
 }
 
+/// Run `stmt` against a SHARED catalog, or answer `None` if it needs the catalog exclusively.
+///
+/// # Why this returns `Option` rather than a `is_read()` predicate
+///
+/// A predicate would let a caller ask "is this a read?" and then run it down the write path
+/// anyway — two places that must agree, which is how a dispatcher and an executor drift apart.
+/// Here the only way to learn a statement is a read is to have it executed, so there is nothing
+/// to keep in sync.
+///
+/// # Why it is safe to run this without the exclusive catalog lock
+///
+/// Three facts, each measured or read rather than assumed:
+///
+/// * The read path never needed `&mut`. D51 changed `ExecCtx.catalog` to `&Catalog` and asked the
+///   compiler: **two error sites in the whole crate, both writes** (`bench/d51_type_probe.txt`).
+/// * A reader's catalog may be a slightly stale SNAPSHOT, and that is safe for page identity
+///   because D53 made the B+tree root cell shared — `plan::open_table` descends from the live
+///   cell, not from the snapshot's recorded `primary_index_root`.
+/// * Schema changes are what a stale snapshot would get wrong, and `Catalog::epoch` moves on
+///   exactly those, so the caller re-snapshots. A root move does NOT move the epoch, which is the
+///   whole reason a write statement no longer invalidates every reader's cache.
+pub fn try_run_read(
+    stmt: &Stmt,
+    catalog: &Catalog,
+    bp: Arc<BufferPoolManager>,
+    txn: Arc<TxnManager>,
+    session: &mut Session,
+) -> Option<Result<Outcome, FerroError>> {
+    // Same order as `run`: a view name is not in `Catalog::tables`, so every other route would
+    // reject it as an unknown table.
+    if let Some(answer) = system_views::intercept(stmt, catalog, session.runtime.as_ref()) {
+        return Some(answer.map(Outcome::Table));
+    }
+    match stmt {
+        Stmt::Explain(s) => Some(explain((**s).clone(), catalog).map(Outcome::Explain)),
+
+        // An agent-session SELECT of the session's OWN branch. `AgentRuntime::select` takes a
+        // `ReadCtx` since D52, so this is a read all the way down.
+        //
+        // ⛔ `from.as_of.is_none()` is load-bearing and was missing. `run` routes an
+        // `AS OF BRANCH x` select through `run_agent_stmt`, whose `SelectAsOf` arm reads the
+        // **named** branch; without this guard the arm below caught those too and read
+        // `session.agent.branch` — the session's own branch — so `AS OF BRANCH x` silently
+        // answered from the wrong branch. `tests/d54_as_of_in_session.rs` fails without it.
+        // Letting `AS OF` fall through to `None` costs it the shared path and keeps `run` the
+        // single implementation of what `AS OF` means.
+        Stmt::Select { from, .. } if session.agent.is_some() && from.as_of.is_none() => {
+            let runtime = session.runtime.clone();
+            let branch = session.agent.as_ref().map(|a| a.branch)?;
+            let ctx = crate::agent_sql::runtime::ReadCtx { catalog, bp, txn };
+            Some(runtime.select(&ctx, branch, stmt, Some(branch)).map(Outcome::Rows))
+        }
+
+        // A plain SELECT outside any agent session. `AS OF BRANCH` is excluded here because
+        // `is_agent_stmt` routes it through the agent path, which needs a session.
+        Stmt::Select { from, .. } if from.as_of.is_none() => {
+            let view = Arc::new(match session.current {
+                Some(txn_id) => match txn.snapshot_of(txn_id) {
+                    Ok(snapshot) => ReadView { snapshot: Arc::new(snapshot), txn_id },
+                    Err(e) => return Some(Err(e)),
+                },
+                None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 },
+            });
+            match plan(stmt.clone(), catalog, bp, None, view) {
+                Ok(Plan::Read(mut root)) => {
+                    let mut res = Vec::new();
+                    loop {
+                        match root.next() {
+                            Some(Ok((_, values))) => res.push(values),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => break,
+                        }
+                    }
+                    Some(Ok(Outcome::Rows(res)))
+                }
+                // A SELECT that planned to a write is not something to guess about.
+                Ok(Plan::Write(_)) => Some(Err(FerroError::Internal(
+                    "a SELECT planned to a write plan; the shared read path refuses rather than \
+                     running it without the exclusive catalog".into(),
+                ))),
+                Err(e) => Some(Err(e)),
+            }
+        }
+
+        _ => None,
+    }
+}
+
 pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: Arc<TxnManager>, session: &mut Session) -> Result<Outcome, FerroError> {
     // B9 — read-only system views over the agent layer, checked BEFORE every other route.
     //
@@ -139,8 +227,8 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                 ));
             }
             let view = Arc::new(match session.current {
-                Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id },
-                None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+                Some(txn_id) => ReadView { snapshot: Arc::new(txn.snapshot_of(txn_id)?), txn_id },
+                None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 }
             });
             let mut op = FullTextSearch::open(catalog, &table, &column_name, &query, top_k, bp.clone(), view)?;
             let mut rows = Vec::new();
@@ -312,8 +400,8 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
         dml => {
             if matches!(dml, Stmt::Select { .. }) {
                 let view = Arc::new(match session.current {
-                    Some(txn_id) => ReadView { snapshot: txn.snapshot_of(txn_id)?, txn_id},
-                    None => ReadView { snapshot: txn.read_snapshot(), txn_id: 0 }
+                    Some(txn_id) => ReadView { snapshot: Arc::new(txn.snapshot_of(txn_id)?), txn_id},
+                    None => ReadView { snapshot: txn.read_snapshot_cached(), txn_id: 0 }
                 });
                 match plan(dml, catalog, bp.clone(), None, view)? {
                     Plan::Read(mut root) => {
@@ -336,7 +424,7 @@ pub fn run(stmt: Stmt, catalog: &mut Catalog, bp: Arc<BufferPoolManager>, txn: A
                     None => (txn.begin()?, true)
                 };
                 let view = match txn.snapshot_of(txn_id) {
-                    Ok(snapshot) => Arc::new(ReadView { snapshot, txn_id }),
+                    Ok(snapshot) => Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id }),
                     Err(e) => {
                         txn.abort(txn_id)?;
                         session.current = None;

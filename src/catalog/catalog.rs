@@ -9,32 +9,126 @@ use crate::storage::index::BPlusTreeManager;
 use crate::storage::heap_file_manager::RecordId;
 use crate::catalog::column::{DataType, Value};
 use crate::storage::index_fulltext::{indexed_text, post_tokens};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::catalog::schema::Schema;
 
+#[derive(Clone)]
 pub struct Catalog {
     pub tables: HashMap<String, TableEntry>,
+    /// **Monotone change counter per table — D69. Deliberately NOT serialized**, like
+    /// `root_cells` below: it exists to detect movement WITHIN a process, between the moment a
+    /// merge is scored and the moment it is published, and a value that survived a restart would
+    /// be comparing against a base that no longer exists anyway.
+    ///
+    /// # Why a counter and not the fingerprint it replaces
+    ///
+    /// `agent_sql::runtime` used to answer "did the base move?" by SCANNING every row of every
+    /// touched table and hashing it — twice per merge, once at scoring and once at publication
+    /// (`evaluate_merge` and `fingerprint_tables`). Measured at 1.87 us/row (D68,
+    /// `bench/d68_merge_is_o_table.txt`): ~1.9 SECONDS per merge against a million-row table, to
+    /// write four rows. Comparing two `u64`s is O(1) and answers the same question.
+    ///
+    /// It is also STRICTLY STRONGER than the hash it replaces. A fingerprint cannot see a change
+    /// that was reverted before it looked; a monotone counter can, because it never goes back.
+    ///
+    /// ⚠ **Every committed row change must bump it, not only agent merges.** The hash it replaces
+    /// was computed by scanning the real table, so it saw ordinary `INSERT`/`UPDATE`/`DELETE` as
+    /// well. A counter bumped only on the agent path would miss direct writes and weaken the
+    /// staleness check silently — which is worse than the cost it removes. Keyed by
+    /// `agent_sql::runtime::table_id`'s FNV-1a hash of the name, so both sides agree without the
+    /// catalog minting ids.
+    table_versions: HashMap<u32, u64>,
     pub buffer_pool: Arc<BufferPoolManager>,
     pub first_catalog_page_id: u32,
     pub stats: HashMap<String, TableStats>,
+    /// **Shared root cells, one per tree.** Deliberately NOT serialized — it is derived from
+    /// `tables` and rebuilt by [`Catalog::sync_root_cells`].
+    ///
+    /// # Why it exists
+    ///
+    /// `BPlusTreeManager::open` wraps the catalog's recorded root in a *private* atomic, so two
+    /// statements over one table held two independent root pointers and the root-split retry in
+    /// `read_leaf_for` compared a private value against itself — it could never fire. Handing
+    /// every statement the SAME cell is what makes that guard live. See `SCALE-DESIGN` D53.
+    ///
+    /// Keyed `(table, None)` for the primary index and `(table, Some(column))` for a secondary or
+    /// full-text one.
+    roots: HashMap<(String, Option<String>), Arc<AtomicU32>>,
+    /// Bumped by every change to the SCHEMA — and deliberately **not** by a root move.
+    ///
+    /// A reader caches a snapshot of this catalog and re-takes it only when this number changes.
+    /// Before D53 a root move had to invalidate every snapshot, because `primary_index_root` was
+    /// the authoritative pointer a reader descended from; now the registry above hands out a
+    /// SHARED cell that a split updates in place, so a snapshot whose recorded root is stale is
+    /// still correct — `open_table` reads the cell, not the record. That is the whole reason a
+    /// write statement no longer invalidates every reader's cache.
+    epoch: u64,
 }
 
 impl Catalog {
     pub fn create(buffer_pool: Arc<BufferPoolManager>) -> Result<Self, FerroError> {
         let page_id = buffer_pool.new_page()?; // = 1 on a fresh DB
         let frame_i = buffer_pool.fetch_page(page_id)?;
-        let mut frame = buffer_pool.frames[frame_i].write().unwrap();
+        let mut frame = buffer_pool.frame_write(frame_i);
         let page = CatalogPage::new(page_id);
         frame.data = page.serialize()?;
         drop(frame);
         buffer_pool.unpin_page(page_id, true);
-        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new()})
+        Ok(Self {tables: HashMap::new(), buffer_pool: buffer_pool.clone(), first_catalog_page_id: 1, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0})
     }
 
     pub fn open(buffer_pool: Arc<BufferPoolManager>, first_catalog_page_id: u32) -> Result<Self, FerroError>{
-        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new()};
+        let mut catalog = Self {tables: HashMap::new(), buffer_pool, first_catalog_page_id, stats: HashMap::new(), table_versions: HashMap::new(), roots: HashMap::new(), epoch: 0};
         catalog.load()?;
         Ok(catalog)
+    }
+
+    /// The SHARED root cell for a tree, or `None` if this catalog has never seen it.
+    ///
+    /// Read-only and lock-free: the map is populated by [`Catalog::sync_root_cells`] from the
+    /// `&mut self` paths, so a reader holding only `&Catalog` does a plain hash lookup.
+    pub fn root_cell(&self, table: &str, column: Option<&str>) -> Option<Arc<AtomicU32>> {
+        self.roots.get(&(table.to_string(), column.map(|c| c.to_string()))).cloned()
+    }
+
+    /// The schema epoch. A reader compares this with one relaxed load and re-snapshots only when
+    /// it moves. See the field's own doc for why a root move does not move it.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Bump the schema epoch from another module in this crate (the ALTER path lives in
+    /// `catalog::alter`). `pub(crate)` on purpose: nothing outside the catalog may invalidate
+    /// every reader's snapshot.
+    pub(crate) fn epoch_bump(&mut self) {
+        self.epoch += 1;
+    }
+
+    /// Ensure every tree named in `tables` has a shared root cell.
+    ///
+    /// **Creates missing cells; never overwrites an existing one.** That asymmetry is the whole
+    /// correctness argument: an existing cell may already be shared with a live handle whose
+    /// split has advanced it past the value recorded on the catalog page, and clobbering it would
+    /// hand the next reader a root that has moved. A missing cell has no such history, so seeding
+    /// it from the durable record is right.
+    pub fn sync_root_cells(&mut self) {
+        let mut want: Vec<((String, Option<String>), u32)> = Vec::new();
+        for (name, entry) in self.tables.iter() {
+            want.push(((name.clone(), None), entry.primary_index_root));
+            for idx in entry.indexes.iter() {
+                want.push(((name.clone(), Some(idx.column_name.clone())), idx.root_page_id));
+            }
+            for ft in entry.fulltext_indexes.iter() {
+                want.push(((name.clone(), Some(ft.column_name.clone())), ft.root_page_id));
+            }
+        }
+        for (key, root) in want {
+            self.roots.entry(key).or_insert_with(|| Arc::new(AtomicU32::new(root)));
+        }
+        // Drop cells for tables this catalog no longer holds, so a DROP+CREATE of the same name
+        // cannot inherit the old tree's pointer.
+        let live: std::collections::HashSet<&String> = self.tables.keys().collect();
+        self.roots.retain(|(t, _), _| live.contains(t));
     }
 
     pub fn create_table(&mut self, name: String, schema: Schema) -> Result<(), FerroError> {
@@ -77,6 +171,10 @@ impl Catalog {
         };
         self.tables.insert(name, entry);
         self.persist()?;
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
+        self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -145,6 +243,10 @@ impl Catalog {
         entry.indexes.push(IndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
         self.persist()?;
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
+        self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -205,6 +307,10 @@ impl Catalog {
         entry.fulltext_indexes.push(FullTextIndexInfo { column_name: column.to_string(), root_page_id: new_root_id });
 
         self.persist()?;
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
+        self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -248,6 +354,10 @@ impl Catalog {
         self.tables.remove(name);
         self.stats.remove(name);
         self.persist()?;
+        // The set of trees changed, so seed (or retire) their shared root cells, and tell
+        // every cached reader snapshot that the schema moved.
+        self.sync_root_cells();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -256,6 +366,12 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.primary_index_root = new_root;
         self.persist()?;
+        // Keep the SHARED cell in step with the durable record. A split stores into the cell and
+        // then calls this, so the two usually already agree; a caller that sets the root directly
+        // (tests, ALTER) would otherwise leave the cell pointing at the old tree.
+        if let Some(cell) = self.roots.get(&(table.to_string(), None)) {
+            cell.store(new_root, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -263,6 +379,9 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.indexes.iter_mut().find(|ind| ind.column_name == column).ok_or(FerroError::KeyNotFound)?.root_page_id = new_root;
         self.persist()?;
+        if let Some(cell) = self.roots.get(&(table.to_string(), Some(column.to_string()))) {
+            cell.store(new_root, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -274,7 +393,40 @@ impl Catalog {
         let entry = self.tables.get_mut(table).ok_or(FerroError::KeyNotFound)?;
         entry.fulltext_indexes.iter_mut().find(|ind| ind.column_name == column).ok_or(FerroError::KeyNotFound)?.root_page_id = new_root;
         self.persist()?;
+        if let Some(cell) = self.roots.get(&(table.to_string(), Some(column.to_string()))) {
+            cell.store(new_root, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Record that `table` changed. Called from every committed write path.
+    ///
+    /// Takes the table NAME and hashes it the same way `agent_sql::runtime::table_id` does, so the
+    /// merge path can look the counter up without the catalog minting ids.
+    pub fn bump_table_version(&mut self, table: &str) {
+        let id = Self::table_version_key(table);
+        *self.table_versions.entry(id).or_insert(0) += 1;
+    }
+
+    /// The current change counter for a table id, or 0 if it has never been written.
+    ///
+    /// 0 for "never written" is correct rather than convenient: a table nobody has written cannot
+    /// have moved, and two reads of 0 compare equal exactly as two reads of any other value do.
+    pub fn table_version(&self, id: u32) -> u64 {
+        self.table_versions.get(&id).copied().unwrap_or(0)
+    }
+
+    /// FNV-1a over the name — byte for byte what `agent_sql::runtime::table_id` computes.
+    ///
+    /// Duplicated rather than imported because `catalog` must not depend on `agent_sql`; the
+    /// duplication is pinned by a test that asserts the two agree, so it cannot drift silently.
+    pub fn table_version_key(table: &str) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in table.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
     }
 
     pub fn persist(&self) -> Result<(), FerroError> {
@@ -322,7 +474,7 @@ impl Catalog {
                     // accept all-zeroes, which would let a genuinely corrupt page through.
                     let frame_i = self.buffer_pool.fetch_page(new_id)?;
                     {
-                        let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+                        let mut frame = self.buffer_pool.frame_write(frame_i);
                         frame.data = CatalogPage::new(new_id).serialize()?;
                     }
                     self.buffer_pool.unpin_page(new_id, true);
@@ -336,7 +488,7 @@ impl Catalog {
             let next = page.next_catalog_page;
 
             {
-                let mut frame = self.buffer_pool.frames[frame_i].write().unwrap();
+                let mut frame = self.buffer_pool.frame_write(frame_i);
                 frame.data = page.serialize()?;
             }
             self.buffer_pool.unpin_page(curr_page_id, true);
@@ -379,6 +531,10 @@ impl Catalog {
             }
             curr_page_id = cat_page.next_catalog_page;
         }
+        // Seed the shared root cells from the records just loaded.
+        self.sync_root_cells();
+        // `load` replaces `tables` wholesale, so anything cached against this catalog is stale.
+        self.epoch += 1;
         Ok(())
     }
 
@@ -411,6 +567,8 @@ impl Catalog {
             ColumnStats {distinct: vals.len(), nulls: nulls[i], min, max}
         }).collect();
         self.stats.insert(table.to_string(), TableStats { row_count, columns});
+        // Stats feed the planner, so a reader's cached snapshot must be told.
+        self.epoch += 1;
         Ok(())
     }
 

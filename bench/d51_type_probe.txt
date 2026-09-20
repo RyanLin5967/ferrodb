@@ -1,0 +1,95 @@
+D51-STATEMENT-CONCURRENCY — THE COMPILER AS THE INSTRUMENT
+==========================================================
+[HERE] this session, on a throwaway worktree of 3267451 (created with wt new, now reaped).
+
+THE QUESTION
+------------
+D50 measured ferrodb's server flat: 15 extra threads buy nothing, because
+src/execution/executor.rs:60 is
+
+    pub fn run(stmt: Stmt, catalog: &mut Catalog, ...) -> Result<Outcome, FerroError>
+
+and src/pgwire/mod.rs:64 holds one Mutex<Catalog>, taken outermost for a whole statement
+(mod.rs:100 says so in its own lock-ordering note). The question that decides whether that is
+fixable at all: DOES A READ ACTUALLY NEED THE CATALOG TO BE MUTABLE?
+
+"&mut" is a TYPE decision, and a type decision has a better instrument than reading the code.
+
+THE PROBE
+---------
+One type changed, in a worktree, never committed to a lane:
+
+    src/agent_sql/runtime.rs:88
+    -    pub catalog: &'a mut Catalog,
+    +    pub catalog: &'a Catalog,
+
+RESULT: the ENTIRE crate produces exactly TWO error sites, and NEITHER is on a read path.
+    Checking ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D51-probe)
+error[E0308]: mismatched types
+    --> src/agent_sql/runtime.rs:4698:24
+     |
+4698 |             op.execute(ctx.catalog)
+     |                ------- ^^^^^^^^^^^ types differ in mutability
+     |                |
+     |                arguments to this method are incorrect
+     |
+     = note: expected mutable reference `&mut Catalog`
+                        found reference `&Catalog`
+note: method defined here
+    --> src/execution/executor.rs:31:8
+     |
+  31 |     fn execute(&mut self, catalog: &mut Catalog) -> Result<usize, FerroError>;
+     |        ^^^^^^^            -------
+
+error[E0596]: cannot borrow `*ctx.catalog` as mutable, as it is behind a `&` reference
+    --> src/agent_sql/runtime.rs:3098:26
+     |
+3098 |             let shapes = ctx.catalog.apply_plan(plan, &ctx.txn)?;
+     |                          ^^^^^^^^^^^ cannot borrow as mutable
+     |
+help: consider changing this to be mutable
+     |
+  88 |     pub catalog: &'a mut Catalog,
+     |                      +++
+
+Some errors have detailed explanations: E0308, E0596.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `ferrodb` (lib) due to 2 previous errors
+
+--all-targets (so tests/ and examples/ compile too): the SAME two sites, nothing new.
+  2 x src/agent_sql/runtime.rs:4698   (once per compilation unit)
+  1 x src/agent_sql/runtime.rs:3098
+
+WHAT THE TWO SITES ARE
+----------------------
+  runtime.rs:4698   op.execute(ctx.catalog)
+                    -> WriteOp::execute(&mut self, catalog: &mut Catalog)  (executor.rs:31)
+                    THE WRITE PATH.
+  runtime.rs:3098   ctx.catalog.apply_plan(plan, &ctx.txn)
+                    A schema/plan application. ALSO A WRITE.
+
+AND THE READ SIDE IS ALREADY IMMUTABLE, THROUGHOUT
+--------------------------------------------------
+  src/planner/plan.rs:11    pub fn plan(stmt, catalog: &Catalog, ...)
+  src/planner/plan.rs:85    pub fn explain(stmt, catalog: &Catalog)
+  src/binder/binder.rs:181  pub fn new(catalog: &'a Catalog)
+  src/catalog/catalog.rs:15 Catalog { tables, buffer_pool: Arc<BufferPoolManager>,
+                              first_catalog_page_id, stats } -- buffer_pool is ALREADY an Arc
+                              and already internally synchronised, so it needs no &mut.
+
+=> The serialization is NOT a property of what a read does. It is ONE type signature,
+   propagated from two write-side call sites to every statement the server runs.
+
+WHAT THIS DOES NOT SAY
+----------------------
+It does not say the fix is cheap, and it does NOT say the standard answer (swap the Mutex for
+an RwLock) works. D49 measured, on turso, that a per-statement SHARED lock acquisition is
+itself an entire scaling wall: x0.308 total at 16 threads, with the readers doing LESS total
+work than one. A read path that takes &Catalog is the PREREQUISITE, not the mechanism.
+
+A HARNESS NOTE, BECAUSE IT NEARLY COST THE RESULT
+-------------------------------------------------
+The first capture of this probe used `cargo check 2>&1 > file`, which sends stderr to the OLD
+stdout (the terminal) and only stdout to the file. `grep -c '^error'` on the resulting empty
+log printed 0 -- a clean-looking zero produced by a discarded stream, which reads exactly like
+"nothing broke". Correct order is `> file 2>&1`.

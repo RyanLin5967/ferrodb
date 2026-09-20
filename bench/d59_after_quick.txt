@@ -1,0 +1,59 @@
+D59 — AFTER (falsifier 1): shared arm at 16 threads with the cached snapshot (99ea1d7).
+[HERE] 2026-09-19T17:51:59Z  d55_agent_read_scaling QUICK shared arm, staged=10, rows=5000
+BEFORE: x2.62/x2.64 one latch mutex -> x3.31 striped -> x5.68 latch-free descent (D58).
+PRIVATE CONTROL (the box): x9.90 / x10.37.
+PRE-REGISTERED: toward x10; under ~x7.5 means another shared write survived -- profile, do not explain.
+
+# QUICK: shared arm staged=10 only
+# round 0 order: 1 2 4 8 16
+#   1T -> 150160 stmt/s (slowest thread 151057)
+#   2T -> 219156 stmt/s (slowest thread 109504)
+#   4T -> 375563 stmt/s (slowest thread 94478)
+#   8T -> 695126 stmt/s (slowest thread 86199)
+#   16T -> 1168032 stmt/s (slowest thread 72680)
+# round 1 order: 2 4 8 16 1
+#   2T -> 237312 stmt/s (slowest thread 118608)
+#   4T -> 386571 stmt/s (slowest thread 97345)
+#   8T -> 737461 stmt/s (slowest thread 92128)
+#   16T -> 1215043 stmt/s (slowest thread 75586)
+#   1T -> 149612 stmt/s (slowest thread 149893)
+# round 2 order: 4 8 16 1 2
+#   4T -> 459927 stmt/s (slowest thread 115834)
+#   8T -> 761136 stmt/s (slowest thread 94245)
+#   16T -> 1237868 stmt/s (slowest thread 76843)
+#   1T -> 149412 stmt/s (slowest thread 149829)
+#   2T -> 256216 stmt/s (slowest thread 128720)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         149612       149612         1.000
+      2         237312       118656         1.586
+      4         386571        96643         2.584
+      8         737461        92183         4.929
+     16        1215043        75940         8.121
+threads   shared_vs_1T   shared_abs
+      1          1.000       149612
+      2          1.586       237312
+      4          2.584       386571
+      8          4.929       737461
+     16          8.121      1215043
+# rc= load=5.25 5.07 5.39
+
+READING: x5.68 -> x8.121 at 16 threads (903k -> 1,215,043 stmt/s), against a private-runtime
+control of x9.90/x10.37 on this box. The pre-registration said "under ~x7.5 means another shared
+write survived -- profile, do not explain"; x8.12 clears it, and the profile
+(bench/d59_profile_16T_after.sample.txt, read window, 16 threads) is the real result:
+
+  read_snapshot:  GONE. Zero frames. It was 17.4k of ~80k samples before this change.
+  page latch:     GONE (D58).
+  what is left:   NO ferrodb mutex above 17 samples. The top waiters are 5841 __semwait_signal
+                  with no ferrodb frame (the harness's own barrier between rounds), then
+                  bind_select at 17 and the touch queue at 16 -- noise, not a wall.
+
+The entire remaining profile is per-statement CPU: malloc/free 28.8k, memmove 8.4k, memset 3.4k,
+BPlusTreePage::deserialize. **The shared read path no longer blocks on anything.** The 8.12 vs the
+control's 9.90-10.37 is now allocator and copy work per statement (a page snapshot is a 4 KB copy,
+D58's cost), not contention -- which is a different row and an honest one: the next lever is doing
+less work per read, not removing another lock.
+
+⚠ Framing, unchanged: the SHAPE transfers -- version the transaction table and let a reader reuse
+its snapshot while nothing changed (Postgres 14 did exactly this for GetSnapshotData) -- and the
+stmt/s are ferrodb's own, on this box, with 16 agent readers.

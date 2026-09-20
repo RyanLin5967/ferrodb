@@ -1464,7 +1464,37 @@ fn a_hundred_agent_writes_across_three_branches_leave_only_forks_and_merges_in_t
         let bp = db.bp.clone();
         let txn = db.txn.clone();
         let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
-        let r = agents.merge(&mut ctx, cs.branch()).unwrap_or_else(|e| panic!("branch {row}: {e}"));
+        // ⚠ `FerroError::NotLeader` here is TRANSIENT BY CONTRACT, and the error text says so:
+        // "an election is in progress ... Retry shortly; do not treat this as the leader being
+        // down." `hold_leader` above establishes leadership, but NOTHING PUMPS HEARTBEATS between
+        // that call and this one, so on a slow machine the lease lapses and a follower starts an
+        // election in the gap. Treating a documented-retryable condition as fatal is a defect in
+        // this test, not in the merge: on 2026-09-20 it turned the whole Windows CI job red, on
+        // the SAME test that produced the unexplained STATUS_ACCESS_VIOLATION
+        // (bench/windows_access_violation.txt) — 34 passed, 1 failed, both times.
+        //
+        // This is NOT weakening the assertion. The claim is still that the merge succeeds and
+        // publishes; the retry only re-establishes the precondition the merge was always entitled
+        // to assume. Any OTHER error fails immediately, and running out of attempts fails loudly
+        // with the last error — a merge that never succeeds is still a red test.
+        //
+        // The retry path was FIRE-CHECKED by forcing the first attempt to return NotLeader: the
+        // test still passed, so the recovery works rather than merely compiling.
+        let mut attempt = 0;
+        let r = loop {
+            match agents.merge(&mut ctx, cs.branch()) {
+                Ok(r) => break r,
+                Err(FerroError::NotLeader { .. }) if attempt < 10 => {
+                    attempt += 1;
+                    drop(ctx);
+                    fleet.hold_leader(leader);
+                    let bp = db.bp.clone();
+                    let txn = db.txn.clone();
+                    ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
+                }
+                Err(e) => panic!("branch {row}: {e}"),
+            }
+        };
         drop(ctx);
         assert!(r.report.applied_to_target, "branch {row} did not publish");
         merged.push(r.merge_round.unwrap());

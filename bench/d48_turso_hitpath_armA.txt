@@ -1,0 +1,43 @@
+D48-TURSO-HITPATH — RAW, arm A (one shared Database, one connection per thread)
+================================================================================
+[HERE] measured by this session, 2026-09-18T22:08:12Z, on this box.
+[HERE] turso worktree /Users/idide/wt/turso-d48-hitpath at 53f153e07 Merge 'bindings/dotnet: add connection-string embedded replicas' from Marc-André Moreau
+[HERE] harness core/examples/d48_hitpath.rs (213 lines), release build,
+[HERE]   CARGO_TARGET_DIR=/Users/idide/wt/.d48-turso-target (private; turso's
+[HERE]   .cargo/config.toml pins rustflags and env but NOT target-dir, so this is honoured)
+[HERE] cold lib build of turso_core, release: 36.79 s wall, 150 crates, empty target dir.
+[HERE]   ⚠ This is NOT the 79.02 s the fork-decision agent reported: that number's scope
+[HERE]   was different (not lib-only, not release). 79.02 s therefore STAYS [AGENT] —
+[HERE]   an unreproduced number is not converted by measuring a different thing.
+[HERE] box: 18 cores, load 5.00 at launch, no cargo/rustc running.
+
+# connections probed: 4  distinct Arc<Pager>: 4
+# => the page cache is PRIVATE (one per connection) across connections
+# rows=2000 warmup=300ms measure=1s rounds=3
+# order is rotated per round: a within-round position bias has constant sign and
+# cannot be averaged away by repeating the same order.
+# round 0 order: 1 2 4 8 16
+#   1T -> 2583060 ops/s (slowest thread 2597701 iters)
+#   2T -> 1383880 ops/s (slowest thread 692474 iters)
+#   4T -> 1194051 ops/s (slowest thread 280898 iters)
+#   8T -> 834342 ops/s (slowest thread 102773 iters)
+#   16T -> 828180 ops/s (slowest thread 50634 iters)
+# round 1 order: 2 4 8 16 1
+#   2T -> 1689605 ops/s (slowest thread 851571 iters)
+#   4T -> 1197255 ops/s (slowest thread 288549 iters)
+#   8T -> 833227 ops/s (slowest thread 102507 iters)
+#   16T -> 832868 ops/s (slowest thread 51058 iters)
+#   1T -> 2472086 ops/s (slowest thread 2480041 iters)
+# round 2 order: 4 8 16 1 2
+#   4T -> 1200893 ops/s (slowest thread 292234 iters)
+#   8T -> 829340 ops/s (slowest thread 103367 iters)
+#   16T -> 827680 ops/s (slowest thread 50388 iters)
+#   1T -> 2505573 ops/s (slowest thread 2530659 iters)
+#   2T -> 1571891 ops/s (slowest thread 782421 iters)
+
+threads   total_ops_s   per_thread_ops_s   total_vs_1T   per_thread_vs_1T
+      1       2505573            2505573         1.000              1.000
+      2       1571891             785946         0.627              0.314
+      4       1197255             299314         0.478              0.119
+      8        833227             104153         0.333              0.042
+     16        828180              51761         0.331              0.021

@@ -1,0 +1,52 @@
+D58 — AFTER (falsifier 1): shared arm at 16 threads with the latch-free descent (30361de).
+[HERE] 2026-09-19T10:05:50Z  d55_agent_read_scaling QUICK shared arm, staged=10, rows=5000
+BEFORE: one latch mutex x2.62/x2.64; striped table x3.31; private control x9.90/x10.37 (16T).
+PRE-REGISTERED: toward x10; under ~x6 means a shared write survived on the descent -- profile, do not explain.
+
+# QUICK: shared arm staged=10 only
+# round 0 order: 1 2 4 8 16
+#   1T -> 158157 stmt/s (slowest thread 159740)
+#   2T -> 234573 stmt/s (slowest thread 117483)
+#   4T -> 419743 stmt/s (slowest thread 105774)
+#   8T -> 583490 stmt/s (slowest thread 72255)
+#   16T -> 917856 stmt/s (slowest thread 57486)
+# round 1 order: 2 4 8 16 1
+#   2T -> 234866 stmt/s (slowest thread 118484)
+#   4T -> 404114 stmt/s (slowest thread 100998)
+#   8T -> 593330 stmt/s (slowest thread 74138)
+#   16T -> 892017 stmt/s (slowest thread 55301)
+#   1T -> 160137 stmt/s (slowest thread 161741)
+# round 2 order: 4 8 16 1 2
+#   4T -> 407142 stmt/s (slowest thread 102216)
+#   8T -> 591388 stmt/s (slowest thread 73910)
+#   16T -> 903443 stmt/s (slowest thread 56394)
+#   1T -> 159148 stmt/s (slowest thread 159730)
+#   2T -> 233610 stmt/s (slowest thread 117641)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         159148       159148         1.000
+      2         234573       117287         1.474
+      4         407142       101786         2.558
+      8         591388        73924         3.716
+     16         903443        56465         5.677
+threads   shared_vs_1T   shared_abs
+      1          1.000       159148
+      2          1.474       234573
+      4          2.558       407142
+      8          3.716       591388
+     16          5.677       903443
+# rc= load=2.41 2.74 2.90
+
+READING: x2.62/x2.64 (one latch mutex) -> x3.31 (striped table) -> x5.68 (latch-free descent) at 16
+threads; 405k -> 525k -> 903k stmt/s. The pre-registration said "under ~x6 means a shared write
+survived on the descent -- find it in the profile". Found (bench/d58_profile_16T_after.sample.txt,
+read window, 16 threads): the page latch is GONE from the profile entirely -- zero page_latch
+frames, zero frame-lock waits -- and the blocking that remains is ONE site:
+    17.4k samples   TxnManager::read_snapshot <- scan_table_where <- visible_rows_where
+a mutex taken once per statement to open the read snapshot -- the read-mark class D49 measured in
+turso (x0.308) and the third time this project has met it. It was 5.5k samples behind the latch
+table before; with the latch gone it is the wall. The rest of the profile is CPU work per level
+(malloc/free/memmove/deserialize of the page snapshot), not a shared write.
+
+So the wall THIS row targeted is removed, measured by its absence from the profile, and the
+throughput it bought is capped by the next wall, which the design entry named before the build.
+That next wall is D59, not a caveat on D58.

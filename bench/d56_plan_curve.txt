@@ -1,0 +1,129 @@
+D56 — point-read throughput vs TABLE SIZE. The instrument is the SLOPE, not a ratio.
+[HERE] 2026-09-19T02:15:43Z  examples/d56_plan_curve.rs, one agent / one plain reader, staged=10
+FIX  = /Users/idide/wt/ferrodb-D56-statsless-index (aafe7ce, the unique-key fact)
+CTRL = /Users/idide/wt/ferrodb-D56-control (b117384, unchanged) — identical harness file
+CTRLA= the same CTRL binary with D56_ANALYZE=1: the CEILING, the plan the engine already trusted
+Order is a LATIN SQUARE over the three configs (R1 FIX,CTRL,CTRLA / R2 CTRL,CTRLA,FIX /
+R3 CTRLA,FIX,CTRL), because point-rotation cannot cancel a between-arm bias (D50).
+This box is NOT quiet: other sessions' builds are running. Load is printed at every point.
+O(table) => throughput falls ~1/N across sizes. O(log N) => flat.
+
+# round=1 load=10.47 13.41 13.09
+r1 FIX  arm=agent  rows=1000  analyze=false  median=145017 stmt/s  rounds=[145447, 145017, 144225]
+r1 FIX  arm=plain  rows=1000  analyze=false  median=165205 stmt/s  rounds=[162255, 165284, 165205]
+# round=1 load=9.62 13.08 12.98
+r1 CTRL  arm=agent  rows=1000  analyze=false  median=11750 stmt/s  rounds=[12603, 11750, 11441]
+r1 CTRL  arm=plain  rows=1000  analyze=false  median=12910 stmt/s  rounds=[12955, 12910, 11512]
+# round=1 load=9.14 12.81 12.88
+r1 CTRLA  arm=agent  rows=1000  analyze=true  median=141142 stmt/s  rounds=[138411, 141142, 144247]
+r1 CTRLA  arm=plain  rows=1000  analyze=true  median=164996 stmt/s  rounds=[165217, 164996, 162236]
+# round=1 load=13.53 13.60 13.17
+r1 FIX  arm=agent  rows=4000  analyze=false  median=141555 stmt/s  rounds=[142033, 141555, 140535]
+r1 FIX  arm=plain  rows=4000  analyze=false  median=156841 stmt/s  rounds=[154494, 159173, 156841]
+# round=1 load=13.95 13.65 13.20
+r1 CTRL  arm=agent  rows=4000  analyze=false  median=3327 stmt/s  rounds=[3214, 3327, 3382]
+r1 CTRL  arm=plain  rows=4000  analyze=false  median=3453 stmt/s  rounds=[3453, 3405, 3500]
+# round=1 load=19.51 15.18 13.78
+r1 CTRLA  arm=agent  rows=4000  analyze=true  median=139093 stmt/s  rounds=[139635, 136330, 139093]
+r1 CTRLA  arm=plain  rows=4000  analyze=true  median=137307 stmt/s  rounds=[137307, 139679, 134115]
+# round=1 load=14.95 14.55 13.61
+r1 FIX  arm=agent  rows=16000  analyze=false  median=135054 stmt/s  rounds=[135054, 134287, 135408]
+r1 FIX  arm=plain  rows=16000  analyze=false  median=149018 stmt/s  rounds=[149018, 148216, 150323]
+# round=1 load=5.70 11.15 12.38
+r1 CTRL  arm=agent  rows=16000  analyze=false  median=870 stmt/s  rounds=[836, 871, 870]
+r1 CTRL  arm=plain  rows=16000  analyze=false  median=785 stmt/s  rounds=[804, 771, 785]
+# round=1 load=8.47 10.29 11.84
+r1 CTRLA  arm=agent  rows=16000  analyze=true  median=123220 stmt/s  rounds=[123220, 125653, 122948]
+r1 CTRLA  arm=plain  rows=16000  analyze=true  median=102677 stmt/s  rounds=[114454, 102677, 100443]
+# round=2 load=17.61 14.17 13.22
+r2 CTRL  arm=agent  rows=1000  analyze=false  median=11202 stmt/s  rounds=[11048, 11585, 11202]
+r2 CTRL  arm=plain  rows=1000  analyze=false  median=11843 stmt/s  rounds=[11434, 11843, 12538]
+# round=2 load=17.13 14.23 13.25
+r2 CTRLA  arm=agent  rows=1000  analyze=true  median=138114 stmt/s  rounds=[136393, 138114, 138336]
+r2 CTRLA  arm=plain  rows=1000  analyze=true  median=151257 stmt/s  rounds=[151666, 151257, 148051]
+# round=2 load=15.74 14.06 13.21
+r2 FIX  arm=agent  rows=1000  analyze=false  median=137964 stmt/s  rounds=[137964, 140434, 126430]
+r2 FIX  arm=plain  rows=1000  analyze=false  median=149485 stmt/s  rounds=[145923, 149485, 149590]
+# round=2 load=14.10 13.77 13.12
+r2 CTRL  arm=agent  rows=4000  analyze=false  median=2982 stmt/s  rounds=[3013, 2982, 2934]
+r2 CTRL  arm=plain  rows=4000  analyze=false  median=3376 stmt/s  rounds=[3416, 3376, 3256]
+# round=2 load=11.55 13.15 12.92
+r2 CTRLA  arm=agent  rows=4000  analyze=true  median=128608 stmt/s  rounds=[128606, 128608, 128749]
+r2 CTRLA  arm=plain  rows=4000  analyze=true  median=143711 stmt/s  rounds=[146976, 142178, 143711]
+# round=2 load=9.97 12.58 12.72
+r2 FIX  arm=agent  rows=4000  analyze=false  median=125237 stmt/s  rounds=[127343, 125237, 124833]
+r2 FIX  arm=plain  rows=4000  analyze=false  median=141536 stmt/s  rounds=[141536, 139143, 145325]
+# round=2 load=9.07 12.06 12.52
+r2 CTRL  arm=agent  rows=16000  analyze=false  median=807 stmt/s  rounds=[785, 807, 813]
+r2 CTRL  arm=plain  rows=16000  analyze=false  median=834 stmt/s  rounds=[842, 824, 834]
+# round=2 load=7.27 10.45 11.81
+r2 CTRLA  arm=agent  rows=16000  analyze=true  median=133501 stmt/s  rounds=[133804, 133315, 133501]
+r2 CTRLA  arm=plain  rows=16000  analyze=true  median=148077 stmt/s  rounds=[149303, 148077, 142534]
+# round=2 load=9.06 9.91 11.39
+r2 FIX  arm=agent  rows=16000  analyze=false  median=136569 stmt/s  rounds=[136799, 136569, 135290]
+r2 FIX  arm=plain  rows=16000  analyze=false  median=150322 stmt/s  rounds=[150719, 149909, 150322]
+# round=3 load=11.64 11.81 12.03
+r3 CTRLA  arm=agent  rows=1000  analyze=true  median=145851 stmt/s  rounds=[146351, 145851, 145434]
+r3 CTRLA  arm=plain  rows=1000  analyze=true  median=161466 stmt/s  rounds=[159908, 161466, 163004]
+# round=3 load=12.69 12.02 12.10
+r3 FIX  arm=agent  rows=1000  analyze=false  median=144612 stmt/s  rounds=[144612, 144862, 144193]
+r3 FIX  arm=plain  rows=1000  analyze=false  median=164313 stmt/s  rounds=[165859, 161816, 164313]
+# round=3 load=11.39 11.77 12.01
+r3 CTRL  arm=agent  rows=1000  analyze=false  median=11256 stmt/s  rounds=[11256, 11163, 11285]
+r3 CTRL  arm=plain  rows=1000  analyze=false  median=11339 stmt/s  rounds=[11644, 11335, 11339]
+# round=3 load=10.88 11.64 11.96
+r3 CTRLA  arm=agent  rows=4000  analyze=true  median=139406 stmt/s  rounds=[139248, 139406, 139754]
+r3 CTRLA  arm=plain  rows=4000  analyze=true  median=156016 stmt/s  rounds=[155949, 158052, 156016]
+# round=3 load=7.86 10.78 11.63
+r3 FIX  arm=agent  rows=4000  analyze=false  median=139988 stmt/s  rounds=[142355, 137937, 139988]
+r3 FIX  arm=plain  rows=4000  analyze=false  median=158664 stmt/s  rounds=[158738, 156453, 158664]
+# round=3 load=8.68 10.73 11.58
+r3 CTRL  arm=agent  rows=4000  analyze=false  median=3350 stmt/s  rounds=[3303, 3350, 3426]
+r3 CTRL  arm=plain  rows=4000  analyze=false  median=2986 stmt/s  rounds=[3298, 2986, 2903]
+# round=3 load=11.55 11.26 11.74
+r3 CTRLA  arm=agent  rows=16000  analyze=true  median=134307 stmt/s  rounds=[133393, 134410, 134307]
+r3 CTRLA  arm=plain  rows=16000  analyze=true  median=150463 stmt/s  rounds=[150463, 148189, 151321]
+# round=3 load=16.39 13.55 12.60
+r3 FIX  arm=agent  rows=16000  analyze=false  median=131160 stmt/s  rounds=[136026, 131160, 127727]
+r3 FIX  arm=plain  rows=16000  analyze=false  median=150335 stmt/s  rounds=[149463, 151512, 150335]
+# round=3 load=19.10 15.36 13.44
+r3 CTRL  arm=agent  rows=16000  analyze=false  median=772 stmt/s  rounds=[734, 772, 798]
+r3 CTRL  arm=plain  rows=16000  analyze=false  median=762 stmt/s  rounds=[750, 762, 799]
+# DONE 2026-09-19T02:43:04Z load=7.76 12.74 12.69
+
+=== REDUCTION (median of the three rounds' medians; every cell completed, 54/54, 0 refusals) ===
+cfg   arm       rows  medians over rounds (r1,r2,r3)   median
+CTRL  agent     1000  [11750, 11202, 11256]   11256
+CTRL  agent     4000  [3327, 2982, 3350]   3327
+CTRL  agent    16000  [870, 807, 772]   807
+CTRLA agent     1000  [141142, 138114, 145851]   141142
+CTRLA agent     4000  [139093, 128608, 139406]   139093
+CTRLA agent    16000  [123220, 133501, 134307]   133501
+FIX   agent     1000  [145017, 137964, 144612]   144612
+FIX   agent     4000  [141555, 125237, 139988]   139988
+FIX   agent    16000  [135054, 136569, 131160]   135054
+CTRL  plain     1000  [12910, 11843, 11339]   11843
+CTRL  plain     4000  [3453, 3376, 2986]   3376
+CTRL  plain    16000  [785, 834, 762]   785
+CTRLA plain     1000  [164996, 151257, 161466]   161466
+CTRLA plain     4000  [137307, 143711, 156016]   143711
+CTRLA plain    16000  [102677, 148077, 150463]   148077
+FIX   plain     1000  [165205, 149485, 164313]   164313
+FIX   plain     4000  [156841, 141536, 158664]   156841
+FIX   plain    16000  [149018, 150322, 150335]   150322
+
+SLOPES per 4x table step (1.0 = flat, 0.25 = 1/N):
+agent: CTRL 0.296, 0.243  (O(table))   FIX 0.968, 0.965  (flat)   FIX/CTRL x12.8, x42.1, x167.4   FIX/CEILING 1.025, 1.006, 1.012
+plain: CTRL 0.285, 0.233  (O(table))   FIX 0.955, 0.958  (flat)   FIX/CTRL x13.9, x46.5, x191.5   FIX/CEILING 1.018, 1.091, 1.015
+
+READING: the control falls as 1/N; the fix is flat and sits AT the ceiling (the plan the engine
+already trusted after ANALYZE), so the whole gap was the plan, and nothing else was hiding behind it.
+The ratio is a function of table size -- x13 at 1,000 rows, x167 at 16,000 -- which is exactly what
+"O(table) -> O(log N)" means and exactly what a single-size ratio could not have shown.
+
+Agent vs plain AT ONE SIZE (D55's retracted "33x" compared 5,000 rows against 200): with the fix,
+agent/plain = 0.88 at 1,000 rows and 0.90 at 16,000 rows, staged=10. The agent path costs ~10-12%
+over a plain read at this workspace size. The staged-rows axis is a separate question.
+
+Load averages ranged 5.7 - 19.5 during the sweep (other sessions' builds); the Latin square is why
+the between-round spread (e.g. FIX agent 4000: 141555 / 125237 / 139988) does not move the reading.

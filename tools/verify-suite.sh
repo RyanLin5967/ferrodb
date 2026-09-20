@@ -26,6 +26,21 @@
 #      suite is therefore part of the measurement too, and its absence is a REFUSAL, not a skip:
 #      this repo already settled that argument in `require_python_module`
 #      (`tests/integration_pgwire.rs`) — "a skipped check would report success for the wrong reason".
+#   6. A RUN THAT WAS NEVER SCHEDULED, reported as a RED. `integration_consensus_failover.rs` waits
+#      on a 45 s wall-clock budget, and this project runs suites under an agent fleet. That budget
+#      has expired FOUR times — `suite-d19-merge-0245Z`, `suite-E79c-0457Z`, `suite-E79c-1036Z`,
+#      D40 run 1 — on a test that passes alone in ~3.1 s, i.e. with a 15x margin. Each cost a re-run
+#      and twice nearly cost a wrong diagnosis. A wall-clock deadline structurally cannot tell "the
+#      cluster failed" from "this process was descheduled", so the test now classifies its own
+#      expiry from two in-process signals (its poll loop's iteration count, and the node child
+#      processes' CPU per wall second) and says INCONCLUSIVE when it was starved. See D42 in
+#      SCALE-DESIGN.md and the classifier block in that test.
+#      ⛔ THE BUDGET WAS NOT RAISED. Raising it is "never edit a test to make it pass" wearing a
+#      constant. What changed is what an expiry is allowed to MEAN.
+#      This script owns the CHANNEL that verdict rides: the refusal below. INCONCLUSIVE is the same
+#      principle as "zero tests collected" — this run does not get to be a number — applied to a
+#      different cause, and it is strictly MORE conservative than the red it replaces: it exits
+#      non-zero, prints no total, and writes no SUMMARY.txt, so nothing downstream can certify it.
 # So: no pipe, a generous bound, examples rebuilt first, both suites run, and HEAD plus the
 # dirty-file count compared before and after. If either moved, it refuses to print a number at all
 # rather than printing one that cannot be trusted.
@@ -150,6 +165,10 @@ OUT=${VERIFY_OUT:-$(mktemp -d)}
 # redirect below fails, which makes the build step look like it failed and the guard refuse with the
 # wrong reason — a fail-safe direction, but a false diagnosis. Found by fire-checking the guard.
 mkdir -p "$OUT" || { echo "$LABEL: REFUSING — cannot create output dir $OUT"; exit 1; }
+# A STALE inconclusive marker from an earlier run into this same directory would block a later,
+# honest green forever, because certify-head.sh refuses on its presence. Clearing it here is what
+# makes that refusal safe to write.
+rm -f "$OUT/INCONCLUSIVE.txt"
 LOG="$OUT/suite-$LABEL.log"
 BOUND=${VERIFY_TIMEOUT:-7200}
 
@@ -268,6 +287,35 @@ if [ "$h0" != "$h1" ] || [ "$d0" != "$d1" ]; then
     echo "$LABEL: UNTRUSTWORTHY — the tree moved during the run ($h0/$d0 -> $h1/$d1). Re-run; do not record this."
     echo "  log: $LOG"
     exit 1
+fi
+
+# ── THE INCONCLUSIVE CHANNEL (note 6). A starved run is not a red. ──────────────────────────────
+#
+# These two strings are `VERDICT_INCONCLUSIVE` and `VERDICT_CLASSIFIER_BROKEN` in
+# tests/integration_consensus_failover.rs. A shell script cannot read a Rust constant, so the
+# duplication is unavoidable; `tools/verify-suite-selftest.sh` part 3 fails if the copies diverge,
+# which is what stops it rotting into a guard that greps for a string nothing emits any more.
+#
+# This runs AFTER the tree-moved check on purpose: a run whose tree moved is untrustworthy whatever
+# its tests said, and that verdict must not be overwritten by a gentler one.
+D42_INCONCLUSIVE='FERRODB-VERDICT: INCONCLUSIVE'
+D42_BROKEN='FERRODB-VERDICT: CLASSIFIER-BROKEN'
+if grep -qF "$D42_INCONCLUSIVE" "$LOG" 2>/dev/null || grep -qF "$D42_BROKEN" "$LOG" 2>/dev/null; then
+    nf=$(awk '/^test result:/ {gsub(/;/,""); for(i=1;i<=NF;i++) if($i=="failed") s+=$(i-1)} END {print s+0}' "$LOG")
+    {
+        echo "$LABEL: INCONCLUSIVE at $(date -u +%FT%TZ) — head=$h1 log=$LOG"
+        grep -F -A 8 -e "$D42_INCONCLUSIVE" -e "$D42_BROKEN" "$LOG"
+    } > "$OUT/INCONCLUSIVE.txt"
+    echo "$LABEL: REFUSING — a test classified its own wall-clock expiry as INCONCLUSIVE: it was" >&2
+    echo "  descheduled, or its child processes were, so the expiry is not evidence about the code." >&2
+    grep -F -m1 -e "$D42_INCONCLUSIVE" -e "$D42_BROKEN" "$LOG" | sed 's/^/  /' >&2
+    echo "  This run does not get to be a number in EITHER direction — not a pass, and not the red" >&2
+    echo "  it would have been reported as before. Re-run it on a quieter machine." >&2
+    echo "  The run also recorded failed=$nf. Those are not dismissed; they are UNMEASURED until a" >&2
+    echo "  run that was not starved reports them." >&2
+    echo "  evidence: $OUT/INCONCLUSIVE.txt" >&2
+    echo "  log: $LOG" >&2
+    exit 4
 fi
 
 p=$(awk '/^test result:/ {gsub(/;/,""); for(i=1;i<=NF;i++) if($i=="passed") s+=$(i-1)} END {print s+0}' "$LOG")

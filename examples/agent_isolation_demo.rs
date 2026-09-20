@@ -601,7 +601,7 @@ impl Db {
     /// The physical slot currently holding the row with this id, so the STORAGE-level
     /// attribution can be asked about a real version rather than a runtime-side row key.
     fn rid_of(&self, table: &str, id: i32) -> Option<RecordId> {
-        let view = Arc::new(ReadView { snapshot: self.txn.read_snapshot(), txn_id: 0 });
+        let view = Arc::new(ReadView { snapshot: Arc::new(self.txn.read_snapshot()), txn_id: 0 });
         let mut exec: Box<dyn Executor> = lower(
             PhysicalPlan::SeqScan { table: table.into() },
             &self.catalog,

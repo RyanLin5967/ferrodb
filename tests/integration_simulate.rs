@@ -993,7 +993,7 @@ fn an_evaluation_whose_read_premise_moved_is_refused_even_though_it_wrote_a_diff
     let mut ctx = ExecCtx { catalog: &mut db.catalog, bp, txn };
 
     let select = stmts("SELECT qty FROM inventory WHERE id = 1;").remove(0);
-    rt.select(&mut ctx, reader.branch, &select, Some(reader.branch)).unwrap();
+    rt.select(&ctx.read(), reader.branch, &select, Some(reader.branch)).unwrap();
     rt.write(&mut ctx, reader.branch, stmts("UPDATE roster SET staff = 2 WHERE id = 1;").remove(0))
         .unwrap();
     rt.write(

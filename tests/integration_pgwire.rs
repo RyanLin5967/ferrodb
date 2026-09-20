@@ -83,6 +83,13 @@ fn walk_newest(dir: &Path) -> Option<std::time::SystemTime> {
     let entries = std::fs::read_dir(dir).ok()?;
     for e in entries.flatten() {
         let p = e.path();
+        // A `src/**/tests_*.rs` file is `#[cfg(test)]` and does not link into an example binary,
+        // so editing one cannot make that binary stale. Counting them made this guard fire on a
+        // tree whose examples were fresh (one edit, 53 tests failed across 5 targets). The
+        // convention is enforced by `test_only_sources_are_cfg_test_gated`, not assumed.
+        if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")) {
+            continue;
+        }
         let t = if p.is_dir() {
             walk_newest(&p)
         } else {

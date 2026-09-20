@@ -63,7 +63,9 @@ use crate::error::FerroError;
 use crate::execution::executor::evaluate;
 use crate::parser::parser::{Expr, Stmt, TableRef};
 use crate::parser::scanner::TokenType;
-use crate::planner::plan::{plan, Plan};
+use crate::planner::plan::{plan, predicate_to_bounds, Plan};
+use crate::optimizer::optimizer::split_and;
+use crate::catalog::column::DataType;
 use crate::provenance::capture::{ProvenanceLog, TxnCapture, WriteRecord};
 use crate::provenance::readset::{AccessShape, Bound, PredicateSummary, VersionRef};
 use crate::provenance::revert::{DependencyGraph, RevertMode, RevertPlan};
@@ -83,11 +85,43 @@ use crate::wal::txn::{ReadView, TxnManager};
 /// client to call anything (DESIGN.md exit criterion 8).
 pub const DEFAULT_LEASE_MILLIS: u64 = 15 * 60 * 1000;
 
-/// Everything the runtime needs to reach the shared tables.
+/// Everything the runtime needs to reach the shared tables, with the catalog EXCLUSIVELY.
+///
+/// A statement holding one of these is the only statement that may run, because the server hands
+/// it the `&mut Catalog` it gets from `pgwire::ServerContext::catalog()` — one process-wide mutex,
+/// taken outermost for the whole statement (`src/pgwire/mod.rs:100`). That is what D50 measured as
+/// a flat throughput curve: 52,187 -> 46,897 statements/s over 1 -> 16 threads.
 pub struct ExecCtx<'a> {
     pub catalog: &'a mut Catalog,
     pub bp: Arc<BufferPoolManager>,
     pub txn: Arc<TxnManager>,
+}
+
+/// The same thing with the catalog SHARED, for statements that only read it.
+///
+/// # Why this type exists rather than a bool or a convention
+///
+/// D51 asked the compiler whether a read needs a mutable catalog, by changing `ExecCtx.catalog`
+/// to `&Catalog` and reading the errors: **two sites in the entire crate, both writes**
+/// (`bench/d51_type_probe.txt`). So the serialization was never a property of what a read does —
+/// it was one type signature propagated from two write-side call sites to every statement.
+///
+/// Splitting the type rather than relaxing it means a read path **cannot** mutate the catalog by
+/// accident: there is no `&mut` to reach for, so the mistake is not expressible rather than
+/// forbidden by a comment. `ExecCtx::read` reborrows, so the exclusive path can call every
+/// read-only helper without duplicating one of them.
+pub struct ReadCtx<'a> {
+    pub catalog: &'a Catalog,
+    pub bp: Arc<BufferPoolManager>,
+    pub txn: Arc<TxnManager>,
+}
+
+impl<'a> ExecCtx<'a> {
+    /// Reborrow as a read context. Free, and it is what lets the exclusive path reuse the shared
+    /// helpers instead of growing a second copy of each.
+    pub fn read(&self) -> ReadCtx<'_> {
+        ReadCtx { catalog: self.catalog, bp: self.bp.clone(), txn: self.txn.clone() }
+    }
 }
 
 /// Table identity, derived from the table name (FNV-1a).
@@ -136,6 +170,50 @@ pub fn row_id_of(row: &[Value]) -> RowId {
     }
 }
 
+/// **D57.** The one overlay key a predicate can touch, if it has a `pk = literal` conjunct.
+///
+/// Uses the planner's own `split_and` + `predicate_to_bounds` — the extraction `build_index_scan`
+/// uses to pick the base access — so the overlay is probed by the same key the base scan probed.
+///
+/// The literal's variant must match the primary key column's declared type. `row_id_of` maps an
+/// `Integer` to its value but a `Float` to a hash of its bits, so `id = 5.0` against an INTEGER
+/// key would probe a key no staged row was ever stored under and MISS a staged version — the one
+/// wrong answer. On any mismatch this returns `None` and the caller walks the table prefix, which
+/// is always correct.
+fn overlay_probe_key(bound: &BoundExpr, pk_type: Option<&DataType>) -> Option<u64> {
+    let pk_type = pk_type?;
+    let mut conjuncts = Vec::new();
+    split_and(bound.clone(), &mut conjuncts);
+    conjuncts.iter().find_map(|c| match predicate_to_bounds(c) {
+        Some((0, std::ops::Bound::Included(lo), std::ops::Bound::Included(hi))) if lo == hi && literal_matches(&lo, pk_type) => {
+            Some(row_id_of(std::slice::from_ref(&lo)).0)
+        }
+        _ => None,
+    })
+}
+
+/// A literal may be probed only when `row_id_of` is exactly as fine as `=` for its variant --
+/// equal values MUST land on one key, or the probe misses a staged row the walk would have found.
+///
+/// `Integer`/`BigInt`/`Timestamp` map to their value; `Varchar` and `Boolean` hash the same bytes
+/// `Value::cmp` compares; `Float` hashes its bits and `cmp` is `total_cmp`, which is also
+/// bit-exact. **`Decimal` is deliberately absent:** `row_id_of` hashes the digit TEXT (`"1.50"`)
+/// while `decimal_cmp` is numeric (`Decimal("1.50") == Decimal("1.5")`), so a re-spelled literal
+/// passes the variant check and probes a key no staged row was stored under. Found by a
+/// fresh-context review after the probe first shipped; `hash_join.rs` canonicalises a decimal
+/// before hashing for the same reason. A DECIMAL key walks the table prefix instead.
+fn literal_matches(v: &Value, t: &DataType) -> bool {
+    matches!(
+        (v, t),
+        (Value::Integer(_), DataType::Integer)
+            | (Value::BigInt(_), DataType::BigInt)
+            | (Value::Varchar(_), DataType::Varchar(_))
+            | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::Float(_), DataType::Float)
+            | (Value::Boolean(_), DataType::Boolean)
+    )
+}
+
 /// The state of one row on a branch.
 #[derive(Debug, Clone, PartialEq)]
 enum RowState {
@@ -159,6 +237,26 @@ struct Workspace {
     /// has nothing to diff against.
     fork_root: PageId,
     rows: PersistentMap<(u32, u64), RowState>,
+    /// **D57.** How many `Present` rows were staged in a state the read path's probe cannot see
+    /// through. The probe -- "only the overlay entry at `row_id_of(k)` can affect `pk = k`" -- is
+    /// sound only while every staged row (a) sits under the key its own column 0 derives, and
+    /// (b) holds column 0 in the column's DECLARED variant, so that `=` and `row_id_of` agree.
+    /// Both can be false on a branch, and neither is refused there:
+    ///
+    /// * an UPDATE may assign the primary key (trunk refuses it in `execution::update`;
+    ///   `integration_escrow` relies on the staged row KEEPING its original key so a PK move
+    ///   cannot leave an escrow pool), breaking (a);
+    /// * an INSERT/UPDATE stages a literal as the variant it was written in -- `21.0` into an
+    ///   INTEGER column stays `Float`, keyed by the hash of its bits -- because a page-backed
+    ///   branch does not run the tuple encoder's width check (`agent_sql_surface` documents this),
+    ///   breaking (b).
+    ///
+    /// Monotone and conservative: counted at the single site that writes `rows`, inherited by a
+    /// forked child (which shares the entries), never decremented; `visible_rows_where` walks
+    /// instead of probing whenever it is non-zero. A guard on the resulting state, not on the
+    /// statement that caused it -- all three of these were found by a fresh-context review after
+    /// the probe first shipped, and the first fix (a counter for (a) alone) missed (b).
+    unprobeable_rows: u64,
     /// Image at first touch = the fork-point value. `None` means the row did not exist.
     base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
     /// Ancestor txns whose STAGED writes this workspace copied at fork time, oldest first.
@@ -887,9 +985,9 @@ impl AgentRuntime {
         // descent of the child's own tree with no parent pointer anywhere to walk. Both are tested
         // directly in `tests/d27_fork_shares_without_leaking.rs`, the second against an ancestor
         // chain abandoned out from under the child.
-        let (rows, base_rows, tables) = match state.workspaces.get(&parent.id) {
-            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone()),
-            None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new()),
+        let (rows, base_rows, tables, unprobeable_rows) = match state.workspaces.get(&parent.id) {
+            Some(p) => (p.rows.clone(), p.base_rows.clone(), p.tables.clone(), p.unprobeable_rows),
+            None => (PersistentMap::new(), PersistentMap::new(), PersistentMap::new(), 0),
         };
         let (parent_schema_edits, parent_base_shapes) = match state.workspaces.get(&parent.id) {
             Some(p) => (p.schema_edits.clone(), p.base_shapes.clone()),
@@ -916,6 +1014,7 @@ impl AgentRuntime {
                 fork_seq,
                 fork_root: record.root_page_id,
                 rows,
+                unprobeable_rows,
                 base_rows,
                 tables,
                 inherited,
@@ -1216,29 +1315,121 @@ impl AgentRuntime {
     /// uncommitted buffer.
     fn visible_rows(
         &self,
-        ctx: &mut ExecCtx,
+        ctx: &ReadCtx,
         branch: Option<BranchId>,
         table: &str,
     ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
-        let base = scan_table(table, ctx)?;
+        self.visible_rows_where(ctx, branch, table, None, None, None)
+    }
+
+    /// The rows of `table` satisfying a predicate, as `branch` sees them.
+    ///
+    /// `raw` goes to the planner (so the base scan can use an index); `bound` is applied to the
+    /// staged overlay. They must be the SAME predicate in two forms, and the caller binds it once.
+    ///
+    /// # Why applying the predicate to both sides is correct
+    ///
+    /// The unfiltered form computes `filter(pred, base ⊕ staged)` where `⊕` is a per-key overlay:
+    /// a staged `Present` replaces the base row, a staged `Deleted` removes it. This computes
+    /// `filter(pred, base) ⊕' filter(pred, staged)`, and the two are equal because the overlay is
+    /// per-KEY and the predicate is per-ROW:
+    ///
+    /// * key in both — staged wins, so only `pred(staged_version)` matters → the staged version
+    ///   is inserted if it passes and the key is REMOVED if it fails (a base row that passed must
+    ///   not survive its own staged replacement failing)
+    /// * key in base only — `pred(base_version)`, which the planner already applied
+    /// * key staged only (a branch INSERT) — `pred(staged_version)`
+    /// * staged `Deleted` — removed on both sides
+    ///
+    /// ⚠ That equality holds for ROW predicates only. A predicate that reads across rows does not
+    /// commute with the overlay and must never be pushed here. `select` refuses joins before it
+    /// gets this far, and there is no aggregate on this path, so the boundary holds by
+    /// construction today — it is stated so the next reader does not widen it silently.
+    fn visible_rows_where(
+        &self,
+        ctx: &ReadCtx,
+        branch: Option<BranchId>,
+        table: &str,
+        alias: Option<&str>,
+        raw: Option<&Expr>,
+        bound: Option<&BoundExpr>,
+    ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
+        debug_assert_eq!(
+            raw.is_some(),
+            bound.is_some(),
+            "raw and bound must be the same predicate in two forms, or the two sides of the \
+             overlay are filtered differently"
+        );
+        let base = scan_table_where(table, alias, raw, ctx)?;
         let tbl = table_id(table);
         let mut rows: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         for r in base {
             rows.insert(row_id_of(&r).0, r);
         }
         if let Some(b) = branch {
-            let state = self.state.lock().unwrap();
-            if let Some(ws) = state.workspaces.get(&b.id) {
-                for ((t, row), st) in &ws.rows {
-                    if *t != tbl.0 {
-                        continue;
-                    }
+            // **D57.** This used to hold the State mutex and iterate EVERY staged row on the
+            // branch — all tables — per statement: ~11.5 ns per staged row per read, ×8 at D27's
+            // measured 4,000 staged rows (`bench/d57_staged_curve_before.txt`), and the whole
+            // walk inside a process-wide critical section. Three things change, none of which
+            // alters a result (the D55 commutation argument is untouched; `tests/d57_overlay_probe`
+            // pins every case against a hand-derived truth AND against the walk):
+            //
+            // 1. The map is SNAPSHOTTED under the lock — `PersistentMap::clone` is one `Arc`
+            //    bump, which is the whole reason that structure exists — and the lock is released
+            //    before any work. What makes that safe is NOT that nobody else writes this
+            //    workspace: another connection can hold the same branch (`AS OF BRANCH` reads a
+            //    live workspace by name, and pgwire is a thread per connection). It is that the
+            //    clone is taken under the lock and the nodes are immutable — `ins` never mutates
+            //    one and `Arc::make_mut` is never used on `rows` — so the snapshot is exactly the
+            //    map at one instant, which is what the walk under the lock also observed. Do not
+            //    hoist the clone out of the lock: that would be a torn read of the root.
+            // 2. A predicate with a `pk = literal` conjunct PROBES the one entry that can affect
+            //    the result, PROVIDED every staged row sits under its own column 0's key in the
+            //    declared variant — `Workspace::unprobeable_rows` counts the rows for which that
+            //    is not so, and the walk is taken while it is non-zero.
+            // 3. Every other predicate walks only THIS table's prefix of the key space, which is
+            //    the honest floor for a non-key predicate — the same reason the base table needs
+            //    an index for one.
+            let staged = {
+                let state = self.state.lock().unwrap();
+                state.workspaces.get(&b.id).map(|ws| (ws.rows.clone(), ws.unprobeable_rows))
+            };
+            if let Some((staged, unprobeable_rows)) = staged {
+                let mut apply = |row: u64, st: &RowState| -> Result<(), FerroError> {
                     match st {
                         RowState::Present(v) => {
-                            rows.insert(*row, v.clone());
+                            let keep = match bound {
+                                Some(p) => matches!(evaluate(p, v)?, Value::Boolean(true)),
+                                None => true,
+                            };
+                            if keep {
+                                rows.insert(row, v.clone());
+                            } else {
+                                // The staged version is what this branch sees, and it fails
+                                // the predicate -- so the base version that passed must go.
+                                rows.remove(&row);
+                            }
                         }
                         RowState::Deleted => {
-                            rows.remove(row);
+                            rows.remove(&row);
+                        }
+                    }
+                    Ok(())
+                };
+                let pk_type = ctx.catalog.get_table(table).map(|e| e.schema.columns[0].data_type.clone());
+                // The probe is sound only while every staged row sits under its own column 0's
+                // key AND holds column 0 in the declared variant; `unprobeable_rows` says whether
+                // either has ever stopped being true here (see `Workspace`).
+                let probe = if unprobeable_rows == 0 { bound.and_then(|p| overlay_probe_key(p, pk_type.as_ref())) } else { None };
+                match probe {
+                    Some(row) => {
+                        if let Some(st) = staged.get(&(tbl.0, row)) {
+                            apply(row, st)?;
+                        }
+                    }
+                    None => {
+                        for ((_, row), st) in staged.range(&(tbl.0, 0), &(tbl.0, u64::MAX)) {
+                            apply(*row, st)?;
                         }
                     }
                 }
@@ -1254,7 +1445,7 @@ impl AgentRuntime {
     /// a scan retains a predicate summary (which is what gives phantom coverage).
     pub fn select(
         &self,
-        ctx: &mut ExecCtx,
+        ctx: &ReadCtx,
         branch: BranchId,
         stmt: &Stmt,
         reader: Option<BranchId>,
@@ -1284,17 +1475,20 @@ impl AgentRuntime {
         };
         let (proj, _out) = binder.bind_projection(columns.clone(), &scope)?;
 
-        let rows = self.visible_rows(ctx, Some(branch), &from.name)?;
-        let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
-        for (rid, row) in rows {
-            let keep = match &bound_where {
-                Some(p) => matches!(evaluate(p, &row)?, Value::Boolean(true)),
-                None => true,
-            };
-            if keep {
-                matched.push((rid, row));
-            }
-        }
+        let rows = self.visible_rows_where(
+            ctx,
+            Some(branch),
+            &from.name,
+            from.alias.as_deref(),
+            where_clause.as_ref(),
+            bound_where.as_ref(),
+        )?;
+        // `visible_rows_where` is the SINGLE authority for the predicate: it pushed it into the
+        // base scan and applied it to the staged overlay. This used to re-evaluate every returned
+        // row, and that second filter masked a broken first one — a mutant that forgot to filter
+        // the overlay survived `tests/d55_pushdown_commutes.rs` because this loop caught what it
+        // let through. Two filters is one you cannot test.
+        let matched: Vec<(RowId, Vec<Value>)> = rows;
 
         // Record the read-set against the *reading* session, if there is one.
         if let Some(reader_branch) = reader {
@@ -1648,7 +1842,7 @@ impl AgentRuntime {
             (bw, resolved)
         };
 
-        let rows = self.visible_rows(ctx, Some(branch), table)?;
+        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -1696,7 +1890,7 @@ impl AgentRuntime {
             bound_where.as_ref(),
         )?;
         let touched = staged.len();
-        self.stage_all(branch, tbl, table, staged)?;
+        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
         Ok(touched)
     }
 
@@ -1735,7 +1929,7 @@ impl AgentRuntime {
         }
         let rid = row_id_of(&row);
         let existing = self
-            .visible_rows(ctx, Some(branch), table)?
+            .visible_rows(&ctx.read(), Some(branch), table)?
             .into_iter()
             .find(|(r, _)| *r == rid);
         if existing.is_some() {
@@ -1745,7 +1939,7 @@ impl AgentRuntime {
             )));
         }
         let op = Op::new(tbl, rid, None, OpKind::RowCreate(row.clone()));
-        self.stage(branch, tbl, table, rid, None, RowState::Present(row), vec![op], None)?;
+        self.stage(branch, tbl, table, &schema.columns[0].data_type, rid, None, RowState::Present(row), vec![op], None)?;
         Ok(1)
     }
 
@@ -1768,7 +1962,7 @@ impl AgentRuntime {
             Some(w) => Some(binder.bind_expr(w.clone(), &scope)?),
             None => None,
         };
-        let rows = self.visible_rows(ctx, Some(branch), table)?;
+        let rows = self.visible_rows(&ctx.read(), Some(branch), table)?;
         let mut staged: Vec<Staged> = Vec::new();
         // The rows this statement's own scan returned. See `record_write_scan`.
         let mut matched: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -1802,7 +1996,7 @@ impl AgentRuntime {
             bound_where.as_ref(),
         )?;
         let n = staged.len();
-        self.stage_all(branch, tbl, table, staged)?;
+        self.stage_all(branch, tbl, table, &schema.columns[0].data_type, staged)?;
         Ok(n)
     }
 
@@ -1816,13 +2010,14 @@ impl AgentRuntime {
         branch: BranchId,
         tbl: TableId,
         table: &str,
+        pk_type: &DataType,
         row: RowId,
         before: Option<Vec<Value>>,
         after: RowState,
         ops: Vec<Op>,
         guard: Option<Guard>,
     ) -> Result<(), FerroError> {
-        self.stage_all(branch, tbl, table, vec![Staged { row, before, after, ops, guard }])
+        self.stage_all(branch, tbl, table, pk_type, vec![Staged { row, before, after, ops, guard }])
     }
 
     // ---- the capability envelope ------------------------------------------------------------
@@ -1901,6 +2096,7 @@ impl AgentRuntime {
         branch: BranchId,
         tbl: TableId,
         table: &str,
+        pk_type: &DataType,
         items: Vec<Staged>,
     ) -> Result<(), FerroError> {
         // ---- decide -------------------------------------------------------------------------
@@ -2013,6 +2209,13 @@ impl AgentRuntime {
             for item in items {
                 let key = Workspace::key(tbl, item.row);
                 ws.base_rows.insert_if_absent(key, item.before);
+                if let RowState::Present(v) = &item.after {
+                    let probeable = row_id_of(v) == item.row
+                        && v.first().is_some_and(|c0| literal_matches(c0, pk_type));
+                    if !probeable {
+                        ws.unprobeable_rows += 1;
+                    }
+                }
                 ws.rows.insert(key, item.after.clone());
                 for op in item.ops {
                     ws.frame.push_op(op);
@@ -2485,8 +2688,60 @@ impl AgentRuntime {
                 continue;
             };
             schemas.insert(*t, entry.schema.clone());
-            for row in scan_table(name, ctx)? {
-                current.insert((*t, row_id_of(&row).0), row);
+        }
+
+        // **D69 — POINT LOOKUPS, NOT A SCAN.** `current` is consulted at exactly two places, and
+        // both are keyed by rows THIS BRANCH touched: the per-row comparison below
+        // (`current.get(&(*t, *r))`) and `pre_images` (`pending_writes[].row_key()`). Nothing ever
+        // iterates it. It used to be filled by scanning every row of every touched table, which
+        // made a merge cost O(table) no matter how little the branch changed — measured at
+        // 1.87 us/row, about 1.9 SECONDS per merge against a million-row table to write four rows
+        // (D68, `bench/d68_merge_is_o_table.txt`).
+        //
+        // The row id cannot be turned back into a key — `row_id_of` is a one-way FNV for Varchar,
+        // Boolean, Float and Decimal primary keys — but it does not need to be: the branch's own
+        // images carry the key in column 0. `after` for rows it wrote, `base_rows` for rows it
+        // deleted, and the union covers both.
+        //
+        // ⚠ This is only safe because `base_fingerprint` NO LONGER READS `current` (D69 step 2).
+        // While it did, narrowing this map would have quietly turned a whole-table staleness check
+        // into a touched-rows one — a weakening of isolation wearing a speedup's clothes.
+        {
+            let mut wanted: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
+            let mut want = |t: u32, row: &[Value]| {
+                if let Some(pk) = row.first() {
+                    wanted.entry(t).or_default().push(pk.clone());
+                }
+            };
+            for ((t, _), st) in &snapshot.rows {
+                if let RowState::Present(row) = st {
+                    want(*t, row);
+                }
+            }
+            for ((t, _), before) in &snapshot.base_rows {
+                if let Some(row) = before {
+                    want(*t, row);
+                }
+            }
+            for (t, mut pks) in wanted {
+                let Some(name) = table_names.get(&t) else { continue };
+                let Some(entry) = ctx.catalog.get_table(name) else { continue };
+                let Some(pk_col) = entry.schema.columns.first().map(|c| c.name.clone()) else {
+                    continue;
+                };
+                // One branch can touch the same row through several ops.
+                pks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                pks.dedup();
+                for key in pks {
+                    let pred = Expr::BinaryOp {
+                        left: Box::new(Expr::ColumnRef { table: None, column: pk_col.clone() }),
+                        operator: TokenType::Equal,
+                        right: Box::new(value_expr(&key)),
+                    };
+                    for row in scan_table_where(name, None, Some(&pred), &ctx.read())? {
+                        current.insert((t, row_id_of(&row).0), row);
+                    }
+                }
             }
         }
 
@@ -2503,8 +2758,14 @@ impl AgentRuntime {
         // the split opened.
         let premise_rows = premise_rows_of(&snapshot.reads);
         // The base this evaluation is about, as one number. See `publish_evaluation`.
-        let base_fingerprint =
-            fnv64_update(fingerprint_rows(&current)?, &self.fingerprint_premises(&premise_rows).to_be_bytes());
+        // D69 — the SAME function over the SAME table set the publish-time check uses
+        // (`fingerprint_tables(ctx, &eval.tables_read)`, and `tables_read` IS `table_names`).
+        // Computing the two sides differently is how a staleness check stops comparing anything;
+        // they are deliberately one call, not two implementations that happen to agree today.
+        let base_fingerprint = fnv64_update(
+            self.fingerprint_tables(ctx, &table_names)?,
+            &self.fingerprint_premises(&premise_rows).to_be_bytes(),
+        );
 
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
@@ -3242,22 +3503,40 @@ impl AgentRuntime {
         })
     }
 
-    /// Fingerprint of every row of `tables`, as the shared tables hold them right now.
+    /// Fingerprint of `tables` **by their change counters**, not by their contents — D69.
+    ///
+    /// # What this answers, and why a counter answers it
+    ///
+    /// The question is "did any of these tables move since this evaluation was scored?", asked
+    /// once at scoring and once at publication and compared. It used to be answered by scanning
+    /// every row of every listed table and hashing it. D68 measured that at 1.87 us/row — about
+    /// 1.9 SECONDS per merge against a million-row table, to write four rows
+    /// (`bench/d68_merge_is_o_table.txt`). Folding one `u64` per table is O(tables).
+    ///
+    /// # Why this is not weaker than the hash it replaces
+    ///
+    /// It is STRICTLY STRONGER, in the one direction that matters. A content hash cannot see a
+    /// change that was reverted between the two observations — write, revert, hash matches, and
+    /// the merge publishes against a base it never scored. `Catalog::bump_table_version` is
+    /// monotone, so it catches that too. Every committed write bumps it, including ordinary DML
+    /// outside any agent session, which is what `tests/d69_table_version.rs` pins.
+    ///
+    /// A table absent from the catalog contributes its id and nothing else, exactly as the scan
+    /// version contributed no rows for it.
     fn fingerprint_tables(
         &self,
         ctx: &mut ExecCtx,
         tables: &BTreeMap<u32, String>,
     ) -> Result<u64, FerroError> {
-        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for (t, name) in tables {
+            h = fnv64_update(h, &t.to_be_bytes());
             if ctx.catalog.get_table(name).is_none() {
                 continue;
             }
-            for row in scan_table(name, ctx)? {
-                current.insert((*t, row_id_of(&row).0), row);
-            }
+            h = fnv64_update(h, &ctx.catalog.table_version(*t).to_be_bytes());
         }
-        fingerprint_rows(&current)
+        Ok(h)
     }
 
     /// Fingerprint of the published version of every row an evaluation READ.
@@ -3788,7 +4067,7 @@ impl AgentRuntime {
                 }
                 (kind, Some(col)) => {
                     let inverse = invert(kind, a.before.as_ref())?;
-                    let rows = scan_table(&a.table, ctx)?;
+                    let rows = scan_table(&a.table, &ctx.read())?;
                     let cur = rows
                         .into_iter()
                         .find(|r| row_id_of(r) == a.row)
@@ -4689,7 +4968,7 @@ fn apply_dml_in(
     author: Author,
 ) -> Result<usize, FerroError> {
     let snapshot = ctx.txn.snapshot_of(txn_id)?;
-    let view = Arc::new(ReadView { snapshot, txn_id });
+    let view = Arc::new(ReadView { snapshot: Arc::new(snapshot), txn_id });
     match plan(stmt, ctx.catalog, ctx.bp.clone(), Some((ctx.txn.clone(), txn_id)), view)? {
         Plan::Write(mut op) => {
             if let Some((prov, id)) = author {
@@ -4702,12 +4981,40 @@ fn apply_dml_in(
 }
 
 /// Every row of a table as the shared (merged) state has it.
-pub fn scan_table(table: &str, ctx: &mut ExecCtx) -> Result<Vec<Vec<Value>>, FerroError> {
-    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot(), txn_id: 0 });
+/// Every row of `table`, unfiltered. The callers that diff, merge and sweep want exactly that.
+pub fn scan_table(table: &str, ctx: &ReadCtx) -> Result<Vec<Vec<Value>>, FerroError> {
+    scan_table_where(table, None, None, ctx)
+}
+
+/// The rows of `table` that satisfy `where_clause`, with the predicate PUSHED INTO THE PLANNER.
+///
+/// # Why this exists
+///
+/// `scan_table` built `SELECT * FROM t` with `where_clause: None` and materialised every row,
+/// and `visible_rows` only applied the statement's own `WHERE` afterwards. So an agent-session
+/// `SELECT … WHERE id = k` read the ENTIRE table to keep one row — O(table) per statement,
+/// where the plain path for the identical query is O(log N) through the B+tree. D55 measured
+/// the gap on this box before this change; `bench/d55_*` holds the numbers. This is the same
+/// shape as D28 (system views materialise, then filter), at the site every branch-per-agent
+/// read goes through.
+///
+/// Passing the predicate here is what lets the planner do what it already does for the plain
+/// path: bind it, and pick the index. Nothing is invented; the predicate was simply never
+/// handed over. `alias` must match the statement's, or the planner cannot bind a qualified
+/// column reference in the predicate.
+pub fn scan_table_where(
+    table: &str,
+    alias: Option<&str>,
+    where_clause: Option<&Expr>,
+    ctx: &ReadCtx,
+) -> Result<Vec<Vec<Value>>, FerroError> {
+    // D59: the cached snapshot — one Acquire load when no transaction has begun or ended
+    // since this thread last asked. `read_snapshot` remains the uncached truth.
+    let view = Arc::new(ReadView { snapshot: ctx.txn.read_snapshot_cached(), txn_id: 0 });
     let stmt = Stmt::Select {
-        from: TableRef::plain(table.to_string(), None),
+        from: TableRef::plain(table.to_string(), alias.map(|a| a.to_string())),
         columns: vec![Expr::ColumnRef { table: None, column: "*".into() }],
-        where_clause: None,
+        where_clause: where_clause.cloned(),
         joins: Vec::new(),
     };
     match plan(stmt, ctx.catalog, ctx.bp.clone(), None, view)? {
@@ -4946,6 +5253,7 @@ mod tests {
             // read by `txn_refs_of`, which is why the index survived that change untouched — only
             // this fixture's spelling had to follow.
             rows: PersistentMap::new(),
+            unprobeable_rows: 0,
             base_rows: PersistentMap::new(),
             inherited: inherited.iter().map(|t| TxnId(*t)).collect(),
             tables: PersistentMap::new(),

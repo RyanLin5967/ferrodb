@@ -1,0 +1,48 @@
+D58 — DIFFERENTIAL: is the latch table's single mutex the wall? Stripe it (64 stripes, table only) and re-measure.
+[HERE] 2026-09-19T09:41:50Z  d55_agent_read_scaling QUICK shared arm, staged=10, rows=5000, same box as d58_shared_vs_private_premise_2.txt
+BEFORE (one mutex, from premise_2): shared 16T = 405062 / 434816 stmt/s, x2.62 / x2.64 vs 1T; private control x9.90 / x10.37.
+PRE-REGISTERED: if the shared 16T point does not move well past x2.6, the latch table's mutex was NOT the wall and the
+profile's attribution was wrong; if it moves toward the private x10, the mutex was (at least most of) it.
+
+# QUICK: shared arm staged=10 only
+# round 0 order: 1 2 4 8 16
+#   1T -> 158395 stmt/s (slowest thread 159025)
+#   2T -> 226538 stmt/s (slowest thread 114290)
+#   4T -> 382293 stmt/s (slowest thread 96204)
+#   8T -> 454399 stmt/s (slowest thread 56322)
+#   16T -> 531743 stmt/s (slowest thread 32899)
+# round 1 order: 2 4 8 16 1
+#   2T -> 224925 stmt/s (slowest thread 113048)
+#   4T -> 379246 stmt/s (slowest thread 95508)
+#   8T -> 462931 stmt/s (slowest thread 57780)
+#   16T -> 520886 stmt/s (slowest thread 32620)
+#   1T -> 156399 stmt/s (slowest thread 157965)
+# round 2 order: 4 8 16 1 2
+#   4T -> 385221 stmt/s (slowest thread 96289)
+#   8T -> 453630 stmt/s (slowest thread 56958)
+#   16T -> 524715 stmt/s (slowest thread 32775)
+#   1T -> 161611 stmt/s (slowest thread 162201)
+#   2T -> 230728 stmt/s (slowest thread 116206)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         158395       158395         1.000
+      2         226538       113269         1.430
+      4         382293        95573         2.414
+      8         454399        56800         2.869
+     16         524715        32795         3.313
+threads   shared_vs_1T   shared_abs
+      1          1.000       158395
+      2          1.430       226538
+      4          2.414       382293
+      8          2.869       454399
+     16          3.313       524715
+# rc=  load=2.24 3.09 3.18
+
+READING: x2.62 / x2.64 -> x3.31 at 16 threads (405-435k -> 525k stmt/s): the single table mutex was PART
+of the wall and its removal is MICRO (x1.29). The profile with the striped table
+(bench/d58_profile_16T_striped_table.sample.txt) still puts 33.5k of ~80k thread-samples in
+PageLatches::read / PageReadGuard::drop -- now on the STRIPE that holds the root and the hot leaf,
+which every reader takes twice per descent -- and TxnManager::read_snapshot rises to 5.5k as the
+next wall behind it. Striping is the standard answer, it was tried, it was measured, and it does
+not clear the bar: every per-page reader-count scheme writes a shared word on the hottest page per
+read, which is D51's measured x0.12 class. What clears the bar is a reader that writes NOTHING
+shared on the descent -- the design entry (SCALE-DESIGN D58).

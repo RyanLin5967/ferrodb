@@ -1,0 +1,2 @@
+D59-snapcache-d: mode=per-target rc=0 passed=2134 failed=0 build_errors=0 head=0ca6581 log=/Users/idide/wt/artie-research/verify-out-d59d/suite-D59-snapcache-d.log
+D59-snapcache-d: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d59d/suite-D59-snapcache-d.go.log

@@ -530,13 +530,15 @@ impl ArenaPageStore {
         pt.remove(&page_id);
         drop(pt);
         {
-            let mut frame = self.pool.frames[frame_i].write().unwrap();
+            let mut frame = self.pool.frame_write(frame_i);
             frame.page_id = None;
             frame.data = [0u8; PAGE_SIZE];
             frame.pin_counter = AtomicU16::new(0);
             frame.dirty_flag = AtomicBool::new(false);
         }
-        let _ = self.pool.arc_cache.lock().unwrap().remove(page_id);
+        // Through `arc_locked`, not the mutex directly: it applies the pending hit-path updates
+        // first, so this cannot remove a page whose own queued `touch` then lands behind it.
+        let _ = self.pool.arc_locked().remove(page_id);
     }
 
     /// Return one page to the free space map. This is the only place `live_pages` goes down a

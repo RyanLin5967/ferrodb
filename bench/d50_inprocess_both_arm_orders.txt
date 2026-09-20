@@ -1,0 +1,172 @@
+D50-FERRODB-SNAPSHOT-COST — IN-PROCESS, BOTH ARM ORDERS. This one is not void.
+==============================================================================
+[HERE] 2026-09-18T22:42:42Z, this session, 18-core box, release.
+[HERE] harness examples/d50_reader_scaling.rs. No socket and no Python: threads call
+[HERE]   executor::run through ServerContext::catalog(), the same MutexGuard<Catalog> a
+[HERE]   connection thread takes, held outermost for a whole statement.
+
+⭐ THE ARM ORDER IS ROTATED TOO, AND IT MATTERED.
+   The first run measured the SAME configuration -- one thread on servers[0] -- at 52187
+   stmt/s as arm A's baseline and 23341 as arm B's. A 2.2x gap for identical work.
+   Rotating POINTS within a round cannot cancel a bias sitting between ARMS. Running the
+   control FIRST put arm A's 1T at 28530 and arm B's at 24046 -- so 52187 was the outlier,
+   an artifact of arm A running first on a freshly started process, and it would have
+   inflated arm A's baseline and made a FLAT curve read as a DECLINING one.
+
+BOTH ORDERS, ON THE ABSOLUTE TOTALS (which need no baseline at all):
+
+                          A-then-B run      B-then-A run
+  arm A (shared)  1T          52187             28530
+  arm A (shared) 16T          46897             23074      <- FLAT. 15 more threads, no gain.
+  arm B (control) 1T          23341             24046
+  arm B (control)16T         174247            134571      <- RISES 5.6x-7.5x
+  apart at 16T                 3.72x             5.83x
+
+ARM A'S TOTAL IS FLAT IN BOTH ORDERS (total_vs_1T at 16T: 0.899 and 0.809). That is the
+signature of one statement at a time: total throughput is capped at the single-threaded
+rate whatever N is. The control, which removes ONLY the shared Mutex<Catalog>, scales.
+
+⭐ AND THE SIGNATURE DIFFERS FROM TURSO'S IN A WAY WORTH KEEPING:
+     turso shared, 16T:   x0.308 of its 1T   -- WORSE than flat
+     ferrodb shared,16T:  x0.809-x0.899      -- flat
+   A clean global mutex hands off and stays flat. A contended SHARED lock is worse than
+   flat, because the readers pay cache-line ping-pong on top of serializing: turso's 16
+   readers do LESS total work than one. Same wall class for the objective -- concurrent
+   agents get no concurrent statements -- but not the same curve, and the difference is
+   the cost of pretending a shared lock is cheap.
+
+=================== RAW: arm order A then B ===================
+# D50-FERRODB-SNAPSHOT-COST  rows=200 warmup=300ms measure=1s rounds=3
+# building 16 independent servers (arm A uses only the first)
+
+=== ARM SHARED  (N threads, ONE ServerContext -- one Mutex<Catalog>) ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1T -> 52187 stmt/s (slowest thread 52274)
+#   2T -> 45930 stmt/s (slowest thread 22413)
+#   4T -> 45259 stmt/s (slowest thread 9682)
+#   8T -> 45192 stmt/s (slowest thread 4021)
+#   16T -> 45713 stmt/s (slowest thread 2213)
+# round 1 order: 2 4 8 16 1
+#   2T -> 45463 stmt/s (slowest thread 20148)
+#   4T -> 44612 stmt/s (slowest thread 10602)
+#   8T -> 44960 stmt/s (slowest thread 4963)
+#   16T -> 46897 stmt/s (slowest thread 1962)
+#   1T -> 51616 stmt/s (slowest thread 52133)
+# round 2 order: 4 8 16 1 2
+#   4T -> 44907 stmt/s (slowest thread 9490)
+#   8T -> 48832 stmt/s (slowest thread 4797)
+#   16T -> 48637 stmt/s (slowest thread 1957)
+#   1T -> 53588 stmt/s (slowest thread 53866)
+#   2T -> 48610 stmt/s (slowest thread 24376)
+
+threads   total_stmt_s   per_thread   total_vs_1T   per_thread_vs_1T
+      1          52187        52187         1.000              1.000
+      2          45930        22965         0.880              0.440
+      4          44907        11227         0.861              0.215
+      8          45192         5649         0.866              0.108
+     16          46897         2931         0.899              0.056
+
+=== ARM PRIVATE (N threads, N ServerContexts) -- the CONTROL ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1T -> 52813 stmt/s (slowest thread 53196)
+#   2T -> 99487 stmt/s (slowest thread 48910)
+#   4T -> 195592 stmt/s (slowest thread 49161)
+#   8T -> 272668 stmt/s (slowest thread 33873)
+#   16T -> 241925 stmt/s (slowest thread 12952)
+# round 1 order: 2 4 8 16 1
+#   2T -> 41115 stmt/s (slowest thread 20640)
+#   4T -> 84240 stmt/s (slowest thread 21099)
+#   8T -> 142366 stmt/s (slowest thread 17784)
+#   16T -> 174247 stmt/s (slowest thread 9920)
+#   1T -> 23341 stmt/s (slowest thread 23519)
+# round 2 order: 4 8 16 1 2
+#   4T -> 86047 stmt/s (slowest thread 21534)
+#   8T -> 140656 stmt/s (slowest thread 17571)
+#   16T -> 165569 stmt/s (slowest thread 9213)
+#   1T -> 22679 stmt/s (slowest thread 22808)
+#   2T -> 45840 stmt/s (slowest thread 22904)
+
+threads   total_stmt_s   per_thread   total_vs_1T   per_thread_vs_1T
+      1          23341        23341         1.000              1.000
+      2          45840        22920         1.964              0.982
+      4          86047        21512         3.686              0.922
+      8         142366        17796         6.099              0.762
+     16         174247        10890         7.465              0.467
+
+threads   shared_vs_1T   private_vs_1T       apart
+      1          1.000           1.000        0.45x
+      2          0.880           1.964        1.00x
+      4          0.861           3.686        1.92x
+      8          0.866           6.099        3.15x
+     16          0.899           7.465        3.72x
+
+=================== RAW: arm order B then A ===================
+# D50-FERRODB-SNAPSHOT-COST  rows=200 warmup=300ms measure=1s rounds=3
+# building 16 independent servers (arm A uses only the first)
+
+=== ARM PRIVATE (N threads, N ServerContexts) -- the CONTROL ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1T -> 56064 stmt/s (slowest thread 56625)
+#   2T -> 105594 stmt/s (slowest thread 53208)
+#   4T -> 149199 stmt/s (slowest thread 37239)
+#   8T -> 166788 stmt/s (slowest thread 20887)
+#   16T -> 38164 stmt/s (slowest thread 2202)
+# round 1 order: 2 4 8 16 1
+#   2T -> 25909 stmt/s (slowest thread 12954)
+#   4T -> 82280 stmt/s (slowest thread 20408)
+#   8T -> 144596 stmt/s (slowest thread 17981)
+#   16T -> 155168 stmt/s (slowest thread 7073)
+#   1T -> 24046 stmt/s (slowest thread 24261)
+# round 2 order: 4 8 16 1 2
+#   4T -> 93920 stmt/s (slowest thread 23666)
+#   8T -> 133373 stmt/s (slowest thread 16743)
+#   16T -> 134571 stmt/s (slowest thread 6897)
+#   1T -> 22371 stmt/s (slowest thread 22400)
+#   2T -> 53047 stmt/s (slowest thread 26530)
+
+threads   total_stmt_s   per_thread   total_vs_1T   per_thread_vs_1T
+      1          24046        24046         1.000              1.000
+      2          53047        26523         2.206              1.103
+      4          93920        23480         3.906              0.976
+      8         144596        18075         6.013              0.752
+     16         134571         8411         5.596              0.350
+
+=== ARM SHARED  (N threads, ONE ServerContext -- one Mutex<Catalog>) ===
+# order rotated per round; a within-round position bias has constant sign
+# round 0 order: 1 2 4 8 16
+#   1T -> 32067 stmt/s (slowest thread 32328)
+#   2T -> 30550 stmt/s (slowest thread 14889)
+#   4T -> 30533 stmt/s (slowest thread 7418)
+#   8T -> 29724 stmt/s (slowest thread 2079)
+#   16T -> 29536 stmt/s (slowest thread 568)
+# round 1 order: 2 4 8 16 1
+#   2T -> 30385 stmt/s (slowest thread 15067)
+#   4T -> 26726 stmt/s (slowest thread 6100)
+#   8T -> 26024 stmt/s (slowest thread 2834)
+#   16T -> 22294 stmt/s (slowest thread 469)
+#   1T -> 27650 stmt/s (slowest thread 27888)
+# round 2 order: 4 8 16 1 2
+#   4T -> 23130 stmt/s (slowest thread 5010)
+#   8T -> 23087 stmt/s (slowest thread 2237)
+#   16T -> 23074 stmt/s (slowest thread 511)
+#   1T -> 28530 stmt/s (slowest thread 28806)
+#   2T -> 27379 stmt/s (slowest thread 13173)
+
+threads   total_stmt_s   per_thread   total_vs_1T   per_thread_vs_1T
+      1          28530        28530         1.000              1.000
+      2          30385        15193         1.065              0.533
+      4          26726         6681         0.937              0.234
+      8          26024         3253         0.912              0.114
+     16          23074         1442         0.809              0.051
+
+# arm order this run: B then A
+
+threads   shared_vs_1T   private_vs_1T       apart
+      1          1.000           1.000        0.84x
+      2          1.065           2.206        1.75x
+      4          0.937           3.906        3.51x
+      8          0.912           6.013        5.56x
+     16          0.809           5.596        5.83x

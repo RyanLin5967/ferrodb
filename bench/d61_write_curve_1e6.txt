@@ -1,0 +1,73 @@
+D61 — THE WRITE-BEARING CURVE TO 10^6. One page written per branch, geometric extents (D31) in.
+[HERE] 2026-09-19T22:35:01Z  examples/branch_curve_writes at 2d6f706, 8 threads, 8 GB budget, 20 GiB disk floor
+WHY THIS RUN: the famous 10^6 curve is FORK-ONLY (no branch in it wrote a page, and its 'cat MB'
+column is CATALOG size). The write-bearing version was last run at N=4000, BEFORE D31's fix, and
+stopped on space at 1,048,316 B/branch -> ~1.05 TB extrapolated at 10^6. Nobody has run it since.
+PRE-REGISTERED: bytes/branch stays flat near 4096. If it climbs, the amplification is back in
+another form and this run NAMES where. If it stops early, the stopping point IS the result.
+⚠ forks/sec is measured on a SHARED, LOADED box (another session's Xcode build is running);
+it is a floor, not a throughput claim. The number this row turns on -- bytes/branch -- is
+load-independent.
+free before: 40Gi
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
+    100000       352.2     409.6      420.3           4096             4203            334       100000
+
+==============================================================================
+⛔ PAUSED BY THE USER, 2026-09-19, mid-run between N=100,000 and N=250,000.
+The binary was stopped deliberately (TaskStop, then confirmed 0 procs). It did NOT crash,
+did NOT hit the 8 GB budget, and did NOT hit the 20 GiB disk floor. There is no rc= line
+and no "free after" line below because the run never reached its own epilogue.
+==============================================================================
+
+WHAT THIS RUN ESTABLISHED BEFORE THE PAUSE
+  N=100,000 write-bearing branches: 4096 len B/branch EXACTLY, 409.6 MB data, 334 cat B/branch,
+  pages live = N. The pre-registered prediction ("stays flat near 4096") HELD at every point
+  reached. Nothing climbed. The run was stopped, not stopped-out.
+
+⚠ PROVENANCE SPLIT -- READ BEFORE QUOTING ANY ROW ABOVE OR BELOW
+  The 100,000 row at the top of this file is from THIS run, written by the binary.
+  The nine-point table below is RECOVERED FROM THE SESSION TRANSCRIPT, not from a file:
+  the earlier 10^5 run wrote to this same path and this run's redirect TRUNCATED it. That
+  is my own rule ("commit the raw artifact BEFORE interpreting it") broken by me, and the
+  cost was real -- the original file is unrecoverable. The numbers are the binary's own
+  stdout as captured in the transcript, but they are a COPY, and a resume should re-run
+  rather than treat this table as primary evidence.
+
+RECOVERED 10^5 CURVE (transcript copy, 8 threads, same binary, same build)
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live
+       496       218.7       2.0        2.2           4104             4360            339          496
+      1000       261.0       4.1        4.3           4100             4260            332         1000
+      2000       224.6       8.2        8.5           4098             4227            330         2000
+      4000       207.9      16.4       16.8           4097             4211            330         4000
+      5000       135.9      20.5       21.0           4097             4202            333         5000
+     10000       135.7      41.0       42.0           4096             4198            333        10000
+     20000       538.2      81.9       83.9           4096             4195            334        20000
+     50000       106.4     204.8      218.1           4096             4363            334        50000
+    100000       113.0     409.6      419.5           4096             4195            334       100000
+
+THE SHAPE, AND THE CAVEAT IN THE SAME SENTENCE
+  len B/branch converges DOWN to exactly PAGE_SIZE (4104 -> 4096) as the fixed per-branch
+  record cost amortises, and pages live == N throughout: each writing branch holds exactly
+  one real page and pays one page of file for it. This is a SHAPE (per-branch space is O(1)
+  in the number of branches, and the unit is the page) and it transfers to any engine that
+  allocates extents per branch; it is NOT a BranchBench result and NOT a comparison against
+  Dolt or Postgres -- a favourable absolute here would be an artifact of what ferrodb lacks.
+
+THE BEFORE/AFTER THAT THIS RUN MAKES AVAILABLE AT AN IDENTICAL N
+  D31 measured the SAME harness at N=4000 and got 1,048,316 data B/branch (= ARENA_EXTENT_PAGES
+  x PAGE_SIZE, the 256x amplification). This run, at N=4000, gets 4,097. Same example, same
+  column, same N: 1,048,316 -> 4,097, a factor of 255.9. That is the geometric-extent fix
+  measured end to end, not extrapolated.
+  ⚠ forks/sec is a FLOOR, not a throughput claim: shared, loaded box (load 12-21 throughout).
+  bytes/branch, which is what this row turns on, is load-independent.
+
+WHAT A RESUME MUST DO (do not trust this file's top row as the finish line)
+  1. Re-run to 10^6 with a DISTINCT output path per run -- never redirect over a banked artifact.
+  2. The unmeasured span is N > 100,000. Everything at or below it is measured and flat.
+  3. At ~350 forks/sec the remaining 900k branches is a multi-hour run; the 8 GB budget binds
+     around N ~ 2,000,000 at 4096 B/branch, so 10^6 (~4.1 GB) fits and the floor was never near.

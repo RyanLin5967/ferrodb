@@ -145,9 +145,6 @@ impl BranchCatalog for MemBranchCatalog {
             .ok_or(BranchError::NotFound(parent))?
             .depth
             .saturating_add(1);
-        if depth > crate::branch::types::MAX_BRANCH_DEPTH {
-            return Err(BranchError::DepthExceeded { branch, depth }.into());
-        }
         rec.parent_id = Some(parent);
         rec.fork_epoch = fork_epoch;
         rec.depth = depth;

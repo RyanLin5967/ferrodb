@@ -4,6 +4,20 @@ use crate::{binder::binder::BoundExpr, catalog::{catalog::Catalog, column::Value
 
 pub const MAX_DP_RELATIONS: usize = 12;
 
+/// How many relations one query may join before the planner refuses it — **D66**.
+///
+/// The relation sets here are BITMASKS in a `u64` (`1 << relation_of(..)`), so relation 64 would
+/// alias onto relation 0. That is not a crash in release, it is a WRONG ANSWER: two different
+/// relations share a mask bit, the join-order search treats them as one, and the query returns a
+/// cross product or drops a predicate silently. In a debug build the same shift panics with
+/// "attempt to shift left with overflow" instead.
+///
+/// This is bounded rather than widened because widening only moves the cliff: any fixed-width mask
+/// has one. A refusal that names the limit is a fact the caller can act on; an aliased bit is not.
+/// `MAX_DP_RELATIONS` (12) is a different limit for a different reason — past it the exhaustive
+/// DP is abandoned for a left-deep plan, which is a QUALITY decision, not a correctness one.
+pub const MAX_JOIN_RELATIONS: usize = 63;
+
 pub struct Sub {
     pub plan: PhysicalPlan,
     pub order: Vec<usize>,
@@ -15,6 +29,12 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
     let mut preds = Vec::new();
     flatten(plan, &mut leaves, &mut preds);
     let n = leaves.len();
+    if n > MAX_JOIN_RELATIONS {
+        return Err(FerroError::SqlParseError(format!(
+            "query joins {} relations; the planner supports at most {}",
+            n, MAX_JOIN_RELATIONS
+        )));
+    }
 
     let widths: Vec<usize> = leaves.iter().map(|l| l.output_schema().len()).collect();
     let mut orig_offset = vec![0usize; n];
@@ -27,12 +47,12 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
         base_plans.push(optimize(leaf, catalog)?)
     }
 
-    let mut conjuncts: Vec<(u32, BoundExpr)> = Vec::new();
+    let mut conjuncts: Vec<(u64, BoundExpr)> = Vec::new();
     for pred in preds {
         let mut parts = Vec::new();
         split_and(pred, &mut parts);
         for part in parts {
-            let mut rel = 0u32;
+            let mut rel = 0u64;
             relations_of(&part, &orig_offset, &mut rel, &widths);
             conjuncts.push((rel, part));
         }
@@ -45,12 +65,12 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
     let mut best = HashMap::new();
     for (r, plan) in base_plans.into_iter().enumerate() {
         let cost = cost(&plan, catalog).cost;
-        best.insert(1 << r, Sub { plan, order: vec![r], cost});
+        best.insert(1u64 << r, Sub { plan, order: vec![r], cost});
     }
 
     // build up subsets by increasing size
     for size in 2..=n {
-        let masks: Vec<u32> = (1u32..(1 << n)).filter(|m| m.count_ones() as usize == size).collect();
+        let masks: Vec<u64> = (1u64..(1u64 << n)).filter(|m| m.count_ones() as usize == size).collect();
         for mask in masks {
             let mut sub = (mask - 1) & mask;
             while sub > 0 {
@@ -80,7 +100,7 @@ pub fn reorder_inner_joins(plan: LogicalPlan, catalog: &Catalog) -> Result<Physi
         }
     }
 
-    let full = (1u32 << n) - 1;
+    let full = (1u64 << n) - 1;
     let best_full = best.remove(&full).ok_or_else(|| FerroError::Bind("disconnected join graph".into()))?;
     
     let idendity: Vec<usize> = (0..n).collect();
@@ -109,26 +129,26 @@ pub fn relation_of(idx: usize, orig_offset: &[usize], widths: &[usize]) -> usize
     (0..widths.len()).find(|&r| idx >= orig_offset[r] && idx < orig_offset[r] + widths[r]).unwrap_or(0)
 }   
 
-pub fn relations_of(expr: &BoundExpr, orig_offset: &[usize], out: &mut u32, widths: &[usize]) {
+pub fn relations_of(expr: &BoundExpr, orig_offset: &[usize], out: &mut u64, widths: &[usize]) {
     match expr {
         BoundExpr::BinaryOp { left, right, .. } => {
             relations_of(left, orig_offset, out, widths);
             relations_of(right, orig_offset, out, widths);
         }
-        BoundExpr::Column(i) => *out |= 1 << relation_of(*i, orig_offset, widths),
+        BoundExpr::Column(i) => *out |= 1u64 << relation_of(*i, orig_offset, widths),
         BoundExpr::Literal(_) => {}
         BoundExpr::UnaryOp {right, .. } => relations_of(right, orig_offset, out, widths),
     }
 }
 
-fn left_deep(base: Vec<PhysicalPlan>, conjuncts: &[(u32, BoundExpr)], orig_offset: &[usize], widths: &[usize], catalog: &Catalog) -> PhysicalPlan {
+fn left_deep(base: Vec<PhysicalPlan>, conjuncts: &[(u64, BoundExpr)], orig_offset: &[usize], widths: &[usize], catalog: &Catalog) -> PhysicalPlan {
     let mut iter = base.into_iter();
     let mut acc = iter.next().unwrap();
     let mut acc_order = vec![0usize];
-    let mut covered = 1u32;
+    let mut covered = 1u64;
     for r in 1..widths.len() {
         let right = iter.next().unwrap();
-        let r_mask = 1 << r;
+        let r_mask = 1u64 << r;
         let mask = covered | r_mask;
         let mut order = acc_order.clone();
         order.push(r);

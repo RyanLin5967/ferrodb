@@ -60,7 +60,33 @@ pub trait PageLinks: Send + Sync {
     fn rewrite_child(&self, page: &mut [u8; PAGE_SIZE], old: PageId, new: PageId);
 }
 
-/// Guard against a cyclic or pathologically deep page graph during collapse.
+/// One page in flight during a [`TwoTierReaper::deep_copy`] — see that function. Holds only what
+/// the recursive version held in a call frame, so the memory profile is unchanged for the wide,
+/// shallow graphs that are the normal case: the live set is the current PATH, not the whole tree.
+struct CopyFrame {
+    page_type: PageType,
+    data: Box<[u8; PAGE_SIZE]>,
+    children: Vec<PageId>,
+    /// How many of `children` have been copied and folded into `rewrites`.
+    next: usize,
+    rewrites: Vec<(PageId, PageId)>,
+}
+
+/// Bounds the number of pages one `collapse` may copy. **It bounds PAGES, not DEPTH — D62.**
+///
+/// This comment used to claim the constant guarded "a cyclic or pathologically deep page graph",
+/// and exactly one of those was true. Three separate guards cover three separate failures, and
+/// conflating them is what let the third go unimplemented for so long:
+///
+/// * **cyclic** — the `seen` set in [`TwoTierReaper::deep_copy`]. Nothing to do with this budget.
+/// * **too much work** — this constant. 65,536 pages, 256 MiB, checked once per page visited.
+/// * **too deep** — the explicit stack in `deep_copy`. A page image declares its own child list
+///   (`child_pages` reads the count straight out of the bytes), so depth is a property of what is
+///   on disk, not of an invariant this code enforces: 65,536 single-child levels are within this
+///   budget. While the walk was recursive each level also parked a 4 KiB page image in its stack
+///   frame, so the stack was exhausted at a depth of roughly (stack bytes / 4 KiB) — orders below
+///   the page budget, and lower again on a thread with a smaller stack. The walk is iterative now,
+///   so depth costs heap, which is bounded by the budget rather than by a guard page.
 const MAX_COLLAPSE_PAGES: usize = 1 << 16;
 
 /// How rarely the crash-orphan collector may run off the background lease tick.
@@ -169,6 +195,12 @@ impl TwoTierReaper {
     /// Remove this branch's fork epoch from its parent's live-children array. This is the single
     /// event that can make a parked page reclaimable, which is why `reap` always follows it with
     /// a `drain_pending`.
+    /// **Iterative since D60.** This walked strictly up the parent chain by calling itself, and
+    /// its termination argument was the chain's length being "capped at `MAX_BRANCH_DEPTH`" —
+    /// a cap D60 removed. Three fresh-context reviewers found it in the same pass: the recursion
+    /// in `table_catalog::has_live_children` was fixed and this one, which the cap bounded in
+    /// exactly the same way, was not. A chain of reaped ancestors is precisely what the cascade
+    /// below walks, and precisely what MCTS pruning produces.
     fn detach_from_parent(&self, rec: &BranchRecord) -> Result<(), FerroError> {
         // **D16 — DO NOT DETACH A BRANCH THAT STILL HAS LIVE CHILDREN.**
         //
@@ -182,31 +214,33 @@ impl TwoTierReaper {
         // Reproduced single-threaded and deterministically in `tests/s18_transitive_visibility.rs`.
         // This is the operation MCTS performs -- pruning an interior node -- so a flat fanout
         // never exercises it, which is why every benchmark here missed it.
-        if self.catalog.has_live_children(rec.branch_id.id)? {
-            return Ok(());
-        }
-        let Some(parent) = rec.parent_id else { return Ok(()) };
-        // One call rather than get/mutate/put. The old shape silently did nothing against any
-        // catalog that keeps the live set in an index instead of inside the record - see
-        // `BranchCatalog::detach_child`.
-        self.catalog.detach_child(parent.id, rec.fork_epoch)?;
-
-        // CASCADE. The parent may itself be a reaped branch that was pinned open only by the
-        // child just removed. Without this the pin is permanent: the grandparent would keep
-        // seeing a live child for ever and its pages could never be reclaimed -- trading a
-        // correctness bug for an unbounded space leak, which is not a trade worth making.
+        // CASCADE, as a loop. The parent may itself be a reaped branch that was pinned open only
+        // by the child just removed. Without following that up, the pin is permanent: the
+        // grandparent would keep seeing a live child for ever and its pages could never be
+        // reclaimed -- trading a correctness bug for an unbounded space leak.
         //
-        // Terminates because each step moves strictly up the parent chain, whose length is capped
-        // at `MAX_BRANCH_DEPTH`. Note the STEPS are bounded (<= 8); the WORK per step is not --
-        // each one asks `has_live_children`, which scans a CHILD span and recurses into reaped
-        // children. See the cost note in `table_catalog.rs::live_child_at`, which corrects an
-        // earlier "O(1) in N" claim of mine that was simply wrong.
-        if let Ok(prec) = self.catalog.get_raw(parent.id) {
-            if prec.state == BranchState::Reaped {
-                self.detach_from_parent(&prec)?;
+        // **Terminates because each step moves strictly up the parent chain**, and a parent id is
+        // written once at fork and never changed, so the chain cannot contain a cycle. The STEPS
+        // are now bounded by the chain's length rather than by a constant (D60 removed the cap);
+        // the WORK per step was never bounded -- each asks `has_live_children`, which scans a
+        // child span and explores reaped children. See the cost note in
+        // `table_catalog.rs::child_liveness`.
+        let mut cur = rec.clone();
+        loop {
+            if self.catalog.has_live_children(cur.branch_id.id)? {
+                return Ok(());
+            }
+            let Some(parent) = cur.parent_id else { return Ok(()) };
+            // One call rather than get/mutate/put. The old shape silently did nothing against any
+            // catalog that keeps the live set in an index instead of inside the record - see
+            // `BranchCatalog::detach_child`.
+            self.catalog.detach_child(parent.id, cur.fork_epoch)?;
+
+            match self.catalog.get_raw(parent.id) {
+                Ok(prec) if prec.state == BranchState::Reaped => cur = prec,
+                _ => return Ok(()),
             }
         }
-        Ok(())
     }
 
     /// Catalog descents the extent sweep has made since this reaper was built.
@@ -406,22 +440,78 @@ impl TwoTierReaper {
     /// deliberately refuses to grow an extent: its error says "ask `arena_for` for a fresh extent"
     /// and nothing here ever did. A tree larger than `ARENA_EXTENT_PAGES` (256 pages, ~1MB)
     /// therefore could not be collapsed at all -- and since `collapse` is the only escape from
-    /// `MAX_BRANCH_DEPTH`, the ninth fork of any database over ~1MiB was a dead end.
+    /// the depth cap D60 removed, the ninth fork of any database over ~1MiB was a dead end.
     ///
     /// `arena_for` is what every other page allocator in the engine already uses (`cow_page`, all
     /// four B+tree split paths): it returns the branch's current extent while it has room and
     /// claims a fresh one when it does not, recording each fresh one against the branch inside
     /// `alloc_arena`'s atomic `add_arena`. That last part is why `collapse` must RE-READ the
     /// record before its final write; see there.
+    /// Copies the reachable page graph, iteratively.
+    ///
+    /// Each page is read ONCE, when its [`CopyFrame`] is opened, and its child list comes from
+    /// that same image — preserving the recursive version's property that a page's bytes and its
+    /// children never come from two different reads. Re-reading at emit time would have been
+    /// cheaper in memory and would have opened a window for the two to disagree.
     fn deep_copy(
         &self,
-        page: PageId,
+        root: PageId,
         branch: BranchId,
         epoch: Epoch,
         links: &dyn PageLinks,
         seen: &mut HashSet<PageId>,
         budget: &mut usize,
     ) -> Result<PageId, FerroError> {
+        // Post-order over the page graph, iteratively. A parent may only be written once every
+        // child has a new id to point at, which is the whole reason this is post-order and not a
+        // plain DFS. `completed` carries the id the just-finished child produced back to its
+        // parent, taking the place of the recursive call's return value.
+        let mut stack: Vec<CopyFrame> = vec![self.open_copy_frame(root, links, seen, budget)?];
+        let mut completed: Option<PageId> = None;
+
+        loop {
+            if let Some(new_child) = completed.take() {
+                let top = stack
+                    .last_mut()
+                    .expect("completed is only set when a parent frame remains");
+                let old = top.children[top.next];
+                top.rewrites.push((old, new_child));
+                top.next += 1;
+            }
+
+            let next_child = {
+                let top = stack.last().expect("the loop returns when the stack empties");
+                (top.next < top.children.len()).then(|| top.children[top.next])
+            };
+
+            match next_child {
+                Some(child) => {
+                    let frame = self.open_copy_frame(child, links, seen, budget)?;
+                    stack.push(frame);
+                }
+                None => {
+                    let frame = stack.pop().expect("checked non-empty above");
+                    let new_id = self.emit_copy(frame, branch, epoch, links)?;
+                    match stack.is_empty() {
+                        true => return Ok(new_id),
+                        false => completed = Some(new_id),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Charge one page against the budget, reject a revisit, and read the page once.
+    ///
+    /// The order of the two refusals is load-bearing and matches the recursive version exactly: a
+    /// budget already at zero is reported as the budget, not as a revisit.
+    fn open_copy_frame(
+        &self,
+        page: PageId,
+        links: &dyn PageLinks,
+        seen: &mut HashSet<PageId>,
+        budget: &mut usize,
+    ) -> Result<CopyFrame, FerroError> {
         if *budget == 0 {
             return Err(BranchError::Arena(format!(
                 "collapse exceeded {} pages; the page graph is cyclic or larger than a branch",
@@ -442,23 +532,33 @@ impl TwoTierReaper {
             let handle = self.store.read_page(page)?;
             (handle.header()?.page_type, handle.read().data)
         };
-
         let children = links.child_pages(page_type, &data)?;
-        let mut rewrites = Vec::with_capacity(children.len());
-        for child in children {
-            let new_child = self.deep_copy(child, branch, epoch, links, seen, budget)?;
-            rewrites.push((child, new_child));
-        }
+        Ok(CopyFrame {
+            page_type,
+            data: Box::new(data),
+            children,
+            next: 0,
+            rewrites: Vec::new(),
+        })
+    }
 
-        let new_id = self.store.alloc_for(branch, page_type, epoch)?;
+    /// Write one page's copy, repointing it at the copies its children became.
+    fn emit_copy(
+        &self,
+        frame: CopyFrame,
+        branch: BranchId,
+        epoch: Epoch,
+        links: &dyn PageLinks,
+    ) -> Result<PageId, FerroError> {
+        let new_id = self.store.alloc_for(branch, frame.page_type, epoch)?;
         let handle = self.store.read_page(new_id)?;
         {
-            let mut frame = handle.write();
-            frame.data[PAGE_HEADER_SIZE..].copy_from_slice(&data[PAGE_HEADER_SIZE..]);
-            for (old, new) in rewrites {
-                links.rewrite_child(&mut frame.data, old, new);
+            let mut fresh = handle.write();
+            fresh.data[PAGE_HEADER_SIZE..].copy_from_slice(&frame.data[PAGE_HEADER_SIZE..]);
+            for (old, new) in frame.rewrites {
+                links.rewrite_child(&mut fresh.data, old, new);
             }
-            crate::cow::stamp_checksum(&mut frame.data);
+            crate::cow::stamp_checksum(&mut fresh.data);
         }
         Ok(new_id)
     }
@@ -1506,18 +1606,18 @@ mod tests {
         let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
             .with_links(Arc::new(ToyLinks));
 
+        // **D60 removed the depth cap**, so this no longer builds "the deepest chain the catalog
+        // allows" — there is no such thing. It builds a chain far past the old cap and checks the
+        // ninth fork SUCCEEDS, which is the property that replaced the refusal this asserted.
         let mut cur = BranchId::TRUNK;
-        use crate::branch::types::MAX_BRANCH_DEPTH;
-        for _ in 0..MAX_BRANCH_DEPTH {
-            cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
+        for i in 1..=12u32 {
+            cur = h
+                .catalog
+                .fork(cur, LeaseDeadline::from_now(LEASE_MS))
+                .unwrap_or_else(|e| panic!("fork at depth {i} refused: {e}"))
+                .branch_id;
         }
-        assert_eq!(h.catalog.get(cur).unwrap().depth, MAX_BRANCH_DEPTH);
-
-        let err = h
-            .catalog
-            .fork(cur, LeaseDeadline::from_now(LEASE_MS))
-            .expect_err("the ninth fork must be refused");
-        assert!(err.to_string().contains("depth"), "got {err}");
+        assert_eq!(h.catalog.get(cur).unwrap().depth, 12);
 
         // Give the chain a real root before collapsing. A branch that has never written still
         // carries the trunk's placeholder root id, which is not an allocated page — collapse then
@@ -1633,6 +1733,67 @@ mod tests {
         assert!(err.to_string().contains("not a tree"), "got {}", err);
     }
 
+    /// **D62 — a single-child chain must not be bounded by the STACK.**
+    ///
+    /// `MAX_COLLAPSE_PAGES` bounds PAGES COPIED and never bounded depth. While `deep_copy` was
+    /// recursive, each level also parked a 4 KiB page image in its call frame, so the stack was
+    /// exhausted at roughly (stack bytes / 4 KiB) levels — orders below the 65,536-page budget. A
+    /// page declares its own child list (`child_pages` reads the count out of the bytes), so the
+    /// depth is whatever is on disk, not something this code enforces.
+    ///
+    /// The chain below is thousands of levels deep and stays well inside the page budget, so it
+    /// can only fail on depth. ⚠ Against the RECURSIVE implementation this test does not fail an assertion —
+    /// it aborts the whole test process with a stack overflow. That is the proof it tests what it
+    /// names; a version of this fixture that merely passes on both implementations tests nothing.
+    #[test]
+    fn collapse_survives_a_page_chain_far_deeper_than_a_call_stack() {
+        const CHAIN: usize = 8_000;
+        assert!(
+            CHAIN < MAX_COLLAPSE_PAGES,
+            "fixture must stay INSIDE the page budget, or a refusal would prove the budget \
+             rather than the depth"
+        );
+
+        let h = Harness::new_with($table);
+        let reaper = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&h.store))
+            .with_links(Arc::new(ToyLinks));
+
+        // The chain is owned by an ancestor, exactly as the wide-tree test does it, so the branch
+        // being collapsed inherits pages it does not own and `deep_copy` has to walk all of them.
+        let anc = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        let e = h.catalog.next_epoch();
+        let leaf = h.store.alloc_for(anc.branch_id, PageType::BTreeLeaf, e).unwrap();
+        let mut child = leaf;
+        for _ in 0..CHAIN {
+            let p = h.store.alloc_for(anc.branch_id, PageType::BTreeInternal, e).unwrap();
+            let handle = h.store.read_page(p).unwrap();
+            {
+                let mut f = handle.write();
+                ToyLinks::write(&mut f.data, &[child]);
+                stamp_checksum(&mut f.data);
+            }
+            child = p;
+        }
+        let root = child;
+
+        let mut cur = anc.branch_id;
+        for _ in 0..6 {
+            cur = h.catalog.fork(cur, LeaseDeadline(0)).unwrap().branch_id;
+        }
+        h.catalog.set_root(cur, root).unwrap();
+        let live_before = h.store.live_page_count().unwrap();
+
+        let collapsed = reaper.collapse(cur).unwrap();
+
+        assert_eq!(collapsed.depth, 1);
+        assert_ne!(collapsed.root_page_id, root, "the chain was materialised, not aliased");
+        assert_eq!(
+            h.store.live_page_count().unwrap(),
+            live_before + CHAIN as u32 + 1,
+            "every page of the chain was copied exactly once"
+        );
+    }
+
     /// **D13b — `collapse` must roll over extents, or it cannot collapse a real database.**
     ///
     /// `collapse` allocated ONE arena and threaded that single id through every `deep_copy`.
@@ -1640,7 +1801,7 @@ mod tests {
     /// `arena_for` for a fresh extent" — so the copy died the moment the materialised tree
     /// crossed `ARENA_EXTENT_PAGES` (256 pages, ~1MB at 4KB pages).
     ///
-    /// That is not a corner: `collapse` is the ONLY escape from `MAX_BRANCH_DEPTH`, so the ninth
+    /// That was not a corner while the depth cap stood: `collapse` was its only escape, so the ninth
     /// fork of any database over ~1MiB was a dead end — the fork is refused, and the one operation
     /// that clears the refusal cannot run. Every existing collapse test copies a 1–3 page tree,
     /// which is why the whole suite stayed green through it.
@@ -1666,15 +1827,16 @@ mod tests {
         let baseline_live = h.store.live_page_count().unwrap();
         let baseline_reserved = h.store.reserved_page_count();
 
-        // A chain sitting exactly where the depth guard leaves one.
+        // A deep chain. Before D60 this sat exactly at the cap and asserted the next fork was
+        // REFUSED — "collapse is the only way forward". There is no cap now, and `collapse` is a
+        // way to shorten a chain rather than the only escape from one, so the test builds the
+        // same shape and keeps everything below it: what it is really about is that collapse
+        // materialises a deep chain's tree correctly.
         let mut cur = BranchId::TRUNK;
-        for _ in 0..crate::branch::types::MAX_BRANCH_DEPTH {
+        for _ in 0..8 {
             cur = h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).unwrap().branch_id;
         }
-        assert!(
-            h.catalog.fork(cur, LeaseDeadline::from_now(LEASE_MS)).is_err(),
-            "the chain is not at the ceiling, so collapse is not the only way forward"
-        );
+        assert_eq!(h.catalog.get(cur).unwrap().depth, 8);
 
         // Build its tree. Note `arena_for` per page rather than one captured `alloc_arena` id:
         // the store could ALREADY roll over, and a normal writer gets it for free. Collapse was

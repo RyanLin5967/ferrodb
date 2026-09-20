@@ -146,7 +146,7 @@ impl Db {
             upper: Bound::Included(Value::Integer(v)),
         };
         let view = Arc::new(ReadView {
-            snapshot: Snapshot { high_water: u64::MAX, active: HashSet::new() },
+            snapshot: Arc::new(Snapshot { high_water: u64::MAX, active: HashSet::new() }),
             txn_id: 0,
         });
         let mut exec = lower(plan, &self.catalog, self.bp.clone(), view).expect("lower the plan");

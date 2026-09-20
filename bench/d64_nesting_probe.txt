@@ -1,0 +1,122 @@
+D64 / D64b — CLIENT-REACHABLE STACK OVERFLOWS IN THE PARSER AND IN WHAT WALKS ITS OUTPUT.
+[HERE] every number is this session's own run of examples/d64_nesting_probe, ONE DEPTH PER PROCESS
+so a stack overflow cannot hide the depths after it. Measured on a SPAWNED thread, because that is
+the stack the server uses: src/pgwire/mod.rs:290 is a bare std::thread::spawn and `stack_size`
+appears nowhere in src/, so every connection gets Rust's 2 MiB default.
+
+⛔ THIS GUARD WAS WALKED AROUND TWICE, AND EACH VERSION ASSERTED IT WAS COMPLETE.
+  v1  charged only Parser::expression.            -> NOT NOT NOT ... walked around it.
+  v2  added not() and unary(), and its comment called those "the three DISTINCT ways this parser
+      adds a level to the tree".                  -> FALSE. A fresh-context review then found:
+        (a) parse_explain  -> parse_statement  and  parse_simulate -> parse_statement, two
+            STATEMENT-level recursions charged by nothing at all; and
+        (b) the six binary-operator loops, which are `while` loops rather than recursion, so the
+            parser's stack never grows while the TREE it builds is left-deep, one level per
+            operator — moving the overflow into binder::bind_expr, executor::evaluate and Expr's
+            own derived Drop. v2's doc claimed the parser limit "transitively bounded" those.
+            It did not.
+  v3  charged parser RE-ENTRY and TREE DEPTH as two separate quantities.
+                                                  -> WALKED AROUND A THIRD TIME. `expression()`
+      RESTORED the chain counter in bulk on exit, and every binary loop parses its LEFT operand
+      before its first `enter_chain()`. So a left-position `(` re-entered `expression()` with the
+      counter still at the parent's entry value — zero, all the way down the leftmost spine. Each
+      nesting level got a FULL FRESH budget while costing only 1 against MAX_EXPR_DEPTH, so the two
+      limits MULTIPLIED rather than adding. MEASURED, with the v3 guard in place, on a 2 MiB
+      connection thread: 62 nesting levels x 800 operators = a ~49,600-deep tree that PARSED
+      CLEANLY and then aborted the process. 10 levels x 800 was already past the debug threshold.
+      v3's own doc argued the restore was correct because "a left-deep chain really is that depth,
+      and that depth belongs to this expression" — the same self-certifying wording v2 used, and
+      false for a LEFT-position grouping, where the parent's spine runs through the child's tree.
+  v4  (this file) makes the tree budget PER STATEMENT: never released until `parse` zeroes it at a
+      statement boundary, so nesting cannot renew it. Also charges once per JOIN, because the
+      planner folds a flat join list into an N-deep `LogicalPlan::Join` tree that several walkers
+      descend. MAX_TREE_DEPTH lowered 4096 -> 1024; see the scope correction below.
+
+THE ABORTS, with BOTH limits lifted, release, 2 MiB spawned thread
+------------------------------------------------------------------
+  shape     what recurses                                  ok        ABORT
+  parens    Parser::expression, ~9 frames/level            1,000     2,000
+  not/neg   Parser::not / Parser::unary, self-recursive   10,000    50,000
+  explain   parse_statement <-> parse_explain              2,000     5,000
+  chain     the WALKERS of a left-deep tree, not the       25,000    50,000
+            parser: 1 + 1 + 1 + ... builds depth N at
+            parser depth 1
+All aborts are `fatal runtime error: stack overflow`, SIGABRT, rc=134.
+
+THE SAME, in a DEBUG build (smaller is the binding case; debug frames are largest)
+----------------------------------------------------------------------------------
+  parens    ok    100 / ABORT    200
+  explain   ok    200 / ABORT    400      <- see the correction below
+  chain     ok 12,800 / ABORT 25,600
+
+⚠ CORRECTION, MEASURED AGAINST MY OWN PROBE: the EXPLAIN row above was first measured with a
+generator that fell through and appended a stray second " FROM t;", producing
+"EXPLAIN ... SELECT 1 FROM t FROM t;". The probe faithfully reported that SYNTAX ERROR as
+REFUSED_CLEANLY, so the "boundary" it found (57) was the typo, not the guard. Fixed with an
+explicit `whole_statement` flag; both shapes then re-measured and the real boundary is 62, the
+same as parens. The abort thresholds were unaffected — the stack is consumed during descent,
+long before the trailing tokens are reached — but the boundary was wrong and a test written from
+it failed, which is how it was caught.
+
+TWO LIMITS, BECAUSE THEY BOUND TWO QUANTITIES 100x APART
+---------------------------------------------------------
+  MAX_EXPR_DEPTH = 64    parser RE-ENTRY: expression, not, unary, parse_statement.
+                         Binding case is parens in debug (abort at 200), so ~3x margin.
+  MAX_TREE_DEPTH = 1024  total operator/join CHARGES per statement, bounding tree depth
+                         conservatively (depth <= total charges). See the scope correction.
+                         ⚠ CHARGES, NOT TERMS: `a = 1 AND b = 2 AND ...` spends TWO per term (the
+                         AND in and(), the = in equality()), so the real ceiling for an ordinary
+                         predicate is ~512 terms, not 1,024. A bare `1 + 1 + 1 ...` chain spends
+                         one per operator and does get 1,024.
+                         ⚠ It does NOT agree with tel::log::MAX_GUARD_DEPTH (256): a TEL guard
+                         predicate accepted here at 300 operators is refused later by the durable
+                         -log encoder. Recorded as a rough edge, not resolved.
+  Collapsing these into one constant would either refuse a 200-term AND chain — legal SQL that
+  generators emit — or leave the expensive shapes unsafe. They are different quantities, not a
+  guard and a spare.
+
+AFTER, with the guard in place (release, 2 MiB thread) — boundaries measured, not derived
+-------------------------------------------------------------------------------------------
+  parens / not / neg / explain   last OK 62, refuses at 63
+  chain                          [v3 figure, SUPERSEDED: last OK 4,096, refuses at 4,097 — the
+                                 constant is 1,024 now, so the v4 boundary is 1,024 / 1,025 and
+                                 the v3 numbers below this line describe code that no longer
+                                 exists. Kept, marked, rather than quietly rewritten.]
+  Nothing aborts at any depth tried, up to 100,000, on any of the five shapes.
+  The refusals name their limit: "expression nests deeper than 64 levels" /
+  "expression chains more than 4096 operators deep".
+
+THE SHAPE, with the caveat in the same sentence: an unguarded recursion over CLIENT-SUPPLIED
+structure is a process abort in any engine — Postgres calls check_stack_depth() in every such walk
+and SQLite ships SQLITE_MAX_EXPR_DEPTH — and THAT transfers. The specific numbers are this machine,
+these build profiles and this stack size, and transfer to nothing.
+
+SEVERITY: SIGABRT kills the process, so one query ends every other session on that server. Both
+statement recursions are reachable from any pgwire client; nothing upstream caps query size.
+⚠ The statement-level recursions are PRE-EXISTING, not introduced by D64: parse_explain is
+byte-identical at 2d6f706. D64 did not create them — it claimed to have closed the class.
+
+
+=== SCOPE CORRECTION, v4 =====================================================================
+⚠ THE CHAIN THRESHOLDS ABOVE DO NOT MEASURE WHAT THIS FILE SAID THEY MEASURED.
+
+`examples/d64_nesting_probe.rs` links only `Parser` and `Scanner`, and `run()` ends at
+`p.parse()`. The only N-deep recursion in that process is `Expr`'s DERIVED DROP GLUE — the chain
+shape is parsed by `while` loops at constant parser depth. So "chain: ok 12,800 / ABORT 25,600"
+measures parse plus drop, which is the LIGHTEST walker there is.
+
+The walkers the constant is actually justified against — `binder::bind_expr`,
+`execution::executor::evaluate`, `optimizer::split_and`, `pgwire::params::walk_expr` — all descend
+the same tree with fatter frames and were NEVER RUN AT DEPTH. Their thresholds are UNMEASURED.
+Earlier text here called that row "the WALKERS of a left-deep tree". It was not.
+
+⇒ MAX_TREE_DEPTH is 1,024, not 4,096: 25x under the one threshold that WAS measured, with the
+margin deliberately standing in for the ones that were not. A limit 3x under the LIGHTEST walker
+would have been a number that does not describe what it is protecting. A `WHERE` with a thousand
+`AND` terms still parses, which covers machine-generated SQL.
+
+AFTER v4 — every shape, 2 MiB connection thread, release, nothing aborts at any depth tried:
+  parens / not / neg / explain   OK at 62, REFUSED at 1,024 / 5,000 / 50,000
+  chain                          OK at 1,024, REFUSED at 5,000 / 50,000
+  nestchain (62 x 800)           REFUSED — and REFUSED at 10 x 800, which v3 allowed
+==============================================================================================

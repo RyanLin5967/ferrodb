@@ -1,0 +1,139 @@
+D58 — PREMISE, second run with the fixed binary: shared vs PRIVATE control, both arm orders.
+[HERE] 2026-09-19T08:27:29Z  examples/d55_agent_read_scaling at 8111352, D55_QUICK=1 D55_QUICK_ARM=both, staged=10, rows=5000, 3600 s bound per pass
+The first run (d58_shared_vs_private_premise.txt) was cut by its own 1800 s timeout inside the private arm.
+PRE-REGISTERED (unchanged): private ~ shared => NOT JUSTIFIED; private >> shared => profile the shared 16T hold.
+
+# order=AB load=3.45 4.76 4.99
+# QUICK: shared then private staged=10 only
+# round 0 order: 1 2 4 8 16
+#   1T -> 157642 stmt/s (slowest thread 158766)
+#   2T -> 235253 stmt/s (slowest thread 118731)
+#   4T -> 382891 stmt/s (slowest thread 96379)
+#   8T -> 369829 stmt/s (slowest thread 46004)
+#   16T -> 405062 stmt/s (slowest thread 25127)
+# round 1 order: 2 4 8 16 1
+#   2T -> 231910 stmt/s (slowest thread 117050)
+#   4T -> 383163 stmt/s (slowest thread 95943)
+#   8T -> 400579 stmt/s (slowest thread 49966)
+#   16T -> 427388 stmt/s (slowest thread 26786)
+#   1T -> 154478 stmt/s (slowest thread 154675)
+# round 2 order: 4 8 16 1 2
+#   4T -> 361389 stmt/s (slowest thread 90648)
+#   8T -> 363382 stmt/s (slowest thread 45113)
+#   16T -> 400769 stmt/s (slowest thread 25003)
+#   1T -> 151031 stmt/s (slowest thread 152210)
+#   2T -> 228274 stmt/s (slowest thread 114666)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         154478       154478         1.000
+      2         231910       115955         1.501
+      4         382891        95723         2.479
+      8         369829        46229         2.394
+     16         405062        25316         2.622
+# round 0 order: 1 2 4 8 16
+#   1T -> 155610 stmt/s (slowest thread 156614)
+#   2T -> 247948 stmt/s (slowest thread 124370)
+#   4T -> 438660 stmt/s (slowest thread 107964)
+#   8T -> 925399 stmt/s (slowest thread 114640)
+#   16T -> 880197 stmt/s (slowest thread 53354)
+# round 1 order: 2 4 8 16 1
+#   2T -> 251721 stmt/s (slowest thread 127097)
+#   4T -> 523192 stmt/s (slowest thread 131393)
+#   8T -> 941249 stmt/s (slowest thread 115546)
+#   16T -> 1540773 stmt/s (slowest thread 93260)
+#   1T -> 151300 stmt/s (slowest thread 152816)
+# round 2 order: 4 8 16 1 2
+#   4T -> 519595 stmt/s (slowest thread 130573)
+#   8T -> 929834 stmt/s (slowest thread 116134)
+#   16T -> 1664626 stmt/s (slowest thread 100900)
+#   1T -> 161182 stmt/s (slowest thread 162113)
+#   2T -> 272861 stmt/s (slowest thread 136525)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         155610       155610         1.000
+      2         251721       125860         1.618
+      4         519595       129899         3.339
+      8         929834       116229         5.975
+     16        1540773        96298         9.902
+threads   shared_vs_1T   shared_abs   private_vs_1T   private_abs   shared/private
+      1          1.000       154478           1.000        155610            0.993
+      2          1.501       231910           1.618        251721            0.921
+      4          2.479       382891           3.339        519595            0.737
+      8          2.394       369829           5.975        929834            0.398
+     16          2.622       405062           9.902       1540773            0.263
+# pass rc=
+
+# order=BA load=2.41 3.03 3.68
+# QUICK: shared then private staged=10 only
+# round 0 order: 1 2 4 8 16
+#   1T -> 164167 stmt/s (slowest thread 165376)
+#   2T -> 248495 stmt/s (slowest thread 124076)
+#   4T -> 457426 stmt/s (slowest thread 115102)
+#   8T -> 979551 stmt/s (slowest thread 121142)
+#   16T -> 1652395 stmt/s (slowest thread 100184)
+# round 1 order: 2 4 8 16 1
+#   2T -> 280501 stmt/s (slowest thread 140190)
+#   4T -> 529509 stmt/s (slowest thread 132192)
+#   8T -> 996038 stmt/s (slowest thread 123188)
+#   16T -> 1685251 stmt/s (slowest thread 104626)
+#   1T -> 162225 stmt/s (slowest thread 163849)
+# round 2 order: 4 8 16 1 2
+#   4T -> 540772 stmt/s (slowest thread 135788)
+#   8T -> 993945 stmt/s (slowest thread 123856)
+#   16T -> 1709935 stmt/s (slowest thread 105564)
+#   1T -> 162521 stmt/s (slowest thread 163016)
+#   2T -> 283862 stmt/s (slowest thread 142924)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         162521       162521         1.000
+      2         280501       140250         1.726
+      4         529509       132377         3.258
+      8         993945       124243         6.116
+     16        1685251       105328        10.369
+# round 0 order: 1 2 4 8 16
+#   1T -> 166928 stmt/s (slowest thread 168455)
+#   2T -> 258400 stmt/s (slowest thread 130259)
+#   4T -> 440278 stmt/s (slowest thread 110511)
+#   8T -> 450556 stmt/s (slowest thread 55931)
+#   16T -> 436016 stmt/s (slowest thread 27317)
+# round 1 order: 2 4 8 16 1
+#   2T -> 259438 stmt/s (slowest thread 129427)
+#   4T -> 461106 stmt/s (slowest thread 116151)
+#   8T -> 452847 stmt/s (slowest thread 56410)
+#   16T -> 410962 stmt/s (slowest thread 25735)
+#   1T -> 164880 stmt/s (slowest thread 164962)
+# round 2 order: 4 8 16 1 2
+#   4T -> 437529 stmt/s (slowest thread 110075)
+#   8T -> 445762 stmt/s (slowest thread 56003)
+#   16T -> 434816 stmt/s (slowest thread 27094)
+#   1T -> 163426 stmt/s (slowest thread 163593)
+#   2T -> 249607 stmt/s (slowest thread 125830)
+threads   total_stmt_s   per_thread   total_vs_1T
+      1         164880       164880         1.000
+      2         258400       129200         1.567
+      4         440278       110070         2.670
+      8         450556        56320         2.733
+     16         434816        27176         2.637
+threads   shared_vs_1T   shared_abs   private_vs_1T   private_abs   shared/private
+      1          1.000       164880           1.000        162521            1.015
+      2          1.567       258400           1.726        280501            0.921
+      4          2.670       440278           3.258        529509            0.831
+      8          2.733       450556           6.116        993945            0.453
+     16          2.637       434816          10.369       1685251            0.258
+# pass rc=
+
+# DONE 2026-09-19T09:33:57Z load=3.71 2.79 2.55
+
+=== REDUCTION ===
+Both arm orders, same binary, load 2.4-5.0:
+                 AB pass                      BA pass
+threads   shared   private   ratio     shared   private   ratio
+     1    154478    155610   0.993     164880    162521   1.015
+     2    231910    251721   0.921     258400    280501   0.921
+     4    382891    519595   0.737     440278    529509   0.831
+     8    369829    929834   0.398     450556    993945   0.453
+    16    405062   1540773   0.263     434816   1685251   0.258
+
+PREMISE HOLDS: one runtime shared by 16 agents reads at x2.62 / x2.64 over one agent; sixteen
+private runtimes on the same box read at x9.90 / x10.37. The x4 gap at 16 threads is in the SHARED
+state and nowhere else -- the base-table read path is the same in both arms (D54's shared read
+path, one ServerContext per runtime), so what differs is AgentRuntime's State mutex and what sits
+under it per statement: the O(1) workspace snapshot (D57) and record_read's capture. Named by the
+profile next, not guessed.

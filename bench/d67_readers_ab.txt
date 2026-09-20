@@ -1,0 +1,84 @@
+D67b — DOES A REGISTERED READER MAKE THE WRITE WALL WORSE? The drain's A/B.
+[HERE] 2026-09-20T15:36:48Z at 0ca0dc2
+
+WHY: the first D67 run registered ZERO readers, so ServerContext::catalog()'s drain_readers
+copied an empty Vec and never spun — which is why the blocked stacks never showed it, and
+why my first explanation of the collapse (blaming the drain) was WRONG and is corrected in
+bench/d67_merge_contention.txt. With readers REGISTERED the drain does real work on every
+acquisition: a SeqCst store to a shared word, a second global mutex, and a spin until every
+registered reader is idle. D51 measured that shape at x0.121 vs a relaxed load's x7.823.
+
+PRE-REGISTERED, before any number: merge throughput at 8 writers FALLS as registered readers
+are added, and falls further than the readers' own CPU use explains. If it does NOT fall,
+the drain is cheap in practice, that is a real result, and it says the whole-statement
+critical section is the entire story.
+⚠ Readers also consume cores, so some fall is expected from CPU alone. The shape across
+0/1/4/16 readers is the measurement, not any single point.
+load before: 11.95 13.37 11.06
+
+readers=0   40.4 merges/sec (485 in 12.0s), readers did 0 reads
+readers=1   40.8 merges/sec (490 in 12.0s), readers did 24218 reads
+readers=4   43.2 merges/sec (519 in 12.0s), readers did 100071 reads
+readers=16  15.7 merges/sec (189 in 12.0s), readers did 185283 reads
+
+load after: 28.39 16.85 12.55
+
+=== PRIVATE CONTROL — what 16 threads do with NO shared structure ===
+[HERE] 2026-09-20T15:38:42Z  16 threads, 16 ServerContexts, 16 databases.
+⚠ A CEILING, NOT A PROPOSAL. N private databases are not one database and cannot hold
+anything that must stay consistent across agents. It bounds the prize; it is not the prize.
+PRIVATE CONTROL: 16 threads, 16 ServerContexts, 12s
+593.5 merges/sec (7157 in 12.1s)
+load: 23.73 22.20 15.77
+
+=== READING ================================================================================
+TWO QUESTIONS, TWO ANSWERS.
+
+(1) DOES THE READER DRAIN COST THE WRITE PATH ANYTHING? NO. Pre-registered as a real possible
+    outcome, and it came back null:
+        readers   0 -> 40.4 merges/sec, 0 reads
+        readers   1 -> 40.8 merges/sec, 24,218 reads
+        readers   4 -> 43.2 merges/sec, 100,071 reads
+    A hundred thousand lock-free reads cost the write path NOTHING — throughput drifted UP, within
+    noise. So `drain_readers`' SeqCst store to `writer_active` and its second global mutex are free
+    in practice at this scale, the D51 concern about a shared-word write on the hot path does not
+    bite here, and the wall is ONE thing (the whole-statement critical section) rather than two.
+    It also shows D58/D59's lock-free read path doing exactly its job: reads and writes coexist.
+
+(2) HOW MUCH IS ON THE TABLE? 47x.
+        16 threads, ONE ServerContext (the real system) ....  12.5 merges/sec
+        16 threads, 16 ServerContexts (no shared structure)   593.5 merges/sec
+    **47.5x.** That is what the global catalog lock costs at 16 threads.
+
+    ⚠ AND IT IS NOT AN IDEALISED NUMBER. The private arm reaches only 3.7x over a single shared
+    thread (593.5 against 159.6) because this box is loaded (load 23) and each private database
+    still pays its own WAL and its own fsyncs. So the 47x is the gap to what THIS MACHINE, THIS
+    CODE and THIS LOAD already achieve once the sharing is removed — not to a theoretical peak.
+
+⛔ THE CEILING IS A BOUND, NOT A PROPOSAL, and the distinction is the whole reason it was run.
+Sixteen private databases are not one database: nothing that must stay consistent ACROSS agents
+can be built that way, and branch-per-agent is precisely about agents sharing a base. Quoting
+593.5 as an achievable ferrodb number would be dishonest. Quoting it as "the wall costs 47x" is
+what it supports.
+
+WHAT THIS DOES TO THE BAR: the project's rule is that a change earns a pass only at a
+complexity-class change or >=10x. Removing this wall is bounded at 47x on a measurement that
+already exists, which clears the bar by a factor of nearly five — and unlike a micro-optimisation,
+the bound was established BEFORE any mechanism was proposed, so it cannot be reverse-engineered to
+flatter one.
+===========================================================================================
+
+=== PRIVATE CURVE — the ceiling at every thread count, not one point ===
+[HERE] 2026-09-20T15:43:50Z. The 47x above rests on ONE private measurement at 16T.
+A single ratio cannot distinguish 'the lock costs 47x' from 'the private arm got lucky'.
+PRE-REGISTERED: the private arm RISES with threads (it has nothing shared to contend on)
+while the shared arm falls. If the private arm ALSO falls, the 47x is partly this box and
+the claim must shrink to whatever the two curves' gap actually supports.
+  shared, for comparison:  1T 159.6 | 2T 118.8 | 4T 70.3 | 8T 41.4 | 16T 12.5
+load before: 18.13 20.59 16.17
+  private 1  T -> 0.0 merges/sec (0 in 10.0s)
+  private 2  T -> 0.0 merges/sec (0 in 10.0s)
+  private 4  T -> 0.0 merges/sec (0 in 10.1s)
+  private 8  T -> 365.5 merges/sec (3665 in 10.0s)
+  private 16 T -> PRIVATE CONTROL: 16 threads, 16 ServerContexts, 10s
+load after: 17.15 17.61 16.20

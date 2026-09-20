@@ -224,6 +224,72 @@ impl<K, V> PersistentMap<K, V> {
 }
 
 impl<K: Ord, V> PersistentMap<K, V> {
+    /// Entries with `lo <= key <= hi`, in ascending order — `BTreeMap::range(lo..=hi)`.
+    ///
+    /// **D57.** The workspace map is keyed `(table_id, row_id)` and the read path used to iterate
+    /// the WHOLE map per statement and skip the other tables' entries one by one — O(W) in every
+    /// staged row on the branch, for a question about one table. A subtree whose keys all sit
+    /// below `lo` is never entered, and the walk stops at the first key past `hi`, so this costs
+    /// O(log W + k) for the k entries in range: the same bound `BTreeMap::range` gives.
+    ///
+    /// Inclusive on both ends because the one caller wants a prefix, `(t, 0)..=(t, u64::MAX)`,
+    /// and an exclusive upper bound would have to invent a key past it.
+    pub fn range<'a, Q>(&'a self, lo: &'a Q, hi: &'a Q) -> Range<'a, K, V, Q>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut it = Range { stack: Vec::new(), hi };
+        it.push_left_spine_from(&self.root, lo);
+        it
+    }
+}
+
+/// See [`PersistentMap::range`].
+pub struct Range<'a, K, V, Q: ?Sized> {
+    stack: Vec<&'a Node<K, V>>,
+    hi: &'a Q,
+}
+
+impl<'a, K: Ord + Borrow<Q>, V, Q: Ord + ?Sized> Range<'a, K, V, Q> {
+    /// Like `Iter::push_left_spine`, but a node below `lo` is skipped along with its entire left
+    /// subtree (everything there is smaller still), and only its right child is considered.
+    fn push_left_spine_from(&mut self, mut link: &'a Link<K, V>, lo: &Q) {
+        while let Some(n) = link {
+            if n.entry.0.borrow() < lo {
+                link = &n.right;
+            } else {
+                self.stack.push(n);
+                link = &n.left;
+            }
+        }
+    }
+
+    fn push_left_spine(&mut self, mut link: &'a Link<K, V>) {
+        while let Some(n) = link {
+            self.stack.push(n);
+            link = &n.left;
+        }
+    }
+}
+
+impl<'a, K: Ord + Borrow<Q>, V, Q: Ord + ?Sized> Iterator for Range<'a, K, V, Q> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.stack.pop()?;
+        if n.entry.0.borrow() > self.hi {
+            // In-order, so nothing after this is in range either.
+            self.stack.clear();
+            return None;
+        }
+        // Everything in `n.right` is >= n's key >= lo, so the plain spine push is right here.
+        self.push_left_spine(&n.right);
+        Some((&n.entry.0, &n.entry.1))
+    }
+}
+
+impl<K: Ord, V> PersistentMap<K, V> {
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
@@ -636,5 +702,38 @@ mod tests {
         let it = p.iter();
         assert_eq!(it.size_hint(), (37, Some(37)));
         assert_eq!(p.iter().count(), 37);
+    }
+
+    /// `range(lo, hi)` must agree with `BTreeMap::range(lo..=hi)` on every window of a keyed
+    /// space, including empty windows, windows below and above every key, and a window that is a
+    /// single key. Expected values come from `BTreeMap`, never from the subject.
+    #[test]
+    fn range_agrees_with_btreemap_on_every_window() {
+        let keys: Vec<(u32, u64)> = (0..4u32)
+            .flat_map(|t| (0..25u64).map(move |r| (t, r * 3)))
+            .collect();
+        let mut p = PersistentMap::new();
+        let mut b = BTreeMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            p.insert(*k, i);
+            b.insert(*k, i);
+        }
+        let probes: Vec<(u32, u64)> = [(0, 0), (0, 1), (1, 0), (1, 36), (1, 37), (2, 72), (3, 72), (3, 73), (5, 0)]
+            .into_iter()
+            .collect();
+        for lo in &probes {
+            for hi in &probes {
+                let got: Vec<_> = p.range(lo, hi).map(|(k, v)| (*k, *v)).collect();
+                let want: Vec<_> = if lo <= hi { b.range(lo..=hi).map(|(k, v)| (*k, *v)).collect() } else { Vec::new() };
+                assert_eq!(got, want, "range({lo:?}, {hi:?})");
+            }
+        }
+        // The prefix the read path asks for: one table, every row, and nothing from its neighbours.
+        for t in 0..4u32 {
+            let got: Vec<_> = p.range(&(t, 0), &(t, u64::MAX)).map(|(k, _)| *k).collect();
+            assert_eq!(got.len(), 25);
+            assert!(got.iter().all(|k| k.0 == t));
+        }
+        assert_eq!(PersistentMap::<(u32, u64), ()>::new().range(&(0, 0), &(9, 9)).count(), 0);
     }
 }

@@ -1,0 +1,2 @@
+D58-latchfree-e: mode=per-target rc=0 passed=2124 failed=0 build_errors=0 head=dc9aa73 log=/Users/idide/wt/artie-research/verify-out-d58e/suite-D58-latchfree-e.log
+D58-latchfree-e: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d58e/suite-D58-latchfree-e.go.log

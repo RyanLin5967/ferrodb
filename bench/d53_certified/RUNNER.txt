@@ -1,0 +1,2 @@
+D53-sharedroot: mode=per-target rc=0 passed=2096 failed=0 build_errors=0 head=06aa445 log=/Users/idide/wt/artie-research/verify-out-d53/suite-D53-sharedroot.log
+D53-sharedroot: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d53/suite-D53-sharedroot.go.log

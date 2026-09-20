@@ -257,7 +257,11 @@ impl SystemView {
                 big("fork_epoch"),
                 big("root_page_id"),
                 text("state", 16),
-                int("depth"),
+                // **BIGINT, not INT — D60.** The depth field widened to `u32` precisely so a deep
+                // chain is reported honestly, and narrowing it here would have put the lie one
+                // layer above the record instead of in it: `u32` does not fit `i32`. Found by a
+                // fresh-context review of D60, which noticed the cast below.
+                big("depth"),
                 int("arenas"),
                 int("live_children"),
                 dec("lease_deadline"),
@@ -664,7 +668,7 @@ fn branches_rows(runtime: &AgentRuntime, hint: &ViewHint) -> Result<Vec<Vec<Valu
                 Value::BigInt(r.fork_epoch.0 as i64),
                 Value::BigInt(r.root_page_id as i64),
                 Value::Varchar(state_name(r.state).into()),
-                Value::Integer(r.depth as i32),
+                Value::BigInt(r.depth as i64),
                 Value::Integer(r.arenas.len() as i32),
                 Value::Integer(r.live_children.len() as i32),
                 u64_text(r.lease_deadline.0),

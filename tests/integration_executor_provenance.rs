@@ -82,7 +82,7 @@ impl Db {
     }
 
     fn scan(&self, table: &str) -> Box<dyn Executor> {
-        let view = Arc::new(ReadView { snapshot: self.txn.read_snapshot(), txn_id: 0 });
+        let view = Arc::new(ReadView { snapshot: Arc::new(self.txn.read_snapshot()), txn_id: 0 });
         lower(PhysicalPlan::SeqScan { table: table.into() }, &self.catalog, self.bp.clone(), view)
             .unwrap()
     }

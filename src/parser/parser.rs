@@ -3,8 +3,93 @@ use crate::{catalog::column::{Column, DataType}, error::FerroError, parser::{sca
 pub struct Parser {
     pub tokens: Vec<Token>,
     pub current: usize,
-    pub errors: Vec<FerroError>
+    pub errors: Vec<FerroError>,
+    /// How many parser frames are currently on the stack. See [`MAX_EXPR_DEPTH`].
+    depth: usize,
+    /// How deep the left-deep tree being built currently is. See [`MAX_TREE_DEPTH`].
+    chain: usize,
 }
+
+/// How many PARSER FRAMES may be on the stack before a statement is refused — **D64/D64b**.
+///
+/// This bounds parser RE-ENTRY. It does NOT bound the height of the tree that comes out: the
+/// binary-operator loops build a left-deep tree iteratively and are bounded by [`MAX_TREE_DEPTH`]
+/// instead. Those are different quantities with thresholds two orders of magnitude apart, which is
+/// why there are two constants and not one.
+///
+/// Charged at every door that re-enters the parser, and a door that is missed is a door that is
+/// open:
+/// * [`Parser::expression`] — grouping, function arguments, `IN` lists, subquery predicates.
+/// * [`Parser::not`] and [`Parser::unary`] — both recurse into THEMSELVES.
+/// * [`Parser::parse_statement`] — `parse_explain` and `parse_simulate` call back into it, so
+///   `EXPLAIN EXPLAIN …` and nested `SIMULATE … CANDIDATE ( … )` are statement-level recursion.
+///
+/// ⚠ **The first two versions of this guard each claimed to be complete and were not.** v1 counted
+/// only in `expression` and `NOT NOT NOT …` walked around it. v2 added `not`/`unary` and its
+/// comment called those "the three DISTINCT ways this parser adds a level" — a fresh-context
+/// review then found both statement doors uncharged and the binary loops unbounded. The lesson is
+/// in the wording: a guard that asserts its own completeness stops the next reader from checking.
+///
+/// **Measured on the stack the server actually uses** (`bench/d64_nesting_probe.txt`): a 2 MiB
+/// connection thread — `src/pgwire/mod.rs:290` is a bare `std::thread::spawn` and `stack_size`
+/// appears nowhere in `src/`. With the limit lifted, a DEBUG build survived 100 nested parens and
+/// aborted at 200; `EXPLAIN` nesting survived 200 and aborted at 400. Debug binds because its
+/// frames are largest, so 64 sits roughly 3x under the tighter of the two.
+pub const MAX_EXPR_DEPTH: usize = 64;
+
+/// How deep a left-deep operator chain may get before the parser refuses it — **D64b**.
+///
+/// `1 + 1 + 1 + …` and `a AND b AND c AND …` are parsed by `while` loops, NOT by recursion, so the
+/// parser's own stack never grows and [`MAX_EXPR_DEPTH`] never fires. The TREE is left-deep all the
+/// same, one level per operator, and everything that later walks it recurses: `binder::bind_expr`,
+/// `execution::executor::evaluate`, and `Expr`'s own derived `Drop`. The overflow does not
+/// disappear, it moves downstream of the parser — which is exactly what D64's original doc got
+/// wrong when it claimed the parser limit transitively bounded those walkers.
+///
+/// **Counted PER STATEMENT and never released early — D64c.** The counter is a budget on how many
+/// operator levels one statement may build in total, and `parse` zeroes it between statements.
+/// It is deliberately a conservative over-approximation of tree DEPTH (depth <= total charges): a
+/// `SELECT` with several thousand separate two-term columns spends the budget without being deep,
+/// and is refused. That is the safe direction, and the alternative is what v3 did.
+///
+/// ⚠ **v3 released this counter in bulk at the end of [`Parser::expression`], and that was the
+/// THIRD hole in this guard.** Every binary loop parses its LEFT operand before its first
+/// `enter_chain`, so a left-position `(` re-entered `expression` with the counter still at the
+/// parent's entry value — zero, all the way down the leftmost spine. Each nesting level then got a
+/// FULL fresh budget while costing only 1 against [`MAX_EXPR_DEPTH`], so the two limits MULTIPLIED
+/// instead of adding: 62 nesting levels x 800 operators built a ~49,600-deep tree that parsed
+/// happily and then aborted the process, measured on a 2 MiB connection thread with the v3 guard
+/// in place.
+///
+/// Also charged once per JOIN, because the planner folds a flat list of joins into an N-deep
+/// `LogicalPlan::Join` tree that several walkers descend.
+///
+/// **Measured, and the scope of that measurement matters** (`bench/d64_nesting_probe.txt`, 2 MiB
+/// thread, limit lifted): a flat chain survived 12,800 levels and aborted at 25,600 in a DEBUG
+/// build. ⚠ That probe links only `Parser` and `Scanner`, so the recursion it measured is parse
+/// plus `Expr`'s derived DROP GLUE — the lightest walker there is. `binder::bind_expr`,
+/// `execution::executor::evaluate`, `optimizer::split_and` and `pgwire::params::walk_expr` all
+/// descend the same tree with fatter frames and are **UNMEASURED**. 1,024 is 25x under the one
+/// threshold that was measured, and that margin is deliberately standing in for the thresholds
+/// that were not: a limit 3x under the LIGHTEST walker would have been justified by a number that
+/// does not describe the walkers it is protecting.
+///
+/// ⚠ **WHAT 1,024 BUYS IN REAL SQL IS ABOUT HALF THAT, and an earlier version of this comment got
+/// it wrong.** The budget counts CHARGES, not terms, and an ordinary predicate spends two per
+/// term: `a = 1 AND b = 2 AND …` charges once in `and()` for the `AND` and once in `equality()`
+/// for the `=`. So the real ceiling is roughly 512 AND-ed comparisons, not a thousand. A bare
+/// chain like `1 + 1 + 1 …` spends one per operator and does get 1,024. Stating the generous
+/// number was the same error as the rest of this row: a claim about the guard that the guard does
+/// not support.
+///
+/// ⚠ **IT ALSO DOES NOT AGREE WITH `tel::log::MAX_GUARD_DEPTH` (256), DELIBERATELY.** A TEL guard
+/// predicate that this parser accepts at 300 operators is refused later by the durable-log
+/// encoder, which is a worse failure than refusing it here — it fails after the statement looks
+/// accepted. They are not unified because they bound different things (this one, any expression
+/// in any statement; that one, what can be round-tripped through a log record), and collapsing
+/// them would drag every `WHERE` in the system down to a limit that exists for the TEL log. The
+/// interaction is recorded rather than hidden; it is a real rough edge, not a resolved one.
+pub const MAX_TREE_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct TableRef {
@@ -310,13 +395,17 @@ pub enum AdmitSpec {
 // OR -> AND -> NOT -> equality/comparison -> term -> factor -> unary -> primary
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self{
-        Self {tokens, current: 0, errors: Vec::new()}
+        Self {tokens, current: 0, errors: Vec::new(), depth: 0, chain: 0}
     }
 
     pub fn parse(&mut self) -> Vec<Stmt> {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
+            // Each top-level statement starts from zero, both counters. Without this a long
+            // script of shallow statements would accumulate charge and refuse a valid later one.
+            self.depth = 0;
+            self.chain = 0;
             match self.parse_statement() {
                 Ok(stmt) => statements.push(stmt),
                 Err(err) => {
@@ -327,7 +416,21 @@ impl Parser {
         }
         statements
     }
+    /// Charges one level, then parses. **Statement nesting is parser recursion too — D64b.**
+    ///
+    /// `parse_explain` and `parse_simulate` both call back into this function, so `EXPLAIN EXPLAIN
+    /// EXPLAIN …` and nested `SIMULATE … CANDIDATE ( … )` descend through native recursion at one
+    /// keyword per level. D64's first guard charged only `expression`, `not` and `unary` and its
+    /// comment claimed those were "the three distinct ways this parser adds a level", which was
+    /// false: neither statement door was charged, and both are reachable from any pgwire client.
     pub fn parse_statement(&mut self) -> Result<Stmt, FerroError>{
+        self.enter()?;
+        let parsed = self.parse_statement_inner();
+        self.leave();
+        parsed
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Stmt, FerroError>{
         if self.match_token(&[TokenType::Select]) {
             return self.parse_select()
         } else if self.match_token(&[TokenType::Insert]) {
@@ -509,6 +612,11 @@ impl Parser {
             }
             if join_type.is_none() && !has_join { break; }
             let actual_join_type = join_type.unwrap_or(JoinType::Inner); // default to inner
+            // One level of PLAN depth per join — D64c. The parser collects joins into a flat Vec,
+            // so nothing recurses here, but the planner folds them into an N-deep
+            // `LogicalPlan::Join` tree that several walkers then descend recursively. Same class
+            // as the binary loops, one layer further on, and charged the same way.
+            self.enter_chain()?;
             let join_table = self.parse_table_ref()?;
             self.consume(TokenType::On, "expected on".into())?;
             let on = self.expression()?;
@@ -1126,13 +1234,65 @@ impl Parser {
         Err(Parser::error(self.peek(), message.to_string()))
     }
 
+    /// The single entry to the precedence chain — and therefore the single place expression
+    /// nesting is bounded. Grouping (`primary`'s `(` branch), function arguments, `IN` lists and
+    /// subquery predicates all re-enter the chain HERE, so one counter sees every level.
+    ///
+    /// Refuses rather than faults: without this, deep nesting is a `SIGABRT` from a query that
+    /// arrives over a socket, which takes every other session on the server with it. See
+    /// [`MAX_EXPR_DEPTH`].
     pub fn expression(&mut self ) -> Result<Expr, FerroError>{
-        return self.or();
+        // The frame counter is a matched enter/leave. The CHAIN counter is NOT released here —
+        // see [`MAX_TREE_DEPTH`]. Restoring it on exit is what let the two limits MULTIPLY.
+        self.enter()?;
+        let parsed = self.or();
+        self.leave();
+        return parsed;
+    }
+
+    /// Charge one parser frame, or refuse. See [`MAX_EXPR_DEPTH`] for where this is charged and
+    /// for the two earlier versions of this guard that were walked around.
+    fn enter(&mut self) -> Result<(), FerroError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(FerroError::SqlParseError(format!(
+                "expression nests deeper than {} levels; refusing to parse it",
+                MAX_EXPR_DEPTH
+            )));
+        }
+        Ok(())
+    }
+
+    /// Release one level charged by [`Parser::enter`].
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Charge one level of left-deep TREE depth, or refuse. See [`MAX_TREE_DEPTH`].
+    ///
+    /// NEVER released except by `parse` at a statement boundary. A charge that is released when an
+    /// inner expression finishes is a charge a nested expression can spend again, which is exactly
+    /// how v3 was walked around.
+    fn enter_chain(&mut self) -> Result<(), FerroError> {
+        self.chain += 1;
+        if self.chain > MAX_TREE_DEPTH {
+            self.chain -= 1;
+            return Err(FerroError::SqlParseError(format!(
+                "expression chains more than {} operators deep; refusing to parse it",
+                MAX_TREE_DEPTH
+            )));
+        }
+        Ok(())
     }
 
     pub fn or(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.and()?;
         while self.match_token(&[TokenType::Or]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.and()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1143,6 +1303,10 @@ impl Parser {
     pub fn and(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.not()?;
         while self.match_token(&[TokenType::And]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.not()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1153,8 +1317,11 @@ impl Parser {
     pub fn not(&mut self) -> Result<Expr, FerroError>{
         if self.match_token(&[TokenType::Not]) {
             let operator = self.previous().token_type;
-            let right = self.not()?;
-            return Ok(Expr::UnaryOp { operator, right: Box::new(right) });
+            // Recurses into ITSELF, not through `expression`, so it charges its own level.
+            self.enter()?;
+            let right = self.not();
+            self.leave();
+            return Ok(Expr::UnaryOp { operator, right: Box::new(right?) });
         }
         self.equality()
     }
@@ -1162,6 +1329,10 @@ impl Parser {
     pub fn equality(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.comparison()?;
         while self.match_token(&[TokenType::BangEqual, TokenType::Equal]){
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.comparison()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1172,6 +1343,10 @@ impl Parser {
     pub fn comparison(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.term()?;
         while self.match_token(&[TokenType::Greater, TokenType::GreaterEqual, TokenType::Less, TokenType::LessEqual]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.term()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1182,6 +1357,10 @@ impl Parser {
     pub fn term(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.factor()?;
         while self.match_token(&[TokenType::Minus, TokenType::Plus]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.factor()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1192,6 +1371,10 @@ impl Parser {
     pub fn factor(&mut self) -> Result<Expr, FerroError>{
         let mut expr = self.unary()?;
         while self.match_token(&[TokenType::Slash, TokenType::Star]) {
+            // One level of TREE depth per iteration: `a OP b OP c` is left-deep, so the
+            // tree grows by one every time round. Charged here because the loop is not
+            // recursion and nothing else would see it.
+            self.enter_chain()?;
             let operator = self.previous().token_type;
             let right = self.unary()?;
             expr = Expr::BinaryOp { left: Box::new(expr), operator, right: Box::new(right) };
@@ -1202,8 +1385,11 @@ impl Parser {
     pub fn unary(&mut self) -> Result<Expr, FerroError>{
         if self.match_token(&[TokenType::Bang, TokenType::Minus]) {
             let operator = self.previous().token_type;
-            let right = self.unary()?;
-            return  Ok(Expr::UnaryOp { operator, right: Box::new(right) });
+            // Same self-recursion as `not`, same reason it must charge its own level.
+            self.enter()?;
+            let right = self.unary();
+            self.leave();
+            return  Ok(Expr::UnaryOp { operator, right: Box::new(right?) });
         }
         self.primary()
 

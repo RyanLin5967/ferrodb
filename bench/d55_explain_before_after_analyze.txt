@@ -1,0 +1,12 @@
+D55 — EXPLAIN on a 5000-row table, before and after ANALYZE
+[HERE] 2026-09-19, examples/d55_explain_probe.rs
+
+--- BEFORE ANALYZE: WHERE id = 7 ---
+Projection [#1] (rows=10 cost=28.10)
+  Filter (#0 = 7) (rows=10 cost=28.00)
+    Sequential scan on t (rows=1000 cost=18.00)
+
+--- AFTER ANALYZE:  WHERE id = 7 ---
+Projection [#1] (rows=1 cost=13.01)
+  Index scan on t (col 0, [7, 7]) (rows=1 cost=13.00)
+

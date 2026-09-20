@@ -1,0 +1,13 @@
+queued behind 53938 cert-8bf4c41 2026-09-18T13:06:17Z
+=== run 1  (loadavg 13.89 17.83 14.74) ===
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.13s
+real 6.81
+=== run 2  (loadavg 13.74 17.73 14.72) ===
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.89s
+real 4.14
+=== run 3  (loadavg 13.52 17.62 14.70) ===
+test a_killed_leader_is_replaced_and_no_acknowledged_write_is_lost ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+real 5.66

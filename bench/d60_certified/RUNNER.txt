@@ -1,0 +1,2 @@
+D60-depth-c: mode=per-target rc=0 passed=2139 failed=0 build_errors=0 head=91270f9 log=/Users/idide/wt/artie-research/verify-out-d60c/suite-D60-depth-c.log
+D60-depth-c: go rc=0 passed=97 failed=0 log=/Users/idide/wt/artie-research/verify-out-d60c/suite-D60-depth-c.go.log

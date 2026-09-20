@@ -1502,7 +1502,25 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
     assert_eq!(
         field_names("struct Workspace {", "Workspace"),
         [
-            "name", "prov", "txn", "fork_seq", "fork_root", "rows", "base_rows",
+            "name", "prov", "txn", "fork_seq", "fork_root", "rows",
+            // D57's, added at `41b98aa`/`31476ee`. Declared after making the determination, and
+            // it is NOT a second funnel:
+            //
+            //   * it is PURELY DERIVED from `rows`: a count of the staged `Present` rows that do
+            //     not sit under their own column 0's key in the declared variant. Its only
+            //     statement-path write site is INSIDE `stage_all`'s commit section, on the same
+            //     line that inserts the row it describes -- after the envelope and escrow have
+            //     decided -- so a write the envelope refuses never reaches it.
+            //   * its other write is at fork, copied once from the parent whose entries the child
+            //     shares, and it is read-only afterwards.
+            //   * it admits nothing and hides nothing: it only ever makes the read path FALL BACK
+            //     from a probe to the walk it replaced (`visible_rows_where`), so a wrong value
+            //     costs time, never rows -- and `tests/d57_overlay_probe.rs` fire-checks both the
+            //     count and its inheritance.
+            //
+            // A field that failed any of those would be a governance hole, not a list entry.
+            "unprobeable_rows",
+            "base_rows",
             // I21's, added by the merge at `c6dcb3a`. Declared after making the determination, and
             // it is NOT a write the envelope must govern: it is set ONCE at fork (the parent's
             // chain plus the parent's own txn) and is read-only afterwards, it holds transaction

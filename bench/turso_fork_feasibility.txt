@@ -1,0 +1,112 @@
+TURSO-FORK-FEASIBILITY — raw artifact, recorded before interpreting it
+======================================================================
+date        2026-09-18
+checkout    /Users/idide/wt/turso-verify-on-main
+revision    176fd75c2  Merge 'bindings/dotnet: add advanced sync database options'
+purpose     discharge the SCALE-NEXT promise TURSO-FORK-FEASIBILITY. Decision row is
+            SCALE-DESIGN D47 (artie-research); D46 holds the option set this judges.
+
+PROVENANCE, STATED BEFORE THE NUMBERS
+-------------------------------------
+Two different sources are mixed below and they are NOT equally strong. Labelled per line.
+
+  [AGENT]  measured by the `fork-decision` subagent, NOT re-run by me at the time this file
+           was first written: a cold `cargo build` writes into
+           /Users/idide/wt/.turso-shared-target, which a live peer session
+           (turso-bughunt-d5) is using, and disturbing a peer's incremental state to
+           re-derive a number is not a trade worth making.
+
+           ⛔ CORRECTED, SAME DAY. This paragraph first said that session "has been asked
+           and has not yet answered". IT HAS NOT BEEN ASKED. Two messages to it were held
+           for the recipient's approval and BOTH EXPIRED UNDELIVERED. "Sent" is not
+           "delivered", and `success: true` from the send tool means it was queued, not
+           that anyone read it. Same shape as the error this pass corrected in the ledger:
+           recording an outcome that the channel never actually produced.
+
+           ⭐ AND THE BLOCK IS NOT REAL, which is the useful half. turso's
+           .cargo/config.toml pins rustflags and env but NOT target-dir (checked at
+           176fd75c2), so CARGO_TARGET_DIR set per invocation is honoured. A build in my
+           own worktree with a private target dir touches neither the peer's tree nor
+           .turso-shared-target, and needs no permission from anyone. What remains is a
+           LOAD question, not a permission question, and load has a normal answer: read the
+           process table first and build when the box is quiet.
+  [HERE]   re-derived by me in this checkout, read-only (grep/sed), zero builds.
+
+1. BUILD AND TEST COST  — the criterion D46 recorded as the one that could disqualify turso
+--------------------------------------------------------------------------------------
+  [AGENT]  cold `cargo build -p turso_core`                      79.02 s
+  [AGENT]  `cargo test -p turso_core --lib`                      2348 passed / 0 failed
+  [AGENT]  tests 44.51 s inside 159.67 s wall
+  verdict: CLEARS. A 79 s cold build does not make a measure/fix loop unusable.
+  ⚠ unverified independently, for the reason above. It is one build away from being [HERE]
+    the moment the peer answers, and it should be re-run then rather than inherited.
+
+2. REDUNDANCY CHECK — is branch-per-agent already there (would make this the 14th dead pitch)
+---------------------------------------------------------------------------------------
+  [HERE]  grep -rn 'struct Branch\b|BranchId|create_branch|fork_database' core/   ->  0 hits
+  verdict: CLEARS. Nothing to be redundant with.
+
+3. SEAMS THE WORK WOULD NEED
+----------------------------
+  [HERE]  core/storage/pager.rs                     286143 B
+  [HERE]  core/storage/page_cache.rs                 65653 B
+  [HERE]  core/storage/buffer_pool.rs                68646 B
+  [HERE]  core/storage/wal.rs                        10793 lines
+  [HERE]  core/storage/shared_wal_coordination.rs   168190 B
+  [HERE]  core/mvcc/                                 present (clock, cursor, database,
+                                                     persistent_storage, portable_logical)
+
+4. THE CITATIONS `fork-decision` GAVE, CHECKED TO THE LINE
+----------------------------------------------------------
+  [HERE]  wal.rs:2828        pub read_locks: [TursoRwLock; 5],                        EXACT
+  [HERE]  wal.rs:4818-4819   self.acquire_proper_checkpoint_guard(mode, lock_source)? EXACT
+  [HERE]  wal.rs:655         find_frame doc: "otherwise method will panic"            EXACT
+  All three land on the line claimed, in a checkout the agent never named. Its facts are
+  good. Its FRAMING is not adopted — see D47; "catalog-as-a-system-table with O(1) reopen"
+  and "replace read_locks" are two different mechanisms and cannot be substituted.
+
+5. ⭐ THE FINDING THAT MATTERS, AND IT REFUTES MY OWN PROPOSED WALL
+-------------------------------------------------------------------
+  I proposed (D47 section 3) that turso inherits SQLite's read-mark cap and that it binds
+  branch-per-agent: slots 1-4 carry a frame number, so at most FOUR DISTINCT snapshot
+  positions can be pinned at once, and `begin_read_tx` returns Busy after ~100 retries of
+  quadratic backoff rather than queueing. That is structurally MAX_BRANCH_DEPTH = 8 in a
+  real engine, which is exactly the kind of cap the objective wants found.
+
+  [HERE]  wal.rs:2821-2828   "Slots 1-4 carry a frame-number in value and may be shared
+                              by many readers"                           -> the cap is on
+                              DISTINCT positions, not on readers. Confirms the reading.
+  [HERE]  wal.rs:874-880     min_read_mark iterates `for slot in 1..5`   -> same four.
+  [HERE]  wal.rs:3310-3345   begin_read_tx: Busy after cnt > 100, quadratic backoff,
+                              comment says it mirrors SQLite deliberately.
+
+  ⛔ AND THEN IT DOES NOT HOLD, because turso has a second mechanism:
+
+  [HERE]  shared_wal_coordination.rs:143,147   fn new(reader_slot_count: u32) ->
+                                               reader_owners: vec![None; reader_slot_count]
+  [HERE]  shared_wal_coordination.rs:399,446   reader_slot_count is a u32 FIELD of the
+                                               on-disk coordination header, not a constant
+  [HERE]  wal.rs:7133                          a test opens one with 64 slots
+  [HERE]  core/build.rs:9                      host_shared_wal: { all(any(unix, windows),
+                                               target_pointer_width = "64") }
+
+  ⇒ `host_shared_wal` is a PLATFORM cfg, not an opt-in feature. On any 64-bit unix or
+    windows host — which is every machine this would run on — the parameterised coordination
+    layer is compiled in. So the four-slot array is the SQLite-file-format path, and turso
+    ALREADY HAS a slot count that is a parameter rather than a constant.
+
+  VERDICT ON MY OWN PITCH: the wall as I stated it is WITHDRAWN. This is prior art inside
+  the target, which D47 itself named as the strongest possible kill, and it was found by
+  reading for twenty minutes instead of by porting for a week. What survives is narrower
+  and still worth one measurement: 64 is a parameter but it is still a number, and nobody
+  has shown what happens to it at 10^3 readers, let alone 10^6. That is a question about a
+  constant, which is the lowest-value shape this project recognises -- so it does NOT get a
+  pass on its own. It gets recorded here so the next session does not re-derive the dead
+  half.
+
+WHAT THIS ARTIFACT DOES NOT CLAIM
+---------------------------------
+  - not a BranchBench result. Running that against ferrodb measures ferrodb.
+  - not an absolute comparison of anything against anything.
+  - not that branch-per-agent survives turso's WAL/MVCC/recovery. That is the whole point
+    of forking and it is untouched by any of the above.

@@ -656,7 +656,7 @@ mod tests {
             "the log was not claimed at the resume point, so a checkpoint could discard it"
         );
         // The reader is closed: it must not go on blocking checkpoints.
-        assert!(txn.att.lock().unwrap().is_empty(), "the snapshot reader was left open");
+        assert!(txn.att_read().is_empty(), "the snapshot reader was left open");
         txn.checkpoint().expect("a closed reader should not block a checkpoint");
     }
 
@@ -672,7 +672,7 @@ mod tests {
         assert!(r.is_err(), "a failed scan produced a snapshot");
         assert!(buf.is_empty(), "a failed scan wrote rows");
         assert!(
-            txn.att.lock().unwrap().is_empty(),
+            txn.att_read().is_empty(),
             "the reader was left open after a failed scan"
         );
         txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
@@ -711,7 +711,7 @@ mod tests {
 
         // And the reader is gone either way, which is what makes reporting safe rather than a
         // choice between diagnosing and cleaning up.
-        assert!(txn.att.lock().unwrap().is_empty(), "the reader was left open");
+        assert!(txn.att_read().is_empty(), "the reader was left open");
         txn.checkpoint().expect("a leaked reader is blocking the checkpoint");
     }
 
@@ -788,7 +788,7 @@ mod tests {
         assert!(buf.is_empty(), "a snapshot that never read anything wrote rows");
 
         // Only the transaction this test opened is still active; the reader did not survive.
-        let live: Vec<u64> = txn.att.lock().unwrap().keys().copied().collect();
+        let live: Vec<u64> = txn.att_read().keys().copied().collect();
         assert_eq!(live, vec![open], "the failed snapshot left its reader open");
 
         // Committed rather than aborted only because an abort walks an undo chain this test just

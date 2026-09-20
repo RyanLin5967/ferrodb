@@ -43,6 +43,12 @@ fn walk_newest(dir: &Path) -> Option<std::time::SystemTime> {
     let mut newest = None;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
+        // A `src/**/tests_*.rs` file is `#[cfg(test)]` and does not link into an example binary,
+        // so editing one cannot make it stale; counting them fired this guard on a fresh tree.
+        // Enforced by `test_only_sources_are_cfg_test_gated`, not assumed.
+        if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tests_")) {
+            continue;
+        }
         let t = if p.is_dir() { walk_newest(&p) } else { std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()) };
         if let Some(t) = t {
             newest = Some(match newest { Some(c) if c > t => c, _ => t });

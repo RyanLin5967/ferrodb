@@ -1,0 +1,65 @@
+D67-RECOUNT — THE WHOLE SWEEP RE-RUN WITH A CORRECTED COUNTER.
+
+WHY: every D67 number before this file counted exec("MERGE;").is_ok(). A QUARANTINED merge
+returns Ok, so that counter credits merges that never reached the target. I then "fixed" it by
+matching Outcome::Table and indexing column 4 — but a MERGE returns Outcome::Agent, so the match
+fell through and the counter read ZERO in every arm. It did not error; it printed 0.0 merges/sec,
+which is what a broken instrument looks like. It now reads MergeReport::applied_to_target directly.
+
+⛔ SO THE HEADLINE NUMBERS ARE RE-MEASURED, NOT ASSUMED TO SURVIVE. The collapse (x0.08) and the
+47x prize both rested on the is_ok counter. If the corrected counter changes the SHAPE, the claim
+changes with it; if it only changes the absolute values, the shape stands and this file says so.
+
+PRE-REGISTERED: in the DISJOINT arm merges should nearly always apply, so the shape should
+survive. In the SHARED arm they often should NOT, so that arm should now FALL rather than
+"recover" at 16T — that recovery was the artifact this counter was fixed to remove.
+[HERE] 2026-09-20T15:46:28Z at a8fc8e6
+load before: 14.20 17.85 15.77
+
+D67 — CONCURRENT BRANCH MANAGEMENT: merges/sec against thread count.
+PREDICTION, recorded before the numbers: FLAT in both arms, because every MERGE takes
+the one `Mutex<Catalog>` at pgwire/mod.rs:64 and drains readers on the way in.
+⚠ merges/sec is a FLOOR on a shared box; the SHAPE against thread count is the result.
+
+  disjoint    1T ->      70.9 merges/sec  (142 in 2.00s)
+  disjoint    2T ->      43.0 merges/sec  (86 in 2.00s)
+  disjoint    4T ->      60.9 merges/sec  (122 in 2.00s)
+  disjoint    8T ->      24.4 merges/sec  (49 in 2.00s)
+  disjoint   16T ->      19.0 merges/sec  (38 in 2.00s)
+
+  shared      1T ->      61.9 merges/sec  (124 in 2.00s)
+  shared      2T ->      63.9 merges/sec  (128 in 2.00s)
+  shared      4T ->      49.0 merges/sec  (98 in 2.00s)
+  shared      8T ->      22.4 merges/sec  (45 in 2.00s)
+  shared     16T ->      20.9 merges/sec  (42 in 2.01s)
+
+threads   disjoint/sec   vs 1T      shared/sec   vs 1T
+      1           70.9    1.00x          61.9    1.00x
+      2           43.0    0.61x          63.9    1.03x
+      4           60.9    0.86x          49.0    0.79x
+      8           24.4    0.34x          22.4    0.36x
+     16           19.0    0.27x          20.9    0.34x
+
+VERDICT at 16T: disjoint x0.27, shared x0.34
+FLAT. Concurrent branch management does not scale, and the disjoint arm rules out
+conflict detection as the cause: no two branches touched the same row. The wall is
+something SHARED AND SERIAL on the merge path. Which one is the next run.
+# rc=0
+
+=== private ceiling, corrected counter, every thread count ===
+  private 1  T -> 105.2 merges/sec (1053 in 10.0s)
+  private 2  T -> 142.8 merges/sec (1431 in 10.0s)
+  private 4  T -> PRIVATE CONTROL: 4 threads, 4 ServerContexts, 10s
+  private 8  T -> note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  private 16 T -> note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+load after: 17.15 17.61 16.20
+
+=== ⛔ THIS FILE IS SUPERSEDED AND ITS NUMBERS ARE WITHDRAWN =================================
+Both this file and d67_recount_long.txt were measured with the harness configured by
+`AgentRuntime::with_catalog`, which sets `storage: None, reaper: None`
+(src/agent_sql/runtime.rs:628-629) — the branch STORAGE engine was absent. See the D68 ledger row.
+They are kept, marked, rather than deleted: the counter bug they were chasing (is_ok crediting
+quarantined merges) is real and was fixed here, and the record of chasing it is worth more than a
+tidy directory. Nothing in either file should be quoted.
+The live measurement of merge cost is bench/d68_merge_is_o_table.txt.
+===========================================================================================

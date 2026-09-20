@@ -1580,16 +1580,46 @@ fn an_undrained_inbox_is_bounded_in_bytes_and_every_refusal_is_counted() {
 
     // ...and the budget is RETURNED as the caller drains, or the transport wedges shut after one
     // burst. This is the half a one-way counter would pass and a working bound must not.
-    let before = t.inbox_bytes();
-    assert!(before > 0, "nothing was queued at all, so nothing was measured");
-    let got = t.recv_timeout(Duration::from_secs(5)).expect("a message must be deliverable");
-    assert!(matches!(got.body, Body::Append { .. }));
-    assert!(
-        t.inbox_bytes() < before,
-        "draining a message did not return its bytes to the budget ({} then {}), so the inbox \
-         fills once and refuses for ever",
-        before,
+    //
+    // ⛔ This used to read one `inbox_bytes()`, drain ONE message, and assert the counter had
+    // fallen. That is racy by construction and it failed on a Windows CI runner with
+    // "(3294 then 3294)": the connection thread still had frames to deliver, so the byte the
+    // drain refunded was charged again to the next message before the second read. The race is
+    // in the ASSERTION, not in the transport — a refund that is immediately re-spent is the
+    // bound working.
+    //
+    // Drain to quiescence instead and assert the budget returns to ZERO, which is strictly
+    // stronger (it pins every byte of every message, not one message's), and race-free once the
+    // sender has stopped: the client wrote exactly `SENT` frames and nothing else connects.
+    const SENT: u64 = 40;
+    let mut drained = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut quiet = 0;
+    while Instant::now() < deadline && quiet < 3 {
+        match t.recv_timeout(Duration::from_millis(200)) {
+            Some(m) => {
+                assert!(matches!(m.body, Body::Append { .. }));
+                drained += 1;
+                quiet = 0;
+            }
+            None => quiet += 1,
+        }
+    }
+    assert!(drained > 0, "nothing was deliverable at all, so the refund was never exercised");
+    assert_eq!(
+        t.inbox_bytes(),
+        0,
+        "after draining every deliverable message the inbox still holds {} bytes, so a drain does \
+         not return its charge and the transport refuses for ever once full",
         t.inbox_bytes()
+    );
+    // Nothing lost and nothing counted twice: every frame the peer sent was either delivered or
+    // refused. This is what makes the zero above a REFUND rather than a counter someone zeroed.
+    assert_eq!(
+        drained + t.inbound_dropped(),
+        SENT,
+        "{drained} delivered + {} refused != {SENT} sent",
+        t.inbound_dropped()
     );
 }
 

@@ -30,10 +30,10 @@ pub use page_header::{
 pub use store::CowStore;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLockReadGuard};
 
 use crate::branch::types::{ArenaId, BranchId, Epoch, PageId};
-use crate::buffer::buffer_pool::{BufferPoolManager, Frame};
+use crate::buffer::buffer_pool::{FrameWriteGuard, BufferPoolManager, Frame};
 use crate::error::FerroError;
 
 /// A pinned page. Unpins on drop, so no caller can leak a pin by taking an early return.
@@ -67,9 +67,11 @@ impl PageHandle {
 
     /// Take a write guard and mark the page dirty. Use [`PageHandle::read`] if you are not
     /// modifying anything.
-    pub fn write(&self) -> RwLockWriteGuard<'_, Frame> {
+    pub fn write(&self) -> FrameWriteGuard<'_> {
         self.dirty.store(true, Ordering::Release);
-        self.pool.frames[self.frame_idx].write().unwrap()
+        // Through the pool's guard, never the raw lock: the guard refreshes the frame's shadow
+        // on drop, which is what lets an optimistic reader (D58) see this write at all.
+        self.pool.frame_write(self.frame_idx)
     }
 
     pub fn mark_dirty(&self) {

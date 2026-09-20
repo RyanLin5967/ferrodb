@@ -56,6 +56,12 @@ done
 
 # The quiet guard. A held lock whose pid is ALIVE means a certification suite is running, and any
 # absolute number taken beside one is not quotable. A lock whose pid is dead is stale and ignored.
+# TWO conditions, because each one alone has been measured to miss the other. The suite lock
+# catches a per-target run BETWEEN targets, when it is a bash script with no cargo child at all.
+# The process table catches a build or a bench that never takes the lock -- which is how
+# bench/d44_pair_CONTAMINATED.txt got taken: lock free, three rustc processes running, load rising
+# 12 -> 24 during the run. Matching on the EXECUTABLE (ps -eo comm) and never on the command line,
+# because `pgrep -f cargo` matches anything that merely spells it, this script included.
 quiet_or_refuse() {
   if [ -d "$SUITE_LOCK" ]; then
     local owner pid
@@ -68,6 +74,14 @@ quiet_or_refuse() {
       exit 3
     fi
     echo "# note: $SUITE_LOCK is present but its pid is dead (stale): $owner" >&2
+  fi
+  local builders
+  builders=$(ps -eo comm | grep -cE '^(.*/)?(cargo|rustc)$')
+  if [ "$builders" -gt 0 ]; then
+    echo "REFUSING: $builders cargo/rustc process(es) are running." >&2
+    echo "  A compile alongside the sweep depresses the 1-thread point hardest, and 16T/1T is" >&2
+    echo "  most sensitive exactly there. Wait for them, then re-run." >&2
+    exit 3
   fi
 }
 quiet_or_refuse
