@@ -1,0 +1,65 @@
+D65 — REOPEN vs BRANCH COUNT, 25x span, k=5 samples per point reporting MEDIAN and MIN.
+[HERE] 2026-09-20T07:43:39Z  at 68c6ff3, 8 threads, 8 GB budget, 20 GiB floor.
+
+WHY THIS SPAN AND NOT 10^6: runs 1 and 2 both tripped the disk floor at N=250,000 on a box
+whose free space moves by tens of GiB in minutes. 10k..250k is ~1 GB and fits with room.
+25x across FIVE points answers the complexity-class question better than two points at 10^6:
+one ratio cannot separate a constant from a class, only a slope can.
+
+WHY MEDIAN AND MIN: runs 1 and 2 took ONE wall-clock sample per point and disagreed about the
+DIRECTION at the same two sizes (100k: 1.144 vs 0.856 ms; 250k: 1.184 vs 1.729 ms). Contention
+can only make a reopen SLOWER, never faster, so MIN is the least contaminated estimate here.
+READ THE MIN COLUMN. The median is reported so the gap between them shows the load.
+
+PRE-REGISTERED: reopen MIN is flat across 25x. If MIN climbs monotonically and materially,
+catalog reopen is linear in branch count — a SHAPE, and a new wall. Also pre-registered:
+len B/branch must read ~4096 throughout or this run disagrees with D61.
+free before: 72Gi   load before: 42.66 46.91 46.33
+
+D32: the curve to 10^6 WITH ONE PAGE WRITTEN PER BRANCH. 8 threads.
+ARENA_EXTENT_PAGES = 256, so D31 predicts ~1024 KiB of DATA file per branch.
+Budget: 8 GB. The run REFUSES to exceed it rather than fill the disk.
+
+         N   forks/sec   data MB   alloc MB   len B/branch   alloc B/branch   cat B/branch   pages live   reopen ms   reopen min
+     10000       524.4      41.0       42.0           4096             4198            333        10000       0.225       0.204
+     25000       545.9     102.4      117.5           4096             4699            334        25000       0.218       0.213
+     50000       529.6     204.8      218.1           4096             4363            334        50000       0.231       0.223
+    100000       408.7     409.6      419.5           4096             4195            334       100000       0.219       0.200
+    250000       413.4    1024.0     1040.2           4096             4161            334       250000       0.394       0.325
+
+DID NOT stop early within the budget: N = 250000, 4096 bytes/branch.
+
+  reference: one page = 4096 B  ·  one full extent = 1048576 B  (256x apart)
+VERDICT — AMPLIFICATION GONE. 4096 B/branch is within 8x of a
+single page, so a branch's first page costs about a page. This is the tree WITH
+geometric extent growth (D31) built; without it this number is ~1048576.
+# rc=0
+free after: 81Gi   load after: 35.02 39.84 41.42
+
+=== READING ===============================================================================
+[HERE] reduced by this session from the table above. Five points, 25x, rc=0, no early stop.
+
+REOPEN IS NOT LINEAR IN BRANCH COUNT — measured WITH DATA PRESENT for the first time.
+  N        10,000   25,000   50,000   100,000   250,000
+  min ms    0.204    0.213    0.223     0.200     0.325
+  25x more branches cost 1.6x reopen. If reopen were O(N) the last point would be ~5 ms, i.e.
+  25x the first. It is 1.6x. That rules out linear by a factor of fifteen, which is the claim
+  S4 needed and which had never been checked on a catalog whose branches OWN PAGES.
+
+WHAT IS NOT SETTLED, and is not being dressed up as settled:
+  · min is flat across 10k..100k (0.204, 0.213, 0.223, 0.200 — a 10x span inside ±6%) and then
+    steps to 0.325 at 250k. ONE step at the last point is exactly what load looks like, and also
+    exactly what a real threshold effect looks like (a B+tree gaining a level, say). A single
+    point cannot tell those apart.
+  · O(1) versus O(log N) is therefore OPEN. log(250k)/log(10k) = 1.33, observed 1.6 — close
+    enough to log that the data does not exclude it, and close enough to flat-plus-noise that it
+    does not exclude that either. Claiming either from this would be inventing a result.
+  · The run that decides it is `d65_reopen_curve_1e6_run3.txt`, which extends to 10^6 and asks
+    whether the 250k step REPRODUCES and whether it keeps stepping.
+
+WHY THE MIN COLUMN: contention can only make a reopen SLOWER, never faster, so min is the least
+load-contaminated estimate available. The median is reported beside it so the gap shows the load
+— here median exceeds min by 3-21%, which is the machine, not the catalog.
+
+len B/branch reads 4096 at all five points, agreeing with D61's decade. Pre-registered check passes.
+===========================================================================================
