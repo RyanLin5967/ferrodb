@@ -343,6 +343,21 @@ struct State {
     next_merge: u64,
     apply_seq: u64,
     applied: Vec<AppliedOp>,
+    /// **D86.** `(tbl, row, col)` -> positions in `applied`, so a merge stops rescanning the whole
+    /// log for every cell it changes.
+    ///
+    /// `concurrent_op` asks a KEYED question — `a.tbl == tbl && a.row == row && a.col == Some(col)`
+    /// — and answered it with a linear scan of a Vec that is never pruned. Measured
+    /// (`bench/d86_merge_degrades_with_merge_count.txt`): across 400 merges a merge got **1.60x
+    /// slower** while the UPDATEs in the same cycles got 18% FASTER, which is a within-run
+    /// comparison a shared box cannot fake. Merge k cost O(k x delta); merging N branches was
+    /// O(N^2).
+    ///
+    /// ⚠ The Vec STAYS. Two other readers need it and neither is served by this key: the `txn`
+    /// filter in `REVERT` (`:4159`) and `highest_applied_seq` (`:3538`). This is an index beside
+    /// the log, not a replacement for it — which also means the two must be pushed together, and
+    /// `push_applied` is the only place that does either.
+    applied_by_cell: std::collections::HashMap<(u32, u64, u32), Vec<u32>>,
     merges: BTreeMap<String, MergeRecord>,
     /// Why each quarantined branch is being held, keyed by branch id slot.
     quarantine_reasons: BTreeMap<u64, String>,
@@ -396,6 +411,31 @@ struct State {
 }
 
 impl State {
+    /// **D86.** The one place that appends to `applied`, so the log and its index cannot drift.
+    ///
+    /// A second source of truth rots when someone adds a write and does not know about the index.
+    /// Making the append the only operation removes the ordering to get wrong — the same reason
+    /// `CatalogState::install` exists for the live-branch counter.
+    fn push_applied(&mut self, op: AppliedOp) {
+        if let Some(col) = op.col {
+            let at = self.applied.len() as u32;
+            self.applied_by_cell
+                .entry((op.tbl.0, op.row.0, col.0))
+                .or_default()
+                .push(at);
+        }
+        self.applied.push(op);
+    }
+
+    /// Positions in `applied` for one cell, newest last. Empty when the cell has never been
+    /// published, which is the common case and is what makes this worth indexing.
+    fn applied_at_cell(&self, tbl: TableId, row: RowId, col: ColId) -> &[u32] {
+        self.applied_by_cell
+            .get(&(tbl.0, row.0, col.0))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Insert a workspace, taking the txn references it holds. One of the two doors into
     /// `workspaces`; see [`State::txn_refs`] for why there are only two.
     fn insert_workspace(&mut self, id: u64, ws: Workspace) {
@@ -3684,10 +3724,30 @@ impl AgentRuntime {
         idx: usize,
     ) -> Option<OpKind> {
         let state = self.state.lock().unwrap();
-        let kinds: Vec<OpKind> = state
-            .applied
+        // **D86: ask the index, do not rescan the log.**
+        //
+        // This filtered ALL of `state.applied` — a never-pruned Vec — on `tbl/row/col/seq`, once
+        // per changed cell. Measured at 1.60x degradation across 400 merges, against a control
+        // that moved the other way. The predicate's first three conjuncts ARE a key; only `seq`
+        // is a range, and it is applied to the handful of entries the key selects.
+        // **D86: binary search the range, do not scan the cell's history.**
+        //
+        // Indexing by `(tbl, row, col)` alone was NOT enough, and the measurement said so: drift
+        // across 400 merges fell only 1.60x -> 1.25x. The reason is that an agent workload writes
+        // the SAME cells over and over, so a cell's own history grows by one entry per merge and
+        // `O(ops for this cell)` is the same order as `O(applied)` for the case that matters.
+        //
+        // The surviving filter is `seq > fork_seq` — a RANGE over a key that is already sorted,
+        // because `push_applied` appends in increasing `seq` and therefore each cell's position
+        // list is increasing in both position and seq. So the answer is a `partition_point`, and
+        // the cost becomes O(log k) plus the entries actually returned.
+        let at = state.applied_at_cell(tbl, row, col);
+        let from = at.partition_point(|&i| {
+            state.applied.get(i as usize).map(|a| a.seq <= fork_seq).unwrap_or(true)
+        });
+        let kinds: Vec<OpKind> = at[from..]
             .iter()
-            .filter(|a| a.seq > fork_seq && a.tbl == tbl && a.row == row && a.col == Some(col))
+            .filter_map(|&i| state.applied.get(i as usize))
             .map(|a| a.kind.clone())
             .collect();
         if !kinds.is_empty() {
@@ -3731,7 +3791,7 @@ impl AgentRuntime {
                     .get(&(op.tbl.0, op.row.0))
                     .cloned()
                     .flatten();
-                state.applied.push(AppliedOp {
+                state.push_applied(AppliedOp {
                     seq,
                     txn,
                     table: r.table.clone(),
