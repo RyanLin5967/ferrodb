@@ -20,7 +20,24 @@ GiB free.
 
 **It did not reach the second checkpoint in the time the OFF arm took to finish all four.**
 
-⚠ **Its per-checkpoint rows are NOT in this file, and the reason is a defect in how I ran it**: the
+⇒ ✅ **THE ROWS WERE RECOVERED.** Stopping the run flushed the pipe, so the harness's own numbers
+did survive after all:
+
+         N   forks/sec   len B/branch      vs OFF at the same N
+      1000        54.7           4100      258.6 -> **4.7x slower**
+      5000        29.2           4097      168.0 -> **5.8x slower**
+     25000        38.2           4096      117.7 -> **3.1x slower**
+  (reached ~56,115 branches in 24:41 before being stopped to free the box for a verification suite)
+
+⇒ **`len B/branch` is IDENTICAL in both arms at every N — 4100, 4097, 4096.** Persistence does not
+move the per-branch space cost by one byte, which is exactly what D80 found at its single N=500
+point and is the half of D61 that survives untouched.
+⇒ **forks/sec is 3-6x lower with persistence on**, at every checkpoint, and the ON arm never
+reached the 100,000 the OFF arm completed.
+⚠ The ratios are noisy (4.7, 5.8, 3.1) and do not themselves show a clean trend; the map-size
+sampling below is what shows the decay.
+
+⚠ **The original defect, kept because it nearly cost the data**: the
 arm's stdout went through `grep`, which block-buffers a pipe, so rows printed before the run's
 timeout never flushed. The rate below is therefore measured a different way — by sampling the SIZE
 of `<db>.arena` on disk, which is exactly `48 x live branches` by D79's measured law, so it is an
