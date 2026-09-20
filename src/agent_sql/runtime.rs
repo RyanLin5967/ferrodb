@@ -2674,8 +2674,21 @@ impl AgentRuntime {
         // wrote to. An assertion over a table the candidate never touched is still a claim about
         // the state the merge would leave behind, and it is read here so the fingerprint below
         // covers it: the evaluation depended on those rows, so a change to them invalidates it.
+        // ⚠ ASSERTION TABLES MUST BE SCANNED IN FULL — D69 REGRESSION, fixed here.
+        //
+        // An assertion is a claim about a WHOLE TABLE (`id >= 0` over `audit`), so it needs every
+        // row, not the handful this branch touched. D69 replaced the blanket scan below with point
+        // lookups over the branch's own rows, on the stated grounds that `current` had exactly two
+        // consumers. That was WRONG: `evaluate_assertions(assertions, &schemas, &current, ..)` is a
+        // THIRD, and the error was methodological — a grep for `current.get(` finds the two and
+        // misses the one passed as `&current`. The result was an assertion examining ZERO rows and
+        // refusing admission with "an assertion that never ran is not an assertion that held",
+        // which is the gate behaving correctly on a base this function had emptied.
+        let mut assertion_tables: BTreeSet<u32> = BTreeSet::new();
         for a in assertions {
-            table_names.entry(table_id(&a.table).0).or_insert_with(|| a.table.clone());
+            let id = table_id(&a.table).0;
+            assertion_tables.insert(id);
+            table_names.entry(id).or_insert_with(|| a.table.clone());
         }
         for (t, name) in &table_names {
             let Some(entry) = ctx.catalog.get_table(name) else {
@@ -2688,6 +2701,13 @@ impl AgentRuntime {
                 continue;
             };
             schemas.insert(*t, entry.schema.clone());
+            // Full scan ONLY for tables an assertion ranges over. A merge with no assertions —
+            // the common case — scans nothing and stays O(delta).
+            if assertion_tables.contains(t) {
+                for row in scan_table(name, &ctx.read())? {
+                    current.insert((*t, row_id_of(&row).0), row);
+                }
+            }
         }
 
         // **D69 — POINT LOOKUPS, NOT A SCAN.** `current` is consulted at exactly two places, and
@@ -4375,31 +4395,6 @@ fn premise_rows_of(reads: &[crate::provenance::readset::ReadSet]) -> Vec<(TableI
     out.sort_by_key(|(t, r)| (t.0, r.0));
     out.dedup();
     out
-}
-
-/// A fingerprint over every row handed in, for detecting that a base moved under an evaluation.
-///
-/// Row *content* and not a counter: an update that leaves the row count alone is exactly the kind
-/// of movement a stale evaluation must not be published against. The bytes come from `encode_row`,
-/// which is the same encoding the branch trees store, so two values that differ only in variant
-/// (`Integer(5)` against `Float(5.0)`) do not collide.
-///
-/// **Its precision floor is `row_id_of`'s, and that is inherited rather than chosen.** The map
-/// handed in is keyed by row identity derived from the first column, so two rows whose first
-/// column collides — two `NULL`s, both `RowId(0)` — collapse into one entry, and a change to the
-/// shadowed row moves nothing here. The merge itself is keyed the same way and has the same blind
-/// spot; `row_id_of` is documented as the stand-in for a surrogate minted at insert, and the day
-/// it becomes one this becomes exact with no change here.
-fn fingerprint_rows(rows: &BTreeMap<(u32, u64), Vec<Value>>) -> Result<u64, FerroError> {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for ((t, r), row) in rows {
-        h = fnv64_update(h, &t.to_be_bytes());
-        h = fnv64_update(h, &r.to_be_bytes());
-        let bytes = encode_row(row)?;
-        h = fnv64_update(h, &(bytes.len() as u64).to_be_bytes());
-        h = fnv64_update(h, &bytes);
-    }
-    Ok(h)
 }
 
 struct WorkspaceSnapshot {
