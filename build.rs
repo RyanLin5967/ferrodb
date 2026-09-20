@@ -49,9 +49,18 @@ fn main() {
 
     let commit = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
 
-    // `--porcelain` over tracked files only. An untracked file is not what this is about: it
-    // cannot change the compiled behaviour unless it is also on the build path, and treating every
-    // stray scratch file as "dirty" would make the flag mean nothing within a day.
+    // `--porcelain` over TRACKED files only, and that is a deliberate trade with a real hole in it.
+    //
+    // ⚠ **AN UNTRACKED FILE ON THE BUILD PATH STAMPS CLEAN, AND THIS WAS DEMONSTRATED, NOT
+    // GUESSED.** Proving the flag fires in both directions needed a throwaway `examples/*.rs`; it
+    // was untracked, it compiled and ran, and the stamp read clean. So the honest statement is not
+    // "untracked files cannot change compiled behaviour" — they plainly can — it is that counting
+    // them would mark the tree dirty for every stray scratch file and the flag would mean nothing
+    // within a day. A flag nobody believes catches nothing at all.
+    //
+    // The hole that remains is narrow and worth naming precisely: a NEW file that is on the build
+    // path and has never been committed. An edit to any file the crate already tracks IS caught,
+    // and that is the case the mechanism exists for.
     let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
         Some(s) => !s.is_empty(),
         // Could not ask. "clean" would be a guess in the direction that invites trust, so it is
