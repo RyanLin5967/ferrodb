@@ -2688,8 +2688,60 @@ impl AgentRuntime {
                 continue;
             };
             schemas.insert(*t, entry.schema.clone());
-            for row in scan_table(name, &ctx.read())? {
-                current.insert((*t, row_id_of(&row).0), row);
+        }
+
+        // **D69 — POINT LOOKUPS, NOT A SCAN.** `current` is consulted at exactly two places, and
+        // both are keyed by rows THIS BRANCH touched: the per-row comparison below
+        // (`current.get(&(*t, *r))`) and `pre_images` (`pending_writes[].row_key()`). Nothing ever
+        // iterates it. It used to be filled by scanning every row of every touched table, which
+        // made a merge cost O(table) no matter how little the branch changed — measured at
+        // 1.87 us/row, about 1.9 SECONDS per merge against a million-row table to write four rows
+        // (D68, `bench/d68_merge_is_o_table.txt`).
+        //
+        // The row id cannot be turned back into a key — `row_id_of` is a one-way FNV for Varchar,
+        // Boolean, Float and Decimal primary keys — but it does not need to be: the branch's own
+        // images carry the key in column 0. `after` for rows it wrote, `base_rows` for rows it
+        // deleted, and the union covers both.
+        //
+        // ⚠ This is only safe because `base_fingerprint` NO LONGER READS `current` (D69 step 2).
+        // While it did, narrowing this map would have quietly turned a whole-table staleness check
+        // into a touched-rows one — a weakening of isolation wearing a speedup's clothes.
+        {
+            let mut wanted: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
+            let mut want = |t: u32, row: &[Value]| {
+                if let Some(pk) = row.first() {
+                    wanted.entry(t).or_default().push(pk.clone());
+                }
+            };
+            for ((t, _), st) in &snapshot.rows {
+                if let RowState::Present(row) = st {
+                    want(*t, row);
+                }
+            }
+            for ((t, _), before) in &snapshot.base_rows {
+                if let Some(row) = before {
+                    want(*t, row);
+                }
+            }
+            for (t, mut pks) in wanted {
+                let Some(name) = table_names.get(&t) else { continue };
+                let Some(entry) = ctx.catalog.get_table(name) else { continue };
+                let Some(pk_col) = entry.schema.columns.first().map(|c| c.name.clone()) else {
+                    continue;
+                };
+                // One branch can touch the same row through several ops.
+                pks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                pks.dedup();
+                for key in pks {
+                    let pred = Expr::BinaryOp {
+                        left: Box::new(Expr::ColumnRef { table: None, column: pk_col.clone() }),
+                        operator: TokenType::Equal,
+                        right: Box::new(value_expr(&key)),
+                    };
+                    for row in scan_table_where(name, None, Some(&pred), &ctx.read())? {
+                        current.insert((t, row_id_of(&row).0), row);
+                    }
+                }
             }
         }
 
@@ -2706,8 +2758,14 @@ impl AgentRuntime {
         // the split opened.
         let premise_rows = premise_rows_of(&snapshot.reads);
         // The base this evaluation is about, as one number. See `publish_evaluation`.
-        let base_fingerprint =
-            fnv64_update(fingerprint_rows(&current)?, &self.fingerprint_premises(&premise_rows).to_be_bytes());
+        // D69 — the SAME function over the SAME table set the publish-time check uses
+        // (`fingerprint_tables(ctx, &eval.tables_read)`, and `tables_read` IS `table_names`).
+        // Computing the two sides differently is how a staleness check stops comparing anything;
+        // they are deliberately one call, not two implementations that happen to agree today.
+        let base_fingerprint = fnv64_update(
+            self.fingerprint_tables(ctx, &table_names)?,
+            &self.fingerprint_premises(&premise_rows).to_be_bytes(),
+        );
 
         let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
         let mut pending_writes: Vec<PendingWrite> = Vec::new();
@@ -3445,22 +3503,40 @@ impl AgentRuntime {
         })
     }
 
-    /// Fingerprint of every row of `tables`, as the shared tables hold them right now.
+    /// Fingerprint of `tables` **by their change counters**, not by their contents — D69.
+    ///
+    /// # What this answers, and why a counter answers it
+    ///
+    /// The question is "did any of these tables move since this evaluation was scored?", asked
+    /// once at scoring and once at publication and compared. It used to be answered by scanning
+    /// every row of every listed table and hashing it. D68 measured that at 1.87 us/row — about
+    /// 1.9 SECONDS per merge against a million-row table, to write four rows
+    /// (`bench/d68_merge_is_o_table.txt`). Folding one `u64` per table is O(tables).
+    ///
+    /// # Why this is not weaker than the hash it replaces
+    ///
+    /// It is STRICTLY STRONGER, in the one direction that matters. A content hash cannot see a
+    /// change that was reverted between the two observations — write, revert, hash matches, and
+    /// the merge publishes against a base it never scored. `Catalog::bump_table_version` is
+    /// monotone, so it catches that too. Every committed write bumps it, including ordinary DML
+    /// outside any agent session, which is what `tests/d69_table_version.rs` pins.
+    ///
+    /// A table absent from the catalog contributes its id and nothing else, exactly as the scan
+    /// version contributed no rows for it.
     fn fingerprint_tables(
         &self,
         ctx: &mut ExecCtx,
         tables: &BTreeMap<u32, String>,
     ) -> Result<u64, FerroError> {
-        let mut current: BTreeMap<(u32, u64), Vec<Value>> = BTreeMap::new();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for (t, name) in tables {
+            h = fnv64_update(h, &t.to_be_bytes());
             if ctx.catalog.get_table(name).is_none() {
                 continue;
             }
-            for row in scan_table(name, &ctx.read())? {
-                current.insert((*t, row_id_of(&row).0), row);
-            }
+            h = fnv64_update(h, &ctx.catalog.table_version(*t).to_be_bytes());
         }
-        fingerprint_rows(&current)
+        Ok(h)
     }
 
     /// Fingerprint of the published version of every row an evaluation READ.
