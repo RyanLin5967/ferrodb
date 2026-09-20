@@ -195,6 +195,44 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("ferrodb-d67-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
+    // D67_POINT=16 D67_SECONDS=30 runs ONE point for a long time, so a sampling profiler has a
+    // steady state to look at. The sweep's 2-second windows are too short to profile and the
+    // build/teardown between points would dominate the sample.
+    if let Ok(n) = std::env::var("D67_POINT") {
+        let threads: usize = n.parse().expect("D67_POINT must be a number");
+        let secs: u64 = std::env::var("D67_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let disjoint = std::env::var("D67_ARM").map(|a| a != "shared").unwrap_or(true);
+        println!("SINGLE POINT: {threads} threads, {secs}s, arm={}", if disjoint { "disjoint" } else { "shared" });
+        let s = Arc::new(build(&dir, "profile"));
+        let start = Arc::new(Barrier::new(threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for tid in 0..threads {
+            let (s, start, stop, done) = (s.clone(), start.clone(), stop.clone(), done.clone());
+            hs.push(std::thread::spawn(move || {
+                let mut seq = 0u64;
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    if one_cycle(&s, tid, seq, disjoint) {
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    seq += 1;
+                }
+            }));
+        }
+        start.wait();
+        println!("pid {} running — profile now", std::process::id());
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_secs(secs));
+        let n = done.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        for h in hs { let _ = h.join(); }
+        println!("{:.1} merges/sec ({} in {:.1}s)", n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64());
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
     println!("D67 — CONCURRENT BRANCH MANAGEMENT: merges/sec against thread count.");
     println!("PREDICTION, recorded before the numbers: FLAT in both arms, because every MERGE takes");
     println!("the one `Mutex<Catalog>` at pgwire/mod.rs:64 and drains readers on the way in.");

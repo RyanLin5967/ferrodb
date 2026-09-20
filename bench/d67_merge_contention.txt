@@ -86,3 +86,39 @@ places this project has looked, and all three are healthy. BranchBench's finding
 branch management", and this is the first time that has been measured here. It is the only
 structural wall currently on the board.
 ===========================================================================================
+
+=== PROFILE — THE SHARED SERIAL THING, NAMED ==============================================
+[HERE] `sample` over 25 s of a 40 s single-point run, 16 threads, DISJOINT arm.
+Raw profile banked beside this file as d67_profile_16T_disjoint.sample.txt.
+The point sustained 23.0 merges/sec over 40 s against 159.6 at one thread, so the collapse is
+not an artifact of the sweep's 2-second windows — it reproduces over a long steady state.
+
+  worker-thread samples (thread_start)                              316,396   100.0%
+  ServerContext::catalog -> Mutex::lock -> __psynch_mutexwait       296,691    93.8%
+  execution::executor::run  (ALL the actual work)                    20,538     6.5%
+
+⇒ **93.8% OF ALL WORKER TIME IS BLOCKED WAITING FOR ONE MUTEX.** The previous section said the
+wall was "something shared and serial" and refused to name it because the candidate had only been
+read off the source. It is now measured, and it is the candidate: `pgwire/mod.rs:64`
+`pub catalog: Mutex<Catalog>`, entered through `ServerContext::catalog()`.
+
+That also settles the shape question the collapse raised. A plain serialised critical section
+predicts FLAT; what makes it COLLAPSE is that `catalog()` does more than take a lock — it calls
+`drain_readers()` on every acquisition, a scan over live connections, so the cost of ACQUIRING
+rises with the number of participants. Sixteen agents do not merely queue, they make each other's
+acquisitions more expensive. ⚠ The drain is visible in the source at the acquisition site and is
+the mechanism consistent with the shape; the profile attributes the time to the acquisition as a
+whole and does not separate the drain from the wait. Splitting those two is a further measurement,
+not a conclusion available here.
+
+WHAT THIS MEANS FOR THE PROJECT'S OWN NUMBERS: D58 and D59 took the READ path to x8.12 at 16
+threads precisely by teaching reads to avoid this lock — the epoch mirror and `try_run_read` exist
+for that. This measurement is the other half of the same structure: every writer, and every MERGE,
+still takes it, AND drains the readers on the way in. So a merge does not merely serialise against
+other merges, it stalls the read path that was freed. The read work was not wrong; it was half the
+problem, and this is the half nobody had measured.
+
+⚠ STILL A SHAPE, NOT A COMPARISON: "the write path serialises on one global lock and its
+acquisition cost grows with concurrency" transfers to any engine built this way. The absolute
+merges/sec is this machine on a shared box and transfers to nothing.
+===========================================================================================
