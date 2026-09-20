@@ -1,0 +1,81 @@
+D69 — CLOSED. The merge IS O(delta). "Merge is O(table)" was a timer wrapping four UPDATEs.
+
+[HERE] built from the tree at db9dcfb (D69 fix present: `assertion_tables` in evaluate_merge).
+Harness `examples/d68_merge_is_o_table.rs`, extended two ways that together settle the row:
+  * the timer, which used to wrap the WHOLE cycle, is SPLIT by phase; and
+  * fsyncs are COUNTED at the syscall, not inferred from a profile aggregate.
+⚠ Shared box, load 51-81 throughout. Absolutes are inflated and the MERGE column is noise-
+dominated; the SHAPE and the BYTE COUNTS are the result.
+
+=== WHAT WAS WRONG, AND WHY NOTHING CAUGHT IT FOR THREE ROWS ==========================
+
+`one_cycle` issues SIX commits — `BEGIN AGENT SESSION`, then N `UPDATE`s, then `MERGE` — and a
+single wall-clock number around the lot was reported, in the file name and in the prose, as
+"merge latency". It is not. D68 read its slope as "a merge reads the whole table twice"; D69
+removed the scans; the curve did not move; D69 "reopened" and a profile was read as "the fsync
+itself scales with database volume". Every one of those steps was reasoning about a number that
+was mostly four UPDATEs.
+
+=== THE THREE MEASUREMENTS THAT SETTLE IT ============================================
+
+**1. PHASE SPLIT, at fixed delta=4, growing table.** The linear term is in the WRITES.
+
+  table rows    writes ms (4 UPDATEs)    MERGE ms    merge fsyncs   bytes/fsync
+        1000                   1.110       7.101            1.07         983.9
+        2000                   2.374      11.530            1.00        1053.0
+        4000                   3.304      12.236            1.00        1053.0
+        8000                   6.262      21.320            1.00        1053.0
+       16000                  11.566      13.687            1.00        1053.0
+
+  writes: 1.110 -> 11.566 over 16x the rows = 10.4x. MERGE: no monotone relation at all — 8000
+  reads HIGHER than 16000. One fsync per merge at every size, of the SAME 1053 bytes.
+
+**2. ORDER REVERSED — the drift control, and the one that kills the slope.** Run 16000 first:
+
+  table rows    writes ms    MERGE ms   fsyncs
+       16000       11.809      12.091     1.00
+        8000       16.269      41.823     1.00
+        4000        3.332      25.382     1.00
+        2000        2.370      37.851     1.00
+        1000        1.013      11.091     1.00
+
+  **The MERGE column does not follow table size in either direction.** 8000 rows costs 41.8 ms and
+  16000 costs 12.1 ms. It is machine load, sampled. The WRITES column survives the reversal and
+  still tracks rows. A single-order run cannot tell those apart, which is exactly why the rule
+  here is to rotate arm order rather than trust one pass.
+
+**3. THE DELTA AXIS at a FIXED 4000-row table — the confirmation.**
+
+  delta   writes ms   MERGE ms   fsyncs   WAL bytes per merge
+      1       0.783      4.226     1.00                   435
+      2       1.480      4.559     1.00                   641
+      4       2.991      5.994     1.00                  1053
+      8       5.492      7.194     1.00                  1877
+     16       9.873      9.980     1.00                  3525
+     32      22.916     17.645     1.00                  6821
+
+  ⇒ **bytes = 229 + 206 x delta, EXACT at all six points**, with NO table-size term and exactly
+  one fsync however large the delta. That is O(delta) in the strongest form the instrument can
+  express: not a fitted slope, an exact affine law over a 32x range.
+
+=== VERDICT ==========================================================================
+
+✅ **D69 CLOSES. The merge is O(delta).** D68's mechanism ("reads the whole table twice") was
+   real in the source and was NOT the cost; D69-REOPEN's mechanism ("the fsync scales with
+   database volume") was an artifact of a file-size delta and a profile aggregate, both of which
+   are blind to the difference between one slow fsync and several fast ones. A counter is not.
+
+⇒ **THE WALL THAT IS ACTUALLY THERE, and it is a new row: `UPDATE t SET v = ? WHERE id = ?` on
+   the PRIMARY KEY is O(table).** 1.110 ms -> 11.566 ms over 16x the rows, holding under order
+   reversal. A point update on the primary key should be a descent, not a scan. That is a SHAPE —
+   true of any B+tree, in any engine — and it is the entire slope that three rows attributed to
+   the merge.
+
+=== WHAT THIS FILE CANNOT SAY =========================================================
+  * The MERGE ms column is not a measurement of anything at this load; only the fsync COUNT and
+    the BYTE COUNT are, because those are integers read off a counter and are load-independent.
+  * The delta axis was run at ONE table size (4000). The claim "no table-size term" rests on the
+    byte counts being identical at 1053 across five sizes in run 1, not on a 2-D sweep.
+  * INTEGER keys only, as every curve here has been. The SLOW failure mode for other key types —
+    a predicate that stops being a recognisable equality and falls back to a seq scan per lookup —
+    is still unmeasured. See bench/d69_keytypes_firecheck.txt.
