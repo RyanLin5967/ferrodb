@@ -339,7 +339,7 @@ impl TwoTierReaper {
     /// reaping it rides on. A reading that goes backwards (a new leader with a lower tick) parks
     /// the next collection rather than firing a burst of them; it is a mop-up pass, and delaying
     /// one leaks nothing that open will not collect.
-    fn collect_orphans_if_due(&self, now_millis: u64) -> Result<u32, FerroError> {
+    pub(crate) fn collect_orphans_if_due(&self, now_millis: u64) -> Result<u32, FerroError> {
         let last = self.last_orphan_sweep_ms.load(Ordering::SeqCst);
         if last != ORPHAN_SWEEP_NEVER && now_millis.saturating_sub(last) < ORPHAN_SWEEP_INTERVAL_MS
         {
@@ -608,7 +608,18 @@ impl Reaper for TwoTierReaper {
         // already holds the cluster's time. It is still O(live_arenas) when it fires, which is
         // why it fires at most once per `ORPHAN_SWEEP_INTERVAL_MS` — the complete answer is at
         // open, in `resume_interrupted_reaps`.
-        self.collect_orphans_if_due(now_millis)?;
+        // **D88: the orphan sweep is NOT run here any more — see `lease_thread::scan_once`.**
+        //
+        // It used to run inside `reap_expired`, which `scan_once` calls inside `with_lock` — and
+        // in production that lock is the TABLE CATALOG mutex, the one every SQL statement needs
+        // (`lease_thread.rs:167-171`, `:197-202`; `cli.rs` passes the catalog as the `RuntimeLock`).
+        // So every 60 seconds every connection in the database stalled behind an O(live arenas)
+        // scan, each arena costing ~2 B+tree descents, an arena-span range scan and 2 store-lock
+        // acquisitions.
+        //
+        // The sweep does not need that lock: it touches `live_arenas`, the BRANCH catalog and the
+        // page store, and none of those is the table catalog. It is now driven from `scan_once`
+        // AFTER the lock is released, so the cadence is unchanged and the stall is gone.
         Ok(reaped)
     }
 
@@ -1839,6 +1850,9 @@ mod tests {
         // Tick 1. Never collected before, so it collects.
         let (a1, _) = orphan_one_extent(&h);
         assert!(reaper.reap_expired(t0).unwrap().is_empty(), "fixture: nothing should expire");
+        // **D88.** The sweep is driven by `scan_once` AFTER the statement lock is released, not by
+        // `reap_expired`. The cadence and the assertions below are unchanged; only the caller is.
+        reaper.collect_orphans_if_due(t0).unwrap();
         for a in a1.iter().copied() {
             assert_eq!(h.store.arena_owner(a), None, "the first tick did not collect");
         }
@@ -1848,6 +1862,7 @@ mod tests {
         // will. Nothing is lost — open collects it.
         let (a2, _) = orphan_one_extent(&h);
         reaper.reap_expired(t0 + ORPHAN_SWEEP_INTERVAL_MS - 1).unwrap();
+        reaper.collect_orphans_if_due(t0 + ORPHAN_SWEEP_INTERVAL_MS - 1).unwrap();
         for a in a2.iter().copied() {
             assert!(h.store.arena_owner(a).is_some(), "the cadence gate did not hold");
         }
@@ -1855,6 +1870,7 @@ mod tests {
         // Tick 3, at the interval. Collected — the gate closes and re-opens, rather than only
         // ever having been open once.
         reaper.reap_expired(t0 + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
+        reaper.collect_orphans_if_due(t0 + ORPHAN_SWEEP_INTERVAL_MS).unwrap();
         for a in a2.iter().copied() {
             assert_eq!(h.store.arena_owner(a), None, "the cadence never re-opened");
         }

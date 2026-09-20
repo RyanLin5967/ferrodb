@@ -396,6 +396,10 @@ fn scan_once(
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
     counters.attempts.fetch_add(1, Ordering::SeqCst);
+    // The sweep runs after the lock is dropped but must use the reading the scan decided on, not a
+    // second one: two clock reads either side of a reap can straddle the cadence boundary and turn
+    // one collection into none or two.
+    let mut sweep_at: Option<u64> = None;
     with_lock(lock, || {
         // Read inside the lock: the freshest reading that can still be acted on without another
         // statement intervening. A refusal is counted and reported, never rounded to a number.
@@ -411,6 +415,7 @@ fn scan_once(
                 return;
             }
         };
+        sweep_at = Some(now);
         match reaper.reap_expired(now) {
             Ok(reaped) => {
                 counters.scans.fetch_add(1, Ordering::SeqCst);
@@ -464,6 +469,25 @@ fn scan_once(
             }
         }
     });
+    // **D88: the orphan sweep runs OUTSIDE the statement lock.**
+    //
+    // `with_lock` above is the table-catalog mutex in both production shapes, so anything inside
+    // it stalls every connection for its duration. `collect_orphans_if_due` is O(live arenas) and
+    // does not touch the table catalog at all — it reads `live_arenas`, asks the BRANCH catalog
+    // whether each owner is dead, and frees through the page store, each of which has its own
+    // lock. Running it here keeps the cadence and the work identical and removes the stall.
+    //
+    // ⚠ Ordered AFTER the reap, not before: a reap is what produces collectable extents, so
+    // sweeping first would always be one tick behind. And any error is reported rather than
+    // propagated — a failed mop-up must not stop the next lease scan, and `open` collects the
+    // same extents anyway.
+    let Some(now) = sweep_at else { return };
+    if let Err(e) = reaper.collect_orphans_if_due(now) {
+        report(format!(
+            "lease: orphan sweep failed: {e}. Nothing is lost — the complete answer is recomputed \
+             at open by `resume_interrupted_reaps`, and the cadence retries."
+        ));
+    }
 }
 
 fn join_ids(ids: &[BranchId]) -> String {
