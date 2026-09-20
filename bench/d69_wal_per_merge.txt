@@ -1,0 +1,34 @@
+D69-REOPEN — WHY A MERGE IS LINEAR IN TABLE SIZE. The measurement that answers it.
+
+[HERE] `D68_SIZES=1000,4000,16000 D68_MERGES=40`, one thread, fixed delta of 4 rows, harness
+instrumented to report bytes appended to the WAL per merge.
+
+  table rows   median ms   ms per 1000 rows   WAL bytes per merge
+        1000       6.219            6.2186   (0 — truncation artifact, see below)
+        4000      10.296            2.5740   1053
+       16000      40.845            2.5528   1053
+
+**THE ANSWER: THE MERGE WRITES THE SAME AMOUNT AND TAKES FOUR TIMES AS LONG.**
+4,000 -> 16,000 rows is 4.00x the table and 3.97x the time, with the WAL bytes per merge IDENTICAL
+at 1053. The work does not grow. The cost does.
+
+⇒ Candidate (b) — "a merge logs more WAL on a bigger table" — is DEAD.
+⇒ Candidate (a) stands: the fsync cost itself scales with the database's size / dirty-page volume,
+  so an identical 1053-byte commit is four times more expensive against a four-times-bigger file.
+
+This is a different mechanism from D68's, and it implies a different fix. D68 said "a merge reads
+the whole table twice"; the truth is "a merge issues SIX commits — BEGIN AGENT SESSION, four
+UPDATEs, MERGE — and each one fsyncs, and an fsync against a bigger database costs more."
+The lever is therefore the NUMBER OF FSYNCS PER MERGE, not the number of rows read. Group commit
+already exists in this codebase (D6 took forks from 254 to 4,382/sec, x17.3, by making one shared
+fsync do the work of many private ones); whether the merge path uses it is the next thing to read.
+
+⚠ THE 1,000-ROW WAL FIGURE IS NOT A MEASUREMENT. It reads 0 because the log was TRUNCATED during
+the window (42,273 -> 17,027 — the file SHRANK), so a file-size delta undercounts and can go
+negative. Only the 4,000 and 16,000 points are clean, which is two points, and two points are
+enough to say "identical" only because they are EXACTLY equal rather than close. A third clean
+point would be worth having before this is treated as settled.
+
+⚠ AND THE ABSOLUTES ARE INFLATED: this ran at load 75 against a 16,000-row table, which is why
+16,000 reads 40.8 ms here against 32.0 ms in d69_verify_curve.txt. The RATIO across sizes within
+one run is the result; the milliseconds are this box under this load.
