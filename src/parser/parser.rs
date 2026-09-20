@@ -46,11 +46,35 @@ pub const MAX_EXPR_DEPTH: usize = 64;
 /// disappear, it moves downstream of the parser — which is exactly what D64's original doc got
 /// wrong when it claimed the parser limit transitively bounded those walkers.
 ///
-/// **Measured** (`bench/d64_nesting_probe.txt`, 2 MiB thread, limit lifted): a chain survived
-/// 12,800 levels and aborted at 25,600 in a DEBUG build. 4,096 is a little over 3x under that, and
-/// leaves room for machine-generated SQL — a `WHERE` with a few thousand `AND` terms still parses,
-/// where a single shared limit of 64 would have refused it.
-pub const MAX_TREE_DEPTH: usize = 4096;
+/// **Counted PER STATEMENT and never released early — D64c.** The counter is a budget on how many
+/// operator levels one statement may build in total, and `parse` zeroes it between statements.
+/// It is deliberately a conservative over-approximation of tree DEPTH (depth <= total charges): a
+/// `SELECT` with several thousand separate two-term columns spends the budget without being deep,
+/// and is refused. That is the safe direction, and the alternative is what v3 did.
+///
+/// ⚠ **v3 released this counter in bulk at the end of [`Parser::expression`], and that was the
+/// THIRD hole in this guard.** Every binary loop parses its LEFT operand before its first
+/// `enter_chain`, so a left-position `(` re-entered `expression` with the counter still at the
+/// parent's entry value — zero, all the way down the leftmost spine. Each nesting level then got a
+/// FULL fresh budget while costing only 1 against [`MAX_EXPR_DEPTH`], so the two limits MULTIPLIED
+/// instead of adding: 62 nesting levels x 800 operators built a ~49,600-deep tree that parsed
+/// happily and then aborted the process, measured on a 2 MiB connection thread with the v3 guard
+/// in place.
+///
+/// Also charged once per JOIN, because the planner folds a flat list of joins into an N-deep
+/// `LogicalPlan::Join` tree that several walkers descend.
+///
+/// **Measured, and the scope of that measurement matters** (`bench/d64_nesting_probe.txt`, 2 MiB
+/// thread, limit lifted): a flat chain survived 12,800 levels and aborted at 25,600 in a DEBUG
+/// build. ⚠ That probe links only `Parser` and `Scanner`, so the recursion it measured is parse
+/// plus `Expr`'s derived DROP GLUE — the lightest walker there is. `binder::bind_expr`,
+/// `execution::executor::evaluate`, `optimizer::split_and` and `pgwire::params::walk_expr` all
+/// descend the same tree with fatter frames and are **UNMEASURED**. 1,024 is 25x under the one
+/// threshold that was measured, and that margin is deliberately standing in for the thresholds
+/// that were not: a limit 3x under the LIGHTEST walker would have been justified by a number that
+/// does not describe the walkers it is protecting. A `WHERE` with a thousand `AND` terms still
+/// parses, which covers machine-generated SQL.
+pub const MAX_TREE_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct TableRef {
@@ -363,9 +387,10 @@ impl Parser {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
-            // Each top-level statement starts from zero. Without this a long script of shallow
-            // statements could accumulate charge and refuse a perfectly valid later one.
+            // Each top-level statement starts from zero, both counters. Without this a long
+            // script of shallow statements would accumulate charge and refuse a valid later one.
             self.depth = 0;
+            self.chain = 0;
             match self.parse_statement() {
                 Ok(stmt) => statements.push(stmt),
                 Err(err) => {
@@ -572,6 +597,11 @@ impl Parser {
             }
             if join_type.is_none() && !has_join { break; }
             let actual_join_type = join_type.unwrap_or(JoinType::Inner); // default to inner
+            // One level of PLAN depth per join — D64c. The parser collects joins into a flat Vec,
+            // so nothing recurses here, but the planner folds them into an N-deep
+            // `LogicalPlan::Join` tree that several walkers then descend recursively. Same class
+            // as the binary loops, one layer further on, and charged the same way.
+            self.enter_chain()?;
             let join_table = self.parse_table_ref()?;
             self.consume(TokenType::On, "expected on".into())?;
             let on = self.expression()?;
@@ -1197,14 +1227,11 @@ impl Parser {
     /// arrives over a socket, which takes every other session on the server with it. See
     /// [`MAX_EXPR_DEPTH`].
     pub fn expression(&mut self ) -> Result<Expr, FerroError>{
-        // The frame counter is a matched enter/leave. The CHAIN counter is restored in bulk: the
-        // binary loops charge one level per ITERATION and never pair it with a release, because a
-        // left-deep chain really is that deep, and that depth belongs to this expression.
-        let chain_entry = self.chain;
+        // The frame counter is a matched enter/leave. The CHAIN counter is NOT released here —
+        // see [`MAX_TREE_DEPTH`]. Restoring it on exit is what let the two limits MULTIPLY.
         self.enter()?;
         let parsed = self.or();
         self.leave();
-        self.chain = chain_entry;
         return parsed;
     }
 
@@ -1229,9 +1256,9 @@ impl Parser {
 
     /// Charge one level of left-deep TREE depth, or refuse. See [`MAX_TREE_DEPTH`].
     ///
-    /// Released in bulk by [`Parser::expression`], which restores the counter it entered with: a
-    /// chain's levels are not individually unwound because the chain really is that deep, and the
-    /// depth belongs to the whole expression rather than to any one iteration.
+    /// NEVER released except by `parse` at a statement boundary. A charge that is released when an
+    /// inner expression finishes is a charge a nested expression can spend again, which is exactly
+    /// how v3 was walked around.
     fn enter_chain(&mut self) -> Result<(), FerroError> {
         self.chain += 1;
         if self.chain > MAX_TREE_DEPTH {

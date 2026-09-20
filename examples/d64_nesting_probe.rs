@@ -48,6 +48,28 @@ fn run(depth: usize, stage: &str) {
             }
             sql.push('1');
         }
+        "nestchain" => {
+            // D64b's THIRD hole: `expression()` restores the chain counter in bulk, and every
+            // binary loop parses its LEFT operand before its first `enter_chain()`. So a
+            // left-position `(` re-enters `expression()` with `self.chain` still at the parent's
+            // entry value — 0 all the way down the leftmost spine — and each nesting level gets a
+            // FULL fresh MAX_TREE_DEPTH budget while costing only 1 against MAX_EXPR_DEPTH.
+            // The two limits multiply instead of adding.
+            //
+            // `depth` here is the number of NESTING levels; each carries a chain of `D64_INNER`
+            // operators (default 200, enough to demonstrate without a megabyte of SQL).
+            let inner: usize = std::env::var("D64_INNER").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+            for _ in 0..depth {
+                sql.push('(');
+            }
+            sql.push('1');
+            for _ in 0..depth {
+                for _ in 0..inner {
+                    sql.push_str(" + 1");
+                }
+                sql.push(')');
+            }
+        }
         "chain" => {
             // `1 + 1 + 1 + ...`: parsed by a WHILE LOOP, not recursion, so the parser never
             // recurses — but the tree it builds is LEFT-DEEP, one level per operator. Whatever

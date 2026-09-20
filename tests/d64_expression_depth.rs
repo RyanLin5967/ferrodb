@@ -199,3 +199,82 @@ fn a_batch_of_many_shallow_statements_does_not_accumulate_depth() {
     );
     assert_eq!(stmts.len(), 50);
 }
+
+/// **The hole three review passes took to find: COMPOSING two shapes.**
+///
+/// Every test above exercises one shape in isolation — `(((1)))` has no operators, `1 + 1 + 1` has
+/// no parens — and that is exactly why they were all green while the guard was walked around. In
+/// v3 the chain budget was released when an inner `expression()` returned, and every binary loop
+/// parses its LEFT operand before charging, so a left-position `(` re-entered with the counter at
+/// zero. Each nesting level got a fresh full budget while costing 1 against the frame limit, so the
+/// two limits MULTIPLIED: 62 levels x 800 operators built a ~49,600-deep tree that parsed happily
+/// and then aborted the process on a 2 MiB connection thread.
+///
+/// The budget is per-STATEMENT now, so nesting cannot renew it.
+#[test]
+fn nesting_cannot_renew_the_chain_budget() {
+    // Well under both limits on their own: 8 parens (limit 64) and 400 operators (limit 1024).
+    // Composed, v3 allowed 8 x 400 = 3,200 levels of tree. v4 must refuse.
+    let nest = 8usize;
+    let inner = 400usize;
+    assert!(nest < MAX_EXPR_DEPTH, "fixture must be legal as pure nesting");
+    assert!(inner < MAX_TREE_DEPTH, "each chain must be legal on its own");
+    assert!(nest * inner > MAX_TREE_DEPTH, "composed, it must exceed the tree budget");
+
+    let mut sql = String::from("SELECT ");
+    for _ in 0..nest {
+        sql.push('(');
+    }
+    sql.push('1');
+    for _ in 0..nest {
+        for _ in 0..inner {
+            sql.push_str(" + 1");
+        }
+        sql.push(')');
+    }
+    sql.push_str(" FROM t;");
+
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let _ = p.parse();
+    let err = p
+        .errors
+        .first()
+        .map(|e| e.to_string())
+        .expect("composing nesting with chains must be refused, not multiplied");
+    assert!(
+        err.contains("chains more than"),
+        "must be refused by the TREE budget specifically; got: {err}"
+    );
+}
+
+/// Joins are charged too: the parser keeps them in a flat `Vec`, but the planner folds them into
+/// an N-deep `LogicalPlan::Join` tree that several walkers descend recursively.
+#[test]
+fn a_join_list_longer_than_the_tree_budget_is_refused() {
+    let mut sql = String::from("SELECT 1 FROM t0");
+    for i in 1..=(MAX_TREE_DEPTH + 10) {
+        sql.push_str(&format!(" JOIN t{i} ON 1 = 1"));
+    }
+    sql.push(';');
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let _ = p.parse();
+    let err = p.errors.first().map(|e| e.to_string()).expect("must be refused");
+    assert!(err.contains("chains more than"), "got: {err}");
+}
+
+/// ...and a join list a real query might contain still parses.
+#[test]
+fn an_ordinary_join_list_still_parses() {
+    let mut sql = String::from("SELECT 1 FROM t0");
+    for i in 1..=25 {
+        sql.push_str(&format!(" JOIN t{i} ON 1 = 1"));
+    }
+    sql.push(';');
+    let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+    let mut p = Parser::new(tokens);
+    let stmts = p.parse();
+    assert!(p.errors.is_empty(), "25 joins must parse; got {:?}", p.errors.first().map(|e| e.to_string()));
+    assert_eq!(stmts.len(), 1);
+}
