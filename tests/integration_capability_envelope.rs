@@ -1449,6 +1449,21 @@ fn the_envelope_reads_one_funnel_while_three_reach_branch_state() {
         field_names("struct State {", "State"),
         [
             "workspaces", "names", "next_txn", "next_merge", "apply_seq", "applied",
+            // **D86.** An INDEX into `applied`, not a second funnel: see the note below.
+            // **D86 — DECIDED, as this guard requires, rather than merely added.**
+            //
+            // `applied_by_cell` is an INDEX into `applied`: `(tbl, row, col) -> positions in that
+            // Vec`. It is NOT a second funnel, on three grounds:
+            //   * it holds no information `applied` does not already hold, and `applied` is
+            //     already on this list and already governed;
+            //   * it is keyed by CELL, not by branch, so there is no per-branch state in it for an
+            //     envelope to govern;
+            //   * the only thing that writes it is `State::push_applied`, which is also the only
+            //     thing that appends to `applied` — one call, one authority, so a statement cannot
+            //     reach the index by any path that does not already go through the funnel.
+            // If it ever gains a field of its own, or a second writer, that reasoning lapses and
+            // this decision has to be made again.
+            "applied_by_cell",
             "merges", "quarantine_reasons", "escrow", "versions", "captures",
             // `runs` and `row_author` were REMOVED by E79c (`ee01420`), and a removal gets the
             // same determination an addition does — the difference is which way it can be wrong.
