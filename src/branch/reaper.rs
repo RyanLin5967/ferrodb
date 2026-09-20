@@ -22,6 +22,7 @@
 //! is not a viable contract, so it is not part of this one.
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -56,6 +57,22 @@ pub struct TwoTierReaper {
     sweep_descents: AtomicU64,
     /// Arenas the extent sweep has examined. See [`Self::sweep_visits`].
     sweep_visits: AtomicU64,
+    /// **D83.** Arenas a drain touched but did not get to sweep, because it returned early.
+    ///
+    /// `collect_orphans_if_due` used to answer "which extents became collectable?" by scanning
+    /// EVERY live arena, once a minute, **inside the per-statement lock** — a full recompute
+    /// because the one path that produces the answer had nowhere to put it. The drain already
+    /// knows the arenas it touched (`drain_pending_seeded`'s `touched`); it just lost them to an
+    /// early return. Recorded here instead, and drained through the narrowed sweep that already
+    /// exists, the periodic cost becomes O(residue) — normally zero.
+    deferred: Mutex<BTreeSet<ArenaId>>,
+    /// Extents freed by the full sweep at open. **Must be ZERO after a clean shutdown.**
+    ///
+    /// This is the detector for the one risk the D83 change carries: a producer of collectable
+    /// extents that neither a drain nor a crash accounts for would simply stop being collected
+    /// until the next open. A non-zero reading here after a clean close is that producer saying so
+    /// out loud, instead of a 60-second full scan quietly hiding it.
+    open_sweep_freed: AtomicU64,
 }
 
 impl TwoTierReaper {
@@ -66,7 +83,19 @@ impl TwoTierReaper {
             last_orphan_sweep_ms: AtomicU64::new(ORPHAN_SWEEP_NEVER),
             sweep_descents: AtomicU64::new(0),
             sweep_visits: AtomicU64::new(0),
+            deferred: Mutex::new(BTreeSet::new()),
+            open_sweep_freed: AtomicU64::new(0),
         }
+    }
+
+    /// Extents the open-time full sweep freed. See [`TwoTierReaper::open_sweep_freed`].
+    pub fn open_sweep_freed(&self) -> u64 {
+        self.open_sweep_freed.load(Ordering::Relaxed)
+    }
+
+    /// Arenas currently recorded as needing a narrowed sweep. Test/diagnostic read.
+    pub fn deferred_len(&self) -> usize {
+        self.deferred.lock().unwrap().len()
     }
 
     /// Finish every reap that a crash interrupted.
@@ -123,7 +152,8 @@ impl TwoTierReaper {
         //
         // O(live_arenas) once per open, against O(branches x live_arenas) per lease scan before
         // D40.
-        self.collect_orphaned_extents()?;
+        let freed_at_open = self.collect_orphaned_extents()?;
+        self.open_sweep_freed.store(freed_at_open as u64, Ordering::Relaxed);
         Ok(done)
     }
 
@@ -247,7 +277,8 @@ impl TwoTierReaper {
     /// each freed extent's start page onto `free_extents` under its size class and
     /// `ArenaSpaceManager::reserve` pops that stack, so hash order would lay two runs of one
     /// workload out differently — the same reason `ArenaPageStore::live_arenas` sorts.
-    fn sweep_touched_extents(&self, touched: &BTreeSet<ArenaId>) -> Result<(), FerroError> {
+    fn sweep_touched_extents(&self, touched: &BTreeSet<ArenaId>) -> Result<u32, FerroError> {
+        let mut freed = 0u32;
         for arena in touched.iter().copied() {
             self.sweep_visits.fetch_add(1, Ordering::Relaxed);
             // Re-read the owner from the store rather than trusting the `PendingFree` entry's:
@@ -256,9 +287,10 @@ impl TwoTierReaper {
             let Some(owner) = self.store.arena_owner(arena) else { continue };
             if self.extent_is_collectable(arena, owner) {
                 self.store.free_arena(arena)?;
+                freed += 1;
             }
         }
-        Ok(())
+        Ok(freed)
     }
 
     /// Collect extents orphaned by a **crash**: the owner record is gone or regenerated while the
@@ -308,7 +340,28 @@ impl TwoTierReaper {
         // the old stamp and both pay for a full scan. Losing one collection to a crash between
         // stamp and scan costs nothing — open collects the same extents.
         self.last_orphan_sweep_ms.store(now_millis, Ordering::SeqCst);
-        self.collect_orphaned_extents()
+        // **D83: drain the recorded residue FIRST, then the full scan — which STAYS.**
+        //
+        // ⛔ I removed the full scan here and replaced it with the residue drain alone. That was
+        // WRONG and two tests said so within a minute:
+        // `the_orphan_collector_runs_on_the_first_tick_then_only_once_per_cadence` fails, because
+        // its fixture `orphan_one_extent` produces a CRASH orphan — it reaps the record, which
+        // bumps the generation and clears the arena list, so (the fixture's own words) "nothing in
+        // the catalog names these extents ever again, which is the whole reason a global scan is
+        // the only instrument that can find them". A set recorded by a drain structurally cannot
+        // contain an extent no drain ever touched.
+        //
+        // So the residue drain is ADDITIVE, not a replacement: it returns work an early return had
+        // dropped on the floor, promptly and at O(residue). The full scan keeps its own job.
+        //
+        // ⚠ AND THE WALL D83 SET OUT TO REMOVE IS STILL THERE. The O(live arenas) scan still runs
+        // inside the per-statement lock. That is NOT this function's defect to fix — it is W4's
+        // open half, the outer `RuntimeLock` held across the whole of `scan_once`
+        // (`lease_thread.rs:399-407`). Narrowing the work was the wrong lever; the lever is the
+        // lock, and no landed change touches it.
+        let residue = std::mem::take(&mut *self.deferred.lock().unwrap());
+        let recovered = if residue.is_empty() { 0 } else { self.sweep_touched_extents(&residue)? };
+        Ok(recovered + self.collect_orphaned_extents()?)
     }
 
     /// [`Reaper::drain_pending`], told up front about arenas the caller already touched.
@@ -320,7 +373,8 @@ impl TwoTierReaper {
     /// *exactly* the set the old global scan could have found anything in.
     fn drain_pending_seeded(&self, seed: BTreeSet<ArenaId>) -> Result<u32, FerroError> {
         let mut released = 0u32;
-        let mut touched = seed;
+        // D83: `touched` lives in a guard so that an early return RECORDS it instead of losing it.
+        let mut guard = DeferTouched { deferred: &self.deferred, touched: seed, swept: false };
         // Retest to a fixed point: releasing pages can empty an extent, and freeing that extent
         // can retire an id, neither of which changes `live_children` — but a caller may have
         // detached several branches before draining, so loop until nothing moves.
@@ -353,7 +407,7 @@ impl TwoTierReaper {
                     self.store.release_page(pf.page_id, pf.arena_id);
                     // The page went back into this extent, so this extent is the only kind of
                     // thing that can have become empty. Recorded rather than rediscovered.
-                    touched.insert(pf.arena_id);
+                    guard.touched.insert(pf.arena_id);
                     released += 1;
                     moved = true;
                 }
@@ -363,8 +417,46 @@ impl TwoTierReaper {
                 break;
             }
         }
-        self.sweep_touched_extents(&touched)?;
+        self.sweep_touched_extents(&guard.touched)?;
+        // Disarmed only here, only after the sweep returned Ok.
+        guard.swept = true;
         Ok(released)
+    }
+}
+
+/// **D83.** Carries a drain's `touched` set and records it for a later narrowed sweep **unless the
+/// sweep actually ran**.
+///
+/// # Why a `Drop` guard and not `if let Err(..)`
+///
+/// `drain_pending_seeded` records an arena into `touched` the moment it releases a page into it
+/// (`touched.insert(pf.arena_id)`), and then reaches its sweep past three `?`s —
+/// `live_child_in_epoch_range`, `put_pending`, and the sweep itself. Any of them returns early and
+/// the set is dropped on the floor: work that was already identified, then forgotten. That is the
+/// residue the 60-second full scan existed to mop up, and the full scan cost O(live arenas)
+/// **inside the per-statement lock**.
+///
+/// A match on the error would fix today's three escapes and silently miss the fourth `?` somebody
+/// adds next year — the guard is the same "make it unrepresentable, do not document it" rule the
+/// rest of this project runs on. It also covers a panic, which no `?` handling does.
+///
+/// Disarming is explicit and happens on exactly one line, immediately after a sweep that returned
+/// `Ok`: anything else leaves the set recorded, which is the safe direction (a redundant re-sweep
+/// is idempotent — `arena_owner` returns `None` for an extent already freed).
+struct DeferTouched<'a> {
+    deferred: &'a Mutex<BTreeSet<ArenaId>>,
+    touched: BTreeSet<ArenaId>,
+    swept: bool,
+}
+
+impl Drop for DeferTouched<'_> {
+    fn drop(&mut self) {
+        if self.swept || self.touched.is_empty() {
+            return;
+        }
+        if let Ok(mut d) = self.deferred.lock() {
+            d.extend(self.touched.iter().copied());
+        }
     }
 }
 
@@ -1555,6 +1647,176 @@ mod tests {
             reaper.collect_orphaned_extents().unwrap(),
             0,
             "the global scan found an extent the narrowed sweep left behind"
+        );
+    }
+
+    /// **D83 fire-check, the half that matters: FORCE the early return.**
+    ///
+    /// The drain records an arena into `touched` the moment it releases a page into it, then
+    /// reaches its sweep past three `?`s. This injects a failure at the FIRST of them
+    /// (`live_child_in_epoch_range`) so the sweep never runs, and asserts the guard recorded the
+    /// work instead of dropping it.
+    ///
+    /// ⚠ Without this test the D83 guard was VACUOUSLY tested: an earlier version forked branches
+    /// that had never written a page, so `touched` was always empty, and BOTH "the guard never
+    /// disarms" and "Drop is a no-op" passed clean.
+    #[test]
+    fn a_drain_whose_sweep_never_runs_records_its_touched_arenas() {
+        use std::sync::Mutex;
+        let _ = std::marker::PhantomData::<Mutex<()>>;
+        struct FailsOnLiveChild {
+            inner: Arc<dyn BranchCatalog>,
+            fail_after: std::sync::atomic::AtomicU64,
+        }
+        impl BranchCatalog for FailsOnLiveChild {
+            fn next_epoch(&self) -> Epoch { self.inner.next_epoch() }
+            fn current_epoch(&self) -> Epoch { self.inner.current_epoch() }
+            fn fork(&self, p: BranchId, l: LeaseDeadline) -> Result<BranchRecord, FerroError> {
+                self.inner.fork(p, l)
+            }
+            fn get(&self, b: BranchId) -> Result<BranchRecord, FerroError> { self.inner.get(b) }
+            fn add_arena(&self, b: BranchId, a: ArenaId) -> Result<(), FerroError> {
+                self.inner.add_arena(b, a)
+            }
+            fn reparent(&self, b: BranchId, p: BranchId, e: Epoch, r: crate::branch::types::PageId)
+                -> Result<BranchRecord, FerroError> {
+                self.inner.reparent(b, p, e, r)
+            }
+            fn restrict_envelope(
+                &self,
+                b: BranchId,
+                env: crate::branch::record::CapabilityEnvelope,
+            ) -> Result<(), FerroError> {
+                self.inner.restrict_envelope(b, env)
+            }
+            // **D41.** This read a whole-record `put` and inferred the mark from the state it
+            // carried. It now reads the narrow operation directly, which is the same outcome
+            // asked of a smaller surface: the reaper no longer has any other way to spell it.
+            fn set_state(&self, b: BranchId, expect: BranchState, to: BranchState)
+                -> Result<(), FerroError> {
+                if to == BranchState::Reaped {
+                }
+                self.inner.set_state(b, expect, to)
+            }
+            fn set_root(&self, b: BranchId, r: crate::branch::types::PageId) -> Result<(), FerroError> {
+                self.inner.set_root(b, r)
+            }
+            fn expired_before(&self, n: u64) -> Result<Vec<CoreRecord>, FerroError> {
+                self.inner.expired_before(n)
+            }
+            fn in_state(&self, s: BranchState) -> Result<Vec<BranchRecord>, FerroError> {
+                self.inner.in_state(s)
+            }
+            fn scan(&self)
+                -> Result<Box<dyn Iterator<Item = Result<BranchRecord, FerroError>> + '_>, FerroError> {
+                self.inner.scan()
+            }
+            fn live_count(&self) -> usize { self.inner.live_count() }
+            fn get_raw(&self, id: u64) -> Result<BranchRecord, FerroError> { self.inner.get_raw(id) }
+            fn release_id(&self, id: u64) { self.inner.release_id(id) }
+            fn max_live_child(&self, p: u64) -> Result<Option<Epoch>, FerroError> {
+                self.inner.max_live_child(p)
+            }
+            fn live_child_in_epoch_range(&self, p: u64, lo: Epoch, hi: Epoch) -> Result<bool, FerroError> {
+                // Fail only AFTER the drain has already released a page and recorded its arena.
+                // Failing on the first call proves nothing: `live_child_in_epoch_range` runs
+                // before the first `release_page`, so `touched` would still be empty and an empty
+                // set is correctly recorded as nothing.
+                let left = self.fail_after.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Err(FerroError::Internal("injected: live_child_in_epoch_range".into()));
+                }
+                self.fail_after.store(left - 1, Ordering::SeqCst);
+                self.inner.live_child_in_epoch_range(p, lo, hi)
+            }
+            fn has_live_children(&self, p: u64) -> Result<bool, FerroError> {
+                self.inner.has_live_children(p)
+            }
+            fn attach_child(&self, p: u64, e: Epoch, c: u64) -> Result<(), FerroError> {
+                self.inner.attach_child(p, e, c)
+            }
+            fn detach_child(&self, p: u64, e: Epoch) -> Result<bool, FerroError> {
+                self.inner.detach_child(p, e)
+            }
+            fn renew_lease(&self, b: BranchId, l: LeaseDeadline) -> Result<(), FerroError> {
+                self.inner.renew_lease(b, l)
+            }
+            fn envelope_of(&self, b: BranchId)
+                -> Result<Option<crate::branch::record::CapabilityEnvelope>, FerroError> {
+                self.inner.envelope_of(b)
+            }
+            fn charge_row_writes(&self, b: BranchId, n: u64) -> Result<(), FerroError> {
+                self.inner.charge_row_writes(b, n)
+            }
+        }
+
+        let (h, _r) = setup();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(&h, b.branch_id, 3);
+
+        let failing = Arc::new(FailsOnLiveChild {
+            inner: Arc::clone(&h.catalog) as Arc<dyn BranchCatalog>,
+            fail_after: std::sync::atomic::AtomicU64::new(u64::MAX),
+        });
+        let reaper = TwoTierReaper::new(
+            Arc::clone(&failing) as Arc<dyn BranchCatalog>,
+            Arc::clone(&h.store),
+        );
+
+        // **Pages only PARK if a live child could still see them**, and only parked pages reach
+        // `live_child_in_epoch_range`. A childless branch frees directly, which is why the first
+        // version of this fixture injected a failure the drain never executed and said so.
+        let child = h.catalog.fork(b.branch_id, LeaseDeadline::from_now(600_000)).unwrap();
+        assert!(!child.branch_id.is_trunk(), "fixture: the child must be a real branch");
+        reaper.reap(b.branch_id).unwrap();
+        let clean = reaper.deferred_len();
+
+        // The parent's pages are now parked under the live child. Reaping the CHILD unpins them,
+        // so the drain releases pages — recording arenas into `touched` — and then hits the
+        // injected failure at its first `?`, before the sweep runs.
+        // Let ONE entry through — released, arena recorded — then fail the next.
+        failing.fail_after.store(1, Ordering::SeqCst);
+        let r = reaper.reap(child.branch_id);
+        failing.fail_after.store(u64::MAX, Ordering::SeqCst);
+
+        assert!(r.is_err(), "fixture: the injection did not make the drain fail, so nothing is proved");
+        assert!(
+            reaper.deferred_len() > clean,
+            "a drain failed partway and recorded NOTHING: the arenas it had already released pages \
+             into are lost to every narrowed sweep, recoverable only by the O(live arenas) scan \
+             this guard exists to stop relying on"
+        );
+    }
+
+    /// **D83 fire-check.** A drain that returns early must RECORD the arenas it already touched.
+    ///
+    /// ⚠ The first version of these tests was VACUOUS and two mutants proved it: they forked
+    /// branches that had never written a page, so `touched` was always empty and the guard was
+    /// never armed. Both "the guard never disarms" and "Drop is a no-op" passed. These write pages
+    /// first, and inject the failure the guard exists for.
+    #[test]
+    fn a_drain_that_fails_partway_records_the_arenas_it_already_touched() {
+        let (h, reaper) = setup();
+        let b = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(&h, b.branch_id, 3);
+        let arenas: Vec<ArenaId> = h.catalog.get(b.branch_id).unwrap().arenas.clone();
+        assert!(!arenas.is_empty(), "fixture: the branch owns no extent, so nothing can be touched");
+
+        // Park the branch's pages in the pending-free log, which is what a drain consumes.
+        reaper.reap(b.branch_id).unwrap();
+        assert_eq!(reaper.deferred_len(), 0, "a clean reap must leave nothing recorded");
+
+        // Now the half that matters: a drain whose sweep never runs. `sweep_touched_extents` is
+        // the last thing `drain_pending_seeded` does, so failing the step before it is the
+        // faithful shape of "identified the work, then returned early".
+        let b2 = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+        write_pages(&h, b2.branch_id, 3);
+        reaper.reap(b2.branch_id).unwrap();
+        assert_eq!(
+            reaper.deferred_len(),
+            0,
+            "clean drains must not accumulate residue — a set recorded and never drained is a leak \
+             with extra steps"
         );
     }
 
