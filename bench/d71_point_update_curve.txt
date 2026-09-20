@@ -57,3 +57,38 @@ three rows it is now located by a control arm rather than inferred from a profil
     engine path beside it is not. Naming it is the next step and must be read off the source, not
     inferred from this curve. Two rows have already been lost to inferring a mechanism from a shape.
   * The crossover is arithmetic on two fits, at one load, at one delta. It is not measured.
+
+=== A SECOND WALL I PROPOSED AND THEN KILLED BY MEASURING IT ==========================
+
+Profiling the staged arm at N=4000 updates showed a median of 4.299 ms against 2.385 ms at N=60,
+and the profile's heaviest frames were `RawVecInner::finish_grow` and `do_reserve_and_handle` —
+vector GROWTH, not I/O and not scan logic. The obvious reading was a second, nastier wall: a
+branch gets slower the more it has already written, because the staged workspace is walked per
+write (`runtime.rs:1423`, the `None` arm ranges the whole table prefix of the overlay). For an
+agent that writes a lot into one branch that would be quadratic in its own session.
+
+**Measured instead of banked. Fixed 4000-row table, varying the number of updates IN the session:**
+
+  updates in session (N)    median ms per update
+                      50                   0.708
+                     100                   0.695
+                     200                   0.717
+                     400                   0.765
+                     800                   0.762
+                    1600                   0.790
+                    3200                   1.027
+
+⛔ **64x the session size costs 1.45x per update. THE HYPOTHESIS IS DEAD.** The overlay walk is
+sublinear in practice — consistent with a BTreeMap range plus allocator pressure, not with a walk
+proportional to staged rows. There is no session-size wall and no quadratic term.
+
+⇒ It also explains the profiling run's higher median without a new mechanism: that run was at
+16,000 rows, 4x the 4,000 used here, and 4.299 / 1.027 ~ 4.2. **That is the table-size term
+already named above, not a second one.** The two axes are now separated: staged write cost is
+LINEAR in TABLE SIZE and essentially FLAT in SESSION SIZE.
+
+⚠ And the `finish_grow` frames stay UNEXPLAINED rather than being attached to the dead hypothesis.
+They are consistent with open row D26 (`CowTree::range_scan` materialises the whole result and the
+caller collects it again, Theta(table)) — which is a TABLE-size mechanism and therefore the right
+shape — but consistent-with is not measured, and this file has already cost three rows of
+mechanisms inferred from shapes. D26 is the candidate to test, not the answer to record.
