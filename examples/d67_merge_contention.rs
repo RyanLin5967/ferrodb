@@ -55,6 +55,7 @@ use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
+use ferrodb::catalog::column::Value;
 use ferrodb::execution::executor::{run, try_run_read, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
@@ -145,9 +146,17 @@ fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
             return false;
         }
     }
-    // A merge that is REFUSED or quarantined still exercised the whole path, which is what is being
-    // timed. Counting only applied merges would make the SHARED arm look faster the more it failed.
-    exec(s, "MERGE;", &mut sess).is_ok()
+    // ⚠ COUNT `applied_to_target`, NOT `is_ok()`. The first version of this counted any Ok, and a
+    // QUARANTINED merge returns Ok — so the SHARED arm looked FASTER the more merges failed, and
+    // its apparent "recovery" to 0.87x at 16 threads was measuring how quickly merges can fail.
+    // A merge that did not reach the target did not do the work being timed.
+    match exec(s, "MERGE;", &mut sess) {
+        Ok(Outcome::Table(t)) => matches!(
+            t.rows.first().and_then(|r| r.get(4)),
+            Some(Value::Boolean(true))
+        ),
+        _ => false,
+    }
 }
 
 /// A reader connection, exactly as the server has them: a REGISTERED slot plus the lock-free read
@@ -232,6 +241,51 @@ fn main() {
     // D67_POINT=16 D67_SECONDS=30 runs ONE point for a long time, so a sampling profiler has a
     // steady state to look at. The sweep's 2-second windows are too short to profile and the
     // build/teardown between points would dominate the sample.
+    // D67_PRIVATE=1 gives every thread its OWN ServerContext and its own database — the CONTROL
+    // d55 used for reads, applied to writes. It removes every shared structure, so it measures
+    // what this machine can do if the global catalog lock simply were not there. The gap between
+    // it and the shared arm is the PRIZE: how much is actually on the table, as opposed to how
+    // bad the shared arm looks.
+    //
+    // ⚠ It is a CEILING, not a proposal. N private databases are not one database, and nothing
+    // that must stay consistent across agents can be built this way. Quoting it as an achievable
+    // number would be dishonest; quoting it as an upper bound is the point.
+    if std::env::var("D67_PRIVATE").is_ok() {
+        let threads: usize = std::env::var("D67_POINT").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let secs: u64 = std::env::var("D67_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+        println!("PRIVATE CONTROL: {threads} threads, {threads} ServerContexts, {secs}s");
+        let mut servers = Vec::new();
+        for t in 0..threads {
+            servers.push(Arc::new(build(&dir, &format!("priv{t}"))));
+        }
+        let start = Arc::new(Barrier::new(threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        let mut hs = Vec::new();
+        for (tid, sv) in servers.into_iter().enumerate() {
+            let (start, stop, done) = (start.clone(), stop.clone(), done.clone());
+            hs.push(std::thread::spawn(move || {
+                let mut seq = 0u64;
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    if one_cycle(&sv, tid, seq, true) {
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    seq += 1;
+                }
+            }));
+        }
+        start.wait();
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_secs(secs));
+        let n = done.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        for h in hs { let _ = h.join(); }
+        println!("{:.1} merges/sec ({} in {:.1}s)", n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64());
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
     if let Ok(n) = std::env::var("D67_POINT") {
         let threads: usize = n.parse().expect("D67_POINT must be a number");
         let secs: u64 = std::env::var("D67_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
