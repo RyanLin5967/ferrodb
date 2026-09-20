@@ -90,7 +90,27 @@ impl FileOps for OsFileOps {
 /// A failure part-way through leaves the temporary behind. That is deliberate: removing it would
 /// need a fifth operation whose own failure would then have to be handled, and the next successful
 /// replace overwrites it anyway.
+/// **D81 instrument: count the checkpoints and the bytes, separately.**
+///
+/// The D81 design turns on one question that a latency number cannot answer: is the free-space
+/// map's cost the BYTES it rewrites or the FSYNCS it performs? Both grow together in wall-clock,
+/// and only one of them a delta scheme would fix — appending 24 bytes instead of 24 KB still costs
+/// one fsync. Two counters separate them; a profile cannot.
+pub static ATOMIC_REPLACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ATOMIC_REPLACE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(replacements, bytes)` since process start. Read twice and subtract to scope to a phase.
+pub fn atomic_replace_counters() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (ATOMIC_REPLACES.load(Ordering::Relaxed), ATOMIC_REPLACE_BYTES.load(Ordering::Relaxed))
+}
+
 pub fn replace_atomically(ops: &dyn FileOps, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    {
+        use std::sync::atomic::Ordering;
+        ATOMIC_REPLACES.fetch_add(1, Ordering::Relaxed);
+        ATOMIC_REPLACE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }
     let _serialised = REPLACE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = temp_path(path)?;
     ops.write(&tmp, bytes)?;

@@ -199,7 +199,7 @@ fn main() {
     println!("{threads} threads doing fork/write/merge cycles; L other branches sit LIVE underneath.");
     println!("PRE-REGISTERED: flat in L -> concurrent branch management scales. Linear -> the wall.");
     println!();
-    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes");
+    println!("  live L    live_count   median ms/cycle   ms per 1000 live   merges   map bytes   replaces   bytes/replace");
     println!("  persistence: {}", if std::env::var("D75_PERSIST").map(|v| v=="1").unwrap_or(false) { "ON (as cli.rs:120 does)" } else { "OFF (as every 10^6 harness here does)" });
     let mut first: Option<(usize, f64)> = None;
     for &l in &lives {
@@ -261,8 +261,13 @@ fn main() {
         flat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = flat[flat.len() / 2];
         let map_bytes = std::fs::metadata(&s.arena_path).map(|m| m.len()).unwrap_or(0);
-        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}",
-                 med / (l as f64 / 1000.0), flat.len());
+        // **D81 falsifier.** Separate the CONSTANT from the GROWING part of the checkpoint cost.
+        // Each `replace_atomically` is two fsyncs (file + dir) whatever the image size, so if the
+        // penalty tracks the REPLACE COUNT a delta scheme buys nothing; if it tracks BYTES, it does.
+        let (reps, rbytes) = ferrodb::storage::atomic_file::atomic_replace_counters();
+        println!("  {l:>7}   {live:>10}   {med:>15.3}   {:>16.4}   {:>6}   {map_bytes:>10}   {reps:>9}   {:>12}",
+                 med / (l as f64 / 1000.0), flat.len(),
+                 if reps == 0 { 0 } else { rbytes / reps });
         if first.is_none() { first = Some((l, med)); }
         if let Some((l0, m0)) = first {
             if l != l0 {
