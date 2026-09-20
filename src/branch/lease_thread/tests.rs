@@ -496,3 +496,80 @@ fn a_gate_that_skips_the_scan_is_refused_rather_than_ignored() {
     }
     with_lock(&SkippingGate, || 1u8);
 }
+
+// -------------------------------------------------------------------------------------------
+// D88 — the orphan sweep must NOT run inside the statement lock.
+// -------------------------------------------------------------------------------------------
+
+/// A lock that reports how many arenas the sweep visited **while it was held**.
+///
+/// `sweep_visits` is incremented once per arena examined by `collect_orphaned_extents` and by
+/// `sweep_touched_extents`, so sampling it either side of the body measures exactly the work that
+/// happened under the statement mutex.
+struct WatchingGate {
+    statement: Mutex<()>,
+    reaper: Mutex<Option<Arc<TwoTierReaper>>>,
+    visits_inside: AtomicU64,
+}
+
+impl RuntimeLock for WatchingGate {
+    fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = self
+            .reaper
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.sweep_visits())
+            .unwrap_or(0);
+        body();
+        let after = self
+            .reaper
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.sweep_visits())
+            .unwrap_or(0);
+        self.visits_inside.fetch_add(after - before, Ordering::SeqCst);
+    }
+}
+
+/// **D88.** The O(live arenas) orphan sweep ran inside `with_lock`, and in production that lock is
+/// the table-catalog mutex every SQL statement takes — so every connection stalled behind it once
+/// a minute. This pins that it now runs after the lock is released.
+///
+/// It refuses to pass vacuously: the sweep must actually have run (visits outside > 0), so a
+/// version that simply stopped sweeping would fail rather than look fixed.
+#[test]
+fn d88_the_orphan_sweep_does_not_run_inside_the_statement_lock() {
+    let f = fixture();
+    // Something for the sweep to find, so "zero visits inside" is not zero visits anywhere.
+    let dead = f.h.catalog.fork(BranchId::TRUNK, LeaseDeadline(0)).unwrap();
+    write_pages(&f, dead.branch_id, 2);
+    f.h.catalog
+        .set_state(dead.branch_id, BranchState::Live, BranchState::Reaped)
+        .unwrap();
+
+    let gate = Arc::new(WatchingGate {
+        statement: Mutex::new(()),
+        reaper: Mutex::new(Some(Arc::clone(&f.reaper))),
+        visits_inside: AtomicU64::new(0),
+    });
+    let counters = Counters::default();
+    let before_total = f.reaper.sweep_visits();
+
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+
+    let inside = gate.visits_inside.load(Ordering::SeqCst);
+    let total = f.reaper.sweep_visits() - before_total;
+    assert!(
+        total > 0,
+        "the sweep visited no arenas at all, so this proves nothing about where it ran"
+    );
+    assert_eq!(
+        inside, 0,
+        "{inside} of {total} arena visits happened INSIDE the statement lock. In production that \
+         lock is the table-catalog mutex, so every connection in the database stalls for the \
+         duration of an O(live arenas) scan."
+    );
+}
