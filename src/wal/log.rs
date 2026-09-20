@@ -15,6 +15,27 @@ const INITIAL_LSN: u64 = 1;
 const MIN_FRAME: usize = 33;
 
 // need next_txn_id for mvcc, and then multi txn statements before mvcc
+/// **D69-REOPEN INSTRUMENT: count the fsyncs, do not infer them from a profile.**
+///
+/// The merge-phase profile put 98.2% of samples in `WalManager::flush` and read that as "the fsync
+/// itself scales with database volume". That is an inference from an aggregate, and an aggregate
+/// cannot separate "one fsync that got slower" from "more fsyncs of the same speed" — they produce
+/// the identical profile. A counter can, so this is a counter.
+///
+/// Process-wide rather than per-`WalManager` so that no constructor has to change; the D68 harness
+/// is one thread and one manager, which is the only configuration these are read in. `Relaxed` is
+/// sufficient — nothing orders anything against these, and they are read after the work is done.
+/// ⚠ Two uncontended relaxed increments per fsync sit inside the timed region. That is the harness
+/// measuring itself, so it is bounded deliberately: an fsync is microseconds at best and these are
+/// nanoseconds, and they are present in EVERY arm, so they cannot create a slope across arms.
+pub static FSYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static FSYNC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(calls, bytes)` since process start. Read it twice and subtract to scope it to a phase.
+pub fn fsync_counters() -> (u64, u64) {
+    (FSYNC_CALLS.load(Ordering::Relaxed), FSYNC_BYTES.load(Ordering::Relaxed))
+}
+
 pub struct WalManager {
     /// The log's bytes. Was a concrete `File`; it is a [`Storage`] so that a crash can be aimed at
     /// this log — a torn frame, a lost frame, a flush that reports success it did not achieve. Those
@@ -746,6 +767,7 @@ impl WalManager {
 
     }
 
+
     pub fn flush(&self) -> Result<(), FerroError> {
         // The buffer lock is held across the file write, and that is the correctness fix rather
         // than caution.
@@ -775,8 +797,11 @@ impl WalManager {
         let offset = HEADER_SIZE as u64 + (start_lsn - self.base_lsn.load(Ordering::SeqCst));
         let wrote = {
             let file = self.file.lock().unwrap();
-            pwrite_all(&**file, &bytes, offset)
-                .and_then(|()| file.sync_data().map_err(|e| FerroError::Wal(e.to_string())))
+            pwrite_all(&**file, &bytes, offset).and_then(|()| {
+                FSYNC_CALLS.fetch_add(1, Ordering::Relaxed);
+                FSYNC_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                file.sync_data().map_err(|e| FerroError::Wal(e.to_string()))
+            })
         };
         if let Err(e) = wrote {
             // The bytes were drained but never reached disk. Putting them back keeps them

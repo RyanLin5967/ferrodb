@@ -69,7 +69,16 @@ use ferrodb::wal::log::WalManager;
 use ferrodb::wal::txn::TxnManager;
 
 const ROWS: i64 = 2000;
-const WRITES_PER_BRANCH: usize = 4;
+/// Rows written per branch. `D68_DELTA` overrides it.
+///
+/// **THE ORTHOGONAL AXIS — D69-REOPEN.** The curve against TABLE SIZE at fixed delta says merge is
+/// linear in the table. This axis asks the complementary question: at a FIXED table, does the cost
+/// scale with how much the branch actually CHANGED? Neither axis alone can separate
+///   * cost ~ delta        -> O(delta) achieved, and the table-size slope is something else; from
+///   * cost flat in delta  -> a per-merge constant that depends on the TABLE, not on the work.
+static WRITES_PER_BRANCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("D68_DELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+});
 const WARMUP: Duration = Duration::from_millis(400);
 const MEASURE: Duration = Duration::from_millis(2000);
 const POINTS: [usize; 5] = [1, 2, 4, 8, 16];
@@ -153,12 +162,40 @@ fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
 }
 
 /// One agent's whole life: fork, write, merge. Returns true if the cycle completed.
-fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
+/// One merge cycle, with the SIX commits it contains timed and counted SEPARATELY.
+///
+/// ⛔ **THE TIMER USED TO WRAP ALL SIX AND THAT IS WHY D68 WAS MISREAD.** `one_cycle` issues
+/// `BEGIN AGENT SESSION`, then `*WRITES_PER_BRANCH` UPDATEs, then `MERGE` — and the single
+/// wall-clock number around the lot was reported, in the file name and in the prose, as "merge
+/// latency". It is not: it is the latency of a session plus N updates plus a merge. If the UPDATEs
+/// are what grow with table size then "the merge is O(table)" was never a statement about the
+/// merge, and every mechanism proposed for it was aimed at the wrong statement.
+///
+/// So the phases are separated here, and the fsyncs each one performs are COUNTED rather than
+/// inferred from a profile aggregate — an aggregate cannot tell one slow fsync from several fast
+/// ones, which is the exact ambiguity left open by the 98.2% `WalManager::flush` reading.
+struct Cycle {
+    begin_ms: f64,
+    writes_ms: f64,
+    merge_ms: f64,
+    merge_fsyncs: u64,
+    merge_fsync_bytes: u64,
+    total_fsyncs: u64,
+}
+
+fn one_cycle_timed(s: &Server, tid: usize, seq: u64, disjoint: bool) -> Option<Cycle> {
+    use ferrodb::wal::log::fsync_counters;
     let mut sess = Session::new();
+    let (c0, _) = fsync_counters();
+
+    let t = Instant::now();
     if exec(s, &format!("BEGIN AGENT SESSION AS 'a{tid}';"), &mut sess).is_err() {
-        return false;
+        return None;
     }
-    for w in 0..WRITES_PER_BRANCH {
+    let begin_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    for w in 0..*WRITES_PER_BRANCH {
         // DISJOINT: a private slice of the key space per thread. SHARED: everyone on the same ids.
         let id = if disjoint {
             1 + (tid as i64 * 97 + w as i64) % ROWS
@@ -167,9 +204,11 @@ fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
         };
         let v = (seq % 1000) as i64;
         if exec(s, &format!("UPDATE t SET v = {v} WHERE id = {id};"), &mut sess).is_err() {
-            return false;
+            return None;
         }
     }
+    let writes_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let (c1, b1) = fsync_counters();
     // ⚠ COUNT `applied_to_target`, NOT `is_ok()`. The first version of this counted any Ok, and a
     // QUARANTINED merge returns Ok — so the SHARED arm looked FASTER the more merges failed, and
     // its apparent "recovery" to 0.87x at 16 threads was measuring how quickly merges can fail.
@@ -178,10 +217,24 @@ fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
     // `Outcome::Table(t)` and indexed column 4 — but a MERGE returns `Outcome::Agent`, so the
     // match fell to `_ => false` and counted ZERO forever, in every arm. It did not fail; it
     // reported 0.0 merges/sec, which is exactly the shape a broken instrument takes.
-    match exec(s, "MERGE;", &mut sess) {
+    let t = Instant::now();
+    let applied = match exec(s, "MERGE;", &mut sess) {
         Ok(Outcome::Agent(AgentOutput::Merge(report))) => report.applied_to_target,
         _ => false,
+    };
+    let merge_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let (c2, b2) = fsync_counters();
+    if !applied {
+        return None;
     }
+    Some(Cycle {
+        begin_ms,
+        writes_ms,
+        merge_ms,
+        merge_fsyncs: c2 - c1,
+        merge_fsync_bytes: b2 - b1,
+        total_fsyncs: c2 - c0,
+    })
 }
 
 /// A reader connection, exactly as the server has them: a REGISTERED slot plus the lock-free read
@@ -246,28 +299,40 @@ fn main() {
     println!("One thread: no contention, so the slope is the merge's own cost.");
     println!("PRE-REGISTERED: linear in table size. If FLAT, the O(table) reading is wrong.");
     println!();
-    println!("  table rows   merges   median ms   ms per 1000 rows");
-    let mut first: Option<(i64, f64)> = None;
+    println!("delta (rows written per branch) = {}", *WRITES_PER_BRANCH);
+    println!();
+    println!("  table    n   total ms | begin ms  writes ms  MERGE ms | merge fsyncs  bytes/fsync");
+    let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    let mut first: Option<(i64, f64, f64)> = None;
     for &rows in &sizes {
         let s = build_sized(&dir, &format!("d68_{rows}"), rows);
-        let mut samples = Vec::new();
+        let (mut tot, mut beg, mut wr, mut mg) = (vec![], vec![], vec![], vec![]);
+        let (mut fs, mut fb) = (0u64, 0u64);
         for i in 0..merges {
-            let t = Instant::now();
-            let ok = one_cycle(&s, 0, i as u64, true);
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            if ok { samples.push(ms); }
+            if let Some(c) = one_cycle_timed(&s, 0, i as u64, true) {
+                tot.push(c.begin_ms + c.writes_ms + c.merge_ms);
+                beg.push(c.begin_ms);
+                wr.push(c.writes_ms);
+                mg.push(c.merge_ms);
+                fs += c.merge_fsyncs;
+                fb += c.merge_fsync_bytes;
+                let _ = c.total_fsyncs;
+            }
         }
-        if samples.is_empty() {
-            println!("  {rows:>10}   {:>6}   NO MERGE APPLIED — not a result", 0);
+        if tot.is_empty() {
+            println!("  {rows:>6}   NO MERGE APPLIED — not a result, and not a zero");
             continue;
         }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let med = samples[samples.len() / 2];
-        println!("  {rows:>10}   {:>6}   {med:>9.3}   {:>16.4}", samples.len(), med / (rows as f64 / 1000.0));
-        if first.is_none() { first = Some((rows, med)); }
-        if let Some((r0, m0)) = first {
+        let n = tot.len() as u64;
+        let (mt, mb, mw, mm) = (med(&mut tot), med(&mut beg), med(&mut wr), med(&mut mg));
+        println!("  {rows:>6} {:>4}   {mt:>8.3} | {mb:>8.3}  {:>9.3}  {mm:>8.3} | {:>12.2}  {:>11.1}",
+                 n, mw, fs as f64 / n as f64,
+                 if fs == 0 { 0.0 } else { fb as f64 / fs as f64 });
+        if first.is_none() { first = Some((rows, mt, mm)); }
+        if let Some((r0, t0, g0)) = first {
             if rows != r0 {
-                println!("             ^ {:.1}x the rows, {:.2}x the merge time", rows as f64 / r0 as f64, med / m0);
+                println!("         ^ {:.1}x rows -> {:.2}x TOTAL, {:.2}x MERGE",
+                         rows as f64 / r0 as f64, mt / t0, mm / g0);
             }
         }
     }
