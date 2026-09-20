@@ -52,3 +52,27 @@ predicted to be and could not be measured before.
    `stdbuf -oL` or write straight to a file.
 ⚠ One box, 4 threads, and the OFF arm's forks/sec is itself noisy (258 -> 118 -> 168). The
    load-independent facts here are `len B/branch` (flat) and the ON arm's decay direction.
+
+=== LATER SAMPLES OF THE ON ARM, same method (map size / 48) =========================
+
+The run kept going well past where it was expected to stall, so the decay is sampled further out:
+
+  ~10,300 branches   ~35 / s
+  ~19,200            ~26 / s
+  ~25,000            ~31 / s
+  ~33,000            ~37 / s
+  ~41,400              —
+  ~53,700              —
+  ~54,300            ~ 5 / s   (600 branches between two checks minutes apart)
+
+⇒ The early samples are noisy either side of ~30/s, and then the rate collapses between ~41,000 and
+~54,000. That is the shape a quadratic cost has once the image gets large: 54,000 branches means a
+~2.6 MB free-space map re-serialised and re-fsynced on EVERY new branch's first write.
+
+⚠ **The OFF arm passed 100,000 at 168 forks/s.** The ON arm took longer to reach 54,000 than OFF
+took for the entire curve, and by the end was moving roughly 30x slower than OFF's steady rate.
+
+⚠ Still measured from file sizes, not from the harness's own rows, for the buffering reason above.
+The two late samples have no rate attached because the checks were minutes apart and unevenly
+spaced — the 5/s figure is a floor, not a measurement, and is labelled so rather than quoted as a
+data point.
