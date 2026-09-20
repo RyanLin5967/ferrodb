@@ -1,0 +1,95 @@
+D63 FIRE-CHECK — do the four tests that REPLACE deleted collapse coverage actually fire?
+[HERE] every line below is raw output read by this session, not a summary.
+
+WHY THIS EXISTS. D63 deleted the `collapse` feature (commit 601ea0f). A fresh-context review of
+that commit found that two behaviours which are NOT collapse-specific lost their only test:
+
+  1. `Node::all_children` must ERROR on an undecodable internal node rather than report it as
+     childless. Three live callers spell `all_children()?` — `walk_pages`, `diff` and the
+     internal split path — and `node.rs` tested only the happy path. The refusal was pinned ONLY
+     through `CowPageLinks::child_pages` (LEDGER row S5), which existed to serve `collapse` and
+     went with it.
+  2. `LogBranchCatalog::reparent` had zero callers AND zero tests after 601ea0f. Its only driver
+     was the collapse suite, which `reaper_suite!(log_catalog, …)` ran against it.
+
+Commit c6d0164 added four tests to replace that coverage. Four tests that pass prove nothing on
+their own, so each was run against a mutant of the code it claims to pin. A test that does not
+fail against the defect it names is not coverage.
+
+METHOD: apply one mutant to the SOURCE (never to a test), run the named tests, revert with
+`git checkout -- <file>` from commit c6d0164, apply the next. Nothing else differs between runs.
+Working tree verified clean after the last revert.
+
+------------------------------------------------------------------------------------------------
+MUTANT A — `Node::all_children` swallows the error, i.e. the exact S5 regression
+             (`unwrap_or_default` in spirit: an undecodable cell reports "no children").
+
+  src/cow/node.rs, in all_children:
+      -            out.push(self.child(i)?);
+      +            match self.child(i) { Ok(c) => out.push(c), Err(_) => return Ok(Vec::new()) }
+
+  $ cargo test --lib -j 5 all_children
+  test cow::node::tests::all_children_refuses_a_cell_that_overruns_the_page ... FAILED
+  test cow::node::tests::all_children_refuses_a_cell_whose_body_is_not_a_child_pointer ... FAILED
+  test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1351 filtered out
+
+  ⇒ BOTH fire. Neither passes against a walker that reports corruption as emptiness.
+
+------------------------------------------------------------------------------------------------
+MUTANT B — `reparent` drops the branch's extents. This is D13b mutant D, the one measured at
+             664 of 664 copied pages leaked for the life of the file: the reaper frees exactly
+             `record.arenas`, so a write that loses them leaks rather than losing an update.
+
+  src/branch/catalog.rs, in reparent:
+      +        rec.arenas.clear();
+
+  $ cargo test --lib -j 5 reparent_
+  test branch::catalog::tests::reparent_refuses_a_branch_that_is_no_longer_readable ... ok
+  test branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else ... FAILED
+  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1351 filtered out
+
+  ⇒ The narrow-write test fires. The refusal test correctly does NOT — it is a different claim.
+
+------------------------------------------------------------------------------------------------
+MUTANT C — `depth` carried over from the old position instead of derived from the NEW parent.
+             The signature has no `depth` parameter precisely so a caller cannot contradict the
+             tree it just asked for; this mutant makes the record describe a position it is not in.
+
+  src/branch/catalog.rs, in reparent:
+      -        rec.depth = depth;
+      +        let _ = depth;
+
+  $ cargo test --lib -j 5 reparent_
+  test branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else ... FAILED
+  test branch::catalog::tests::reparent_refuses_a_branch_that_is_no_longer_readable ... ok
+  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1351 filtered out
+
+  ⇒ Fires. Asserting the four fields together is what catches this; a root-only check would not.
+
+------------------------------------------------------------------------------------------------
+MUTANT D — `reparent` skips `check_readable`, so a reaped branch can be re-parented back into
+             the tree under a new parent.
+
+  src/branch/catalog.rs, in reparent:
+      -        rec.check_readable(branch)?;
+
+  $ cargo test --lib -j 5 reparent_
+  test branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else ... ok
+  test branch::catalog::tests::reparent_refuses_a_branch_that_is_no_longer_readable ... FAILED
+  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1351 filtered out
+
+  ⇒ Fires, and it is the ONLY one of the four that catches this mutant — which is why it exists
+    as a separate control rather than as another assertion inside the test above.
+
+------------------------------------------------------------------------------------------------
+RESULT: 4 mutants, 4 killed, and each killed exactly the test that names it while leaving the
+other alive. The discrimination matters as much as the kill: a set of tests that all fail on
+every mutant would be one test wearing four names.
+
+ANTI-VACUITY CONTROL: `internal_child_routing_uses_the_leftmost_slot_for_small_keys` (node.rs)
+asserts a well-formed internal node still answers `all_children() == vec![10, 20, 30]`, so the
+two refusal tests cannot be satisfied by a version that refuses everything.
+
+NOT CLAIMED: this fire-check covers the four NEW tests only. It says nothing about whether
+deleting `collapse` was right, and nothing about `TableBranchCatalog::reparent`, which keeps its
+own pre-existing test.
