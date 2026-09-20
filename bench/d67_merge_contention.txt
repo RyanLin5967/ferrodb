@@ -122,3 +122,45 @@ problem, and this is the half nobody had measured.
 acquisition cost grows with concurrency" transfers to any engine built this way. The absolute
 merges/sec is this machine on a shared box and transfers to nothing.
 ===========================================================================================
+
+=== ⛔ CORRECTION TO THE SECTION ABOVE — I NAMED THE RIGHT LOCK AND THE WRONG MECHANISM ====
+[HERE] read out of the banked sample's CALL TREE, which the aggregate-by-symbol view hid.
+
+WHAT I WROTE: that the collapse comes from `catalog()` calling `drain_readers()` on every
+acquisition, a scan whose cost grows with the number of live connections. I wrote that the same
+day I wrote "that is a HYPOTHESIS READ OFF THE SOURCE, not a measurement" about the lock itself —
+and then failed to apply the same standard one paragraph later. It is wrong, twice over:
+
+  1. **This benchmark registers ZERO readers.** `grep -c register_reader examples/d67_*.rs` is 0.
+     `drain_readers` copies an empty Vec and its spin loop never executes. There is nothing to
+     drain, so draining cannot be the cost.
+  2. **The drain is not in the blocked stacks at all.** Every blocked sample is
+     `ServerContext::catalog + 60 -> Mutex::lock + 12 -> _pthread_mutex_firstfit_lock_wait`.
+     Reading `catalog()` in source order: `self.catalog.lock()` comes FIRST, `drain_readers()`
+     second. Offset +60 is the first acquisition. The threads are blocked on the CATALOG mutex,
+     before the drain is ever reached.
+
+SO THE LOCK IDENTIFICATION STANDS AND THE EXPLANATION DOES NOT. What actually produces a COLLAPSE
+rather than the flat line a serialised section predicts:
+
+  * **The critical section is the WHOLE STATEMENT.** `run(stmt, &mut cat, ...)` executes while
+    holding the guard — parse, plan, execute, WAL. The lock is not held across a catalog lookup,
+    it is held across the entire unit of work.
+  * **The mutex blocks in the kernel.** Every handoff at 16 waiters is a `__psynch_mutexwait`
+    round trip, and macOS's firstfit mutex is not FIFO-fair, so heavy contention convoys: the
+    per-handoff cost rises with the number of waiters. Long critical section + kernel handoff +
+    16 waiters is the textbook convoy shape, and a convoy collapses where pure serialisation
+    would plateau.
+
+⇒ **THE STRUCTURAL STATEMENT, and it is stronger than what I claimed before: ferrodb executes
+EVERY WRITE STATEMENT while holding ONE GLOBAL MUTEX. Write concurrency is not poor, it is ONE by
+construction.** A merge is six statements, so it takes and releases that lock six times, queueing
+behind every other agent each time.
+
+⚠ WHAT IS STILL NOT MEASURED, stated so the next reader does not inherit another guess: the
+drain's `writer_active` SeqCst store and its `readers.lock()` are a shared-word write and a SECOND
+global mutex on every acquisition. With readers registered — the real server — those would matter,
+and D51 says a shared-word write on a hot path is exactly what does not scale. This benchmark
+cannot see it because it has no readers. A version that registers reader slots is the run that
+would.
+===========================================================================================
