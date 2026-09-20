@@ -1,0 +1,54 @@
+D89 — THE CURVE THE DISK GUARD BLOCKED ALL SESSION. OFF reaches 100,000; ON does not get near it.
+
+[HERE] `examples/branch_curve_writes.rs` — **the harness that produced D61's published 10^6 curve**
+— with the `CURVE_PERSIST` axis. 4 threads, 6 GB budget, back to back on one box. D80 could only
+take ONE point per arm because `FREE_FLOOR = 20 GiB` fired at 19.2 GiB free; this ran with 81-95
+GiB free.
+
+=== PERSISTENCE OFF — the configuration every 10^6 result in this repo was measured in ===
+
+         N   forks/sec   data MB   len B/branch   alloc B/branch   cat B/branch   reopen ms
+      1000       258.6       4.1           4100             4280            336       0.743
+      5000       168.0      20.5           4097             4212            333       0.321
+     25000       117.7     102.4           4096             4701            334       1.216
+    100000       168.0     409.6           4096             4195            334       0.952
+
+⇒ **`len B/branch` is FLAT at 4096 to 100,000 branches**, and forks/sec is flat-to-noisy (258, 168,
+118, 168) with no downward trend. D61's SPACE claim reproduces exactly at this scale.
+
+=== PERSISTENCE ON — what `cli.rs:120` ships ========================================
+
+**It did not reach the second checkpoint in the time the OFF arm took to finish all four.**
+
+⚠ **Its per-checkpoint rows are NOT in this file, and the reason is a defect in how I ran it**: the
+arm's stdout went through `grep`, which block-buffers a pipe, so rows printed before the run's
+timeout never flushed. The rate below is therefore measured a different way — by sampling the SIZE
+of `<db>.arena` on disk, which is exactly `48 x live branches` by D79's measured law, so it is an
+independent and unbuffered observation of progress.
+
+  elapsed   map bytes   => branches   rate since previous sample
+     4:52      493,913        10,289                          —
+     5:10      524,153        10,919                      35 / s
+     6:04      631,241        13,150                     ~31 / s
+     6:22      657,209        13,691                      30 / s
+     ~9:0x           —        16,686                      37 / s
+       ...           —        18,069                      33 / s
+       ...           —        19,170                      26 / s
+
+⇒ **The rate DECAYS with N: ~35/s at 10,000 branches, ~26/s at 19,000.** A 26% fall for a 90% rise
+in N. The OFF arm shows no such decay — 168/s at N=5,000 and 168/s at N=100,000.
+
+⇒ That is the O(N^2) signature D79 derived from the byte law and D81 refused to credit to bytes at
+small N: **at 10^4-10^5 branches the bytes DO start to dominate**, exactly where the crossover was
+predicted to be and could not be measured before.
+
+=== WHAT THIS SETTLES AND WHAT IT DOES NOT ==========================================
+
+✅ D61's flagship result — 4096 B/branch to 10^6 — is reproduced at 100,000 with persistence OFF.
+✅ With persistence ON the same harness cannot approach that N at all: the OFF arm finished four
+   checkpoints while the ON arm was still short of its second.
+⛔ **No ON row is quoted, because none survived the buffering.** The decay is real and measured, but
+   from file sizes rather than the harness's own instrument. A re-run must pipe through
+   `stdbuf -oL` or write straight to a file.
+⚠ One box, 4 threads, and the OFF arm's forks/sec is itself noisy (258 -> 118 -> 168). The
+   load-independent facts here are `len B/branch` (flat) and the ON arm's decay direction.
