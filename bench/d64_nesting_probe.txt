@@ -1,0 +1,53 @@
+D64 — NESTED SQL ABORTS THE PROCESS. Probe, thresholds, and the guard's effect.
+[HERE] every number below is this session's own run of examples/d64_nesting_probe, one depth PER
+PROCESS so a stack overflow cannot hide the depths after it.
+
+⛔ THIS FILE'S FIRST VERSION WAS WRONG IN THE WAY THAT MATTERS, and is corrected here rather than
+quietly replaced. It reported 750 (debug) and 4,000 (release) as the abort thresholds. Those are
+MAIN-THREAD numbers — 8 MB of stack. The server does not parse on the main thread:
+`src/pgwire/mod.rs:290` is a bare `std::thread::spawn` and there is NO `stack_size` anywhere in
+`src/`, so every connection gets Rust's 2 MiB default. Measuring on the main thread overstates what
+a connection survives by roughly 4x, and picking a limit from it would have shipped a guard that
+does not protect the path it exists for.
+
+THE THRESHOLDS, limit lifted (MAX_EXPR_DEPTH raised so the parser could not refuse)
+-----------------------------------------------------------------------------------
+shape = SELECT ((((1)))) FROM t        main thread (8 MB)      spawned thread (2 MiB, THE SERVER)
+  release                              ok 4,000 / ABORT 8,000   ok 1,000 / ABORT 2,000
+  debug                                ok   750 / ABORT 1,000   ok   200 / ABORT   256
+
+shape = SELECT NOT NOT NOT … 1 FROM t  (Parser::not recurses into ITSELF)
+  release, spawned thread              ok 10,000 / ABORT 50,000
+shape = SELECT - - - … 1 FROM t        (Parser::unary recurses into ITSELF)
+  release, spawned thread              ok 10,000 / ABORT 50,000
+
+All aborts are `fatal runtime error: stack overflow`, SIGABRT, rc=134.
+
+⚠ THE FIRST GUARD WAS WALKED AROUND, and this is the reason the shapes above exist. Counting depth
+only in `Parser::expression` left `not` and `unary` uncovered: both recurse directly into themselves
+and never re-enter `expression`, so `NOT NOT NOT …` sailed past a guard that was already in place.
+Three call sites are not belt-and-braces here; they are the three distinct ways this parser adds a
+level, and covering one of them is covering none.
+
+AFTER — MAX_EXPR_DEPTH = 64, charged in expression + not + unary (release, both stacks)
+---------------------------------------------------------------------------------------
+  parens depth 63 -> OK (1 stmt)      64, 65, 2,000, 64,000 -> REFUSED_CLEANLY
+  not    depth 63 -> OK (1 stmt)      64, 65, 2,000, 64,000 -> REFUSED_CLEANLY
+  neg    depth 63 -> OK (1 stmt)      64, 65, 2,000, 64,000 -> REFUSED_CLEANLY
+Identical boundary on all three paths; nothing aborts at any depth tried, up to 64,000.
+
+WHY 64 AND NOT SQLITE'S 1,000
+------------------------------
+The limit must hold on the SMALLEST stack the parser runs on, which is a 2 MiB connection thread in
+a DEBUG build — and that aborted at 256. 64 leaves ~3x margin under the 200 that survived. Each
+level of parens costs ~9 Rust frames here (the precedence chain or->and->not->equality->comparison
+->term->factor->unary->primary), which is why the headroom that C parsers enjoy does not apply:
+SQLite's 1,000 is 1,000 small C frames, not 9,000 unoptimised Rust ones.
+
+THE SHAPE, with the caveat in the same sentence: an unguarded recursion over CLIENT-SUPPLIED
+structure is a process abort in any engine — which is why Postgres calls check_stack_depth() in
+every such walk and SQLite ships SQLITE_MAX_EXPR_DEPTH — and THAT claim transfers. The specific
+numbers here are this machine, these build profiles, these stack sizes, and transfer to nothing.
+
+SEVERITY, established rather than assumed: SIGABRT kills the process, so one query ends every other
+session on that server. Reachable by any pgwire client; nothing upstream rejects a query that size.

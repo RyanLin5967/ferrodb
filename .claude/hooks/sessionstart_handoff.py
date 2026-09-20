@@ -172,6 +172,17 @@ full = [u"ferrodb POST-COMPACTION HANDOFF -- FULL PAYLOAD, %s"
         % datetime.datetime.now().isoformat(timespec="seconds"),
         u"Read this WHOLE file. Five proof tokens are spread through it; the gate needs all five,",
         u"so a head or a tail of this file cannot clear it. That is deliberate.", u""]
+# --- PAUSE SENTINEL -- a paused build must survive a compaction -------------------------
+# Added 2026-09-19. The pause was written to SCALE-NEXT and to both skill files, and NONE of
+# those is what a resumed session reads first: THIS payload is, because the gate refuses every
+# tool call until it has been read. A pause that is invisible here is a pause that a compacted
+# session walks straight past and resumes. If `.PAUSED` sits next to this script, its text goes
+# ABOVE every section, before the work is described at all. Delete that file to resume.
+_pause_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".PAUSED")
+_pause_t = read(_pause_f).strip()
+if _pause_t:
+    full[1:1] = [u""] + [u"#" * 78] + _pause_t.split(u"\n") + [u"#" * 78, u""]
+
 per = max(1, len(SECTIONS) // len(tokens))
 ti = 0
 for i, s in enumerate(SECTIONS):
