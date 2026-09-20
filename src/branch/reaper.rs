@@ -1851,6 +1851,69 @@ mod tests {
         }
     }
 
+    /// **D85 end-to-end.** Does the understated `next_free` become DATA LOSS for a live child?
+    ///
+    /// Proven separately in `branch::arena::tests::d85_next_free_after_a_crash_...`: after a crash
+    /// an extent that was checkpointed empty and then filled restores with `next_free = 0`, so
+    /// `extent_is_empty()` reports TRUE while it holds live pages.
+    ///
+    /// This asks what that costs. `retire_arenas_by_rule` enumerates the pages to park via
+    /// `allocated_pages(arena)` = `(0..ext.next_free)` (`arena.rs:618`), so with `next_free = 0` it
+    /// parks NOTHING — and then the extent sits empty-looking and owned by a dead branch, which is
+    /// precisely `extent_is_collectable`'s pair of conditions.
+    /// ⛔ **FAILS TODAY — THIS IS THE BUG, NOT A BROKEN TEST.** `#[ignore]`d with its reason, the
+    /// same way D29's reproduction was carried until D41 closed it. Run it with
+    /// `cargo test -- --ignored d85_a_live_childs` and it reproduces on BOTH catalogs, including
+    /// `TableBranchCatalog`, which is the one that ships.
+    ///
+    /// It refuses to pass vacuously: the fixture asserts pages were written after the checkpoint
+    /// and that the parent actually has a live child, so a green line cannot come from the
+    /// interval rule never being consulted.
+    #[test]
+    #[ignore = "D85: reproduces silent data loss — a live child's pages are freed after a crash \
+                because the restored next_free is 0. Un-ignore when the fix lands."]
+    fn d85_a_live_childs_pages_survive_a_reap_after_a_crash_understated_next_free() {
+        let (h, reaper) = setup();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline::from_now(600_000)).unwrap();
+        write_pages(&h, parent.branch_id, 4);
+
+        // Drive to a fresh extent and empty it, so the image records it with next_free = 0 — the
+        // state a crash immediately after `alloc_arena` leaves behind.
+        let arena = *h.catalog.get(parent.branch_id).unwrap().arenas.last().unwrap();
+        for p in h.store.allocated_pages(arena) {
+            h.store.release_page(p, arena);
+        }
+        let checkpoint = h.store.state_bytes();
+
+        // Live pages written AFTER the image, and a child forked so they are visible to it.
+        let live = write_pages(&h, parent.branch_id, 3);
+        assert!(!live.is_empty(), "fixture: no pages written after the checkpoint");
+        let child = h.catalog.fork(parent.branch_id, LeaseDeadline::from_now(600_000)).unwrap();
+        assert!(
+            h.catalog.has_live_children(parent.branch_id.id).unwrap(),
+            "fixture: the parent has no live child, so the interval rule is not even consulted"
+        );
+
+        // ...and the crash.
+        let store2 = h.fresh_store();
+        store2.load_state(&checkpoint).unwrap();
+        let reaper2 = TwoTierReaper::new(Arc::clone(&h.catalog), Arc::clone(&store2));
+
+        // Reap the parent. The child is live, so the interval rule runs — over an understated set.
+        reaper2.reap(parent.branch_id).unwrap();
+        // The sweep that decides an extent is collectable.
+        reaper2.collect_orphaned_extents().unwrap();
+
+        let _ = child;
+        assert!(
+            store2.arena_owner(arena).is_some(),
+            "D85 IS DATA LOSS: the extent holding {} page(s) a LIVE CHILD can read was freed after \
+             a crash, because the restored `next_free` was 0 so `retire_arenas_by_rule` parked \
+             nothing and `extent_is_empty` then reported it collectable",
+            live.len()
+        );
+    }
+
     #[test]
     fn a_crash_orphaned_extent_is_collected_when_the_store_is_reopened() {
         // Where the collector's job actually is after D40. A crash is its only producer, so the
