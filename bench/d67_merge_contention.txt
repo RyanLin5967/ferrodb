@@ -164,3 +164,30 @@ and D51 says a shared-word write on a hot path is exactly what does not scale. T
 cannot see it because it has no readers. A version that registers reader slots is the run that
 would.
 ===========================================================================================
+
+=== PREMISE CHECK — IS THE HARNESS MEASURING WHAT THE SERVER DOES? =========================
+[HERE] read from src/pgwire/extended.rs:325-362 at this commit. Checked because a benchmark that
+calls an internal API directly can measure a path no client ever takes, and the whole D67 claim
+rests on the harness being representative.
+
+IT IS. The server's per-statement dispatch is:
+    1. `ctx.read_catalog(catalog_cache)` — refresh the per-connection snapshot.
+    2. `ctx.begin_read(read_slot)` then `try_run_read(..)` — the lock-free read path (D58/D59).
+       `try_run_read` returns None for ANYTHING needing the catalog exclusively.
+    3. On None: `let mut catalog = ctx.catalog(); run(stmt, &mut catalog, ..); drop(catalog);`
+
+Step 3 is exactly what `examples/d67_merge_contention.rs::exec` does — `ctx.catalog()` then `run`
+under the guard. Every WRITE and every MERGE takes step 3, because `try_run_read` answers None for
+them. So the measured path is the shipped path, and the harness is not a shortcut.
+
+The source says it plainly at extended.rs:355, and it is worth quoting because it shows this is a
+KNOWN design point rather than an oversight:
+    "**The catalog lock, held for exactly one statement.** See `pgwire::serve` for why this is the
+     outermost lock and why holding it for longer would rebuild the sequential server this
+     replaced."
+
+⇒ The lock is already the result of making things BETTER: it replaced a wholly sequential server,
+and holding it per-statement rather than per-connection was the improvement. D58/D59 then lifted
+READS out of it entirely. What D67 measures is the part of that progression that was never
+finished: writes still take it, one statement at a time, and a merge is six statements.
+===========================================================================================

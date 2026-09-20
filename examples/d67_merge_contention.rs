@@ -55,7 +55,7 @@ use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
-use ferrodb::execution::executor::{run, Outcome};
+use ferrodb::execution::executor::{run, try_run_read, Outcome};
 use ferrodb::execution::session::Session;
 use ferrodb::parser::parser::Parser;
 use ferrodb::parser::scanner::Scanner;
@@ -150,6 +150,40 @@ fn one_cycle(s: &Server, tid: usize, seq: u64, disjoint: bool) -> bool {
     exec(s, "MERGE;", &mut sess).is_ok()
 }
 
+/// A reader connection, exactly as the server has them: a REGISTERED slot plus the lock-free read
+/// path (`read_catalog` + `begin_read` + `try_run_read`) that D58/D59 built.
+///
+/// This exists to close a gap the first D67 run could not see. `ServerContext::catalog()` calls
+/// `drain_readers()`, which stores SeqCst to a shared `writer_active` word and takes a SECOND
+/// global mutex (`self.readers`) on EVERY acquisition — and then SPINS until every registered
+/// reader is idle. With no readers registered that is all free, which is why the first run's
+/// blocked stacks never showed it. With readers registered it is a shared-word write on the hot
+/// path, and D51 measured that exact shape at x0.121 against a relaxed load's x7.823.
+fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
+    let slot = Arc::new(AtomicBool::new(false));
+    s.ctx.register_reader(Arc::clone(&slot));
+    let mut cache: Option<(u64, Arc<Catalog>)> = None;
+    let mut sess = Session::new();
+    let sql = "SELECT v FROM t WHERE id = 7;";
+    while !stop.load(Ordering::Relaxed) {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut parser = Parser::new(tokens);
+        let mut stmts = parser.parse();
+        if !parser.errors.is_empty() {
+            return;
+        }
+        let stmt = stmts.remove(0);
+        let shared = s.ctx.read_catalog(&mut cache);
+        let attempted = match s.ctx.begin_read(&slot) {
+            Some(_pass) => try_run_read(&stmt, shared, s.bp.clone(), s.txn.clone(), &mut sess),
+            None => None,
+        };
+        if attempted.is_some() {
+            reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn sweep(dir: &std::path::Path, disjoint: bool) -> Vec<(usize, f64)> {
     let arm = if disjoint { "disjoint" } else { "shared" };
     let mut out = Vec::new();
@@ -221,14 +255,26 @@ fn main() {
                 }
             }));
         }
+        // D67_READERS=N adds N REGISTERED reader connections. They are not counted in the merge
+        // rate; they exist so `drain_readers` has something to drain.
+        let nreaders: usize = std::env::var("D67_READERS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut rh = Vec::new();
+        for _ in 0..nreaders {
+            let (s, stop, reads) = (s.clone(), stop.clone(), reads.clone());
+            rh.push(std::thread::spawn(move || reader_thread(s, stop, reads)));
+        }
         start.wait();
-        println!("pid {} running — profile now", std::process::id());
+        println!("pid {} running with {nreaders} registered readers — profile now", std::process::id());
         let t0 = Instant::now();
         std::thread::sleep(Duration::from_secs(secs));
         let n = done.load(Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
         for h in hs { let _ = h.join(); }
-        println!("{:.1} merges/sec ({} in {:.1}s)", n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64());
+        for h in rh { let _ = h.join(); }
+        println!("{:.1} merges/sec ({} in {:.1}s), readers did {} reads",
+                 n as f64 / t0.elapsed().as_secs_f64(), n, t0.elapsed().as_secs_f64(),
+                 reads.load(Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
