@@ -1,0 +1,59 @@
+D71 — THE WALL IS THE AGENT STAGING PATH, NOT THE MERGE AND NOT THE ENGINE.
+
+[HERE] `examples/d71_point_update_curve.rs`, built at 991d6e0 (+DIRTY at run time — the instrument
+edits were uncommitted; they are committed at 2ddeee1 and the code is identical). Load 99 -> 23
+across the two arms, so absolutes are inflated and unstable; the SHAPE is the result.
+
+PRE-REGISTERED before the run, three outcomes, written into the harness:
+  * PLAIN flat, STAGED linear -> the wall is the agent staging path.
+  * BOTH linear               -> the planner is not using the primary index; a general engine bug.
+  * BOTH flat                 -> the slope is neither, and d69_fsync_counted.txt is wrong.
+
+=== ARM PLAIN — an ordinary UPDATE, no agent session ==================================
+  table rows   median ms   ms per 1000 rows   fsyncs/update
+        1000       4.032             4.0324            1.03
+        2000       4.138             2.0688            1.03
+        4000       4.093             1.0232            1.00
+        8000       5.042             0.6303            1.00
+       16000       5.396             0.3373            1.00
+  16x the rows -> 1.34x the time, and ms-per-1000-rows FALLS 4.03 -> 0.34.
+  ⇒ A DESCENT. The primary index is used. ~1 fsync per update is the floor and it is a constant.
+
+=== ARM STAGED — the same UPDATE inside BEGIN AGENT SESSION ===========================
+  table rows   median ms   ms per 1000 rows   fsyncs/update
+        1000       0.185             0.1848            0.00
+        2000       0.342             0.1708            0.00
+        4000       0.688             0.1719            0.00
+        8000       1.421             0.1776            0.00
+       16000       2.385             0.1491            0.00
+  16x the rows -> **12.91x** the time, and ms-per-1000-rows is FLAT at ~0.17.
+  ⇒ A SCAN. O(table) per staged write. 0.00 fsyncs: staged writes do not commit until MERGE.
+
+=== OUTCOME 1 CONFIRMED ===============================================================
+
+**The general engine path is O(log N). The branch-per-agent staging path is O(table) — per write.**
+
+This is the entire slope that D68 attributed to the merge, that D69 tried to fix in the merge, and
+that D69-REOPEN attributed to fsync scaling. None of those were it. The merge is O(delta)
+(`bench/d69_fsync_counted.txt`: WAL bytes = 229 + 206 x delta, exact over a 32x range, one fsync).
+The plain engine is O(log N). The linear term lives in exactly one place and it is the path that
+only exists because of branching.
+
+⚠ **NOTE THE ABSOLUTES BEFORE READING THIS AS A DISASTER.** STAGED is 20x FASTER than PLAIN at
+1,000 rows (0.185 ms vs 4.032) because it does not fsync. It is a linear curve starting far below
+a flat one, so the crossover is what matters, not the slope alone: extrapolating the fitted rates
+(~0.149 us/row staged, ~5.4 ms flat plain) they cross near ~36,000 rows. Below that, staging is
+still the faster path. ⚠ That crossover is ARITHMETIC ON TWO FITS, not a measurement — the largest
+table measured here is 16,000 — and the fsync floor in PLAIN is load-dependent on a box at load 99,
+which moves the crossover directly. It is a pointer to the next measurement, not a result.
+
+⇒ **THE ROW THIS OPENS: make a staged write a DESCENT.** The objective is 10^6 branches on real
+tables; a per-write cost linear in the table is the wall that reaches first, and unlike the last
+three rows it is now located by a control arm rather than inferred from a profile.
+
+=== WHAT THIS CANNOT SAY ==============================================================
+  * INTEGER keys only, as every curve here.
+  * It does not name the mechanism inside the staging path — only that the path is linear and the
+    engine path beside it is not. Naming it is the next step and must be read off the source, not
+    inferred from this curve. Two rows have already been lost to inferring a mechanism from a shape.
+  * The crossover is arithmetic on two fits, at one load, at one delta. It is not measured.
