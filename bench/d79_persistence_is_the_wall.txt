@@ -1,0 +1,82 @@
+D79 — CONCURRENT BRANCH MANAGEMENT SCALES HERE *ONLY WITH DURABILITY TURNED OFF*.
+
+[HERE] `examples/d75_live_branch_scaling.rs` with the `D75_PERSIST` axis, built at ac55f718d6c9.
+Same harness, same workload, same box, back to back: 4 threads doing fork -> 4 writes -> merge
+while L branches sit LIVE underneath. 80 merges applied at every point. Load 17 -> 25 across.
+
+=== WHY THIS AXIS EXISTS =============================================================
+
+`ArenaPageStore` persists its free-space map **only if `checkpoint_to` has been called**
+(`arena.rs:914`, `persist_if_configured` at `:917`). Checked, not assumed:
+
+  * `src/cli/cli.rs:120`              calls it -> **the shipped binary pays this.**
+  * `examples/pgserver.rs:101`        calls it.
+  * `examples/branch_curve_writes.rs` **does NOT** -> this is D61's 10^6 harness.
+  * `examples/branch_scaling_bench.rs` **does NOT**.
+  * `examples/d75_live_branch_scaling.rs` did NOT, until this axis was added.
+
+⇒ **Every 10^6 result this project has published was measured with the free-space map's
+durability disabled.**
+
+=== THE MEASUREMENT ==================================================================
+
+  OFF — what every 10^6 harness here measured
+    live L    median ms/cycle   map bytes
+        500            98.051           0
+       1000            92.033           0
+       2000            90.955           0
+       4000            73.504           0
+    8x the live branches -> 0.75x the cycle.  FLAT, and monotonically declining.
+
+  ON — what cli.rs:120 ships
+    live L    median ms/cycle   map bytes
+        500           184.038       27929
+       1000           136.190       51929
+       2000           216.893       99929
+       4000           242.094      195929
+    8x the live branches -> 1.32x the cycle.
+
+  ON/OFF, the within-L comparison and therefore the cleaner signal:
+       L=500   1.88x
+       L=1000  1.48x
+       L=2000  2.39x
+       L=4000  3.29x
+
+⇒ **The baseline is flat and the penalty is not.** Turning durability on costs ~1.9x at 500 live
+branches and ~3.3x at 4,000, and the trend is upward across a 8x axis.
+
+=== THE LAW, AND IT IS EXACT =========================================================
+
+  map bytes: 27929 -> 51929 -> 99929 -> 195929
+  deltas:          24000     48000     96000      for L deltas of 500, 1000, 2000
+
+  ⇒ **exactly 48 bytes per live branch**, plus a ~3.9 KB constant. Four points, no residual.
+
+And that map is **re-serialised and re-fsynced IN FULL on every new branch's first page write**
+(`alloc_arena -> persist_if_configured -> checkpoint_with -> replace_atomically`). There is no
+delta form, no batching and no cadence.
+
+⚠ **THE FOLLOWING IS ARITHMETIC ON THAT LAW, NOT A MEASUREMENT.** Writing a 48·i-byte image once
+per branch i gives sum(48·i, i=1..N) = 24·N² bytes over a run. At N = 10^6 that is **~24 TB
+written to persist ~48 MB of map**, and one fsync per branch. The largest L measured here is 4,000.
+
+=== WHAT THIS DOES AND DOES NOT SAY ==================================================
+
+✅ It says the flat curve in `bench/d75_live_branch_scaling.txt` — and D61's and D65's 10^6
+   results — describe a configuration the shipped binary does not run.
+✅ It says the wall is not "branches are expensive"; it is one unbatched whole-image rewrite.
+⛔ It does NOT say the 10^6 SPACE result is wrong. D61 measured the data and catalog files at
+   4096 B/branch; 48 B/branch of map is ~1% on top, so that claim survives nearly intact. What does
+   not survive is anything about TIME or write volume at 10^6.
+⚠ The ON arm is noisy too — L=1000 reads LOWER than L=500 — so the per-point milliseconds are not
+   trustworthy to better than ~2x. The ON/OFF RATIO and the byte law are the results; both are
+   computed within a point or from integers.
+⚠ One box, one workload, one thread count.
+
+=== EXIT =============================================================================
+
+The fix shape is the one the absence of a delta form implies: make the checkpoint incremental, or
+batch it on a cadence, so a branch's first write does not rewrite every other branch's entry. Both
+are standard; neither is invented here. **But measure D61's curve with persistence ON first** —
+the honest headline is not "we fixed it", it is "the published 10^6 numbers were measured with
+this off, and here is what it costs".
