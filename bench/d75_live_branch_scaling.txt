@@ -1,0 +1,51 @@
+D75 — DOES A STATEMENT COST MORE WHILE MANY BRANCHES ARE LIVE? No detectable slope to 8,000.
+
+[HERE] `examples/d75_live_branch_scaling.rs`, built at ac55f718d6c9. 4 threads doing fork -> 4
+writes -> merge cycles while L other branches sit LIVE and untouched underneath. 25 cycles/thread,
+100 merges applied at every point.
+
+⚠ **`D75_PERSIST` was OFF for this run**, which is the configuration every 10^6 harness in this
+repo uses and NOT the one `cli.rs:120` ships. See `bench/d79_*` — that axis is measured separately
+and this file's result is scoped to persistence-off.
+
+=== WHY THIS EXPERIMENT ==============================================================
+
+BranchBench's finding is about *concurrent branch management*. Everything measured here at 10^6 is
+about branches EXISTING — D61 (10^6 write-bearing branches at 4096 B/branch) and D65 (reopen flat
+to 10^6). Neither asks what a statement costs WHILE that many are live. D67 varied THREADS, which
+at one branch per thread tops out at 16 concurrent branches. And D74 established the closest prior
+art does not answer it either: ForkBase asserts "no restrictions on the number of branches per key"
+and runs no branch-count experiment at all.
+
+=== RESULT ===========================================================================
+
+  live L    live_count   median ms/cycle   ms per 1000 live   merges
+      500          501           104.996           209.9918      100
+     1000         1001            93.136            93.1358      100
+     2000         2001           181.832            90.9159      100
+     4000         4001           160.008            40.0019      100
+     8000         8001            78.915             9.8644      100
+
+  16x the live branches -> **0.75x the cycle**. The cost went DOWN.
+
+⇒ **NO DETECTABLE SLOPE IN L.** The pre-registered "flat" outcome, and the `ms per 1000 live`
+column falls by 21x across the axis, which is the signature of a cost independent of L.
+
+⚠ **AND THE NOISE FLOOR IS ±2x, WHICH IS THE HONEST LIMIT OF THIS RUN.** The points are not
+monotone in either direction — 1,000 reads LOWER than 500, 2,000 reads higher than 4,000 — so a
+real slope smaller than about 2x over 16x the branches would be invisible here. The claim this
+supports is "no LARGE slope", not "flat". A quiet box and an order-reversed control would tighten
+it; the box was running a full test suite and a 21-agent fan-out throughout.
+
+=== THE GUARD THAT MADE THIS WORTH ANYTHING ==========================================
+
+The harness refuses to print a row unless `live_count >= L`, and **on its first run it refused
+every row** — `live_count=1 < L`, meaning the parked branches did not exist. That was not a bug in
+the parking loop. It was `Session::new()`, which hands every session a BRAND-NEW private
+`AgentRuntime` with no branch catalog (`execution/session.rs:20`), while `run()` reaches the engine
+through `session.runtime` and nowhere else. The fix is `Session::with_runtime(ctx.runtime)`, which
+is what `pgwire/mod.rs:358` and `cli/cli.rs:163` do.
+
+**D67 has `Session::new()` x3 and `Session::with_runtime` x0**, which is why every one of its
+numbers is withdrawn a third time — see `SCALE-DESIGN.md` D76. Without this guard, this file would
+have reported a beautiful flat line for a database containing one branch.
