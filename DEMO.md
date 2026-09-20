@@ -359,6 +359,6 @@ this was confirmed rather than assumed.
 | Criterion 8, page counts | `src/branch/reaper.rs` (unit tests, crate-internal harness) |
 | Criterion 8 against the **shipped binaries** | `tests/integration_server_reaps.rs`, `src/branch/lease_thread/tests.rs` |
 | Criterion 9 at the storage layer | `tests/provenance_e2e.rs` |
-| CoW tree over arenas, collapse | `tests/integration_cow_branch.rs` |
+| CoW tree over arenas | `tests/integration_cow_branch.rs` |
 | Durable branch engine under SQL | `tests/integration_sql_on_durable_branches.rs` |
 | Effect log, merge agreement | `tests/integration_effect_log.rs`, `tests/integration_merge_agreement.rs` |

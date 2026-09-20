@@ -1,3 +1,14 @@
+# ============================================================================================
+# ⛔ SUPERSEDED BY D63. KEPT, NOT DELETED. THE SUBJECT OF THIS FIRE-CHECK NO LONGER EXISTS.
+#
+# D63 deleted the `collapse` feature outright: `Reaper::collapse`, `deep_copy` (both the
+# recursive and the iterative form this file compares), and the test named below. The
+# measurement here was sound when taken and is kept as the record that D62's guard was really
+# fire-checked — but it certifies code that is gone, so do not read it as live coverage.
+#
+# See commit "D63: delete `collapse` entirely" and its follow-up.
+# ============================================================================================
+
 D62 FIRE-CHECK — does collapse_survives_a_page_chain_far_deeper_than_a_call_stack ACTUALLY FIRE?
 [HERE] 2026-09-20T02:18:58Z  every line below is raw output read by this session, not a summary.
 

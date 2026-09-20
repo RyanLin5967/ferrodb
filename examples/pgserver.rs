@@ -16,7 +16,7 @@ use ferrodb::branch::TableBranchCatalog;
 use ferrodb::branch::lease_thread::{scan_interval_from_env, LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::{BranchCatalog, Reaper};
-use ferrodb::cow::{CowPageLinks, PageStore};
+use ferrodb::cow::PageStore;
 use ferrodb::pgwire::{serve, ServerContext};
 use ferrodb::storage::db_lock::DbLock;
 use ferrodb::tel::MemEffectLog;
@@ -102,13 +102,10 @@ fn main() {
 
     // F11 — the reaper, built over the SAME catalog and page store as the runtime, which is the
     // contract `with_reaper` states and cannot check.
-    //
-    // `CowPageLinks` is supplied because `TwoTierReaper::collapse` refuses without a page-layout
-    // walker rather than re-parenting a branch onto ancestor-owned pages, and this is the tree this
-    // server's branches are on. `examples/agent_isolation_demo.rs` attaches the same one.
-    let reaper = Arc::new(
-        TwoTierReaper::new(branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, store.clone()).with_links(Arc::new(CowPageLinks)),
-    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        branches.clone() as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
+        store.clone(),
+    ));
 
     let runtime = Arc::new(
         if arena_exists {

@@ -746,6 +746,78 @@ mod tests {
         LogBranchCatalog::in_memory(1)
     }
 
+    /// **D41 site 1 against THIS catalog, restored by D63.**
+    ///
+    /// `reparent` had no test of its own here. What drove it was the collapse suite in
+    /// `branch::reaper::tests`, which `reaper_suite!(log_catalog, false)` ran against
+    /// `LogBranchCatalog`; D63 deleted `collapse` and that suite went with it, leaving this
+    /// method with zero callers AND zero tests. A mutant making it a no-op, dropping
+    /// `check_readable`, or appending outside `state.write()` would then have survived the whole
+    /// suite — the same mutation class `table_catalog.rs` records for `attach_child`.
+    ///
+    /// Two claims, because `reparent` exists to make exactly these hold together:
+    ///
+    /// 1. **The four position fields move, and `depth` comes from the PARENT.** The signature has
+    ///    no `depth` parameter on purpose — a caller allowed to state it could contradict the tree
+    ///    it just asked for.
+    /// 2. **NOTHING ELSE moves.** This is the whole difference from the `put` it replaced: a lease
+    ///    renewal, an envelope charge and an arena claimed before the call must all still stand
+    ///    afterwards. Asserted on the record read BACK from the catalog, not only on the one
+    ///    returned, so a write that answers correctly and stores something else still fails.
+    #[test]
+    fn reparent_moves_the_four_position_fields_and_nothing_else() {
+        let c = cat();
+        // A chain, so the re-parent genuinely changes depth rather than leaving it alone.
+        let mid = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap();
+        let leaf = c.fork(mid.branch_id, LeaseDeadline(1_000)).unwrap();
+        assert_eq!(leaf.depth, 2, "fixture: expected a depth-2 leaf");
+
+        // State that `reparent` must NOT disturb, established before the call.
+        c.add_arena(leaf.branch_id, ArenaId(7)).unwrap();
+        c.add_arena(leaf.branch_id, ArenaId(9)).unwrap();
+        c.renew_lease(leaf.branch_id, LeaseDeadline(55_555)).unwrap();
+        c.restrict_envelope(leaf.branch_id, CapabilityEnvelope::new(0b001, 500)).unwrap();
+        let before = c.get_raw(leaf.branch_id.id).unwrap();
+        assert_eq!(before.arenas, vec![ArenaId(7), ArenaId(9)], "fixture: arenas not recorded");
+
+        let epoch = c.next_epoch();
+        let moved = c.reparent(leaf.branch_id, BranchId::TRUNK, epoch, 321).expect("reparent");
+
+        for rec in [&moved, &c.get_raw(leaf.branch_id.id).unwrap()] {
+            assert_eq!(rec.parent_id, Some(BranchId::TRUNK), "parent_id did not move");
+            assert_eq!(rec.fork_epoch, epoch, "fork_epoch did not move");
+            assert_eq!(rec.root_page_id, 321, "root_page_id did not move");
+            assert_eq!(
+                rec.depth, 1,
+                "depth must be derived from the new parent (trunk.depth + 1), not carried over"
+            );
+            // The narrow half. `record.arenas` is the one the reaper frees from, so dropping it
+            // here is a permanent space leak rather than a lost update (D13b mutant D).
+            assert_eq!(rec.arenas, before.arenas, "reparent dropped the branch's extents");
+            assert_eq!(rec.lease_deadline, before.lease_deadline, "reparent lost a lease renewal");
+            assert_eq!(rec.envelope, before.envelope, "reparent lost an envelope restriction");
+        }
+    }
+
+    /// Control for the test above: `reparent` goes through `check_readable`, so a branch that is
+    /// already gone is refused rather than resurrected under a new parent. Without this, the
+    /// assertions above would still pass against a version that skipped the readability check.
+    #[test]
+    fn reparent_refuses_a_branch_that_is_no_longer_readable() {
+        let c = cat();
+        let b = c.fork(BranchId::TRUNK, LeaseDeadline(1_000)).unwrap();
+        c.set_state(b.branch_id, BranchState::Live, BranchState::Reaped).unwrap();
+        let epoch = c.next_epoch();
+        let err = c
+            .reparent(b.branch_id, BranchId::TRUNK, epoch, 321)
+            .expect_err("reparenting a reaped branch must be refused");
+        assert!(
+            matches!(err, FerroError::Branch(_)),
+            "expected a branch error, got {:?}",
+            err
+        );
+    }
+
         /// **A parent whose stored array still lists a child that is Reaped comes back EMPTY.**
     ///
     /// The derivation only visits parents that HAVE live children, so a parent that has none is

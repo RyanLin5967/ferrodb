@@ -23,7 +23,7 @@ pub mod store;
 #[cfg(test)]
 mod tests_isolation;
 
-pub use btree::{CowPageLinks, CowTree, ScanCursor};
+pub use btree::{CowTree, ScanCursor};
 pub use page_header::{
     flags, stamp_checksum, verify_checksum, PageHeader, PageType, PAGE_HEADER_SIZE,
 };
@@ -150,15 +150,16 @@ pub trait PageStore: Send + Sync {
     /// is full**.
     ///
     /// This is [`PageStore::arena_for`] followed by [`PageStore::alloc_in_arena`], which is what
-    /// every allocating path in the engine already spelled out by hand: `cow_page`, all four
-    /// B+tree split paths, and — after D13b — `TwoTierReaper::deep_copy`.
+    /// every allocating path in the engine already spelled out by hand: `cow_page` and all four
+    /// B+tree split paths.
     ///
     /// **It exists because spelling it out by hand is a trap with a bug history.** An `ArenaId`
     /// captured once and reused refuses the moment its extent fills (`alloc_in_arena` never grows
     /// one, by design), so the caller works perfectly until the branch happens to write past an
-    /// extent boundary and then fails with "arena aN is exhausted". That is exactly how `collapse`
-    /// was unable to materialise any tree over 1 MiB (D13b), and geometric extent growth (D31)
-    /// moves the boundary to the FIRST page, where every such caller finds it immediately.
+    /// extent boundary and then fails with "arena aN is exhausted". That is exactly how the
+    /// since-deleted `collapse` was unable to materialise any tree over 1 MiB (D13b), and
+    /// geometric extent growth (D31) moves the boundary to the FIRST page, where every such
+    /// caller finds it immediately.
     ///
     /// Reach for `alloc_in_arena` only when the arena is genuinely the subject — a test pinning
     /// the refusal, or a caller that must not be handed a different extent.

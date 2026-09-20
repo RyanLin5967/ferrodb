@@ -1,7 +1,16 @@
 //! **D41 — the two reproductions for the sites that had none.**
 //!
-//! `collapse`'s window was already reproduced in-crate
-//! (`branch::reaper::tests::*::collapse_discards_a_lease_renewal_that_lands_on_its_re_read`).
+//! `collapse`'s window (ledger row D29) was reproduced in-crate by
+//! `branch::reaper::tests::*::collapse_discards_a_lease_renewal_that_lands_on_its_re_read`, which
+//! D41 fixed and D63 then deleted along with `collapse` itself.
+//!
+//! ⚠ **Nothing in THIS file exercises `reparent`** — site 1's narrow op. The `reparent` below is a
+//! bare forward that exists to satisfy `BranchCatalog`; the two reproductions here drive
+//! `restrict_envelope` and `charge_row_writes`. What covers `reparent` is
+//! `branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else` and one case
+//! in `branch::table_catalog::tests`. Said explicitly because a comment in `branch/mod.rs` used to
+//! claim this file pinned it, and it never did.
+//!
 //! The other two exposed read-modify-writes on a branch record had nothing driving them:
 //!
 //! * **Site 2 — `AgentRuntime::restrict_branch`.** `get` -> [`BranchRecord::restrict`] -> `put`

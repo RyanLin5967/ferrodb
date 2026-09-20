@@ -52,10 +52,10 @@ use ferrodb::branch::lease_thread::{LeaseThread, RuntimeLock};
 use ferrodb::branch::reaper::TwoTierReaper;
 use ferrodb::branch::record::BranchRecord;
 use ferrodb::branch::types::{ArenaId, BranchId, BranchState, LeaseDeadline};
-use ferrodb::branch::{BranchCatalog, PageLinks};
+use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::Value;
-use ferrodb::cow::{CowPageLinks, PageStore};
+use ferrodb::cow::PageStore;
 use ferrodb::storage::disk_manager::DiskManager;
 use ferrodb::tel::MemEffectLog;
 
@@ -791,10 +791,10 @@ fn a_node_that_does_not_know_the_clusters_time_refuses_to_reap_rather_than_guess
         )
         .unwrap(),
     );
-    let reaper = Arc::new(
-        TwoTierReaper::new(Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&store))
-            .with_links(Arc::new(CowPageLinks) as Arc<dyn PageLinks>),
-    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        Arc::clone(&catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>,
+        Arc::clone(&store),
+    ));
 
     // Built while standalone: on a cluster member `alloc_arena` refuses without a leader grant, and
     // this test is about the clock, not about grants.

@@ -38,7 +38,7 @@ use ferrodb::branch::{BranchCatalog, Reaper};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::catalog::Catalog;
 use ferrodb::catalog::column::Value;
-use ferrodb::cow::{stamp_checksum, CowPageLinks, CowTree, PageStore, PageType, PAGE_HEADER_SIZE};
+use ferrodb::cow::{stamp_checksum, CowTree, PageStore, PageType, PAGE_HEADER_SIZE};
 use ferrodb::error::FerroError;
 use ferrodb::execution::executor::{run, Executor, Outcome};
 use ferrodb::optimizer::optimizer::lower;
@@ -309,8 +309,7 @@ root page id is the parent's. Measured with PageStore::live_page_count on a real
 fn criterion_8_lease_reaping(led: &mut Ledger) {
     criterion(8, "*** THE THESIS *** branches abandoned with NO client cooperation are reaped");
     let env = page_env("c8");
-    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&env.store))
-        .with_links(Arc::new(CowPageLinks));
+    let reaper = TwoTierReaper::new(Arc::clone(&env.catalog) as std::sync::Arc<dyn ferrodb::branch::BranchCatalog>, Arc::clone(&env.store));
 
     // The baseline must NOT be an empty database. "Page count returns to baseline" is trivially
     // satisfied by freeing everything, so trunk is given real data first: the reaper then has to
