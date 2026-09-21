@@ -75,6 +75,35 @@ fn build(n: usize) -> (MemCherryLog, MemCherryTarget, Vec<u64>) {
     (log, target, seqs)
 }
 
+/// **The control arm: the same log with NO by-cell index.**
+///
+/// `op_at` delegates, so it is identical in both arms and the A/B isolates exactly one thing —
+/// how `ops_on_cell` is answered. Here it is answered by a LINEAR SEARCH over the distinct cells,
+/// which is the pre-D86 shape: a keyed question answered by scanning.
+///
+/// Without this arm, axis 2's number is uninterpretable. "1.99x across 100x the log" is only
+/// evidence that the index works if something shows what NOT having it costs on the same machine,
+/// in the same process, in the same run.
+struct ScanCherryLog {
+    inner: MemCherryLog,
+    cells: Vec<((u32, u64, u32), Vec<u64>)>,
+}
+
+impl CherryLog for ScanCherryLog {
+    fn op_at(&self, seq: u64) -> Option<&RecordedOp> {
+        self.inner.op_at(seq)
+    }
+
+    fn ops_on_cell(&self, tbl: TableId, row: RowId, col: ColId) -> &[u64] {
+        let key = (tbl.0, row.0, col.0);
+        self.cells
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
 fn median(mut us: Vec<f64>) -> f64 {
     us.sort_by(|a, b| a.partial_cmp(b).unwrap());
     us[us.len() / 2]
@@ -89,7 +118,7 @@ fn median(mut us: Vec<f64>) -> f64 {
 /// the target's own cost dominated it; keeping both is what makes that visible rather than
 /// silently folded into the curve.
 fn measure(
-    log: &MemCherryLog,
+    log: &dyn CherryLog,
     sel: &[OpSelector],
     base: &MemCherryTarget,
     reps: usize,
@@ -194,6 +223,51 @@ fn main() {
         m1,
         m3,
         m3 / m1
+    );
+
+    // ---- AXIS 2b: the SAME axis with the index removed. -------------------------------------
+    //
+    // Same process, same machine, same selection, same `op_at`. The ONLY difference is that
+    // `ops_on_cell` scans instead of being keyed. A detector that has only ever been observed
+    // quiet is not a clean result — this is the arm that makes it fire.
+    println!();
+    println!("AXIS 2b — THE SAME AXIS WITH NO BY-CELL INDEX (ops_on_cell scans)");
+    println!(
+        "  {:>10}  {:>14}  {:>14}  {:>16}",
+        "log ops", "plan us", "plan+commit us", "plan us per pick"
+    );
+    let mut axis2b: Vec<(usize, f64)> = Vec::new();
+    for &size in &[1_000usize, 10_000, 100_000] {
+        let (l, b, s) = build(size);
+        // Rebuild the by-cell map as an unindexed Vec. Op `i` is the only op on row `i`, col C.
+        let cells: Vec<((u32, u64, u32), Vec<u64>)> =
+            (0..size).map(|i| ((T.0, i as u64, C.0), vec![s[i]])).collect();
+        let scan = ScanCherryLog { inner: l, cells };
+        let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
+        let (whole, plan) = measure(&scan, &sel, &b, 201);
+        println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", size, plan, whole, plan / 100.0);
+        axis2b.push((size, plan));
+    }
+    println!();
+    let (_, b1) = axis2b[0];
+    let (_, b3) = axis2b[2];
+    println!(
+        "  {}x more log, same 100 picks, NO INDEX: plan {:.3} us -> {:.3} us = {:.1}x.",
+        s3 / s1,
+        b1,
+        b3,
+        b3 / b1
+    );
+    println!();
+    println!(
+        "  ==> AT {} LOG OPS THE INDEXED PICK IS {:.1}x FASTER THAN THE SCANNING ONE\n               ({:.3} us vs {:.3} us), and the two arms' SLOPES across the same 100x are {:.2}x vs \
+         {:.1}x. Same process, same run.",
+        s3,
+        b3 / m3,
+        m3,
+        b3,
+        m3 / m1,
+        b3 / b1
     );
 
     // ---- The refusal path, for completeness. ------------------------------------------------
