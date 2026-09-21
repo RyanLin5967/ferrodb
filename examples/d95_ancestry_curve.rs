@@ -147,7 +147,7 @@ fn main() {
         println!("# ⚠ DEBUG BUILD — absolute numbers are meaningless; re-run with --release.");
     }
     println!(
-        "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>13}  {:>11}  {:>11}",
+        "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>11}  {:>11}",
         "depth",
         "anc_walk_ns",
         "anc_index_ns",
@@ -156,6 +156,7 @@ fn main() {
         "lca_index_ns",
         "lca_x",
         "forkreap_ns",
+        "depth1hash_ns",
         "walk_steps",
         "index_nodes",
     );
@@ -245,8 +246,17 @@ fn main() {
         });
         assert_eq!(g.len(), n, "depth {d}: churn must leave the graph the size it found it");
 
+        // ---- the mechanism check for the shallow-depth crossover ---------------------------
+        //
+        // The index LOSES below ~depth 30, and the claimed reason is that the BranchId -> slot
+        // hash lookup dominates: `is_ancestor` pays two of them, while the climb itself is only
+        // popcount(delta) array indexings. That is a mechanism, so it gets measured rather than
+        // asserted. `depth()` is exactly one hash lookup and no climb, so if the claim holds,
+        // 2 x this should account for most of `anc_index_ns` at every depth.
+        let depth_hash = ns_per_op(|| g.depth(bid(leaf_a)).map(u64::from).unwrap_or(0));
+
         println!(
-            "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>11}  {:>11}",
+            "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>11}  {:>11}",
             d,
             anc_walk,
             anc_index,
@@ -255,6 +265,7 @@ fn main() {
             lca_index,
             lca_walk / lca_index,
             fork_reap,
+            depth_hash,
             w_anc_steps.max(w_lca_steps),
             g.len(),
         );

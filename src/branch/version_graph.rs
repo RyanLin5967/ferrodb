@@ -657,6 +657,77 @@ mod tests {
         assert_eq!(g.lca(new, b(1)).unwrap(), Some(b(0)));
     }
 
+    /// The capability this module exists for, in the shape `SIMULATE` actually produces: K
+    /// candidate branches forked off one base, each then deepened by its own writes.
+    ///
+    /// Today ferrodb cannot merge two of these with each other, because the merge target is
+    /// hard-wired to `parent_id` (`agent_sql/runtime.rs`) and no LCA exists to supply the fork
+    /// point for any other pair. The fork point of candidates i and j is what makes that merge
+    /// expressible, and it must stay correct after MCTS prunes some of the candidates — pruning
+    /// an interior node is exactly the operation `reaper.rs` calls out as the one a flat fanout
+    /// never exercises.
+    #[test]
+    fn sibling_candidates_have_a_fork_point_that_survives_pruning() {
+        const K: u64 = 8;
+        const RUN: u64 = 12;
+
+        let base = b(500);
+        let mut edges = vec![(base, b(0))];
+        let mut tips = Vec::new();
+        for c in 0..K {
+            let mut prev = base;
+            for step in 0..RUN {
+                let node = b(1000 + c * 100 + step);
+                edges.push((node, prev));
+                prev = node;
+            }
+            tips.push(prev);
+        }
+        let mut g = graph(b(0), &edges);
+        let par = parents(&edges);
+
+        // Every pair of candidate tips meets at the base, not at the trunk.
+        for i in 0..K as usize {
+            for j in 0..K as usize {
+                let expect =
+                    if i == j { Some(tips[i]) } else { Some(base) };
+                assert_eq!(g.lca(tips[i], tips[j]).unwrap(), expect, "candidates {i},{j}");
+                assert_eq!(g.lca(tips[i], tips[j]).unwrap(), walk_lca(&par, tips[i], tips[j]));
+            }
+        }
+
+        // MCTS prunes candidates 0..3 entirely: every node on those runs is reaped, deepest
+        // first, which is what actually happens when a subtree is abandoned.
+        for c in 0..4u64 {
+            for step in (0..RUN).rev() {
+                g.reap(b(1000 + c * 100 + step)).unwrap();
+            }
+        }
+
+        // The base itself is now reaped too — the agent that held it is gone — but four live
+        // candidates still hang off it, so it must remain answerable as their fork point.
+        g.reap(base).unwrap();
+        assert!(g.is_tombstoned(base).unwrap());
+
+        for i in 4..K as usize {
+            for j in 4..K as usize {
+                if i == j {
+                    continue;
+                }
+                assert_eq!(
+                    g.lca(tips[i], tips[j]).unwrap(),
+                    Some(base),
+                    "pruning the other candidates must not move the fork point of {i},{j}"
+                );
+            }
+            assert!(g.is_ancestor(base, tips[i]).unwrap());
+            assert_eq!(g.depth(tips[i]).unwrap(), (RUN + 1) as u32, "depths must not shift");
+        }
+
+        // The pruned runs are gone, not merely hidden: 4 runs x RUN nodes collected.
+        assert_eq!(g.len(), 1 + 1 + 4 * RUN as usize, "pruned nodes should be collected");
+    }
+
     #[test]
     fn an_unknown_branch_refuses_rather_than_answering_false() {
         let g = graph(b(0), &[(b(1), b(0))]);
