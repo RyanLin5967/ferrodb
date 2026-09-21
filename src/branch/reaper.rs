@@ -575,28 +575,18 @@ impl Reaper for TwoTierReaper {
     }
 
     fn reap_expired(&self, now_millis: u64) -> Result<Vec<BranchId>, FerroError> {
-        // Asks for exactly the expired branches instead of cloning every record in the catalog
-        // and filtering here. The old shape ran every 30 seconds for the life of the process and
-        // its cost was O(N) whether or not anything had expired — fine at 10³ branches, fatal at
-        // 10⁶, and invisible to any measurement of `fork`. `SCALE-DESIGN.md` D2.
-        // CORE records, not whole ones. The three fields used below are all core, and hydrating
-        // each answer row cost an arena range-scan plus an envelope lookup that were discarded --
-        // 24.3 us/row measured. See SCALE-DESIGN D11.
-        let mut candidates: Vec<CoreRecord> = self.catalog.expired_before(now_millis)?;
-
-        // Deepest first: reaping a child removes its epoch from the parent's live-children array,
-        // which is exactly what lets the parent's own reap take the fast path.
-        candidates.sort_by(|a, b| {
-            b.depth().cmp(&a.depth()).then(b.fork_epoch().cmp(&a.fork_epoch()))
-        });
-
+        // **D98: the query and the reap loop are separable, and `lease_thread` separates them.**
+        //
+        // This method is now the two halves run back to back, which is what every caller that can
+        // afford one long pass still wants. `scan_once` calls the halves itself so that it can put
+        // the server's per-statement lock around bounded groups of reaps instead of around all of
+        // them — see `branch::lease_thread::REAP_CHUNK`. There is one implementation of each half,
+        // so the two call shapes cannot drift on what "expired" means or on what order reaps go in.
+        let candidates = self.expired_candidates(now_millis)?;
         let mut reaped = Vec::with_capacity(candidates.len());
         for rec in candidates {
-            match self.reap(rec.branch_id()) {
-                Ok(_) => reaped.push(rec.branch_id()),
-                // A branch already reaped as a side effect of this same scan is not an error.
-                Err(FerroError::Branch(_)) => {}
-                Err(e) => return Err(e),
+            if self.reap_if_still_expired(rec.branch_id(), now_millis)? {
+                reaped.push(rec.branch_id());
             }
         }
 
@@ -625,6 +615,78 @@ impl Reaper for TwoTierReaper {
 
     fn drain_pending(&self) -> Result<u32, FerroError> {
         self.drain_pending_seeded(BTreeSet::new())
+    }
+}
+
+impl TwoTierReaper {
+    /// Every branch whose lease had expired at `now_millis`, deepest first.
+    ///
+    /// **The half of a lease scan that needs no statement lock.** It reads the BRANCH catalog,
+    /// which has its own lock; it is not the table catalog `pgwire` serialises statements on, and
+    /// it frees nothing. `scan_once` therefore runs it outside the runtime lock and takes the lock
+    /// only around the reaps themselves.
+    ///
+    /// Asks for exactly the expired branches instead of cloning every record in the catalog and
+    /// filtering here. The old shape ran every 30 seconds for the life of the process and its cost
+    /// was O(N) whether or not anything had expired — fine at 10³ branches, fatal at 10⁶, and
+    /// invisible to any measurement of `fork`. `SCALE-DESIGN.md` D2.
+    ///
+    /// CORE records, not whole ones. The three fields read below are all core, and hydrating each
+    /// answer row cost an arena range-scan plus an envelope lookup that were discarded — 24.3 µs/row
+    /// measured. See SCALE-DESIGN D11.
+    pub(crate) fn expired_candidates(&self, now_millis: u64) -> Result<Vec<CoreRecord>, FerroError> {
+        let mut candidates: Vec<CoreRecord> = self.catalog.expired_before(now_millis)?;
+        // Deepest first: reaping a child removes its epoch from the parent's live-children array,
+        // which is exactly what lets the parent's own reap take the fast path. The order is a
+        // property of the reap, not of the query, which is why it lives here and not in the
+        // catalog — and why a chunked caller must consume this vector in order.
+        candidates.sort_by(|a, b| {
+            b.depth().cmp(&a.depth()).then(b.fork_epoch().cmp(&a.fork_epoch()))
+        });
+        Ok(candidates)
+    }
+
+    /// Reap `branch`, but only if its lease is **still** expired at `now_millis`. Returns whether
+    /// it reaped.
+    ///
+    /// # The re-check is not belt and braces; it is the guarantee the lock used to give
+    ///
+    /// [`Self::expired_candidates`] answers from the catalog as it was when it ran. While the
+    /// whole sweep sat inside one acquisition of the server's per-statement lock, nothing could
+    /// change in between, because a `renew_lease` arrives on a statement and a statement needs
+    /// that lock. `scan_once` no longer holds it across the query, so the window is real: an agent
+    /// whose keepalive lands between the query and its own reap would otherwise have its branch
+    /// reaped out from under it, and a `BranchId` generation makes that unrecoverable.
+    ///
+    /// Re-reading here closes it exactly, because this runs **inside** the caller's acquisition of
+    /// that same lock: a renewal cannot land between this read and the reap below without holding
+    /// a lock the caller is holding. The old whole-sweep atomicity is not needed for that — only
+    /// per-branch atomicity is, which is all this takes.
+    ///
+    /// It adds no second opinion about anything [`Reaper::reap`] already decides. Generation,
+    /// trunk and already-reaped are `reap`'s to judge and are left to it; duplicating them here
+    /// would be a second predicate to drift, and the one that is easier to test would mask the one
+    /// that ships. The single new question is the deadline, and it is asked because the removed
+    /// lock is what used to answer it.
+    pub(crate) fn reap_if_still_expired(
+        &self,
+        branch: BranchId,
+        now_millis: u64,
+    ) -> Result<bool, FerroError> {
+        match self.catalog.get_raw(branch.id) {
+            Ok(rec) if !rec.lease_deadline.is_expired_at(now_millis) => return Ok(false),
+            Ok(_) => {}
+            // The slot is gone entirely between the query and here: nothing to reap, and nothing
+            // wrong. Same class as the `Branch` error below.
+            Err(FerroError::Branch(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        match self.reap(branch) {
+            Ok(_) => Ok(true),
+            // A branch already reaped as a side effect of this same scan is not an error.
+            Err(FerroError::Branch(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
