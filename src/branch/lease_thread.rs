@@ -42,9 +42,28 @@
 //! it. Taking that same lock adds no new lock and no new lock order — the alternative, a private
 //! reap mutex, would be a third order to get wrong.
 //!
-//! The cost is stated rather than hidden: a scan waits for whatever statement is in flight, and a
-//! statement issued during a scan waits for the scan. Both are bounded by one reap, and the scan
-//! does no client I/O.
+//! **What the lock has to contain is a reap, not a sweep — D98.** This paragraph used to read
+//! "a statement issued during a scan waits for the scan. Both are bounded by one reap", and the
+//! body did not do that: [`scan_once`] held ONE acquisition across the clock read, the candidate
+//! query, *every* reap on the tick and the reconciliation, so a statement waited for all of it.
+//! Measured at 1 000 branches with 64 expired, a statement waited 3.71 s at the median
+//! (`bench/d98_outer_runtime_lock.txt`). The sentence described the intended design and the code
+//! ran a different one — the failure this project has now hit three times, and the reason a header
+//! here is audited against its body rather than read.
+//!
+//! It is true as written now. The reaps run [`REAP_CHUNK`] at a time, each group inside its own
+//! acquisition, and everything that does not need the lock — the clock, the candidate query, the
+//! error path's O(open sessions) reconciliation, D88's orphan sweep — runs outside it. So a scan
+//! waits for whatever statement is in flight, a statement issued during a scan waits for at most
+//! `REAP_CHUNK` reaps instead of for the whole sweep, and the scan does no client I/O. A scan that
+//! finds nothing expired now takes the lock **not at all**.
+//!
+//! Chunking does not weaken the guarantee rule 2 is about.
+//! [`crate::branch::reaper::TwoTierReaper::reap_if_still_expired`] re-reads each record inside the
+//! acquisition that is about to reap it, so a keepalive that lands after the candidate query
+//! cannot have its branch reaped — the one thing whole-sweep atomicity provided for free. What
+//! rule 2 needs is that no merge is running while a branch's extents go back to the free-space
+//! map, and that is a property of one reap.
 //!
 //! **3. Never guess the time.** The clock is [`LeaseDeadline::try_now_millis`], i.e.
 //! `cluster::lease_now_millis` — the local wall clock on a standalone node, the last applied
@@ -60,7 +79,11 @@ use std::time::Duration;
 
 use crate::agent_sql::runtime::AgentRuntime;
 use crate::branch::types::{BranchId, LeaseDeadline};
-use crate::branch::{Reaper, TwoTierReaper};
+// `Reaper` is deliberately NOT imported: since D98 this module reaches the reaper only through its
+// inherent methods (`resume_interrupted_reaps`, `expired_candidates`, `reap_if_still_expired`,
+// `collect_orphans_if_due`), because the trait's `reap_expired` is the whole-sweep shape whose
+// hold time is what this row removed.
+use crate::branch::TwoTierReaper;
 use crate::catalog::catalog::Catalog;
 use crate::error::FerroError;
 
@@ -68,8 +91,14 @@ use crate::error::FerroError;
 ///
 /// Well under `DEFAULT_LEASE_MILLIS` (15 minutes), because the interval is the worst-case delay
 /// between a lease expiring and its pages coming back, and it costs one pass over the live branch
-/// records. It is not shorter because a scan takes the statement lock (rule 2 above), and a
-/// database with nothing expired should not be taking that lock more often than it has to.
+/// records.
+///
+/// It used to say it was not shorter because "a scan takes the statement lock ... and a database
+/// with nothing expired should not be taking that lock more often than it has to". Since D98 a
+/// scan that finds nothing expired takes that lock zero times — the candidate query runs outside
+/// it and the loop that acquires it has nothing to iterate — so that is no longer the reason. What
+/// remains is the cost of the query itself: one deadline-index descent per tick against the branch
+/// catalog, which is cheap but not free.
 pub const DEFAULT_SCAN_MILLIS: u64 = 30_000;
 
 /// Name of the environment variable [`scan_interval_from_env`] reads.
@@ -210,7 +239,13 @@ impl RuntimeLock for CatalogLock {
 pub struct LeaseStats {
     /// Scans begun, counted **before** the runtime lock is acquired.
     pub attempts: u64,
-    /// Scans that ran with the runtime lock held.
+    /// Scans that ran to completion without failing.
+    ///
+    /// This used to read "scans that ran with the runtime lock held", and since D98 that is no
+    /// longer what it counts: a scan that finds nothing expired completes without ever taking the
+    /// lock, and one that finds many takes it once per [`REAP_CHUNK`]. It still separates "the
+    /// scan is waiting for a statement" from "the thread died" — see the note on this struct —
+    /// because a thread blocked inside a chunk raises `attempts` and not this.
     pub scans: u64,
     /// Branches reaped by those scans.
     pub reaped: u64,
@@ -386,7 +421,56 @@ impl Drop for LeaseThread {
     }
 }
 
+/// How many expired branches one acquisition of the runtime lock is allowed to reap.
+///
+/// **This constant is what stops the hold being a function of the branch count.** It is a tuning
+/// number; the shape is that there IS one. Whatever it is set to, an unrelated statement waits for
+/// at most this many reaps rather than for every branch that happened to expire on the same tick,
+/// and that is the property D98 is about.
+///
+/// Small, because a reap is dominated by a durable catalog write and the sweep is single-threaded,
+/// so it joins no commit group and each reap costs roughly one fsync. Taking and releasing an
+/// uncontended mutex is microseconds against that, so a small chunk buys a much shorter stall for
+/// an overhead that does not register. It is not 1: the lock is released between chunks and
+/// clients are queued on it, so the sweep goes to the back of the queue every time it lets go —
+/// a chunk of one makes a sweep with many candidates as slow as the queue is long. Four bounds the
+/// stall at four reaps while still letting the sweep make progress in groups.
+///
+/// `bench/d98_outer_runtime_lock.txt` reports the measured stall and the sweep's own wall time in
+/// the same table, so starving the sweep to buy latency would be visible there rather than traded
+/// silently.
+const REAP_CHUNK: usize = 4;
+
 /// One pass: read the cluster's time, reap what has expired, then let the runtime forget it.
+///
+/// # D98 — what is inside the runtime lock, and what is not
+///
+/// This whole body used to sit inside one `with_lock`, and in both production shapes that lock is
+/// the mutex every SQL statement takes. So the length of one lease scan was the length of a stall
+/// on every connection in the database — and the scan's length is a function of how many branches
+/// expired on that tick, which in an agent fleet is a function of how many agents there are.
+/// Measured before the change at N=1 000 branches with 64 of them expired: a statement waited
+/// **3.71 s at the median**, against 333 ns in a control arm running the identical sweep under a
+/// private lock (`bench/d98_outer_runtime_lock.txt`).
+///
+/// Three things moved out, each for a reason of its own:
+///
+/// - **The clock read**, which touches no catalog at all.
+/// - **The candidate query**, which reads the BRANCH catalog. That is not the table catalog
+///   statements serialise on, and it frees nothing; this is D88's argument for the orphan sweep,
+///   applied to the other read the scan does.
+/// - **The reconciliation on the error path**, which is O(open sessions) and walks
+///   `AgentRuntime`'s own state under `AgentRuntime`'s own mutex. It was the largest remaining
+///   unbounded hold and `bench/w4/DECISION.md` lists it as open. Moving it out costs nothing that
+///   was actually held: `forget_reaped_branches` already releases its state lock every
+///   `FORGET_CHUNK` entries, so "the reap and the forget are one atomic step" has not been true
+///   since that chunking landed, and nothing depends on it.
+///
+/// What stays inside is the reap itself, in groups of [`REAP_CHUNK`] — because rule 2 in the
+/// module header is about exactly that: a merge must not be running while a branch's extents go
+/// back to the free-space map. That needs the reap of one branch to be inside the lock. It never
+/// needed the whole sweep to be inside one acquisition, and the difference between those two
+/// readings is this entire row.
 fn scan_once(
     reaper: &TwoTierReaper,
     runtime: &AgentRuntime,
@@ -396,79 +480,136 @@ fn scan_once(
     // Before the lock, so a scan blocked on a statement is visibly a scan that is waiting rather
     // than a thread that has died.
     counters.attempts.fetch_add(1, Ordering::SeqCst);
-    // The sweep runs after the lock is dropped but must use the reading the scan decided on, not a
-    // second one: two clock reads either side of a reap can straddle the cadence boundary and turn
-    // one collection into none or two.
-    let mut sweep_at: Option<u64> = None;
-    with_lock(lock, || {
-        // Read inside the lock: the freshest reading that can still be acted on without another
-        // statement intervening. A refusal is counted and reported, never rounded to a number.
-        let now = match LeaseDeadline::try_now_millis() {
-            Ok(now) => now,
-            Err(e) => {
-                counters.refused.fetch_add(1, Ordering::SeqCst);
-                report(format!(
-                    "lease: NOT reaping — this node does not know the cluster's time ({e}). \
-                     Expired branches keep their pages until a LeaseTick is applied; reaping on a \
-                     local clock is the divergence this refusal exists to prevent."
-                ));
+
+    // **Outside the lock.** A refusal is counted and reported, never rounded to a number. It used
+    // to be read inside, for "the freshest reading that can still be acted on without another
+    // statement intervening" — but what acts on the reading is `reap_if_still_expired`, which
+    // re-reads each record inside the lock and refuses a branch whose lease moved. The freshness
+    // that argument wanted is now enforced where the decision is made instead of being inferred
+    // from where the clock was read.
+    let now = match LeaseDeadline::try_now_millis() {
+        Ok(now) => now,
+        Err(e) => {
+            counters.refused.fetch_add(1, Ordering::SeqCst);
+            report(format!(
+                "lease: NOT reaping — this node does not know the cluster's time ({e}). \
+                 Expired branches keep their pages until a LeaseTick is applied; reaping on a \
+                 local clock is the divergence this refusal exists to prevent."
+            ));
+            return;
+        }
+    };
+
+    // **Outside the lock.** An index descent on the branch catalog, which has its own lock.
+    let candidates = match reaper.expired_candidates(now) {
+        Ok(c) => c,
+        Err(e) => {
+            counters.failed.fetch_add(1, Ordering::SeqCst);
+            report(format!(
+                "lease: could not ask which branches have expired: {e}. Nothing was freed and \
+                 nothing is lost; the next scan asks again."
+            ));
+            return;
+        }
+    };
+
+    // ---- the reaps: inside the lock, [`REAP_CHUNK`] at a time -------------------------------
+    //
+    // Consumed in the order `expired_candidates` produced — deepest first — because reaping a
+    // child is what lets its parent's own reap take the fast path. Chunking must not reorder it.
+    let mut reaped_all: Vec<BranchId> = Vec::new();
+    let mut forgotten_all = 0usize;
+    let mut failure: Option<FerroError> = None;
+    for group in candidates.chunks(REAP_CHUNK) {
+        let mut reaped: Vec<BranchId> = Vec::with_capacity(group.len());
+        with_lock(lock, || {
+            for rec in group {
+                match reaper.reap_if_still_expired(rec.branch_id(), now) {
+                    Ok(true) => reaped.push(rec.branch_id()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        failure = Some(e);
+                        return;
+                    }
+                }
+            }
+            if reaped.is_empty() {
                 return;
             }
-        };
-        sweep_at = Some(now);
-        match reaper.reap_expired(now) {
-            Ok(reaped) => {
-                counters.scans.fetch_add(1, Ordering::SeqCst);
-                if reaped.is_empty() {
-                    return;
-                }
-                counters.reaped.fetch_add(reaped.len() as u64, Ordering::SeqCst);
-                // **Forget exactly what was reaped, not everything that might have been.**
-                //
-                // This used to call `forget_reaped_branches`, which re-derives the set by walking
-                // every open session and asking the catalog about each one — O(open sessions),
-                // inside this `with_lock`, which is the pgwire server's PER-STATEMENT mutex. So a
-                // timer stopped every statement in the database for the length of that walk. The
-                // list is right here; searching for what we were already handed was the whole cost.
-                //
-                // Measured in `bench/w4/statement-lock-FASTPATH.txt`: the reconciliation's
-                // wall time — which is what this lock is held for — rises 91x across 100x open
-                // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
-                // O(reaped). A larger figure for the same walk is reported on branch
-                // S15-runtime-at-1e6 (commit 0ac1931, `bench/runtime_at_1e6.txt`, W4); that file is
-                // not in this worktree and the number is NOT reproduced here, so it is motivation
-                // rather than evidence.
-                let forgotten = runtime.forget_branches(&reaped);
-                counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
+            // **Forget exactly what was reaped, not everything that might have been.**
+            //
+            // This used to call `forget_reaped_branches`, which re-derives the set by walking
+            // every open session and asking the catalog about each one — O(open sessions),
+            // inside this `with_lock`, which is the pgwire server's PER-STATEMENT mutex. So a
+            // timer stopped every statement in the database for the length of that walk. The
+            // list is right here; searching for what we were already handed was the whole cost.
+            //
+            // It stays inside the lock because it is now O(this chunk), which is bounded by
+            // construction: moving it out would buy nothing and would widen the window in which
+            // a statement can find a workspace whose branch is already gone.
+            //
+            // Measured in `bench/w4/statement-lock-FASTPATH.txt`: the reconciliation's
+            // wall time — which is what this lock is held for — rises 91x across 100x open
+            // sessions (269 us -> 24.5 ms at 10⁵), while this call shows no trend because it is
+            // O(reaped). A larger figure for the same walk is reported on branch
+            // S15-runtime-at-1e6 (commit 0ac1931, `bench/runtime_at_1e6.txt`, W4); that file is
+            // not in this worktree and the number is NOT reproduced here, so it is motivation
+            // rather than evidence.
+            forgotten_all += runtime.forget_branches(&reaped);
+        });
+        reaped_all.append(&mut reaped);
+        if failure.is_some() {
+            break;
+        }
+    }
+
+    match failure {
+        None => {
+            // Counted once per pass, including a pass that found nothing: `scans` is what tells
+            // "the thread is scanning and there is nothing to do" apart from "the thread is stuck",
+            // and a counter that only moved when something expired could not say that.
+            counters.scans.fetch_add(1, Ordering::SeqCst);
+            if !reaped_all.is_empty() {
+                counters.reaped.fetch_add(reaped_all.len() as u64, Ordering::SeqCst);
+                counters.forgotten.fetch_add(forgotten_all as u64, Ordering::SeqCst);
                 report(format!(
                     "lease: reaped {} expired branch(es) with no client cooperation ({}); {} \
                      workspace(s) forgotten",
-                    reaped.len(),
-                    join_ids(&reaped),
-                    forgotten
-                ));
-            }
-            Err(e) => {
-                counters.failed.fetch_add(1, Ordering::SeqCst);
-                // **The one path where the list cannot be trusted, so the full sweep runs.**
-                //
-                // `reap_expired` accumulates the ids it reaps and then DISCARDS that vector if any
-                // later branch fails (`reaper.rs`, the `Err(e) => return Err(e)` arm; likewise if
-                // `sweep_empty_extents` fails after a clean loop). Those branches are gone from the
-                // catalog and nothing will ever name them again, so the fast path above cannot see
-                // them and they would leak for the life of the process. The reconciliation is what
-                // covers that, and this is the only tick that has to pay for it.
-                let forgotten = runtime.forget_reaped_branches();
-                counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
-                report(format!(
-                    "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
-                     is re-entrant, so the next scan resumes rather than double-freeing. \
-                     {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
-                     does not report which branches it had already reaped."
+                    reaped_all.len(),
+                    join_ids(&reaped_all),
+                    forgotten_all
                 ));
             }
         }
-    });
+        Some(e) => {
+            counters.failed.fetch_add(1, Ordering::SeqCst);
+            counters.reaped.fetch_add(reaped_all.len() as u64, Ordering::SeqCst);
+            counters.forgotten.fetch_add(forgotten_all as u64, Ordering::SeqCst);
+            // **The one path where the list cannot be trusted, so the full sweep runs.**
+            //
+            // A reap can fail after freeing part of what it names, and `sweep_empty_extents` can
+            // fail after a clean loop; either way a branch can be gone from the catalog without
+            // this pass being able to name it, so the fast path above cannot see it and its
+            // workspace would leak for the life of the process. The reconciliation covers that,
+            // and this is the only tick that has to pay for it.
+            //
+            // **D98: it runs OUTSIDE the lock.** It is O(open sessions) — the largest hold left in
+            // this function — and it needs none of the table catalog: it walks `AgentRuntime`'s
+            // own state under `AgentRuntime`'s own mutex, releasing it every `FORGET_CHUNK`
+            // entries, and asks the BRANCH catalog about the candidates. That it already lets go
+            // of its own lock between chunks is also why moving it out gives nothing up: this was
+            // never one atomic step with the reap.
+            let forgotten = runtime.forget_reaped_branches();
+            counters.forgotten.fetch_add(forgotten as u64, Ordering::SeqCst);
+            report(format!(
+                "lease: scan failed: {e}. Whatever it had already freed is durable and `reap` \
+                 is re-entrant, so the next scan resumes rather than double-freeing. \
+                 {forgotten} workspace(s) forgotten by reconciliation, because a failed scan \
+                 does not report which branches it had already reaped."
+            ));
+        }
+    }
+
     // **D88: the orphan sweep runs OUTSIDE the statement lock.**
     //
     // `with_lock` above is the table-catalog mutex in both production shapes, so anything inside
@@ -481,7 +622,10 @@ fn scan_once(
     // sweeping first would always be one tick behind. And any error is reported rather than
     // propagated — a failed mop-up must not stop the next lease scan, and `open` collects the
     // same extents anyway.
-    let Some(now) = sweep_at else { return };
+    //
+    // D98 note: this no longer needs a `sweep_at` carried out of a closure, because the reading it
+    // must use is now an ordinary local — but the rule that produced that variable is unchanged
+    // and is why `now` is read once for the whole pass rather than re-read here.
     if let Err(e) = reaper.collect_orphans_if_due(now) {
         report(format!(
             "lease: orphan sweep failed: {e}. Nothing is lost — the complete answer is recomputed \

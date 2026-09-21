@@ -474,6 +474,41 @@ impl State {
     /// loss. Auditing at both doors is what turns that constraint from advice into a failing test.
     #[cfg(debug_assertions)]
     fn audit_txn_refs(&self) {
+        // **D98 — bounded, and the bound gives up nothing against the bug this catches.**
+        //
+        // The full re-derive is O(open sessions) and runs at both doors, so a debug fixture that
+        // opens N sessions is O(N²) and a debug build stops being a way to reproduce anything at
+        // scale. Measured on this tree with `examples/outer_runtime_lock.rs`, building the same
+        // fixture in both profiles (machine under fleet load, so read the trend, not the cells):
+        //
+        // | N      | debug   | release | per branch, debug MINUS release |
+        // |--------|---------|---------|---------------------------------|
+        // |  4 000 |  20.2 s |  14.7 s | 1 373 µs                        |
+        // |  8 000 |  46.4 s |  25.1 s | 2 660 µs                        |
+        // | 16 000 | 107.8 s |  53.5 s | 3 396 µs                        |
+        //
+        // Release's per-branch cost is flat (3 685 → 3 143 → 3 344 µs); debug's excess over it
+        // RISES with N, which is this audit appearing. At 16 000 a debug build already costs 2×,
+        // and the factor keeps growing — at the 10⁶ branches `SCALE-DESIGN.md` targets it is the
+        // difference between an hour and days. That is a reproduction trap, not merely slow: the
+        // person it stops is the next one trying to reproduce a scale row in a debuggable build.
+        //
+        // **So it is capped — and the cap is not a weakening.** The bug this exists to catch is
+        // structural: a rewrite that reaches `workspaces` without going through
+        // `insert_workspace`/`remove_workspace` desyncs the index, and it does so on its FIRST
+        // crossing. To have more than `AUDIT_FULL_MAX` workspaces you must have crossed a door
+        // that many times, starting from none — so every such bypass is exercised, and fully
+        // audited, long before the map outgrows the cap. Sampling or a cadence WOULD have been a
+        // weakening; a prefix of the crossings is not.
+        //
+        // ⚠ The blind spot, stated here rather than discovered later: a door that is correct for
+        // small maps and wrong only above `AUDIT_FULL_MAX` is not caught. Nothing in this file
+        // branches on the map's size, so no such door exists today, and a change that added one
+        // would have to raise this cap with it.
+        if self.workspaces.len() > AUDIT_FULL_MAX {
+            audit_downgraded_once(self.workspaces.len());
+            return;
+        }
         let mut want: BTreeMap<u64, u32> = BTreeMap::new();
         for ws in self.workspaces.values() {
             for t in txn_refs_of(ws) {
@@ -483,12 +518,13 @@ impl State {
         assert_eq!(self.txn_refs, want, "txn_refs disagrees with a scan of workspaces");
     }
 
-    /// Release builds pay nothing, which is the only reason this can sit on two hot doors: the
-    /// audit is O(open sessions), so it makes a debug fixture that forks N sessions O(N²). The
-    /// largest fork loop anywhere in `tests/` is ~200, and `cargo test --lib` is unchanged at
-    /// 63 s with it live, so the cost is not paid today — but a future debug test forking tens of
-    /// thousands of sessions would feel it, and should use a release build or a fixture helper
-    /// rather than weakening this.
+    /// Release builds pay nothing, which is the only reason this can sit on two hot doors.
+    ///
+    /// The note that used to be here said a future debug test forking tens of thousands of
+    /// sessions "would feel it, and should use a release build or a fixture helper rather than
+    /// weakening this". D98 measured how much it would feel it and took the third option instead:
+    /// see [`AUDIT_FULL_MAX`] and the comment on the debug arm for why capping the map size gives
+    /// up nothing against the bug the audit exists to catch.
     #[cfg(not(debug_assertions))]
     fn audit_txn_refs(&self) {}
 
@@ -577,6 +613,43 @@ pub struct RunActivity {
 /// 256 wins the median and loses the tail by 5x; 1024 stayed inside 419-574 us on every single
 /// round. A latency bound is a claim about the worst case, so the tail is what decides it.
 const FORGET_CHUNK: usize = 1024;
+
+/// Largest `workspaces` map [`State::audit_txn_refs`] re-derives in full, in debug builds.
+///
+/// **D98.** Above this the audit is skipped and says so once. The argument for why that is a bound
+/// and not a weakening is on the audit itself; the short form is that reaching a map of size M
+/// requires M crossings of a door starting from zero, so every door is fully audited while the map
+/// is small, and a bypass cannot hide above a threshold it had to walk past.
+///
+/// 1024 rather than the ~200 the old note claimed the suite needed, because that figure was
+/// asserted rather than measured. It is checked the way that claim should have been: the skip
+/// prints a distinctive line, and `cargo test --lib` is run and grepped for it. A suite that does
+/// exceed this is not broken — it has downgraded one detector, and the line is there to say so.
+#[cfg(debug_assertions)]
+const AUDIT_FULL_MAX: usize = 1024;
+
+/// Say once, per process, that the debug index audit has stopped re-deriving in full.
+///
+/// Once, because a hot door would otherwise turn a notice into the cost it is announcing. On
+/// stderr with a tolerated `EPIPE`, for the reason `branch::lease_thread::report` spells out: this
+/// can run on a thread whose panic nobody would see.
+#[cfg(debug_assertions)]
+fn audit_downgraded_once(len: usize) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "ferrodb: AUDIT_TXN_REFS_DOWNGRADED — {len} open workspaces exceeds AUDIT_FULL_MAX \
+         ({AUDIT_FULL_MAX}), so the debug re-derive of `txn_refs` is no longer running at every \
+         door. It ran for the first {AUDIT_FULL_MAX} crossings, which is where a door that \
+         bypasses insert_workspace/remove_workspace would have shown itself. A door that is \
+         correct below {AUDIT_FULL_MAX} and wrong above it is NOT covered."
+    );
+}
 
 /// Resolves a branch name written in SQL (`b_3`) to a live `BranchId`.
 pub trait BranchResolver {

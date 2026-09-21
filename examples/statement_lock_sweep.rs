@@ -1,5 +1,12 @@
 //! W4 — how long does `forget_reaped_branches` block an unrelated statement?
 //!
+//! ⚠ **This file is about `AgentRuntime`'s `Mutex<State>` and nothing else.** It builds an
+//! `AgentRuntime` directly and never constructs a `RuntimeLock`, so it has never measured the
+//! server's per-statement mutex — the OUTER lock `lease_thread::scan_once` takes. Confusing the
+//! two is the error `bench/w4/DECISION.md` addendum 1 exists to correct, so it is said here as
+//! well as there. The outer lock is measured by `examples/outer_runtime_lock.rs` (D98), which
+//! wires a real `ServerContext` and probes the mutex statements actually take.
+//!
 //! `AgentRuntime` holds one `Mutex<State>`, taken by every statement that touches branch state.
 //! `forget_reaped_branches` runs in three phases: phase 1 walks `state.workspaces` **holding that
 //! lock**, phase 2 asks the catalog about each candidate with **no lock held**, phase 3 re-takes
@@ -203,7 +210,15 @@ fn oneshot(
                 .set_state(sess.branch, rec.state, BranchState::Reaped)
                 .expect("mark the record reaped");
         }
-        // Exactly what `reap_expired` hands `scan_once`, for the targeted arm to be given.
+        // The list of branches a reap produced, for the targeted arm to be given.
+        //
+        // ⛔ **CORRECTED (D98): this said "exactly what `reap_expired` hands `scan_once`", and
+        // `scan_once` does not call `reap_expired` any more.** It calls
+        // `TwoTierReaper::expired_candidates` outside the runtime lock and then
+        // `reap_if_still_expired` per branch inside it, accumulating the same ids itself — so the
+        // CONTENT of this vector is still what a tick forgets, but it reaches `forget_branches` in
+        // groups of `lease_thread::REAP_CHUNK`, not in one call of length `g`. See the note on the
+        // `fast` arm below for what that does to the number.
         let reaped: Vec<BranchId> = sessions.iter().take(g).map(|sess| sess.branch).collect();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -231,8 +246,14 @@ fn oneshot(
         let sweep_start = Instant::now().duration_since(base).as_nanos() as u64;
         let t0 = Instant::now();
         // `recon` is the full reconciliation -- the backstop, O(open sessions). `fast` is
-        // `forget_branches(&reaped)`, which is what `scan_once` calls on every successful tick
-        // now that it stops re-deriving a list `reap_expired` already handed it.
+        // `forget_branches(&reaped)`, which is what a successful tick calls to drop exactly what
+        // it reaped rather than re-deriving the set.
+        //
+        // ⛔ **CORRECTED (D98): a tick no longer makes this call once with all `g` ids.** It makes
+        // it once per `lease_thread::REAP_CHUNK` reaps, so the per-call cost a tick actually pays
+        // is this arm at `g = REAP_CHUNK`. Read the `fast` rows at larger `g` as an UPPER BOUND on
+        // one call and as the right shape for the question "is it O(gone) or O(S)" -- which is the
+        // question this arm was built to answer, and which the chunking does not change.
         let dropped =
             if targeted { rt.forget_branches(&reaped) } else { rt.forget_reaped_branches() };
         walls.push(t0.elapsed().as_nanos() as u64);
@@ -423,8 +444,12 @@ fn main() {
     println!("#");
     println!("# TWO ARMS. `recon` is `forget_reaped_branches` -- the reconciliation, which walks");
     println!("# every open session and is the BACKSTOP the lease thread now runs only when a scan");
-    println!("# failed and cannot report what it reaped. `fast` is `forget_branches(&reaped)`,");
-    println!("# which is what `scan_once` calls on every successful tick: O(gone), not O(S).");
+    println!("# failed and cannot report what it reaped. Since D98 that backstop runs OUTSIDE the");
+    println!("# server's per-statement lock, so these rows are about AgentRuntime's own state");
+    println!("# mutex and no longer also about the statement lock. `fast` is");
+    println!("# `forget_branches(&reaped)` -- O(gone), not O(S). D98: a tick calls it once per");
+    println!("# lease_thread::REAP_CHUNK reaps, not once with every id, so rows at larger `gone`");
+    println!("# are an UPPER BOUND on one call rather than the cost of one tick.");
     println!("#");
     println!("# `blind` counts fixtures whose sweep NO probe acquisition overlapped -- the sweep");
     println!("# finished between two probes {probe_ns} ns apart. Those contribute no stall sample and");

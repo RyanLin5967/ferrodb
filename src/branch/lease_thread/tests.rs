@@ -573,3 +573,160 @@ fn d88_the_orphan_sweep_does_not_run_inside_the_statement_lock() {
          duration of an O(live arenas) scan."
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// D98 — the statement lock must not be held across a whole sweep.
+// -------------------------------------------------------------------------------------------
+
+/// A lock that reports the **largest number of branches reaped inside one acquisition**.
+///
+/// The property itself, not a proxy for it. Sampling how many records are `Reaped` either side of
+/// the body measures exactly the destructive work that happened while every SQL statement in the
+/// database was blocked — which is the quantity D98 is about, and which a wall-clock assertion
+/// could not state without being a timing test.
+struct ChunkGate {
+    statement: Mutex<()>,
+    catalog: Arc<dyn BranchCatalog>,
+    /// Most reaps seen inside a single acquisition.
+    worst: AtomicU64,
+    /// How many times the lock was taken at all.
+    acquisitions: AtomicU64,
+    /// Run after the body of each acquisition, so a test can move the world between chunks.
+    after_body: Mutex<Option<Box<dyn FnMut(u64) + Send>>>,
+}
+
+impl ChunkGate {
+    fn new(catalog: Arc<dyn BranchCatalog>) -> Arc<ChunkGate> {
+        Arc::new(ChunkGate {
+            statement: Mutex::new(()),
+            catalog,
+            worst: AtomicU64::new(0),
+            acquisitions: AtomicU64::new(0),
+            after_body: Mutex::new(None),
+        })
+    }
+
+    fn reaped_now(&self) -> u64 {
+        self.catalog.in_state(BranchState::Reaped).map(|v| v.len() as u64).unwrap_or(0)
+    }
+}
+
+impl RuntimeLock for ChunkGate {
+    fn with_runtime_lock(&self, body: &mut dyn FnMut()) {
+        let _statement = self.statement.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = self.reaped_now();
+        body();
+        let after = self.reaped_now();
+        let n = self.acquisitions.fetch_add(1, Ordering::SeqCst);
+        self.worst.fetch_max(after.saturating_sub(before), Ordering::SeqCst);
+        if let Some(f) = self.after_body.lock().unwrap().as_mut() {
+            f(n);
+        }
+    }
+}
+
+/// **D98.** `scan_once` held ONE acquisition of the runtime lock across every reap on the tick, and
+/// in production that lock is the mutex every SQL statement takes — so a statement waited for the
+/// whole sweep, whose length is a function of how many branches expired. Measured before the fix
+/// at 1 000 branches with 64 expired: 3.71 s at the median (`bench/d98_outer_runtime_lock.txt`).
+///
+/// This pins the shape rather than the constant: whatever [`REAP_CHUNK`] is, one acquisition must
+/// never contain more reaps than it, however many branches expire at once.
+///
+/// **It cannot pass vacuously.** The tick must still reap every expired branch, and the lock must
+/// still have been taken more than once — a version that stopped reaping, or one that reaped
+/// everything without ever taking the lock, fails here rather than looking fixed.
+#[test]
+fn d98_one_acquisition_never_reaps_more_than_a_chunk() {
+    let f = fixture();
+    // Deliberately not a multiple of the chunk, so an off-by-one in the last group shows up.
+    let n = REAP_CHUNK * 5 + 3;
+    for _ in 0..n {
+        branch_with_pages(&f, EXPIRED, 1);
+    }
+
+    let gate = ChunkGate::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+
+    let stats = counters.snapshot();
+    assert_eq!(
+        stats.reaped, n as u64,
+        "the tick reaped {} of {n} expired branches, so this proves nothing about how the lock \
+         was held — a sweep that stopped sweeping must fail here, not pass",
+        stats.reaped
+    );
+    let worst = gate.worst.load(Ordering::SeqCst);
+    let taken = gate.acquisitions.load(Ordering::SeqCst);
+    assert!(
+        taken > 1,
+        "the lock was taken {taken} time(s) for {n} reaps; bounding the hold means taking it \
+         repeatedly, and one acquisition for the whole sweep is the defect itself"
+    );
+    assert!(
+        worst <= REAP_CHUNK as u64,
+        "{worst} branches were reaped inside ONE acquisition of the statement lock, against a \
+         chunk of {REAP_CHUNK}. In production that lock is the per-statement mutex, so every \
+         connection in the database stalls for all {worst} durable reaps — and that number grows \
+         with the number of agents, which is the wall BranchBench reports across every branchable \
+         DBMS it measured."
+    );
+}
+
+/// **D98.** The candidate query now runs OUTSIDE the lock, which opens a window the lock used to
+/// close: a keepalive can land between "which branches have expired" and "reap this one".
+///
+/// `reap_if_still_expired` re-reads each record inside the acquisition that is about to reap it,
+/// so a branch renewed in that window is skipped. This drives exactly that: the first chunk reaps
+/// normally, then every branch still alive is renewed, and nothing further may be reaped — even
+/// though all of them were on the candidate list when it was built.
+///
+/// Without the re-check every branch is reaped and an agent that was still working loses its
+/// branch, which a `BranchId` generation makes unrecoverable. That is why this is a test and not a
+/// comment.
+#[test]
+fn d98_a_branch_renewed_after_the_query_is_not_reaped() {
+    let f = fixture();
+    let n = REAP_CHUNK * 4;
+    let all: Vec<BranchId> = (0..n).map(|_| branch_with_pages(&f, EXPIRED, 1)).collect();
+
+    let gate = ChunkGate::new(Arc::clone(&f.h.catalog) as Arc<dyn BranchCatalog>);
+    {
+        // Renew everything still Live once the FIRST chunk has been reaped. The candidate list was
+        // built before any of this, so every one of them is on it.
+        let catalog = Arc::clone(&f.h.catalog);
+        let all = all.clone();
+        *gate.after_body.lock().unwrap() = Some(Box::new(move |acquisition| {
+            if acquisition != 0 {
+                return;
+            }
+            for b in &all {
+                if catalog.get_raw(b.id).map(|r| r.state) == Ok(BranchState::Live) {
+                    catalog.renew_lease(*b, FAR_FUTURE).unwrap();
+                }
+            }
+        }));
+    }
+
+    let counters = Counters::default();
+    scan_once(&f.reaper, &f.runtime, &*gate, &counters);
+
+    let stats = counters.snapshot();
+    assert_eq!(
+        stats.reaped, REAP_CHUNK as u64,
+        "the first chunk reaps {REAP_CHUNK} branches and the renewal must save the rest; {} were \
+         reaped instead. More than {REAP_CHUNK} means a renewed lease was ignored — an agent that \
+         was still working lost its branch, and the generation makes that unrecoverable.",
+        stats.reaped
+    );
+    let survivors = all
+        .iter()
+        .filter(|b| f.h.catalog.get_raw(b.id).map(|r| r.state) == Ok(BranchState::Live))
+        .count();
+    assert_eq!(
+        survivors,
+        n - REAP_CHUNK,
+        "expected the {} renewed branches to survive, found {survivors}",
+        n - REAP_CHUNK
+    );
+}
