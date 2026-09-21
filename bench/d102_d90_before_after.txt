@@ -37,6 +37,40 @@ in the BEFORE arm, which contains no D102 code. D90 is an example, not a suite t
 nothing was watching it. Anyone quoting "~4320 B flat across r = 1..64" is quoting a
 stale row.
 
+DERIVATION (NOT A MEASUREMENT — it follows from the harness's own definitions plus the
+census, and is labelled so it is not quoted as a counter):
+
+  STORED(r) = distinct pages x 4096 + WAL bytes, and one_cycle() brackets every cycle
+  with flush_all() on both sides. So every byte a merge makes durable inside main.db
+  lands in that window, and the smallest unit DiskManager writes is one 4096-byte page.
+
+  => ANY scheme that records a merge's divergence in a DATA PAGE costs at least 4096 B
+     per merge in this harness, whatever the divergence is. The banked r=1 row, 1 page
+     and 4352 B, is therefore already AT that floor, not above it. The "120.9x
+     amplification" at r=1 is not a chunk-versus-delta result at all: it is the price of
+     a page being the unit of durable storage, and it is the same for a 36-byte change
+     and a 4000-byte one.
+
+  => An intra-page delta cannot go below the floor, because it changes what is inside a
+     page and not how many pages are written. This is why D102 is neutral here, and it
+     would be neutral for any other encoder placed at the same seam.
+
+  => Only two levers move that r=1 row, and neither is an encoding:
+       (a) put the divergence somewhere that is not a data page. WAL bytes ARE counted
+           in STORED(r), so a WAL-resident record of a one-row change would show up as a
+           few hundred bytes rather than 4352 - roughly 14x, and visible. This is the
+           direction src/branch/delta.rs's own header already names as the condition for
+           DELETING that module: "if the TEL ever became the read path".
+       (b) amortise one page across several merges. The per-cycle flush_all() forbids
+           it by construction here, so it cannot be demonstrated with this harness even
+           if it were built.
+
+  NOT A LEVER, and recorded so nobody reaches for it: writing the delta into the arena's
+  free-space map. That sink is deliberately OUTSIDE STORED(r) because it is a function of
+  merge count rather than of r. Moving per-r bytes into it would not reduce any cost; it
+  would only move them where this instrument cannot see them, and would invalidate the
+  exclusion the harness's own header argues for.
+
 THESE ARE COUNTERS, NOT TIMINGS. The merge ms* column is wall-clock taken on a box at
 load ~12-15 with a fleet running; it is not a measurement and must not be quoted.
 
