@@ -1,0 +1,81 @@
+# D93 — delta encoding below the chunk: intra-page deltas for a branch's divergence
+#
+# ============================================================================
+# PART 1 — PRE-REGISTRATION.  Written and committed BEFORE the first measurement.
+# Amendments to this section are append-only and must be dated.
+# ============================================================================
+#
+# THE CLAIM UNDER TEST
+#
+# ferrodb's branch page store shadows a WHOLE 4096-byte page the first time a branch
+# touches a page it inherited (src/branch/arena.rs, `cow_page`: the else-branch copies
+# `source[PAGE_HEADER_SIZE..]` into a freshly allocated page). An agent branch that
+# changes four rows therefore stores four 4096-byte pages to represent tens of bytes of
+# divergence. The claim is that an intra-page delta makes the stored bytes PROPORTIONAL
+# TO WHAT CHANGED rather than flat at (pages touched) * PAGE_SIZE.
+#
+# WHAT IS MEASURED
+#
+# Arm WHOLE  — bytes = PAGE_SIZE * (number of distinct pages the update touched).
+#              This is what `cow_page` does today, counted exactly, not modelled.
+# Arm DELTA  — bytes = sum of PageDelta::encoded_len() over the same touched pages,
+#              where the delta is computed by byte-diffing the real before/after page
+#              images produced by the real slotted node encoder in src/cow/node.rs.
+#
+# Both arms see the SAME page images, produced by the same mutations, in the same run.
+# There is no separate build, so the arms cannot diverge by build.
+#
+# INSTRUMENTS
+#
+# - stored bytes: exact byte counts from the encoder. Not a timing. Load-independent.
+# - read cost:    number of deltas applied to materialise a page, counted by the
+#                 materialiser itself. Not a timing. Load-independent.
+#   Timings are deliberately NOT the headline: this machine was at load average 35-62
+#   on 18 cores with ten agents running, so a wall-clock number here would be noise.
+#   Both headline instruments are counters and are unaffected by that.
+#
+# THE SWEEP
+#
+# r (rows changed) = 1, 2, 4, 8, ..., 4096 over a table of 16384 rows laid out by the
+# real node encoder. Rows to change are chosen by a fixed-seed PRNG so the run is
+# reproducible, and the SAME row set is used for both arms.
+# Chain depth L = 1..64 successive branch generations each editing the same page.
+#
+# ============================================================================
+# FALSIFIERS — declared before running. Either one firing is a real result.
+# ============================================================================
+#
+# F-A (read cost).  If the number of deltas applied to materialise a page grows with
+#      chain length L beyond MAX_CHAIN_DEPTH, the design is WRONG and must be reported
+#      as wrong: an unbounded chain turns an O(1) read into O(chain), which is exactly
+#      the parent-chain walk that src/branch/mod.rs invariant 2 forbids and that
+#      BranchBench measured at up to 4000x read degradation.
+#      PASS CONDITION: applied_deltas <= MAX_CHAIN_DEPTH for every L in 1..64.
+#      This must be a NON-VACUOUS pass: the run must also report that collapses
+#      actually fired (collapses > 0), otherwise the bound was never exercised.
+#
+# F-B (stored bytes).  If stored bytes do not fall by at least 10x at r=4 versus the
+#      whole-page arm, delta encoding does not clear the bar for this workload and
+#      that must be stated plainly rather than rescued with a different r.
+#      PASS CONDITION: WHOLE_bytes(r=4) / DELTA_bytes(r=4) >= 10.0.
+#
+# F-C (added, same sitting, before running — honesty guard on my own arm).  A byte-diff
+#      of a slotted page is NOT guaranteed small just because few rows changed:
+#      `NodeMut::replace_cell_at` writes the new cell into fresh heap space, and when
+#      the heap runs out it calls `compact()`, which REWRITES THE WHOLE CELL AREA. A
+#      compacting update produces a delta the size of the page. If compaction dominates
+#      the sweep, the headline ratio is an artifact of an unrealistically empty page.
+#      REPORTING CONDITION: the run must report what fraction of updated pages
+#      compacted, and must report the ratio for the compacting regime separately.
+#      This falsifier cannot "pass" — it is a disclosure requirement.
+#
+# WHAT WOULD INVALIDATE THE WHOLE RUN
+#
+# - Delta sizes computed against synthetic byte arrays rather than real node images.
+# - A delta arm allowed to store something larger than a page (it must never: a delta
+#   that does not beat the page it encodes is refused and a full page stored instead).
+# - The two arms not seeing identical mutations.
+#
+# ============================================================================
+# PART 2 — RESULTS.  Appended after the run, below this line.
+# ============================================================================
