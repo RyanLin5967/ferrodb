@@ -506,6 +506,17 @@ fn row_bytes() -> usize {
 /// the accumulated cost of everything before it. Read out of the system (`MergeReport::from`)
 /// rather than assumed, and a repeat is a refusal, not a warning.
 fn assert_fresh_branches(cycles: &[Cycle], label: &str) {
+    // A run that collected nothing has not passed. Every assertion below lives inside the loop,
+    // so on an empty slice this whole guard is vacuous: it returns cleanly, `print_pass` writes
+    // its control header over an empty table, and the harness exits 0 having measured nothing.
+    // That is indistinguishable in the output from a pass, which is the direction that gets
+    // quoted. Refuse instead, and name which pass came back empty.
+    assert!(
+        !cycles.is_empty(),
+        "{label}: zero cycles were collected, so every freshness check below is vacuous. An \
+         empty pass is not a passing pass — it is a pass that did not run. Refusing to print a \
+         control header over an empty table."
+    );
     let mut seen: HashSet<(u64, u32)> = HashSet::new();
     let mut seen_prov: HashSet<ferrodb::provenance::ProvId> = HashSet::new();
     for c in cycles {
@@ -899,4 +910,45 @@ fn main() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+mod fire_check {
+    //! The empty-pass refusal in `assert_fresh_branches` is a detector, and a detector that has
+    //! never been forced to fire is not a clean result. These two prove both directions: it
+    //! panics on the empty slice it exists for, and it does NOT panic on a legitimate one-cycle
+    //! pass (a guard that refuses everything is the same defect wearing the other sign).
+    use super::*;
+
+    fn a_cycle(r: i64, branch_id: u64, generation: u32, prov: u32) -> Cycle {
+        let b = ferrodb::branch::types::BranchId { id: branch_id, generation };
+        Cycle {
+            r,
+            pages: 0,
+            raw_bytes: 0,
+            writes: 0,
+            wal_bytes: 0,
+            fsyncs: 0,
+            arena_replaces: 0,
+            arena_bytes: 0,
+            live_delta: 0,
+            merge_ms: 0.0,
+            total_ms: 0.0,
+            from: b,
+            branch: b,
+            prov: ferrodb::provenance::ProvId(prov),
+            seq: 0,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zero cycles were collected")]
+    fn an_empty_pass_is_refused_rather_than_printed_as_a_control() {
+        assert_fresh_branches(&[], "FIRE CHECK");
+    }
+
+    #[test]
+    fn a_pass_that_actually_collected_something_still_passes() {
+        assert_fresh_branches(&[a_cycle(1, 7, 0, 1)], "FIRE CHECK");
+    }
 }
