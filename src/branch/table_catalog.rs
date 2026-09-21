@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::branch::group_commit::CommitGroup;
+/// ⛔ D123 MEASUREMENT SCAFFOLD — must never merge. See `src/branch/d123_probe.rs`.
+use crate::branch::d123_probe as probe;
 use crate::branch::record::{BranchRecord, CapabilityEnvelope, CoreRecord};
 use crate::branch::tree_keys as keys;
 use crate::branch::types::{
@@ -40,6 +42,10 @@ use crate::storage::index::BPlusTreeManager;
 
 /// Header payload: `next_id` then `epoch`, both big-endian.
 const HEADER_BYTES: usize = 16;
+
+/// ⛔ D123 SCAFFOLD. Synthetic parent id for F5's extra upserts, chosen so the keys cannot collide
+/// with any real branch's child span. Only reachable when `FERRODB_D123_EXTRA` > 0.
+const D123_EXTRA_PARENT: u64 = u64::MAX / 2;
 
 pub struct TableBranchCatalog {
     tree: BPlusTreeManager<Vec<u8>, Vec<u8>>,
@@ -774,11 +780,17 @@ impl BranchCatalog for TableBranchCatalog {
 
     fn fork(&self, parent: BranchId, lease: LeaseDeadline) -> Result<BranchRecord, FerroError> {
         let fork_epoch = self.next_epoch();
+        // ⛔ D123 MEASUREMENT SCAFFOLD — every `probe::` call and every `stub` branch below must be
+        // reverted before this file merges. See `src/branch/d123_probe.rs`.
+        let stub = probe::stub_level();
         // The lock covers every TREE MUTATION and nothing else. It is dropped before the fsync, so
         // concurrent forkers share one disk round-trip instead of queueing for private ones. See
         // `group_commit` for why the ticket is taken last.
         let (child, seq) = {
+            let t_wait = probe::mark();
             let _g = self.logical.lock().unwrap();
+            probe::record(probe::PH_WAIT, t_wait);
+            let t_hold = probe::mark();
 
         // HYDRATED, and this is a security property, not an optimisation. `fork_child` does
         // `parent.envelope.as_ref().map(CapabilityEnvelope::inherited)`, so a parent read WITHOUT
@@ -787,29 +799,43 @@ impl BranchCatalog for TableBranchCatalog {
         //
         // `core()` deliberately leaves the envelope empty because it lives in its own key span.
         // That is exactly why reading a parent through it here was wrong.
+        let t_core = probe::mark();
         let parent_core = self.core(parent.id)?.ok_or(BranchError::NotFound(parent))?;
         parent_core.check_readable(parent)?;
+        probe::record(probe::PH_CORE, t_core);
         // ONE POINT LOOKUP, not `hydrate`. `hydrate` also range-scans the parent's whole arena
         // span, and `fork_child` never reads `arenas` -- measured at ~42ns per arena of the parent,
         // x0.72 throughput at 2000 (`bench/fork_parent_arena_scan.txt`). The envelope is still
         // loaded, and that is not optional: a parent read without it hands the child `None`, which
         // is the UNGOVERNED default and was a shipped capability escape (339e405).
-        let parent_envelope = self.envelope_bytes(parent.id)?;
+        let t_env = probe::mark();
+        // ⛔ SCAFFOLD: stub 3 drops the envelope lookup. That is a CAPABILITY ESCAPE in a real
+        // build — the comment above says so — which is exactly why this file may not merge.
+        let parent_envelope =
+            if stub >= 3 { None } else { self.envelope_bytes(parent.id)? };
+        probe::record(probe::PH_ENVELOPE, t_env);
 
         // Recycle a retired slot if one is free, otherwise mint a new one. Either way the
         // generation comes from the slot's history, never from zero — a reused id whose generation
         // restarted would make a stale handle look current.
-        let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
-        let recycled = self
-            .tree
-            .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
-            .next()
-            .transpose()?
-            .and_then(|(k, _)| keys::free_id_from_key(&k));
+        let t_free = probe::mark();
+        // ⛔ SCAFFOLD: stub 2+ skips the scan and always mints fresh, which leaks retired slots.
+        let recycled = if stub >= 2 {
+            None
+        } else {
+            let (lo, hi) = keys::whole_group(keys::tag::FREE_ID);
+            self.tree
+                .range_scan(Bound::Included(lo), Bound::Excluded(hi))?
+                .next()
+                .transpose()?
+                .and_then(|(k, _)| keys::free_id_from_key(&k))
+        };
+        probe::record(probe::PH_FREE_SCAN, t_free);
 
         // `reused` decides which writer runs below, and it is the whole safety condition for
         // `write_record_new`: a recycled slot still holds the reaped branch's record, state and
         // deadline keys, so its keys are NOT new.
+        let t_mint = probe::mark();
         let (child_num, generation, reused) = match recycled {
             Some(id) => {
                 self.remove_if_present(&keys::free_id(id))?;
@@ -819,6 +845,8 @@ impl BranchCatalog for TableBranchCatalog {
             None => (self.next_id.fetch_add(1, Ordering::SeqCst), 0, false),
         };
         let child_id = BranchId::new(child_num, generation);
+        probe::record(probe::PH_MINT, t_mint);
+            let t_build = probe::mark();
             let child = BranchRecord::fork_child_from_core(
                 &parent_core,
                 parent_envelope.as_ref(),
@@ -826,25 +854,62 @@ impl BranchCatalog for TableBranchCatalog {
                 fork_epoch,
                 lease,
             )?;
+            probe::record(probe::PH_BUILD, t_build);
 
-            if reused {
-                self.write_record(&child, None)?;
-            } else {
-                self.write_record_new(&child)?;
+            let t_wr = probe::mark();
+            // ⛔ SCAFFOLD: stub 1+ never writes the child's record. The branch does not exist.
+            if stub == 0 {
+                if reused {
+                    self.write_record(&child, None)?;
+                } else {
+                    self.write_record_new(&child)?;
+                }
             }
+            probe::record(probe::PH_WRITE_RECORD, t_wr);
             // The child's entry in its parent's live set. A child that exists but is not listed in its
         // parent is a GC correctness hole, which is why both happen under one logical lock.
         // The VALUE is the child's branch id, so a reader can resolve the child and check
         // whether it is still live. See `live_child_at` for why the entry is only a hint.
-            self.tree
-                .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
+            let t_ck = probe::mark();
+            // ⛔ SCAFFOLD: stub 3 drops the parent's live-children entry — the GC hole the comment
+            // above names.
+            if stub < 3 {
+                self.tree
+                    .insert(keys::child(parent.id, fork_epoch.0), child_num.to_be_bytes().to_vec())?;
+            }
+            probe::record(probe::PH_CHILD_KEY, t_ck);
+
+            // F5's additive axis: k extra upserts under `logical`, on a fixed key set so the tree
+            // does not grow with k. Cheap, correctness-neutral, and the ONLY arm that needs no
+            // stub at all — see `bench/d123_PREREGISTRATION.md`.
+            let extra = probe::extra_upserts();
+            if extra > 0 {
+                let t_extra = probe::mark();
+                for i in 0..extra {
+                    self.upsert(keys::child(D123_EXTRA_PARENT, i), Vec::new())?;
+                }
+                probe::record(probe::PH_EXTRA, t_extra);
+            }
+
+            let t_hdr = probe::mark();
+            // ⛔ NEVER STUBBED AT ANY LEVEL. This is the ≥1 dirty page that keeps the fsync real;
+            // without it macOS short-circuits F_FULLFSYNC and the stub measures a non-durable
+            // system. See `d123_probe::stub_level`.
             self.write_header()?;
+            probe::record(probe::PH_HEADER, t_hdr);
             // Ticket LAST: every mutation above is now in the pool, so an fsync issued after this
             // point necessarily covers this fork.
-            (child, self.stage()?)
+            let t_stage = probe::mark();
+            let staged = self.stage()?;
+            probe::record(probe::PH_STAGE, t_stage);
+            probe::record(probe::PH_HOLD, t_hold);
+            (child, staged)
         };
         // Durable before the caller is told the fork happened -- but shared, not private.
+        let t_dur = probe::mark();
         self.durable(seq)?;
+        probe::record(probe::PH_DURABLE, t_dur);
+        probe::bump_fork();
         Ok(child)
     }
 
