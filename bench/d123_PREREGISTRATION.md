@@ -181,3 +181,32 @@ is **biased toward detecting line bouncing and biased against detecting eviction
 effects.** If it comes back ≈1.0x, that rules out line-bouncing-on-shared-pages specifically; it
 does not rule out a mechanism that needs many distinct pages. Said here so the negative result is
 not overread later.
+
+# ⭐ AMENDMENT 4 — A THIRD REGIME MISMATCH IN THE INHERITED SUBTRACTION. Written before any result.
+
+The two numbers being subtracted were not taken on the same tree, and nobody has said so.
+
+* **0.228 ms** comes from `fork_concurrency.rs`, which opens an **EMPTY** catalog and times 4,000
+  forks. The tree grows 0 → 4,000 keys *during* the timed window.
+* **0.0748 ms** comes from `serial_section_profile`, which does `const WARM: usize = 20_000` first,
+  precisely so that "a profile taken on an empty tree measures the best case of every descent".
+
+So the named components were priced on a **5x deeper tree** than the throughput they are subtracted
+from. Every one of those seven components is a B+tree descent. The subtraction therefore mixes
+**three** regimes, not the one the brief names: 1-thread vs 64-thread, uncontended vs contended,
+**and 20k-key vs 0→4k-key**. The depth mismatch pushes in the direction of making the named share
+look LARGER than it is in the throughput regime, i.e. the true unattributed share at 4k keys may be
+**more** than 67.2%, not less.
+
+My harness is immune to this by construction — `HOLD` and `S_eff` come from the same run on the same
+tree — but comparability to `bench/fork_concurrency_after.txt` is not. Therefore:
+
+**PRE-REGISTERED, BEFORE SEEING ANY NUMBER:** the battery is run a second time end to end with
+`FERRODB_D123_WARM=0`, which reproduces `fork_concurrency`'s exact regime.
+
+* **Reproduction check:** the warm=0, stub=0, T=64 arm must land within **±15%** of 4,382 forks/sec.
+  If it does not, my harness is measuring a different system from the one the inherited numbers
+  describe, **and every comparison to them is withdrawn** — I report the discrepancy rather than
+  the attribution.
+* The warm=20,000 battery keeps its own numbers; the two are reported side by side and never mixed
+  into one subtraction. That is the error this row exists to stop repeating.
