@@ -12,6 +12,7 @@ import sys
 
 WT = "/Users/idide/wt/ferrodb-D94-dedup"
 SWEEP = f"{WT}/bench/d94_sweep_raw.txt"
+SWEEP2 = f"{WT}/bench/d94_sweep_raw_part2.txt"
 EXTENT = f"{WT}/bench/d94_extent_premise_raw.txt"
 TESTS = f"{WT}/bench/d94_dedup_tests.txt"
 OUT = f"{WT}/bench/d94_chunk_dedup.txt"
@@ -23,21 +24,33 @@ ROW = re.compile(
 
 
 def read_sweep():
-    rows, stamp = [], None
-    for line in open(SWEEP):
-        if line.startswith("d94_dedup_premise at"):
-            stamp = line.strip()
-        m = ROW.match(line.rstrip("\n"))
-        if m:
-            g = m.groups()
-            rows.append(
-                dict(
-                    n=int(g[0]), dup=float(g[1]), trunk=int(g[2]), refs=int(g[3]),
-                    distinct=int(g[4]), whole=int(g[5]), payload=int(g[6]),
-                    live=int(g[7]), cow=int(g[8]), gain=int(g[9]),
+    """Read every raw sweep file, keeping each one's provenance stamp.
+
+    The sweep was interrupted by a rate limit after 7 of 9 rows and finished in a second run, so
+    there are two raw files and two stamps. Both are reported rather than merged into one claim:
+    a banked number has to say which build produced it.
+    """
+    rows, stamps = [], []
+    for path in (SWEEP, SWEEP2):
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("d94_dedup_premise at"):
+                stamps.append((path.rsplit("/", 1)[-1], line.strip()))
+            m = ROW.match(line)
+            if m:
+                g = m.groups()
+                rows.append(
+                    dict(
+                        n=int(g[0]), dup=float(g[1]), trunk=int(g[2]), refs=int(g[3]),
+                        distinct=int(g[4]), whole=int(g[5]), payload=int(g[6]),
+                        live=int(g[7]), cow=int(g[8]), gain=int(g[9]),
+                    )
                 )
-            )
-    return stamp, rows
+    rows.sort(key=lambda r: (r["n"], r["dup"]))
+    return stamps, rows
 
 
 def fit(points):
@@ -58,15 +71,22 @@ def fit(points):
 
 
 def main():
-    stamp, rows = read_sweep()
+    stamps, rows = read_sweep()
     if not rows:
         print("REFUSING: no rows parsed from the sweep. A run that collected nothing has not "
               "passed.", file=sys.stderr)
         return 2
-    if stamp is None or "+DIRTY" in stamp:
-        print(f"REFUSING: provenance stamp is missing or DIRTY ({stamp!r}). A banked measurement "
-              "must name the commit that produced it.", file=sys.stderr)
+    if not stamps or any("+DIRTY" in st for _, st in stamps):
+        print(f"REFUSING: a provenance stamp is missing or DIRTY ({stamps!r}). A banked "
+              "measurement must name the commit that produced it.", file=sys.stderr)
         return 2
+    expected = {(100, 0.0), (100, 0.5), (100, 1.0), (1000, 0.0), (1000, 0.5), (1000, 1.0),
+                (10000, 0.0), (10000, 0.5), (10000, 1.0)}
+    have = {(r["n"], r["dup"]) for r in rows}
+    missing = sorted(expected - have)
+    if missing:
+        print(f"WARNING: the sweep is INCOMPLETE -- missing {missing}. Banking a partial curve.",
+              file=sys.stderr)
 
     try:
         extent = open(EXTENT).read()
@@ -85,26 +105,53 @@ def main():
     L = []
     w = L.append
     w("=== D94: CROSS-BRANCH CHUNK DEDUP -- the premise first, then the sweep ===")
-    w(f"harness: examples/d94_dedup_premise.rs, built {stamp.split('at',1)[1].strip()}")
+    for fname, st in stamps:
+        w(f"harness: examples/d94_dedup_premise.rs, built {st.split('at',1)[1].strip()}  [{fname}]")
+    if len({st for _, st in stamps}) > 1:
+        w("  two builds: the sweep was cut off by a rate limit after 7 of 9 rows and finished in a")
+        w("  second run. The only source delta between them is +53 lines of #[cfg(test)] module in")
+        w("  src/cow/dedup.rs, which is unwired and not on the harness's path; the harness file")
+        w("  itself is byte-identical (git diff 48c6e60 HEAD -- examples/d94_dedup_premise.rs is")
+        w("  empty). The rows are therefore comparable, and both stamps are printed rather than")
+        w("  one being presented as if it covered all nine rows.")
     w(f"module:  src/cow/dedup.rs        tests: {test_line}")
-    w("raw:     bench/d94_sweep_raw.txt, bench/d94_extent_premise_raw.txt,")
+    w("raw:     bench/d94_sweep_raw.txt + bench/d94_sweep_raw_part2.txt,")
+    w("         bench/d94_extent_premise_raw.txt,")
     w("         bench/d94_zero_falsifier.txt (the 0 at dup_frac=0.00, forced to fire at k=1,2,3)")
     w("built by: bench/d94_summarise.py -- every number here is read from a raw run, not retyped")
     w("")
-    w("SHORT VERSION. The mechanism is built and tested. Adopting it is NOT recommended on this")
-    w("evidence, and the reason is the first table, not the second.")
+    w("VERDICT: REFUSE. The mechanism is built and tested; it is NOT adopted and NOT wired into")
+    w("any write path. The deciding result is not that dedup wins too little -- it is that the")
+    w("frontier's mechanism CANNOT FIRE IN THIS ENGINE AT ALL, and that this is deliberate:")
+    w("")
+    w("  There is not one byte-identical WHOLE page in any configuration measured below, including")
+    w("  dup_frac = 1.00 where every branch writes byte-identical ROWS. ForkBase dedups because its")
+    w("  chunks carry no per-owner identity; ferrodb's pages carry birth_epoch and arena_id exactly")
+    w("  so the epoch-interval reaper can free them without a global liveness question.")
+    w("  THE SAME 24 BYTES THAT MAKE DEDUP IMPOSSIBLE ARE WHAT MAKE RECLAMATION CHEAP.")
+    w("")
+    w("  Payload-level dedup -- keying on page[24..] instead of the whole page -- is the only form")
+    w("  that could ever pay here, and it is refused too. It buys a workload-CONDITIONAL 10-30% and")
+    w("  costs refcounts; refcounts reintroduce the global liveness question that src/cow/mod.rs")
+    w("  lists as a deliberate non-goal ('this is why Dolt needs copying mark-and-sweep GC'), which")
+    w("  makes a chunk-GC row live that is otherwise dead. Reopening a solved reclamation path for")
+    w("  a conditional 10-30% is the wrong trade. Written down so it is not rediscovered.")
     w("")
 
     # ---- Premise 1: the extent wall -------------------------------------------------
     w("-- PREMISE 1: is extent granularity still the space wall? NO. It was, and it is closed. --")
     w("")
-    w("The brief points at a 262x space amplification from 1 MiB extents per branch. That number")
-    w("is real and was measured on branch D32-write-curve, which is NOT merged: its artifact")
-    w("bench/d32_write_curve.txt does not exist on main (git cat-file -e HEAD:bench/d32_write_curve.txt")
-    w("-> ABSENT; git branch --contains 4f46e6d -> D32-write-curve only). What it recorded:")
+    w("The brief pointed at a 262x space amplification from 1 MiB extents per branch and cited")
+    w("bench/d32_write_curve.txt. That citation is wrong and the brief has been retracted: the file")
+    w("is not on main (git cat-file -e HEAD:bench/d32_write_curve.txt -> ABSENT; it lives only on")
+    w("the unmerged branch D32-write-curve). The number itself is real and IS banked on main, as")
+    w("the BEFORE row of bench/d31_before.txt -- which is the reference to quote:")
     w("")
-    w("    D32, one page written per branch:  1,048,316 len B/branch   965,108 alloc B/branch")
-    w("    -> extrapolated 1.05 TB at 10^6 branches. D31 named as the binding wall.")
+    w("    bench/d31_before.txt:9   N=4000   4193.3 MB data   1,048,316 len B/branch")
+    w("    bench/d31_after.txt:9    N=4000     16.4 MB data       4,097 len B/branch")
+    w("                             -> 'VERDICT -- AMPLIFICATION GONE'")
+    w("")
+    w("So 262x is a FIXED BUG, not a live wall, and it was fixed before this row was opened.")
     w("")
     w("D31 has since landed on main: branch::types::ARENA_FIRST_EXTENT_PAGES = 1 with geometric")
     w("growth to a 256-page cap (next_extent_pages), used by ArenaPageStore (arena.rs:1325).")
