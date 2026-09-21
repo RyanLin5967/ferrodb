@@ -1104,14 +1104,14 @@ fn compose_failed(
 /// the target absorbed": with a source that assigned a cell twice and only the first pick taken,
 /// the second (unselected) op equalled ours, `resolve_cell`'s same-value shortcut fired, and the
 /// target's concurrent write was **silently overwritten**. See
-/// `d1_an_unselected_source_op_is_not_the_targets_divergence`.
+/// `regression_an_unselected_source_op_must_not_excuse_a_target_move`.
 ///
 /// The seq cut is gone with it, and that fixed a second defect: `seq` is one global counter over a
 /// log that interleaves branches, so the target's write to a cell is not obliged to come *after*
 /// the source's. With the cut in place, truth-table row 2 — two `Add`s that should commute —
 /// refused whenever the target happened to write first, which for cherry-pick is the likely order
 /// (the fix being picked is recent; the branch it lands on has been writing that cell for a
-/// while). See `d2_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq`.
+/// while). See `row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq`.
 ///
 /// **2. A composed divergence is trusted only if it EXPLAINS the value the target actually
 /// holds.** Composing every non-source op on the cell can over-count: an op that landed before the
@@ -1911,12 +1911,22 @@ mod tests {
     // Every test in this block was written to FAIL against the version of this module that was
     // committed before it, and every one of them did. They are the specification of the fixes.
 
-    /// **D1.** `divergence` must not count the SOURCE branch's own unselected ops as "what the
-    /// target absorbed". Source assigns twice, only the first is picked; the target concurrently
-    /// assigned something else. The unselected source op equals ours, so the same-value shortcut
-    /// in `resolve_cell` fires and the target's write is silently overwritten.
+    /// **The original defect, end to end.** Source assigns the same cell twice and only the first
+    /// is picked; the target concurrently assigned something else. Under the version that had both
+    /// a `seq` cut and no branch filter, the unselected SOURCE op was the only thing above the cut,
+    /// it equalled ours, `resolve_cell`'s same-value shortcut fired, and the target's write was
+    /// silently overwritten.
+    ///
+    /// ⚠ **This case needs BOTH faults, so it does not isolate either guard** — removing just the
+    /// branch filter, or just the verification, still leaves it refusing. It is here as the
+    /// regression test for the defect as it actually occurred. The guards are each covered
+    /// separately, and a mutation sweep confirmed it: removing the branch filter fails
+    /// `row02_target_moved_but_ops_commute_applies_composed_onto_target`,
+    /// `row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq` and
+    /// `row02_max_and_min_divergences_commute_as_well_as_add`; removing the verification fails
+    /// `row27_divergence_that_does_not_explain_the_targets_value_is_not_trusted`.
     #[test]
-    fn d1_an_unselected_source_op_is_not_the_targets_divergence() {
+    fn regression_an_unselected_source_op_must_not_excuse_a_target_move() {
         let mut log = MemCherryLog::new();
         let mut theirs = cell_op(OpKind::Assign(int(5)), Some(int(0)));
         theirs.branch = dst();
@@ -1934,10 +1944,12 @@ mod tests {
         assert_eq!(t.cell(T, R, C), Some(&int(5)), "the target's write must not be lost");
     }
 
-    /// **D2.** Truth-table row 2 must not depend on which branch happened to write first. This is
-    /// `row02` with the two pushes swapped: the target's op has the LOWER seq.
+    /// Truth-table row 2 must not depend on which branch happened to write first. This is
+    /// `row02_target_moved_but_ops_commute...` with the two pushes swapped, so the target's op has
+    /// the LOWER seq — the order a cherry-pick actually meets, since the fix being picked is recent
+    /// and the branch it lands on has been writing that cell for a while.
     #[test]
-    fn d2_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq() {
+    fn row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq() {
         let mut log = MemCherryLog::new();
         let mut theirs = cell_op(OpKind::Add(Delta::Int(-5)), Some(int(20)));
         theirs.branch = dst();
@@ -1950,7 +1962,7 @@ mod tests {
         assert_eq!(t.cell(T, R, C), Some(&int(12)), "20 - 5 - 3");
     }
 
-    /// **D5.** Only the LAST whole-row op was examined, so a `RowCreate` earlier in the selection
+    /// Row 25. Only the LAST whole-row op was examined, so a `RowCreate` earlier in the selection
     /// was never checked against the target and row 10's `RowExists` refusal was bypassed.
     #[test]
     fn row25_a_create_then_delete_selection_still_checks_the_create() {
@@ -1967,7 +1979,7 @@ mod tests {
         assert_eq!(t.snapshot(), before, "the row must not have been deleted");
     }
 
-    /// **D5, mirror.** Delete-then-create onto a target that has the row is legitimate: the row
+    /// Row 24. Delete-then-create onto a target that has the row is legitimate: the row
     /// ends existing with the created image.
     #[test]
     fn row24_a_delete_then_create_selection_replaces_the_row() {
@@ -1980,7 +1992,7 @@ mod tests {
         assert_eq!(t.get(T, R), Some(&vec![int(1), int(2), int(3)]));
     }
 
-    /// **D4.** `apply_op` has no arm for the set ops, so they reached the caller as an engine
+    /// Row 22. `apply_op` has no arm for the set ops, so they reached the caller as an engine
     /// `Err`. The contract says `Err` is for impossible internal state and everything a caller
     /// can express comes back as a refusal.
     #[test]
@@ -1998,7 +2010,7 @@ mod tests {
         assert_eq!(t.commits, 0);
     }
 
-    /// **D4, second half.** An op recorded with no column but a cell-shaped kind is malformed
+    /// Row 23. An op recorded with no column but a cell-shaped kind is malformed
     /// input, not an impossible internal state.
     #[test]
     fn row23_a_whole_row_op_with_a_cell_kind_refuses_rather_than_erroring() {
@@ -2011,7 +2023,7 @@ mod tests {
         assert_eq!(t.commits, 0);
     }
 
-    /// **The divergence verification.** When the log's non-source ops do NOT explain the value
+    /// Row 27, the divergence verification. When the log's non-source ops do NOT explain the value
     /// the target actually holds, the engine must not trust them: it falls back to an opaque
     /// `Assign`, which conflicts. Without this the composed `theirs` is a guess dressed as a
     /// reading, and rows 3/4/5's fixtures cannot tell the two apart.
