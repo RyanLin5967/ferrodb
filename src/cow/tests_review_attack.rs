@@ -644,3 +644,117 @@ fn a8_deletes_leave_the_leaf_count_where_it_was() {
         want.len()
     );
 }
+
+// ================================================================================================
+// A9 — reproducing cid.rs's delete diagnosis, then changing only the delete SHAPE
+// ================================================================================================
+
+/// `cid::tests::a_delete_leaves_empty_leaves_behind_and_breaks_the_partition` (main, 1758b3b)
+/// asserts, as a load-bearing diagnosis, that after a delete "the live partition is exact, and the
+/// whole difference is empty leaves":
+///
+/// ```text
+///   assert_eq!(ordered_leaf_entries(churned).filter(!is_empty), ordered_leaf_entries(clean),
+///       "the SURVIVING leaves must already agree — if they do not, the gap is in the boundary
+///        rule and not merely in unreclaimed empty leaves, and the diagnosis above is wrong");
+/// ```
+///
+/// Its fixture deletes keys 500..1000 — a contiguous **suffix**. This probe runs that shape
+/// first (to reproduce their result), then changes nothing but the delete shape.
+#[test]
+fn a9_the_delete_diagnosis_holds_only_for_a_suffix_delete() {
+    // cid.rs's own key/value shape.
+    let ck = |n: u32| n.to_be_bytes().to_vec();
+    let cv = |n: u32| format!("v{n}").into_bytes();
+    let all: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32).map(|i| (ck(i), cv(i))).collect();
+
+    // Their claim, stated as a closure so both shapes are judged by the identical predicate.
+    let surviving_leaves_agree = |churned: &[Vec<(Vec<u8>, Vec<u8>)>],
+                                  clean: &[Vec<(Vec<u8>, Vec<u8>)>]| {
+        let live: Vec<_> = churned.iter().filter(|l| !l.is_empty()).cloned().collect();
+        live == clean.to_vec()
+    };
+
+    // ---- SHAPE S: their fixture, a contiguous suffix -----------------------------------------
+    let fs = Fixture::new();
+    let mut churned_s = fs.build(&all);
+    for i in 500..1000u32 {
+        churned_s = fs.tree.delete(churned_s, BranchId::TRUNK, fs.tick(), &ck(i)).unwrap();
+    }
+    let churned_s_part = fs.leaf_partition(churned_s);
+    let gs = Fixture::new();
+    let clean_s: Vec<(Vec<u8>, Vec<u8>)> = (0..500u32).map(|i| (ck(i), cv(i))).collect();
+    let clean_s_part = gs.leaf_partition(gs.build(&clean_s));
+    let s_holds = surviving_leaves_agree(&churned_s_part, &clean_s_part);
+    println!(
+        "A9 SHAPE S (suffix 500..1000): churned {} leaves ({} empty), clean {} leaves -> \
+         surviving leaves agree: {}",
+        churned_s_part.len(),
+        churned_s_part.iter().filter(|l| l.is_empty()).count(),
+        clean_s_part.len(),
+        s_holds
+    );
+
+    // ---- SHAPE I: one interior key that terminates a leaf ------------------------------------
+    let fi = Fixture::new();
+    let mut churned_i = fi.build(&all);
+    let base = fi.leaf_partition(churned_i);
+    // Pick a leaf well inside the tree whose last entry is a content boundary.
+    let idx = base.len() / 2;
+    let (vk, vv) = base[idx].last().unwrap().clone();
+    assert!(chunker::is_boundary(&vk, &vv), "fixture: leaf {} must end on a boundary", idx);
+    churned_i = fi.tree.delete(churned_i, BranchId::TRUNK, fi.tick(), &vk).unwrap();
+    let churned_i_part = fi.leaf_partition(churned_i);
+
+    let clean_i: Vec<(Vec<u8>, Vec<u8>)> =
+        all.iter().filter(|(kk, _)| kk != &vk).cloned().collect();
+    let gi = Fixture::new();
+    let clean_i_part = gi.leaf_partition(gi.build(&clean_i));
+    let i_holds = surviving_leaves_agree(&churned_i_part, &clean_i_part);
+    println!(
+        "A9 SHAPE I (one interior boundary key): churned {} leaves ({} empty), clean {} leaves \
+         -> surviving leaves agree: {}",
+        churned_i_part.len(),
+        churned_i_part.iter().filter(|l| l.is_empty()).count(),
+        clean_i_part.len(),
+        i_holds
+    );
+
+    // Control: both sides really do hold the same rows, or nothing above measures shape.
+    let flat_i: Vec<_> = churned_i_part.iter().flatten().cloned().collect();
+    assert_eq!(flat_i, clean_i, "control: the two trees must hold the same rows");
+
+    if !i_holds {
+        let live: Vec<_> = churned_i_part.iter().filter(|l| !l.is_empty()).collect();
+        let at = live
+            .iter()
+            .zip(clean_i_part.iter())
+            .position(|(a, b)| **a != *b)
+            .expect("they differ, so a first difference exists");
+        println!(
+            "A9 first disagreeing SURVIVING leaf is #{}: churned holds {} rows, clean holds {} \
+             rows (neither is empty)",
+            at,
+            live[at].len(),
+            clean_i_part[at].len()
+        );
+        println!(
+            "A9   churned live leaf sizes {:?}",
+            live.iter().skip(at.saturating_sub(1)).take(4).map(|l| l.len()).collect::<Vec<_>>()
+        );
+        println!(
+            "A9   clean   leaf sizes {:?}",
+            clean_i_part.iter().skip(at.saturating_sub(1)).take(4).map(|l| l.len()).collect::<Vec<_>>()
+        );
+    }
+
+    assert!(s_holds, "could not reproduce cid.rs's result on its own suffix fixture");
+    assert!(
+        i_holds,
+        "AXIS 2 — cid.rs's diagnosis is scope-limited: it holds for a suffix delete (reproduced \
+         above) and fails for a single interior boundary key. The disagreeing leaves are NOT \
+         empty, so by that test's own wording 'the gap is in the boundary rule and not merely in \
+         unreclaimed empty leaves', and the pre-registered fix it points at (unlink emptied \
+         leaves) cannot close it."
+    );
+}
