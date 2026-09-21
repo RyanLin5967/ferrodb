@@ -19,13 +19,26 @@
 //! - A subtree neither side touched: `ours == theirs` (both still the base page). **Skipped.**
 //! - A subtree only *ours* touched: `theirs == base`. **Skipped** — ours already holds it.
 //! - A subtree only *theirs* touched: `ours == base`. **Descended**, because the merged tree is
-//!   built on ours and theirs' change has to be found and applied.
+//!   built on ours and theirs' change has to be found and applied, but with no conflict reachable.
+//! - A subtree **both** sides touched: no rule fires, full three-way descent to the leaf.
 //!
-//! So the descent follows **theirs' four paths and nothing else**, plus the spine they share. With
-//! a B+tree of depth d that is at most `4 x d` node triples, so `nodes_read <= 12 x d`, and d grows
-//! like log N. Concretely: if d is 2 at N=1k and 3 at N=256k, `nodes_read` should grow by roughly
-//! 1.5x while N grows 256x and the page count grows with it. **If `nodes_read` tracks the page
-//! count, the descent is not skipping and the design is wrong.**
+//! Either way the descent follows only the paths somebody wrote. With a B+tree of depth d that is
+//! at most `(ours' paths + theirs' paths) x d` node triples, and d grows like log N. **If
+//! `nodes_read` tracks the page count, the descent is not skipping and the design is wrong.**
+//!
+//! # Two workloads, because a counter that never fires proves nothing
+//!
+//! The first run of this harness used adjacent keys (`i` and `i+1`) for the two sides. They land
+//! in the same leaf, so every changed path is contested, `skip_theirs_unchanged` and
+//! `descend_ours_unchanged` both read **0 at every N**, and a reader would have had no way to tell
+//! a rule that cannot fire from a rule that had nothing to fire on. Both workloads therefore run:
+//!
+//! - **contested** — the sides change keys one apart, so they share every node down to the leaf.
+//!   This is the worst case for skipping and the one that bounds `nodes_read` from above.
+//! - **separated** — ours changes keys in the first half of the key space, theirs in the second,
+//!   so most changed paths are touched by exactly one side. This is the case rules 2 and 3 exist
+//!   for, and it is what makes their zeros in the contested arm readable as "nothing to skip"
+//!   rather than "counter is dead".
 //!
 //! `ids_compared` is the other half and is reported rather than hidden: every child of a descended
 //! node is *tested*, and most are retired by that test without a read. It grows like
@@ -121,8 +134,44 @@ struct Arm {
     conflicts: usize,
 }
 
-/// One point on the curve: build N rows, fork twice, change `deltas` disjoint keys per side, merge.
-fn arm(n: usize, deltas: usize) -> Arm {
+/// How the two sides' changed keys are placed relative to each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// `i` and `i+1`: the sides share every node down to the leaf. Worst case for skipping.
+    Contested,
+    /// Ours in the first half of the key space, theirs in the second. Most changed paths belong to
+    /// exactly one side, which is what rules 2 and 3 are for.
+    Separated,
+}
+
+impl Placement {
+    fn name(self) -> &'static str {
+        match self {
+            Placement::Contested => "contested",
+            Placement::Separated => "separated",
+        }
+    }
+
+    /// The keys each side changes, given N and the per-side delta.
+    fn keys(self, n: usize, deltas: usize) -> (Vec<usize>, Vec<usize>) {
+        match self {
+            Placement::Contested => {
+                let ours: Vec<usize> = (0..deltas).map(|j| n * (j + 1) / (deltas + 1)).collect();
+                let theirs = ours.iter().map(|k| k + 1).collect();
+                (ours, theirs)
+            }
+            Placement::Separated => {
+                let half = n / 2;
+                let ours = (0..deltas).map(|j| half * (j + 1) / (deltas + 1)).collect();
+                let theirs = (0..deltas).map(|j| half + half * (j + 1) / (deltas + 1)).collect();
+                (ours, theirs)
+            }
+        }
+    }
+}
+
+/// One point on the curve: build N rows, fork twice, change `deltas` keys per side, merge.
+fn arm(n: usize, deltas: usize, placement: Placement) -> Arm {
     let h = Harness::new(&format!("n{n}"));
     let e = h.tick();
     let mut base = h.tree.create(TRUNK, e).unwrap();
@@ -137,8 +186,7 @@ fn arm(n: usize, deltas: usize) -> Arm {
     let tb = h.fork(3);
 
     // Spread the changes across the key space so the descent cannot get lucky with locality.
-    let ours_keys: Vec<usize> = (0..deltas).map(|j| n * (j + 1) / (deltas + 1)).collect();
-    let theirs_keys: Vec<usize> = ours_keys.iter().map(|k| k + 1).collect();
+    let (ours_keys, theirs_keys) = placement.keys(n, deltas);
 
     let mut ours = base;
     for &i in &ours_keys {
@@ -158,9 +206,9 @@ fn arm(n: usize, deltas: usize) -> Arm {
     // A curve over a WRONG merge is worse than no curve. These run at every N.
     assert_eq!(
         r.stats.root_fast_path, None,
-        "N={n}: a root fast path retired the merge, so this arm measured nothing"
+        "N={n} {}: a root fast path retired the merge, so this arm measured nothing", placement.name()
     );
-    assert!(r.conflicts.is_empty(), "N={n}: disjoint keys must not conflict: {:?}", r.conflicts);
+    assert!(r.conflicts.is_empty(), "N={n} {}: disjoint keys must not conflict: {:?}", placement.name(), r.conflicts);
     for &i in &ours_keys {
         assert_eq!(h.tree.get(r.merged_root, &key(i)).unwrap(), Some(b"OURS".to_vec()));
     }
@@ -248,70 +296,110 @@ fn main() {
 
     let deltas = 4;
     let sizes = [1_000usize, 4_000, 16_000, 64_000, 256_000];
-    let arms: Vec<Arm> = sizes.iter().map(|&n| arm(n, deltas)).collect();
 
-    println!("        N |  pages |  depth | nodes_read | ids_cmp | skips | skip_agree | skip_theirs_unch | descend_ours_unch | leaf_triples | keys_cmp | edits");
-    println!("----------|--------|--------|------------|---------|-------|------------|------------------|-------------------|--------------|----------|------");
-    for a in &arms {
-        let s = &a.stats;
-        println!(
-            "{:9} | {:6} | {:6} | {:10} | {:7} | {:5} | {:10} | {:16} | {:17} | {:12} | {:8} | {:5}",
-            a.n,
-            a.pages,
-            a.depth,
-            s.nodes_read,
-            s.ids_compared,
-            s.skips(),
-            s.skip_sides_agree,
-            s.skip_theirs_unchanged,
-            s.descend_ours_unchanged,
-            s.leaf_triples,
-            s.keys_compared,
-            s.edits_applied,
-        );
-        assert_eq!(a.conflicts, 0);
-    }
-    println!();
+    let mut by_placement = Vec::new();
+    for placement in [Placement::Contested, Placement::Separated] {
+        let arms: Vec<Arm> = sizes.iter().map(|&n| arm(n, deltas, placement)).collect();
 
-    let first = &arms[0];
-    let last = &arms[arms.len() - 1];
-    let grow = |a: usize, b: usize| if a == 0 { f64::NAN } else { b as f64 / a as f64 };
-    println!("across N = {} -> {} (x{:.0}):", first.n, last.n, grow(first.n, last.n));
-    println!("  pages        {:>7} -> {:>7}   x{:.1}", first.pages, last.pages, grow(first.pages, last.pages));
-    println!("  depth        {:>7} -> {:>7}", first.depth, last.depth);
-    println!(
-        "  nodes_read   {:>7} -> {:>7}   x{:.2}   <- the claim",
-        first.stats.nodes_read,
-        last.stats.nodes_read,
-        grow(first.stats.nodes_read, last.stats.nodes_read)
-    );
-    println!(
-        "  ids_compared {:>7} -> {:>7}   x{:.2}",
-        first.stats.ids_compared,
-        last.stats.ids_compared,
-        grow(first.stats.ids_compared, last.stats.ids_compared)
-    );
-    println!();
-    println!("  nodes_read as a fraction of the tree:");
-    for a in &arms {
+        println!("workload: {} — ours and theirs each change {deltas} keys.", placement.name());
+        match placement {
+            Placement::Contested => println!(
+                "  keys are one apart, so both sides share every node from the root to the leaf."
+            ),
+            Placement::Separated => println!(
+                "  ours in the first half of the key space, theirs in the second."
+            ),
+        }
+        println!("        N |  pages |  depth | nodes_read | ids_cmp | skips | skip_agree | skip_theirs_unch | descend_ours_unch | leaf_triples | keys_cmp | edits");
+        println!("----------|--------|--------|------------|---------|-------|------------|------------------|-------------------|--------------|----------|------");
+        for a in &arms {
+            let s = &a.stats;
+            println!(
+                "{:9} | {:6} | {:6} | {:10} | {:7} | {:5} | {:10} | {:16} | {:17} | {:12} | {:8} | {:5}",
+                a.n,
+                a.pages,
+                a.depth,
+                s.nodes_read,
+                s.ids_compared,
+                s.skips(),
+                s.skip_sides_agree,
+                s.skip_theirs_unchanged,
+                s.descend_ours_unchanged,
+                s.leaf_triples,
+                s.keys_compared,
+                s.edits_applied,
+            );
+            assert_eq!(a.conflicts, 0);
+        }
+        println!();
+
+        let first = &arms[0];
+        let last = &arms[arms.len() - 1];
+        let grow = |a: usize, b: usize| if a == 0 { f64::NAN } else { b as f64 / a as f64 };
+        println!("  across N = {} -> {} (x{:.0}):", first.n, last.n, grow(first.n, last.n));
+        println!("    pages        {:>7} -> {:>7}   x{:.1}", first.pages, last.pages, grow(first.pages, last.pages));
+        println!("    depth        {:>7} -> {:>7}", first.depth, last.depth);
         println!(
-            "    N={:>7}  {:>5} / {:>6} pages = {:.4}%   nodes_read/depth = {:.1}",
-            a.n,
-            a.stats.nodes_read,
-            a.pages,
-            100.0 * a.stats.nodes_read as f64 / a.pages as f64,
-            a.stats.nodes_read as f64 / a.depth as f64
+            "    nodes_read   {:>7} -> {:>7}   x{:.2}   <- the claim",
+            first.stats.nodes_read,
+            last.stats.nodes_read,
+            grow(first.stats.nodes_read, last.stats.nodes_read)
         );
+        println!(
+            "    ids_compared {:>7} -> {:>7}   x{:.2}",
+            first.stats.ids_compared,
+            last.stats.ids_compared,
+            grow(first.stats.ids_compared, last.stats.ids_compared)
+        );
+        println!("    nodes_read as a fraction of the tree, and against depth:");
+        for a in &arms {
+            println!(
+                "      N={:>7}  {:>5} / {:>6} pages = {:>7.4}%   nodes_read/depth = {:.1}",
+                a.n,
+                a.stats.nodes_read,
+                a.pages,
+                100.0 * a.stats.nodes_read as f64 / a.pages as f64,
+                a.stats.nodes_read as f64 / a.depth as f64
+            );
+        }
+        println!(
+            "    If this were O(N), nodes_read would have grown by the x{:.0} the page count did.",
+            grow(first.pages, last.pages)
+        );
+        println!(
+            "    It grew x{:.2}, tracking depth ({} -> {}), which is what O(delta x log N) predicts.",
+            grow(first.stats.nodes_read, last.stats.nodes_read),
+            first.depth,
+            last.depth
+        );
+        println!();
+        by_placement.push((placement, arms));
     }
-    println!();
-    println!("  If this were O(N), nodes_read would have grown by the same x{:.0} the page count did.",
-        grow(first.pages, last.pages));
-    println!(
-        "  It grew x{:.2}, tracking depth ({} -> {}), which is what O(delta x log N) predicts.",
-        grow(first.stats.nodes_read, last.stats.nodes_read),
-        first.depth,
-        last.depth
-    );
+
+    // ---- every skip counter must be shown to fire ----------------------------------------------
+    //
+    // `skip_theirs_unchanged` and `descend_ours_unchanged` read 0 at every N in the contested arm.
+    // That is correct — no path there belongs to one side alone — but a zero from a counter that
+    // has never been seen nonzero is indistinguishable from a counter that cannot count. The
+    // separated arm is what tells the two apart, and it is asserted rather than eyeballed.
+    let contested = &by_placement[0].1;
+    let separated = &by_placement[1].1;
+    println!("counter fire-check — each rule must be observed firing at least once:");
+    let sep_theirs: usize = separated.iter().map(|a| a.stats.skip_theirs_unchanged).sum();
+    let sep_ours: usize = separated.iter().map(|a| a.stats.descend_ours_unchanged).sum();
+    let con_theirs: usize = contested.iter().map(|a| a.stats.skip_theirs_unchanged).sum();
+    let con_ours: usize = contested.iter().map(|a| a.stats.descend_ours_unchanged).sum();
+    println!("  rule 1 (ours == theirs, skip)        contested {:>5}   separated {:>5}",
+        contested.iter().map(|a| a.stats.skip_sides_agree).sum::<usize>(),
+        separated.iter().map(|a| a.stats.skip_sides_agree).sum::<usize>());
+    println!("  rule 2 (theirs == base, skip)        contested {con_theirs:>5}   separated {sep_theirs:>5}");
+    println!("  rule 3 (ours == base, two-way)       contested {con_ours:>5}   separated {sep_ours:>5}");
+    assert!(sep_theirs > 0, "rule 2 never fired even when only ours touched a subtree");
+    assert!(sep_ours > 0, "rule 3 never fired even when only theirs touched a subtree");
+    assert_eq!(con_theirs, 0, "contested keys share every node; rule 2 cannot fire there");
+    assert_eq!(con_ours, 0, "contested keys share every node; rule 3 cannot fire there");
+    println!("  -> rules 2 and 3 read 0 in the contested arm because nothing there can trigger");
+    println!("     them, not because the counters are dead. The separated arm proves they count.");
     println!();
 
     // ---- the detector has to be able to fire --------------------------------------------------
