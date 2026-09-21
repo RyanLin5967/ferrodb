@@ -38,13 +38,22 @@
 //! this module was written, and the survey that established that was
 //! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/`.
 //!
-//! **Correction.** That grep no longer returns zero, and by the time this module landed it already
-//! did not: `src/cow/merge3.rs` came in on the same merge and matches `Merkle` six times, for a
-//! `MerkleId` that carried its own private 128-bit hasher. The survey's *conclusion* stands — there
-//! was no content id in `src/cow/` before these two files — but the command is no longer the
-//! evidence for it, and a reader who re-ran it would have found a second hasher rather than none.
-//! That second hasher is gone: `merge3::MerkleId` now computes [`leaf_cid`] and [`internal_cid`]
-//! from this file, so there is exactly one 128-bit hash in `src/cow/` and it is [`Hasher128`].
+//! **Correction, and do not repair it by re-running the grep.** That command no longer returns
+//! zero, and by the time this module landed it already did not: `src/cow/merge3.rs` came in on the
+//! same merge and matched `Merkle` six times, for a `MerkleId` that carried its own private
+//! 128-bit hasher. The survey's *conclusion* was right — there was no content id in `src/cow/`
+//! before this module — but the command stopped being the evidence for it the moment a second
+//! file landed, and a reader who re-ran it would have found a hasher rather than none.
+//!
+//! What is true now, stated as a count rather than as a command, because the count is what the
+//! claim was always about. `src/cow/` holds **two** 128-bit constructions — [`Hasher128`] here,
+//! and the FNV pair `diff::SubtreeHash` composes into 16 bytes — plus `chunker`'s `Buzhash`,
+//! which is a 64-bit *rolling* hash for content-defined chunking and is not a content id at all.
+//! `merge3` used to make it three: it carried a private `H128` on the path that declares a merge
+//! conflict-free, which is the one place `cid.rs` says a fingerprint must not be sole authority.
+//! That copy is deleted — `merge3` now computes no digest, and takes its identity from
+//! `cow::diff`. See `bench/d92_content_identity_trade.txt` for the measurement that says a merge
+//! is better off not hashing at all.
 //!
 //! # What it found, and where it stands
 //!

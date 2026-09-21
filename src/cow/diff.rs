@@ -80,6 +80,30 @@ const MAX_DESCENT: usize = 64;
 /// silently drops a change from the diff.
 pub trait NodeIdentity {
     fn id_of(&self, page: PageId) -> [u8; 16];
+
+    /// What an equality between two of these ids **proves**, as opposed to suggests.
+    ///
+    /// **No default.** An implementor that has not thought about it must not be able to inherit
+    /// the safe-sounding answer; that is the whole reason this is on the trait rather than in a
+    /// doc comment. `cow::cid` states the rule it exists to serve: a content-id equality "must
+    /// never be the *sole* authority for an operation whose wrongness is silent: deduplicating
+    /// storage, declaring a merge conflict-free, or skipping a subtree in a diff whose output
+    /// someone will act on." Both callers of this trait do exactly that kind of skipping, so the
+    /// strength of the answer travels with the answer.
+    fn proof(&self) -> IdentityProof;
+}
+
+/// What an equal [`NodeIdentity`] id proves, and therefore what a skip — or an empty conflict
+/// list — rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProof {
+    /// Equal ids **prove** equal subtrees. [`PageIdentity`] within one copy-on-write lineage: an
+    /// equal page id is not a fingerprint of the same page, it *is* the same page.
+    Exact,
+    /// Equal ids are a 128-bit fingerprint match, not a proof. Sound against accident; **not**
+    /// sound against an input someone chose, which in a database is every key and value. A skip
+    /// or a conflict-free verdict carrying this is a strong claim, not a demonstration.
+    Fingerprint,
 }
 
 /// Byte 0 of an id says which domain produced it, so the two can never compare equal.
@@ -107,6 +131,12 @@ pub struct PageIdentity;
 impl NodeIdentity for PageIdentity {
     fn id_of(&self, page: PageId) -> [u8; 16] {
         page_id_identity(page)
+    }
+
+    /// Exact, and not by assumption: the id *is* the page id. Two equal ids are one page, so
+    /// there is no collision to be sound against.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Exact
     }
 }
 
@@ -337,6 +367,13 @@ impl NodeIdentity for SubtreeHash {
             Some(s) => s.id,
             None => page_id_identity(page),
         }
+    }
+
+    /// A fingerprint: 120 effective bits of FNV-1a, which this type's own doc is explicit is not
+    /// a cryptographic commitment. The page-identity fallback is exact, but a provider cannot say
+    /// which answer a caller will get, so the weaker of the two is the honest answer for both.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Fingerprint
     }
 }
 
@@ -603,6 +640,11 @@ where
         // be answered by the *wrong* id with `misses()` reading zero.
         self.misses.fetch_add(1, AtomicOrdering::Relaxed);
         page_id_identity(page)
+    }
+
+    /// The wrapped digest's strength, which this adapter cannot know and must not overstate.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Fingerprint
     }
 }
 

@@ -57,7 +57,7 @@ use ferrodb::branch::types::{BranchId, Epoch, PageId};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cow::btree::CowTree;
 use ferrodb::cow::merge3::{
-    merge3, AcceptFingerprintIdentity, MergeStats, MerkleId, RootFastPath, ShadowId,
+    merge3, MergeStats, PageIdentity, RootFastPath, SubtreeHash,
 };
 use ferrodb::cow::node::Node;
 use ferrodb::cow::page_header::{PageHeader, PageType};
@@ -331,7 +331,7 @@ fn arm(n: usize, deltas: usize, placement: Placement) -> Arm {
 
     let into = h.fork(4);
     let e = h.tick();
-    let r = merge3(&h.tree, base, ours, theirs, &ShadowId, into, e).unwrap();
+    let r = merge3(&h.tree, base, ours, theirs, &PageIdentity, into, e).unwrap();
 
     // ---- the harness checks the merge it is measuring -----------------------------------------
     //
@@ -440,13 +440,15 @@ fn detector_fires(n: usize) -> (MergeStats, usize) {
     }
     let into = h.fork(14);
     let e = h.tick();
-    let r = merge3(&h.tree, roots[0], roots[1], roots[2], &ShadowId, into, e).unwrap();
+    let r = merge3(&h.tree, roots[0], roots[1], roots[2], &PageIdentity, into, e).unwrap();
     assert_eq!(r.stats.root_fast_path, None);
     (r.stats, r.conflicts.len())
 }
 
 /// What the stronger identity buys: both sides make the SAME edit. Byte-identical subtrees at
-/// different page ids, so `ShadowId` must descend and `MerkleId` retires it at the root.
+/// different page ids, so page identity must descend and a content id retires it at the root.
+/// What that costs is the point of the third return value — see
+/// `bench/d92_content_identity_trade.txt`.
 fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
     let h = Harness::new("convergent");
     let e = h.tick();
@@ -462,15 +464,19 @@ fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
     let into = h.fork(23);
 
     let e = h.tick();
-    let s = merge3(&h.tree, base, ours, theirs, &ShadowId, into, e).unwrap();
-    // The token is the caller saying, at the call site, that it will treat a 128-bit fingerprint
-    // match as proof two subtrees are equal. See `cow::merge3::IdentityProof`.
-    let merkle = MerkleId::new(&h.tree, AcceptFingerprintIdentity);
+    let s = merge3(&h.tree, base, ours, theirs, &PageIdentity, into, e).unwrap();
+    // Content identity comes from `cow::diff`; merge3 owns no hasher. Stamping is the caller's
+    // explicit O(N) precompute, and it is the number this function returns so the trade is
+    // reported rather than hidden.
+    let hash = SubtreeHash::new(h.store.clone() as Arc<dyn PageStore>);
+    for r in [base, ours, theirs] {
+        hash.stamp(r).unwrap();
+    }
     let e = h.tick();
-    let m = merge3(&h.tree, base, ours, theirs, &merkle, into, e).unwrap();
+    let m = merge3(&h.tree, base, ours, theirs, &hash, into, e).unwrap();
     assert_eq!(m.stats.root_fast_path, Some(RootFastPath::SidesAgree));
     assert!(s.conflicts.is_empty() && m.conflicts.is_empty());
-    (s.stats, m.stats, merkle.pages_hashed())
+    (s.stats, m.stats, hash.stamped_nodes())
 }
 
 fn main() {
@@ -480,7 +486,7 @@ fn main() {
         "instrument: MergeStats operation counts (pages read, identity comparisons). No wall clock."
     );
     println!("workload: N rows of {VALUE_BYTES}-byte values, two forks, 4 disjoint keys changed per side.");
-    println!("identity: ShadowId (the page id) — exact for COW-descended trees and free to compute.");
+    println!("identity: cow::diff::PageIdentity (the page id) — exact for COW-descended trees, free.");
     println!();
 
     let deltas = 4;
@@ -632,15 +638,15 @@ fn main() {
     let (shadow, merkle, hashed) = convergent_edit(16_000);
     println!("identity comparison — both sides make the SAME edit (truth-table row 4):");
     println!(
-        "  ShadowId:  nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
+        "  page id:      nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
         shadow.nodes_read, shadow.ids_compared, shadow.root_fast_path
     );
     println!(
-        "  MerkleId:  nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
+        "  content id:   nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
         merkle.nodes_read, merkle.ids_compared, merkle.root_fast_path
     );
-    println!("  MerkleId's own cost, reported separately and NOT folded into nodes_read above:");
-    println!("    pages hashed to compute the three root ids cold = {hashed}");
+    println!("  The content id's own cost, reported separately and NOT folded into nodes_read:");
+    println!("    nodes stamped to compute the three root ids cold = {hashed}");
     println!("  Content identity retires a convergent edit at the root that page identity cannot");
     println!("  see; it pays for that by reading the tree once. That is the trade, stated both ways.");
 }

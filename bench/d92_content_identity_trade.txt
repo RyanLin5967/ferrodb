@@ -1,0 +1,52 @@
+D92 — what content identity costs merge3, and what it saves
+===========================================================
+
+Question it answers: merge3 shipped its own 128-bit hasher (H128) to compute a content id per
+node. Before choosing a *better* hash (cid.rs's Hasher128, or provenance/sha256.rs truncated to
+128 bits), measure whether merge3 should be computing a content id on this path at all.
+
+Instrument: MergeStats counters (pages read) and MerkleId::pages_hashed (pages read to answer
+id_of). Integers, not wall clock — the box was running an agent fleet at load 20-60.
+Workload: the CONVERGENT EDIT (truth-table row 4) — both branches independently make the same
+edit. This is the one case page identity provably cannot skip and content identity can, i.e. the
+case most favourable to content identity.
+
+  n       pages   shadow_reads   merkle_reads   merkle_pages_hashed   saved   cost   cost/saved
+  500        66             6              0                    70       6      70         11.7
+  1000      141             6              0                   145       6     145         24.2
+  2000      261             9              0                   267       9     267         29.7
+  4000      540             9              0                   546       9     546         60.7
+  8000     1021             9              0                  1027       9    1027        114.1
+  16000    2015             9              0                  2021       9    2021        224.6
+
+READ THE SLOPE, NOT THE RATIO.
+
+  * What content identity SAVES is CONSTANT: 6 -> 9 page reads across a 32x range of n. It is
+    bounded by the descent's depth, which grows like log N.
+  * What it COSTS is O(N): 70 -> 2021, tracking `pages` almost exactly (it hashes every page
+    under all three roots).
+  * So cost/saved is not a constant to be tuned — it grows linearly and is already 225x at
+    n=16000. There is no n at which this turns around.
+
+CONSEQUENCE FOR THE HASH CHOICE. The hash function is second-order. SHA-256 truncated to 128
+bits would remove the collision argument, but it only makes the O(N) side more expensive and
+changes nothing about the O(1) side. A faster hash does not rescue an O(N)-for-O(log N) trade
+either. So the answer is neither "SHA-256" nor "keep a fast hash": **merge3 should own no hasher
+and should not compute a content id on its descent.** Page identity is exact within a
+copy-on-write lineage (equal page id IS the same page), free, and is what bench/d92_merge3_curve
+already measures.
+
+This is the same effect the D91 diff agent reported from the other side as `skip_cid = 0 at every
+N`: within one lineage, page identity decides first and the content digest is never the thing
+that wins a skip.
+
+WHEN CONTENT IDENTITY WOULD WIN. Only if the id were stamped at WRITE time and amortised into
+the write path, as ForkBase does — cow::diff's SubtreeHash doc says it "models the write-time cid
+stamping that ForkBase does as nodes are built". Then the O(N) term is not paid at merge time and
+only the O(log N) saving remains. Nothing in ferrodb stamps cids at write time today, so that
+configuration is not measurable here and is not claimed.
+
+Reproduce: the numbers above came from a temporary #[test] driving merge3 with ShadowId and with
+MerkleId over the same three roots, printing MergeStats::nodes_read and MerkleId::pages_hashed.
+Both identities are deleted from merge3 by the commit that adds this file; the equivalents are
+cow::diff::PageIdentity and cow::diff::SubtreeHash.
