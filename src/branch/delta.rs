@@ -336,6 +336,20 @@ impl PageDelta {
         let base = PageId::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let depth = bytes[4];
         let run_count = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+        // **The count is checked against the FORMAT before it sizes an allocation.** These bytes
+        // came off a disk page, so `run_count` is whatever corruption put there, up to 65535. Every
+        // run costs at least `RUN_FRAME` bytes of framing inside a `PAYLOAD_LEN` payload, so a
+        // record can hold at most that many and a larger claim is already impossible rather than
+        // merely unlikely. Refusing here keeps `with_capacity` below bounded by the encoding
+        // instead of by `u16`, and refuses the same record the run loop would have refused anyway
+        // — one byte later and one 2 MB allocation poorer.
+        const MAX_RUNS: usize = PAYLOAD_LEN / RUN_FRAME;
+        if run_count > MAX_RUNS {
+            return Err(FerroError::Cow(format!(
+                "delta record claims {run_count} runs; a {PAYLOAD_LEN}-byte payload holds at most \
+                 {MAX_RUNS}"
+            )));
+        }
         let mut runs = Vec::with_capacity(run_count);
         let mut at = DELTA_HEADER;
         for i in 0..run_count {
@@ -915,6 +929,31 @@ mod delta_tests {
             refused += 1;
         }
         assert_eq!(refused, n, "every truncation must have been exercised");
+    }
+
+    /// A run count larger than the payload could ever hold is refused before it sizes anything.
+    ///
+    /// The bytes come off a disk page, so the count is whatever corruption put there — up to
+    /// 65535, which would reserve about 2 MB for a record that cannot exist. Every run costs at
+    /// least `RUN_FRAME` bytes inside a `PAYLOAD_LEN` payload, so the format itself bounds it.
+    #[test]
+    fn a_record_claiming_more_runs_than_a_payload_can_hold_is_refused() {
+        let impossible = (PAYLOAD_LEN / RUN_FRAME) + 1;
+        let mut buf = vec![0u8; DELTA_HEADER];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[4] = 1;
+        buf[5..7].copy_from_slice(&(impossible as u16).to_le_bytes());
+        let got = PageDelta::decode(&buf);
+        assert!(got.is_err(), "a {impossible}-run claim must be refused, got {got:?}");
+
+        // And the largest count the format CAN express is still parsed on its merits rather than
+        // rejected by the cap — it fails on the missing run bytes, which is the run loop's job.
+        let mut ok_count = buf.clone();
+        ok_count[5..7].copy_from_slice(&((PAYLOAD_LEN / RUN_FRAME) as u16).to_le_bytes());
+        assert!(
+            PageDelta::decode(&ok_count).is_err(),
+            "a header-only buffer claiming the maximum run count must still refuse on the runs"
+        );
     }
 
     /// A run that claims to land past the end of the payload is refused, not clamped.

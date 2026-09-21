@@ -53,7 +53,9 @@ use std::sync::Arc;
 
 use ferrodb::agent_sql::dispatch::AgentOutput;
 use ferrodb::agent_sql::runtime::AgentRuntime;
-use ferrodb::branch::arena::{cow_path_census, reset_cow_path_census, ArenaPageStore};
+use ferrodb::branch::arena::{
+    cow_path_census, reset_cow_path_census, stale_delta_base_count, ArenaPageStore,
+};
 use ferrodb::branch::table_catalog::TableBranchCatalog;
 use ferrodb::branch::BranchCatalog;
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
@@ -381,6 +383,22 @@ fn main() {
         println!("  bases they encode to {deltas} B, with {refused} refused for exceeding the budget.");
         if deltas > 0 {
             println!("  ⇒ {:.1}x less, measured on pages the engine really produced.", copied as f64 / deltas as f64);
+        }
+        // **A base whose page id was reissued is refused, and this says whether that ever
+        // happened.** The argument that it cannot reach a recorded base spans arena.rs and the
+        // reaper; a counter reading zero because the situation never arose is the honest form of
+        // that argument, and a non-zero here would mean whole pages are being stored silently.
+        let stale = stale_delta_base_count();
+        println!();
+        if stale == 0 {
+            println!("  stale delta bases: 0 — no recorded base had its page id reissued, which is");
+            println!("  what the epoch interval rule predicts. The refusal is proven to fire in");
+            println!("  branch::arena::tests::a_base_whose_id_was_reissued_is_refused_rather_than_encoded_against,");
+            println!("  so this zero is a fact about the workload and not about a dead counter.");
+        } else {
+            println!("  ⚠ stale delta bases: {stale}. A recorded base had its page id REISSUED, so a");
+            println!("  delta was refused and a whole page stored. That is the safe direction, but the");
+            println!("  epoch interval rule was expected to make it unreachable — investigate.");
         }
         println!();
         println!("  ⚠ THAT RATIO IS OCCUPANCY, NOT BYTES STORED, AND THE TWO ARE NOT THE SAME HERE.");
