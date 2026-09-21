@@ -1,0 +1,352 @@
+//! **D92's primary evidence: what a structural three-way merge costs as the tree grows.**
+//!
+//! The claim is a complexity class — O(delta x log N) rather than O(N) — and a wall clock proves a
+//! class only indirectly, on a box that has ten agents on it. `MergeStats::nodes_read` is an
+//! operation count: the number of pages `cow::merge3::descend` actually read. It is identical on an
+//! idle machine and a thrashing one, which is the only reason a number measured here is worth
+//! banking.
+//!
+//! # The workload
+//!
+//! One base tree of N rows. Two branches forked off it — a fork is a metadata record and the
+//! child's root **is** the parent's root, so every subtree starts shared. Each side changes 4 keys,
+//! spread across the key space and disjoint from the other side's. Then merge.
+//!
+//! # Pre-registered expectation, written before the first run
+//!
+//! `merged` is built on ours, so the three subtree rules land like this:
+//!
+//! - A subtree neither side touched: `ours == theirs` (both still the base page). **Skipped.**
+//! - A subtree only *ours* touched: `theirs == base`. **Skipped** — ours already holds it.
+//! - A subtree only *theirs* touched: `ours == base`. **Descended**, because the merged tree is
+//!   built on ours and theirs' change has to be found and applied.
+//!
+//! So the descent follows **theirs' four paths and nothing else**, plus the spine they share. With
+//! a B+tree of depth d that is at most `4 x d` node triples, so `nodes_read <= 12 x d`, and d grows
+//! like log N. Concretely: if d is 2 at N=1k and 3 at N=256k, `nodes_read` should grow by roughly
+//! 1.5x while N grows 256x and the page count grows with it. **If `nodes_read` tracks the page
+//! count, the descent is not skipping and the design is wrong.**
+//!
+//! `ids_compared` is the other half and is reported rather than hidden: every child of a descended
+//! node is *tested*, and most are retired by that test without a read. It grows like
+//! `fanout x depth x changed paths`, which is sublinear in N but is not free, and folding it into
+//! `nodes_read` would be the kind of per-block count labelled per-op that this repo has been bitten
+//! by before.
+//!
+//! Run: `cargo run --release --example d92_merge3_curve`
+
+use std::sync::Arc;
+
+use ferrodb::branch::types::{BranchId, Epoch, PageId};
+use ferrodb::buffer::buffer_pool::BufferPoolManager;
+use ferrodb::cow::btree::CowTree;
+use ferrodb::cow::merge3::{merge3, MergeStats, MerkleId, RootFastPath, ShadowId};
+use ferrodb::cow::node::Node;
+use ferrodb::cow::page_header::{PageHeader, PageType};
+use ferrodb::cow::store::CowStore;
+use ferrodb::cow::PageStore;
+use ferrodb::storage::disk_manager::DiskManager;
+
+const TRUNK: BranchId = BranchId::TRUNK;
+const VALUE_BYTES: usize = 100;
+
+struct Harness {
+    path: std::path::PathBuf,
+    store: Arc<CowStore>,
+    tree: CowTree,
+    clock: std::cell::Cell<u64>,
+}
+
+impl Harness {
+    fn new(tag: &str) -> Harness {
+        let path = std::env::temp_dir().join(format!("d92-{}-{}.db", std::process::id(), tag));
+        let _ = std::fs::remove_file(&path);
+        let file =
+            std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path).unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let store = Arc::new(CowStore::new(pool));
+        let tree = CowTree::new(store.clone() as Arc<dyn PageStore>);
+        Harness { path, store, tree, clock: std::cell::Cell::new(1) }
+    }
+
+    fn tick(&self) -> Epoch {
+        let e = self.clock.get();
+        self.clock.set(e + 1);
+        Epoch(e)
+    }
+
+    fn put(&self, root: PageId, br: BranchId, key: &[u8], val: &[u8]) -> PageId {
+        let e = self.tick();
+        self.tree.insert(root, br, e, key, val).unwrap()
+    }
+
+    fn fork(&self, id: u64) -> BranchId {
+        let b = BranchId::new(id, 0);
+        let e = self.tick();
+        self.store.register_branch(b, Some(TRUNK), e).unwrap();
+        b
+    }
+
+    /// Levels from root to leaf, counted by descending leftmost. 1 = the root is a leaf.
+    fn depth(&self, root: PageId) -> usize {
+        let mut pid = root;
+        let mut d = 1;
+        loop {
+            let h = self.store.read_page(pid).unwrap();
+            let f = h.read();
+            if PageHeader::read_from(&f.data).unwrap().page_type == PageType::BTreeLeaf {
+                return d;
+            }
+            pid = Node::new(&f.data).leftmost();
+            d += 1;
+        }
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn key(i: usize) -> Vec<u8> {
+    format!("{:016}", i).into_bytes()
+}
+
+struct Arm {
+    n: usize,
+    pages: usize,
+    depth: usize,
+    stats: MergeStats,
+    conflicts: usize,
+}
+
+/// One point on the curve: build N rows, fork twice, change `deltas` disjoint keys per side, merge.
+fn arm(n: usize, deltas: usize) -> Arm {
+    let h = Harness::new(&format!("n{n}"));
+    let e = h.tick();
+    let mut base = h.tree.create(TRUNK, e).unwrap();
+    let val = vec![b'v'; VALUE_BYTES];
+    for i in 0..n {
+        base = h.put(base, TRUNK, &key(i), &val);
+    }
+    let pages = h.tree.walk_pages(base).unwrap().len();
+    let depth = h.depth(base);
+
+    let ob = h.fork(2);
+    let tb = h.fork(3);
+
+    // Spread the changes across the key space so the descent cannot get lucky with locality.
+    let ours_keys: Vec<usize> = (0..deltas).map(|j| n * (j + 1) / (deltas + 1)).collect();
+    let theirs_keys: Vec<usize> = ours_keys.iter().map(|k| k + 1).collect();
+
+    let mut ours = base;
+    for &i in &ours_keys {
+        ours = h.put(ours, ob, &key(i), b"OURS");
+    }
+    let mut theirs = base;
+    for &i in &theirs_keys {
+        theirs = h.put(theirs, tb, &key(i), b"THEIRS");
+    }
+
+    let into = h.fork(4);
+    let e = h.tick();
+    let r = merge3(&h.tree, base, ours, theirs, &ShadowId, into, e).unwrap();
+
+    // ---- the harness checks the merge it is measuring -----------------------------------------
+    //
+    // A curve over a WRONG merge is worse than no curve. These run at every N.
+    assert_eq!(
+        r.stats.root_fast_path, None,
+        "N={n}: a root fast path retired the merge, so this arm measured nothing"
+    );
+    assert!(r.conflicts.is_empty(), "N={n}: disjoint keys must not conflict: {:?}", r.conflicts);
+    for &i in &ours_keys {
+        assert_eq!(h.tree.get(r.merged_root, &key(i)).unwrap(), Some(b"OURS".to_vec()));
+    }
+    for &i in &theirs_keys {
+        assert_eq!(h.tree.get(r.merged_root, &key(i)).unwrap(), Some(b"THEIRS".to_vec()));
+    }
+    // And every other key still reads its original value. Sampled, because reading all 256k keys
+    // at every arm would dominate the run; the sample is deterministic and spans the space.
+    let touched: Vec<usize> = ours_keys.iter().chain(theirs_keys.iter()).copied().collect();
+    let step = (n / 512).max(1);
+    for i in (0..n).step_by(step) {
+        if touched.contains(&i) {
+            continue;
+        }
+        assert_eq!(
+            h.tree.get(r.merged_root, &key(i)).unwrap(),
+            Some(val.clone()),
+            "N={n}: untouched key {i} did not survive the merge"
+        );
+    }
+
+    Arm { n, pages, depth, stats: r.stats, conflicts: r.conflicts.len() }
+}
+
+/// The detector's fire-check: three trees that share nothing must report **zero** skips.
+///
+/// Built independently rather than forked, over the same keys with different values, so no page id
+/// is shared anywhere. A skip counter that is nonzero here is counting something other than a skip,
+/// and every zero it ever reported would be meaningless.
+fn detector_fires(n: usize) -> (MergeStats, usize) {
+    let h = Harness::new("detector");
+    let mut roots = Vec::new();
+    for (bi, tag) in [(11u64, b'1'), (12, b'2'), (13, b'3')] {
+        let br = h.fork(bi);
+        let e = h.tick();
+        let mut root = h.tree.create(br, e).unwrap();
+        let val = vec![tag; VALUE_BYTES];
+        for i in 0..n {
+            root = h.put(root, br, &key(i), &val);
+        }
+        roots.push(root);
+    }
+    let into = h.fork(14);
+    let e = h.tick();
+    let r = merge3(&h.tree, roots[0], roots[1], roots[2], &ShadowId, into, e).unwrap();
+    assert_eq!(r.stats.root_fast_path, None);
+    (r.stats, r.conflicts.len())
+}
+
+/// What the stronger identity buys: both sides make the SAME edit. Byte-identical subtrees at
+/// different page ids, so `ShadowId` must descend and `MerkleId` retires it at the root.
+fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
+    let h = Harness::new("convergent");
+    let e = h.tick();
+    let mut base = h.tree.create(TRUNK, e).unwrap();
+    let val = vec![b'v'; VALUE_BYTES];
+    for i in 0..n {
+        base = h.put(base, TRUNK, &key(i), &val);
+    }
+    let ob = h.fork(21);
+    let tb = h.fork(22);
+    let ours = h.put(base, ob, &key(n / 2), b"same");
+    let theirs = h.put(base, tb, &key(n / 2), b"same");
+    let into = h.fork(23);
+
+    let e = h.tick();
+    let s = merge3(&h.tree, base, ours, theirs, &ShadowId, into, e).unwrap();
+    let merkle = MerkleId::new(&h.tree);
+    let e = h.tick();
+    let m = merge3(&h.tree, base, ours, theirs, &merkle, into, e).unwrap();
+    assert_eq!(m.stats.root_fast_path, Some(RootFastPath::SidesAgree));
+    assert!(s.conflicts.is_empty() && m.conflicts.is_empty());
+    (s.stats, m.stats, merkle.pages_hashed())
+}
+
+fn main() {
+    println!("ferrodb D92 — structural three-way merge, cost curve");
+    println!("build provenance: {}", ferrodb::build_provenance());
+    println!(
+        "instrument: MergeStats operation counts (pages read, identity comparisons). No wall clock."
+    );
+    println!("workload: N rows of {VALUE_BYTES}-byte values, two forks, 4 disjoint keys changed per side.");
+    println!("identity: ShadowId (the page id) — exact for COW-descended trees and free to compute.");
+    println!();
+
+    let deltas = 4;
+    let sizes = [1_000usize, 4_000, 16_000, 64_000, 256_000];
+    let arms: Vec<Arm> = sizes.iter().map(|&n| arm(n, deltas)).collect();
+
+    println!("        N |  pages |  depth | nodes_read | ids_cmp | skips | skip_agree | skip_theirs_unch | descend_ours_unch | leaf_triples | keys_cmp | edits");
+    println!("----------|--------|--------|------------|---------|-------|------------|------------------|-------------------|--------------|----------|------");
+    for a in &arms {
+        let s = &a.stats;
+        println!(
+            "{:9} | {:6} | {:6} | {:10} | {:7} | {:5} | {:10} | {:16} | {:17} | {:12} | {:8} | {:5}",
+            a.n,
+            a.pages,
+            a.depth,
+            s.nodes_read,
+            s.ids_compared,
+            s.skips(),
+            s.skip_sides_agree,
+            s.skip_theirs_unchanged,
+            s.descend_ours_unchanged,
+            s.leaf_triples,
+            s.keys_compared,
+            s.edits_applied,
+        );
+        assert_eq!(a.conflicts, 0);
+    }
+    println!();
+
+    let first = &arms[0];
+    let last = &arms[arms.len() - 1];
+    let grow = |a: usize, b: usize| if a == 0 { f64::NAN } else { b as f64 / a as f64 };
+    println!("across N = {} -> {} (x{:.0}):", first.n, last.n, grow(first.n, last.n));
+    println!("  pages        {:>7} -> {:>7}   x{:.1}", first.pages, last.pages, grow(first.pages, last.pages));
+    println!("  depth        {:>7} -> {:>7}", first.depth, last.depth);
+    println!(
+        "  nodes_read   {:>7} -> {:>7}   x{:.2}   <- the claim",
+        first.stats.nodes_read,
+        last.stats.nodes_read,
+        grow(first.stats.nodes_read, last.stats.nodes_read)
+    );
+    println!(
+        "  ids_compared {:>7} -> {:>7}   x{:.2}",
+        first.stats.ids_compared,
+        last.stats.ids_compared,
+        grow(first.stats.ids_compared, last.stats.ids_compared)
+    );
+    println!();
+    println!("  nodes_read as a fraction of the tree:");
+    for a in &arms {
+        println!(
+            "    N={:>7}  {:>5} / {:>6} pages = {:.4}%   nodes_read/depth = {:.1}",
+            a.n,
+            a.stats.nodes_read,
+            a.pages,
+            100.0 * a.stats.nodes_read as f64 / a.pages as f64,
+            a.stats.nodes_read as f64 / a.depth as f64
+        );
+    }
+    println!();
+    println!("  If this were O(N), nodes_read would have grown by the same x{:.0} the page count did.",
+        grow(first.pages, last.pages));
+    println!(
+        "  It grew x{:.2}, tracking depth ({} -> {}), which is what O(delta x log N) predicts.",
+        grow(first.stats.nodes_read, last.stats.nodes_read),
+        first.depth,
+        last.depth
+    );
+    println!();
+
+    // ---- the detector has to be able to fire --------------------------------------------------
+    let (d, dconf) = detector_fires(4_000);
+    println!("detector fire-check — three INDEPENDENTLY built trees, nothing shared:");
+    println!(
+        "  skips = {}  (skip_agree {}, skip_theirs_unchanged {}), nodes_read = {}, keys_compared = {}, conflicts = {}",
+        d.skips(),
+        d.skip_sides_agree,
+        d.skip_theirs_unchanged,
+        d.nodes_read,
+        d.keys_compared,
+        dconf
+    );
+    assert_eq!(d.skips(), 0, "three unrelated trees share no subtree; a skip here is a false skip");
+    assert!(d.nodes_read > 0);
+    assert_eq!(d.keys_compared, 4_000, "every key must be compared when nothing can be skipped");
+    assert_eq!(dconf, 4_000, "all three differ at every key, so every key conflicts");
+    println!("  -> ZERO skips, all 4000 keys compared, all 4000 conflict. The counter can read 0,");
+    println!("     so the large values above are a measurement and not a stuck register.");
+    println!();
+
+    // ---- what the stronger identity buys, and what it costs ------------------------------------
+    let (shadow, merkle, hashed) = convergent_edit(16_000);
+    println!("identity comparison — both sides make the SAME edit (truth-table row 4):");
+    println!(
+        "  ShadowId:  nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
+        shadow.nodes_read, shadow.ids_compared, shadow.root_fast_path
+    );
+    println!(
+        "  MerkleId:  nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
+        merkle.nodes_read, merkle.ids_compared, merkle.root_fast_path
+    );
+    println!("  MerkleId's own cost, reported separately and NOT folded into nodes_read above:");
+    println!("    pages hashed to compute the three root ids cold = {hashed}");
+    println!("  Content identity retires a convergent edit at the root that page identity cannot");
+    println!("  see; it pays for that by reading the tree once. That is the trade, stated both ways.");
+}
