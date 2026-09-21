@@ -115,6 +115,12 @@
 //! two branches as unrelated, and a merge that proceeds on a wrongly-unrelated pair is the bug
 //! this module would be blamed for. A branch id that is absent means the caller and the index
 //! disagree about what exists, and that is a fault, not a negative result.
+//!
+//! `insert_child` refuses a **tombstoned** parent for the same reason ([`AncestryError::
+//! ParentReaped`]). Accepting one would record a live branch whose lineage runs through a dead
+//! one — a fork the engine itself would have refused, since its fork path checks the parent is
+//! readable. Tombstones exist for ancestors that already have descendants, never to acquire new
+//! ones. This was the one caller/index disagreement the module used to swallow in silence.
 
 use std::collections::HashMap;
 
