@@ -133,6 +133,12 @@ fn build(dir: &std::path::Path, tag: &str) -> Server {
     const ARENA_BASE: u32 = 1024;
     let arena_base = ARENA_BASE;
     let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), arena_base).unwrap());
+    // D101 — ARM PERSISTENCE, because production does and this harness did not.
+    // `ArenaPageStore` persists its free-space map through `persist_if_configured`, which is a
+    // NO-OP until a checkpoint path is set. `src/cli/cli.rs:120` and `examples/pgserver.rs:101`
+    // both set one, so a run without it measures a configuration nobody ships — and it measures
+    // it in the flattering direction, since the persistence work is simply skipped.
+    store.checkpoint_to(d.join("main.arena"));
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             branches,

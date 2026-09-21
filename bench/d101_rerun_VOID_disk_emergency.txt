@@ -1,3 +1,11 @@
+⛔⛔ THIS SWEEP IS VOID — DO NOT QUOTE ANY NUMBER FROM IT.
+Disk hit 0G during the run and every target/ on the box was deleted. D68 was SIGKILLed
+(rc=137) partway through its curve, D71 arm=PLAIN completed (rc=0), and the remaining
+eleven blocks exited rc=127 because their binaries no longer existed. The runner then
+printed 'ALL FIVE COMPLETE' over the top of them — a banner that was false when written.
+Kept as the record of that failure. The runner is gated on per-block rc as of this commit.
+Re-run: bench/d101_rerun.txt
+================================================================================
 ================================================================================
 D101 RE-RUN — the five harnesses, on the runtime they build.
 [HERE] 2026-09-21T05:21:29Z  worktree=/Users/idide/wt/ferrodb-D101-stub-runtime-guard  sha=fc443c4

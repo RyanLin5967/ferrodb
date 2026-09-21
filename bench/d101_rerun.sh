@@ -11,6 +11,7 @@ WT=/Users/idide/wt/ferrodb-D101-stub-runtime-guard
 EX=$WT/target/release/examples
 OUT=$WT/bench/d101_rerun.txt
 SHA=$(git -C "$WT" rev-parse --short HEAD)
+FAILED=0
 
 ACQ=$(~/wt/logs/measure-lock.sh acquire d101-rerun) || { echo "LOCK FAILED: $ACQ" >>"$OUT"; exit 1; }
 trap '~/wt/logs/measure-lock.sh release d101-rerun' EXIT
@@ -33,12 +34,26 @@ run() {           # run <label> <timeout-seconds> <env...> -- <binary> [args]
     echo "# cmd: $*"
   } >>"$OUT"
   local t0=$(date +%s)
-  env "$@" >>"$OUT" 2>&1
+  timeout "$tmo" env "$@" >>"$OUT" 2>&1
   local rc=$?
   {
     echo "# rc=$rc  elapsed=$(( $(date +%s) - t0 ))s"
     echo "# load after: $(uptime | sed 's/.*averages*: *//')"
   } >>"$OUT"
+  # ⛔ A BLOCK THAT DID NOT EXIT 0 IS NOT A RESULT. The first version of this script printed
+  # "ALL FIVE COMPLETE" unconditionally; a disk emergency deleted target/ mid-sweep, eleven
+  # blocks exited 127 ("No such file or directory"), and the banner went out over them. A run
+  # that collected nothing has not passed, so every failure is counted and the banner is gated.
+  if [ "$rc" -ne 0 ]; then
+    FAILED=$((FAILED + 1))
+    echo "# ⛔ FAILED BLOCK: $label (rc=$rc) — NOT A RESULT" >>"$OUT"
+  fi
+  # Re-assert the binary still exists: a vanished target/ is the exact failure that produced the
+  # false banner, and it is silent until the next exec.
+  if [ ! -x "$EX/d68_merge_is_o_table" ]; then
+    echo "# ⛔ ABORTING: $EX is gone (target/ deleted mid-sweep). Nothing below would be a result." >>"$OUT"
+    exit 1
+  fi
 }
 
 run "D68 — merge latency vs TABLE SIZE at fixed delta (banked: bench/d68_merge_is_o_table.txt)" \
@@ -69,5 +84,13 @@ for r in 1 2 3; do
   done
 done
 
-echo "" >>"$OUT"
-echo "#### ALL FIVE COMPLETE $(date -u +%FT%TZ)" >>"$OUT"
+{
+  echo
+  if [ "$FAILED" -eq 0 ]; then
+    echo "#### ALL FIVE COMPLETE, every block rc=0 — $(date -u +%FT%TZ)"
+  else
+    echo "#### ⛔ SWEEP INCOMPLETE: $FAILED block(s) did not exit 0 — $(date -u +%FT%TZ)"
+    echo "#### Do NOT quote a number from this file until the failed blocks are re-run."
+  fi
+} >>"$OUT"
+exit $(( FAILED > 0 ))
