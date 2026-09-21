@@ -79,3 +79,161 @@
 # ============================================================================
 # PART 2 — RESULTS.  Appended after the run, below this line.
 # ============================================================================
+
+# Run on 2026-09-21. Instruments are COUNTERS (stored bytes, deltas applied), not
+# timings, so the machine's load average (35-62 on 18 cores, ten agents running) does
+# not enter any number below. Nothing here is a duration.
+#
+# Guards: `cargo test --lib` on this worktree -> 1374 passed, 0 failed, 2 ignored.
+# Sweep: `cargo test --lib d93_sweep -- --ignored --nocapture`, verbatim below.
+#
+# ---------------------------------------------------------------------------
+# RAW OUTPUT, verbatim
+# ---------------------------------------------------------------------------
+
+ferrodb at 9751880985d4
+fixture: 16384 rows, 60 rows/page, key 8 B, value 24 B, cell 36 B, seed 0x5eedd93
+constants: PAGE_SIZE=4096 PAYLOAD_LEN=4072 MAX_CHAIN_DEPTH=8 DELTA_BUDGET=1018
+pages in fixture: 274
+
+     r   pages       whole B       delta B      ratio  delta B/row    compact  collapsed
+     1       1          4096            52      78.8x         52.0          0          0
+     2       2          8192           105      78.0x         52.5          0          0
+     4       4         16384           211      77.6x         52.8          0          0
+     8       8         32768           422      77.6x         52.8          0          0
+    16      16         65536           846      77.5x         52.9          0          0
+    32      30        122880          1665      73.8x         52.0          0          0
+    64      59        241664          3321      72.8x         51.9          0          0
+   128     108        442368          6514      67.9x         50.9          0          0
+   256     174        712704         12483      57.1x         48.8          0          0
+   512     237        970752         23561      41.2x         46.0          0          0
+  1024     266       1089536         44496      24.5x         43.5          0          0
+  2048     273       1118208         85629      13.1x         41.8          0          0
+  4096     273       1118208        167485       6.7x         40.9          0          0
+
+chain depth: one page, one row updated per generation, 20 rows/page
+   gen    deltas   bytes touched    stored B
+     1         1            4102          53
+     2         2            4131          52
+     3         3            4160          52
+     4         4            4189          52
+     5         5            4218          52
+     6         6            4247          52
+     7         7            4276          52
+     8         8            4306          53
+     9         0            4072        4096
+    10         1            4101          52
+    11         2            4130          52
+    12         3            4159          52
+    13         4            4188          52
+    14         5            4217          52
+    15         6            4247          53
+    16         7            4276          52
+    17         8            4305          52
+    18         0            4072        4096
+    19         1            4101          52
+    20         2            4129          51
+    21         3            4158          52
+    22         4            4187          52
+    23         5            4217          53
+    24         6            4246          52
+chain stats after 24 generations: DeltaStats { deltas: 22, full_by_depth: 2, full_by_budget: 0 }
+
+# ---------------------------------------------------------------------------
+# VERDICTS against the pre-registered falsifiers
+# ---------------------------------------------------------------------------
+#
+# F-A (read cost) — DID NOT FIRE.  deltas_applied cycles 1..8 and never exceeds
+#      MAX_CHAIN_DEPTH = 8; the 9th generation collapses to a full page and the cycle
+#      restarts. The pass is NON-VACUOUS as required: DeltaStats reports
+#      full_by_depth = 2 over 24 generations, so the bound actually fired, and
+#      full_by_budget = 0, so the DEPTH bound is what fired and not the budget bound
+#      standing in for it. Worst materialisation touched 4306 B against the derived
+#      ceiling of PAGE_SIZE + 8*DELTA_BUDGET = 12240 B.
+#
+# F-B (stored bytes) — DID NOT FIRE.  At r=4: 16384 B whole-page against 211 B of
+#      delta, a ratio of 77.6x. The bar was 10x.
+#
+# F-C (compaction disclosure) — DISCLOSED, and the disclosure is that the sweep never
+#      entered the compaction regime at all: the `compact` column is 0 at every one of
+#      the 13 points. That is a fact about the sweep's shape, not a clean bill of
+#      health. At r=4096, 4096 updates spread over 273 pages average ~15 per page, and
+#      a 60-row page absorbs ~39 rewrites before its heap runs out. A branch that
+#      concentrates its writes on one page DOES reach compaction, so that regime was
+#      measured separately rather than left unmeasured:
+#
+#        equal-width cells, first compaction       1373 B delta  -> over budget, stored whole
+#        after one cell changed width              2552 B delta  -> over budget, stored whole
+#
+#      Both exceed DELTA_BUDGET = 1018 B, so DeltaStore stores a full page and the
+#      delta arm never pretends to a saving it cannot deliver. Neither is page-SIZED
+#      (4072 B), which is why the pre-registration's wording is corrected below.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE SLOPE SHOWS
+# ---------------------------------------------------------------------------
+#
+# The result the brief asked for holds: stored bytes became PROPORTIONAL TO r instead
+# of flat at r * PAGE_SIZE. The `delta B/row` column stays between 52.9 and 40.9 across
+# a 4096x sweep in r — it does not grow — while the whole-page arm saturates at
+# 1118208 B (all 274 pages) from r=2048 onward because every page has been touched.
+#
+# The ratio therefore FALLS as r grows, from 78.8x at r=1 to 6.7x at r=4096, and that
+# is the honest shape rather than a disappointment: the whole-page arm cannot get worse
+# than the whole table, so once a branch has dirtied every page the two arms converge on
+# the ratio of live bytes to page bytes. Delta encoding pays where a branch touches a
+# small fraction of the table, which is the agent-branch workload it was aimed at.
+#
+# THE NUMBER TO QUOTE FOR A LONG-LIVED BRANCH IS NOT 78x.  The chain table shows why.
+# A chain must collapse to a full page every 9th generation to hold the read bound, so
+# one full cycle stores 8 deltas plus one page: 418 B + 4096 B = 4514 B, against
+# 9 * 4096 = 36864 B for whole-page storage. That is 8.2x amortised. The 78x figure is
+# a single generation from the fork point; 8.2x is the steady state under the bound that
+# makes reads safe. Both are real and they answer different questions.
+#
+# ---------------------------------------------------------------------------
+# REVERSAL LOG (required by the pre-registration's append-only rule)
+# ---------------------------------------------------------------------------
+#
+# 2026-09-21. F-C's pre-registered wording — "a compacting update produces a delta the
+# size of the page" — went through one wrong correction before reaching its final form.
+# Recording both steps, because the intermediate one was a WRONG CORRECTION OF A RIGHT
+# CLAIM, which is the same category of error as asserting something false.
+#
+#   1. Pre-registered: compaction produces a page-sized delta, so it must collapse.
+#   2. First measurement said 463 B, comfortably inside the budget. I concluded the
+#      pre-registration was FALSE and wrote a test asserting compaction stays a delta,
+#      reasoning that `compact()` rewrites cells in slot order descending from
+#      PAYLOAD_LEN — the same rule `fill_leaf` used — so equal-width cells land back on
+#      the offsets they already occupied and compaction is layout-restoring.
+#   3. That 463 B was a FIXTURE DEFECT, not a finding. `value_of` zero-filled its
+#      values, and zeros flatter a byte differ twice: a cell written into virgin heap
+#      diffs only in its non-zero bytes because `NodeMut::init` zeroes the payload, and
+#      a cell shifted by a width change does not diff wherever zeros land on zeros.
+#      Real column data is not zeros.
+#   4. With high-entropy values the same fixture reports 1373 B — over budget, stored
+#      whole. So step 2's correction is REVERSED: the pre-registration's conclusion
+#      (compaction collapses) was right all along.
+#
+#   What remains corrected from the pre-registration is only its magnitude: a compacting
+#   delta is 1373-2552 B, not the ~4072 B "size of the page" the original wording
+#   claimed. The layout-restoring mechanism from step 2 is still true and is why the
+#   equal-width case (1373 B) is cheaper than the width-changed case (2552 B); it just
+#   does not make either one cheap enough to store as a delta.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS RUN DOES NOT ESTABLISH
+# ---------------------------------------------------------------------------
+#
+# - The mechanism is NOT wired into ArenaPageStore::cow_page. Everything above measures
+#   src/branch/delta.rs standing alone. Behaviour under the real buffer pool, page
+#   checksums and the reaper is unmeasured, and a delta chain interacts with the epoch
+#   interval rule in ways this run says nothing about: a base page must not be
+#   reclaimable while a delta still points at it.
+# - Single-threaded throughout. No concurrent writer or merge is exercised.
+# - The delta arm is charged only its encoded bytes. A real implementation needs a
+#   container to pack deltas into, and that container's own overhead is not counted
+#   here; it would amortise across many deltas but it is not zero.
+# - The sweep updates existing rows. Inserts, deletes and node splits are not measured,
+#   and a split rewrites both halves, which is a whole-page cost delta encoding cannot
+#   avoid.
