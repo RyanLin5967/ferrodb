@@ -1103,6 +1103,11 @@ impl MemCherryTarget {
         self.rows.get(&(tbl.0, row.0))
     }
 
+    /// Drop a row, to set up the "a sibling deleted it" case without going through a plan.
+    pub fn remove(&mut self, tbl: TableId, row: RowId) -> Option<Vec<Value>> {
+        self.rows.remove(&(tbl.0, row.0))
+    }
+
     pub fn cell(&self, tbl: TableId, row: RowId, col: ColId) -> Option<&Value> {
         self.rows.get(&(tbl.0, row.0)).and_then(|r| r.get(col.0 as usize))
     }
