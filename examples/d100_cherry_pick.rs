@@ -13,9 +13,11 @@
 //! Axis 2 is the control for axis 1. **Read it against axis 2b and never on its own**: axis 2's
 //! per-pick cost is not flat in the log size, so "it rose, therefore the pick is scanning" is not
 //! a reading this harness supports. What separates the two hypotheses is the gap to the unindexed
-//! arm over the same range — measured 5-6x against 41-45x over two runs on a machine that was
-//! also building other work, so treat each figure as an upper bound and the GAP as the result.
-//! The residual rise in axis 2 is real and its cause is not established here.
+//! arm over the same range. Three runs on a machine that was concurrently building other work,
+//! slope across 100x the log: indexed **3.12x / 5.16x / 5.94x**, unindexed **42.4x / 41.2x /
+//! 45.2x**. The indexed arm's own slope is the noisy one and no single value of it should be
+//! quoted; the order-of-magnitude SEPARATION is what reproduced. The residual rise in axis 2 is
+//! real and its cause is not established here.
 //!
 //! Every reported number is wall time from `std::time::Instant`, median over the reps named in
 //! the output. Two columns are reported and they are not the same measurement:
