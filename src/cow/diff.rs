@@ -1718,6 +1718,62 @@ mod tests {
         );
     }
 
+    /// The **other** store recycles too, and the guard has to hold there as well.
+    ///
+    /// Every other test in this module runs on `CowStore`. `ArenaPageStore` is the second
+    /// recycler the module header names — it pops `st.recycled` in `alloc_in_arena` — and it is
+    /// the one that evicts its own stale cached image at that point. Forcing the recycle is
+    /// exact here rather than a search: `free_page` on an unpinned page releases it to its
+    /// arena's `recycled` list, and the next `alloc_in_arena` on that arena pops it straight back.
+    #[test]
+    fn the_second_store_recycles_page_ids_too_and_a_stale_row_misses_there_as_well() {
+        use crate::branch::arena::ArenaPageStore;
+        use crate::branch::catalog::LogBranchCatalog;
+        use crate::branch::BranchCatalog;
+
+        let dir = TempDir::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("arena.db"))
+            .unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(
+            ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, 1024).unwrap(),
+        );
+        let tree = CowTree::new(Arc::clone(&store) as Arc<dyn PageStore>);
+
+        let e = catalog.next_epoch();
+        let root = tree.create(BranchId::TRUNK, e).unwrap();
+        let root = tree.insert(root, BranchId::TRUNK, e, b"a", b"1").unwrap();
+        assert_eq!(tree.walk_pages(root).unwrap(), vec![root], "premise: a single-leaf tree");
+
+        let h = SubtreeHash::new(Arc::clone(&store) as Arc<dyn PageStore>);
+        let stale = h.stamp(root).unwrap();
+        assert_eq!(stale[0], TAG_CONTENT);
+
+        // The page's OWN extent, read off its header -- `arena_for` answers "where would this
+        // branch allocate next", which after D31's geometric growth is a different, newer extent.
+        // `release_page` files a freed page under the extent it was born in, so that is the one to
+        // ask for it back.
+        let arena = store.read_page(root).unwrap().header().unwrap().arena_id;
+        store.free_page(root, catalog.next_epoch()).unwrap();
+        let reused = store
+            .alloc_in_arena(arena, PageType::BTreeLeaf, catalog.next_epoch())
+            .unwrap();
+        assert_eq!(reused, root, "premise: the freed id did not come straight back");
+
+        assert_ne!(h.id_of(root), stale, "the memo answered for the page's previous life");
+        assert_eq!(
+            h.id_of(root),
+            page_id_identity(root),
+            "a stale row must fall back to page identity in this store too"
+        );
+    }
+
     /// `birth` participates in the key, pinned at the only level where it can be.
     ///
     /// There is no store-level version of this, because the **store** never writes such a page:
