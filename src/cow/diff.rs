@@ -132,12 +132,19 @@ impl NodeIdentity for PageIdentity {
 ///   and an in-place rewrite alike. The in-place case is not a corner: `btree.rs` mutates a node
 ///   where it lies whenever it is already private to the writer, and that path leaves `birth`
 ///   exactly where it was. So `checksum` is the discriminator that carries the guard.
-/// * `birth` is therefore **not** catching a class `checksum` misses — `birth` lives inside the
-///   bytes `checksum` covers, and an attempt to build a recycled page that agrees on `checksum`
-///   but not on `birth` is unconstructable for that reason. What it buys is *exactness where
-///   crc32 is probabilistic*: a recycled id always starts a new epoch, so comparing `birth` makes
-///   the recycle case an exact decision instead of one a 32-bit collision could get wrong. It
-///   rides along on the same header read and costs nothing, which is the whole argument for it.
+/// * `birth` is therefore **not** catching a class `checksum` misses on the write path — `birth`
+///   lives inside the bytes `checksum` covers, so nothing the store does to one leaves the other
+///   still. What it buys is *exactness where crc32 is probabilistic*: a recycled id always starts
+///   a new epoch, so comparing `birth` makes the recycle case an exact decision instead of one a
+///   32-bit collision could get wrong. It rides along on the same header read and costs nothing,
+///   which is the whole argument for it.
+///
+///   "Probabilistic" is the claim that holds. This used to go further and call a page that agrees
+///   on `checksum` while disagreeing on `birth` *unconstructable*, which is false: crc32 is
+///   affine, so such a page is built by solving a 32-bit system over GF(2) for compensating
+///   payload bits, and the result passes `verify_checksum`. Nothing on the write path builds one
+///   — but `a_page_crafted_onto_a_colliding_checksum_is_still_a_different_version` does, and
+///   `birth` is what catches it.
 ///
 /// Keying on `birth` **alone** — the obvious reading, since `birth` is the field the stores
 /// restamp — is the version of this guard that does not work: it cannot see an in-place rewrite
@@ -1680,12 +1687,15 @@ mod tests {
 
     /// `birth` participates in the key, pinned at the only level where it can be.
     ///
-    /// The store-level test this wants cannot be written: `checksum` is a crc32 over the whole
-    /// page **including** the header, so two pages that agree on `checksum` and disagree on
-    /// `birth` differ only by a crc32 collision, and a collision cannot be constructed in a test.
-    /// That is also why dropping `birth` breaks no store-level test in this file — it is carried
-    /// for exactness on the recycle case, not to cover a class `checksum` misses. This pins that
-    /// it is actually consulted; [`PageVersion`]'s docs carry the argument for keeping it.
+    /// There is no store-level version of this, because the **store** never writes such a page:
+    /// `checksum` is a crc32 over the whole page **including** the header, so two pages that agree
+    /// on `checksum` and disagree on `birth` differ by a crc32 collision, and no write path
+    /// produces one. That is also why dropping `birth` breaks no store-level test in this file —
+    /// it is carried for exactness on the recycle case, not to cover a class `checksum` misses.
+    ///
+    /// What this used to say is that such a page "cannot be constructed in a test". It can, and
+    /// the next test constructs one. This one pins only that `birth` is consulted at all;
+    /// [`PageVersion`]'s docs carry the argument for keeping it.
     #[test]
     fn the_version_key_consults_the_birth_epoch_and_not_only_the_checksum() {
         let mut older = PageHeader::new(Epoch(7), crate::branch::types::ArenaId(1), PageType::BTreeLeaf);
@@ -1699,6 +1709,106 @@ mod tests {
             "two lives of one page id with a colliding checksum compared equal"
         );
         assert_eq!(PageVersion::of(&older), PageVersion::of(&older.clone()));
+    }
+
+    /// The construction this file used to say did not exist, and the `birth` half catching it.
+    ///
+    /// crc32 is **affine**: for equal-length messages `crc(a) ^ crc(b) ^ crc(c) == crc(a ^ b ^ c)`,
+    /// so the difference a bit-flip makes to the checksum is a property of the flip alone and not
+    /// of the page it lands on. Read off the difference each of 64 free payload bits makes, solve
+    /// over GF(2) for the combination that cancels the difference a new `birth_epoch` made, and
+    /// the result is a **well-formed page** — `verify_checksum` passes — that is a different page
+    /// in a different epoch carrying the *same* checksum.
+    ///
+    /// Nothing in this store's write path builds one, which is why there is no store-level test.
+    /// But "unconstructable" was the wrong word for it, and this is what `birth` is actually for:
+    /// keyed on `checksum` alone the memo would call these two lives of the page one page.
+    #[test]
+    fn a_page_crafted_onto_a_colliding_checksum_is_still_a_different_version() {
+        use crate::cow::page_header::{stamp_checksum, PAGE_HEADER_SIZE};
+        use crate::storage::disk_manager::PAGE_SIZE;
+        use crate::wal::log::crc32;
+
+        // An honestly stamped page.
+        let mut original = [0u8; PAGE_SIZE];
+        PageHeader::new(Epoch(7), crate::branch::types::ArenaId(1), PageType::BTreeLeaf)
+            .write_to(&mut original);
+        for (i, b) in original.iter_mut().enumerate().skip(PAGE_HEADER_SIZE).take(64) {
+            *b = (i as u8).wrapping_mul(31);
+        }
+        stamp_checksum(&mut original);
+        let older = PageHeader::read_from(&original).unwrap();
+
+        // The same page id in its next life, one epoch later, checksum field cleared ready to
+        // be solved for.
+        let mut forged = original;
+        forged[0..8].copy_from_slice(&8u64.to_be_bytes());
+        forged[12..16].copy_from_slice(&0u32.to_be_bytes());
+        assert_ne!(crc32(&forged), older.checksum, "premise: the epoch change moved the crc");
+
+        // Sixty-four free bits at the tail of the payload, and what each one does to the crc.
+        let sites: Vec<usize> = (PAGE_SIZE - 64..PAGE_SIZE).collect();
+        let base = crc32(&forged);
+        let cols: Vec<u32> = sites
+            .iter()
+            .map(|&s| {
+                let mut probe = forged;
+                probe[s] ^= 1;
+                crc32(&probe) ^ base
+            })
+            .collect();
+
+        // Row-reduce to a basis keyed by leading bit, carrying which sites each row came from.
+        let mut basis: [Option<(u32, u64)>; 32] = [None; 32];
+        for (i, &c) in cols.iter().enumerate() {
+            let (mut v, mut sel) = (c, 1u64 << i);
+            while v != 0 {
+                let hi = (31 - v.leading_zeros()) as usize;
+                match basis[hi] {
+                    None => {
+                        basis[hi] = Some((v, sel));
+                        break;
+                    }
+                    Some((bv, bsel)) => {
+                        v ^= bv;
+                        sel ^= bsel;
+                    }
+                }
+            }
+        }
+
+        // Solve for the flips that put the crc back on the original checksum.
+        let (mut residual, mut sel) = (base ^ older.checksum, 0u64);
+        while residual != 0 {
+            let hi = (31 - residual.leading_zeros()) as usize;
+            let (bv, bsel) = basis[hi]
+                .unwrap_or_else(|| panic!("the 64 chosen sites do not span bit {hi} of the crc"));
+            residual ^= bv;
+            sel ^= bsel;
+        }
+        for (i, &s) in sites.iter().enumerate() {
+            if sel & (1u64 << i) != 0 {
+                forged[s] ^= 1;
+            }
+        }
+        forged[12..16].copy_from_slice(&older.checksum.to_be_bytes());
+
+        // It is a real page, not a smudge: the store's own verifier accepts it.
+        assert!(
+            crate::cow::page_header::verify_checksum(&forged),
+            "the crafted page does not verify, so the construction is wrong and proves nothing"
+        );
+        let newer = PageHeader::read_from(&forged).unwrap();
+        assert_ne!(original, forged, "control: the two pages must actually differ");
+        assert_eq!(newer.checksum, older.checksum, "the collision was not achieved");
+        assert_ne!(newer.birth_epoch, older.birth_epoch);
+
+        // A key on `checksum` alone calls these one page. The shipped key does not.
+        assert_ne!(
+            PageVersion::of(&older),
+            PageVersion::of(&newer),
+            "a constructed crc32 collision defeated the version key"
+        );
     }
 
     /// The half that carries the guard, and the half the obvious fix — key on `birth_epoch` —
