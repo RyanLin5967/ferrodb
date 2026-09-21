@@ -92,6 +92,7 @@ use std::sync::Mutex;
 
 use crate::branch::types::{BranchId, Epoch, PageId};
 use crate::cow::btree::CowTree;
+use crate::cow::cid::{subtree_cid, Cid};
 use crate::cow::node::Node;
 use crate::cow::page_header::{PageHeader, PageType};
 use crate::error::FerroError;
@@ -105,14 +106,15 @@ const MAX_DEPTH: usize = 64;
 /// How the merge decides two subtrees are the same subtree.
 ///
 /// Supplied rather than fixed, because the two available answers have genuinely different powers
-/// and different costs — see [`ShadowId`] and [`MerkleId`]. `src/cow/cid.rs` is landing a content
-/// id with this shape and will drop in here.
+/// and different costs — see [`ShadowId`] and [`MerkleId`], which is a memo over `cow::cid`.
+///
+/// `Cid` is `cid.rs`'s `[u8; 16]`, so the two modules cannot drift on the width of an identity.
 ///
 /// **On the `Result`.** The brief's shape is `fn id_of(&self, page) -> [u8; 16]`. A content id has
 /// to *read* the page to compute itself, and a torn page or a checksum failure has to be reportable
 /// rather than a panic inside a merge, so the return is wrapped. [`ShadowId`] never fails.
 pub trait PageIdentity {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError>;
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError>;
 }
 
 /// **The page id itself.** Free, and *exact* for the trees this store produces.
@@ -130,7 +132,7 @@ pub trait PageIdentity {
 pub struct ShadowId;
 
 impl PageIdentity for ShadowId {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError> {
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError> {
         let mut out = [0u8; 16];
         out[..4].copy_from_slice(&page.to_be_bytes());
         // Tag the rest so a ShadowId can never be confused with a MerkleId if the two are ever
@@ -140,118 +142,59 @@ impl PageIdentity for ShadowId {
     }
 }
 
-/// **A recursive content id**: `H(leaf entries)` for a leaf, `H(child content ids)` for an internal
-/// node. Two subtrees with the same id have the same contents whatever their page ids.
+/// **A memo over [`crate::cow::cid::subtree_cid`]**: the recursive content id, cached per page.
 ///
-/// This is what buys row 4 and row 13 — convergent edits — as *skips* rather than as descents that
-/// find nothing. It is also the only identity that works if a caller ever hands this function three
-/// roots that are not COW relatives of each other.
+/// Two subtrees with the same cid have the same contents whatever their page ids, which is what
+/// buys truth-table rows 4 and 13 — convergent edits — as *skips* rather than as descents that find
+/// nothing. It is also the only identity that works if a caller ever hands `merge3` three roots
+/// that are not COW relatives of each other.
 ///
-/// **Cost, stated rather than rounded.** Cold, computing one root's id reads the whole tree: O(N).
-/// Warm it is a hash lookup, and page ids are stable under shadow paging (a modified page gets a
-/// *new* id, so a memoised entry can never go stale), which is what makes the memo sound. The curve
-/// in `bench/d92_merge3_curve.txt` is therefore measured with [`ShadowId`], where `id_of` reads
-/// nothing and `nodes_read` is honestly the descent's own cost. Use this one when you need the
-/// extra skips and can pay for the walk, or when `cid.rs` lands the id inside the page header and
-/// the cold cost goes away.
+/// **The hashing is `cid.rs`'s, not this file's.** An earlier draft of this type carried its own
+/// 128-bit mixer, which was a byte-for-byte-incompatible second answer to "what is this subtree's
+/// identity?" — two 16-byte content ids that disagree is a worse failure than having none. So the
+/// values here ARE `subtree_cid`'s, by calling it, with no tag or mixing constant duplicated.
+///
+/// **What this adds to it, and why.** `subtree_cid` says in its own doc that it has no memo table:
+/// a cid is computed on demand and thrown away. That is right for a caller that wants one cid. It
+/// is wrong inside a descent, which asks about the same page repeatedly — `base` and `ours` are
+/// literally the same page over most of a merge, and a band re-asks about a child it has already
+/// seen. The memo is sound because shadow paging never mutates a page in place under a live id: a
+/// modified page gets a *new* id, so an entry can go stale only if that invariant breaks.
+///
+/// **Cost, stated rather than rounded.** A memo miss reads the whole subtree under that page, so
+/// the first call on a root is O(N). Hits are a hash lookup. The curve in
+/// `bench/d92_merge3_curve.txt` is therefore measured with [`ShadowId`], where `id_of` reads
+/// nothing and `nodes_read` is honestly the descent's own cost. Reach for this one when you expect
+/// the two sides to have converged and want that caught at the root.
 pub struct MerkleId<'a> {
     tree: &'a CowTree,
-    memo: Mutex<HashMap<PageId, [u8; 16]>>,
-    /// Pages this provider read to answer `id_of`. Not part of [`MergeStats::nodes_read`], which
-    /// is the descent's own cost; kept separate so neither number can quietly absorb the other.
-    pages_hashed: Mutex<usize>,
+    memo: Mutex<HashMap<PageId, Cid>>,
+    /// Memo misses, i.e. calls that actually walked a subtree. Not part of
+    /// [`MergeStats::nodes_read`], which is the descent's own cost; kept separate so neither number
+    /// can quietly absorb the other.
+    computed: Mutex<usize>,
 }
 
 impl<'a> MerkleId<'a> {
     pub fn new(tree: &'a CowTree) -> Self {
-        MerkleId { tree, memo: Mutex::new(HashMap::new()), pages_hashed: Mutex::new(0) }
+        MerkleId { tree, memo: Mutex::new(HashMap::new()), computed: Mutex::new(0) }
     }
 
-    pub fn pages_hashed(&self) -> usize {
-        *self.pages_hashed.lock().unwrap()
-    }
-
-    fn compute(&self, page: PageId, depth: usize) -> Result<[u8; 16], FerroError> {
-        if depth > MAX_DEPTH {
-            return Err(FerroError::Cow("merkle id exceeded the depth guard".into()));
-        }
-        if let Some(h) = self.memo.lock().unwrap().get(&page) {
-            return Ok(*h);
-        }
-        let view = read_node(self.tree, page)?;
-        *self.pages_hashed.lock().unwrap() += 1;
-        let mut h = H128::new();
-        let id = match view {
-            NodeView::Leaf(entries) => {
-                h.field(b"leaf");
-                h.field(&(entries.len() as u64).to_be_bytes());
-                for (k, v) in &entries {
-                    h.field(k);
-                    h.field(v);
-                }
-                h.finish()
-            }
-            NodeView::Internal { leftmost, seps } => {
-                h.field(b"internal");
-                h.field(&(seps.len() as u64).to_be_bytes());
-                h.field(&self.compute(leftmost, depth + 1)?);
-                for (k, c) in &seps {
-                    h.field(k);
-                    h.field(&self.compute(*c, depth + 1)?);
-                }
-                h.finish()
-            }
-        };
-        self.memo.lock().unwrap().insert(page, id);
-        Ok(id)
+    /// How many subtree walks this provider paid for. The price of the extra skips, reported.
+    pub fn subtrees_walked(&self) -> usize {
+        *self.computed.lock().unwrap()
     }
 }
 
 impl PageIdentity for MerkleId<'_> {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError> {
-        self.compute(page, 0)
-    }
-}
-
-/// A 128-bit mixer, length-prefixing every field so that concatenation is unambiguous
-/// (`H("ab","c") != H("a","bc")` — the classic way a content id collides on purpose).
-///
-/// Two independent 64-bit streams. This crate has **zero dependencies** (see `Cargo.toml`) and this
-/// file does not change that; if a cryptographic id is ever needed — it would be, for a content id
-/// that crosses a trust boundary — `cid.rs` is the place for it, not here.
-struct H128 {
-    a: u64,
-    b: u64,
-}
-
-impl H128 {
-    fn new() -> Self {
-        H128 { a: 0xcbf2_9ce4_8422_2325, b: 0x9e37_79b9_7f4a_7c15 }
-    }
-
-    fn field(&mut self, bytes: &[u8]) {
-        self.write(&(bytes.len() as u64).to_be_bytes());
-        self.write(bytes);
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &x in bytes {
-            self.a = (self.a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
-            self.b = (self.b.rotate_left(27) ^ x as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError> {
+        if let Some(c) = self.memo.lock().unwrap().get(&page) {
+            return Ok(*c);
         }
-    }
-
-    fn finish(self) -> [u8; 16] {
-        let mut a = self.a ^ self.b.rotate_left(31);
-        let mut b = self.b ^ self.a.rotate_left(17);
-        a = (a ^ (a >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        a ^= a >> 29;
-        b = (b ^ (b >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        b ^= b >> 32;
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&a.to_be_bytes());
-        out[8..].copy_from_slice(&b.to_be_bytes());
-        out
+        let c = subtree_cid(self.tree, page)?;
+        *self.computed.lock().unwrap() += 1;
+        self.memo.lock().unwrap().insert(page, c);
+        Ok(c)
     }
 }
 
@@ -1140,18 +1083,29 @@ mod tests {
         assert!(m.is_clean());
         assert_eq!(fx.get(m.merged_root, &100u32.to_be_bytes()), Some(b"same".to_vec()));
         // And the cost that buys it is real and reported, not hidden.
-        assert!(merkle.pages_hashed() > 0);
+        assert!(merkle.subtrees_walked() > 0);
     }
 
     #[test]
-    fn merkle_id_separates_fields_so_concatenation_cannot_collide() {
-        let mut a = H128::new();
-        a.field(b"ab");
-        a.field(b"c");
-        let mut b = H128::new();
-        b.field(b"a");
-        b.field(b"bc");
-        assert_ne!(a.finish(), b.finish());
+    fn merkle_id_returns_exactly_what_cid_subtree_cid_returns() {
+        // The memo must be a CACHE and never a second opinion. If this file ever grows its own
+        // hashing again, two 16-byte "content ids" would disagree, which is worse than having none.
+        let fx = Fx::new();
+        let e = fx.tick();
+        let mut root = fx.tree.create(TRUNK, e).unwrap();
+        for i in 0..300u32 {
+            root = fx.put(root, TRUNK, &i.to_be_bytes(), &[4u8; 30]);
+        }
+        let ids = MerkleId::new(&fx.tree);
+        for page in fx.tree.walk_pages(root).unwrap() {
+            assert_eq!(ids.id_of(page).unwrap(), crate::cow::cid::subtree_cid(&fx.tree, page).unwrap());
+        }
+        // And a second pass is served entirely from the memo.
+        let after_first = ids.subtrees_walked();
+        for page in fx.tree.walk_pages(root).unwrap() {
+            ids.id_of(page).unwrap();
+        }
+        assert_eq!(ids.subtrees_walked(), after_first, "the memo did not serve the second pass");
     }
 
     // ---- the curve's own instrument, checked at a size a human can verify ---------------------

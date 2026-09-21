@@ -281,7 +281,7 @@ fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
     let m = merge3(&h.tree, base, ours, theirs, &merkle, into, e).unwrap();
     assert_eq!(m.stats.root_fast_path, Some(RootFastPath::SidesAgree));
     assert!(s.conflicts.is_empty() && m.conflicts.is_empty());
-    (s.stats, m.stats, merkle.pages_hashed())
+    (s.stats, m.stats, merkle.subtrees_walked())
 }
 
 fn main() {
@@ -434,7 +434,7 @@ fn main() {
         merkle.nodes_read, merkle.ids_compared, merkle.root_fast_path
     );
     println!("  MerkleId's own cost, reported separately and NOT folded into nodes_read above:");
-    println!("    pages hashed to compute the three root ids cold = {hashed}");
+    println!("    subtree walks paid for (memo misses) = {hashed}");
     println!("  Content identity retires a convergent edit at the root that page identity cannot");
     println!("  see; it pays for that by reading the tree once. That is the trade, stated both ways.");
 }
