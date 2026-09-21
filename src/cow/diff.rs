@@ -861,9 +861,25 @@ fn decode_payload(h: &PageHandle, pid: PageId, enclosing: &Span) -> Result<Paylo
 ///
 /// "O(1)" is the provider's cost, and the memoising providers here spend one page fetch and a
 /// header parse in it, to check that the row they are about to answer from still describes the
-/// page ([`PageVersion`]). That is bounded by the same O(delta · log_m N) comparisons, and it buys
-/// the difference between a stale row *missing* and a stale row *lying*. [`PageIdentity`] has no
-/// memo and so spends nothing.
+/// page ([`PageVersion`]). That buys the difference between a stale row *missing* and a stale row
+/// *lying*, and it is not free: **a skip stopped being a zero-read event.** Comparisons, not
+/// decodes, are what a skipping diff does most of, so the bill lands on exactly the operation the
+/// module optimises. Counted on the 16k-row, 1085-node tree of
+/// `warming_a_whole_tree_through_an_on_demand_digest_costs_more_than_the_o_n_path`, four rows
+/// changed:
+///
+/// ```text
+/// diff + PageIdentity  :   18 page reads   (no memo, so nothing to validate)
+/// diff + SubtreeHash   :  748 page reads   (~2 per comparison, on top of the same 18 decodes)
+/// CowTree::diff, O(N)  : 2188 page reads
+/// ```
+///
+/// Both still decode 18 payloads — `visited` does not move, and `examples/d91_diff_curve.rs`
+/// records the same `new_visited` for both providers at every N. It is the *fetches* that grow,
+/// bounded by the comparison count O(delta · m · log_m N) rather than by N: the validated hash
+/// provider still reads fewer pages than the tree has nodes, and under half what the path it
+/// replaces reads. [`PageIdentity`] holds no memo, has nothing to validate, and is unaffected —
+/// which is another reason it is the provider to prefer inside ferrodb.
 ///
 /// A pair that is the **same page id** costs nothing either, from any provider: `id_of` is a pure
 /// function of the page id, so the descent settles that case itself and never asks. In a
@@ -2144,8 +2160,16 @@ mod tests {
         let diff_reads = counting.take();
         assert_eq!(skipping.changes.len(), 4);
 
+        // What validating the memo costs on the hot path: every comparison re-reads both pages'
+        // headers, so a memoising provider fetches where `PageIdentity` — which holds no memo and
+        // so has nothing to validate — does not. Bounded by the comparisons, not by N.
+        let by_hash = diff(&tree, base, head, &stamp).unwrap();
+        let hash_diff_reads = counting.take();
+        assert_eq!(by_hash.changes, skipping.changes, "the providers disagree on the changeset");
+
         println!("  tree nodes                                 : {nodes:>8}");
         println!("  diff + PageIdentity, 4 rows changed        : {diff_reads:>8} page reads");
+        println!("  diff + SubtreeHash, same 4 rows            : {hash_diff_reads:>8} page reads");
         println!("  CowTree::diff, the O(N) path being beaten  : {control_reads:>8} page reads");
         println!("  SubtreeHash::stamp, bottom-up              : {stamp_reads:>8} page reads");
         println!("  MemoIdentity(subtree_cid).warm             : {warm_reads:>8} page reads");
@@ -2176,6 +2200,16 @@ mod tests {
             stamp_reads < control_reads,
             "the bottom-up precompute ({stamp_reads}) is no longer cheaper than the path it \
              replaces ({control_reads})"
+        );
+        // Validating costs two header reads per comparison, and the comparisons — not the decodes
+        // — are what a skipping diff does most of. So the hash provider's read count is far above
+        // its `visited` count, and the bound that still has to hold is the structural one: fewer
+        // reads than the tree has nodes means it is not enumerating, and fewer than the control
+        // means it still beats the path it replaces.
+        assert!(
+            hash_diff_reads < nodes && hash_diff_reads < control_reads,
+            "validating the memo on every comparison ({hash_diff_reads}) has pushed the skipping \
+             diff into enumerating: {nodes} nodes, and the O(N) path costs {control_reads}"
         );
         assert!(
             warm_reads > control_reads,
