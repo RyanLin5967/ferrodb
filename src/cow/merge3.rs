@@ -88,7 +88,7 @@
 //! `agent_sql`'s gate already does with `MergeOutcome::Conflict`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use crate::branch::types::{BranchId, Epoch, PageId};
@@ -154,6 +154,25 @@ pub trait PageIdentity {
     /// default is for a stateless provider, which has nothing to refuse.
     fn begin_merge(&self) -> Result<(), FerroError> {
         Ok(())
+    }
+
+    /// Called by [`merge3`] however it returns — normally, or through a `?`. The pair
+    /// [`PageIdentity::begin_merge`]/`end_merge` brackets the only window in which a cache keyed
+    /// on anything but content can be sound, because it is the only window in which `merge3`
+    /// guarantees nothing writes to the three trees.
+    fn end_merge(&self) {}
+}
+
+/// Closes the [`PageIdentity::begin_merge`]/[`PageIdentity::end_merge`] bracket on **every** exit
+/// path out of [`merge3`], including the `?` on a torn page.
+///
+/// A hand-written `end_merge()` before each `return` is a denylist over control flow: it covers the
+/// paths someone remembered, and this function has four returns plus a `?` on almost every line.
+struct MergeSession<'a>(&'a dyn PageIdentity);
+
+impl Drop for MergeSession<'_> {
+    fn drop(&mut self) {
+        self.0.end_merge();
     }
 }
 
@@ -225,9 +244,18 @@ impl PageIdentity for ShadowId {
 /// for is not. The only sound scope is a window in which nothing writes to the three trees.
 ///
 /// That window is one [`merge3`] call: it asks for every id during the descent and does not write
-/// until the descent has returned. So the memo is scoped to one merge, and scoped by refusing
-/// rather than by saying so — [`MerkleId::begin_merge`] spends the provider, and a second merge on
-/// the same one is an error, not a stale hit.
+/// until the descent has returned. So the memo is scoped to one merge, and scoped by mechanism
+/// rather than by saying so. The provider runs `Fresh -> Serving -> Spent`, never backwards:
+///
+/// * **`Fresh`** — `id_of` answers, and computes from the pages every time. No memo is read and
+///   none is written, so an answer here cannot be stale however long the provider has been held.
+/// * **`Serving`** — inside the one `merge3` that called `begin_merge`. The memo is live, and it
+///   is sound because nothing writes to the three trees inside that bracket.
+/// * **`Spent`** — `end_merge` ran. `id_of` still answers, and is again computed from the pages;
+///   the memo is never consulted again. A second `merge3` on this provider is refused outright.
+///
+/// So the stale hit has nowhere to happen: the memo only ever answers inside the window where it
+/// is sound, and outside it the provider is merely slower, never wrong.
 ///
 /// **Cost, stated rather than rounded.** Cold, computing one root's id reads the whole tree: O(N),
 /// and the memo is what keeps the descent's repeated `id_of` calls from making that O(N x depth).
@@ -240,10 +268,14 @@ pub struct MerkleId<'a> {
     /// Pages this provider read to answer `id_of`. Not part of [`MergeStats::nodes_read`], which
     /// is the descent's own cost; kept separate so neither number can quietly absorb the other.
     pages_hashed: Mutex<usize>,
-    /// Set by [`MerkleId::begin_merge`]. One provider, one merge; see the type's doc for why the
-    /// memo cannot outlive one.
-    served: AtomicBool,
+    /// `FRESH` / `SERVING` / `SPENT`, and only ever forwards. The memo is read and written **only**
+    /// in `SERVING`; see the type's doc for why no other window is sound.
+    state: AtomicU8,
 }
+
+const FRESH: u8 = 0;
+const SERVING: u8 = 1;
+const SPENT: u8 = 2;
 
 impl<'a> MerkleId<'a> {
     /// Build a content-identity provider for **one** [`merge3`] call.
@@ -255,7 +287,7 @@ impl<'a> MerkleId<'a> {
             tree,
             memo: Mutex::new(HashMap::new()),
             pages_hashed: Mutex::new(0),
-            served: AtomicBool::new(false),
+            state: AtomicU8::new(FRESH),
         }
     }
 
@@ -267,8 +299,13 @@ impl<'a> MerkleId<'a> {
         if depth > MAX_DEPTH {
             return Err(FerroError::Cow("merkle id exceeded the depth guard".into()));
         }
-        if let Some(h) = self.memo.lock().unwrap().get(&page) {
-            return Ok(*h);
+        // The memo answers only inside a merge. Outside one this recomputes from the pages, which
+        // is slower and cannot be stale — the whole point of the state machine above.
+        let memoising = self.state.load(Ordering::SeqCst) == SERVING;
+        if memoising {
+            if let Some(h) = self.memo.lock().unwrap().get(&page) {
+                return Ok(*h);
+            }
         }
         let shape = cid::shape_of(self.tree, page)?;
         *self.pages_hashed.lock().unwrap() += 1;
@@ -283,7 +320,9 @@ impl<'a> MerkleId<'a> {
                 cid::internal_cid(&leftmost_cid, &children)
             }
         };
-        self.memo.lock().unwrap().insert(page, id);
+        if memoising {
+            self.memo.lock().unwrap().insert(page, id);
+        }
         Ok(id)
     }
 }
@@ -304,7 +343,8 @@ impl PageIdentity for MerkleId<'_> {
     /// stale by the next. Refusing is the only answer that is not a silent wrong merge; see the
     /// type's doc for why no cheaper key works.
     fn begin_merge(&self) -> Result<(), FerroError> {
-        if self.served.swap(true, Ordering::SeqCst) {
+        if self.state.compare_exchange(FRESH, SERVING, Ordering::SeqCst, Ordering::SeqCst).is_err()
+        {
             return Err(FerroError::Cow(
                 "this MerkleId has already served a merge: its memo is keyed on PageId, and a \
                  PageId is not stable across merges — ArenaPageStore mutates a branch's own page \
@@ -314,6 +354,12 @@ impl PageIdentity for MerkleId<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// The merge is over, so the window in which the memo was sound is over with it. Everything
+    /// already in it stays — it is simply never consulted again.
+    fn end_merge(&self) {
+        self.state.store(SPENT, Ordering::SeqCst);
     }
 }
 
@@ -489,6 +535,9 @@ pub fn merge3(
     // Before a single id is asked for. A caching provider refuses here if its cache cannot be
     // sound for this call — `MerkleId` spends itself, because its memo is only good for one merge.
     ids.begin_merge()?;
+    // Closes the bracket on every path out of this function, `?` included. Named, not `_`, so it
+    // lives to the end of the call rather than being dropped on the spot.
+    let _session = MergeSession(ids);
     let identity_proof = ids.proof();
 
     // The same three comparisons as `resolve_cell`, at the coarsest granularity there is. Each one
@@ -1330,6 +1379,40 @@ mod tests {
         let r = merge3(&fx.tree, base, ours, theirs2, &fresh, into, fx.tick()).unwrap();
         assert!(r.is_clean(), "{:?}", r.conflicts);
         assert_eq!(fx.get(r.merged_root, b"k"), Some(b"vT".to_vec()));
+    }
+
+    /// The other half of the same defect, and the one the review described directly: "a caller
+    /// holding one across a reap gets a STALE content id". `MerkleId` is `pub`, `id_of` is `pub`
+    /// through a `pub` trait, so refusing a second *merge* is not enough on its own — a caller can
+    /// ask the provider for an id without going through `merge3` at all.
+    ///
+    /// The memo is therefore live only between `begin_merge` and `end_merge`. Outside that bracket
+    /// `id_of` recomputes from the pages: slower, and incapable of being stale.
+    #[test]
+    fn a_spent_merkle_id_recomputes_rather_than_answering_from_its_memo() {
+        let fx = Fx::new();
+        let (base, ob, tb) = fx.forked(&[(b"k", b"v0")]);
+        let ours = fx.put(base, ob, b"a", b"1");
+        let theirs1 = fx.put(base, tb, b"a", b"1");
+
+        let into = BranchId::new(75, 0);
+        fx.store.register_branch(into, Some(TRUNK), fx.tick()).unwrap();
+
+        let merkle = MerkleId::new(&fx.tree, AcceptFingerprintIdentity);
+        merge3(&fx.tree, base, ours, theirs1, &merkle, into, fx.tick()).unwrap();
+        let memoised = merkle.id_of(theirs1).unwrap();
+
+        // Same page id, different contents — cow_page's in-place arm, as above.
+        let theirs2 = fx.put(theirs1, tb, b"k", b"vT");
+        assert_eq!(theirs2, theirs1, "this test needs cow_page's in-place arm");
+
+        let truth = cid::subtree_cid(&fx.tree, theirs2).unwrap();
+        assert_ne!(memoised, truth, "the page's content id really did change");
+        assert_eq!(
+            merkle.id_of(theirs2).unwrap(),
+            truth,
+            "a spent MerkleId answered id_of from its stale memo"
+        );
     }
 
     /// A page that is not a B+tree node must be refused, not decoded as an internal node and its
