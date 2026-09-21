@@ -347,7 +347,16 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Cycle> {
             return None;
         }
     };
+    // **FIRE CHECK for the anti-vacuity guard below.** `D90_FIRECHECK=1` stages NOTHING while
+    // still forking and merging, so the branch publishes an empty changeset and every merge still
+    // reports `applied_to_target`. The read-back must then refuse every single cycle and the run
+    // must exit non-zero. If it instead prints a sweep, the guard is decorative and every number
+    // it protects is unprotected — which is the only way to know the guard is not decorative.
+    let fire_check = std::env::var("D90_FIRECHECK").is_ok();
     for i in 0..r {
+        if fire_check {
+            break;
+        }
         // 7919 is prime and does not divide `nrows`, so `i -> i * 7919 mod nrows` is injective for
         // every `r` this sweep reaches: exactly `r` DISTINCT rows, spread across the whole key
         // space. Clustering them would let one page absorb many changes and would report the
@@ -398,6 +407,43 @@ fn one_cycle(s: &Server, r: i64, nrows: i64, seq: usize) -> Option<Cycle> {
     let (f1, b1) = fsync_counters();
     let (a1, ab1) = atomic_replace_counters();
     let live1 = s.store.live_page_count().unwrap_or(0) as i64;
+
+    // ---- ANTI-VACUITY: the merge must have actually MOVED THE ROWS ------------------------
+    //
+    // `applied_to_target` says the merge published a changeset. It does NOT say the changeset
+    // contained anything. A merge that published nothing would report `applied = true`, cost the
+    // one page every merge costs, and this sweep would then report that page as the price of
+    // changing one row — a flat line manufactured out of an empty operation, which is exactly the
+    // shape the run is looking for and therefore the one it must not be able to fake.
+    //
+    // So the LAST row the branch wrote is read back through an ordinary `SELECT` against the
+    // trunk, outside any agent session, and must carry the value the branch put there. Read AFTER
+    // the counters so the verification cannot land inside the measurement window.
+    let last_i = r - 1;
+    let check_id = 1 + (last_i * 7919) % nrows;
+    let expect = Value::Integer((last_i + 1) as i32);
+    let mut verify = Session::with_runtime(Arc::clone(&s.ctx.runtime));
+    match exec(s, &format!("SELECT v FROM t WHERE id = {check_id};"), &mut verify) {
+        Ok(Outcome::Rows(rows)) => {
+            let got = rows.first().and_then(|row| row.first()).cloned();
+            if got.as_ref() != Some(&expect) {
+                eprintln!(
+                    "  r={r}: MERGE reported applied, but trunk row id={check_id} reads {got:?}, \
+                     not {expect:?}. The merge published nothing this sweep can price. \
+                     Refusing to report its bytes."
+                );
+                return None;
+            }
+        }
+        Ok(_) => {
+            eprintln!("  r={r}: the read-back SELECT did not return Rows — the check is broken, refusing.");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("  r={r}: the read-back SELECT failed: {e}. Refusing to report unverified bytes.");
+            return None;
+        }
+    }
     Some(Cycle {
         r,
         pages,
