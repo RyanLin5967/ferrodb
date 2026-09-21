@@ -45,6 +45,7 @@
 //! Both ends are run every time, because a dedup number without its own null case is unreadable.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::Arc;
 
 use ferrodb::branch::arena::ArenaPageStore;
@@ -262,6 +263,11 @@ fn main() {
                 r.page_refs - r.distinct_pages,
                 r.distinct_pages - r.distinct_payload,
             );
+            // **Flush every row as it is produced.** The 10^4 point takes minutes, and a run that
+            // is killed -- by a timeout, by the fleet, by the disk floor -- must leave the rows it
+            // already measured behind rather than losing all of them in a block buffer. A partial
+            // curve is a result; an empty file is not.
+            let _ = std::io::stdout().flush();
             rows_out.push(r);
         }
     }
