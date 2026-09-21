@@ -1,0 +1,36 @@
+
+================ ATTACK B: force the control to fire ================
+  [ok  ] B1 1000-key tree, one value +1 byte                  equal=false (wanted false)  41cfb97ddfba11f00c343ec1bb232fe4 / 1861c65cabadc4edfafc4c9738b039e9
+  [ok  ] B2 1000 keys vs 999 keys                             equal=false (wanted false)  41cfb97ddfba11f00c343ec1bb232fe4 / 3d4e5cd2137b10df15b6acaed5b55487
+  [ok  ] B3 tree{(ab,c)} vs tree{(a,bc)} (same byte stream)   equal=false (wanted false)  2272d427ee1f5a951ebd0216e4396fc8 / 9537d65d2c33612b668fa263076def4c
+  [ok  ] B4 values swapped between two keys                   equal=false (wanted false)  f4280cfe2733100ea88e6dcc85fce647 / 3f93ddc0c15c6174b05fff9f17b7e305
+  [ok  ] B5 empty value vs one zero byte                      equal=false (wanted false)  ed89cc3a5fd02af39a215c0e8bdb402b / c2ca17c334d832bc250deace9ee6dbad
+  [ok  ] B6a empty tree vs empty tree (must AGREE)            equal=true (wanted true)  5ab9110cf4476b6cec6398e1ae470b3f / 5ab9110cf4476b6cec6398e1ae470b3f
+  [ok  ] B6b empty tree vs one-entry tree                     equal=false (wanted false)  5ab9110cf4476b6cec6398e1ae470b3f / ed89cc3a5fd02af39a215c0e8bdb402b
+  [ok  ] B7 8 different key sets -> 8 distinct content cids (wanted 8)
+  [ok  ] B8 3000 random content sets -> 3000 distinct content cids, 0 colliding buckets
+  B verdict: 0 failures
+
+================ ATTACK C: physical independence ================
+  reference: root=1026 pages 1024..1033 (10 pages)  part=c861c8777435729cecf24521cabccff5 sub=580b659cb8a1f5b8963aa148b1d6c7ab
+  [ok  ] C1 same store, second build                  root=1036    pages   1034..1043   disjoint-from-ref=true  part=c861c8777435729cecf24521cabccff5 sub=580b659cb8a1f5b8963aa148b1d6c7ab
+  [ok  ] C2 different file, arena base 65536          root=65538   pages  65536..65545  disjoint-from-ref=true  part=c861c8777435729cecf24521cabccff5 sub=580b659cb8a1f5b8963aa148b1d6c7ab
+  [ok  ] C3 forked branch, epoch+50, own arena        root=1026    pages   1024..1033   disjoint-from-ref=false  part=c861c8777435729cecf24521cabccff5 sub=580b659cb8a1f5b8963aa148b1d6c7ab
+  [ok  ] C4 300 heap pages allocated first            root=1326    pages   1324..1333   disjoint-from-ref=true  part=c861c8777435729cecf24521cabccff5 sub=580b659cb8a1f5b8963aa148b1d6c7ab
+  [ok  ] C5 1000 insert+delete churn cycles          leaves=9 contentEq=true partitionEq=true
+  [ok  ] C6 one leaf, 20 entries, 7 insert orders   all leaf_cids equal=true  cid=2be6a1f528c4d80b48e440abb47b1827
+  C verdict: 0 failures
+
+================ ATTACK D: two different trees, one partition cid ================
+  donor tree has 5 leaf pages
+  shape A (1 internal, 3 children) : part=c43e68dee8bef6fb7eb6974ad94ec6d7 sub=06a8c6bfb645ce4f35db2dad888cfad3
+  shape B (2 levels, other seps)   : part=c43e68dee8bef6fb7eb6974ad94ec6d7 sub=d55c394b0af45b049fb2c9b714ed30a2
+  -> partition cids equal: true   content cids equal: true   subtree cids equal: false
+
+  D2 birthday over 2097152 distinct leaves:
+    full 128-bit collisions : 0
+    first-32-bit collisions : 534 (random expectation ~512)
+    first-48-bit collisions : 0 (random expectation ~0.0)
+  D3 2^22 chosen 8-byte keys, looking for a 64-bit-prefix collision: none (birthday expectation at 2^22 is ~2^-20)
+  D4 leaf order swapped in the fold: equal=false
+  D4 count 1 vs count 2 over the same first cid: equal=false
