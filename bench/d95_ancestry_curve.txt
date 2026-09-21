@@ -1,19 +1,25 @@
 D95 — ANCESTRY QUERIES: is-ancestor and LCA vs branch DEPTH, walk vs index, both arms in one run.
 
-[HERE] runs 04:22-04:26Z, banked 2026-09-21T04:25:26Z  examples/d95_ancestry_curve.rs  ferrodb at 5203b462ab95 (clean)
-       load=24.11 35.49 45.70 at run 1 (ten agents building; the reading is the SLOPE, not the
-       absolutes). Taken while holding ~/wt/logs/measure-lock.sh as "D95-ancestry", so no other
-       fleet measurement overlapped it.
+[HERE] examples/d95_ancestry_curve.rs
+       HOPS  (the headline)     ferrodb at 3869f956a97a (clean), taken 2026-09-21T04:46:39Z UNLOCKED.
+                                Hop counts are integers; a loaded box cannot move them, so no
+                                measure lock is needed or claimed for them.
+       CLOCK (confirmatory)     ferrodb at 3869f956a97a (clean), 3 runs, taken while holding
+                                ~/wt/logs/measure-lock.sh as "D95-ancestry", which granted with
+                                load_at_acquire=20 and printed its own caveat: exclusivity
+                                against other measurers, NOT a quiet box. Released after.
+                                Per that caveat every duration here is an UPPER BOUND at load 20.
 
-       LOCK HISTORY, stated exactly because it decides how these numbers may be used: the lock
-       was taken at 04:18:27Z and released at 04:31Z, and ALL FOUR RUNS were taken inside that
-       window. The lock's inner wait for load<8 NEVER COMPLETED — this box does not go quiet
-       while ten agents are up — so by that script's own rule the ABSOLUTES here are
-       untrustworthy and are not reported as anything else. What the lock did buy is real and is
-       the reason it was taken: no other fleet measurement ran against this box while these were
-       taken. The SLOPE across depths, measured in one process with arm order alternated per
-       depth, is the result; bench/d60_depth_premise.txt banked its curve under load 49 for the
-       same reason. The load-independent check on the whole claim is the walk_steps column.
+       An earlier set of four clock runs (the RAW RUNS appendix, ferrodb at 5203b46/bdb36f0) was
+       taken 04:22-04:26Z under the PREVIOUS version of the lock script, whose acquire blocked on
+       load < 8 and could therefore never return on this box. That is recorded rather than
+       deleted; its numbers agree with the confirmatory runs below.
+
+       WHY HOPS AND NOT MILLISECONDS. Sixteen sibling agents compile on this machine and load ran
+       20-60 throughout. An operation count proves a complexity class directly where a wall clock
+       only illustrates one — the same reasoning that makes reaper.rs state D40's claim in
+       `sweep_descents` rather than in milliseconds. The hop table is the result; the clock is
+       corroboration.
 
 ## PREMISE CORRECTION — READ THIS BEFORE THE NUMBERS
 
@@ -79,6 +85,44 @@ reaper.rs:169 walks chains of reaped ancestors on purpose. A tombstone is collec
 childless, cascading upward — the same shape as detach_from_parent. Invariant: a node with any
 descendant is never physically removed, which is what makes free-list slot reuse safe.
 
+## HEADLINE — POINTER HOPS. Integers, immune to load.
+
+Unit: one pointer dereference. For the walk that is a parent pointer; for the index a jump-table
+entry. The same unit on both sides, so the ratio is the complexity class and nothing else.
+
+   depth   anc_hop_walk    anc_hop_idx   anc_hop_x   lca_hop_walk    lca_hop_idx   lca_hop_x
+      10             10              2         5.0             20              6         3.3
+     100            100              3        33.3            200             10        20.0
+    1000           1000              6       166.7           2000             18       111.1
+   10000          10000              5      2000.0          20000             18      1111.1
+  100000         100000              6     16666.7         200000             22      9090.9
+ 1000000        1000000              7    142857.1        2000000             26     76923.1
+
+WALK: exactly D and 2D. Linear, by construction — one dereference per level.
+
+INDEX, is_ancestor: exactly popcount(D) — 2, 3, 6, 5, 6, 7. Not merely logarithmic but the exact
+predicted value, because the climb takes one jump per set bit of the depth delta. Note it is NOT
+monotonic (6 at depth 1000, 5 at depth 10000): popcount is not, and that is the signature of the
+algorithm actually being binary lifting rather than something that merely looks logarithmic.
+
+INDEX, lca: 6, 10, 18, 18, 22, 26. Grows like 2*log2(D), as the descent reads a jump entry from
+BOTH sides at each level it examines.
+
+AT THE PROJECT'S TARGET SCALE, depth 10^6: **7 hops versus 1,000,000** for is_ancestor, and
+**26 versus 2,000,000** for LCA. 142857x and 76923x fewer dereferences.
+
+These numbers are asserted as exact bounds in the unit tests, not merely observed here:
+`hop_counts_are_logarithmic_in_depth_and_the_walk_is_linear` checks popcount(D) for is_ancestor
+and 3*log2(D) for lca across 14 depths including every power-of-two boundary, and
+`hop_counts_do_not_grow_with_fan_out` checks that a 64-wide fan-out does not enter the count. A
+test that only asserted "index beats walk" would still pass at O(sqrt(depth)); these do not.
+
+ONE HONEST ASYMMETRY. In HOPS the index wins at every depth, including depth 10 (2 vs 10). In
+WALL CLOCK it LOSES below about depth 30. Those are not in conflict: the algorithm wins
+everywhere, and the implementation loses when a ~19 ns constant that is not a hop at all — two
+BranchId->slot hash lookups — outweighs a ten-step walk over a hot dense array. The MECHANISM
+CHECK section measures that constant directly.
+
 ## HOW TO READ THE COLUMNS
 
   anc_/lca_walk_ns   the parent-pointer walk, over DENSE Vec<u32> arrays — one array index per
@@ -135,7 +179,9 @@ depth.
 # rc=0
 # rc=0
 
-## THE READING
+## THE READING — WALL CLOCK, CONFIRMATORY ONLY
+
+Superseded as the headline by the hop table above; kept because it corroborates it.
 
 SLOPE, run 1, depth 10 -> 100000 (a 10^4x increase in depth):
 
@@ -229,3 +275,53 @@ Two consequences worth recording:
   100000        35827.1           22.6     1587.0        82683.4           50.7     1632.2          247.6            8.9       200000       200001
 # rc=0
 
+
+## APPENDIX A — HOPS, raw harness output (D95_SKIP_TIMING=1, no lock, depth to 10^6)
+
+# D95 ancestry curve. ferrodb at 3869f956a97a
+# profile=release  arms=walk,index  two chains of depth D off one root
+
+## POINTER HOPS — the headline. Integers; a loaded box cannot move them.
+## unit = one pointer dereference (parent pointer for walk, jump entry for index).
+   depth   anc_hop_walk    anc_hop_idx   anc_hop_x   lca_hop_walk    lca_hop_idx   lca_hop_x  index_nodes
+      10             10              2         5.0             20              6         3.3           21
+     100            100              3        33.3            200             10        20.0          201
+    1000           1000              6       166.7           2000             18       111.1         2001
+   10000          10000              5      2000.0          20000             18      1111.1        20001
+  100000         100000              6     16666.7         200000             22      9090.9       200001
+ 1000000        1000000              7    142857.1        2000000             26     76923.1      2000001
+# rc=0
+
+## APPENDIX B — CONFIRMATORY CLOCK, 3 runs under the fixed measure lock (load_at_acquire=20)
+## Every duration below is an UPPER BOUND at load 20, per the lock's own caveat.
+
+## confirmatory timing run 1  load_at_acquire=20  load_now=24.60 25.19 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           24.7        0.2            6.6           29.2        0.2           92.6           10.3
+     100          118.1           27.5        4.3          121.5           35.8        3.4          146.0            9.5
+    1000         1222.1           22.5       54.3         1289.1           37.2       34.7          145.7           10.0
+   10000         7798.8           39.5      197.4        14320.2           69.8      205.0          246.0           10.7
+  100000        37754.8           27.6     1366.9        81748.7           89.9      909.8          277.9           10.6
+# rc=0
+## confirmatory timing run 2  load_at_acquire=20  load_now=24.60 25.19 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           27.5        0.2            6.8           30.3        0.2          107.0           12.2
+     100          139.2           29.7        4.7          150.1           33.7        4.5          163.3           11.5
+    1000          369.1           27.9       13.2         1251.0           47.6       26.3          169.1           10.2
+   10000         5282.2           27.3      193.4        12285.4           44.0      279.3          181.9           12.7
+  100000        43750.7           33.6     1302.5        78273.8           50.4     1553.1          243.3           10.9
+# rc=0
+## confirmatory timing run 3  load_at_acquire=20  load_now=25.19 25.31 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           23.5        0.2            6.7           29.3        0.2          103.4           10.4
+     100          161.5           27.5        5.9          137.6           41.3        3.3          163.6           15.0
+    1000         1567.6           29.5       53.2         1715.4           61.5       27.9          170.6           13.0
+   10000        10138.8           46.5      217.9        14182.3           85.1      166.6          261.9           11.5
+  100000        63046.9           37.7     1670.6        80792.0           94.7      852.8          257.7           10.3
+# rc=0
