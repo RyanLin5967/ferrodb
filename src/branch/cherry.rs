@@ -45,6 +45,17 @@
 //! tree, so you must first decide what the pruned diff even means before you can apply it. An op
 //! log has no such problem — a subset of a list is a list.
 //!
+//! ## What is NOT here
+//!
+//! **Nothing wires this to `runtime.rs`, and there is no `CHERRY PICK` at the SQL surface.** There
+//! is no `impl CherryLog` or `impl CherryTarget` outside this file and its harness. This is the
+//! engine and its contract, written against the op-log shape `AgentRuntime` already keeps, so that
+//! wiring is a projection (`CherryLog::op_at` is `state.applied[i]`; `ops_on_cell` is
+//! `applied_by_cell`) rather than a translation. Every claim below is proved against
+//! `MemCherryLog` / `MemCherryTarget`; none of it is evidence about the runtime until that impl
+//! exists and is tested, and `commit_all`'s all-or-nothing contract in particular is the part the
+//! runtime will owe.
+//!
 //! ## Atomicity: made unrepresentable, not documented
 //!
 //! A half-applied cherry-pick is worse than a refused one: it leaves the target holding a state
@@ -1719,6 +1730,50 @@ mod tests {
         let r = pick(&log, &[], &mut t, &PolicyTable::new());
         let refusal = r.refusal().expect("an empty pick must refuse");
         assert!(refusal.has(CherryConflictKind::EmptySelection), "{:?}", refusal);
+        assert_eq!(t.commits, 0);
+    }
+
+    /// Row 2 is proved for `Add`/`Add`; `Max`/`Max` and `Min`/`Min` are different pairs in
+    /// `commutes_with` and had no test. Named here because the table says row 2 covers "ops that
+    /// commute", not "two Adds".
+    ///
+    /// Each case names a witness the target's op could actually have reached the target's value
+    /// from. That is not decoration: the first draft of this test used a witness of 0 for the
+    /// `Min` case, where `Min(4)` applied to 0 yields 0 and not 4, and [`divergence`]'s
+    /// verification correctly refused to trust a composition that did not explain the value — the
+    /// fixture was inconsistent and the check caught it.
+    #[test]
+    fn row02_max_and_min_divergences_commute_as_well_as_add() {
+        for (witness, ours, theirs, target, expect) in [
+            (int(0), OpKind::Max(int(7)), OpKind::Max(int(5)), int(5), int(7)),
+            (int(0), OpKind::Max(int(3)), OpKind::Max(int(9)), int(9), int(9)),
+            (int(10), OpKind::Min(int(2)), OpKind::Min(int(4)), int(4), int(2)),
+            (int(10), OpKind::Min(int(8)), OpKind::Min(int(3)), int(3), int(3)),
+        ] {
+            let mut log = MemCherryLog::new();
+            let a = log.push(cell_op(ours.clone(), Some(witness.clone())));
+            let mut t_op = cell_op(theirs.clone(), Some(witness.clone()));
+            t_op.branch = dst();
+            log.push(t_op);
+            let mut t = target_with(target.clone());
+            let r = pick(&log, &[a], &mut t, &PolicyTable::new());
+            assert!(r.is_applied(), "{:?} vs {:?} must commute, got {:?}", ours, theirs, r);
+            assert_eq!(t.cell(T, R, C), Some(&expect), "{:?} vs {:?}", ours, theirs);
+        }
+    }
+
+    /// Row 8's wording is about "the target row", but the same check exists against the image a
+    /// `RowCreate` in this selection produces, and that arm had no test.
+    #[test]
+    fn row08_a_column_past_the_end_of_a_created_row_image_also_refuses() {
+        let mut log = MemCherryLog::new();
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2)]), None, None));
+        let edit = log.push(op(OpKind::Assign(int(9)), Some(ColId(5)), None));
+        let mut t = MemCherryTarget::new();
+        let r = pick(&log, &[create, edit], &mut t, &PolicyTable::new());
+        let refusal = r.refusal().expect("expected REFUSE");
+        assert!(refusal.has(CherryConflictKind::ColumnAbsent), "{:?}", refusal);
+        assert_eq!(t.get(T, R), None, "the create must not have landed either");
         assert_eq!(t.commits, 0);
     }
 
