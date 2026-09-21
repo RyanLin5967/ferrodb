@@ -7,6 +7,25 @@ superseded — do not merge it.
 ## Commits
 - `499fe80` findings 3 and 4, plus a first cut at 1 and 2.
 - `0c4956d` supersedes that first cut: merge3 owns no identity, no hasher and no memo.
+- `5e61c45` verification record, and that `d92_merge3_curve` is red on main already.
+- `5220530` the three-route measurement of `(PageId, birth_epoch)`.
+- `953efa0` `cid.rs`: "trivially collidable" was too strong.
+
+A sixth commit withdrawing the `diff.rs` edits was made and then **discarded** (`git reset`) when
+the lead reversed the drop order; it survives only in the reflog and must not be resurrected.
+
+## ⚠ MERGE ORDER — do not rebase unprompted
+`src/cow/diff.rs` is touched by two branches. `fix-diff-memo` lands **first**; only then does this
+branch rebase onto it, and only then does the lead merge. **Do not rebase until the lead says
+`diff.rs` has landed.**
+
+This branch's `diff.rs` footprint is **purely additive — 70 insertions, 0 deletions** (`IdentityProof`,
+`NodeIdentity::proof()` with no default plus its three impls, and staleness warnings on
+`SubtreeHash`/`MemoIdentity`). That is what makes the co-edit safe: the lost-edit shape is two
+writers modifying the same lines, which this is not. **If `fix-diff-memo`'s work deletes or
+reshapes `NodeIdentity`, `SubtreeHash`, `MemoIdentity` or `page_id_identity`, additive stops
+holding — tell the lead rather than forcing the rebase.** `fix-diff-memo` has been asked to give a
+heads-up if it plans any of those, and has been told `proof()` is staying.
 
 ## The four findings
 1. **Memo keyed on a reused `PageId`.** Resolved by deletion: merge3 owns no memo. ⚠ **Not**
