@@ -320,7 +320,19 @@ fi
 
 p=$(awk '/^test result:/ {gsub(/;/,""); for(i=1;i<=NF;i++) if($i=="passed") s+=$(i-1)} END {print s+0}' "$LOG")
 f=$(awk '/^test result:/ {gsub(/;/,""); for(i=1;i<=NF;i++) if($i=="failed") s+=$(i-1)} END {print s+0}' "$LOG")
-be=$(grep -cE '^error(\[|:)' "$LOG")
+# Real build failures only. Cargo prints its own test OUTCOMES as `^error:` lines too
+# ("error: test failed, to rerun pass `--lib`" and "error: 1 target failed:"), so the previous
+# `^error(\[|:)` reported build_errors=2 for a run that compiled perfectly and failed a single
+# test. A reader — or a push gate keying on this field — takes that to mean the tree stopped
+# compiling, which is a different and much worse thing.
+#
+# Test outcomes are EXCLUDED by pattern rather than build errors being selected by one, and the
+# direction is deliberate: an `^error:` shape nobody anticipated still counts as a build error, so
+# an unrecognised line over-reports (and over-reporting refuses) instead of under-reporting (which
+# would wave a broken build through). Nothing is lost by not double-counting test failures here —
+# `failed=` and `rc=` already carry them.
+be=$(grep -E '^error(\[|:)' "$LOG" \
+     | grep -cvE '^error: (test|bench|doctest) failed|^error: [0-9]+ targets? failed')
 # A run that collected nothing has not passed, whatever its exit code says.
 if [ "${p:-0}" -eq 0 ]; then
     echo "$LABEL: REFUSING — zero tests collected (rc=$rc). That is a broken run, not a green one."
