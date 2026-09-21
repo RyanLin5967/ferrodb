@@ -125,17 +125,24 @@ impl NodeIdentity for PageIdentity {
 /// Keyed on the id alone they do not go *slow* when a page is recycled, they go **wrong**: a hit
 /// answers for content that is no longer on the page, and the diff skips a subtree that differs.
 ///
-/// Both fields are load-bearing, and they catch different things:
+/// The two fields are not independent, and the asymmetry matters:
 ///
-/// * `birth` is restamped on every allocation by both stores (`format_page` / `write_fresh_page`
-///   both write a fresh `PageHeader`), so it changes whenever an id starts a new life. It is the
-///   only one of the two that can catch a recycle into a page whose *bytes* happen to match the
-///   old ones — an internal node that points at the same child ids under the same separators, but
-///   whose children now hold different rows.
-/// * `checksum` is the crc32 `stamp_checksum` writes over the whole page on every write, so it
-///   changes whenever the page's bytes change **without** a reallocation. That is not a corner
-///   case: `btree.rs` mutates a node in place whenever it is already private to the writer, and
-///   `birth` does not move when it does.
+/// * `checksum` is the crc32 `stamp_checksum` writes over the **whole page, header included**, so
+///   it moves on any change to the page's bytes — a fresh allocation (which restamps the header)
+///   and an in-place rewrite alike. The in-place case is not a corner: `btree.rs` mutates a node
+///   where it lies whenever it is already private to the writer, and that path leaves `birth`
+///   exactly where it was. So `checksum` is the discriminator that carries the guard.
+/// * `birth` is therefore **not** catching a class `checksum` misses — `birth` lives inside the
+///   bytes `checksum` covers, and an attempt to build a recycled page that agrees on `checksum`
+///   but not on `birth` is unconstructable for that reason. What it buys is *exactness where
+///   crc32 is probabilistic*: a recycled id always starts a new epoch, so comparing `birth` makes
+///   the recycle case an exact decision instead of one a 32-bit collision could get wrong. It
+///   rides along on the same header read and costs nothing, which is the whole argument for it.
+///
+/// Keying on `birth` **alone** — the obvious reading, since `birth` is the field the stores
+/// restamp — is the version of this guard that does not work: it cannot see an in-place rewrite
+/// at all. `an_in_place_rewrite_invalidates_the_row_although_the_birth_epoch_is_unchanged` is the
+/// test that fails when the `checksum` half is removed.
 ///
 /// # What this cannot see, stated where the guard is
 ///
@@ -1520,7 +1527,31 @@ mod tests {
         );
     }
 
-    /// The other half of the key, and the half `birth_epoch` alone does not cover.
+    /// `birth` participates in the key, pinned at the only level where it can be.
+    ///
+    /// The store-level test this wants cannot be written: `checksum` is a crc32 over the whole
+    /// page **including** the header, so two pages that agree on `checksum` and disagree on
+    /// `birth` differ only by a crc32 collision, and a collision cannot be constructed in a test.
+    /// That is also why dropping `birth` breaks no store-level test in this file — it is carried
+    /// for exactness on the recycle case, not to cover a class `checksum` misses. This pins that
+    /// it is actually consulted; [`PageVersion`]'s docs carry the argument for keeping it.
+    #[test]
+    fn the_version_key_consults_the_birth_epoch_and_not_only_the_checksum() {
+        let mut older = PageHeader::new(Epoch(7), crate::branch::types::ArenaId(1), PageType::BTreeLeaf);
+        older.checksum = 0xdead_beef;
+        let mut newer = older;
+        newer.birth_epoch = Epoch(8);
+
+        assert_ne!(
+            PageVersion::of(&older),
+            PageVersion::of(&newer),
+            "two lives of one page id with a colliding checksum compared equal"
+        );
+        assert_eq!(PageVersion::of(&older), PageVersion::of(&older.clone()));
+    }
+
+    /// The half that carries the guard, and the half the obvious fix — key on `birth_epoch` —
+    /// does not cover.
     ///
     /// `btree::insert` writes into a node in place once it is private to the writer and stops
     /// copying up there, so the page id and the birth epoch both stay put while the contents
