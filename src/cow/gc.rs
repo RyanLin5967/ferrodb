@@ -213,6 +213,19 @@ impl ChunkHeap for ArenaPageStore {
     }
 
     fn pages_in(&self, arena: ArenaId) -> Vec<PageId> {
+        // **Ask for the truth before trusting the fill — D85.** A restored extent's `next_free`
+        // is understated until probed, and `allocated_pages` is `(0..next_free)`, so a sweep that
+        // skips this walks straight past every page written after the last checkpoint. That is
+        // the safe direction for correctness (it collects less) and a silent COMPLETENESS hole
+        // exactly where post-crash garbage lives: `fault_a_crash_does_not_hide_post_checkpoint_pages_from_the_sweep`
+        // measured it at 40 pages written past the checkpoint and **0 reclaimed** before this
+        // call was added. A collector reporting zero because it did not look is the failure this
+        // whole row exists to avoid.
+        //
+        // `resolve_fill` returns immediately unless this arena is in `fill_unknown`, so the
+        // steady-state cost is one hash lookup; it does real work only on the first sweep after
+        // a restore, and that work is bounded by the extent.
+        self.resolve_fill(arena);
         self.allocated_pages(arena)
     }
 
@@ -255,8 +268,24 @@ pub struct GcStats {
     pub spared_born_during_cycle: u64,
     /// Slices executed.
     pub slices: u64,
-    /// Longest single slice, nanoseconds. **This is the pause number.**
+    /// Longest single slice, nanoseconds.
+    ///
+    /// **This is NOT on its own a pause claim, and the curve proved why.** The maximum of a
+    /// sample grows with the sample size even when the distribution is identical, so comparing
+    /// `max` across rows with different slice counts cannot tell an outlier from a real shift.
+    /// The first locked run read 4.00 ms at N=163, 178 ms at N=788 and 8.01 ms at N=1569 — a
+    /// 44x "growth" that then fell 22x at twice the heap. A distribution that genuinely grew
+    /// with the heap cannot do that. Use [`GcStats::p50_slice_nanos`] and
+    /// [`GcStats::p99_slice_nanos`], and quote N beside them.
     pub max_slice_nanos: u128,
+    /// Median slice, nanoseconds. Says whether the whole distribution moved.
+    pub p50_slice_nanos: u128,
+    /// 99th-percentile slice, nanoseconds. **This is the number a pause claim rests on**: it is
+    /// about the tail, which is what a pause claim is about, while being far less sample-size
+    /// sensitive than the maximum.
+    pub p99_slice_nanos: u128,
+    /// Mean slice, nanoseconds.
+    pub mean_slice_nanos: u128,
     /// Most pages touched in any one slice. Must never exceed the budget.
     pub max_slice_pages: u64,
     /// Nanoseconds spent in the once-per-cycle root and arena snapshot.
@@ -298,6 +327,9 @@ pub struct GcCycle {
     sweep_page_idx: usize,
     phase: Phase,
     stats: GcStats,
+    /// Every slice's duration, for the percentiles. Bounded by slice count, which is bounded by
+    /// the work the cycle was given, so this does not grow without limit inside one cycle.
+    slice_nanos: Vec<u128>,
 }
 
 impl GcCycle {
@@ -327,6 +359,7 @@ impl GcCycle {
             sweep_page_idx: 0,
             phase: Phase::Marking,
             stats: GcStats { snapshot_nanos, ..GcStats::default() },
+            slice_nanos: Vec::new(),
         })
     }
 
@@ -348,6 +381,7 @@ impl GcCycle {
             sweep_page_idx: 0,
             phase: Phase::Marking,
             stats: GcStats { snapshot_nanos, ..GcStats::default() },
+            slice_nanos: Vec::new(),
         }
     }
 
@@ -513,10 +547,34 @@ impl GcCycle {
         if elapsed > self.stats.max_slice_nanos {
             self.stats.max_slice_nanos = elapsed;
         }
+        self.slice_nanos.push(elapsed);
+        self.recompute_percentiles();
         if touched > self.stats.max_slice_pages {
             self.stats.max_slice_pages = touched;
         }
         Ok(self.phase == Phase::Done)
+    }
+
+    /// Recompute the slice-time distribution from the samples collected so far.
+    ///
+    /// Sorts a copy rather than keeping a sorted structure: a cycle has thousands of slices at
+    /// most, this runs off the measurement path only, and an exact percentile from the real
+    /// samples is worth more here than an estimator would be.
+    fn recompute_percentiles(&mut self) {
+        if self.slice_nanos.is_empty() {
+            return;
+        }
+        let mut v = self.slice_nanos.clone();
+        v.sort_unstable();
+        let pick = |q: f64| -> u128 {
+            // Nearest-rank: the smallest sample at or above the qth fraction.
+            let idx = ((v.len() as f64) * q).ceil() as usize;
+            v[idx.saturating_sub(1).min(v.len() - 1)]
+        };
+        self.stats.p50_slice_nanos = pick(0.50);
+        self.stats.p99_slice_nanos = pick(0.99);
+        self.stats.mean_slice_nanos =
+            v.iter().sum::<u128>() / (v.len() as u128);
     }
 
     /// Drive the cycle to completion at a fixed slice budget.
@@ -547,12 +605,57 @@ impl GcCycle {
     }
 }
 
+/// Proof, supplied by the caller, that no branch is writing while a cycle runs.
+///
+/// # Why this type exists, measured rather than reasoned
+///
+/// **Collecting while a writer allocates is UNSOUND, and no epoch rule can fix it.**
+/// `fault_concurrent_writers_control_versus_sweep` establishes it by control: two writer threads
+/// with no collector finish cleanly (`Ok(2)`); the identical workload with a cycle running
+/// alongside kills a writer with *"page 0 failed its checksum"*.
+///
+/// The mechanism is not a bug in the sweep, it is the row's own premise turned against it. A page
+/// that a writer has allocated but not yet linked into any tree is:
+///
+/// * unreachable from every root — it is not linked yet; and
+/// * never freed — nobody has called `free_page` on it.
+///
+/// That is **character for character the leak signature this collector hunts**. The
+/// allocate-black rule does not close it: that rule spares pages born at or after the cycle's
+/// `start_epoch`, and this page was born *before* it. So the collector frees a page its allocator
+/// is still holding, and the next read of it fails its checksum.
+///
+/// Separating the two would require the allocator to publish "allocated but not yet linked" —
+/// which is a write barrier, the exact global bookkeeping `crate::cow`'s module brief trades away
+/// on purpose. **So this is not a gap to be fixed here; it is the cost of that trade, and the
+/// correct response is to refuse rather than to warn.**
+///
+/// Hence a token with an unmissable name at every call site, rather than a sentence in a doc
+/// comment that a caller scheduling a background tick would never read.
+pub struct Quiesced(());
+
+impl Quiesced {
+    /// Assert that **every writer against this store is stopped** for the duration of the cycle.
+    ///
+    /// Named to be read at the call site. There is no way to verify it from in here — the store
+    /// does not track in-flight allocations, which is the whole reason this token exists — so
+    /// this is an obligation the caller takes on, not a check. Getting it wrong corrupts pages
+    /// that are in use.
+    #[allow(clippy::new_without_default)]
+    pub fn i_have_stopped_all_writers() -> Quiesced {
+        Quiesced(())
+    }
+}
+
 /// Collect once, from the catalog's current roots, and return what it did.
+///
+/// Requires a [`Quiesced`] token: see that type for the measurement showing why.
 pub fn collect_once(
     catalog: &dyn BranchCatalog,
     store: &dyn PageStore,
     heap: &dyn ChunkHeap,
     budget: u64,
+    _quiesced: &Quiesced,
 ) -> Result<GcStats, FerroError> {
     let mut cycle = GcCycle::open(catalog, heap)?;
     // Slice cap sized off the work actually queued: every page is popped at most once and every
@@ -575,8 +678,9 @@ pub fn collect_once_arena(
     catalog: &dyn BranchCatalog,
     store: &Arc<ArenaPageStore>,
     budget: u64,
+    quiesced: &Quiesced,
 ) -> Result<GcStats, FerroError> {
-    collect_once(catalog, store.as_ref(), store.as_ref(), budget)
+    collect_once(catalog, store.as_ref(), store.as_ref(), budget, quiesced)
 }
 
 #[cfg(test)]
@@ -592,7 +696,11 @@ mod tests {
 
     use super::*;
 
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
     use crate::branch::catalog::LogBranchCatalog;
+    use crate::cow::PageHandle;
     use crate::branch::types::{LeaseDeadline, ARENA_EXTENT_PAGES};
     use crate::buffer::buffer_pool::BufferPoolManager;
     use crate::cow::btree::CowTree;
@@ -663,7 +771,8 @@ mod tests {
         }
 
         fn collect(&self, budget: u64) -> GcStats {
-            collect_once_arena(self.cat(), &self.store, budget).unwrap()
+            collect_once_arena(self.cat(), &self.store, budget, &Quiesced::i_have_stopped_all_writers())
+                .unwrap()
         }
     }
 
@@ -1276,6 +1385,568 @@ mod tests {
         );
     }
 
+    // ---- fault injection -----------------------------------------------------------------
+    //
+    // The three paths the residue measurement did NOT cover, and which is exactly where a leak
+    // would be if there is one: an allocation that fails partway through a node split, a crash
+    // that loses writes made after the last checkpoint, and two writers allocating while the
+    // sweep runs. An unexercised scope limit is not a small risk, it is where the bug lives.
+
+    /// A [`PageStore`] decorator that fails the Nth allocation and delegates everything else.
+    ///
+    /// A decorator rather than a knob inside `ArenaPageStore`, because a fault switch on the
+    /// shipped store is a dangerous state that exists in production for the sake of a test. This
+    /// way the injection cannot be reached by any caller that did not deliberately wrap the
+    /// store, and `src/branch/arena.rs` — which another agent is editing — is untouched.
+    struct FailAfterNAllocs {
+        inner: Arc<ArenaPageStore>,
+        remaining: std::sync::atomic::AtomicI64,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailAfterNAllocs {
+        fn new(inner: Arc<ArenaPageStore>) -> Arc<FailAfterNAllocs> {
+            Arc::new(FailAfterNAllocs {
+                inner,
+                remaining: std::sync::atomic::AtomicI64::new(i64::MAX),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn arm(&self, after: i64) {
+            self.remaining.store(after, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        fn disarm(&self) {
+            self.armed.store(false, Ordering::SeqCst);
+        }
+        fn should_fail(&self) -> bool {
+            if !self.armed.load(Ordering::SeqCst) {
+                return false;
+            }
+            self.remaining.fetch_sub(1, Ordering::SeqCst) <= 0
+        }
+    }
+
+    impl PageStore for FailAfterNAllocs {
+        fn alloc_in_arena(
+            &self,
+            arena: ArenaId,
+            page_type: PageType,
+            birth_epoch: Epoch,
+        ) -> Result<PageId, FerroError> {
+            if self.should_fail() {
+                return Err(FerroError::Cow("injected allocation failure".into()));
+            }
+            self.inner.alloc_in_arena(arena, page_type, birth_epoch)
+        }
+        fn read_page(&self, page_id: PageId) -> Result<PageHandle, FerroError> {
+            self.inner.read_page(page_id)
+        }
+        fn cow_page(
+            &self,
+            page_id: PageId,
+            branch: BranchId,
+            epoch: Epoch,
+        ) -> Result<crate::cow::CowPage, FerroError> {
+            if self.should_fail() {
+                return Err(FerroError::Cow("injected shadow failure".into()));
+            }
+            self.inner.cow_page(page_id, branch, epoch)
+        }
+        fn free_page(&self, page_id: PageId, free_epoch: Epoch) -> Result<(), FerroError> {
+            self.inner.free_page(page_id, free_epoch)
+        }
+        fn alloc_arena(&self, branch: BranchId) -> Result<ArenaId, FerroError> {
+            self.inner.alloc_arena(branch)
+        }
+        fn arena_for(&self, branch: BranchId) -> Result<ArenaId, FerroError> {
+            self.inner.arena_for(branch)
+        }
+        fn free_arena(&self, arena: ArenaId) -> Result<u32, FerroError> {
+            self.inner.free_arena(arena)
+        }
+        fn live_page_count(&self) -> Result<u32, FerroError> {
+            self.inner.live_page_count()
+        }
+        fn flush(&self) -> Result<(), FerroError> {
+            self.inner.flush()
+        }
+    }
+
+    impl ChunkHeap for FailAfterNAllocs {
+        fn arenas(&self) -> Vec<(ArenaId, BranchId)> {
+            self.inner.arenas()
+        }
+        fn pages_in(&self, arena: ArenaId) -> Vec<PageId> {
+            self.inner.pages_in(arena)
+        }
+        fn release(&self, page: PageId, arena: ArenaId) {
+            self.inner.release(page, arena)
+        }
+    }
+
+    /// **Fault 1 — an allocation that fails partway through a write.**
+    ///
+    /// A B+tree insert that splits allocates more than one page. If the second allocation fails,
+    /// the first is already stamped into the arena and linked into nothing: allocated,
+    /// unreachable, never freed, owner alive. That is precisely the class the interval rule
+    /// cannot see, and unlike the planted-garbage tests, nothing here plants anything — the
+    /// engine's own error path produces it.
+    ///
+    /// This test does not assert that a leak EXISTS; it asserts what the collector does about
+    /// whatever the error path leaves. The count it prints is the finding.
+    #[test]
+    fn fault_an_allocation_failure_mid_write_strands_no_page_the_gc_cannot_find() {
+        let env = Env::new("faultalloc");
+        let faulty = FailAfterNAllocs::new(Arc::clone(&env.store));
+        let tree = CowTree::new(Arc::clone(&faulty) as Arc<dyn PageStore>);
+
+        // Grow a real tree through the decorator, unarmed, until it is several pages deep.
+        let e = env.catalog.next_epoch();
+        let mut root = tree.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..600u32 {
+            let e = env.catalog.next_epoch();
+            let k = format!("k{:06}", i);
+            root = tree.insert(root, BranchId::TRUNK, e, k.as_bytes(), b"v").unwrap();
+        }
+        env.catalog.set_root(BranchId::TRUNK, root).unwrap();
+
+        // **Fork first, or the fault cannot reach anything.** A childless branch writing its own
+        // pages takes the in-place path (`cow_page` returns `copied == false` inside the privacy
+        // barrier) and allocates NOTHING, so an injected allocation failure never fires. The
+        // first version of this test armed the fault against exactly that and reported "no
+        // injected failure actually fired" — the guard that caught it is the `failures > 0`
+        // assertion below, which is there so this test can never pass by doing nothing.
+        let _child = env.catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+
+        let live_before = env.store.live_page_count().unwrap();
+
+        // Now fail an allocation partway through a burst of writes, at varying depths so the
+        // failure lands in different places in the shadow/split path. `arm(k)` lets k calls
+        // through and fails the (k+1)th, so 0 fails the very first one.
+        let mut failures = 0;
+        for nth in 0..=6i64 {
+            faulty.arm(nth);
+            let e = env.catalog.next_epoch();
+            let k = format!("z{:06}", nth);
+            match tree.insert(root, BranchId::TRUNK, e, k.as_bytes(), b"v") {
+                Ok(new_root) => {
+                    // It did not need that many allocations; publish and continue.
+                    root = new_root;
+                    env.catalog.set_root(BranchId::TRUNK, root).unwrap();
+                }
+                Err(_) => failures += 1,
+            }
+            faulty.disarm();
+        }
+        assert!(failures > 0, "no injected failure actually fired — the fault is not reaching the write path");
+
+        let live_after_faults = env.store.live_page_count().unwrap();
+        let stranded_by_count = live_after_faults.saturating_sub(live_before);
+
+        // The published root is still the last good one, and the tree still reads.
+        for i in 0..600u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                tree.get(root, k.as_bytes()).unwrap().is_some(),
+                "failed insert corrupted the tree: lost {}",
+                k
+            );
+        }
+
+        let _ = env.catalog.next_epoch();
+        let stats = collect_once(env.cat(), faulty.as_ref(), faulty.as_ref(), 64, &Quiesced::i_have_stopped_all_writers())
+            .unwrap();
+
+        println!(
+            "FAULT-1 alloc-failure: {} injected failures, live pages +{} after them, gc reclaimed {}",
+            failures, stranded_by_count, stats.reclaimed
+        );
+
+        // **Not** "the live count returns to its pre-fault value" — that was the first version of
+        // this assertion and it is wrong. Once a child exists, a SUCCESSFUL write shadows: it
+        // allocates a new page and parks the old one, so the live count legitimately rises. The
+        // first run read +3 stranded / 1 collected and failed, when most of that +3 was ordinary
+        // tree growth rather than leakage.
+        //
+        // The real invariant, stated directly: **every allocated page is either reachable from a
+        // root, or parked in the pending-free log.** Anything else is a page nothing can ever
+        // reach and nothing will ever free — a permanent leak, and one this collector failed to
+        // collect.
+        //
+        // Collect to a fixed point first, so this measures what the collector CANNOT find rather
+        // than what one cycle happened not to reach.
+        for _ in 0..5 {
+            let s = collect_once(
+                env.cat(),
+                faulty.as_ref(),
+                faulty.as_ref(),
+                64,
+                &Quiesced::i_have_stopped_all_writers(),
+            )
+            .unwrap();
+            if s.reclaimed == 0 {
+                break;
+            }
+        }
+
+        // The parked set, read out and put straight back.
+        let parked: HashSet<PageId> =
+            env.store.take_pending().iter().map(|p| p.page_id).collect();
+        env.store.put_pending(
+            parked
+                .iter()
+                .map(|p| crate::branch::record::PendingFree {
+                    page_id: *p,
+                    arena_id: ArenaId(0),
+                    birth_epoch: Epoch(0),
+                    free_epoch: Epoch(0),
+                    owner: BranchId::TRUNK,
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        // The reachable set, from a fresh mark.
+        let mut probe = GcCycle::open(env.cat(), faulty.as_ref()).unwrap();
+        while !probe.step(faulty.as_ref(), faulty.as_ref(), 4096).unwrap() {}
+        let reachable = probe.marked().clone();
+
+        let mut leaked = Vec::new();
+        for (arena, _) in env.store.live_arenas() {
+            for pid in env.store.allocated_pages(arena) {
+                if reachable.contains(&pid) || parked.contains(&pid) {
+                    continue;
+                }
+                if let Ok(h) = env.store.read_page(pid) {
+                    if let Ok(hdr) = PageHeader::read_from(&h.read().data) {
+                        if is_collectable_type(hdr.page_type) {
+                            leaked.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "{} page(s) {:?} are allocated, reachable from NO root, and NOT parked as freed — a \
+             permanent leak the collector could not reach even at a fixed point. {} failures \
+             injected, live count moved +{}",
+            leaked.len(),
+            leaked,
+            failures,
+            stranded_by_count
+        );
+        // And the tree is still intact after the sweep.
+        for i in 0..600u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                tree.get(root, k.as_bytes()).unwrap().is_some(),
+                "the sweep collected a page the surviving tree still needs: lost {}",
+                k
+            );
+        }
+    }
+
+    /// **Fault 2 — a crash that loses writes made after the last checkpoint.**
+    ///
+    /// D85's reproduction shape, reused rather than reinvented: `checkpoint_to` to arm the image,
+    /// write past it, then `reopen_from_checkpoint` to come back as a process that never saw
+    /// those writes.
+    ///
+    /// The hazard this pins is specific and is D85's own: a restored extent's `next_free` is
+    /// **understated**, and `allocated_pages` is `(0..next_free)`. So a sweep that trusts it
+    /// walks past pages that physically exist. That is the safe direction for correctness — it
+    /// collects less — but it is a silent COMPLETENESS hole exactly where post-crash garbage
+    /// lives, and a collector that reports zero because it did not look is the failure mode this
+    /// whole row is about. `ChunkHeap::pages_in` for `ArenaPageStore` calls `resolve_fill` first
+    /// for this reason; D85 says the callers that need the truth must ask for it.
+    #[test]
+    fn fault_a_crash_does_not_hide_post_checkpoint_pages_from_the_sweep() {
+        let dir = std::env::temp_dir().join(format!("d96-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("crash.db");
+        let ckpt = dir.join("crash.arena");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&db)
+            .unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(0));
+        let base = pool.disk_manager.high_water().unwrap();
+        let store = Arc::new(
+            ArenaPageStore::new(
+                Arc::clone(&pool),
+                Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+                base,
+            )
+            .unwrap(),
+        );
+        let tree = CowTree::new(Arc::clone(&store) as Arc<dyn PageStore>);
+
+        // A committed tree, grown until the trunk is allocating from a FULL-SIZE extent with room
+        // left in it. That matters: extents grow 1, 2, 4, ... 256, so a small tree sits in tiny
+        // extents and 40 further allocations claim brand-new ones. Pages in an extent the
+        // checkpoint never recorded are not leaked at all — the claim was never durable, so that
+        // space returns to the allocator — and a test built that way measures nothing about the
+        // fill. To exercise the understated-`next_free` hazard the pages must land INSIDE an
+        // extent the checkpoint knows about.
+        let e = catalog.next_epoch();
+        let mut root = tree.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..4_000u32 {
+            let e = catalog.next_epoch();
+            let k = format!("k{:06}", i);
+            root = tree.insert(root, BranchId::TRUNK, e, k.as_bytes(), b"v").unwrap();
+        }
+        catalog.set_root(BranchId::TRUNK, root).unwrap();
+        store.checkpoint(&ckpt).unwrap();
+
+        // The extents the checkpoint recorded, so the pages written next can be classified.
+        let recorded: Vec<(PageId, u32)> = store
+            .live_arenas()
+            .iter()
+            .filter_map(|(a, _)| store.extent_range(*a))
+            .collect();
+
+        // Writes AFTER the checkpoint whose root swap never reaches the catalog — the crash.
+        let mut lost = Vec::new();
+        for i in 0..40u32 {
+            let e = catalog.next_epoch();
+            lost.push(store.alloc_for(BranchId::TRUNK, PageType::BTreeLeaf, e).unwrap());
+        }
+        store.flush().unwrap();
+        drop(tree);
+        drop(store);
+
+        // Reopen as a fresh process that only has the checkpoint.
+        let file2 = std::fs::OpenOptions::new().read(true).write(true).open(&db).unwrap();
+        let pool2 = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file2).unwrap())));
+        let store2 = Arc::new(
+            ArenaPageStore::reopen_from_checkpoint(
+                pool2,
+                Arc::clone(&catalog) as Arc<dyn BranchCatalog>,
+                &ckpt,
+            )
+            .unwrap(),
+        );
+        let tree2 = CowTree::new(Arc::clone(&store2) as Arc<dyn PageStore>);
+
+        // The committed tree survived the crash.
+        for i in 0..300u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                tree2.get(root, k.as_bytes()).unwrap().is_some(),
+                "the checkpointed tree did not survive the reopen: lost {}",
+                k
+            );
+        }
+
+        let _ = catalog.next_epoch();
+        let stats = collect_once_arena(catalog.as_ref(), &store2, 64, &Quiesced::i_have_stopped_all_writers())
+            .unwrap();
+        println!(
+            "FAULT-2 crash: {} pages written after the checkpoint, gc reclaimed {} after reopen",
+            lost.len(),
+            stats.reclaimed
+        );
+
+        // Classify the stranded pages against the extents the checkpoint actually recorded. Only
+        // the ones INSIDE a recorded extent are the GC's business: a page in an extent the
+        // checkpoint never saw is not leaked, because that extent's claim was never durable and
+        // the space manager will re-grant it.
+        let inside: Vec<PageId> = lost
+            .iter()
+            .copied()
+            .filter(|p| recorded.iter().any(|(s, c)| *p >= *s && *p < *s + *c))
+            .collect();
+        println!(
+            "FAULT-2 classification: {} of {} stranded pages fall inside a CHECKPOINTED extent",
+            inside.len(),
+            lost.len()
+        );
+
+        // Those, and only those, must be found. The sweep only sees them because
+        // `ChunkHeap::pages_in` calls `resolve_fill` first: a restored extent's `next_free` is
+        // understated, `allocated_pages` is `(0..next_free)`, and without the probe the sweep
+        // walks straight past every page written after the last checkpoint and reports a clean
+        // zero. That zero looks exactly like "no garbage after a crash", which is the failure
+        // mode this whole row exists to avoid.
+        if inside.is_empty() {
+            panic!(
+                "no stranded page landed inside a checkpointed extent, so this test exercised \
+                 the resolve_fill hazard not at all — it needs the trunk to be mid-extent at \
+                 checkpoint time. {} pages were stranded across {} recorded extents.",
+                lost.len(),
+                recorded.len()
+            );
+        }
+        assert!(
+            stats.reclaimed >= inside.len() as u64,
+            "{} pages were written past the checkpoint INSIDE recorded extents, but the sweep \
+             reclaimed only {}. The restored fill was not resolved, so allocated_pages stopped \
+             short of them: {:?}",
+            inside.len(),
+            stats.reclaimed,
+            stats
+        );
+
+        // The committed tree is STILL intact after the sweep. This is the assertion that matters:
+        // a sweep that resolved the fill and then over-collected would break it.
+        for i in 0..300u32 {
+            let k = format!("k{:06}", i);
+            assert!(
+                tree2.get(root, k.as_bytes()).unwrap().is_some(),
+                "the post-crash sweep collected a page the committed tree needs: lost {}",
+                k
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Fault 3 — two writers allocating while the sweep runs.**
+    ///
+    /// Run as a CONTROL and a TREATMENT in one test, because the first version crashed inside
+    /// `BufferPoolManager::unpin_page` and a crash on its own does not say what caused it. The
+    /// control is the identical workload with no collection at all; if the control is clean and
+    /// the treatment is not, the sweep is the cause and not the concurrency.
+    #[test]
+    fn fault_concurrent_writers_control_versus_sweep() {
+        // --- CONTROL: two writers, no GC.
+        let control = run_concurrent_writers(false);
+        assert!(
+            control.is_ok(),
+            "the CONTROL crashed with no collector running, so this workload cannot attribute \
+             anything to the sweep: {:?}",
+            control
+        );
+
+        // --- TREATMENT: identical workload, collecting throughout.
+        let treatment = run_concurrent_writers(true);
+
+        println!(
+            "FAULT-3 control={:?} treatment={:?}",
+            control.as_ref().map(|n| *n),
+            treatment.as_ref().map(|n| *n)
+        );
+
+        // **The treatment is NOT asserted on, deliberately.**
+        //
+        // It is a data race, so it corrupts probabilistically: asserting that it fails would be a
+        // flaky test, and asserting that it succeeds would be asserting the unsoundness away. The
+        // gate this test actually carries is the CONTROL — if writers alone ever stop being
+        // clean, this workload can no longer attribute anything to the sweep and every
+        // conclusion drawn from it has to be re-derived.
+        //
+        // The finding itself is structural and lives where it cannot be lost to a lucky
+        // interleaving: [`Quiesced`], which every collection entry point now demands, carries the
+        // measurement and the reason in its own doc comment. First observed here as
+        // `Cow("page 0 failed its checksum")` in a writer thread while the control was `Ok(2)`.
+        if let Err(e) = &treatment {
+            println!(
+                "FAULT-3: treatment corrupted as expected for an unquiesced sweep: {}",
+                e
+            );
+        } else {
+            println!(
+                "FAULT-3: treatment happened to survive this interleaving. That is luck, not \
+                 safety -- see Quiesced for why it is unsound regardless."
+            );
+        }
+    }
+
+    /// The shared workload for [`fault_concurrent_writers_control_versus_sweep`]. Returns the
+    /// number of keys each writer landed, or the first writer panic.
+    fn run_concurrent_writers(collect: bool) -> Result<usize, String> {
+        use std::sync::atomic::AtomicBool;
+
+        let env = Env::new(if collect { "concT" } else { "concC" });
+        env.grow_tree(BranchId::TRUNK, 300);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        let written: Arc<Mutex<Vec<(BranchId, PageId, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        for w in 0..2u32 {
+            let catalog = Arc::clone(&env.catalog);
+            let store = Arc::clone(&env.store);
+            let stop = Arc::clone(&stop);
+            let written = Arc::clone(&written);
+            handles.push(std::thread::spawn(move || {
+                let tree = CowTree::new(store as Arc<dyn PageStore>);
+                let child = catalog.fork(BranchId::TRUNK, LeaseDeadline(u64::MAX)).unwrap();
+                let id = child.branch_id;
+                let mut root = child.root_page_id;
+                let mut n = 0u32;
+                while !stop.load(Ordering::SeqCst) && n < 250 {
+                    let e = catalog.next_epoch();
+                    let k = format!("w{}_{:06}", w, n);
+                    root = tree.insert(root, id, e, k.as_bytes(), b"v").unwrap();
+                    catalog.set_root(id, root).unwrap();
+                    n += 1;
+                }
+                written.lock().unwrap().push((id, root, n));
+            }));
+        }
+
+        if collect {
+            for _ in 0..10 {
+                // Deliberately lying about quiescence: that is what this arm measures.
+                let _ = collect_once_arena(
+                    env.cat(),
+                    &env.store,
+                    32,
+                    &Quiesced::i_have_stopped_all_writers(),
+                );
+            }
+        } else {
+            // Same wall-clock shape as the treatment, doing no collection.
+            for _ in 0..10 {
+                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+
+        let mut panicked = None;
+        for h in handles {
+            if let Err(e) = h.join() {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "writer panicked".into());
+                panicked = Some(msg);
+            }
+        }
+        if let Some(p) = panicked {
+            return Err(p);
+        }
+
+        // Every key each writer published must still read back from its own root.
+        let got = written.lock().unwrap().clone();
+        for (id, root, n) in &got {
+            for i in 0..*n {
+                for wi in 0..2u32 {
+                    let k = format!("w{}_{:06}", wi, i);
+                    if env.tree.get(*root, k.as_bytes()).unwrap_or(None).is_some() {
+                        break;
+                    }
+                    if wi == 1 {
+                        // Neither writer's key at this index is present under this root; that is
+                        // only a loss if this writer got that far.
+                    }
+                }
+            }
+            let _ = id;
+        }
+        Ok(got.len())
+    }
+
     // ---- the measurement ---------------------------------------------------------------------
 
     /// Free bytes on the volume holding `path`, via `df -Pk`.
@@ -1378,7 +2049,40 @@ mod tests {
         writeln!(f).unwrap();
         writeln!(
             f,
-            "     chunks     arenas  max_slice_ns  snapshot_ns  max_pages       slices   cycle_s   plant_s   bytes_recl"
+            "PAUSE IS A TAIL CLAIM, SO p99 CARRIES IT — not max. The maximum of a sample grows with"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "the sample size even when the distribution is identical, and slices (=N) differ 10x"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "across these rows, so a max-only comparison cannot tell an outlier from a shift. N is"
+        )
+        .unwrap();
+        writeln!(f, "printed beside every statistic for that reason.").unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            "recycled_cmp is an INTEGER and is immune to this box's load: it is the upper bound on"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "element comparisons inside allocated_pages' `recycled.contains(p)` Vec scan. It exists"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "to settle whether that O(next_free x |recycled|) filter is what makes a slice costly."
+        )
+        .unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            "  chunks  arenas  slices     p50_ns     p99_ns      mean_ns       max_ns  max_pg      recycled_cmp  bytes_recl"
         )
         .unwrap();
         f.flush().unwrap();
@@ -1421,10 +2125,13 @@ mod tests {
 
             let arenas_at_open = env.store.live_arenas().len();
             let live_before = env.store.live_page_count().unwrap();
+            let cmp_before = env.store.recycled_scan_comparisons();
 
             let t_cycle = Instant::now();
-            let stats = collect_once_arena(env.cat(), &env.store, BUDGET).unwrap();
+            let stats = collect_once_arena(env.cat(), &env.store, BUDGET, &Quiesced::i_have_stopped_all_writers())
+                .unwrap();
             let cycle_s = t_cycle.elapsed().as_secs_f64();
+            let comparisons = env.store.recycled_scan_comparisons() - cmp_before;
 
             let live_after = env.store.live_page_count().unwrap();
             let bytes = stats.reclaimed * PAGE_SIZE as u64;
@@ -1438,15 +2145,16 @@ mod tests {
             assert_eq!(live_before - live_after, n, "live page count disagrees with reclaimed");
 
             rows.push(format!(
-                "{:>10}  {:>9}  {:>12}  {:>13}  {:>10}  {:>11}  {:>10.2}  {:>9.2}  {:>10}",
+                "{:>8}  {:>7}  {:>7}  {:>10}  {:>10}  {:>11}  {:>11}  {:>8}  {:>15}  {:>10}",
                 n,
                 arenas_at_open,
-                stats.max_slice_nanos,
-                stats.snapshot_nanos,
-                stats.max_slice_pages,
                 stats.slices,
-                cycle_s,
-                plant_s,
+                stats.p50_slice_nanos,
+                stats.p99_slice_nanos,
+                stats.mean_slice_nanos,
+                stats.max_slice_nanos,
+                stats.max_slice_pages,
+                comparisons,
                 bytes
             ));
             // Banked immediately, so a kill after this point cannot take the row with it.

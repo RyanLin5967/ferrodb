@@ -261,6 +261,21 @@ pub struct ArenaPageStore {
     /// Compared against [`crate::cluster::epoch`] on every allocation path; a change revokes the
     /// right to fill anything claimed before it. See [`ArenaPageStore::revoke_stale_authority`].
     authority_epoch: AtomicU64,
+    /// **D96 instrument.** Upper bound on element comparisons spent inside
+    /// [`ArenaPageStore::allocated_pages`]'s `recycled.contains(p)` filter.
+    ///
+    /// `recycled` is a `Vec`, so that filter is O(next_free x |recycled|) — quadratic in extent
+    /// size, though bounded by it rather than by the heap. Whether that quadratic is what makes a
+    /// GC sweep slice expensive is a question a DURATION cannot answer on this box, because the
+    /// fleet's load dominates any timing. It is a question a COUNTER answers exactly, at any load:
+    /// if the count scales with the square and the time scales with it too, the mechanism is
+    /// identified; if the count scales merely with page count, this is eliminated for free.
+    ///
+    /// Counts `next_free * |recycled|` per call, which is an UPPER BOUND rather than the exact
+    /// figure: `Vec::contains` early-exits on a hit, so a page that IS recycled costs |recycled|/2
+    /// on average. Within a factor of two, which is far finer than the 44x-versus-5x distinction
+    /// it exists to make.
+    recycled_scan_comparisons: AtomicU64,
     /// Where to persist the free-space map when an extent is claimed or freed, if anywhere.
     ///
     /// Without this the map reaches disk only when the owner remembers to call `checkpoint`, which
@@ -356,6 +371,7 @@ impl ArenaPageStore {
                 arena_ids: GrantedCounter::new("arena-id", 1, SELF_GRANT_ARENA_IDS),
                 recycle_epoch: AtomicU64::new(crate::cluster::epoch()),
             },
+            recycled_scan_comparisons: AtomicU64::new(0),
             state: Mutex::new(StoreState {
             fill_unknown: std::collections::HashSet::new(),
                 extents: HashMap::new(),
@@ -497,6 +513,13 @@ impl ArenaPageStore {
         self.state.lock().unwrap().extents.get(&arena).map(|e| e.owner)
     }
 
+    /// Upper bound on `recycled.contains` element comparisons since this store opened. See
+    /// [`ArenaPageStore::recycled_scan_comparisons`] the field for why this is a counter and not
+    /// a timer.
+    pub fn recycled_scan_comparisons(&self) -> u64 {
+        self.recycled_scan_comparisons.load(Ordering::Relaxed)
+    }
+
     /// The page range `arena` covers, as `(start_page, page_count)`. Two live extents that
     /// overlap is silent corruption, so this is what a restart test must actually check.
     pub fn extent_range(&self, arena: ArenaId) -> Option<(PageId, u32)> {
@@ -508,6 +531,8 @@ impl ArenaPageStore {
         let st = self.state.lock().unwrap();
         let Some(ext) = st.extents.get(&arena) else { return Vec::new() };
         let recycled = st.recycled.get(&arena).cloned().unwrap_or_default();
+        self.recycled_scan_comparisons
+            .fetch_add(ext.next_free as u64 * recycled.len() as u64, Ordering::Relaxed);
         (0..ext.next_free)
             .map(|i| ext.start_page + i)
             .filter(|p| !recycled.contains(p))
