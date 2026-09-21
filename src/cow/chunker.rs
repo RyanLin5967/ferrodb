@@ -60,34 +60,33 @@
 ///
 /// This is the whole tuning decision, and it is a straight trade against fanout. Chunk lengths
 /// are geometric, so with a mean of `capacity / r` bytes the chance a chunk does not fit a page
-/// is about `e^-r`, while the mean fanout is `r` times smaller than a full page would hold:
+/// is about `e^-r` — and a chunk that does not fit is the *only* case this design cannot keep
+/// invariant, because [`leaf_cuts`] must then re-cut it and a leaf holding part of an over-long
+/// chunk cannot see the rest of it without the sibling pointer this layout does not have.
+///
+/// Measured with `cow::tests_chunking::measure_the_partition`, one instrument across all three
+/// settings. Over-page is the share of chunks taking that re-cut path, over 200k ascending rows;
+/// the leaf figures are the 1500-row fixture:
 ///
 /// ```text
-///   r    P(chunk exceeds a page)   mean entries per leaf, ~30-byte rows
-///   2            13.5 %                          68     <- what the byte-balanced split gave
-///   4             1.8 %                          34
-///   6             0.25 %                         22
-///   8             0.03 %                         17
+///   shift  r   target   over a page   rows/leaf   ascending vs shuffled
+///     1    2   2030 B     13.06 %        46.9     32 leaves vs 33  <- NOT a function of content
+///     2    4   1015 B      1.11 %        33.3     45 leaves vs 45
+///     3    8    507 B      0.00 %        16.0     94 leaves vs 94  <- this setting
 /// ```
 ///
-/// A chunk that does not fit is the one case this design cannot keep invariant — [`leaf_cuts`]
-/// re-cuts it finer, and a leaf holding part of an over-long chunk has no way to see the rest of
-/// that chunk, so which cuts it ends up with depends on when it overflowed.
+/// The measured shares track `e^-r` (13.5 %, 1.8 %, 0.03 % predicted), so the bound is a real one
+/// rather than a hope.
 ///
-/// Measured, on the 1500-row fixture in `cow::tests_chunking`, by printing the chunker's cuts for
-/// the whole sorted set beside the cuts each build actually produced:
+/// **`shift = 2` passes the invariance test and is still wrong**, which is the reason this table
+/// exists. On the 1500-row fixture it produced zero re-cut chunks and both orders agreed exactly;
+/// at 200k rows the same setting puts 89 chunks on the re-cut path. Forty-five chunks at a 1.1 %
+/// rate draws zero about half the time, so that agreement was the fixture's size and not the
+/// property. Only `shift = 3` makes the re-cut path rare enough that the partition is a function
+/// of content at any scale worth the name.
 ///
-/// ```text
-///   mean chunk ~ half a page (r ~ 2)   27 cuts, 9 of them from the re-cut path;
-///                                      the shuffled build differed on 16 of them
-///                                      (12 cuts it added, 4 it never made)
-///   mean chunk ~ an eighth of a page   99 cuts, none from the re-cut path;
-///   (r = 8, this setting)              ascending and shuffled both matched exactly
-/// ```
-///
-/// So the fanout is spent on the property the change exists to deliver, deliberately and with the
-/// number written down: about 15 rows per leaf here against the 68 the byte-balanced split gave,
-/// and a 10^6-row tree one level deeper.
+/// The fanout is what pays for it, deliberately and in the open: 16 rows per leaf here against
+/// the 68 the byte-balanced split gave, and a 10^6-row tree roughly a level deeper.
 pub const CHUNK_SHIFT: u32 = 3;
 
 /// Mean chunk size, in bytes of slot-plus-cell.
@@ -196,7 +195,8 @@ impl Buzhash {
 ///   bytes no matter how little the keys vary. A static pattern has no such feedback, which is
 ///   what lets a low-entropy stream drift into one enormous chunk.
 ///
-/// Measured over 200k rows, mean chunk against a 507-byte target, worst chunk seen:
+/// Measured over 200k rows by `cow::tests_chunking::measure_the_partition` — from this code, not
+/// from a model of it — mean chunk against a 507-byte target, worst chunk seen:
 ///
 /// ```text
 ///   ascending key{:06}            mean 507 B   max 2,132 B    0 chunks over a page
@@ -204,7 +204,7 @@ impl Buzhash {
 ///   big-endian u32 counter        mean 514 B   max 3,204 B    0
 ///   monotonic timestamps          mean 510 B   max 5,920 B    7 of 15,691  (0.04 %)
 ///   32-byte common prefix         mean 513 B   max 4,032 B    0
-///   random 16-byte keys (control) mean 505 B   max 4,464 B    3 of 18,999  (0.02 %)
+///   random 16-byte keys (control) mean 503 B   max 4,752 B    4 of 19,069  (0.02 %)
 /// ```
 ///
 /// The control is the point: the sorted shapes are not worse than random keys, so the reported
