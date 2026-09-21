@@ -295,15 +295,25 @@ impl VersionGraph {
         Ok(self.node(self.slot(branch)?).tombstone)
     }
 
-    fn climb(&self, mut slot: u32, target_depth: u32) -> u32 {
+    /// Climb to `target_depth`, returning the slot and **the number of jump-pointer
+    /// dereferences performed**.
+    ///
+    /// The hop count falls out of the one real implementation rather than being reproduced by a
+    /// parallel counting copy, because a counting copy is free to drift from the thing it claims
+    /// to describe. It is a local `u64` in a register, not an atomic, so it does not perturb the
+    /// timing of the query it is counting.
+    fn climb(&self, mut slot: u32, target_depth: u32) -> (u32, u64) {
+        let mut hops = 0u64;
         let mut delta = self.node(slot).depth - target_depth;
-        // One array index per set bit: climb by the lowest set bit, clear it, repeat.
+        // One array index per set bit: climb by the lowest set bit, clear it, repeat. So the hop
+        // count is exactly `popcount(delta)`, which is bounded by `floor(log2(depth)) + 1`.
         while delta > 0 {
             let k = delta.trailing_zeros() as usize;
             slot = self.node(slot).jump[k];
+            hops += 1;
             delta &= delta - 1;
         }
-        slot
+        (slot, hops)
     }
 
     /// The ancestor of `branch` at exactly `depth`. O(log depth).
@@ -313,7 +323,7 @@ impl VersionGraph {
         if depth > node_depth {
             return Err(AncestryError::DepthOutOfRange { branch, depth, node_depth });
         }
-        Ok(self.node(self.climb(slot, depth)).branch)
+        Ok(self.node(self.climb(slot, depth).0).branch)
     }
 
     /// Is `a` an ancestor of `b`? O(log depth).
@@ -322,12 +332,31 @@ impl VersionGraph {
     /// wants the reflexive one can ask `a == b` for free while the caller that wants the strict
     /// one cannot un-ask it.
     pub fn is_ancestor(&self, a: BranchId, b: BranchId) -> Result<bool, AncestryError> {
+        Ok(self.is_ancestor_hops(a, b)?.0)
+    }
+
+    /// [`Self::is_ancestor`], plus the jump-pointer dereferences it performed.
+    ///
+    /// **This is the instrument the complexity claim is stated in.** A hop count is an integer
+    /// that does not move when the machine is loaded, and this box runs a dozen build agents, so
+    /// a wall clock here measures the fleet as much as the algorithm. The same reasoning is why
+    /// `reaper.rs` states D40's claim in `sweep_descents` rather than in milliseconds: an
+    /// operation count proves a complexity class directly, where a clock only illustrates one.
+    ///
+    /// The comparable number for the parent walk is `depth(b) - depth(a)`, one dereference per
+    /// level, which is what makes the two directly commensurable.
+    pub fn is_ancestor_hops(
+        &self,
+        a: BranchId,
+        b: BranchId,
+    ) -> Result<(bool, u64), AncestryError> {
         let (sa, sb) = (self.slot(a)?, self.slot(b)?);
         let (da, db) = (self.node(sa).depth, self.node(sb).depth);
         if da >= db {
-            return Ok(false);
+            return Ok((false, 0));
         }
-        Ok(self.climb(sb, da) == sa)
+        let (landed, hops) = self.climb(sb, da);
+        Ok((landed == sa, hops))
     }
 
     /// Lowest common ancestor. O(log depth).
@@ -342,15 +371,33 @@ impl VersionGraph {
     /// the fork point of a child and its own parent IS the parent, which is the case ferrodb
     /// already relies on everywhere.
     pub fn lca(&self, a: BranchId, b: BranchId) -> Result<Option<BranchId>, AncestryError> {
+        Ok(self.lca_hops(a, b)?.0)
+    }
+
+    /// [`Self::lca`], plus the jump-pointer dereferences it performed. See
+    /// [`Self::is_ancestor_hops`] for why the count, and not the clock, is the instrument.
+    ///
+    /// Both sides are counted: the descent reads a jump entry from each of the two nodes at every
+    /// level it examines, so the honest unit is total dereferences, which is also the unit the
+    /// walk arm is measured in.
+    pub fn lca_hops(
+        &self,
+        a: BranchId,
+        b: BranchId,
+    ) -> Result<(Option<BranchId>, u64), AncestryError> {
         let (mut sa, mut sb) = (self.slot(a)?, self.slot(b)?);
         let (da, db) = (self.node(sa).depth, self.node(sb).depth);
+        let mut hops = 0u64;
 
         // Lift the deeper one to the shallower one's depth; now both tables are the same length.
         let target = da.min(db);
-        sa = self.climb(sa, target);
-        sb = self.climb(sb, target);
+        let (la, ha) = self.climb(sa, target);
+        let (lb, hb) = self.climb(sb, target);
+        sa = la;
+        sb = lb;
+        hops += ha + hb;
         if sa == sb {
-            return Ok(Some(self.node(sa).branch));
+            return Ok((Some(self.node(sa).branch), hops));
         }
 
         // Descend the powers of two together, taking every jump that keeps them apart. What
@@ -375,6 +422,7 @@ impl VersionGraph {
                 continue;
             }
             let (ja, jb) = (na.jump[k], nb.jump[k]);
+            hops += 2;
             if ja != jb {
                 sa = ja;
                 sb = jb;
@@ -383,7 +431,7 @@ impl VersionGraph {
 
         // Disjoint trees fall out here: the climb ran to two different roots, and a root has no
         // parent, so the answer is `None` rather than an invented one.
-        Ok(self.node(sa).parent.map(|p| self.node(p).branch))
+        Ok((self.node(sa).parent.map(|p| self.node(p).branch), hops))
     }
 
     /// Mark a branch reaped, then collect whatever that makes collectable.
@@ -726,6 +774,81 @@ mod tests {
 
         // The pruned runs are gone, not merely hidden: 4 runs x RUN nodes collected.
         assert_eq!(g.len(), 1 + 1 + 4 * RUN as usize, "pruned nodes should be collected");
+    }
+
+    /// **The complexity claim, stated as integers.** Hops do not move when the box is loaded, so
+    /// this and not a wall clock is what proves O(log depth). A chain of depth D is walked in
+    /// exactly D parent dereferences; the index must stay inside the binary-lifting bound.
+    ///
+    /// The bound is asserted as an exact formula, not as "smallish": a test that only checks the
+    /// index is faster than the walk would still pass if the index were O(sqrt(depth)).
+    #[test]
+    fn hop_counts_are_logarithmic_in_depth_and_the_walk_is_linear() {
+        for &d in &[1u64, 2, 3, 7, 8, 9, 31, 32, 33, 127, 128, 1000, 4095, 4096] {
+            let mut edges = Vec::new();
+            for i in 1..=d {
+                edges.push((b(i), if i == 1 { b(0) } else { b(i - 1) }));
+            }
+            for i in 1..=d {
+                edges.push((b(1_000_000 + i), if i == 1 { b(0) } else { b(1_000_000 + i - 1) }));
+            }
+            let g = graph(b(0), &edges);
+
+            let levels = (u64::BITS - d.leading_zeros()) as u64; // floor(log2 d) + 1
+            let leaf = b(d);
+            let other = b(1_000_000 + d);
+
+            // is_ancestor(root, leaf): exactly popcount(d) hops, since the climb takes one jump
+            // per set bit of the depth delta.
+            let (ans, hops) = g.is_ancestor_hops(b(0), leaf).unwrap();
+            assert!(ans);
+            assert_eq!(hops, d.count_ones() as u64, "depth {d}: is_ancestor hops");
+            assert!(hops <= levels, "depth {d}: {hops} hops exceeds the log bound {levels}");
+
+            // lca of the two chain tips, which meet only at the root: the worst case, and still
+            // bounded by a small multiple of log2(d). The walk needs 2*d.
+            let (l, lhops) = g.lca_hops(leaf, other).unwrap();
+            assert_eq!(l, Some(b(0)), "depth {d}");
+            assert!(
+                lhops <= 3 * levels,
+                "depth {d}: lca took {lhops} hops, above the 3*log2 bound {}",
+                3 * levels
+            );
+
+            // The walk's cost, in the same unit, computed from the tree rather than from the
+            // subject: one parent dereference per level.
+            let walk_hops = d;
+            if d >= 32 {
+                assert!(
+                    lhops < walk_hops,
+                    "depth {d}: index {lhops} hops vs walk {walk_hops} - no win"
+                );
+            }
+        }
+    }
+
+    /// Hops must not depend on where in the tree the question is asked, only on depth. A
+    /// structure whose cost quietly depended on fan-out would still pass the chain test above.
+    #[test]
+    fn hop_counts_do_not_grow_with_fan_out() {
+        const DEPTH: u64 = 64;
+        const FAN: u64 = 64;
+        let mut edges = Vec::new();
+        for i in 1..=DEPTH {
+            edges.push((b(i), if i == 1 { b(0) } else { b(i - 1) }));
+        }
+        // Hang a wide fan off the deepest node, and another off the root.
+        for j in 0..FAN {
+            edges.push((b(10_000 + j), b(DEPTH)));
+            edges.push((b(20_000 + j), b(0)));
+        }
+        let g = graph(b(0), &edges);
+
+        let (_, narrow) = g.is_ancestor_hops(b(0), b(DEPTH)).unwrap();
+        let (_, wide) = g.is_ancestor_hops(b(0), b(10_000)).unwrap();
+        assert_eq!(narrow, DEPTH.count_ones() as u64);
+        assert_eq!(wide, (DEPTH + 1).count_ones() as u64);
+        assert!(wide <= 7, "fan-out must not enter the hop count: got {wide}");
     }
 
     #[test]

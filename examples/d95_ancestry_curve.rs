@@ -141,26 +141,30 @@ fn main() {
     assert!(!depths.is_empty(), "D95_DEPTHS collected nothing");
 
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let skip_timing = std::env::var("D95_SKIP_TIMING").is_ok();
     println!("# D95 ancestry curve. ferrodb {}", ferrodb::build_provenance());
     println!("# profile={profile}  arms=walk,index  two chains of depth D off one root");
     if profile == "debug" {
         println!("# ⚠ DEBUG BUILD — absolute numbers are meaningless; re-run with --release.");
     }
-    println!(
-        "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>11}  {:>11}",
-        "depth",
-        "anc_walk_ns",
-        "anc_index_ns",
-        "anc_x",
-        "lca_walk_ns",
-        "lca_index_ns",
-        "lca_x",
-        "forkreap_ns",
-        "depth1hash_ns",
-        "walk_steps",
-        "index_nodes",
-    );
 
+    /// One depth's results. Hops are exact integers; the nanosecond fields are only filled when
+    /// timing was asked for.
+    struct Row {
+        d: u64,
+        anc_hops_walk: u64,
+        anc_hops_index: u64,
+        lca_hops_walk: u64,
+        lca_hops_index: u64,
+        anc_walk: f64,
+        anc_index: f64,
+        lca_walk: f64,
+        lca_index: f64,
+        fork_reap: f64,
+        depth_hash: f64,
+        nodes: usize,
+    }
+    let mut rows: Vec<Row> = Vec::new();
     let mut disagreements = 0u64;
 
     for (di, &d) in depths.iter().enumerate() {
@@ -193,9 +197,10 @@ fn main() {
         // A run whose arms disagree is not a slow-vs-fast comparison, it is two different
         // programs. Check first, refuse rather than report.
         let (w_anc, w_anc_steps) = walk.is_ancestor(0, leaf_a as u32);
-        let i_anc = g.is_ancestor(bid(0), bid(leaf_a)).expect("index is_ancestor");
+        let (i_anc, i_anc_hops) =
+            g.is_ancestor_hops(bid(0), bid(leaf_a)).expect("index is_ancestor");
         let (w_lca, w_lca_steps) = walk.lca(leaf_a as u32, leaf_b as u32);
-        let i_lca = g.lca(bid(leaf_a), bid(leaf_b)).expect("index lca");
+        let (i_lca, i_lca_hops) = g.lca_hops(bid(leaf_a), bid(leaf_b)).expect("index lca");
         let i_lca_id = i_lca.map(|b| b.id);
 
         if w_anc != i_anc || w_lca.map(|x| x as u64) != i_lca_id {
@@ -210,7 +215,12 @@ fn main() {
         assert_eq!(w_lca, Some(0), "depth {d}: the two chains must meet at the root");
 
         // ---- timing, arm order alternated per depth ---------------------------------------
-        let (anc_walk, anc_index, lca_walk, lca_index);
+        //
+        // Secondary. The hop counts above already settle the complexity class and do not move
+        // when the box is loaded; these only illustrate it.
+        let (mut anc_walk, mut anc_index, mut lca_walk, mut lca_index) = (0.0, 0.0, 0.0, 0.0);
+        let (mut fork_reap, mut depth_hash) = (0.0, 0.0);
+        if !skip_timing {
         if di % 2 == 0 {
             anc_walk = ns_per_op(|| walk.is_ancestor(0, leaf_a as u32).1);
             anc_index =
@@ -238,7 +248,7 @@ fn main() {
         // a different size between depths, and so the free list is exercised the way a real
         // fork/reap cycle exercises it. The leaf is childless, so the reap really does remove it.
         let mut churn_id = 1_000_000_000u64;
-        let fork_reap = ns_per_op(|| {
+        fork_reap = ns_per_op(|| {
             churn_id += 1;
             let id = bid(churn_id);
             g.insert_child(id, bid(leaf_a)).expect("churn fork");
@@ -253,22 +263,72 @@ fn main() {
         // popcount(delta) array indexings. That is a mechanism, so it gets measured rather than
         // asserted. `depth()` is exactly one hash lookup and no climb, so if the claim holds,
         // 2 x this should account for most of `anc_index_ns` at every depth.
-        let depth_hash = ns_per_op(|| g.depth(bid(leaf_a)).map(u64::from).unwrap_or(0));
+        depth_hash = ns_per_op(|| g.depth(bid(leaf_a)).map(u64::from).unwrap_or(0));
+        }
 
-        println!(
-            "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>11}  {:>11}",
+        rows.push(Row {
             d,
+            anc_hops_walk: w_anc_steps,
+            anc_hops_index: i_anc_hops,
+            lca_hops_walk: w_lca_steps,
+            lca_hops_index: i_lca_hops,
             anc_walk,
             anc_index,
-            anc_walk / anc_index,
             lca_walk,
             lca_index,
-            lca_walk / lca_index,
             fork_reap,
             depth_hash,
-            w_anc_steps.max(w_lca_steps),
-            g.len(),
+            nodes: g.len(),
+        });
+    }
+
+    // ---- HEADLINE: pointer hops. Integers, immune to load. --------------------------------
+    println!();
+    println!("## POINTER HOPS — the headline. Integers; a loaded box cannot move them.");
+    println!("## unit = one pointer dereference (parent pointer for walk, jump entry for index).");
+    println!(
+        "{:>8}  {:>13}  {:>13}  {:>10}  {:>13}  {:>13}  {:>10}  {:>11}",
+        "depth", "anc_hop_walk", "anc_hop_idx", "anc_hop_x", "lca_hop_walk", "lca_hop_idx",
+        "lca_hop_x", "index_nodes",
+    );
+    for r in &rows {
+        println!(
+            "{:>8}  {:>13}  {:>13}  {:>10.1}  {:>13}  {:>13}  {:>10.1}  {:>11}",
+            r.d,
+            r.anc_hops_walk,
+            r.anc_hops_index,
+            r.anc_hops_walk as f64 / r.anc_hops_index.max(1) as f64,
+            r.lca_hops_walk,
+            r.lca_hops_index,
+            r.lca_hops_walk as f64 / r.lca_hops_index.max(1) as f64,
+            r.nodes,
         );
+    }
+
+    // ---- CONFIRMATORY: wall clock. Only illustrates what the hops establish. --------------
+    if !skip_timing {
+        println!();
+        println!("## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else");
+        println!("## it is running; the hop table above is what proves the complexity class.");
+        println!(
+            "{:>8}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}  {:>9}  {:>13}  {:>13}",
+            "depth", "anc_walk_ns", "anc_index_ns", "anc_x", "lca_walk_ns", "lca_index_ns",
+            "lca_x", "forkreap_ns", "depth1hash_ns",
+        );
+        for r in &rows {
+            println!(
+                "{:>8}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}  {:>9.1}  {:>13.1}  {:>13.1}",
+                r.d,
+                r.anc_walk,
+                r.anc_index,
+                r.anc_walk / r.anc_index,
+                r.lca_walk,
+                r.lca_index,
+                r.lca_walk / r.lca_index,
+                r.fork_reap,
+                r.depth_hash,
+            );
+        }
     }
 
     if disagreements > 0 {
