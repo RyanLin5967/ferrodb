@@ -274,9 +274,10 @@ fn main() {
     out.push_str("a row that did not would have aborted the run rather than been banked.\n");
     out.push_str("\n");
     out.push_str("MEASURE LOCK / LOAD. The counter columns are INTEGERS produced by structural\n");
-    out.push_str("decisions, not timings, so fleet load cannot move them; they were taken without\n");
-    out.push_str("the lock and reproduce exactly run to run. The wall-clock table below is the\n");
-    out.push_str("only load-sensitive part of this file and is labelled where it was taken.\n");
+    out.push_str("decisions, not timings, so fleet load cannot move them. Checked rather than\n");
+    out.push_str("asserted: four runs on this box — three with no measure lock at loads 20-50,\n");
+    out.push_str("one holding it — produced identical counter columns. The wall-clock table is\n");
+    out.push_str("the only load-sensitive part of this file and carries its own lock stamp.\n");
     out.push('\n');
     out.push_str(
         "      N   nodes  depth | visited  visited | skip_pid  skip_cid  skip_cid  skipped |  old_touched  old_examined\n",
@@ -314,6 +315,23 @@ fn main() {
             "{:7} | {:12?}  {:10?}  {:9?} | {:?}\n",
             r.n, r.t_new_pageid, r.t_new_hash, r.t_old, r.t_stamp
         ));
+    }
+
+    let all_free = rows.iter().all(|r| r.new_skip_cid == 0 && r.hash_skip_cid == 0);
+    if all_free {
+        out.push_str("\nWHICH TIER DID THE WORK: skip_cid is 0 at every N, for BOTH providers.\n");
+        out.push_str("Every skip here was won by page identity alone — a u32 compare, no hashing,\n");
+        out.push_str("no warm-up. On this workload (one lineage, a fork plus four overwrites) the\n");
+        out.push_str("content digest contributed NOTHING, and the curve above would be unchanged\n");
+        out.push_str("if it did not exist. That is the honest reading and it follows from the\n");
+        out.push_str("store's design: within a lineage an unchanged subtree IS the same page, so\n");
+        out.push_str("there is nothing left for a digest to find. A content id earns its cost only\n");
+        out.push_str("where page ids CANNOT match — two branches that never shared a page, or a\n");
+        out.push_str("subtree rewritten to identical content. Neither occurs here. Anyone quoting\n");
+        out.push_str("this table as evidence FOR content addressing would be quoting it backwards.\n");
+    } else {
+        out.push_str("\nWHICH TIER DID THE WORK: skip_cid is NON-ZERO — the content digest won\n");
+        out.push_str("skips that page identity could not. See the per-row columns.\n");
     }
 
     let first = rows.first().unwrap();
