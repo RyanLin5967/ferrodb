@@ -32,11 +32,16 @@ heads-up if it plans any of those, and has been told `proof()` is staying.
    resolved by consolidating onto `cow::diff` — `SubtreeHash` and `MemoIdentity` are keyed on
    `PageId` too. Reproduced and pinned by
    `merge3::tests::a_stale_subtree_hash_makes_merge3_drop_a_change_silently`.
-   ⚠ **Nor is it resolved by re-keying on `(PageId, birth_epoch)`**, which catches one route of
-   three: a recycled id yes, an in-place write no, an in-place write to a *descendant* no — and
-   the last cannot be fixed by any per-page key. Measured in
-   `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write` and in
-   `bench/d92_content_identity_trade.txt`'s addendum. `fix-diff-memo` has been told.
+   ⚠ **`(PageId, birth_epoch)` would have caught one route of three** — a recycled id yes, an
+   in-place write no, an in-place write to a *descendant* no. Measured in
+   `birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write`.
+   ✅ **The key `fix-diff-memo` actually landed is `(birth_epoch, checksum)`, which catches two of
+   three**: crc32 covers the header too, so it moves on an in-place write where `birth_epoch` does
+   not. Route C — an in-place write to a *descendant* — is unreachable by any per-page key and is
+   now **asserted** as a limit on its side, not merely documented. See
+   `bench/d92_content_identity_trade.txt`'s second addendum. The merge3 store-property test stays
+   as it is: it measures `birth_epoch`, which genuinely does not discriminate B or C, and it is
+   deliberately not duplicated into `diff.rs`.
 2. **Sole authority / duplicate hasher.** `H128` deleted. `NodeIdentity::proof()` added with no
    default; rides out on `MergeResult::identity_proof`.
 3. **`read_node`'s `_ =>` arm.** Now `cid::shape_of`. Fire-checked: the pre-fix arm followed a

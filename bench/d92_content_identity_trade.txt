@@ -80,3 +80,43 @@ digest is a window in which nothing writes to the stamped trees: stamp, use, dis
 
 Pinned by cow::merge3::tests::birth_epoch_discriminates_a_recycled_page_but_not_an_in_place_write,
 which asserts all three rows and says what to do if any of them changes.
+
+
+SECOND ADDENDUM — the key that actually landed is NOT the one measured above
+============================================================================
+
+The addendum above measures (PageId, birth_epoch) and finds it covers route A only. The fix
+`fix-diff-memo` landed on D105-diff-memo uses a DIFFERENT key: (birth_epoch, CHECKSUM). crc32
+covers the whole page INCLUDING the header, so it moves on an in-place write where birth_epoch
+alone does not. Against that key, reported by its author and asserted in
+cow::diff::tests::the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant:
+
+  A  recycled page id                  DISCRIMINATED
+  B  in-place write to the page itself DISCRIMINATED   <- the checksum's case, not covered above
+  C  in-place write to a DESCENDANT    provably NOT, and asserted as such
+
+So: two of three, not one of three. Route C stands exactly as stated — no per-page key can reach
+it, because an ancestor's own bytes (and therefore its checksum) do not change when a descendant
+is mutated in place. That limit is now asserted rather than documented, so a future fix flips the
+test into a signal instead of passing quietly.
+
+The store-property test in merge3 is unaffected and still true: it measures birth_epoch, and
+birth_epoch alone genuinely does not discriminate routes B or C. It is deliberately NOT duplicated
+into diff.rs — two tests asserting one store property is the shape where a mutant in either is
+masked by the other.
+
+CROSS-LINEAGE, which the table at the top of this file does NOT cover
+---------------------------------------------------------------------
+The measurement above is in-lineage (base plus two COW descendants), which is what merge3 is
+normally handed. fix-diff-memo measured the cross-lineage case — 1200 rows, 90+90 nodes, no shared
+pages:
+
+  PageIdentity  180 reads, 0 skips
+  SubtreeHash     2 reads, 1 skip, plus 180 reads to stamp, paid once
+
+So one cross-lineage diff is a wash (182 vs 180) and it starts paying from the SECOND diff off a
+single stamp. It reproduces the in-lineage result independently at 18 vs 1833.
+
+⇒ The conclusion in this file is scoped to the in-lineage path and stays as written. "The digest
+never pays" would be too strong as a general claim and is not made: cross-lineage, with the stamp
+amortised over more than one comparison, it pays.

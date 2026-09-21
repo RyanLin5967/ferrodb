@@ -127,9 +127,17 @@ const MAX_DEPTH: usize = 64;
 // argument but only makes the O(N) side dearer, and a faster hash cannot rescue an O(N)-for-
 // O(log N) trade. Hence [`diff::PageIdentity`] is the identity to pass, and it is exact.
 //
-// Content identity becomes a win only if the id is stamped at WRITE time, as ForkBase does and as
-// `diff::SubtreeHash`'s own doc says it models. Nothing in ferrodb stamps cids at write time, so
-// that configuration is not measurable here and is not claimed.
+// ⚠ THAT CONCLUSION IS SCOPED TO THE IN-LINEAGE CASE, which is the one a merge is normally handed:
+// a base and two copy-on-write descendants of it, sharing pages. "The digest never pays" would be
+// a stronger claim than anything measured, and it is not made. Two cases where it does pay:
+//
+//   * **Cross-lineage**, i.e. three roots that are not COW relatives — which this function does
+//     accept. Measured by `fix-diff-memo` at 1200 rows with no shared pages: page identity reads
+//     180 and skips nothing, the digest reads 2 and skips 1, and the stamp costs 180 reads once.
+//     One comparison is a wash; it pays from the SECOND off a single stamp.
+//   * **Write-time stamping**, as ForkBase does and as `diff::SubtreeHash`'s doc says it models.
+//     Then the O(N) term is not paid at merge time at all. Nothing in ferrodb stamps at write
+//     time today, so that configuration is not measurable here and is not claimed.
 
 pub use crate::cow::diff::{IdentityProof, MemoIdentity, NodeIdentity, PageIdentity, SubtreeHash};
 

@@ -83,14 +83,23 @@ pub trait NodeIdentity {
 
     /// What an equality between two of these ids **proves**, as opposed to suggests.
     ///
-    /// **No default.** An implementor that has not thought about it must not be able to inherit
-    /// the safe-sounding answer; that is the whole reason this is on the trait rather than in a
-    /// doc comment. `cow::cid` states the rule it exists to serve: a content-id equality "must
-    /// never be the *sole* authority for an operation whose wrongness is silent: deduplicating
-    /// storage, declaring a merge conflict-free, or skipping a subtree in a diff whose output
-    /// someone will act on." Both callers of this trait do exactly that kind of skipping, so the
-    /// strength of the answer travels with the answer.
-    fn proof(&self) -> IdentityProof;
+    /// `cow::cid` states the rule this serves: a content-id equality "must never be the *sole*
+    /// authority for an operation whose wrongness is silent: deduplicating storage, declaring a
+    /// merge conflict-free, or skipping a subtree in a diff whose output someone will act on."
+    /// Both callers of this trait do exactly that kind of skipping, so the strength of the answer
+    /// travels out with the answer.
+    ///
+    /// **It defaults to [`IdentityProof::Fingerprint`], which is the conservative end**, and only
+    /// [`PageIdentity`] overrides it. An earlier cut of this made it a required method, on the
+    /// reasoning that an implementor who has not thought about it should be forced to choose.
+    /// That was backwards: forcing the choice puts `Exact` within reach of someone who has not
+    /// earned it, and picking it wrongly is silent — whereas an undeclared provider inheriting
+    /// `Fingerprint` merely under-claims, costing a skip that was available. Fail to the side
+    /// where the mistake is expensive rather than wrong. It also stops a required method breaking
+    /// impls outside this crate's tree, such as the `Colliding` probe in `tests/review_cow_adv.rs`.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Fingerprint
+    }
 }
 
 /// What an equal [`NodeIdentity`] id proves, and therefore what a skip — or an empty conflict
