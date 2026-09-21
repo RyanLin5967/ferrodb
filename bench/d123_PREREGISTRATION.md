@@ -138,3 +138,46 @@ knee. Sharpest single discriminator and it costs one run.
 * Not report a mechanism I did not put a counter on (F3).
 * Not quote any stub level whose `syncs_issued()` collapsed.
 * Not carry P4's 1-thread numbers into a 64-thread claim without saying which regime each came from.
+
+---
+
+# AMENDMENT 1 — written BEFORE any result was read. A seam in my own instrument.
+
+`probe::record(PH_HOLD, ..)` fires at the end of the critical-section block, but **Rust drops in
+reverse declaration order and `_g` is declared FIRST, so it drops LAST.** Between my `PH_HOLD`
+stamp and the actual unlock, these still run *with the lock held*:
+
+* `parent_core: CoreRecord` drops,
+* `parent_envelope: Option<Vec<u8>>` drops,
+* the guard `_g` itself unlocks.
+
+So `gap = S_eff − HOLD` is **not** purely handoff. It is `unlock + those drops + park/unpark +
+scheduler latency`. Freeing heap under 64 threads is itself a named candidate (allocator
+contention), so if `gap` comes back large I may not attribute it to handoff without splitting it.
+
+**Pre-registered rule, so that this cannot be decided after seeing the number:**
+
+* If `gap` ≤ 0.02 ms, the seam is immaterial and no follow-up is run.
+* If `gap` > 0.02 ms, **a second scaffold iteration is REQUIRED** before any attribution claim:
+  add `PH_DROPS` (explicit `drop(parent_core)`/`drop(parent_envelope)` bracketed) and `PH_UNLOCK`
+  (explicit `drop(_g)` bracketed), so `gap` splits into measured parts and a true residual.
+  Until that runs, `gap` is reported as **unattributed**, per F3 — not as "handoff".
+
+# AMENDMENT 2 — a wrong number inherited from the source artifact, recorded for the retraction.
+
+`bench/fork_concurrency_after.txt` states "one fsync 3.574 ms". Reproducing it:
+`3.690 − 0.11017 = 3.580`, not 3.574. `3.690 − 0.1148 = 3.575` does reproduce it — **0.1148 is the
+SUPERSEDED value of SUM**, corrected to 0.11017 in `serial_section_profile.txt`. So the residual was
+computed against the old sum and never recut when the sum was fixed. Immaterial to every conclusion
+here (0.006 ms on a 3.58 ms quantity), but it is a stale derived number sitting in an artifact
+others quote, and it is the same class of error as the regime mix-up this row exists to check.
+
+# AMENDMENT 3 — what "extra ms / k" buys, and its bias.
+
+F5's extra upserts hit a **fixed key set**, so every thread touches the same few pages. That is the
+BEST case for cache residency and the WORST case for cache-line bouncing. Therefore:
+`extra_ms(T=64)/k ÷ extra_ms(T=1)/k` is a same-instrument, same-work contention multiplier, but it
+is **biased toward detecting line bouncing and biased against detecting eviction or page-diversity
+effects.** If it comes back ≈1.0x, that rules out line-bouncing-on-shared-pages specifically; it
+does not rule out a mechanism that needs many distinct pages. Said here so the negative result is
+not overread later.
