@@ -11,10 +11,11 @@
 //!            something to be compared against rather than being read on its own.
 //!
 //! Axis 2 is the control for axis 1. **Read it against axis 2b and never on its own**: axis 2's
-//! per-pick cost is not flat in the log size (5.16x across 100x, measured), so "it rose, therefore
-//! the pick is scanning" is not a reading this harness supports. What separates the two
-//! hypotheses is the gap to the unindexed arm over the same range — 5.16x against 41.2x. The
-//! residual rise in axis 2 is real and its cause is not established here.
+//! per-pick cost is not flat in the log size, so "it rose, therefore the pick is scanning" is not
+//! a reading this harness supports. What separates the two hypotheses is the gap to the unindexed
+//! arm over the same range — measured 5-6x against 41-45x over two runs on a machine that was
+//! also building other work, so treat each figure as an upper bound and the GAP as the result.
+//! The residual rise in axis 2 is real and its cause is not established here.
 //!
 //! Every reported number is wall time from `std::time::Instant`, median over the reps named in
 //! the output. Two columns are reported and they are not the same measurement:
@@ -151,11 +152,11 @@ fn sel_row(sel: &[OpSelector]) -> RowId {
 /// arm then costs the same at 1e3 and at 1e5 log ops, and the A/B that exists to show what the
 /// index buys measures nothing at all.
 ///
-/// Measured with `s[..100]`, at 100,000 log ops: the "scanning" arm came in at **50.375 us**
-/// against the indexed arm's **52.250 us** — the scan the arm was built to expose was never
-/// performed, and the harness's own "N x FASTER" line was reading noise. This is the same defect
-/// as the refusal arm's: a fixture whose stated premise does not hold, in a detector that had
-/// only ever been observed quiet.
+/// Measured with `s[..100]`, at 100,000 log ops, on the run that caught it: the "scanning" arm
+/// came in at **50.375 us** against the indexed arm's **52.250 us** — the scan the arm was built
+/// to expose was never performed, and the harness's own "N x FASTER" line was reading noise. This
+/// is the same defect as the refusal arm's: a fixture whose stated premise does not hold, in a
+/// detector that had only ever been observed quiet.
 ///
 /// Striding puts the average matched cell in the middle of the list, so the scan's cost is
 /// proportional to the log size — which is the thing the arm claims to show. Both arms select
@@ -272,9 +273,9 @@ fn main() {
     // log's size.
     //
     // **It is not flat, and the number is reported rather than explained.** With the strided
-    // selection this arm measures 0.3588 -> 1.8521 us per pick across 100x the log, a 5.16x
-    // rise. That is not the scan signature — axis 2b rises 41.2x over the same range — but it is
-    // not the constant the paragraph above predicts either. The `ops_on_cell` key is a
+    // selection this arm rose 5.16x and 5.94x per pick across 100x the log on two runs. That is
+    // not the scan signature — axis 2b rose 41.2x and 45.2x over the same range, on the same two
+    // runs — but it is not the constant the paragraph above predicts either. The `ops_on_cell` key is a
     // `BTreeMap` whose depth and cache behaviour both move with the number of distinct cells,
     // and this harness does not separate those from the lookup itself, so the cause is UNVERIFIED
     // and stated as open. Reading "it rose, therefore the pick is scanning" off this arm alone
