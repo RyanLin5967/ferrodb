@@ -47,8 +47,10 @@ use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRo
 use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
-use crate::branch::record::{CapabilityEnvelope, RowImage};
+use crate::branch::record::{BranchRecord, CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
+use crate::branch::version_graph::{AncestryError, VersionGraph};
+use crate::cow::diff::{diff as cow_diff, Change as CowChange, PageIdentity};
 use crate::cow::PageStore;
 use crate::branch::{BranchCatalog, Reaper};
 
@@ -332,6 +334,25 @@ struct Staged {
     after: RowState,
     ops: Vec<Op>,
     guard: Option<Guard>,
+}
+
+/// What one page-derived `DIFF` cost, in integers.
+///
+/// **Integers and not a duration, deliberately.** This box runs a build fleet and a 46x
+/// quiet-vs-loaded spread has been measured on it, so a wall clock here would report the load
+/// rather than the algorithm. A node count does not move when the machine is busy, which is the
+/// same reasoning `version_graph::is_ancestor_hops` gives for counting jump-pointer dereferences.
+///
+/// `visited` is every node this diff READ — there is no second, uncounted enumeration behind it.
+/// That is precisely what `cow::btree::TreeDiff::pages_examined` could not say on its own, which
+/// is why the production path no longer reports through it. See
+/// [`AgentRuntime::page_changeset_with_cost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffCost {
+    /// Nodes whose payload was decoded by the synchronised descent.
+    pub visited: usize,
+    /// Subtree pairs found equal by page identity and abandoned without either page being read.
+    pub skipped_subtrees: usize,
 }
 
 
@@ -705,6 +726,27 @@ pub struct AgentRuntime {
     /// attached. See [`AgentRuntime::with_reaper`].
     reaper: Option<Arc<dyn Reaper>>,
     state: Mutex<State>,
+    /// **The ancestry index (D103).** Jump-pointer forest over the branch graph, so the fork point
+    /// of two branches is an O(log depth) query instead of two walks to the root.
+    ///
+    /// # Why it is its own lock and not a field of `State`
+    ///
+    /// Hydrating it reads `self.branches`, which takes the catalog lock. `stage_all` documents the
+    /// one lock order this runtime keeps — `put_row` takes the catalog lock and must not be
+    /// reached while `state` is held — so an ancestry index living inside `State` would have to be
+    /// filled from under the state lock, which is exactly the inverted order that deadlocks. This
+    /// is a leaf lock: it is taken alone, never while `state` is held, and nothing under it does
+    /// I/O.
+    ///
+    /// # Why it is hydrated on demand rather than written at fork
+    ///
+    /// One door instead of two. A fork hook would be a second place that has to stay in step with
+    /// the branch catalog, and a catalog that was reopened from a record log — or a branch minted
+    /// by anything other than `begin_session_as` — would be missing from the index with nothing to
+    /// say so. [`AgentRuntime::ensure_ancestry`] derives the chain from the catalog itself, so the
+    /// index cannot disagree with the records it answers about; a branch already present costs one
+    /// hash lookup, and only a branch that is absent pays the walk, once.
+    ancestry: Mutex<VersionGraph>,
 }
 
 impl Default for AgentRuntime {
@@ -741,6 +783,7 @@ impl AgentRuntime {
             storage: None,
             reaper: None,
             state: Mutex::new(State::default()),
+            ancestry: Mutex::new(VersionGraph::new()),
         }
     }
 
@@ -798,6 +841,7 @@ impl AgentRuntime {
             storage: Some(rows),
             reaper: None,
             state: Mutex::new(State::default()),
+            ancestry: Mutex::new(VersionGraph::new()),
         })
     }
 
@@ -836,6 +880,7 @@ impl AgentRuntime {
             storage: Some(PagedRows::new(store)),
             reaper: None,
             state: Mutex::new(State::default()),
+            ancestry: Mutex::new(VersionGraph::new()),
         })
     }
 
@@ -1401,7 +1446,59 @@ impl AgentRuntime {
     /// base tables live in the tree as well, the fork root will hold real rows and this same call
     /// will return the same answer for a better reason — the diff will then be doing the work the
     /// map is doing now.
+    ///
+    /// # D103 — this is `cow::diff`'s synchronised descent, not `CowTree::diff`
+    ///
+    /// See [`AgentRuntime::page_changeset_with_cost`] for what changed and what it costs.
     pub fn page_changeset(&self, branch: BranchId) -> Result<Vec<PageRowChange>, FerroError> {
+        Ok(self.page_changeset_with_cost(branch)?.0)
+    }
+
+    /// [`AgentRuntime::page_changeset`], with what the descent cost as integers.
+    ///
+    /// # Why the production `DIFF` path stopped calling `CowTree::diff`
+    ///
+    /// `CowTree::diff` prunes by page identity — sound here, and the right test — but it finds the
+    /// shared pages by calling `walk_pages` on **both roots** into two `HashSet<PageId>` before it
+    /// can prune either against the other. Its own doc conceded it: "page *identity* traversal is
+    /// proportional to the tree". So a branch that changed four rows of a million-row table paid a
+    /// two-million-page enumeration to discover four changes, and its `pages_examined` counter
+    /// reported only the decode half — four — so the O(N) operation read as cheap. Both halves are
+    /// now on [`crate::cow::btree::TreeDiff`], and this path pays neither.
+    ///
+    /// [`crate::cow::diff::diff`] descends the two roots **together**: at each level the children
+    /// are merge-joined on their key spans and a pair with equal identity is abandoned in O(1)
+    /// without either page being read. Neither side is ever enumerated alone, so the traversal is
+    /// O(delta · log_m N) rather than O(N).
+    ///
+    /// # Which identity, and why not the content digest
+    ///
+    /// [`crate::cow::diff::PageIdentity`] — the page id **is** the identity. That is sound in this
+    /// store and nowhere else, for exactly the reason `CowTree::diff` already relied on: DESIGN.md
+    /// rules out content addressing and refcounts, so a subtree that did not change is not merely
+    /// equal to its old self, it *is* the same page. The premise is unchanged from the path this
+    /// replaces; only the traversal is new.
+    ///
+    /// ⚠ **`cow::cid::subtree_cid` is deliberately NOT used here**, and passing it in directly
+    /// would be a performance regression wearing a skip counter: its own docs say "Cost is the
+    /// whole subtree, every time — there is no memo table", so every O(1) skip test would become a
+    /// full subtree walk and the diff would cost strictly more than the O(N) path it replaced.
+    /// `cow::diff::MemoIdentity` exists for callers that need that digest and must be `warm()`ed
+    /// first, with `misses()` checked afterwards so an unwarmed provider is visible rather than
+    /// silently slow — `integration_production_diff_wiring::the_memoised_content_identity_agrees`
+    /// exercises that contract. `PageIdentity` needs none of it: zero precompute, zero collisions.
+    ///
+    /// # The counters
+    ///
+    /// [`DiffCost::visited`] counts nodes whose payload was **decoded**, which on this path is
+    /// also every node that was read at all — there is no second, uncounted enumeration hiding
+    /// behind it. That is the difference from `pages_examined` and it is why this is the number
+    /// the claim is stated in. Integers, not durations: this box runs a build fleet, and a wall
+    /// clock here measures the fleet as much as the algorithm.
+    pub fn page_changeset_with_cost(
+        &self,
+        branch: BranchId,
+    ) -> Result<(Vec<PageRowChange>, DiffCost), FerroError> {
         let rows = self.rows()?;
         let fork_root = {
             let state = self.state.lock().unwrap();
@@ -1410,18 +1507,27 @@ impl AgentRuntime {
         .ok_or_else(|| FerroError::Branch(format!("no agent session on branch {branch}")))?;
         let current = self.root_of(branch)?;
 
-        let diff = rows.tree().diff(fork_root, current)?;
-        let mut out = Vec::with_capacity(diff.deltas.len());
-        for (key, before, after) in diff.deltas {
-            let (table, row) = split_row_key(&key)?;
+        let report = cow_diff(rows.tree(), fork_root, current, &PageIdentity)?;
+        let mut out = Vec::with_capacity(report.changes.len());
+        for change in &report.changes {
+            let (key, before, after) = match change {
+                CowChange::Added { key, value } => (key, None, Some(value)),
+                CowChange::Removed { key, value } => (key, Some(value), None),
+                CowChange::Modified { key, before, after } => (key, Some(before), Some(after)),
+            };
+            let (table, row) = split_row_key(key)?;
             out.push(PageRowChange {
                 table,
                 row,
-                before: before.as_deref().map(decode_row).transpose()?,
-                after: after.as_deref().map(decode_row).transpose()?,
+                before: before.map(|v| decode_row(v)).transpose()?,
+                after: after.map(|v| decode_row(v)).transpose()?,
             });
         }
-        Ok(out)
+        let cost = DiffCost {
+            visited: report.visited,
+            skipped_subtrees: report.skipped_subtrees,
+        };
+        Ok((out, cost))
     }
 
     /// Every row of `table` as `branch` sees it: the shared table overlaid with that branch's

@@ -44,12 +44,26 @@ const MAX_DESCENT: usize = 64;
 pub type Delta = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// What changed between two roots, and how much of the tree had to be read to find out.
+///
+/// **Two numbers, because one of them was reporting an O(N) operation as cheap.** `pages_examined`
+/// is the decode half and it is O(delta); `pages_walked` is the identity half and it is O(N).
+/// Reading only the first is what made this path look like `cow::diff`'s synchronised descent
+/// while costing a full traversal of both trees — see [`CowTree::diff`].
 #[derive(Debug)]
 pub struct TreeDiff {
     pub deltas: Vec<Delta>,
     /// Pages whose **entries were decoded**. Subtrees the two roots share are skipped whole,
     /// by page identity, so this stays proportional to what changed rather than to the tree.
     pub pages_examined: usize,
+    /// Pages whose **identity had to be known** before either side could be pruned against the
+    /// other: `|walk_pages(base)| + |walk_pages(head)|`. Proportional to the TREE, not to the
+    /// change, and it is paid before the first entry is decoded.
+    ///
+    /// This is the number that makes the cost of this path visible. `cow::diff::diff` does not
+    /// pay it at all — it descends the two roots together and never enumerates either side — so a
+    /// comparison between the two paths is only honest when it is stated in this field rather
+    /// than in `pages_examined` alone.
+    pub pages_walked: usize,
 }
 
 
@@ -196,17 +210,34 @@ impl CowTree {
     /// **Cost, stated precisely rather than rounded to "O(changed)":** page *identity* traversal
     /// is proportional to the tree, because the set of pages each side reaches has to be known
     /// before either can be pruned against the other. Entry *decoding* — deserialising cells, the
-    /// expensive half — is proportional to what actually changed. `pages_examined` reports the
-    /// second number so the claim can be checked rather than believed.
+    /// expensive half — is proportional to what actually changed.
+    ///
+    /// ⚠ **BOTH halves are now reported, and the second one is why.** `pages_examined` alone is
+    /// O(delta), so a reader who trusted it read this O(N) operation as cheap — including the
+    /// production `DIFF` path, which used to call this and report a handful of decoded pages
+    /// while the two `walk_pages` calls below had just enumerated a million. `pages_walked` is
+    /// that enumeration, and it is the number to compare against
+    /// [`crate::cow::diff::DiffReport::visited`].
+    ///
+    /// **The production `DIFF` path no longer calls this** — `AgentRuntime::page_changeset` uses
+    /// `cow::diff::diff`, whose synchronised descent never enumerates either side. This is kept
+    /// for the callers that want a `BTreeMap`-shaped answer and for the control arm of the
+    /// measurement in `examples/d103_production_diff_curve.rs`.
     pub fn diff(&self, base_root: PageId, head_root: PageId) -> Result<TreeDiff, FerroError> {
         // Same root is the common case for an agent that read but never wrote, and it is the
         // cleanest statement of the invariant: identical pointer, identical tree, nothing read.
         if base_root == head_root {
-            return Ok(TreeDiff { deltas: Vec::new(), pages_examined: 0 });
+            return Ok(TreeDiff { deltas: Vec::new(), pages_examined: 0, pages_walked: 0 });
         }
 
-        let base_pages: HashSet<PageId> = self.walk_pages(base_root)?.into_iter().collect();
-        let head_pages: HashSet<PageId> = self.walk_pages(head_root)?.into_iter().collect();
+        let base_walk = self.walk_pages(base_root)?;
+        let head_walk = self.walk_pages(head_root)?;
+        // Counted from the WALKS, not from the sets: two pages shared between the roots collapse
+        // into one set entry, and the cost this records is the pages that were read, not the
+        // distinct pages that survived deduplication.
+        let walked = base_walk.len() + head_walk.len();
+        let base_pages: HashSet<PageId> = base_walk.into_iter().collect();
+        let head_pages: HashSet<PageId> = head_walk.into_iter().collect();
 
         let mut examined = 0usize;
         let mut before = BTreeMap::new();
@@ -227,7 +258,7 @@ impl CowTree {
                 deltas.push((k.clone(), b.cloned(), a.cloned()));
             }
         }
-        Ok(TreeDiff { deltas, pages_examined: examined })
+        Ok(TreeDiff { deltas, pages_examined: examined, pages_walked: walked })
     }
 
     /// Gather leaf entries from every subtree of `pid` that `other` does not also contain.
