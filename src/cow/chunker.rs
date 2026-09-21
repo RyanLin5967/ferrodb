@@ -50,10 +50,24 @@
 //! for it. The numbers behind that trade — including what was measured at the setting that kept
 //! the old fanout instead — are on [`CHUNK_SHIFT`].
 //!
-//! Two narrower gaps, both on the paths that *remove* content rather than add it: overwriting a
-//! value and deleting a key can each erase a boundary, and repairing that means merging with the
-//! right-hand neighbour, which is sibling access again. A tree built by insertion — what the
-//! invariance tests build, and what a branch's writes do — is exact.
+//! One narrower gap, and it is `delete` alone. This header used to name overwrite alongside it;
+//! that was wrong once the chunking hash became key-only, and a sibling's measurement caught it.
+//!
+//! **Overwrite is safe.** [`key_hash`] reads the key, so rewriting a value of the same length
+//! cannot move any boundary, its own included. A rewrite that changes the row's length can flip
+//! that one row's boundary and no other, because the threshold compares against that row's own
+//! size rather than a running total. `tests_chunking::rewriting_values_in_place_leaves_the_
+//! partition_alone` holds the first half green.
+//!
+//! **`delete` is the gap**, and it is worse than an erased boundary: `CowTree::delete` removes the
+//! entry and relinks the path, and nothing unlinks a leaf the delete emptied. An empty leaf stays
+//! in the partition, so the tree stops matching the chunker's partition of its own content.
+//! Unlinking it is the parent-side surgery a merge needs — sibling access again.
+//! `tests_chunking::deleting_every_row_of_a_leaf_leaves_it_linked_and_empty` reproduces it,
+//! `#[ignore]`d, which is this repo's marker for a known-open defect.
+//!
+//! A tree built by insertion — what the invariance tests build, and what a branch's first writes
+//! do — is exact.
 
 /// How many times the mean chunk divides into a page: the page capacity over
 /// [`TARGET_CHUNK_BYTES`].

@@ -548,3 +548,48 @@ fn measure_the_partition() {
         );
     }
 }
+
+/// **Known-open defect**, carried `#[ignore]`d the way this repo marks one.
+///
+/// `CowTree::delete` removes the entry and relinks the path; nothing unlinks a leaf that the
+/// delete emptied. So deleting every row of one leaf leaves an empty leaf in the partition, and
+/// the tree stops agreeing with the chunker about its own content — the property the rest of this
+/// file asserts. Repairing it is the parent-side surgery a merge needs, which is the same sibling
+/// access `cow::chunker`'s header names as the architectural limit.
+///
+/// Overwrite is deliberately **not** in this test: since the chunking hash reads the key alone, a
+/// same-length rewrite moves nothing, which `rewriting_values_in_place_leaves_the_partition_alone`
+/// holds green.
+#[test]
+#[ignore]
+fn deleting_every_row_of_a_leaf_leaves_it_linked_and_empty() {
+    let set = pairs(1500);
+    let f = Fixture::new();
+    let mut root = f.build(&set);
+    let before = f.leaf_partition(root);
+    assert!(before.len() > 4, "fixture: need several leaves");
+
+    // Empty leaf 2 exactly, by deleting the rows it holds and nothing else.
+    let victim: Vec<(Vec<u8>, Vec<u8>)> = before[2].clone();
+    for (k, _) in &victim {
+        let e = f.tick();
+        root = f.tree.delete(root, BranchId::TRUNK, e, k).unwrap();
+    }
+
+    let after = f.leaf_partition(root);
+    let empties = after.iter().filter(|l| l.is_empty()).count();
+    let remaining: Vec<(Vec<u8>, Vec<u8>)> =
+        set.iter().filter(|(k, _)| !victim.iter().any(|(vk, _)| vk == k)).cloned().collect();
+
+    assert_eq!(
+        empties, 0,
+        "delete left {} empty leaf/leaves linked in the partition: {}",
+        empties,
+        describe(&after)
+    );
+    assert_eq!(
+        after,
+        canonical(&remaining),
+        "after deleting a whole leaf the tree no longer matches the chunker's partition"
+    );
+}
