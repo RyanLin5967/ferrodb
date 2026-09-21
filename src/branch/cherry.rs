@@ -45,6 +45,17 @@
 //! tree, so you must first decide what the pruned diff even means before you can apply it. An op
 //! log has no such problem — a subset of a list is a list.
 //!
+//! ## What is NOT here
+//!
+//! **Nothing wires this to `runtime.rs`, and there is no `CHERRY PICK` at the SQL surface.** There
+//! is no `impl CherryLog` or `impl CherryTarget` outside this file and its harness. This is the
+//! engine and its contract, written against the op-log shape `AgentRuntime` already keeps, so that
+//! wiring is a projection (`CherryLog::op_at` is `state.applied[i]`; `ops_on_cell` is
+//! `applied_by_cell`) rather than a translation. Every claim below is proved against
+//! `MemCherryLog` / `MemCherryTarget`; none of it is evidence about the runtime until that impl
+//! exists and is tested, and `commit_all`'s all-or-nothing contract in particular is the part the
+//! runtime will owe.
+//!
 //! ## Atomicity: made unrepresentable, not documented
 //!
 //! A half-applied cherry-pick is worse than a refused one: it leaves the target holding a state
@@ -87,9 +98,9 @@
 //! | 7  | cell op; the row no longer exists on the target                     | **REFUSE WHOLE** `RowGone` |
 //! | 8  | cell op; the target row is too narrow to hold that column           | **REFUSE WHOLE** `ColumnAbsent` |
 //! | 9  | `RowCreate`; row absent on target                                   | **APPLY** — materialise from the carried image |
-//! | 10 | `RowCreate`; row already present on target                          | **REFUSE WHOLE** `RowExists` |
+//! | 10 | `RowCreate`; row already present **at that point in the selection**  | **REFUSE WHOLE** `RowExists` |
 //! | 11 | `RowDelete`; row present on target                                  | **APPLY** — remove |
-//! | 12 | `RowDelete`; row absent on target                                   | **REFUSE WHOLE** `RowGone` |
+//! | 12 | `RowDelete`; row absent **at that point in the selection**           | **REFUSE WHOLE** `RowGone` |
 //! | 13 | **two selected ops on one cell**, composable                        | **APPLY as ONE composed write** — see note below |
 //! | 14 | **two selected ops on one cell**, composition undefined             | **REFUSE WHOLE** `ComposeFailed` |
 //! | 15 | the **same op selected twice**                                      | **REFUSE WHOLE** `DuplicateSelector` — `Add` is not idempotent |
@@ -99,6 +110,12 @@
 //! | 19 | selector names an op recorded by a **different** branch             | **REFUSE WHOLE** `NotFromSource` |
 //! | 20 | **empty** selection                                                 | **REFUSE** `EmptySelection` — a pick that picked nothing has not picked |
 //! | 21 | **any** one row refuses                                             | **NOTHING is written** — `commit_all` is never reached |
+//! | 22 | the algebra cannot apply the op to a cell (the **set ops**)          | **REFUSE WHOLE** `OpNotApplicable` — not an engine `Err` |
+//! | 23 | the op's own shape is wrong (cell kind, no column)                   | **REFUSE WHOLE** `MalformedOp` |
+//! | 24 | **several whole-row ops** on one row — delete then recreate          | **APPLY** — one `InsertRow` replacing the prior image |
+//! | 25 | several whole-row ops — **create** then delete, row on target        | **REFUSE WHOLE** `RowExists` — the create is checked, not just the last op |
+//! | 26 | cell op **before** a `RowDelete` in the same pick                    | **APPLY** — subsumed by the delete; the row leaves |
+//! | 27 | the target's value is **not explained** by any non-source op         | **REFUSE WHOLE** `TargetCellMoved` — an unexplained move is not composed with |
 //!
 //! **Note on row 13, which is the one that looks like it should be a conflict and is not.**
 //! Two ops the *same* branch recorded on one cell are sequential, not concurrent, so there is no
@@ -113,6 +130,16 @@
 //! Non-contiguity is still **reported**, in [`CherryApplied::straddled`], because the resulting
 //! value is one the source branch never itself held and the caller should be able to see that.
 //! It is reported, never decisive — the same posture `blind_writes` takes at the merge gate.
+//!
+//! **Which rows their tests actually discriminate.** Rows 3, 4 and 5 each have a passing test, but
+//! in all three fixtures the target's recorded op assigns exactly the value the target already
+//! holds, so reading the log and falling back to an opaque `Assign` produce the *same* `theirs`
+//! and the tests would pass with the log read deleted. Row 2 and row 27 are the only two places
+//! where reading the log is observable: row 2 applies **only** if the log is read (an `Add` and an
+//! opaque `Assign` do not commute), and row 27 refuses **only** if the verification in
+//! [`divergence`] rejects a composition that does not explain the target's value. That is stated
+//! here rather than left for the next reader to discover, because three green tests that cannot
+//! fail for the reason they name look exactly like three that can.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -199,9 +226,18 @@ pub enum CherryWrite {
         /// What the target held before this write. The witness [`invert`] needs.
         before: Option<Value>,
     },
-    /// Materialise a row the target does not have, with every picked cell op on it already folded
-    /// into the image.
-    InsertRow { table: String, tbl: TableId, row: RowId, image: Vec<Value> },
+    /// Materialise a row, with every picked cell op on it already folded into the image.
+    ///
+    /// `replaced` is what the target held at this key beforehand, which is `None` for an ordinary
+    /// create and `Some` when a selection deleted the row and recreated it. Carried so
+    /// [`CherryPlan::inverse`] restores the prior image instead of deleting a row that existed.
+    InsertRow {
+        table: String,
+        tbl: TableId,
+        row: RowId,
+        image: Vec<Value>,
+        replaced: Option<Vec<Value>>,
+    },
     /// Remove a row.
     DeleteRow { table: String, tbl: TableId, row: RowId, before_row: Vec<Value> },
 }
@@ -226,15 +262,22 @@ impl CherryWrite {
 
 /// The branch being picked **onto**.
 ///
-/// **There is exactly one mutating method and it takes the whole plan.** That is the atomicity
-/// guarantee, expressed as a type rather than as a comment: no caller of this trait — this
-/// engine included — holds any way to apply a single write, so a partially applied cherry-pick
-/// is not a state this module can reach.
+/// **There is exactly one mutating method and it takes the whole plan.**
 ///
-/// Implementations owe `commit_all` the same all-or-nothing contract: either every write in the
-/// slice lands or none does. `MemCherryTarget` below gets it by mutating a clone and swapping,
-/// which is the cheapest correct implementation; a runtime impl gets it from the one `Mutex` and
-/// the `PendingWrite` batch a merge already publishes under.
+/// **Exactly what that buys, and what it does not.** The type stops *this engine* from applying a
+/// subset: `plan_cherry_pick` takes `&dyn CherryTarget` and can only read, and `cherry_pick` holds
+/// no call that writes one op, so a pick that refuses cannot have written and a pick that applies
+/// went through one `commit_all`. That half is enforced by the signature.
+///
+/// The other half is **not** enforced, and an earlier version of this comment overstated it.
+/// Whether `commit_all` is itself all-or-nothing is a contract an implementor owes and this module
+/// cannot check; nothing stops any caller from writing `commit_all(&[one])` in a loop.
+/// `MemCherryTarget` below honours it by journalling the pre-image of every row it touches and
+/// restoring them on failure, and it is *tested* for it
+/// (`row21_a_commit_that_fails_partway_leaves_the_target_unchanged`, and the two-touches case
+/// beside it). A runtime impl gets it from the one `Mutex` and the `PendingWrite` batch a merge
+/// already publishes under — which is a claim that will need its own test when that impl exists,
+/// not one this trait can make on its behalf.
 pub trait CherryTarget {
     /// The target's current image of a row, or `None` if it has no such row.
     fn row_image(&self, tbl: TableId, row: RowId) -> Option<Vec<Value>>;
@@ -318,17 +361,28 @@ impl CherryPlan {
                         before: Some(value.clone()),
                     }
                 }
-                CherryWrite::InsertRow { table, tbl, row, image } => CherryWrite::DeleteRow {
-                    table: table.clone(),
-                    tbl: *tbl,
-                    row: *row,
-                    before_row: image.clone(),
+                CherryWrite::InsertRow { table, tbl, row, image, replaced } => match replaced {
+                    // It replaced a row: put the prior image back, do not delete.
+                    Some(prior) => CherryWrite::InsertRow {
+                        table: table.clone(),
+                        tbl: *tbl,
+                        row: *row,
+                        image: prior.clone(),
+                        replaced: Some(image.clone()),
+                    },
+                    None => CherryWrite::DeleteRow {
+                        table: table.clone(),
+                        tbl: *tbl,
+                        row: *row,
+                        before_row: image.clone(),
+                    },
                 },
                 CherryWrite::DeleteRow { table, tbl, row, before_row } => CherryWrite::InsertRow {
                     table: table.clone(),
                     tbl: *tbl,
                     row: *row,
                     image: before_row.clone(),
+                    replaced: None,
                 },
             });
         }
@@ -350,6 +404,14 @@ pub enum CherryConflictKind {
     ColumnAbsent,
     /// Row 14: the selected ops on one cell have no composition in the algebra.
     ComposeFailed,
+    /// Row 22: the algebra cannot apply this op to a cell at all — the set ops, which
+    /// `merge_engine::apply_op` has no arm for, and any cell whose composed effect will not
+    /// apply to the value present. A caller can express this, so it is a refusal and not an
+    /// engine error.
+    OpNotApplicable,
+    /// Row 23: the recorded op's own shape is wrong — a cell kind with no column, or a whole-row
+    /// kind carrying one.
+    MalformedOp,
     /// Row 15: the same op was selected more than once. `Add` is not idempotent.
     DuplicateSelector,
     /// Row 18: no op was recorded at that seq.
@@ -368,6 +430,8 @@ impl CherryConflictKind {
             CherryConflictKind::RowExists => "RowExists",
             CherryConflictKind::ColumnAbsent => "ColumnAbsent",
             CherryConflictKind::ComposeFailed => "ComposeFailed",
+            CherryConflictKind::OpNotApplicable => "OpNotApplicable",
+            CherryConflictKind::MalformedOp => "MalformedOp",
             CherryConflictKind::DuplicateSelector => "DuplicateSelector",
             CherryConflictKind::NoSuchOp => "NoSuchOp",
             CherryConflictKind::NotFromSource => "NotFromSource",
@@ -422,7 +486,13 @@ pub struct CherryApplied {
 pub struct CherryRefusal {
     pub from: BranchId,
     pub onto: BranchId,
-    /// Every reason found, not just the first — an agent re-selecting wants the whole list.
+    /// Every reason found **at the stage that refused** — an agent re-selecting wants the whole
+    /// list, not just the first.
+    ///
+    /// Selector resolution is its own stage and short-circuits: if a selector names no op, names
+    /// another branch's, or repeats, nothing is planned at all, because a plan computed over a
+    /// different op set than the one asked for is not an answer to the question. So a selection
+    /// with both a bad selector and a moved cell reports only the bad selector.
     pub conflicts: Vec<CherryConflict>,
 }
 
@@ -635,13 +705,20 @@ pub fn plan_cherry_pick(
 
 /// Decide one row's worth of the pick.
 ///
-/// The row's selected ops are in increasing seq. The decision tree is on what whole-row ops the
-/// selection contains, because those determine whether the row even exists to have cells:
+/// The row's selected ops arrive in increasing seq. There are two shapes and they are decided
+/// separately, because whole-row ops determine whether the row even exists to have cells:
 ///
-/// * the last whole-row op is a `RowDelete` -> the row ends deleted; cell ops **after** it refuse;
-/// * the selection contains a `RowCreate` -> the row is new to the target, so no divergence is
-///   possible and every later cell op folds into the created image;
-/// * no whole-row op -> the ordinary case: resolve each cell against the target.
+/// * **no whole-row op** — the ordinary case. Group the cell ops by column, compose each group
+///   into one effect, and resolve it against the target through [`resolve_cell`].
+/// * **any whole-row op** — walk every op for the row in **seq order** against a staged image,
+///   and emit the one net write at the end.
+///
+/// The walk replaced a version that looked only at the *last* whole-row op
+/// (`row_ops.iter().rev().find(..)`), which a fresh-context review falsified: a selection of
+/// `RowCreate` then `RowDelete` onto a target that **already had the row** never checked the
+/// create, so truth-table row 10's `RowExists` refusal was bypassed and the row was deleted with
+/// no report that half the selection had been discarded. The mirror case over-refused: a
+/// legitimate delete-then-recreate was rejected as `RowExists`. Both are covered by `d5_*` below.
 #[allow(clippy::too_many_arguments)]
 fn plan_one_row(
     log: &dyn CherryLog,
@@ -657,16 +734,18 @@ fn plan_one_row(
 ) -> Result<(), FerroError> {
     let first = row_ops[0];
     let (tbl, row, table) = (first.tbl, first.row, first.table.clone());
-    let on_target = target.row_image(tbl, row);
+    let real = target.row_image(tbl, row);
 
-    // Last whole-row op in the selection decides the row's final existence.
-    let last_row_op = row_ops.iter().rev().find(|o| o.col.is_none());
+    if row_ops.iter().any(|o| o.col.is_none()) {
+        return plan_row_with_whole_row_ops(row_ops, tbl, row, table, real, writes, conflicts);
+    }
 
-    match last_row_op.map(|o| (&o.kind, o.seq)) {
-        // ---- Row 11 / 12: the pick ends by deleting the row. ----------------------------------
-        Some((OpKind::RowDelete, del_seq)) => {
-            // Row 17: a cell op *after* the delete names a row this pick has removed.
-            for o in row_ops.iter().filter(|o| o.col.is_some() && o.seq > del_seq) {
+    // ---- The ordinary case: cell ops against a row the target already has. --------------------
+    let image = match real {
+        Some(i) => i,
+        // Row 7.
+        None => {
+            for o in row_ops {
                 conflicts.push(CherryConflict {
                     kind: CherryConflictKind::RowGone,
                     seq: Some(o.seq),
@@ -674,268 +753,316 @@ fn plan_one_row(
                     row: Some(row),
                     col: o.col,
                     detail: format!(
-                        "op {} writes a cell of row {}, which op {} in this same selection deletes",
-                        o.seq, row, del_seq
+                        "op {} writes a cell of row {}, which the target does not have",
+                        o.seq, row
                     ),
                 });
             }
-            match on_target {
-                // Cell ops *before* the delete are subsumed by it and produce no write: the row
-                // is leaving. That is not a silent drop — the delete is the effect that was asked
-                // for, and applying a cell write to a row about to vanish would be the noise.
-                Some(image) => writes.push(CherryWrite::DeleteRow {
-                    table,
-                    tbl,
-                    row,
-                    before_row: image,
-                }),
-                None => conflicts.push(CherryConflict {
-                    kind: CherryConflictKind::RowGone,
-                    seq: Some(del_seq),
+            return Ok(());
+        }
+    };
+
+    let mut by_col: BTreeMap<u32, Vec<&RecordedOp>> = BTreeMap::new();
+    for o in row_ops {
+        by_col.entry(o.col.expect("filtered to cell ops").0).or_default().push(o);
+    }
+
+    for (col_raw, ops) in by_col {
+        let col = ColId(col_raw);
+        let idx = col_raw as usize;
+
+        // Row 8.
+        let target_now = match image.get(idx) {
+            Some(v) => v.clone(),
+            None => {
+                conflicts.push(CherryConflict {
+                    kind: CherryConflictKind::ColumnAbsent,
+                    seq: Some(ops[0].seq),
                     tbl: Some(tbl),
                     row: Some(row),
-                    col: None,
-                    detail: format!("op {} deletes row {}, which the target does not have", del_seq, row),
-                }),
+                    col: Some(col),
+                    detail: format!(
+                        "op {} names column {} of a {}-column target row",
+                        ops[0].seq,
+                        col_raw,
+                        image.len()
+                    ),
+                });
+                continue;
+            }
+        };
+
+        // Rows 13 / 14: compose the selected ops on this cell into one effect.
+        let kinds: Vec<OpKind> = ops.iter().map(|o| o.kind.clone()).collect();
+        let ours = match compose_ops(&kinds) {
+            Ok(k) => k,
+            Err(e) => {
+                conflicts.push(compose_failed(tbl, row, col, &ops, &e));
+                continue;
+            }
+        };
+
+        // Row 13's note: report a non-contiguous selection, do not refuse it.
+        let picked_seqs: Vec<u64> = ops.iter().map(|o| o.seq).collect();
+        if let (Some(lo), Some(hi)) = (picked_seqs.first(), picked_seqs.last()) {
+            let skipped: Vec<u64> = log
+                .ops_on_cell(tbl, row, col)
+                .iter()
+                .copied()
+                .filter(|s| s > lo && s < hi && !selected.contains(s))
+                .collect();
+            if !skipped.is_empty() {
+                straddled.push(Straddled { tbl, row, col, picked: picked_seqs.clone(), skipped });
             }
         }
 
-        // ---- Rows 9 / 10 / 16: the pick creates the row. --------------------------------------
-        Some((OpKind::RowCreate(initial), create_seq)) => {
-            if on_target.is_some() {
+        // The witness is the *earliest* selected op's before-image: that is the value the replay
+        // starts from, so it is the one the target must still hold.
+        let witness = ops[0].before.clone();
+        let theirs = divergence(log, from, tbl, row, col, witness.as_ref(), &target_now);
+
+        // **Reuse, not reimplementation.** This is the merge engine's cell decision, unchanged.
+        // `base` is the fork-point witness, `target` is what the target holds now, `ours` is the
+        // composed *selected* effect, `theirs` is what the target absorbed. Only `ours` differs
+        // from a merge, which is the whole thesis of this module.
+        let cell = CellMerge {
+            tbl,
+            row,
+            col,
+            base: witness.clone(),
+            target: Some(target_now.clone()),
+            ours,
+            theirs,
+        };
+        // **Row 22.** A caller can select an op whose kind the cell algebra cannot apply — the set
+        // ops, which `apply_op` has no arm for. That is a refusal, not an engine error: the
+        // contract on `cherry_pick` says `Err` is reserved for an impossible internal state.
+        let resolved = match resolve_cell(&cell, from, policy) {
+            Ok(r) => r,
+            Err(e) => {
                 conflicts.push(CherryConflict {
-                    kind: CherryConflictKind::RowExists,
-                    seq: Some(create_seq),
+                    kind: CherryConflictKind::OpNotApplicable,
+                    seq: Some(ops[0].seq),
+                    tbl: Some(tbl),
+                    row: Some(row),
+                    col: Some(col),
+                    detail: format!("op {} cannot be applied to this cell: {}", ops[0].seq, e),
+                });
+                continue;
+            }
+        };
+        match resolved {
+            // Rows 1 / 2 / 4.
+            CellResolution::Clean { value, .. } | CellResolution::Commuting { value, .. } => {
+                writes.push(CherryWrite::Cell {
+                    table: table.clone(),
+                    tbl,
+                    row,
+                    col,
+                    value,
+                    before: Some(target_now),
+                })
+            }
+            // Row 5.
+            CellResolution::Lossy { value, discarded: d, .. } => {
+                discarded.push(d);
+                writes.push(CherryWrite::Cell {
+                    table: table.clone(),
+                    tbl,
+                    row,
+                    col,
+                    value,
+                    before: Some(target_now),
+                })
+            }
+            // Rows 3 / 6.
+            CellResolution::Conflict(report) => conflicts.push(CherryConflict {
+                kind: CherryConflictKind::TargetCellMoved,
+                seq: Some(ops[0].seq),
+                tbl: Some(tbl),
+                row: Some(row),
+                col: Some(col),
+                detail: format!(
+                    "the target moved under op {} and the two effects do not commute: {}",
+                    ops[0].seq, report.detail
+                ),
+            }),
+        }
+    }
+    Ok(())
+}
+
+/// Walk one row's selection in **seq order**, staging its existence and image, and emit the one
+/// net write.
+///
+/// Every refusal returns immediately: once the row's history contradicts the target there is
+/// nothing further to decide about it, and the whole pick is refused anyway.
+///
+/// **A cell op reached while the row was not created by this selection is skipped**, and that is
+/// safe rather than lossy. In this branch the selection contains at least one whole-row op, so
+/// such an op is either followed by a `RowDelete` — which subsumes it, the row is leaving — or by
+/// a `RowCreate`, which refuses below because the row still exists. It cannot be the last word on
+/// a row that survives.
+fn plan_row_with_whole_row_ops(
+    row_ops: &[&RecordedOp],
+    tbl: TableId,
+    row: RowId,
+    table: String,
+    real: Option<Vec<Value>>,
+    writes: &mut Vec<CherryWrite>,
+    conflicts: &mut Vec<CherryConflict>,
+) -> Result<(), FerroError> {
+    let mut image: Option<Vec<Value>> = real.clone();
+    let mut created_here = false;
+
+    for o in row_ops {
+        match (&o.kind, o.col) {
+            // Rows 9 / 10.
+            (OpKind::RowCreate(initial), None) => {
+                if image.is_some() {
+                    conflicts.push(CherryConflict {
+                        kind: CherryConflictKind::RowExists,
+                        seq: Some(o.seq),
+                        tbl: Some(tbl),
+                        row: Some(row),
+                        col: None,
+                        detail: format!(
+                            "op {} creates row {}, which already exists at that point in the \
+                             selection",
+                            o.seq, row
+                        ),
+                    });
+                    return Ok(());
+                }
+                image = Some(initial.clone());
+                created_here = true;
+            }
+            // Rows 11 / 12.
+            (OpKind::RowDelete, None) => {
+                if image.is_none() {
+                    conflicts.push(CherryConflict {
+                        kind: CherryConflictKind::RowGone,
+                        seq: Some(o.seq),
+                        tbl: Some(tbl),
+                        row: Some(row),
+                        col: None,
+                        detail: format!(
+                            "op {} deletes row {}, which does not exist at that point in the \
+                             selection",
+                            o.seq, row
+                        ),
+                    });
+                    return Ok(());
+                }
+                image = None;
+                created_here = false;
+            }
+            // Row 23: a cell kind recorded with no column.
+            (kind, None) => {
+                conflicts.push(CherryConflict {
+                    kind: CherryConflictKind::MalformedOp,
+                    seq: Some(o.seq),
                     tbl: Some(tbl),
                     row: Some(row),
                     col: None,
                     detail: format!(
-                        "op {} creates row {}, which the target already has",
-                        create_seq, row
+                        "op {} is recorded with no column but kind {}, which is a cell op",
+                        o.seq,
+                        kind.name()
                     ),
                 });
                 return Ok(());
             }
-            // Row 16. The row is new to the target, so there is no divergence to resolve and no
-            // witness to check: every selected cell op on it applies to the created image, and
-            // the whole row lands as ONE `InsertRow` rather than an insert followed by updates.
-            // That is strictly more atomic and it is also what the truth table promises.
-            let mut image = initial.clone();
-            let mut by_col: BTreeMap<u32, Vec<&RecordedOp>> = BTreeMap::new();
-            for o in row_ops.iter().filter(|o| o.col.is_some() && o.seq > create_seq) {
-                by_col.entry(o.col.unwrap().0).or_default().push(o);
-            }
-            // A cell op *before* the create names a row that, in this selection, does not yet
-            // exist.
-            for o in row_ops.iter().filter(|o| o.col.is_some() && o.seq < create_seq) {
-                conflicts.push(CherryConflict {
-                    kind: CherryConflictKind::RowGone,
-                    seq: Some(o.seq),
-                    tbl: Some(tbl),
-                    row: Some(row),
-                    col: o.col,
-                    detail: format!(
-                        "op {} writes a cell of row {} before op {} in this same selection creates it",
-                        o.seq, row, create_seq
-                    ),
-                });
-            }
-            for (col_raw, ops) in by_col {
-                let col = ColId(col_raw);
-                let idx = col_raw as usize;
-                if idx >= image.len() {
-                    conflicts.push(CherryConflict {
-                        kind: CherryConflictKind::ColumnAbsent,
-                        seq: Some(ops[0].seq),
-                        tbl: Some(tbl),
-                        row: Some(row),
-                        col: Some(col),
-                        detail: format!(
-                            "op {} names column {} of a {}-column row image",
-                            ops[0].seq,
-                            col_raw,
-                            image.len()
-                        ),
-                    });
-                    continue;
-                }
-                let kinds: Vec<OpKind> = ops.iter().map(|o| o.kind.clone()).collect();
-                let composed = match compose_ops(&kinds) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        conflicts.push(compose_failed(tbl, row, col, &ops, &e));
-                        continue;
-                    }
-                };
-                match apply_op(image.get(idx), &composed) {
-                    Ok(v) => image[idx] = v,
-                    Err(e) => conflicts.push(compose_failed(tbl, row, col, &ops, &e)),
-                }
-            }
-            if conflicts.is_empty() {
-                writes.push(CherryWrite::InsertRow { table, tbl, row, image });
-            }
-        }
-
-        Some((other, seq)) => {
-            return Err(FerroError::Merge(format!(
-                "op {} is recorded with no column and kind {}, which is not a whole-row op",
-                seq,
-                other.name()
-            )))
-        }
-
-        // ---- The ordinary case: cell ops against a row the target already has. ----------------
-        None => {
-            let image = match on_target {
-                Some(i) => i,
-                // Row 7.
-                None => {
-                    for o in row_ops {
+            // Rows 16 / 17.
+            (kind, Some(col)) => {
+                let img = match image.as_mut() {
+                    Some(i) => i,
+                    None => {
                         conflicts.push(CherryConflict {
                             kind: CherryConflictKind::RowGone,
                             seq: Some(o.seq),
                             tbl: Some(tbl),
                             row: Some(row),
-                            col: o.col,
+                            col: Some(col),
                             detail: format!(
-                                "op {} writes a cell of row {}, which the target does not have",
+                                "op {} writes a cell of row {}, which does not exist at that \
+                                 point in the selection",
                                 o.seq, row
                             ),
                         });
+                        return Ok(());
                     }
-                    return Ok(());
+                };
+                if !created_here {
+                    // Subsumed by a later delete, or the walk refuses at a later create. See the
+                    // function header for why this cannot silently drop a surviving write.
+                    continue;
                 }
-            };
-
-            let mut by_col: BTreeMap<u32, Vec<&RecordedOp>> = BTreeMap::new();
-            for o in row_ops {
-                by_col.entry(o.col.expect("filtered to cell ops").0).or_default().push(o);
-            }
-
-            for (col_raw, ops) in by_col {
-                let col = ColId(col_raw);
-                let idx = col_raw as usize;
-
-                // Row 8.
-                let target_now = match image.get(idx) {
-                    Some(v) => v.clone(),
-                    None => {
-                        conflicts.push(CherryConflict {
-                            kind: CherryConflictKind::ColumnAbsent,
-                            seq: Some(ops[0].seq),
-                            tbl: Some(tbl),
-                            row: Some(row),
-                            col: Some(col),
-                            detail: format!(
-                                "op {} names column {} of a {}-column target row",
-                                ops[0].seq,
-                                col_raw,
-                                image.len()
-                            ),
-                        });
-                        continue;
-                    }
-                };
-
-                // Rows 13 / 14: compose the selected ops on this cell into one effect.
-                let kinds: Vec<OpKind> = ops.iter().map(|o| o.kind.clone()).collect();
-                let ours = match compose_ops(&kinds) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        conflicts.push(compose_failed(tbl, row, col, &ops, &e));
-                        continue;
-                    }
-                };
-
-                // Row 13's note: report a non-contiguous selection, do not refuse it.
-                let picked_seqs: Vec<u64> = ops.iter().map(|o| o.seq).collect();
-                if let (Some(lo), Some(hi)) = (picked_seqs.first(), picked_seqs.last()) {
-                    let skipped: Vec<u64> = log
-                        .ops_on_cell(tbl, row, col)
-                        .iter()
-                        .copied()
-                        .filter(|s| s > lo && s < hi && !selected.contains(s))
-                        .collect();
-                    if !skipped.is_empty() {
-                        straddled.push(Straddled {
-                            tbl,
-                            row,
-                            col,
-                            picked: picked_seqs.clone(),
-                            skipped,
-                        });
-                    }
-                }
-
-                // The witness is the *earliest* selected op's before-image: that is the value the
-                // replay starts from, so it is the one the target must still hold.
-                let witness = ops[0].before.clone();
-
-                let theirs = divergence(
-                    log,
-                    tbl,
-                    row,
-                    col,
-                    ops[0].seq,
-                    selected,
-                    witness.as_ref(),
-                    &target_now,
-                );
-
-                // **Reuse, not reimplementation.** This is the merge engine's cell decision,
-                // unchanged. `base` is the fork-point witness, `target` is what the target holds
-                // now, `ours` is the composed *selected* effect, `theirs` is what the target
-                // absorbed. Only `ours` differs from a merge, which is the whole thesis of this
-                // module.
-                let cell = CellMerge {
-                    tbl,
-                    row,
-                    col,
-                    base: witness.clone(),
-                    target: Some(target_now.clone()),
-                    ours,
-                    theirs,
-                };
-                match resolve_cell(&cell, from, policy)? {
-                    // Rows 1 / 2 / 4.
-                    CellResolution::Clean { value, .. } | CellResolution::Commuting { value, .. } => {
-                        writes.push(CherryWrite::Cell {
-                            table: table.clone(),
-                            tbl,
-                            row,
-                            col,
-                            value,
-                            before: Some(target_now),
-                        })
-                    }
-                    // Row 5.
-                    CellResolution::Lossy { value, discarded: d, .. } => {
-                        discarded.push(d);
-                        writes.push(CherryWrite::Cell {
-                            table: table.clone(),
-                            tbl,
-                            row,
-                            col,
-                            value,
-                            before: Some(target_now),
-                        })
-                    }
-                    // Rows 3 / 6.
-                    CellResolution::Conflict(report) => conflicts.push(CherryConflict {
-                        kind: CherryConflictKind::TargetCellMoved,
-                        seq: Some(ops[0].seq),
+                let idx = col.0 as usize;
+                if idx >= img.len() {
+                    conflicts.push(CherryConflict {
+                        kind: CherryConflictKind::ColumnAbsent,
+                        seq: Some(o.seq),
                         tbl: Some(tbl),
                         row: Some(row),
                         col: Some(col),
                         detail: format!(
-                            "the target moved under op {} and the two effects do not commute: {}",
-                            ops[0].seq, report.detail
+                            "op {} names column {} of a {}-column row image",
+                            o.seq,
+                            col.0,
+                            img.len()
                         ),
-                    }),
+                    });
+                    return Ok(());
+                }
+                // No divergence check: the row does not exist on the target in this form, so
+                // there is nothing on the target for the op to contend with.
+                match apply_op(img.get(idx), kind) {
+                    Ok(v) => img[idx] = v,
+                    Err(e) => {
+                        conflicts.push(CherryConflict {
+                            kind: CherryConflictKind::OpNotApplicable,
+                            seq: Some(o.seq),
+                            tbl: Some(tbl),
+                            row: Some(row),
+                            col: Some(col),
+                            detail: format!(
+                                "op {} cannot be applied to the staged row image: {}",
+                                o.seq, e
+                            ),
+                        });
+                        return Ok(());
+                    }
                 }
             }
         }
+    }
+
+    // The one net write. A selection that creates and then deletes a row the target never had
+    // writes nothing, which is the correct net effect and not a dropped op.
+    match (real, image) {
+        (Some(prior), Some(final_image)) => {
+            if prior != final_image {
+                writes.push(CherryWrite::InsertRow {
+                    table,
+                    tbl,
+                    row,
+                    image: final_image,
+                    replaced: Some(prior),
+                });
+            }
+        }
+        (Some(prior), None) => {
+            writes.push(CherryWrite::DeleteRow { table, tbl, row, before_row: prior })
+        }
+        (None, Some(final_image)) => writes.push(CherryWrite::InsertRow {
+            table,
+            tbl,
+            row,
+            image: final_image,
+            replaced: None,
+        }),
+        (None, None) => {}
     }
     Ok(())
 }
@@ -962,27 +1089,53 @@ fn compose_failed(
     }
 }
 
-/// What the target absorbed on this cell since the op being replayed was recorded, if anything.
+/// What **the target** absorbed on this cell, if anything.
 ///
-/// **The same rule `concurrent_op` uses, for the same reason.** Prefer the recorded ops, which
-/// name the algebra element and therefore let `Add`/`Add` commute instead of conflicting; fall
-/// back to comparing the image, which is the conservative reading — *a value that moved with no
-/// recorded op is an opaque `Assign`*.
+/// Two rules, and the second one exists because a fresh-context review falsified the first
+/// version of this function twice over.
 ///
-/// Reads the divergence through D86's by-cell key ([`CherryLog::ops_on_cell`]) and a
-/// `partition_point` over its increasing seqs, rather than scanning the log: the predicate's
-/// first three conjuncts *are* a key and only `seq` is a range, which is the whole finding D86
-/// banked.
+/// **1. Only ops the source branch did NOT record can be the target's divergence.** The first
+/// version filtered on `seq > the picked op's seq` and nothing else, copying `concurrent_op`'s
+/// shape (`runtime.rs:3744`). That shape does not transfer, and the reason is worth stating: what
+/// `concurrent_op` reads is `state.applied`, the log of **published** ops, cut at `fork_seq` — so
+/// everything above its cut genuinely does belong to the target. Cherry-pick's input population is
+/// different, because the source branch's ops must be in the log to be *selectable* at all. The
+/// unfiltered read therefore scooped up the source's own unselected ops and offered them as "what
+/// the target absorbed": with a source that assigned a cell twice and only the first pick taken,
+/// the second (unselected) op equalled ours, `resolve_cell`'s same-value shortcut fired, and the
+/// target's concurrent write was **silently overwritten**. See
+/// `regression_an_unselected_source_op_must_not_excuse_a_target_move`.
 ///
-/// The selected ops are excluded: they are `ours`, not `theirs`, and counting them on both sides
-/// would make every pick of an already-published op look like a conflict with itself.
+/// The seq cut is gone with it, and that fixed a second defect: `seq` is one global counter over a
+/// log that interleaves branches, so the target's write to a cell is not obliged to come *after*
+/// the source's. With the cut in place, truth-table row 2 — two `Add`s that should commute —
+/// refused whenever the target happened to write first, which for cherry-pick is the likely order
+/// (the fix being picked is recent; the branch it lands on has been writing that cell for a
+/// while). See `row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq`.
+///
+/// **2. A composed divergence is trusted only if it EXPLAINS the value the target actually
+/// holds.** Composing every non-source op on the cell can over-count: an op that landed before the
+/// source forked is already folded into the source op's witness, and there is no fork point here
+/// to cut it out with. So the composition is applied to the witness and checked against the
+/// target's current value. If it does not reproduce it, something the log cannot account for
+/// touched this cell, and the answer is the conservative one below rather than a guess wearing a
+/// reading's clothes. See `row27_divergence_that_does_not_explain_the_targets_value_is_not_trusted`.
+///
+/// That check is also what makes the log read *testable*. Rows 3/4/5's fixtures cannot tell a log
+/// read from the fallback — both yield the same `theirs` — so row 2 and the verification test are
+/// the only two places where the difference is observable.
+///
+/// The fallback is an opaque `Assign` of whatever the target holds. Under the default `Reject`
+/// policy that conflicts with everything: `OpKind::commutes_with` (`tel/op.rs:117`) pairs only
+/// Add/Add, Max/Max, Min/Min and the set ops, and answers `false` for every pair involving an
+/// `Assign`. So the fallback always refuses, which is the intended reading of "we cannot establish
+/// what happened here".
 fn divergence(
     log: &dyn CherryLog,
+    from: BranchId,
     tbl: TableId,
     row: RowId,
     col: ColId,
-    after: u64,
-    selected: &BTreeSet<u64>,
     witness: Option<&Value>,
     target_now: &Value,
 ) -> Option<OpKind> {
@@ -991,26 +1144,27 @@ fn divergence(
         return None;
     }
 
-    let at = log.ops_on_cell(tbl, row, col);
-    // D86's range, verbatim: the list is increasing in seq, so the `seq > after` filter is a
-    // binary search and not a scan of the cell's history.
-    let from = at.partition_point(|&s| s <= after);
-    let kinds: Vec<OpKind> = at[from..]
-        .iter()
-        .filter(|s| !selected.contains(s))
-        .filter_map(|&s| log.op_at(s))
-        .map(|o| o.kind.clone())
-        .collect();
-    if !kinds.is_empty() {
-        if let Ok(k) = compose_ops(&kinds) {
-            return Some(k);
+    if let Some(w) = witness {
+        // D86's by-cell key answers "which ops touched this cell" in one lookup. The branch
+        // filter is applied to what it returns, not to a scan of the log.
+        let kinds: Vec<OpKind> = log
+            .ops_on_cell(tbl, row, col)
+            .iter()
+            .filter_map(|&s| log.op_at(s))
+            .filter(|o| o.branch != from)
+            .map(|o| o.kind.clone())
+            .collect();
+        if !kinds.is_empty() {
+            if let Ok(composed) = compose_ops(&kinds) {
+                if let Ok(reached) = apply_op(Some(w), &composed) {
+                    if &reached == target_now {
+                        return Some(composed);
+                    }
+                }
+            }
         }
     }
 
-    // Row 6 lives here too: with no witness we cannot establish that the cell did not move, so we
-    // report an opaque `Assign` of whatever the target holds. Against an `Assign` of a different
-    // value that is a conflict under `Reject`, which is the refusal row 6 promises; against an
-    // `Add` it commutes, which is correct — a delta does not care what it is added to.
     Some(OpKind::Assign(target_now.clone()))
 }
 
@@ -1101,6 +1255,11 @@ impl MemCherryTarget {
 
     pub fn get(&self, tbl: TableId, row: RowId) -> Option<&Vec<Value>> {
         self.rows.get(&(tbl.0, row.0))
+    }
+
+    /// Drop a row, to set up the "a sibling deleted it" case without going through a plan.
+    pub fn remove(&mut self, tbl: TableId, row: RowId) -> Option<Vec<Value>> {
+        self.rows.remove(&(tbl.0, row.0))
     }
 
     pub fn cell(&self, tbl: TableId, row: RowId, col: ColId) -> Option<&Value> {
@@ -1574,6 +1733,50 @@ mod tests {
         assert_eq!(t.commits, 0);
     }
 
+    /// Row 2 is proved for `Add`/`Add`; `Max`/`Max` and `Min`/`Min` are different pairs in
+    /// `commutes_with` and had no test. Named here because the table says row 2 covers "ops that
+    /// commute", not "two Adds".
+    ///
+    /// Each case names a witness the target's op could actually have reached the target's value
+    /// from. That is not decoration: the first draft of this test used a witness of 0 for the
+    /// `Min` case, where `Min(4)` applied to 0 yields 0 and not 4, and [`divergence`]'s
+    /// verification correctly refused to trust a composition that did not explain the value — the
+    /// fixture was inconsistent and the check caught it.
+    #[test]
+    fn row02_max_and_min_divergences_commute_as_well_as_add() {
+        for (witness, ours, theirs, target, expect) in [
+            (int(0), OpKind::Max(int(7)), OpKind::Max(int(5)), int(5), int(7)),
+            (int(0), OpKind::Max(int(3)), OpKind::Max(int(9)), int(9), int(9)),
+            (int(10), OpKind::Min(int(2)), OpKind::Min(int(4)), int(4), int(2)),
+            (int(10), OpKind::Min(int(8)), OpKind::Min(int(3)), int(3), int(3)),
+        ] {
+            let mut log = MemCherryLog::new();
+            let a = log.push(cell_op(ours.clone(), Some(witness.clone())));
+            let mut t_op = cell_op(theirs.clone(), Some(witness.clone()));
+            t_op.branch = dst();
+            log.push(t_op);
+            let mut t = target_with(target.clone());
+            let r = pick(&log, &[a], &mut t, &PolicyTable::new());
+            assert!(r.is_applied(), "{:?} vs {:?} must commute, got {:?}", ours, theirs, r);
+            assert_eq!(t.cell(T, R, C), Some(&expect), "{:?} vs {:?}", ours, theirs);
+        }
+    }
+
+    /// Row 8's wording is about "the target row", but the same check exists against the image a
+    /// `RowCreate` in this selection produces, and that arm had no test.
+    #[test]
+    fn row08_a_column_past_the_end_of_a_created_row_image_also_refuses() {
+        let mut log = MemCherryLog::new();
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2)]), None, None));
+        let edit = log.push(op(OpKind::Assign(int(9)), Some(ColId(5)), None));
+        let mut t = MemCherryTarget::new();
+        let r = pick(&log, &[create, edit], &mut t, &PolicyTable::new());
+        let refusal = r.refusal().expect("expected REFUSE");
+        assert!(refusal.has(CherryConflictKind::ColumnAbsent), "{:?}", refusal);
+        assert_eq!(t.get(T, R), None, "the create must not have landed either");
+        assert_eq!(t.commits, 0);
+    }
+
     // -- Row 21: atomicity ---------------------------------------------------------------------
 
     /// **The atomicity proof.** A selection whose *first* op applies cleanly and whose *second*
@@ -1703,6 +1906,158 @@ mod tests {
         );
     }
 
+    // -- Rows 22-27, and the two divergence defects a fresh-context review found ---------------
+    //
+    // Every test in this block was written to FAIL against the version of this module that was
+    // committed before it, and every one of them did. They are the specification of the fixes.
+
+    /// **The original defect, end to end.** Source assigns the same cell twice and only the first
+    /// is picked; the target concurrently assigned something else. Under the version that had both
+    /// a `seq` cut and no branch filter, the unselected SOURCE op was the only thing above the cut,
+    /// it equalled ours, `resolve_cell`'s same-value shortcut fired, and the target's write was
+    /// silently overwritten.
+    ///
+    /// ⚠ **This case needs BOTH faults, so it does not isolate either guard** — removing just the
+    /// branch filter, or just the verification, still leaves it refusing. It is here as the
+    /// regression test for the defect as it actually occurred. The guards are each covered
+    /// separately, and a mutation sweep confirmed it: removing the branch filter fails
+    /// `row02_target_moved_but_ops_commute_applies_composed_onto_target`,
+    /// `row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq` and
+    /// `row02_max_and_min_divergences_commute_as_well_as_add`; removing the verification fails
+    /// `row27_divergence_that_does_not_explain_the_targets_value_is_not_trusted`.
+    #[test]
+    fn regression_an_unselected_source_op_must_not_excuse_a_target_move() {
+        let mut log = MemCherryLog::new();
+        let mut theirs = cell_op(OpKind::Assign(int(5)), Some(int(0)));
+        theirs.branch = dst();
+        log.push(theirs); // seq 1: the TARGET's concurrent write
+        let picked = log.push(cell_op(OpKind::Assign(int(7)), Some(int(0)))); // seq 2: ours
+        log.push(cell_op(OpKind::Assign(int(7)), Some(int(7)))); // seq 3: source's own, NOT picked
+
+        let mut t = target_with(int(5)); // the target carries ITS write
+        let r = pick(&log, &[picked], &mut t, &PolicyTable::new());
+        let refusal = r.refusal().expect(
+            "the target moved contradictorily under us; an unselected SOURCE op is not the \
+             target's divergence and must not excuse the conflict",
+        );
+        assert!(refusal.has(CherryConflictKind::TargetCellMoved), "{:?}", refusal);
+        assert_eq!(t.cell(T, R, C), Some(&int(5)), "the target's write must not be lost");
+    }
+
+    /// Truth-table row 2 must not depend on which branch happened to write first. This is
+    /// `row02_target_moved_but_ops_commute...` with the two pushes swapped, so the target's op has
+    /// the LOWER seq — the order a cherry-pick actually meets, since the fix being picked is recent
+    /// and the branch it lands on has been writing that cell for a while.
+    #[test]
+    fn row02_commuting_divergence_is_found_when_the_targets_op_has_the_lower_seq() {
+        let mut log = MemCherryLog::new();
+        let mut theirs = cell_op(OpKind::Add(Delta::Int(-5)), Some(int(20)));
+        theirs.branch = dst();
+        log.push(theirs); // seq 1 — the target wrote FIRST
+        let ours = log.push(cell_op(OpKind::Add(Delta::Int(-3)), Some(int(20)))); // seq 2
+
+        let mut t = target_with(int(15));
+        let r = pick(&log, &[ours], &mut t, &PolicyTable::new());
+        assert!(r.is_applied(), "expected APPLY (row 2), got {:?}", r);
+        assert_eq!(t.cell(T, R, C), Some(&int(12)), "20 - 5 - 3");
+    }
+
+    /// Row 25. Only the LAST whole-row op was examined, so a `RowCreate` earlier in the selection
+    /// was never checked against the target and row 10's `RowExists` refusal was bypassed.
+    #[test]
+    fn row25_a_create_then_delete_selection_still_checks_the_create() {
+        let mut log = MemCherryLog::new();
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2), int(3)]), None, None));
+        let del = log.push(op(OpKind::RowDelete, None, None));
+        let mut t = target_with(int(5)); // the target ALREADY HAS the row
+        let before = t.snapshot();
+        let r = pick(&log, &[create, del], &mut t, &PolicyTable::new());
+        let refusal = r
+            .refusal()
+            .expect("the RowCreate contradicts a target that already has the row");
+        assert!(refusal.has(CherryConflictKind::RowExists), "{:?}", refusal);
+        assert_eq!(t.snapshot(), before, "the row must not have been deleted");
+    }
+
+    /// Row 24. Delete-then-create onto a target that has the row is legitimate: the row
+    /// ends existing with the created image.
+    #[test]
+    fn row24_a_delete_then_create_selection_replaces_the_row() {
+        let mut log = MemCherryLog::new();
+        let del = log.push(op(OpKind::RowDelete, None, None));
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2), int(3)]), None, None));
+        let mut t = target_with(int(5));
+        let r = pick(&log, &[del, create], &mut t, &PolicyTable::new());
+        assert!(r.is_applied(), "expected APPLY, got {:?}", r);
+        assert_eq!(t.get(T, R), Some(&vec![int(1), int(2), int(3)]));
+    }
+
+    /// Row 22. `apply_op` has no arm for the set ops, so they reached the caller as an engine
+    /// `Err`. The contract says `Err` is for impossible internal state and everything a caller
+    /// can express comes back as a refusal.
+    #[test]
+    fn row22_a_set_op_on_a_cell_refuses_rather_than_erroring() {
+        use crate::tel::ids::Dot;
+        let mut log = MemCherryLog::new();
+        let s = log.push(cell_op(
+            OpKind::SetInsert { elem: int(1), dot: Dot { branch: src(), seq: 1 } },
+            Some(int(0)),
+        ));
+        let mut t = target_with(int(0));
+        let r = cherry_pick(&log, src(), &[OpSelector::new(s)], dst(), &mut t, &PolicyTable::new())
+            .expect("a set op is something a caller can express; it must not be an engine Err");
+        assert!(r.refusal().is_some(), "expected REFUSE, got {:?}", r);
+        assert_eq!(t.commits, 0);
+    }
+
+    /// Row 23. An op recorded with no column but a cell-shaped kind is malformed
+    /// input, not an impossible internal state.
+    #[test]
+    fn row23_a_whole_row_op_with_a_cell_kind_refuses_rather_than_erroring() {
+        let mut log = MemCherryLog::new();
+        let s = log.push(op(OpKind::Assign(int(1)), None, None));
+        let mut t = target_with(int(0));
+        let r = cherry_pick(&log, src(), &[OpSelector::new(s)], dst(), &mut t, &PolicyTable::new())
+            .expect("malformed input must refuse, not error");
+        assert!(r.refusal().is_some(), "expected REFUSE, got {:?}", r);
+        assert_eq!(t.commits, 0);
+    }
+
+    /// Row 27, the divergence verification. When the log's non-source ops do NOT explain the value
+    /// the target actually holds, the engine must not trust them: it falls back to an opaque
+    /// `Assign`, which conflicts. Without this the composed `theirs` is a guess dressed as a
+    /// reading, and rows 3/4/5's fixtures cannot tell the two apart.
+    #[test]
+    fn row27_divergence_that_does_not_explain_the_targets_value_is_not_trusted() {
+        let mut log = MemCherryLog::new();
+        let ours = log.push(cell_op(OpKind::Add(Delta::Int(1)), Some(int(0))));
+        let mut theirs = cell_op(OpKind::Add(Delta::Int(10)), Some(int(0)));
+        theirs.branch = dst();
+        log.push(theirs);
+        // The log says the target should hold 10. It holds 99 — something the log cannot account
+        // for touched this cell.
+        let mut t = target_with(int(99));
+        let r = pick(&log, &[ours], &mut t, &PolicyTable::new());
+        let refusal = r
+            .refusal()
+            .expect("an unexplained target value must not be composed with as if understood");
+        assert!(refusal.has(CherryConflictKind::TargetCellMoved), "{:?}", refusal);
+        assert_eq!(t.cell(T, R, C), Some(&int(99)));
+    }
+
+    /// Cell ops **before** a `RowDelete` in the same selection are subsumed by it, and the row
+    /// still leaves. The companion of row 17, which covers the other order.
+    #[test]
+    fn row26_a_cell_op_before_a_delete_in_the_same_pick_is_subsumed() {
+        let mut log = MemCherryLog::new();
+        let edit = log.push(cell_op(OpKind::Assign(int(1)), Some(int(0))));
+        let del = log.push(op(OpKind::RowDelete, None, None));
+        let mut t = target_with(int(0));
+        let r = pick(&log, &[edit, del], &mut t, &PolicyTable::new());
+        assert!(r.is_applied(), "expected APPLY, got {:?}", r);
+        assert_eq!(t.get(T, R), None, "the row leaves; the cell write is subsumed");
+    }
+
     // -- Reuse of the REVERT machinery ---------------------------------------------------------
 
     /// A landed pick is undone through [`invert`] — the same primitive `undo_txn` calls — and the
@@ -1748,6 +2103,25 @@ mod tests {
         assert!(t2.get(T, R).is_none());
         t2.commit_all(&applied2.plan.inverse().unwrap().writes).unwrap();
         assert_eq!(t2.snapshot(), before2, "the row must come back with its image");
+    }
+
+    /// A `RowCreate` that REPLACED an existing row inverts back to that row's prior image, not to
+    /// a delete. Without `CherryWrite::InsertRow::replaced` the undo of row 24 would destroy a row
+    /// the target owned before the pick.
+    #[test]
+    fn the_inverse_of_a_replacing_create_restores_the_prior_image() {
+        let mut log = MemCherryLog::new();
+        let del = log.push(op(OpKind::RowDelete, None, None));
+        let create = log.push(op(OpKind::RowCreate(vec![int(1), int(2), int(3)]), None, None));
+        let mut t = target_with(int(5));
+        let before = t.snapshot();
+        let applied = pick(&log, &[del, create], &mut t, &PolicyTable::new())
+            .applied()
+            .expect("expected APPLY")
+            .clone();
+        assert_eq!(t.get(T, R), Some(&vec![int(1), int(2), int(3)]));
+        t.commit_all(&applied.plan.inverse().unwrap().writes).unwrap();
+        assert_eq!(t.snapshot(), before, "the row the target owned must come back, not vanish");
     }
 
     /// `invert` refuses an `Assign` with no witness rather than guessing, and that refusal must

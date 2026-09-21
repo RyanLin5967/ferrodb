@@ -1,0 +1,87 @@
+D89 — Merkle content addressing (src/cow/cid.rs): the partition measurement, before and after
+content-defined chunking landed.
+
+Banked because the "before" half is no longer reproducible from HEAD. The tree that produced it
+was replaced by cow::chunker; reproducing those numbers now requires checking out 36011fc.
+
+Instrument: cargo test --lib cow::cid -- --nocapture
+Fixture:    1000 pairs, key = u32 big-endian, value = "v{n}", inserted ascending vs. a fixed
+            LCG Fisher-Yates shuffle (seed 0x5eed1234). Same rows both sides, byte for byte —
+            leaf_content_cid is the control and is equal in every run below.
+
+
+=== BEFORE: commit 36011fc, byte-balanced split (src/cow/node.rs split_point) ===
+
+    ascending insert : 9 leaves, partition cid c861c8777435729cecf24521cabccff5
+    shuffled  insert : 8 leaves, partition cid d78571b3cea10cbb938cf0dd025d26bf
+    content cid (both): 41cfb97ddfba11f00c343ec1bb232fe4
+    leaves with an equal cid on both sides: 0 of 9 / 8
+
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 1365 filtered out; finished in 0.23s
+
+Reading: two trees holding identical rows shared ZERO leaves. A leaf boundary was a function of
+when a page happened to fill, so a content-derived id could not match across two lineages and the
+O(1) subtree skip bought nothing. The #[ignore]d test asserting convergence failed here, by design.
+
+
+=== AFTER: commit c1da717, content-defined boundaries (src/cow/chunker.rs) ===
+
+    ascending insert : 45 leaves, partition cid 7d676293965afa0635bd8e2e3189351a
+    shuffled  insert : 45 leaves, partition cid 7d676293965afa0635bd8e2e3189351a
+    content cid (both): 41cfb97ddfba11f00c343ec1bb232fe4
+    leaves with an equal cid on both sides: 45 of 45 / 45
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 1483 filtered out; finished in 3.36s
+
+Reading: total convergence. The content cid is unchanged across both commits (41cfb97d...), which
+is the control confirming the row set never differed — so the whole change is in the partition.
+Leaf count rose 9 -> 45 because CHUNK_SHIFT=3 spends fanout to buy the property (~15 rows/leaf
+against ~68 before); that trade is argued on cow::chunker::CHUNK_SHIFT.
+
+The obsolete assertion was not hunted down. It carried a guard that fired on its own obsolescence
+("the partitioning is more content-determined than this test assumes and the gap needs restating"),
+so the fix landing turned the suite red and named the reason.
+
+
+=== STILL OPEN: the delete path, same instrument, at c1da717 ===
+
+    clean   25 leaves,  0 empty, partition cid e8051f36dbe91c9d7a1289f9275573a1
+    churned 45 leaves, 20 empty, partition cid 371db26401024a1b95371c569e0b4ffa
+
+500 rows reached two ways — inserted directly, versus inserting 1000 and deleting half. Identical
+rows (content cid equal). The 25 LIVE leaves are identical byte for byte, so content-defined
+chunking is exact here; the entire difference is 20 emptied leaves that CowTree::delete left
+linked. Churned leaf sizes:
+
+    [14,29,8,4,55,24,21,15,14,14,3,42,21,53,28,2,11,27,36,36,19,3,11,1,9,
+     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+
+cow::chunker's header names overwrite and delete together as the paths that can erase a boundary.
+Measured, that is narrower on both halves:
+
+  - overwrite does NOT break convergence. 1000 rows in two insert orders, then 143 values
+    overwritten in two different orders: partition_eq=true, 55/55 leaves shared, in all three
+    combinations (insert order differs / overwrite order differs / both).
+  - delete does, but not via the boundary rule. The fix is unlinking an emptied leaf in
+    cow::btree, not a neighbour merge.
+
+Pinned by cow::cid::tests::a_delete_leaves_empty_leaves_behind_and_breaks_the_partition, with
+a_delete_must_not_change_the_partition_of_the_surviving_rows #[ignore]d as the acceptance
+criterion, written before the work.
+
+
+=== Adversarial pass ===
+
+Branch D89-falsify, commit 3c2a132, attacked the BEFORE measurement in a fresh context
+(examples/d89_falsify.rs, d89_falsify2.rs; raw output in bench/d89_falsify_raw/). It confirmed the
+instrument — no PageId/epoch/arena leak under 6 physical conditions, the control fires when the
+data really differs, the shared-leaf statistic equals a true LCS in all 1016 sweep rows — and
+falsified the doc comment's GENERALISATION, which claimed convergent lineages never share subtrees.
+At 990-byte values or near-sorted orders, sharing already survived pre-chunker. That over-broad
+sentence is gone; the module now states its reach as a measured boundary rather than a slogan.
+
+It also showed leaf_partition_cid is blind to tree height and separator keys: two well-formed trees
+over the same leaves, one height 2 and one height 3, answering get() identically on all 312 keys,
+share a partition cid (c43e68de...) while their subtree_cids differ (903bcc9b... vs ecc07373...).
+By construction, and now documented on leaf_partition_cid — compare trees for sameness with
+subtree_cid, not with the partition cid.

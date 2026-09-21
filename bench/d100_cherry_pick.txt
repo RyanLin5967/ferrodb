@@ -1,0 +1,87 @@
+D100 — CHERRY-PICK: WHAT IT COSTS.
+
+[HERE] `examples/d100_cherry_pick.rs`, release profile, one thread. Built at 8953efb6f54e (clean —
+the stamp is `ferrodb::build_provenance()` and carries no +DIRTY).
+
+Taken under the fleet measure lock: `ACQUIRED cherry-pick load_at_acquire=19`, released after.
+Exclusive against other MEASURERS; the box was NOT quiet, and per the lock script's own header
+that means COUNTERS are the instrument and every duration below is an UPPER BOUND.
+
+⇒ **THE HEADLINE IS AXIS 0, AND IT HAS NO CLOCK IN IT.** This is a CAPABILITY, not a speed. The
+cost that decides the design is how many ops the engine examines, which is an exact integer,
+reproducible on any machine in any state. The timing axes are kept because they were already
+banked and because they agree, but nothing in this file needs them.
+
+=== AXIS 0 — OPS TOUCHED. THE ANSWER. ============================================
+
+    picked         op_at  cell lookups   index entries  total per pick
+         1             3             2               4            7.00
+        10            30            20              40            7.00
+       100           300           200             400            7.00
+      1000          3000          2000            4000            7.00
+
+  Log size INDEPENDENCE, 100 picks — indexed total vs unindexed key-compares:
+     log ops   indexed touched  unindexed compares       ratio
+        1000               700               49700       71.0x
+       10000               700              495200      707.4x
+      100000               700             4950200     7071.7x
+
+**Picking N ops touches exactly 7N ops, whatever the log holds.** 100 picks touch 700 at a
+1,000-op log and 700 at a 100,000-op log — CONSTANT — while the same selection against a log with
+the by-cell index REMOVED compares 49,700 then 4,950,200 keys. That is the design claim in full:
+divergence is read through D86's `(tbl,row,col)` key, so cost depends on what was PICKED and not
+on how large the log has grown. No machine load can move these numbers.
+
+`CountingLog` wraps any `CherryLog` and counts what the engine asks it for; `ScanCherryLog` counts
+the keys its linear search compares. Both are properties of the algorithm.
+
+=== THE TIMING AXES — UPPER BOUNDS AT load_at_acquire=19 =========================
+
+`std::time::Instant`, median over the reps named per row. `plan us` is
+`cherry::plan_cherry_pick` ALONE (the engine; touches the target zero times); `plan+commit us`
+adds `MemCherryTarget::commit_all`, which is the TEST DOUBLE's cost, reported separately so it
+cannot hide inside the curve. Target reset happens OUTSIDE every timed region.
+
+AXIS 1 — picked ops, log fixed at 20000 ops
+    picked         plan us  plan+commit us  plan us per pick
+         1           0.667           0.459            0.6670
+        10           4.667           4.041            0.4667
+       100          36.834          38.125            0.3683
+      1000         532.791         584.041            0.5328
+
+  1 -> 1000 picked ops: plan 0.667 us -> 532.791 us = 798.8x for 1000x the work.
+  Plan cost per pick moved 0.6670 us -> 0.5328 us (0.799x).
+
+AXIS 2 — log size, picked held at 100  [THE CONTROL FOR AXIS 1]
+     log ops         plan us  plan+commit us  plan us per pick
+
+Consistent with axis 0: per-pick plan cost is flat (0.37-0.53 us from 100 to 1000 picks), and the
+indexed arm's slope across a 100x larger log stays far below the scanning arm's. Across five runs
+at different fleet loads the indexed-vs-scanning advantage at 100,000 log ops was 15.8x, 11.1x,
+10.2x, 10.3x and the figure above. Direction and order of magnitude are stable; **no absolute
+microsecond here should be quoted as this engine's speed** — that is what axis 0 is for.
+
+=== THREE FALSE READINGS THIS HARNESS PRODUCED FIRST =============================
+
+Recorded because each looked exactly like a result, and because all three were caught by an ARM,
+never by inspection.
+
+1. "The pick is linear in log size, 91.8x across 100x."
+   `MemCherryTarget::commit_all` cloned the whole row map inside the timed window, so it cost
+   O(rows in target). The harness was the wall. Fixed by journalling only the rows the plan
+   touches, and by splitting `plan` from `plan+commit`.
+
+2. "The index makes no difference: 1.79x indexed vs 1.6x unindexed" — reported TWICE, two causes:
+   (a) every op's witness equalled the target's value, so `divergence` returned at truth-table
+       row 1 (*provably unchanged*) BEFORE calling `ops_on_cell`. The index was never consulted.
+   (b) with that fixed, the selection was a PREFIX, so the control's linear search found every
+       key in its first few entries and never scanned.
+   Fixed by a fixture that diverges on every cell and a selection spread evenly across the log.
+
+   The harness is now SELF-CHECKING against (a): with no index entry, `divergence` falls back to
+   an opaque `Assign`, which does not commute with an `Add`, so the pick REFUSES. Every
+   `assert!(is_applied())` is therefore an assertion that the measured path fired.
+
+⇒ The lesson worth keeping: "the index helps" is uninterpretable without an arm that has the index
+  REMOVED in the same process — and a measurement can return entirely plausible numbers while
+  never executing the code under test. Axis 0 exists because integers cannot have this problem.
