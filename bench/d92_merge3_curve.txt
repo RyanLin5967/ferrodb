@@ -16,6 +16,14 @@ THE RESULT IN ONE LINE
 At N = 256,000 the merge read 36 pages of a 16,250-page tree (0.22%) in the contested workload and
 21 (0.13%) in the separated one. `nodes_read / depth` is flat.
 
+REPRODUCIBILITY
+
+Every count below came out IDENTICAL on three independent runs of this harness, built from three
+different commits of this branch (6ac68d8, 9fef21c, 8164089), on a box whose load average moved
+between 24 and 45 across them. The only line that differed between runs is MerkleId's own cost,
+because that implementation changed. Operation counts do this; wall clocks do not, which is why
+there is not a single timing in this file.
+
 HOW TO FALSIFY IT
 
 Read the `pages` and `nodes_read` columns. If the merge were O(N) they would grow by the same
@@ -28,8 +36,8 @@ WHAT THE INSTRUMENT IS
   nodes_read           page reads the descent issued, DEDUPLICATED WITHIN EACH NODE TRIPLE AND
                        NOT GLOBALLY. Within the triple, because over most of a merge `base` and
                        `ours` are literally the same page id and counting that page twice would
-                       inflate this file's own y-axis by half. Not globally, because a node reached
-                       from two bands is two real reads.
+                       inflate this file's own y-axis by half. Not globally, because a node
+                       reached from two bands is two real reads.
   ids_compared         identity comparisons. Free for ShadowId (it IS the page id), so this is CPU
                        and not I/O. Reported separately and never folded into nodes_read.
   skip_sides_agree     subtrees retired by `ours == theirs` (subsumes all-three-equal).
@@ -50,7 +58,7 @@ RAW HARNESS OUTPUT — examples/d92_merge3_curve.rs, verbatim
 ============================================================
 
 ferrodb D92 — structural three-way merge, cost curve
-build provenance: at 6ac68d801911
+build provenance: at 8164089b7e23
 instrument: MergeStats operation counts (pages read, identity comparisons). No wall clock.
 workload: N rows of 100-byte values, two forks, 4 disjoint keys changed per side.
 identity: ShadowId (the page id) — exact for COW-descended trees and free to compute.
@@ -119,9 +127,14 @@ identity comparison — both sides make the SAME edit (truth-table row 4):
   ShadowId:  nodes_read =    9, ids_compared =   246, root fast path = None
   MerkleId:  nodes_read =    0, ids_compared =     3, root fast path = Some(SidesAgree)
   MerkleId's own cost, reported separately and NOT folded into nodes_read above:
-    pages hashed to compute the three root ids cold = 1022
+    3 subtree walks (one per root, all memo misses) over a 1016-page tree
+      = about 3048 page reads. NOT 3 -- a walk is O(the whole subtree).
+    cow::cid::subtree_cid has no memo INSIDE the walk (it says so in its own doc), so
+    the three roots share almost every page and re-read all of it. A memo inside the
+    recursion would cost about 1016 reads instead of 3048; that is the price of
+    having ONE content identity in the codebase rather than two that disagree.
   Content identity retires a convergent edit at the root that page identity cannot
-  see; it pays for that by reading the tree once. That is the trade, stated both ways.
+  see; it pays for that by reading the tree three times. Both halves stated.
 
 WHAT THIS REPLACES, AND WHAT IT DOES NOT
 
@@ -162,3 +175,17 @@ Every count above is arithmetically checkable by hand, which is the point of an 
 Worked example, contested arm at N = 1,000 (depth 2): the root triple reads 3 distinct pages; four
 leaf triples read 3 each; 3 + 12 = 15, which is what `nodes_read` says. At depth 4 the same
 accounting gives the mid-level reads, minus the nodes the four paths share on the way down.
+
+ONE CONTENT IDENTITY, AND WHAT IT COST
+
+`MerkleId` used to carry a private 128-bit mixer inside `merge3.rs`. D89 landed `src/cow/cid.rs`
+with `Cid = [u8; 16]` and `subtree_cid(tree, page)` answering the same question, so the tree held
+two 16-byte content identities that disagreed byte for byte. The mixer is deleted and `MerkleId`
+now calls `subtree_cid`; `merkle_id_returns_exactly_what_cid_subtree_cid_returns` checks that over
+every page of a 300-key tree, and checks that a second pass costs zero additional walks.
+
+That cost 3x, and the identity section above prints it rather than burying it: `subtree_cid` has no
+memo INSIDE its recursion, so the three roots re-read almost the same pages — about 3,048 reads over
+a 1,016-page tree, where the deleted mixer's per-page memo touched 1,022. The trade was taken on
+purpose. Two content identities that disagree will be compared eventually and that failure is
+silent; 3x on a path this curve does not even use is not.
