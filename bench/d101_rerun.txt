@@ -21,3 +21,22 @@ delta (rows written per branch) = 4
            merge latency: first 2 = 59.970 ms, last 2 = 154.858 ms  -> 2.58x drift
            CONTROL writes: first 2 = 30.356 ms, last 2 = 36.569 ms  -> 1.20x drift (this one must stay ~1.0 or the machine moved)
     1000   25    100.093 |   12.508     36.445    48.008 |         1.12        946.9
+           merge latency: first 2 = 46.448 ms, last 2 = 24.656 ms  -> 0.53x drift
+           CONTROL writes: first 2 = 35.172 ms, last 2 = 36.111 ms  -> 1.03x drift (this one must stay ~1.0 or the machine moved)
+    2000   25     78.882 |   10.222     29.463    38.718 |         1.00       1053.0
+         ^ 2.0x rows -> 0.79x TOTAL, 0.81x MERGE
+           merge latency: first 2 = 66.639 ms, last 2 = 94.211 ms  -> 1.41x drift
+           CONTROL writes: first 2 = 125.678 ms, last 2 = 107.944 ms  -> 0.86x drift (this one must stay ~1.0 or the machine moved)
+    4000   25    194.977 |   16.362     70.643    87.852 |         1.00       1053.0
+         ^ 4.0x rows -> 1.95x TOTAL, 1.83x MERGE
+# rc=137  elapsed=278s
+# load after: 16.15 20.89 22.77
+
+#### D71 arm=PLAIN — ordinary UPDATE (banked: bench/d71_point_update_curve.txt)
+# load before: 16.15 20.89 22.77
+# cmd: /Users/idide/wt/ferrodb-D101-stub-runtime-guard/target/release/examples/d71_point_update_curve
+D71 — point UPDATE on the primary key: descent or scan?
+at fc443c437027
+arm = PLAIN, 60 updates per size
+
+  table rows   median ms   ms per 1000 rows   fsyncs/update
