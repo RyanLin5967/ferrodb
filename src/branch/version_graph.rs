@@ -131,6 +131,11 @@ pub enum AncestryError {
     Unknown(BranchId),
     /// `insert_child`/`insert_root` was given a branch the index already holds.
     Duplicate(BranchId),
+    /// A fork was recorded against a parent the index has been told is reaped. Refused rather
+    /// than accepted, because the result would be a LIVE branch whose lineage runs through a
+    /// dead one — and the index would then be asserting a fork that the engine's own fork path
+    /// (`check_readable`) would have refused.
+    ParentReaped { child: BranchId, parent: BranchId },
     /// A depth was requested that is below the root or deeper than the branch itself.
     DepthOutOfRange { branch: BranchId, depth: u32, node_depth: u32 },
 }
@@ -144,6 +149,12 @@ impl std::fmt::Display for AncestryError {
             AncestryError::Duplicate(b) => {
                 write!(f, "branch {} is already in the version graph", b)
             }
+            AncestryError::ParentReaped { child, parent } => write!(
+                f,
+                "cannot fork {} from {}: the parent has been reaped, so the child's lineage \
+                 would run through a dead branch",
+                child, parent
+            ),
             AncestryError::DepthOutOfRange { branch, depth, node_depth } => write!(
                 f,
                 "depth {} is not an ancestor level of branch {} (which is at depth {})",
@@ -242,6 +253,16 @@ impl VersionGraph {
             return Err(AncestryError::Duplicate(child));
         }
         let pslot = self.slot(parent)?;
+
+        // A reaped parent is refused, not accepted. This is the one caller/index disagreement
+        // the module was silently tolerating (review-branch, F9): the engine's fork path already
+        // refuses a reaped branch via `check_readable`, so an index that accepts one is recording
+        // a fork the database would never have performed, and the result is a LIVE node whose
+        // lineage runs through a dead one. Tombstones are for ancestors that already have
+        // descendants, never for new ones.
+        if self.node(pslot).tombstone {
+            return Err(AncestryError::ParentReaped { child, parent });
+        }
 
         // jump[0] = parent; jump[k] = the 2^(k-1)-th ancestor of the 2^(k-1)-th ancestor.
         // The table stops as soon as the parent's table runs out, which is exactly when the
@@ -685,6 +706,24 @@ mod tests {
         // The root survived every reuse with its own identity intact.
         assert_eq!(g.depth(b(0)).unwrap(), 0);
         assert_eq!(g.parent(b(0)).unwrap(), None);
+
+        // **THE ASSERTION THIS TEST IS NAMED FOR.** Everything above observes `index`, which
+        // drains back to one node every round whether or not a freed slot is ever popped — so
+        // the whole test passed with `free.pop()` replaced by `None`, verified by mutation. The
+        // slot arena is the only thing that sees reuse, and if it is not reused this Vec grows
+        // for the life of the process under exactly the continuous fork/reap churn this module
+        // exists to serve: 101 slots for 3 live nodes after 50 rounds, measured.
+        //
+        // Found by a fresh-context review (review-branch, F1), which is the failure mode this
+        // repository keeps re-learning: a detector fails silently in the direction that looks
+        // like success.
+        assert!(
+            g.nodes.len() <= 3,
+            "slot arena grew to {} across 50 fork/reap rounds holding at most 3 live nodes: \
+             the free list is not being reused",
+            g.nodes.len()
+        );
+        assert_eq!(g.free.len(), g.nodes.len() - 1, "every slot but the root's should be free");
     }
 
     /// The same id slot at a new generation is a DIFFERENT branch — which is the entire reason
@@ -857,6 +896,46 @@ mod tests {
         assert!(matches!(g.is_ancestor(b(1), b(99)), Err(AncestryError::Unknown(_))));
         assert!(matches!(g.lca(b(99), b(1)), Err(AncestryError::Unknown(_))));
         assert!(matches!(g.depth(b(99)), Err(AncestryError::Unknown(_))));
+    }
+
+    /// The module header calls `remove_slot`'s assert the thing that makes free-list reuse safe,
+    /// and says it "refuses rather than warns". Until this test there was no `should_panic`
+    /// anywhere in the file, so the guard had never once been observed firing (review-branch,
+    /// F8) — a guard nobody has seen fire is a comment.
+    ///
+    /// Reached by calling `remove_slot` directly, because every path that reaches it through
+    /// `reap` has already established `children == 0`. That is the point: the assert exists for
+    /// a future caller that forgets, not for the one that exists today.
+    #[test]
+    #[should_panic(expected = "still has 1 children")]
+    fn freeing_a_slot_with_a_descendant_is_refused() {
+        let mut g = graph(b(0), &[(b(1), b(0)), (b(2), b(1))]);
+        let slot = g.slot(b(1)).unwrap();
+        // b(1) has b(2) under it; a jump pointer aimed at b(1) would survive into a reused slot.
+        g.remove_slot(slot);
+    }
+
+    /// Forking from a reaped parent is refused, not silently recorded (review-branch, F9).
+    #[test]
+    fn forking_from_a_reaped_parent_is_refused() {
+        let mut g = graph(b(0), &[(b(1), b(0)), (b(2), b(1))]);
+
+        // b(1) is tombstoned but retained, because b(2) still hangs off it.
+        g.reap(b(1)).unwrap();
+        assert!(g.is_tombstoned(b(1)).unwrap());
+
+        assert!(
+            matches!(
+                g.insert_child(b(9), b(1)),
+                Err(AncestryError::ParentReaped { .. })
+            ),
+            "a live child must not be attachable to a dead parent"
+        );
+        // Refusing means refusing: nothing was half-recorded.
+        assert!(matches!(g.depth(b(9)), Err(AncestryError::Unknown(_))));
+        assert_eq!(g.len(), 3);
+        // And the existing descendant is untouched by the refusal.
+        assert!(g.is_ancestor(b(1), b(2)).unwrap());
     }
 
     #[test]
