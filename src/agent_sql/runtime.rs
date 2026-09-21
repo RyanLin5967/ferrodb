@@ -47,7 +47,7 @@ use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRo
 use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
-use crate::branch::record::{BranchRecord, CapabilityEnvelope, RowImage};
+use crate::branch::record::{CapabilityEnvelope, RowImage};
 use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
 use crate::branch::version_graph::{AncestryError, VersionGraph};
 use crate::cow::diff::{diff as cow_diff, Change as CowChange, PageIdentity};
@@ -3404,8 +3404,8 @@ impl AgentRuntime {
             .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
             .map(|o| o.kind.clone())
             .collect();
-        if let Some(k) = compose_ops(&ops) {
-            return Some(k);
+        if !ops.is_empty() {
+            return compose_ops(&ops).ok();
         }
         // The target moved the cell without an op recorded against it — a whole-row write, for
         // instance. The move is still real, so it is reported as the assignment it amounts to
