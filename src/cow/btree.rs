@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::branch::types::{BranchId, Epoch, PageId};
+use crate::cow::chunker;
 use crate::cow::node::{self, Node, NodeMut};
 use crate::cow::page_header::{stamp_checksum, PageHeader, PageType};
 use crate::cow::{PageHandle, PageStore, WriteBuffer, WriteBufferEntry};
@@ -52,12 +53,39 @@ pub struct TreeDiff {
 }
 
 
-/// A separator key promoted from a split, together with the page it separates off.
-type Split = Option<(Vec<u8>, PageId)>;
+/// Separator keys promoted from a split, each with the page it separates off, in key order.
+///
+/// A vector rather than an `Option` because a content-defined split is k-way: re-chunking a leaf
+/// can cut it at a content boundary *and* again at the byte cap, so more than one separator can
+/// travel up from a single insert. Empty means nothing split.
+type Split = Vec<(Vec<u8>, PageId)>;
 
 /// The internal nodes walked on the way to a leaf, each with the child slot taken. `None` in the
 /// slot means the leftmost child, which has no slot of its own.
 type DescentPath = Vec<(PageId, Option<usize>)>;
+
+/// The smallest key strictly greater than `key`: `key` with a zero byte appended.
+///
+/// # Why a leaf split does not promote the right piece's first key
+///
+/// The textbook separator is the first key of the right child, and with a content-defined
+/// partition that is the wrong boundary. A chunk ends **at** its boundary entry, so the next
+/// chunk owns every key after it — including the keys between the boundary and whatever the
+/// right piece happens to hold right now. Promoting the right piece's first key gives that gap
+/// to the *left* leaf, and a key arriving in it re-descends into a leaf that is already
+/// terminated by a boundary, which splits off another one-entry leaf, which moves the gap, which
+/// does it again. Measured before this line existed: 43 leaves from a shuffled build against 23
+/// from the ascending one, strung with runs of `1, 1, 1, 1`.
+///
+/// Appending a zero byte names the key-space boundary itself rather than a row that sits near
+/// it: every `k > key` satisfies `k >= successor_of(key)`, and `key` itself does not, so the cut
+/// in the parent falls exactly where the chunker put it.
+fn successor_of(key: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(key.len() + 1);
+    s.extend_from_slice(key);
+    s.push(0);
+    s
+}
 
 pub struct CowTree {
     store: Arc<dyn PageStore>,
@@ -297,7 +325,7 @@ impl CowTree {
             stamp_checksum(&mut f.data);
         }
         drop(cp);
-        self.relink_up(root, path, leaf_id, new_leaf, None, branch, epoch)
+        self.relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch)
     }
 
     /// Apply a whole [`WriteBuffer`] and return the new root.
@@ -370,7 +398,29 @@ impl CowTree {
         Err(FerroError::Cow("btree descent exceeded the depth guard".into()))
     }
 
-    /// Write one entry into an already-shadowed leaf, splitting it if it will not fit.
+    /// Write one entry into an already-shadowed leaf, re-chunking it if the content says so.
+    ///
+    /// # Why a leaf can split when it is nowhere near full
+    ///
+    /// A B+tree splits on overflow, which makes every leaf boundary a fact about *when* the page
+    /// filled. This one splits where [`chunker::is_boundary`] says a chunk ends, which makes the
+    /// boundary a fact about the bytes — the structural invariance a prolly tree has and a
+    /// textbook B+tree does not (see `cow::chunker` for what that property buys here). Overflow
+    /// is still handled, but as the escape hatch that keeps a page from bursting rather than as
+    /// the thing that decides where leaves end.
+    ///
+    /// # Why an insert can never need more than a local re-chunk
+    ///
+    /// The boundary predicate reads one entry and nothing else, so inserting a key cannot move or
+    /// erase any other entry's boundary — it can only add its own. The leaf therefore holds at
+    /// most one interior boundary after the insert (the new entry's), and re-chunking the leaf's
+    /// own entries is enough; there is no cascade into the neighbour this tree has no pointer to.
+    ///
+    /// **The exception, stated rather than hidden:** replacing an existing key's value *can*
+    /// erase a boundary, and so can `delete`. That leaves a leaf whose last entry is no longer a
+    /// boundary, which is a partition the chunker would not have chosen — repairing it means
+    /// merging with the right neighbour, which needs the sibling access this layout deliberately
+    /// does not have. Fresh inserts, the path that builds a tree, are exact.
     fn leaf_put(
         &self,
         handle: &PageHandle,
@@ -379,51 +429,101 @@ impl CowTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<Split, FerroError> {
-        let mut entries = {
+        let entries = {
             let mut f = handle.write();
             let mut n = NodeMut::new(&mut f.data);
             let cell = node::leaf_cell(key, value);
             let found = n.view().search(key)?;
+            let at = match found {
+                Ok(i) => i,
+                Err(i) => i,
+            };
             let fits = match found {
                 Ok(i) => n.replace_cell_at(i, &cell)?,
                 Err(i) => n.insert_cell_at(i, &cell)?,
             };
             if fits {
-                stamp_checksum(&mut f.data);
-                return Ok(None);
+                // Fast path: it went in without putting a chunk boundary in the leaf's interior,
+                // so the partition is unchanged and nothing above needs to know.
+                //
+                // Exactly one entry can change status, and which one depends on where this landed.
+                // An interior insert can only have brought its own boundary. An **append** brings
+                // none of its own — it is the entry it displaced from the end that has just become
+                // interior, and missing that is how an ascending build silently swallows every
+                // boundary it appends.
+                let interior_boundary = {
+                    let v = n.view();
+                    let last = v.count() - 1;
+                    if at == last {
+                        v.count() >= 2
+                            && chunker::is_boundary(v.key(last - 1)?, v.value(last - 1)?)
+                    } else {
+                        chunker::is_boundary(key, value)
+                    }
+                };
+                if !interior_boundary {
+                    stamp_checksum(&mut f.data);
+                    return Ok(Vec::new());
+                }
+                n.view().leaf_entries()?
+            } else {
+                let mut entries = n.view().leaf_entries()?;
+                match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    Ok(i) => entries[i].1 = value.to_vec(),
+                    Err(i) => entries.insert(i, (key.to_vec(), value.to_vec())),
+                }
+                entries
             }
-            let mut entries = n.view().leaf_entries()?;
-            match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(i) => entries[i].1 = value.to_vec(),
-                Err(i) => entries.insert(i, (key.to_vec(), value.to_vec())),
-            }
-            entries
         };
 
         let sizes: Vec<usize> =
             entries.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
-        let s = node::split_point(&sizes);
-        let separator = entries[s].0.clone();
-        let right_entries: Vec<_> = entries.split_off(s);
-
-        let arena = self.store.arena_for(branch)?;
-        let right_id = self.store.alloc_in_arena(arena, PageType::BTreeLeaf, epoch)?;
-        {
-            let rh = self.store.read_page(right_id)?;
-            let mut f = rh.write();
-            NodeMut::new(&mut f.data).fill_leaf(&right_entries)?;
-            stamp_checksum(&mut f.data);
-        }
-        {
+        let hashes: Vec<u32> = entries.iter().map(|(k, v)| chunker::cell_hash(k, v)).collect();
+        let cuts = chunker::leaf_cuts(&sizes, &hashes, node::NODE_CAPACITY);
+        if cuts.is_empty() {
+            // The content says this is one chunk. It reached here only because the entry did not
+            // fit the page as laid out, so rewriting the leaf compacts it.
             let mut f = handle.write();
             NodeMut::new(&mut f.data).fill_leaf(&entries)?;
             stamp_checksum(&mut f.data);
+            return Ok(Vec::new());
         }
-        Ok(Some((separator, right_id)))
+
+        // Piece 0 stays in the page the caller already shadowed; the rest are novel pages whose
+        // separators travel up. Allocate before overwriting, so a failure to allocate leaves the
+        // leaf exactly as it was rather than truncated to its first piece.
+        let mut promoted: Split = Vec::with_capacity(cuts.len());
+        for (j, &start) in cuts.iter().enumerate() {
+            let end = cuts.get(j + 1).copied().unwrap_or(entries.len());
+            // `alloc_for`, not a single `arena_for` hoisted out of the loop: a k-way split can
+            // ask for several pages, and an `ArenaId` captured once refuses the moment its
+            // extent fills rather than rolling over. See `PageStore::alloc_for`.
+            let id = self.store.alloc_for(branch, PageType::BTreeLeaf, epoch)?;
+            let rh = self.store.read_page(id)?;
+            let mut f = rh.write();
+            NodeMut::new(&mut f.data).fill_leaf(&entries[start..end])?;
+            stamp_checksum(&mut f.data);
+            promoted.push((successor_of(&entries[start - 1].0), id));
+        }
+        {
+            let mut f = handle.write();
+            NodeMut::new(&mut f.data).fill_leaf(&entries[..cuts[0]])?;
+            stamp_checksum(&mut f.data);
+        }
+        Ok(promoted)
     }
 
-    /// Point an already-shadowed internal node at its new child, and absorb a separator promoted
-    /// from below. Returns a separator of its own if it had to split in turn.
+    /// Point an already-shadowed internal node at its new child, and absorb the separators
+    /// promoted from below. Returns separators of its own if it had to split in turn.
+    ///
+    /// **This level is still byte-balanced, deliberately.** An internal cell carries a `PageId`,
+    /// and page ids are handed out in allocation order, so hashing an internal cell would make
+    /// the boundary depend on exactly the history the leaf level has just been freed from.
+    /// Content-defining this level needs child references that do not name an allocation, which
+    /// is a separate change; what it inherits today is an invariant leaf partition underneath it.
+    ///
+    /// A content-defined leaf split promotes as many separators as it cut, not one, so both the
+    /// absorb and the split here are k-way.
     fn internal_relink(
         &self,
         handle: &PageHandle,
@@ -440,55 +540,74 @@ impl CowTree {
         // Checked before anything is mutated: bailing out after the child pointer has moved but
         // before the checksum is restamped would leave a page that fails verification.
         if promoted
-            .as_ref()
-            .is_some_and(|(sep, _)| node::internal_entry_bytes(sep) > node::MAX_ENTRY_BYTES)
+            .iter()
+            .any(|(sep, _)| node::internal_entry_bytes(sep) > node::MAX_ENTRY_BYTES)
         {
             return Err(FerroError::Cow("separator key is too large for a 4KB page".into()));
         }
-        let (leftmost, mut entries) = {
+        let (leftmost, entries) = {
             let mut f = handle.write();
             let mut n = NodeMut::new(&mut f.data);
             match slot {
                 None => n.set_leftmost(child),
                 Some(i) => n.set_child(i, child)?,
             }
-            let (sep, right) = match promoted {
-                None => {
-                    stamp_checksum(&mut f.data);
-                    return Ok(None);
-                }
-                Some(p) => p,
-            };
-            if n.insert_cell_at(at, &node::internal_cell(&sep, right))? {
+            if promoted.is_empty() {
                 stamp_checksum(&mut f.data);
-                return Ok(None);
+                return Ok(Vec::new());
+            }
+            // The separators belong at consecutive slots from `at`. Place as many as the page
+            // takes; `insert_cell_at` compacts before it refuses, so the first refusal means the
+            // node is genuinely full and the rest have to go through the split path.
+            let mut placed = 0usize;
+            for (j, (sep, right)) in promoted.iter().enumerate() {
+                if !n.insert_cell_at(at + j, &node::internal_cell(sep, *right))? {
+                    break;
+                }
+                placed = j + 1;
+            }
+            if placed == promoted.len() {
+                stamp_checksum(&mut f.data);
+                return Ok(Vec::new());
             }
             let mut entries = n.view().internal_entries()?;
-            entries.insert(at, (sep, right));
+            for (j, p) in promoted.iter().enumerate().skip(placed) {
+                entries.insert(at + j, p.clone());
+            }
             (n.leftmost(), entries)
         };
 
         let sizes: Vec<usize> =
             entries.iter().map(|(k, _)| node::internal_entry_bytes(k)).collect();
-        let s = node::split_point(&sizes);
-        let right_side: Vec<_> = entries.split_off(s);
-        let (middle_key, right_leftmost) = right_side[0].clone();
-        let right_entries = &right_side[1..];
-
-        let arena = self.store.arena_for(branch)?;
-        let right_id = self.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch)?;
-        {
-            let rh = self.store.read_page(right_id)?;
-            let mut f = rh.write();
-            NodeMut::new(&mut f.data).fill_internal(right_leftmost, right_entries)?;
-            stamp_checksum(&mut f.data);
-        }
-        {
+        let mut cuts = Vec::new();
+        chunker::balanced_cuts(&sizes, node::NODE_CAPACITY, 0, &mut cuts);
+        if cuts.is_empty() {
+            // Everything fits once the cell heap is rewritten without its garbage.
             let mut f = handle.write();
             NodeMut::new(&mut f.data).fill_internal(leftmost, &entries)?;
             stamp_checksum(&mut f.data);
+            return Ok(Vec::new());
         }
-        Ok(Some((middle_key, right_id)))
+
+        // Each cut promotes the entry it lands on: its key becomes the parent's separator and its
+        // child becomes the next node's leftmost, so that entry belongs to neither side.
+        let mut out: Split = Vec::with_capacity(cuts.len());
+        for (j, &s) in cuts.iter().enumerate() {
+            let end = cuts.get(j + 1).copied().unwrap_or(entries.len());
+            let (middle_key, right_leftmost) = entries[s].clone();
+            let id = self.store.alloc_for(branch, PageType::BTreeInternal, epoch)?;
+            let rh = self.store.read_page(id)?;
+            let mut f = rh.write();
+            NodeMut::new(&mut f.data).fill_internal(right_leftmost, &entries[s + 1..end])?;
+            stamp_checksum(&mut f.data);
+            out.push((middle_key, id));
+        }
+        {
+            let mut f = handle.write();
+            NodeMut::new(&mut f.data).fill_internal(leftmost, &entries[..cuts[0]])?;
+            stamp_checksum(&mut f.data);
+        }
+        Ok(out)
     }
 
     /// Copy the path back up to the root, stopping the moment nothing above needs to change.
@@ -504,25 +623,25 @@ impl CowTree {
         epoch: Epoch,
     ) -> Result<PageId, FerroError> {
         for (parent_id, slot) in path.into_iter().rev() {
-            if child_new == child_old && promoted.is_none() {
+            if child_new == child_old && promoted.is_empty() {
                 // the node was private and was mutated in place: its parent already points at it
                 return Ok(root);
             }
             let cp = self.store.cow_page(parent_id, branch, epoch)?;
             let new_parent = cp.page_id;
-            promoted =
-                self.internal_relink(&cp.handle, slot, child_new, promoted.take(), branch, epoch)?;
+            let taken = std::mem::take(&mut promoted);
+            promoted = self.internal_relink(&cp.handle, slot, child_new, taken, branch, epoch)?;
             drop(cp);
             child_old = parent_id;
             child_new = new_parent;
         }
 
-        if let Some((sep, right)) = promoted {
+        if !promoted.is_empty() {
             let arena = self.store.arena_for(branch)?;
             let new_root = self.store.alloc_in_arena(arena, PageType::BTreeInternal, epoch)?;
             let h = self.store.read_page(new_root)?;
             let mut f = h.write();
-            NodeMut::new(&mut f.data).fill_internal(child_new, &[(sep, right)])?;
+            NodeMut::new(&mut f.data).fill_internal(child_new, &promoted)?;
             stamp_checksum(&mut f.data);
             return Ok(new_root);
         }

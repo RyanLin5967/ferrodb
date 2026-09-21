@@ -16,12 +16,15 @@
 //! Liveness is answered instead by the epoch interval rule in `branch::record::reclaimable`.
 
 pub mod btree;
+pub mod chunker;
 pub mod cid;
 pub mod merge3;
 pub mod node;
 pub mod page_header;
 pub mod store;
 
+#[cfg(test)]
+mod tests_chunking;
 #[cfg(test)]
 mod tests_isolation;
 
