@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 use ferrodb::branch::types::{BranchId, Epoch, PageId};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cow::btree::CowTree;
-use ferrodb::cow::diff::{diff, skipped_node_count, Change, PageIdentity, SubtreeHash};
+use ferrodb::cow::diff::{
+    diff, first_inversion, skipped_node_count, Change, PageIdentity, SubtreeHash,
+};
 use ferrodb::cow::node::Node;
 use ferrodb::cow::page_header::{PageHeader, PageType};
 use ferrodb::cow::store::CowStore;
@@ -306,8 +308,37 @@ fn main() {
     }
     out.push('\n');
     let lock = std::env::var("D91_MEASURE_LOCK")
-        .unwrap_or_else(|_| "NOT HELD — treat these times as indicative only".to_string());
+        .unwrap_or_else(|_| "NOT HELD".to_string());
+
+    // A timing instrument that reports the CONTROL getting faster as the tree grows measured the
+    // box, not the code: old_touched provably grows with N, so t_old cannot fall. When that
+    // happens the durations are refused rather than banked — a number that cannot be right is not
+    // a weaker number, it is not a number. The counters above are unaffected, being integers.
+    let control: Vec<Duration> = rows.iter().map(|r| r.t_old).collect();
+    let monotonic_violation = first_inversion(&control).map(|(i, j)| {
+        format!(
+            "t_old fell from {:?} at N={} to {:?} at N={} — a {:.0}x inversion against a\n  control whose page count ROSE {}x over the same step",
+            rows[i].t_old,
+            rows[i].n,
+            rows[j].t_old,
+            rows[j].n,
+            rows[i].t_old.as_secs_f64() / rows[j].t_old.as_secs_f64().max(f64::MIN_POSITIVE),
+            rows[j].old_pages_touched / rows[i].old_pages_touched.max(1),
+        )
+    });
+
     out.push_str(&format!("\nWALL CLOCK. Fleet measure lock: {lock}\n"));
+    if let Some(v) = &monotonic_violation {
+        out.push_str("⛔ THESE DURATIONS ARE INADMISSIBLE AND ARE NOT A RESULT. The harness refuses\n");
+        out.push_str("them on its own evidence:\n");
+        out.push_str(&format!("  {v}.\n"));
+        out.push_str("Roughly a dozen sibling agents compile on this box; the measure lock excludes\n");
+        out.push_str("other MEASURERS but cannot make the machine quiet, and it did not. The rows\n");
+        out.push_str("are printed below only so the refusal can be checked, NOT to be quoted. No\n");
+        out.push_str("timing claim is made by this file. The counter table above is the result.\n");
+    } else {
+        out.push_str("Monotonicity check on the control passed: t_old rises with N at every step.\n");
+    }
     out.push_str("      N | t_new_pageid  t_new_hash      t_old | t_stamp (write-time cid, NOT diff cost)\n");
     out.push_str("------- | ------------  ----------  --------- | --------------------------------------\n");
     for r in &rows {

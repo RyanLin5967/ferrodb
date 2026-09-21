@@ -417,6 +417,20 @@ pub struct DiffReport {
     pub skipped_roots: Vec<PageId>,
 }
 
+/// The first point where a cost series got **cheaper as the input grew**, as
+/// `(index_before, index_after)`.
+///
+/// A harness uses this on its control column. If the control's cost falls while the input rises,
+/// the clock measured the machine rather than the code, and the durations from that run are not a
+/// weaker result — they are not a result. This repo runs its suites under an agent fleet, so that
+/// is the normal case rather than the exotic one, and a harness that quietly banks such a row
+/// publishes noise with a commit sha on it.
+///
+/// `None` means every step was non-decreasing. Ties are fine; only a strict fall is an inversion.
+pub fn first_inversion<T: PartialOrd>(series: &[T]) -> Option<(usize, usize)> {
+    series.windows(2).position(|w| w[1] < w[0]).map(|i| (i, i + 1))
+}
+
 /// Exact node count under the skipped subtrees. **O(skipped) — an audit, not part of the diff.**
 ///
 /// Deduplicates by page id first: a misaligned split can make the descent meet the same child
@@ -1258,6 +1272,29 @@ mod tests {
             assert_eq!(by_page.changes, expected, "case {label}: page identity disagrees");
             assert_eq!(by_hash.changes, expected, "case {label}: subtree hash disagrees");
         }
+    }
+
+    /// Fired both ways, because a refusal that has never refused anything is indistinguishable
+    /// from one that cannot.
+    #[test]
+    fn the_inversion_detector_fires_on_a_fall_and_stays_quiet_otherwise() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // Quiet: rising, and flat-with-ties.
+        assert_eq!(first_inversion(&[ms(1), ms(2), ms(3), ms(90)]), None);
+        assert_eq!(first_inversion(&[ms(5), ms(5), ms(5)]), None);
+        assert_eq!(first_inversion::<Duration>(&[]), None);
+        assert_eq!(first_inversion(&[ms(7)]), None);
+
+        // Fires: the shape actually banked on 2026-09-21 — 15.2 s at N=64k, 138 ms at N=256k.
+        assert_eq!(
+            first_inversion(&[ms(0), ms(1), ms(4), ms(15_209), ms(138)]),
+            Some((3, 4))
+        );
+        // And it reports the FIRST fall, not the largest.
+        assert_eq!(first_inversion(&[ms(10), ms(9), ms(100), ms(1)]), Some((0, 1)));
+        assert_eq!(first_inversion(&[1.0f64, 2.0, 1.5]), Some((1, 2)));
     }
 
     #[test]
