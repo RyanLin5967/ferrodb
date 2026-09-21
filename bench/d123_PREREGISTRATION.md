@@ -284,3 +284,52 @@ right and the label is wrong: **`20_threads` is F6. F1 is `40_stub`**, which ran
 (mtimes 18:40 vs 18:43; the build was at 18:37–18:38 local). So F1 carries no known contamination,
 and F6 — whose verdict is `measured/bound` 1.00x→0.03x, nowhere near any boundary — carries one
 that cannot reach it.
+
+---
+
+# AMENDMENT 7 — TWO ELIMINATIONS FROM ALREADY-BANKED DATA, AND THE ONE ARM STILL MISSING.
+
+Written after reading the first battery, before the F1 re-run's numbers exist.
+
+### Eliminated: BUFFER-POOL EVICTION. Free, from data already on disk.
+`MAX_BUFFER_POOL_PAGES = 1024` (`src/buffer/buffer_pool.rs:442`). The warm=20,000 tree (~100k keys)
+strains that pool; the warm=0 tree (~40k keys at most, and starting empty) does not. If eviction
+drove the inflation, the LARGE tree would inflate more. It inflates **less**:
+
+| 64/1 ratio | warm=20k (large tree) | warm=0 (small tree) |
+|---|---|---|
+| write_record | 2.29x | **2.36x** |
+| child_key_insert | 2.43x | **2.61x** |
+| HOLD | 1.61x | **1.71x** |
+
+Wrong direction, both phases, both totals. **Eviction is not the mechanism.** No const change and no
+extra arm was needed to establish it, and none will be run.
+
+### Eliminated: EVERY CANDIDATE THAT NEEDS TWO THREADS INSIDE THE SECTION.
+`fork` does all of its tree work under `logical`, so **only one thread is ever inside**. Therefore
+in-section work cannot be slowed by another section-holder — not by page-latch contention between
+forkers, not by allocator contention between forkers, not by cache-line bouncing between forkers.
+This is structural, not statistical. Combined with U(hold) ≈ 97%, which puts the time inside the
+section, **the counterparty must be something running OUTSIDE the lock** — and the only thing that
+does is `durable()` → `pool.flush_all()` + `disk_manager.sync()`, the group-commit flush.
+
+### The surviving named mechanism, and the four signals that select it
+Group-commit flush interference: the lock holder's NEW-page writes collide with the concurrent
+flusher draining dirty pages.
+1. Only the two phases that insert NEW keys inflate (2.29x, 2.43x).
+2. Reads and single-page writes get **faster** (0.74–0.92x) — a hotter pool, no collision.
+3. F5's fixed-key upserts, which re-dirty pages that are already dirty, are **0.68x** — cheaper.
+4. Inflation tracks `f/sync`, i.e. how many forks' worth of new pages each flush must drain:
+   f/sync 1.0 → 4.0 → 17.5 against write_record 1.00x → 1.59x → 2.29x. Monotone.
+
+### ⚠ THE ARM I HAVE NOT RUN, STATED PLAINLY PER F3
+I have not run an arm with the flush removed, because removing it removes durability and macOS then
+short-circuits `F_FULLFSYNC` — the confound this row has guarded against throughout. So the
+mechanism is **named by elimination plus four selectivity counters plus a structural argument, not
+by direct intervention.**
+
+**The one arm that would close it**, to be run only if the F1 re-run leaves lock time: a stub level
+that skips `child_key_insert` ONLY, keeping `write_record`, then `phases` at T=64. If write_record's
+own cost falls when the OTHER new-key insert is removed — fewer new pages per fork for the flusher
+to drain — the mechanism is confirmed by intervention. If write_record is unchanged, the flush is
+not the counterparty and the mechanism reverts to unattributed. **Pre-registered either way.**
