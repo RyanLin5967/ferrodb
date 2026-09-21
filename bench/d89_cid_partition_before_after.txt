@@ -43,7 +43,7 @@ The obsolete assertion was not hunted down. It carried a guard that fired on its
 so the fix landing turned the suite red and named the reason.
 
 
-=== STILL OPEN: the delete path, same instrument, at c1da717 ===
+=== THE DELETE PATH: found open at c1da717 by this instrument, CLOSED by D104 ===
 
     clean   25 leaves,  0 empty, partition cid e8051f36dbe91c9d7a1289f9275573a1
     churned 45 leaves, 20 empty, partition cid 371db26401024a1b95371c569e0b4ffa
@@ -65,9 +65,43 @@ Measured, that is narrower on both halves:
   - delete does, but not via the boundary rule. The fix is unlinking an emptied leaf in
     cow::btree, not a neighbour merge.
 
-Pinned by cow::cid::tests::a_delete_leaves_empty_leaves_behind_and_breaks_the_partition, with
-a_delete_must_not_change_the_partition_of_the_surviving_rows #[ignore]d as the acceptance
-criterion, written before the work.
+Pinned at the time by cow::cid::tests::a_delete_leaves_empty_leaves_behind_and_breaks_the_partition,
+with a_delete_must_not_change_the_partition_of_the_surviving_rows #[ignore]d beside it as the
+acceptance criterion, written before the fix existed.
+
+CLOSED by D104. CowTree::unlink_up drops an emptied leaf out of its parent and cascades while that
+leaves a parent with no children at all. Same fixture, after:
+
+    clean   22 leaves, 0 empty, partition cid a59b5daa282b5b33f85cc0b4aefb1348
+    churned 22 leaves, 0 empty, partition cid a59b5daa282b5b33f85cc0b4aefb1348
+
+The acceptance test was un-ignored and the assert-current-behaviour test deleted, which is the
+protocol those two tests documented for each other. So the instrument's reach is now: a cid
+compares two trees holding the same rows exactly, however those rows were reached.
+
+An internal node holds a leftmost child plus `count` slots, so removing a slotted child always
+leaves the leftmost behind; a node becomes childless in exactly one case, when the removed child
+was the leftmost and count was 0. That single case is the whole cascade condition, which is why it
+terminates in tree depth and needs no rebalance. Pages are freed only after the parent has stopped
+pointing at them — free_page can hand a page straight back to the free map, so the other order
+leaves a live parent pointing at a page an allocator may have reissued.
+
+It does NOT merge half-empty siblings or collapse a root left with one child. Both are rebalancing,
+both need the sibling access this layout deliberately lacks, and neither is needed for the partition
+to be a function of the rows.
+
+Measured effects of the fix:
+
+    live pages after deleting every key of 1000: 45 -> 1   (pages freed, not merely unlinked)
+    cargo test --lib, D104 tip 913e53f: 1548 passed; 0 failed; 2 ignored; finished in 86.93s
+    cow::btree::delete_unlink_tests: 7 passed; 0 failed
+
+Seven tests were added because CowTree::delete had almost no direct coverage to break — one diff
+test used it and nothing else. The two that would catch this going wrong are
+every_surviving_key_is_still_readable_after_scattered_deletion (point lookups AND an ordered scan,
+because a broken separator shows up only in the scan) and
+deleting_on_a_fork_leaves_the_parents_tree_intact (a child freeing a page its ancestor still points
+at would corrupt the ancestor, in the wrong branch, silently).
 
 
 === Adversarial pass ===
