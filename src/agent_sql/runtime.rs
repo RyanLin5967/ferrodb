@@ -48,7 +48,10 @@ use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
 use crate::branch::record::{CapabilityEnvelope, RowImage};
-use crate::branch::types::{BranchId, BranchState, CommitHash, LeaseDeadline, PageId};
+use crate::branch::types::{BranchId, BranchState, CommitHash, Epoch, LeaseDeadline, PageId};
+use crate::branch::attest::{
+    AttestedHistory, Attestation, BranchOp, ContentId, HistoryEntry, InclusionProof, TreeHead,
+};
 use crate::branch::version_graph::{AncestryError, VersionGraph};
 use crate::cow::diff::{diff as cow_diff, Change as CowChange, PageIdentity};
 use crate::cow::PageStore;
@@ -805,6 +808,34 @@ pub struct AgentRuntime {
     /// index cannot disagree with the records it answers about; a branch already present costs one
     /// hash lookup, and only a branch that is absent pays the walk, once.
     ancestry: Mutex<VersionGraph>,
+    /// **The branch-history chain (D103).** Tamper-evident record of the branch lifecycle: one
+    /// entry per fork, per published merge and per reap, hash-linked per branch and accumulated
+    /// into an RFC 6962 Merkle log whose head an operator can publish.
+    ///
+    /// Also a leaf lock, taken alone and never while `state` or the catalog is held, for the same
+    /// reason [`AgentRuntime::ancestry`] is.
+    ///
+    /// # ⚠ What is attested, and what is deliberately NOT
+    ///
+    /// **Attested:** that a branch was forked from a particular parent at a particular epoch under
+    /// a particular run identity; that a merge published a particular set of row images; that a
+    /// branch was reaped, sealing its history. Altering any of those after the fact breaks every
+    /// later link, and `verify_consistency` against a previously published head catches a wholesale
+    /// rewrite that a chain walk cannot.
+    ///
+    /// **Not attested: the branch's tree contents at fork or commit time.** That would need a
+    /// digest over the whole tree, and the only one this engine has is `cow::cid::subtree_cid`,
+    /// whose own doc says "Cost is the whole subtree, every time — there is no memo table". Paying
+    /// it on the fork path would make forking O(N) — destroying exit criterion 1, the measured
+    /// claim that a fork copies zero pages, to gain a commitment the merge entries already make
+    /// for the data that actually reaches the shared tables. So there is **no `BranchOp::Commit`
+    /// entry**, and that is a decision rather than an omission.
+    ///
+    /// **Not durable.** `AttestedHistory` is in-memory and says so (item 4 of its own "What this
+    /// does NOT prove"). Across a restart this answers nothing; within one process an operator who
+    /// records [`AgentRuntime::attestation_head`] can later prove the log was only appended to.
+    /// Persisting it is a separate decision about where roots are published, not a wiring detail.
+    attested: Mutex<AttestedHistory>,
 }
 
 impl Default for AgentRuntime {
@@ -842,6 +873,7 @@ impl AgentRuntime {
             reaper: None,
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
+            attested: Mutex::new(AttestedHistory::new()),
         }
     }
 
@@ -900,6 +932,7 @@ impl AgentRuntime {
             reaper: None,
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
+            attested: Mutex::new(AttestedHistory::new()),
         })
     }
 
@@ -939,6 +972,7 @@ impl AgentRuntime {
             reaper: None,
             state: Mutex::new(State::default()),
             ancestry: Mutex::new(VersionGraph::new()),
+            attested: Mutex::new(AttestedHistory::new()),
         })
     }
 
@@ -1142,18 +1176,43 @@ impl AgentRuntime {
             .branches
             .fork(parent, LeaseDeadline::from_now(DEFAULT_LEASE_MILLIS))?;
         let branch = record.branch_id;
-        let mut state = self.state.lock().unwrap();
 
-        state.next_txn += 1;
-        let txn = TxnId(state.next_txn);
         let run = run_id.unwrap_or("<unnamed>").to_string();
         let (model_name, model_version) = model.unwrap_or(("unspecified", "unspecified"));
+        // **D103 — the fork is attested here, before the state lock is taken.**
+        //
+        // Hoisted above the lock rather than folded in below it for one reason: the attestation
+        // log is a LEAF lock, taken alone and never while `state` is held. Both halves of that
+        // discipline have to be kept at every call site or it is not a discipline; see the field
+        // docs on `AgentRuntime::attested`. The three values it needs are all derived from the
+        // caller's arguments, so nothing forces this below the lock.
+        //
+        // Cost: one SHA-256 over ~100 bytes plus the Merkle extend, which is `ceil(log2(n))`
+        // compressions of 64 bytes and no I/O at all. The fork path immediately above this line
+        // appends a `BranchRecord` to the catalog log and fsyncs it, so this is not the same order
+        // of expense — and it is deliberately NOT a digest of the branch's tree, which would make
+        // a fork O(N) and destroy exit criterion 1.
+        //
         // **This is where the prompt stops being text.** Hashed once, here, and the `&str` is
         // dropped at the end of the call: what the store, the WAL identity record, the change feed
         // and `ferro_runs` all receive is 32 bytes. `None` — no `PROMPT` clause — is the all-zero
         // hash, which is not `prompt_digest("")` and must never become it: "no prompt was declared"
         // and "the prompt was empty" are different facts about a run.
         let prompt_hash = prompt.map(prompt_digest).unwrap_or([0u8; 32]);
+        self.attest_fork(
+            branch,
+            parent,
+            record.fork_epoch,
+            agent_id,
+            &run,
+            (model_name, model_version),
+            &prompt_hash,
+        );
+
+        let mut state = self.state.lock().unwrap();
+        state.next_txn += 1;
+        let txn = TxnId(state.next_txn);
+
         // Intern first so the store assigns the id, then rebuild the entity carrying it. The
         // store returns the SAME id for a repeated (agent, run), which is what makes attribution
         // run-level; it also refuses a re-intern whose actor tuple disagrees. `same_actor` counts
@@ -2894,6 +2953,129 @@ impl AgentRuntime {
         format!("m_{}", state.next_merge)
     }
 
+    // ---- D103: the branch-history chain -----------------------------------------------------
+
+    /// The Merkle head over every attested branch event so far.
+    ///
+    /// **This is the value an operator publishes.** `AttestedHistory`'s own documentation is blunt
+    /// about why it matters: a chain walk passes on a wholesale rewrite, because an adversary who
+    /// can write the log can recompute every `prev` after the entry they altered. Only a root
+    /// witnessed *before* the rewrite catches that, so "a deployment that never publishes a root
+    /// anywhere gets far less from this file than it thinks".
+    pub fn attestation_head(&self) -> TreeHead {
+        self.attested.lock().unwrap().head()
+    }
+
+    /// The whole log, in append order.
+    ///
+    /// **Index into this is the index an [`InclusionProof`] is about**, which is why it exists
+    /// rather than leaving a caller to reassemble log order from per-branch views: those interleave
+    /// and reassembling them is a second, wrong definition of the order the proofs are stated in.
+    pub fn attested_log(&self) -> Vec<HistoryEntry> {
+        self.attested.lock().unwrap().entries().to_vec()
+    }
+
+    /// This branch's attested events, oldest first.
+    pub fn attested_entries(&self, branch: BranchId) -> Vec<HistoryEntry> {
+        let h = self.attested.lock().unwrap();
+        h.entries().iter().filter(|e| e.branch == branch).copied().collect()
+    }
+
+    /// The branch's current chain head, or `None` if nothing has been attested for it.
+    pub fn attestation_of(&self, branch: BranchId) -> Option<Attestation> {
+        self.attested.lock().unwrap().head_of(branch)
+    }
+
+    /// Re-link this branch's chain and report how many entries verified.
+    pub fn verify_attested_branch(&self, branch: BranchId) -> Result<usize, FerroError> {
+        self.attested.lock().unwrap().verify_branch(branch).map_err(FerroError::from)
+    }
+
+    /// Inclusion proof for the entry at `index` in the log, against [`Self::attestation_head`].
+    pub fn attested_inclusion_proof(&self, index: usize) -> Option<InclusionProof> {
+        self.attested.lock().unwrap().inclusion_proof(index)
+    }
+
+    /// Prove the log at its current size is an append-only extension of the one at `old_size`.
+    ///
+    /// This is the call that answers "has anything already logged been rewritten", which the
+    /// chain walk cannot.
+    pub fn attested_consistency_proof(
+        &self,
+        old_size: usize,
+    ) -> Option<crate::branch::attest::ConsistencyProof> {
+        self.attested.lock().unwrap().consistency_proof(old_size)
+    }
+
+    /// Entries in the log. The size half of a published `(size, root)` witness.
+    pub fn attested_len(&self) -> usize {
+        self.attested.lock().unwrap().len()
+    }
+
+    /// Record a fork. The child's `prev` is the **parent's** head, which is what makes a
+    /// verification walk of a child continue into the ancestry it forked from.
+    ///
+    /// The content is the run identity — agent, run, model and prompt digest — length-prefixed so
+    /// the encoding is injective. That is genuine content and it is already in hand: it binds the
+    /// branch to the agent run that created it, which is the half of the audit question
+    /// (`which agent produced this`) provenance already answers, now bound into a chain that
+    /// answers the other half.
+    fn attest_fork(
+        &self,
+        child: BranchId,
+        parent: BranchId,
+        epoch: Epoch,
+        agent_id: &str,
+        run_id: &str,
+        model: (&str, &str),
+        prompt_hash: &[u8; 32],
+    ) {
+        let mut buf = Vec::with_capacity(96);
+        for part in [agent_id.as_bytes(), run_id.as_bytes(), model.0.as_bytes(), model.1.as_bytes()]
+        {
+            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            buf.extend_from_slice(part);
+        }
+        buf.extend_from_slice(prompt_hash);
+        self.attested.lock().unwrap().append_fork(child, parent, epoch, ContentId::of(&buf));
+    }
+
+    /// Record a published merge on the branch it published INTO, committing to the row images it
+    /// actually wrote.
+    ///
+    /// O(delta): only the rows this merge published are folded in, each length-prefixed. A merge
+    /// that published nothing still gets an entry — "this merge landed and wrote no rows" is a
+    /// fact worth being unable to erase.
+    fn attest_merge(&self, into: BranchId, epoch: Epoch, images: &PublishedImages) {
+        let mut buf = Vec::with_capacity(images.post.len() * 32);
+        buf.extend_from_slice(&(images.post.len() as u64).to_be_bytes());
+        for ((tbl, row), vals) in &images.post {
+            buf.extend_from_slice(&tbl.to_be_bytes());
+            buf.extend_from_slice(&row.to_be_bytes());
+            // A row that will not encode is not a reason to abandon the attestation: the entry
+            // still commits to the key, and a missing value reads as a distinct (empty) encoding
+            // rather than as the row being absent.
+            let enc = encode_row(vals).unwrap_or_default();
+            buf.extend_from_slice(&(enc.len() as u64).to_be_bytes());
+            buf.extend_from_slice(&enc);
+        }
+        self.attested.lock().unwrap().append(into, epoch, BranchOp::Merge, ContentId::of(&buf));
+    }
+
+    /// Record a reap, sealing the branch's chain.
+    ///
+    /// The content is the branch's own head at this moment, so the terminal entry commits to the
+    /// entire history being closed: a later attempt to extend a reaped branch's chain has to
+    /// contend with an entry that already named the end.
+    fn attest_reap(&self, branch: BranchId, epoch: Epoch, published: bool) {
+        let mut h = self.attested.lock().unwrap();
+        let head = h.head_of(branch).unwrap_or_else(Attestation::genesis);
+        let mut buf = Vec::with_capacity(33);
+        buf.extend_from_slice(&head.0);
+        buf.push(u8::from(published));
+        h.append(branch, epoch, BranchOp::Reap, ContentId::of(&buf));
+    }
+
     // ---- D103: ancestry, and the merge it makes possible ------------------------------------
 
     /// Put `branch` and every ancestor it needs into the ancestry index, deriving the chain from
@@ -4402,6 +4584,17 @@ impl AgentRuntime {
             &images,
             reserved,
         )?;
+
+        // **D103 — the merge is attested AFTER the publish transaction committed**, and that
+        // order is the whole point. An entry appended before the commit would attest a merge that
+        // a failed commit then never performed, which is worse than no attestation: it is a
+        // tamper-evident record of something that did not happen.
+        //
+        // It commits to `images.post`, the row images this merge actually wrote — real content,
+        // O(delta), and the one place on the branch lifecycle where a content commitment is
+        // affordable. See the field docs on `AgentRuntime::attested` for why fork and commit get
+        // no such commitment.
+        self.attest_merge(into, self.branches.next_epoch(), &images);
         self.seal(from, true)?;
 
         Ok(MergeReport {
@@ -4923,6 +5116,12 @@ impl AgentRuntime {
             }
         }
         self.branches.set_state(branch, record.state, BranchState::Reaped)?;
+        // **D103 — attested after the state change lands**, for the same reason the merge entry is
+        // appended after its commit: a record of a reap that did not happen is worse than none.
+        // The entry seals this branch's chain, and it carries whether the branch's writes were
+        // published, because "merged" and "abandoned" are different facts about a retired branch
+        // and the record must not conflate them.
+        self.attest_reap(branch, record.fork_epoch, published);
         Ok(())
     }
 
