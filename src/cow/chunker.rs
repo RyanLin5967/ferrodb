@@ -50,10 +50,26 @@
 //! for it. The numbers behind that trade — including what was measured at the setting that kept
 //! the old fanout instead — are on [`CHUNK_SHIFT`].
 //!
-//! Two narrower gaps, both on the paths that *remove* content rather than add it: overwriting a
-//! value and deleting a key can each erase a boundary, and repairing that means merging with the
-//! right-hand neighbour, which is sibling access again. A tree built by insertion — what the
-//! invariance tests build, and what a branch's writes do — is exact.
+//! Two narrower gaps were predicted here on the paths that *remove* content rather than add it:
+//! overwriting a value and deleting a key can each erase a boundary. Both are now repaired by
+//! [`crate::cow::btree::CowTree`]'s merge with the right-hand neighbour, so a tree is exact
+//! however it was reached, not only one built by insertion.
+//!
+//! **That repair was called impossible here, and the reasoning was wrong in a way worth keeping
+//! visible.** It read "which is sibling access again", treating sibling access as ruled out by
+//! `cow::node`'s refusal of sibling POINTERS. Those are different things. A stored `next_leaf`
+//! link is rejected for a reason specific to shadow paging — shadowing leaf N+1 forces shadowing
+//! N to update its pointer, which cascades leftward along the whole leaf level. Reaching the
+//! right-hand neighbour stores nothing and cascades nothing: climb the descent path to the
+//! shallowest ancestor with a child further right and take that subtree's leftmost leaf, which is
+//! exactly what `ScanCursor` already does for an ordered scan. A merge then shadows two leaves
+//! and their ancestors up to the common one — bounded by twice the depth, not by the leaf level.
+//!
+//! What remains is the over-long chunk above, and the delete path can now reach it deliberately:
+//! a join has only ONE boundary, the neighbour's last entry, so deleting terminators repeatedly
+//! in one region grows a single run until it no longer fits a page. Measured, 40 such deletes
+//! leave 205 leaves with 40 of them cut by the byte cap rather than by content. Every leaf still
+//! fits; that guarantee has no exception.
 
 /// How many times the mean chunk divides into a page: the page capacity over
 /// [`TARGET_CHUNK_BYTES`].

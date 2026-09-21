@@ -43,10 +43,25 @@ The obsolete assertion was not hunted down. It carried a guard that fired on its
 so the fix landing turned the suite red and named the reason.
 
 
-=== THE DELETE PATH: found open at c1da717 by this instrument, CLOSED by D104 ===
+=== THE DELETE PATH: found open at c1da717, EMPTY-LEAF half closed by D104, BOUNDARY half by D108 ===
+
+⚠ READ THE WHOLE SECTION BEFORE QUOTING IT. An earlier header here said "CLOSED by D104", which
+the correction further down contradicted and the D104 merge commit contradicted too ("closes the
+EMPTY-LEAF defect, NOT delete-path convergence"). A reader scanning headers acted on "CLOSED".
+The delete path took TWO fixes, in two commits, for two different defects.
 
     clean   25 leaves,  0 empty, partition cid e8051f36dbe91c9d7a1289f9275573a1
     churned 45 leaves, 20 empty, partition cid 371db26401024a1b95371c569e0b4ffa
+
+⚠ THOSE TWO ROWS WERE MEASURED AT c1da717 AND THE "after" ROWS BELOW AT A LATER BASE, SO THEY ARE
+NOT A BEFORE/AFTER OF ANY ONE CHANGE. The clean, insert-only build reads 25 leaves here and 22
+below, and no delete-path fix can do that: unlink_up runs only inside CowTree::delete and cannot
+touch an insert-only tree at all. The difference is unrelated tree-shape churn between the two
+commits, and presenting it as a result of the fix was a false record. Re-measured on one tree,
+the clean 500-row build is 22 leaves; the 1000-row build is 44 leaves, 22 of them empty after the
+suffix delete, before D104. The live numbers are now PRINTED by
+cow::cid::tests::a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone rather than
+copied into any comment, so they cannot drift again.
 
 500 rows reached two ways — inserted directly, versus inserting 1000 and deleting half. Identical
 rows (content cid equal). The 25 LIVE leaves are identical byte for byte, so content-defined
@@ -75,8 +90,17 @@ leaves a parent with no children at all. Same fixture, after:
     clean   22 leaves, 0 empty, partition cid a59b5daa282b5b33f85cc0b4aefb1348
     churned 22 leaves, 0 empty, partition cid a59b5daa282b5b33f85cc0b4aefb1348
 
-The acceptance test was un-ignored and the assert-current-behaviour test deleted, which is the
-protocol those two tests documented for each other.
+⚠ AN EARLIER VERSION OF THIS LINE SAID the acceptance test was un-ignored and the
+assert-current-behaviour test deleted. That was false as shipped. What actually happened:
+a_delete_must_not_change_the_partition_of_the_surviving_rows was RENAMED to
+a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone and re-scoped to the suffix
+shape, because a contiguous suffix is the one delete shape that cannot destroy an interior
+boundary; and the general criterion was re-registered under the new name
+a_delete_of_an_interior_boundary_key_must_not_change_the_partition, #[ignore]d, still failing.
+Anyone grepping for a green acceptance test at that point would have found an ignored one.
+
+D108 then built CowTree::merge_right and that criterion is un-ignored and passing. So the protocol
+did run to completion -- two rounds, not one, and the record above skipped the middle round.
 
 ⚠ CORRECTION, logged where the claim was made. An earlier version of this section read "the
 instrument's reach is now: a cid compares two trees holding the same rows exactly, however those

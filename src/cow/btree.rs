@@ -342,9 +342,16 @@ impl CowTree {
         let (path, leaf_id) = self.descend(root, key)?;
         let cp = self.store.cow_page(leaf_id, branch, epoch)?;
         let new_leaf = cp.page_id;
-        let split = self.leaf_put(&cp.handle, branch, epoch, key, value)?;
+        let (split, unterminated) = self.leaf_put(&cp.handle, branch, epoch, key, value)?;
         drop(cp);
-        self.relink_up(root, path, leaf_id, new_leaf, split, branch, epoch)
+        let root = self.relink_up(root, path, leaf_id, new_leaf, split, branch, epoch)?;
+        if unterminated {
+            // An overwrite can erase the terminating boundary of the leaf it lands in, exactly as
+            // a delete can. `key` is the last entry of that run, so it still descends to the leaf
+            // that lost its terminator even when the write above split the run.
+            return self.merge_right(root, key, branch, epoch);
+        }
+        Ok(root)
     }
 
     /// Remove `key` if present. Returns the new root page id (unchanged when the key was absent —
@@ -366,16 +373,24 @@ impl CowTree {
         }
         let cp = self.store.cow_page(leaf_id, branch, epoch)?;
         let new_leaf = cp.page_id;
-        let emptied = {
+        let (emptied, unterminated, first_key) = {
             let mut f = cp.handle.write();
             let mut n = NodeMut::new(&mut f.data);
             let found = n.view().search(key)?;
             if let Ok(i) = found {
                 n.remove_at(i)?;
             }
-            let emptied = n.count() == 0;
+            let v = n.view();
+            let count = v.count();
+            let emptied = count == 0;
+            // Did this delete take the entry that TERMINATED the leaf? `cow::chunker` ends a leaf
+            // AT a boundary entry, so a leaf whose last entry is no longer one has lost its
+            // terminator and the content now calls for it to be joined with what follows.
+            let unterminated = !emptied
+                && !chunker::is_boundary(v.key(count - 1)?, v.value(count - 1)?);
+            let first_key = if emptied { Vec::new() } else { v.key(0)?.to_vec() };
             stamp_checksum(&mut f.data);
-            emptied
+            (emptied, unterminated, first_key)
         };
         drop(cp);
         // A leaf whose last entry has just left has to leave the tree with it.
@@ -397,7 +412,14 @@ impl CowTree {
         if emptied && !path.is_empty() {
             return self.unlink_up(root, path, new_leaf, branch, epoch);
         }
-        self.relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch)
+        let root = self.relink_up(root, path, leaf_id, new_leaf, Vec::new(), branch, epoch)?;
+        if unterminated {
+            // The leaf lost its terminating boundary. Join it with what follows, or the partition
+            // stops being a function of the rows: `leaf_put`'s re-chunk only ever splits further,
+            // so nothing else in the tree can ever rejoin these two.
+            return self.merge_right(root, &first_key, branch, epoch);
+        }
+        Ok(root)
     }
 
     /// Apply a whole [`WriteBuffer`] and return the new root.
@@ -500,7 +522,7 @@ impl CowTree {
         epoch: Epoch,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Split, FerroError> {
+    ) -> Result<(Split, bool), FerroError> {
         let entries = {
             let mut f = handle.write();
             let mut n = NodeMut::new(&mut f.data);
@@ -534,8 +556,14 @@ impl CowTree {
                     }
                 };
                 if !interior_boundary {
+                    // Nothing moved in the partition — but an OVERWRITE of the last entry can
+                    // still have erased the leaf's terminator without creating an interior one,
+                    // which is the same defect as the delete case and just as permanent.
+                    let v = n.view();
+                    let last = v.count() - 1;
+                    let unterminated = !chunker::is_boundary(v.key(last)?, v.value(last)?);
                     stamp_checksum(&mut f.data);
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), unterminated));
                 }
                 // The entry is already in the page and the re-chunk below reopens it through a
                 // fresh `write()`. Restamp before this guard drops: the page is pinned throughout
@@ -554,6 +582,29 @@ impl CowTree {
             }
         };
 
+        self.write_leaf_chunked(handle, entries, branch, epoch)
+    }
+
+    /// Lay `entries` into `handle`'s page, cutting them where the CONTENT says to, and return the
+    /// separators of any pieces that did not fit in that page.
+    ///
+    /// Extracted from [`CowTree::leaf_put`] so the delete-side merge re-chunks through the same
+    /// code the insert side does. Two implementations of "where do the leaves end" is the one way
+    /// to lose the property `cow::chunker` exists to provide, and it would be lost silently —
+    /// both sides would look right in isolation and disagree only on trees that had seen both.
+    fn write_leaf_chunked(
+        &self,
+        handle: &PageHandle,
+        entries: node::LeafEntries,
+        branch: BranchId,
+        epoch: Epoch,
+    ) -> Result<(Split, bool), FerroError> {
+        // Whether the RUN ends on a boundary, which is the same question however it is cut: the
+        // last piece ends on the run's last entry whatever the cuts do in between.
+        let unterminated = match entries.last() {
+            Some((k, v)) => !chunker::is_boundary(k, v),
+            None => false,
+        };
         let sizes: Vec<usize> =
             entries.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
         let hashes: Vec<u32> = entries.iter().map(|(k, _)| chunker::key_hash(k)).collect();
@@ -564,7 +615,7 @@ impl CowTree {
             let mut f = handle.write();
             NodeMut::new(&mut f.data).fill_leaf(&entries)?;
             stamp_checksum(&mut f.data);
-            return Ok(Vec::new());
+            return Ok((Vec::new(), unterminated));
         }
 
         // Piece 0 stays in the page the caller already shadowed; the rest are novel pages whose
@@ -588,7 +639,7 @@ impl CowTree {
             NodeMut::new(&mut f.data).fill_leaf(&entries[..cuts[0]])?;
             stamp_checksum(&mut f.data);
         }
-        Ok(promoted)
+        Ok((promoted, unterminated))
     }
 
     /// Point an already-shadowed internal node at its new child, and absorb the separators
@@ -729,6 +780,132 @@ impl CowTree {
         Ok(child_new)
     }
 
+    /// The leftmost leaf of the subtree at `pid`.
+    fn leftmost_leaf(&self, mut pid: PageId) -> Result<PageId, FerroError> {
+        for _ in 0..MAX_DESCENT {
+            let h = self.store.read_page(pid)?;
+            let f = h.read();
+            if PageHeader::read_from(&f.data)?.page_type == PageType::BTreeLeaf {
+                return Ok(pid);
+            }
+            let next = Node::new(&f.data).leftmost();
+            drop(f);
+            drop(h);
+            pid = next;
+        }
+        Err(FerroError::Cow("btree leftmost walk exceeded the depth guard".into()))
+    }
+
+    /// The leaf immediately right of the one `path` descended to, or `None` if it is the last.
+    ///
+    /// **No sibling pointer, and that distinction is the whole reason the merge is possible.**
+    /// `cow::node`'s header rejects a stored `next_leaf` link for a reason specific to shadow
+    /// paging: shadowing leaf N+1 would force shadowing N to update its pointer, cascading
+    /// leftward along the entire leaf level. Nothing here is stored and nothing points sideways —
+    /// this climbs the descent path to the shallowest ancestor that still has a child further
+    /// right and takes that subtree's leftmost leaf, exactly as `ScanCursor` already does for an
+    /// ordered scan. Cost is the depth, paid only on the delete that erases a boundary.
+    fn right_neighbour(&self, path: &DescentPath) -> Result<Option<PageId>, FerroError> {
+        for (parent_id, slot) in path.iter().rev() {
+            let kids = {
+                let h = self.store.read_page(*parent_id)?;
+                let f = h.read();
+                Node::new(&f.data).all_children()?
+            };
+            // `all_children` is [leftmost, child(0), child(1), ...], so slot i sits at i + 1.
+            let taken = match slot {
+                None => 0,
+                Some(i) => i + 1,
+            };
+            if taken + 1 < kids.len() {
+                return Ok(Some(self.leftmost_leaf(kids[taken + 1])?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Repair a leaf whose terminating content boundary a delete has just removed, by absorbing
+    /// its right neighbour and re-cutting the pair.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// `cow::chunker` makes a leaf end **at** a boundary entry, so the partition is a function of
+    /// the rows. Deleting that entry leaves the leaf unterminated, and `leaf_put`'s re-chunk can
+    /// only ever split a leaf further, never rejoin one — so without this the leaf and its
+    /// neighbour stay split where the content calls for one leaf, permanently. Measured before
+    /// this existed: deleting one interior boundary key from a 1000-row build left 28 + 9 rows
+    /// against a clean build's single leaf of 37.
+    ///
+    /// # Why it terminates, which is NOT the argument `unlink_up` uses
+    ///
+    /// `unlink_up` terminates because removing a slotted child always leaves the leftmost behind.
+    /// Moving entries between leaves breaks that property, so the argument is rebuilt here: the
+    /// merged run ends on the right neighbour's LAST entry, and that entry is a boundary because
+    /// the neighbour was a well-formed leaf. So one absorption always terminates the left leaf and
+    /// there is no second round. The single exception is a neighbour that was itself the last leaf
+    /// in the tree, and the last leaf is allowed to end anywhere — so that case is finished too.
+    ///
+    /// # Why it is three passes rather than one clever one
+    ///
+    /// The two leaves can sit under different parents (measured: 3 of 486 leaves at depth 2), so
+    /// the relink is over two root-to-leaf paths that share only a prefix. Rewriting both in one
+    /// upward walk means tracking two cursors that merge partway up — the intricate version, and
+    /// the one most likely to be subtly wrong in a core B+tree. Instead each step re-descends and
+    /// uses a fresh, valid path, and every step is machinery that already has tests:
+    /// `unlink_up` removes the neighbour, `write_leaf_chunked` re-cuts the merged run through the
+    /// same code the insert side uses, and `relink_up` absorbs whatever that promotes. Three
+    /// descents at O(depth) each, on a delete that fires roughly once per leaf's worth of rows.
+    fn merge_right(
+        &self,
+        root: PageId,
+        key_in_left: &[u8],
+        branch: BranchId,
+        epoch: Epoch,
+    ) -> Result<PageId, FerroError> {
+        // 1. Locate the unterminated leaf afresh and find what is to its right.
+        let (path_l, _) = self.descend(root, key_in_left)?;
+        let Some(r_id) = self.right_neighbour(&path_l)? else {
+            // It is the last leaf, which may end anywhere.
+            return Ok(root);
+        };
+        let r_entries = {
+            let h = self.store.read_page(r_id)?;
+            let f = h.read();
+            Node::new(&f.data).leaf_entries()?
+        };
+        let Some((r_first, _)) = r_entries.first().cloned() else {
+            // An empty neighbour: nothing to absorb, and `delete` no longer leaves one behind.
+            return Ok(root);
+        };
+
+        // 2. Take the neighbour out of the tree. Shadow it first — freeing a page this branch
+        //    does not own would corrupt the ancestor that still points at it, not this branch.
+        let (path_r, r_live) = self.descend(root, &r_first)?;
+        let cpr = self.store.cow_page(r_live, branch, epoch)?;
+        let r_shadow = cpr.page_id;
+        drop(cpr);
+        let root = self.unlink_up(root, path_r, r_shadow, branch, epoch)?;
+
+        // 3. Re-descend — step 2 shadowed ancestors the first path shared — and rewrite the left
+        //    leaf with the merged run, re-cut by content.
+        let (path_l, l_live) = self.descend(root, key_in_left)?;
+        let cpl = self.store.cow_page(l_live, branch, epoch)?;
+        let l_shadow = cpl.page_id;
+        let mut merged = {
+            let f = cpl.handle.read();
+            Node::new(&f.data).leaf_entries()?
+        };
+        merged.extend(r_entries);
+        // The flag can only still be set when the neighbour just absorbed was itself the tree's
+        // LAST leaf, because every other leaf ends on a boundary — and the last leaf is allowed
+        // to end anywhere. So there is no second round, which is the termination argument above
+        // stated as code rather than prose.
+        let (promoted, _now_the_last_leaf) =
+            self.write_leaf_chunked(&cpl.handle, merged, branch, epoch)?;
+        drop(cpl);
+        self.relink_up(root, path_l, l_live, l_shadow, promoted, branch, epoch)
+    }
+
     /// Drop `doomed` out of the tree, cascading while its removal leaves a parent with no children
     /// at all, then relink the rest of the path normally. Returns the new root.
     ///
@@ -758,20 +935,10 @@ impl CowTree {
     /// rebalancing and both need the sibling access this layout deliberately lacks (`cow::node`'s
     /// header).
     ///
-    /// **The sibling merge is not merely deferred — its absence leaves a real gap, and an earlier
-    /// version of this comment said otherwise.** Deleting the key that *terminates* a leaf destroys
-    /// that leaf's content boundary, and nothing here puts it back: the leaf and its right
-    /// neighbour stay split where `cow::chunker` would cut one. Measured on a 1000-row build,
-    /// deleting one interior boundary key gives 28 + 9 rows against a clean build's single leaf of
-    /// 37 — **identical either side of this function**, because no leaf was emptied, so there was
-    /// nothing for it to unlink.
-    ///
-    /// So this closes the empty-leaf defect and **not** delete-path convergence. The distinction is
-    /// pinned by two tests in `cow::cid`:
-    /// `a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone` (passes — a suffix is the
-    /// one shape that destroys no interior boundary) and
-    /// `a_delete_of_an_interior_boundary_key_must_not_change_the_partition` (`#[ignore]`d, and it
-    /// needs the merge).
+    /// This closes the empty-leaf defect and nothing else; an erased content boundary is
+    /// [`CowTree::merge_right`]'s job, and the two are genuinely different repairs. A delete that
+    /// erases a terminator empties no leaf at all, so there is nothing here for it to unlink —
+    /// measured identical either side of this function before `merge_right` existed.
     fn unlink_up(
         &self,
         root: PageId,
@@ -1344,6 +1511,86 @@ mod delete_unlink_tests {
         out
     }
 
+    /// Assert how many leaves (excluding the last) fail to end on a content boundary.
+    fn assert_unterminated_leaves(t: &CowTree, root: PageId, want: usize, ctx: &str) {
+        let leaves = leaf_entries_of(t, root);
+        let bad: Vec<usize> = leaves
+            .iter()
+            .enumerate()
+            .take(leaves.len() - 1)
+            .filter(|(_, l)| {
+                let (k, v) = l.last().expect("no leaf may be empty");
+                !chunker::is_boundary(k, v)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bad.len(),
+            want,
+            "{ctx}: {} of {} leaves do not end on a content boundary (leaves {:?}) -- the \
+             partition is no longer a function of the rows",
+            bad.len(),
+            leaves.len(),
+            &bad[..bad.len().min(8)]
+        );
+    }
+
+    /// Leaves of the subtree at `pid`, in key order.
+    fn collect_leaves(t: &CowTree, pid: PageId, out: &mut Vec<node::LeafEntries>) {
+        let h = t.store.read_page(pid).unwrap();
+        let f = h.read();
+        let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+        let n = Node::new(&f.data);
+        if ty == PageType::BTreeLeaf {
+            out.push(n.leaf_entries().unwrap());
+        } else {
+            let kids = n.all_children().unwrap();
+            drop(f);
+            drop(h);
+            for c in kids {
+                collect_leaves(t, c, out);
+            }
+        }
+    }
+
+    /// Every leaf's entries, in key order.
+    fn leaf_entries_of(t: &CowTree, root: PageId) -> Vec<node::LeafEntries> {
+        fn go(t: &CowTree, pid: PageId, out: &mut Vec<node::LeafEntries>) {
+            let h = t.store.read_page(pid).unwrap();
+            let f = h.read();
+            let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+            let n = Node::new(&f.data);
+            if ty == PageType::BTreeLeaf {
+                out.push(n.leaf_entries().unwrap());
+            } else {
+                let kids = n.all_children().unwrap();
+                drop(f);
+                drop(h);
+                for c in kids { go(t, c, out); }
+            }
+        }
+        let mut out = Vec::new();
+        go(t, root, &mut out);
+        out
+    }
+
+    /// How `cow::chunker` says this content should be cut, independent of any tree. This is the
+    /// authority both a built tree and a repaired one are supposed to obey.
+    fn chunker_partition(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
+        let sizes: Vec<usize> =
+            rows.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).collect();
+        let hashes: Vec<u32> = rows.iter().map(|(k, _)| chunker::key_hash(k)).collect();
+        let cuts = chunker::leaf_cuts(&sizes, &hashes, node::NODE_CAPACITY);
+        let mut out = Vec::new();
+        let mut prev = 0usize;
+        for &c in &cuts {
+            out.push(c - prev);
+            prev = c;
+        }
+        out.push(rows.len() - prev);
+        out
+    }
+
     /// **The property the unlink exists for.** An emptied leaf must leave the tree rather than
     /// stay linked holding nothing.
     ///
@@ -1528,6 +1775,319 @@ mod delete_unlink_tests {
         }
     }
 
+    /// **The merge, held to the chunker's own invariant.** Delete the key that terminates a leaf
+    /// and the leaf must be rejoined with its neighbour, so that every leaf but the last still
+    /// ends ON a content boundary — which is exactly what
+    /// `cow::tests_chunking::every_leaf_but_the_last_ends_on_a_content_boundary` demands of the
+    /// insert path, and what makes the partition a function of the rows.
+    ///
+    /// **Not** equality with `chunker::leaf_cuts` over the whole row list, which is a different
+    /// and wrong claim: `leaf_cuts` re-cuts an over-capacity piece at a finer target, so its
+    /// answer depends on the window it is given and legitimately differs from a tree's wherever
+    /// that recursion fires. Asserting it cost an hour before the distinction was clear.
+    ///
+    /// The victims are spread across the tree rather than taken in order. Deleting terminators
+    /// consecutively merges the same region over and over — measured at 42, 93, 105, 122, 173 and
+    /// then 256 entries — until the run no longer fits a page and the byte cap cuts it somewhere
+    /// the content did not choose. That is the chunker's own documented exception
+    /// (`chunker::CHUNK_SHIFT`), not a property of this repair, and
+    /// `deleting_every_boundary_drives_chunks_over_a_page` pins it separately.
+    #[test]
+    fn deleting_a_terminating_boundary_key_rejoins_the_leaf_with_its_neighbour() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 4000);
+        assert_unterminated_leaves(&t, root, 0, "a freshly built tree");
+
+        let e = cat.next_epoch();
+        let mut repaired = 0usize;
+        for step in 0..30usize {
+            let leaves = leaf_entries_of(&t, root);
+            if leaves.len() < 8 {
+                break;
+            }
+            // Spread out, so each repair joins two leaves rather than compounding one run.
+            let idx = (step * 7 + 1) % (leaves.len() - 1);
+            let (vk, vv) = leaves[idx].last().unwrap().clone();
+            assert!(chunker::is_boundary(&vk, &vv), "fixture: leaf {idx} must end on a boundary");
+
+            let before = leaves.len();
+            root = t.delete(root, BranchId::TRUNK, e, &vk).unwrap();
+            let after = leaf_entries_of(&t, root).len();
+            assert!(after < before, "deleting terminator {vk:?} did not rejoin anything");
+            assert_unterminated_leaves(&t, root, 0, &format!("after deleting terminator {vk:?}"));
+            repaired += 1;
+        }
+        assert!(repaired > 10, "only {repaired} repairs exercised");
+        println!("    {repaired} terminators deleted; every leaf but the last still ends on a boundary");
+    }
+
+    /// **The limit of the repair, measured rather than left to be discovered.** Deleting a leaf's
+    /// terminator joins it to its neighbour, and the join has only ONE boundary — the neighbour's
+    /// last entry. So deleting terminators repeatedly in one region grows a single run without
+    /// bound, and once it no longer fits a page `chunker::leaf_cuts` falls back to cutting it by
+    /// SIZE. Those cuts are not content boundaries, so the partition stops being a function of
+    /// the rows there.
+    ///
+    /// That is `chunker::CHUNK_SHIFT`'s documented exception reached deliberately rather than by
+    /// an `e^-8` accident, and the repair cannot avoid it: the content genuinely has no boundary
+    /// left to cut on. Pinned so the number is visible if the trade is ever retuned.
+    #[test]
+    fn deleting_every_boundary_drives_chunks_over_a_page() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 4000);
+        let e = cat.next_epoch();
+
+        for _ in 0..40 {
+            let leaves = leaf_entries_of(&t, root);
+            if leaves.len() < 3 {
+                break;
+            }
+            let (vk, _) = leaves[0].last().unwrap().clone();
+            root = t.delete(root, BranchId::TRUNK, e, &vk).unwrap();
+        }
+
+        let leaves = leaf_entries_of(&t, root);
+        let capped = leaves
+            .iter()
+            .enumerate()
+            .take(leaves.len() - 1)
+            .filter(|(_, l)| {
+                let (k, v) = l.last().unwrap();
+                !chunker::is_boundary(k, v)
+            })
+            .count();
+        let widest = leaves.iter().map(|l| l.len()).max().unwrap_or(0);
+        println!(
+            "    after 40 terminator deletes in one region: {} leaves, widest {widest} rows, \
+             {capped} cut by the byte cap rather than by content",
+            leaves.len()
+        );
+        // Every leaf must still FIT, which is the guarantee that has no exception.
+        for (i, l) in leaves.iter().enumerate() {
+            let bytes: usize =
+                l.iter().map(|(k, v)| node::leaf_entry_bytes(k, v)).sum();
+            assert!(bytes <= node::NODE_CAPACITY, "leaf {i} holds {bytes} bytes, over capacity");
+        }
+        assert!(capped > 0, "the byte cap never fired; this no longer measures its own subject");
+    }
+
+    /// The same repair when the neighbour is **under a different parent**, which is the case the
+    /// climb exists for and the one a same-parent-only merge would silently skip.
+    #[test]
+    fn a_boundary_delete_rejoins_across_a_parent_as_well() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 12_000);
+        let depth = t.descend(root, &k(0)).unwrap().0.len();
+        assert!(depth >= 2, "tree is {depth} internal level(s); no cross-parent case exists");
+
+        // Terminators of leaves that are the LAST child of their own parent: repairing those is
+        // exactly what needs the climb.
+        let mut victims = Vec::new();
+        {
+            let leaves = leaf_entries_of(&t, root);
+            for (i, l) in leaves.iter().enumerate().take(leaves.len() - 1) {
+                let (kk, vv) = l.last().unwrap();
+                let (path, _) = t.descend(root, kk).unwrap();
+                let (parent, slot) = *path.last().unwrap();
+                let kids = {
+                    let h = t.store.read_page(parent).unwrap();
+                    let f = h.read();
+                    Node::new(&f.data).all_children().unwrap()
+                };
+                let taken = match slot { None => 0, Some(j) => j + 1 };
+                if taken + 1 >= kids.len() {
+                    victims.push(kk.clone());
+                }
+                let _ = (i, vv);
+            }
+        }
+        assert!(!victims.is_empty(), "no leaf is its parent's last child; the climb is untested");
+
+        let e = cat.next_epoch();
+        let mut survivors: Vec<(Vec<u8>, Vec<u8>)> =
+            leaf_entries_of(&t, root).into_iter().flatten().collect();
+        for victim in &victims {
+            root = t.delete(root, BranchId::TRUNK, e, victim).unwrap();
+            survivors.retain(|(kk, _)| kk != victim);
+            let want = chunker_partition(&survivors);
+            let got: Vec<usize> = leaf_entries_of(&t, root).iter().map(|l| l.len()).collect();
+            assert_eq!(got, want, "cross-parent repair of {victim:?} did not match the chunker");
+        }
+        println!("    {} cross-parent terminators repaired at depth {depth}", victims.len());
+    }
+
+    /// An OVERWRITE can erase a terminator too, and `leaf_put` can only ever split a leaf
+    /// further, never rejoin one — so without the same repair the two leaves stay split for good.
+    ///
+    /// The value has to get SHORTER, not longer, and that is not a detail: an entry is a boundary
+    /// when its key hash falls in the lowest `size / target` of the hash space, so growing the
+    /// value makes a boundary MORE likely and can never erase one. The first version of this test
+    /// appended bytes trying to clear the flag, never cleared it once, and failed on its own
+    /// vacuity guard — which is the guard doing its job.
+    #[test]
+    fn an_overwrite_that_erases_a_terminator_also_rejoins() {
+        let (_d, cat, t) = tree();
+        // Roomier values than `filled` uses, so emptying one is a big enough size change to move
+        // an entry across the boundary threshold at all.
+        let e0 = cat.next_epoch();
+        let mut root = t.create(BranchId::TRUNK, e0).unwrap();
+        for i in 0..4000u32 {
+            root = t
+                .insert(root, BranchId::TRUNK, e0, &k(i), format!("value{i:08}").as_bytes())
+                .unwrap();
+        }
+        assert_unterminated_leaves(&t, root, 0, "a freshly built tree");
+
+        let e = cat.next_epoch();
+        let mut repaired = 0usize;
+        for _ in 0..40usize {
+            // A terminator that STOPS being one when its value is emptied. Searched for rather
+            // than assumed: only entries whose hash sits in the band between the two sizes flip.
+            let leaves = leaf_entries_of(&t, root);
+            if leaves.len() < 8 {
+                break;
+            }
+            let victim = leaves
+                .iter()
+                .take(leaves.len() - 1)
+                .map(|l| l.last().unwrap().clone())
+                .find(|(vk, vv)| {
+                    chunker::is_boundary(vk, vv) && !chunker::is_boundary(vk, b"")
+                });
+            let Some((vk, _)) = victim else { break };
+
+            let before = leaves.len();
+            root = t.insert(root, BranchId::TRUNK, e, &vk, b"").unwrap();
+            let after = leaf_entries_of(&t, root).len();
+            assert!(
+                after < before,
+                "overwriting terminator {vk:?} with a shorter value did not rejoin anything \
+                 ({before} -> {after} leaves)"
+            );
+            assert_unterminated_leaves(&t, root, 0, &format!("after overwriting {vk:?}"));
+            repaired += 1;
+        }
+        assert!(
+            repaired > 3,
+            "only {repaired} overwrites erased a terminator; the fixture is not exercising this"
+        );
+        println!("    {repaired} terminator overwrites repaired");
+    }
+
+    /// The anti-corruption guard for the merge, as for the unlink: a repair must not lose,
+    /// reorder or resurrect a row.
+    #[test]
+    fn no_row_is_lost_or_reordered_by_a_boundary_repair() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 4000);
+        let e = cat.next_epoch();
+
+        let mut expect: Vec<u32> = (0..4000).collect();
+        for step in 0..40u32 {
+            let leaves = leaf_entries_of(&t, root);
+            if leaves.len() < 3 { break; }
+            let (vk, _) = leaves[(step as usize * 7) % (leaves.len() - 1)].last().unwrap().clone();
+            let n = u32::from_be_bytes(vk.clone().try_into().unwrap());
+            root = t.delete(root, BranchId::TRUNK, e, &vk).unwrap();
+            expect.retain(|i| *i != n);
+
+            let scanned: Vec<u32> = t
+                .range_scan(root, None, None)
+                .unwrap()
+                .map(|r| u32::from_be_bytes(r.unwrap().0.try_into().unwrap()))
+                .collect();
+            assert_eq!(scanned, expect, "rows diverged after repair {step}");
+        }
+        for i in &expect {
+            assert_eq!(
+                t.get(root, &k(*i)).unwrap().as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "survivor {i} is gone or wrong"
+            );
+        }
+    }
+
+    /// **The cascade branch of [`CowTree::unlink_up`], which nothing else here reaches.**
+    ///
+    /// Every other test in this module uses a 1000-row fixture, and that is a TWO-level tree — one
+    /// root over ~44 leaves. A leaf's parent is therefore the root, so emptying a subtree only ever
+    /// exercises the cascaded-past-the-root tail. The branch that removes a **childless internal
+    /// node from its own parent** — the case `unlink_up`'s longest doc paragraph exists to justify,
+    /// and the one where getting it wrong leaves a live grandparent pointing at a freed page —
+    /// never executed. Found by review, not by these tests.
+    ///
+    /// This forces it: build deep enough for a middle level, pick one mid-level internal node,
+    /// delete every key beneath it, and require that the node leave the tree while everything
+    /// else survives untouched.
+    #[test]
+    fn a_childless_internal_node_is_removed_from_its_parent() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 12_000);
+
+        // Non-vacuity, asserted rather than assumed: without a middle level there is no such node.
+        let depth = t.descend(root, &k(0)).unwrap().0.len();
+        assert!(depth >= 2, "tree is {depth} internal level(s); the cascade branch cannot exist");
+
+        // A mid-level internal node, and every key beneath it.
+        let mid = {
+            let h = t.store.read_page(root).unwrap();
+            let f = h.read();
+            let kids = Node::new(&f.data).all_children().unwrap();
+            assert!(kids.len() >= 2, "root has {} children; removing one would empty the tree", kids.len());
+            kids[0]
+        };
+        let mut doomed_keys = Vec::new();
+        {
+            let mut leaves = Vec::new();
+            collect_leaves(&t, mid, &mut leaves);
+            assert!(leaves.len() > 1, "the chosen node has {} leaf; pick a real subtree", leaves.len());
+            for l in leaves {
+                for (kk, _) in l {
+                    doomed_keys.push(kk);
+                }
+            }
+        }
+        let survivors_before: Vec<Vec<u8>> = leaf_entries_of(&t, root)
+            .into_iter()
+            .flatten()
+            .map(|(kk, _)| kk)
+            .filter(|kk| !doomed_keys.contains(kk))
+            .collect();
+        assert!(!survivors_before.is_empty(), "the subtree is the whole tree");
+
+        let pages_before = t.store.live_page_count().unwrap();
+        let e = cat.next_epoch();
+        for kk in &doomed_keys {
+            root = t.delete(root, BranchId::TRUNK, e, kk).unwrap();
+        }
+
+        // The internal node itself must be gone from the tree, not merely emptied.
+        let reachable = t.walk_pages(root).unwrap();
+        assert!(
+            !reachable.contains(&mid),
+            "the emptied internal node {mid} is still linked into the tree"
+        );
+        // Its pages went back, rather than being unlinked and leaked.
+        let pages_after = t.store.live_page_count().unwrap();
+        println!(
+            "    removed a mid-level subtree of {} rows at depth {depth}: live pages {pages_before} -> {pages_after}",
+            doomed_keys.len()
+        );
+        assert!(pages_after < pages_before, "live pages did not drop ({pages_before} -> {pages_after})");
+
+        // And nothing else moved: every surviving row still readable, in order, none resurrected.
+        for kk in &doomed_keys {
+            assert_eq!(t.get(root, kk).unwrap(), None, "deleted key {kk:?} is still readable");
+        }
+        let scanned: Vec<Vec<u8>> = t
+            .range_scan(root, None, None)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(scanned, survivors_before, "the surviving rows changed or reordered");
+        assert_unterminated_leaves(&t, root, 0, "after removing a whole mid-level subtree");
+    }
+
     /// A delete that hits nothing must still shadow nothing — the unlink path must not fire on a
     /// miss and must not be reached by one.
     #[test]
@@ -1539,5 +2099,137 @@ mod delete_unlink_tests {
         let same = t.delete(root, BranchId::TRUNK, e, &k(9999)).unwrap();
         assert_eq!(same, root, "a miss shadowed the tree");
         assert_eq!(t.walk_pages(same).unwrap(), pages, "a miss changed the page set");
+    }
+}
+
+#[cfg(test)]
+mod right_walk_probe {
+    //! DESIGN PROBE for the neighbour merge. Establishes one fact: the right-hand neighbour of a
+    //! leaf is reachable from an ordinary descent path, with no sibling pointer anywhere.
+    use super::*;
+    use crate::branch::arena::ArenaPageStore;
+    use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::BranchCatalog;
+    use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::storage::disk_manager::DiskManager;
+
+    fn tree() -> (tempfile::TempDir, Arc<LogBranchCatalog>, CowTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dir.path().join("rw.db")).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(dm));
+        let cat = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(
+            ArenaPageStore::new(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, 1024).unwrap(),
+        );
+        (dir, cat, CowTree::new(store as Arc<dyn PageStore>))
+    }
+    fn k(n: u32) -> Vec<u8> { n.to_be_bytes().to_vec() }
+
+    impl CowTree {
+        /// The leftmost leaf of the subtree at `pid`.
+        fn leftmost_leaf_probe(&self, mut pid: PageId) -> Result<PageId, FerroError> {
+            for _ in 0..MAX_DESCENT {
+                let h = self.store.read_page(pid)?;
+                let f = h.read();
+                if PageHeader::read_from(&f.data)?.page_type == PageType::BTreeLeaf {
+                    return Ok(pid);
+                }
+                let next = Node::new(&f.data).leftmost();
+                drop(f); drop(h);
+                pid = next;
+            }
+            Err(FerroError::Cow("leftmost walk exceeded the depth guard".into()))
+        }
+
+        /// The leaf immediately to the right of the one `path` ends at, or `None` if it is the
+        /// last. **No sibling pointer**: it climbs the descent path to the shallowest ancestor
+        /// that still has a child further right, then takes that subtree's leftmost leaf.
+        fn right_neighbour_probe(&self, path: &DescentPath) -> Result<Option<PageId>, FerroError> {
+            for (parent_id, slot) in path.iter().rev() {
+                let kids = {
+                    let h = self.store.read_page(*parent_id)?;
+                    let f = h.read();
+                    Node::new(&f.data).all_children()?
+                };
+                // `all_children` is [leftmost, child(0), child(1), ...], so slot i sits at i+1.
+                let taken = match slot { None => 0, Some(i) => i + 1 };
+                if taken + 1 < kids.len() {
+                    return Ok(Some(self.leftmost_leaf_probe(kids[taken + 1])?));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    /// Exhaustive, not a sample: for EVERY leaf in the tree, the descent-path right-walk must
+    /// name exactly the next leaf in key order, and `None` for the last one.
+    #[test]
+    fn every_leaf_can_reach_its_right_neighbour_without_a_sibling_pointer() {
+        let (_d, cat, t) = tree();
+        let e = cat.next_epoch();
+        let mut root = t.create(BranchId::TRUNK, e).unwrap();
+        // Deep enough that the right neighbour is NOT always a sibling under one parent. The
+        // first version of this probe used 2000 rows, got a 2-level tree (90 leaves under a
+        // single root), and so never exercised the climb at all -- it verified only the easy
+        // case while reading as exhaustive. The depth is asserted below for that reason.
+        for i in 0..12_000u32 {
+            root = t.insert(root, BranchId::TRUNK, e, &k(i), format!("v{i}").as_bytes()).unwrap();
+        }
+
+        // Ground truth: the leaves in key order, by first key.
+        let mut truth: Vec<(PageId, Vec<u8>)> = Vec::new();
+        fn walk(t: &CowTree, pid: PageId, out: &mut Vec<(PageId, Vec<u8>)>) {
+            let h = t.store.read_page(pid).unwrap();
+            let f = h.read();
+            let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+            let n = Node::new(&f.data);
+            if ty == PageType::BTreeLeaf {
+                out.push((pid, n.key(0).unwrap().to_vec()));
+            } else {
+                let kids = n.all_children().unwrap();
+                drop(f); drop(h);
+                for c in kids { walk(t, c, out); }
+            }
+        }
+        walk(&t, root, &mut truth);
+        assert!(truth.len() > 8, "only {} leaves; the probe would be vacuous", truth.len());
+        // The whole point: at depth 1 every right neighbour shares a parent and the climb is
+        // never taken. Refuse rather than report a pass that proves only the easy half.
+        let depth = t.descend(root, &truth[0].1).unwrap().0.len();
+        assert!(depth >= 2, "tree is {depth} internal level(s); the cross-parent climb is untested");
+        // And at least one leaf must actually REQUIRE the climb, i.e. be the last child of its
+        // own parent while still having a neighbour to its right.
+        let mut climbed = 0usize;
+        for (i, (_, first_key)) in truth.iter().enumerate().take(truth.len() - 1) {
+            let (path, _) = t.descend(root, first_key).unwrap();
+            let (parent, slot) = *path.last().unwrap();
+            let kids = {
+                let h = t.store.read_page(parent).unwrap();
+                let f = h.read();
+                Node::new(&f.data).all_children().unwrap()
+            };
+            let taken = match slot { None => 0, Some(j) => j + 1 };
+            if taken + 1 >= kids.len() { climbed += 1; }
+            let _ = i;
+        }
+        assert!(climbed > 0, "no leaf is the last child of its parent; the climb is still untested");
+
+        for (i, (leaf, first_key)) in truth.iter().enumerate() {
+            let (path, landed) = t.descend(root, first_key).unwrap();
+            assert_eq!(landed, *leaf, "descent to leaf {i}'s own first key missed it");
+            let got = t.right_neighbour_probe(&path).unwrap();
+            let want = truth.get(i + 1).map(|(p, _)| *p);
+            assert_eq!(got, want, "right neighbour of leaf {i} of {}", truth.len());
+        }
+        println!(
+            "    right-walk verified for all {} leaves at depth {}; {} of them required the \
+             cross-parent climb. No sibling pointer anywhere.",
+            truth.len(),
+            depth,
+            climbed
+        );
     }
 }
