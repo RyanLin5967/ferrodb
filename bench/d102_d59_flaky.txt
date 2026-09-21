@@ -1,0 +1,37 @@
+D102 — d59_snapshot_cache::a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move
+IS LOAD-FLAKY, NOT A D102 REGRESSION.
+
+Seen failing during D102's integration sweep at 97413b2. The assertion is an
+anti-vacuity threshold on THROUGHPUT, not on a structural property:
+
+    tests/d59_snapshot_cache.rs:189
+    assert!(n > 1000, "the writer churned only {n} times; the race was not exercised");
+
+THE INSTRUMENT THAT SETTLES IT: the SAME binary at the SAME commit, three consecutive
+runs, no code change between them, on a box at load ~16 with the agent fleet running and
+this branch's own 124-target test loop and cargo builds competing for CPU:
+
+    rep 1   FAILED   "the writer churned only 376 times"
+    rep 2   FAILED   "the writer churned only 980 times"
+    rep 3   ok       1 passed
+
+A failure whose outcome moves 376 -> 980 -> pass with the code held fixed is not a
+function of the code. It is a wall-clock throughput budget being missed because the
+threads were starved, and the threshold (>1000 churns) sits close enough to what a loaded
+box achieves that it lands on either side.
+
+NOT FIXED HERE, and deliberately so: the fix is to assert the structure rather than the
+moment — pigeonhole the interleaving instead of counting how many happened in a fixed
+window — and tests/d59_snapshot_cache.rs is outside D102's remit. Recorded so the next
+person to see it red does not spend the afternoon bisecting a change that cannot cause it.
+D102 touches only src/branch/arena.rs and src/branch/delta.rs; nothing on this test's path.
+================================================================================
+raw reps:
+--- rep1:
+the writer churned only 376 times; the race was not exercised
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 4.34s
+--- rep2:
+the writer churned only 980 times; the race was not exercised
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 4.12s
+--- rep3:
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 4.02s

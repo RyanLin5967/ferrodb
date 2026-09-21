@@ -78,12 +78,34 @@
 //! at the point where `cow_page`'s full-payload `copy_from_slice` currently throws away
 //! information the writer was holding. The claim worth defending is a measurement, not an idea.
 //!
-//! # Scope: this is the mechanism, not yet the write path
+//! # Scope: what is on the write path, and what is still only measured here
 //!
-//! [`DeltaStore`] is a self-contained store used to encode, bound and measure the mechanism. It is
-//! deliberately **not** wired into `ArenaPageStore::cow_page`: doing that edits files this change
-//! does not own. What is established here is the encoding, the two bounds, and the slope. What is
-//! not established here is behaviour under the real buffer pool, checksums, or the reaper.
+//! **D102 corrected the paragraph that used to sit here.** It said this module was "deliberately
+//! not wired into `ArenaPageStore::cow_page`", and that stayed true long enough to become the
+//! problem: nothing in the crate called this file, so every property below was a property of a
+//! fixture. Two pieces were missing and are now present.
+//!
+//! * A **wire format** — [`PageDelta::encode_to`] and [`PageDelta::decode`]. Without one a delta
+//!   could be computed but never stored, so no write path could have used it whatever else was
+//!   true.
+//! * The **base**. A delta is meaningless without the page it is taken against, and `cow_page`
+//!   was discarding that: the identity of the shadowed page left only as
+//!   `CowPage::previous_page_id`, which the caller consumes to relink a parent and then drops.
+//!   [`crate::branch::arena::ArenaPageStore`] now records it, enforces [`MAX_CHAIN_DEPTH`] at
+//!   write time while recording it, and exposes
+//!   [`crate::branch::arena::ArenaPageStore::delta_against_base`], which encodes a shadow against
+//!   its base and refuses — stores a whole page — when the delta does not beat the page.
+//!
+//! **What is still NOT established, stated so it is not mistaken for done.** The delta is computed
+//! over real arena pages, but `cow_page` still writes a whole page. Making the *stored* bytes the
+//! delta needs a hook at write-back, and there is not one: the buffer pool decides when a dirty
+//! frame reaches disk, `PageStore::flush` has no caller outside tests, and `DiskManager::write`
+//! writes 4096 bytes whatever it is given. So the saving this module measures is a saving in page
+//! OCCUPANCY, and occupancy becomes stored bytes only once several logical pages can share one
+//! physical page. `examples/d102_cow_census.rs` measures both and prints the distinction; D90's
+//! headline is `distinct pages x 4096 + WAL` and therefore cannot see an intra-page saving at all.
+//! Do not quote [`DeltaStore`]'s own sweep as an engine-level result: that store has no buffer
+//! pool, no checksums and no reaper, and it models the encoding, not ferrodb.
 
 use std::collections::HashMap;
 
@@ -380,6 +402,95 @@ impl PageDelta {
             payload[at..at + run.bytes.len()].copy_from_slice(&run.bytes);
         }
         Ok(())
+    }
+
+    /// Serialise into `out`, returning the bytes written.
+    ///
+    /// **The layout is [`PageDelta::encoded_len`] made real, and the two are bound by a test
+    /// rather than by a comment.** `encoded_len` was written first, as the cost model the budget
+    /// rule spends; if the writer and the cost model disagree, the budget is enforced against a
+    /// size the store does not actually occupy, and [`DELTA_BUDGET`] stops meaning anything. So
+    /// the layout is exactly `DELTA_HEADER` = `base: u32` + `depth: u8` + `run_count: u16`,
+    /// followed by `RUN_FRAME` = `at: u16` + `len: u16` per run and then its bytes.
+    ///
+    /// Little-endian throughout, which is what the rest of this engine's on-disk integers use
+    /// (`PageHeader::write_to`, `ArenaPageStore::state_bytes`).
+    pub fn encode_to(&self, out: &mut [u8]) -> Result<usize, FerroError> {
+        let need = self.encoded_len();
+        if out.len() < need {
+            return Err(FerroError::Cow(format!(
+                "a {need}-byte delta does not fit {} bytes of room",
+                out.len()
+            )));
+        }
+        // `u16` run count, so a delta with more runs than that cannot be written. Unreachable from
+        // `between` (a run costs at least 5 bytes and the budget is 1018) but refused rather than
+        // truncated, because a silently truncated run list decodes as a SHORTER, VALID delta and
+        // materialises a page that is wrong in exactly the bytes the writer cared about.
+        let run_count: u16 = self.runs.len().try_into().map_err(|_| {
+            FerroError::Cow(format!("a delta with {} runs cannot be encoded", self.runs.len()))
+        })?;
+        out[0..4].copy_from_slice(&self.base.to_le_bytes());
+        out[4] = self.depth;
+        out[5..7].copy_from_slice(&run_count.to_le_bytes());
+        let mut at = DELTA_HEADER;
+        for run in &self.runs {
+            let len: u16 = run.bytes.len().try_into().map_err(|_| {
+                FerroError::Cow(format!("a {}-byte run cannot be encoded", run.bytes.len()))
+            })?;
+            out[at..at + 2].copy_from_slice(&run.at.to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&len.to_le_bytes());
+            at += RUN_FRAME;
+            out[at..at + run.bytes.len()].copy_from_slice(&run.bytes);
+            at += run.bytes.len();
+        }
+        debug_assert_eq!(at, need, "encode_to wrote a different size than encoded_len promised");
+        Ok(need)
+    }
+
+    /// Parse a delta out of `bytes`, which may be longer than the record.
+    ///
+    /// **Every length is checked against what is actually there.** This parses bytes that came off
+    /// a disk page, so a short buffer, a run that claims to end past the payload, or a run count
+    /// that outruns the record are all reachable from a corrupt or torn page — and each is refused
+    /// rather than clamped. Clamping would turn a damaged record into a plausible one, which is
+    /// the D85 failure shape: a partial write that reads as a complete, smaller truth.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FerroError> {
+        if bytes.len() < DELTA_HEADER {
+            return Err(FerroError::Cow(format!(
+                "a delta record is at least {DELTA_HEADER} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let base = PageId::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let depth = bytes[4];
+        let run_count = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+        let mut runs = Vec::with_capacity(run_count);
+        let mut at = DELTA_HEADER;
+        for i in 0..run_count {
+            if at + RUN_FRAME > bytes.len() {
+                return Err(FerroError::Cow(format!(
+                    "delta record ends inside the framing of run {i} of {run_count}"
+                )));
+            }
+            let run_at = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            let len = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+            at += RUN_FRAME;
+            if at + len > bytes.len() {
+                return Err(FerroError::Cow(format!(
+                    "delta run {i} claims {len} bytes but only {} remain",
+                    bytes.len() - at
+                )));
+            }
+            if run_at as usize + len > PAYLOAD_LEN {
+                return Err(FerroError::Cow(format!(
+                    "delta run {i} at {run_at} of {len} bytes runs past the {PAYLOAD_LEN}-byte payload"
+                )));
+            }
+            runs.push(DeltaRun { at: run_at, bytes: bytes[at..at + len].to_vec() });
+            at += len;
+        }
+        Ok(PageDelta { base, depth, runs })
     }
 }
 
@@ -865,6 +976,116 @@ mod delta_tests {
         let delta = PageDelta::between(1, &full, &full, 1).unwrap();
         let mut wrong = vec![0u8; 10];
         assert!(delta.apply(&mut wrong).is_err(), "applying onto a short buffer must refuse");
+    }
+
+    // ---- the wire format ---------------------------------------------------------------
+
+    /// **The budget is spent in `encoded_len`, so the writer must occupy exactly that.**
+    ///
+    /// `DeltaStore::write` refuses a delta whose `encoded_len()` exceeds `DELTA_BUDGET`, and
+    /// `ArenaPageStore` writes the record into a page with `encode_to`. If the two disagree by so
+    /// much as a byte, the bound is being enforced against a size nothing actually occupies. This
+    /// binds them over a delta with several runs of different lengths, including one at the very
+    /// end of the payload.
+    #[test]
+    fn the_writer_occupies_exactly_what_the_cost_model_charges() {
+        let base = vec![0u8; PAYLOAD_LEN];
+        let mut new = base.clone();
+        new[0] = 1;
+        new[100..140].copy_from_slice(&[7u8; 40]);
+        new[PAYLOAD_LEN - 1] = 9;
+        let delta = PageDelta::between(42, &base, &new, 3).unwrap();
+        assert!(delta.runs().len() >= 3, "the fixture must produce several runs");
+
+        let mut out = vec![0u8; PAYLOAD_LEN];
+        let wrote = delta.encode_to(&mut out).unwrap();
+        assert_eq!(
+            wrote,
+            delta.encoded_len(),
+            "encode_to wrote {wrote} bytes while encoded_len charges {}",
+            delta.encoded_len()
+        );
+    }
+
+    /// A record read back out of a page must rebuild the same page, not merely the same struct.
+    #[test]
+    fn a_record_round_trips_through_bytes_and_rebuilds_the_page() {
+        let mut base = vec![0u8; PAYLOAD_LEN];
+        for (i, b) in base.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut new = base.clone();
+        new[13] = 0xAA;
+        new[2000..2030].copy_from_slice(&[0xBBu8; 30]);
+        let delta = PageDelta::between(7, &base, &new, 2).unwrap();
+
+        let mut out = vec![0u8; PAYLOAD_LEN];
+        let n = delta.encode_to(&mut out).unwrap();
+        let back = PageDelta::decode(&out[..n]).unwrap();
+        assert_eq!(back, delta, "decode did not recover the delta it was given");
+        assert_eq!(back.base(), 7);
+        assert_eq!(back.depth(), 2);
+
+        // Decoding from a buffer LONGER than the record is the real case: the record sits in a
+        // 4072-byte page payload with trailing bytes after it.
+        let from_whole_page = PageDelta::decode(&out).unwrap();
+        assert_eq!(from_whole_page, delta, "a record must parse out of a full page payload");
+
+        let mut rebuilt = base.clone();
+        back.apply(&mut rebuilt).unwrap();
+        assert_eq!(rebuilt, new, "the round-tripped delta rebuilt the wrong page");
+    }
+
+    /// **A truncated record must REFUSE, never decode as a shorter valid one.**
+    ///
+    /// This is the D85 shape applied to the wire format: a partial write that parses cleanly into
+    /// a smaller truth is silent data loss, because the page it materialises is wrong precisely in
+    /// the bytes the writer cared about and nothing anywhere reports an error. Every prefix of a
+    /// real record is therefore fed to `decode` and must fail — except the prefixes that are not
+    /// truncations at all, i.e. the empty-run-list header, which is a legitimate record.
+    #[test]
+    fn every_truncation_of_a_record_is_refused_rather_than_read_short() {
+        let base = vec![0u8; PAYLOAD_LEN];
+        let mut new = base.clone();
+        new[5..9].copy_from_slice(&[1, 2, 3, 4]);
+        new[900..916].copy_from_slice(&[9u8; 16]);
+        let delta = PageDelta::between(3, &base, &new, 1).unwrap();
+        let mut buf = vec![0u8; PAYLOAD_LEN];
+        let n = delta.encode_to(&mut buf).unwrap();
+        assert!(n > DELTA_HEADER, "the fixture must have runs to truncate");
+
+        let mut refused = 0;
+        for cut in 0..n {
+            let got = PageDelta::decode(&buf[..cut]);
+            if cut < DELTA_HEADER {
+                assert!(got.is_err(), "a {cut}-byte buffer is shorter than the header and must refuse");
+                refused += 1;
+                continue;
+            }
+            // At or past the header the run count is readable and says how many runs must follow,
+            // so any cut before the last run's last byte must be refused.
+            assert!(
+                got.is_err(),
+                "a record truncated to {cut} of {n} bytes decoded successfully as {:?} — a \
+                 truncated record that parses is silent data loss",
+                got.map(|d| d.runs().len())
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, n, "every truncation must have been exercised");
+    }
+
+    /// A run that claims to land past the end of the payload is refused, not clamped.
+    #[test]
+    fn a_record_claiming_a_run_past_the_payload_is_refused() {
+        let mut buf = vec![0u8; 32];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // base
+        buf[4] = 1; // depth
+        buf[5..7].copy_from_slice(&1u16.to_le_bytes()); // one run
+        buf[7..9].copy_from_slice(&((PAYLOAD_LEN - 2) as u16).to_le_bytes()); // at
+        buf[9..11].copy_from_slice(&8u16.to_le_bytes()); // len: runs 6 bytes past the end
+        let got = PageDelta::decode(&buf);
+        assert!(got.is_err(), "a run ending past the payload must be refused, got {got:?}");
     }
 
     // ---- the bounds --------------------------------------------------------------------
