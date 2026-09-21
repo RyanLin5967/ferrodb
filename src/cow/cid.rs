@@ -799,25 +799,34 @@ mod tests {
     }
 
     /// **Scoped deliberately: a delete that destroys no interior boundary.** Deleting the
-    /// contiguous suffix `500..1000` leaves the same partition as building those 500 rows directly.
+    /// contiguous suffix `500..1000` leaves the same partition as building those 500 rows
+    /// directly.
     ///
-    /// This was written as an `#[ignore]`d acceptance criterion before `CowTree::unlink_up`
-    /// existed, and it failed then for the right reason — the two leaf-cid sequences agreed for 25
-    /// leaves and the churned tree carried 20 more, every one of them the cid of an empty leaf.
+    /// Written as an `#[ignore]`d acceptance criterion before `CowTree::unlink_up` existed, and
+    /// it failed then for the right reason: the two leaf-cid sequences agreed for every live leaf
+    /// and the churned tree carried a run of extra ones, each the cid of an EMPTY leaf.
     ///
     /// **Its name used to claim the general property and that was too strong.** A contiguous
-    /// suffix is the one delete shape that cannot destroy an interior content boundary: the only
+    /// suffix is the one delete shape that cannot destroy an interior content boundary — the only
     /// terminator it removes belongs to the last leaf, and the last leaf may end anywhere. So this
-    /// passing says the empty-leaf defect is fixed — it does **not** say the delete path converges.
-    /// [`a_delete_of_an_interior_boundary_key_must_not_change_the_partition`] is the shape that
-    /// says the rest, and it still fails.
+    /// passing says the empty-leaf defect is fixed; the interior-boundary shape is
+    /// [`a_delete_of_an_interior_boundary_key_must_not_change_the_partition`], which needed
+    /// `CowTree::merge_right` rather than the unlink.
     ///
-    /// ```text
-    /// before unlink_up   clean 25 leaves,  0 empty, e8051f36dbe91c9d7a1289f9275573a1
-    ///                    churned 45 leaves, 20 empty, 371db26401024a1b95371c569e0b4ffa
-    /// after              clean 22 leaves,  0 empty, a59b5daa282b5b33f85cc0b4aefb1348
-    ///                    churned 22 leaves, 0 empty, a59b5daa282b5b33f85cc0b4aefb1348
-    /// ```
+    /// # No figures are written down here, on purpose
+    ///
+    /// An earlier version of this comment carried a before/after table reading "clean 25 leaves"
+    /// before and "clean 22 leaves" after. That was a **false record**, and its shape is worth
+    /// naming: `unlink_up` runs only inside `CowTree::delete` and therefore cannot change an
+    /// insert-only build at all, so no fix of that diff could move the clean row. The two halves
+    /// had simply been measured on different base commits, and an unrelated change to the tree's
+    /// shape was attributed to this one. It also contradicted the module header 700 lines above,
+    /// which had the right numbers.
+    ///
+    /// The absolute leaf counts are a function of `chunker::CHUNK_SHIFT` and will move again when
+    /// anyone retunes it, so this test PRINTS them rather than asserting or documenting them, and
+    /// asserts only the relationship that is actually the claim. A number that is regenerated on
+    /// every run cannot go stale.
     #[test]
     fn a_suffix_delete_leaves_the_partition_of_the_surviving_rows_alone() {
         let (_d, cat, t) = tree();
@@ -850,6 +859,26 @@ mod tests {
             leaf_partition_cid(&t, churned).unwrap(),
             "same rows must yield one partition cid"
         );
+
+        // Regenerated every run, so it cannot become a false record the way the table that used
+        // to sit in this doc comment did.
+        let empty = leaf_cid(&[]);
+        let count_empty = |root| {
+            ordered_leaf_cids(&t, root).unwrap().iter().filter(|c| **c == empty).count()
+        };
+        println!(
+            "    clean 500 rows  : {} leaves, {} empty, partition cid {}",
+            ordered_leaf_cids(&t, clean).unwrap().len(),
+            count_empty(clean),
+            hex(&leaf_partition_cid(&t, clean).unwrap())
+        );
+        println!(
+            "    1000 then -500  : {} leaves, {} empty, partition cid {}",
+            ordered_leaf_cids(&t, churned).unwrap().len(),
+            count_empty(churned),
+            hex(&leaf_partition_cid(&t, churned).unwrap())
+        );
+        assert_eq!(count_empty(churned), 0, "a delete left an empty leaf linked");
     }
 
     /// **The delete-path gap that is still open.** Deleting the single key that *terminates* a

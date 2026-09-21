@@ -1535,6 +1535,24 @@ mod delete_unlink_tests {
         );
     }
 
+    /// Leaves of the subtree at `pid`, in key order.
+    fn collect_leaves(t: &CowTree, pid: PageId, out: &mut Vec<node::LeafEntries>) {
+        let h = t.store.read_page(pid).unwrap();
+        let f = h.read();
+        let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+        let n = Node::new(&f.data);
+        if ty == PageType::BTreeLeaf {
+            out.push(n.leaf_entries().unwrap());
+        } else {
+            let kids = n.all_children().unwrap();
+            drop(f);
+            drop(h);
+            for c in kids {
+                collect_leaves(t, c, out);
+            }
+        }
+    }
+
     /// Every leaf's entries, in key order.
     fn leaf_entries_of(t: &CowTree, root: PageId) -> Vec<node::LeafEntries> {
         fn go(t: &CowTree, pid: PageId, out: &mut Vec<node::LeafEntries>) {
@@ -1987,6 +2005,87 @@ mod delete_unlink_tests {
                 "survivor {i} is gone or wrong"
             );
         }
+    }
+
+    /// **The cascade branch of [`CowTree::unlink_up`], which nothing else here reaches.**
+    ///
+    /// Every other test in this module uses a 1000-row fixture, and that is a TWO-level tree — one
+    /// root over ~44 leaves. A leaf's parent is therefore the root, so emptying a subtree only ever
+    /// exercises the cascaded-past-the-root tail. The branch that removes a **childless internal
+    /// node from its own parent** — the case `unlink_up`'s longest doc paragraph exists to justify,
+    /// and the one where getting it wrong leaves a live grandparent pointing at a freed page —
+    /// never executed. Found by review, not by these tests.
+    ///
+    /// This forces it: build deep enough for a middle level, pick one mid-level internal node,
+    /// delete every key beneath it, and require that the node leave the tree while everything
+    /// else survives untouched.
+    #[test]
+    fn a_childless_internal_node_is_removed_from_its_parent() {
+        let (_d, cat, t) = tree();
+        let mut root = filled(&t, &cat, 12_000);
+
+        // Non-vacuity, asserted rather than assumed: without a middle level there is no such node.
+        let depth = t.descend(root, &k(0)).unwrap().0.len();
+        assert!(depth >= 2, "tree is {depth} internal level(s); the cascade branch cannot exist");
+
+        // A mid-level internal node, and every key beneath it.
+        let mid = {
+            let h = t.store.read_page(root).unwrap();
+            let f = h.read();
+            let kids = Node::new(&f.data).all_children().unwrap();
+            assert!(kids.len() >= 2, "root has {} children; removing one would empty the tree", kids.len());
+            kids[0]
+        };
+        let mut doomed_keys = Vec::new();
+        {
+            let mut leaves = Vec::new();
+            collect_leaves(&t, mid, &mut leaves);
+            assert!(leaves.len() > 1, "the chosen node has {} leaf; pick a real subtree", leaves.len());
+            for l in leaves {
+                for (kk, _) in l {
+                    doomed_keys.push(kk);
+                }
+            }
+        }
+        let survivors_before: Vec<Vec<u8>> = leaf_entries_of(&t, root)
+            .into_iter()
+            .flatten()
+            .map(|(kk, _)| kk)
+            .filter(|kk| !doomed_keys.contains(kk))
+            .collect();
+        assert!(!survivors_before.is_empty(), "the subtree is the whole tree");
+
+        let pages_before = t.store.live_page_count().unwrap();
+        let e = cat.next_epoch();
+        for kk in &doomed_keys {
+            root = t.delete(root, BranchId::TRUNK, e, kk).unwrap();
+        }
+
+        // The internal node itself must be gone from the tree, not merely emptied.
+        let reachable = t.walk_pages(root).unwrap();
+        assert!(
+            !reachable.contains(&mid),
+            "the emptied internal node {mid} is still linked into the tree"
+        );
+        // Its pages went back, rather than being unlinked and leaked.
+        let pages_after = t.store.live_page_count().unwrap();
+        println!(
+            "    removed a mid-level subtree of {} rows at depth {depth}: live pages {pages_before} -> {pages_after}",
+            doomed_keys.len()
+        );
+        assert!(pages_after < pages_before, "live pages did not drop ({pages_before} -> {pages_after})");
+
+        // And nothing else moved: every surviving row still readable, in order, none resurrected.
+        for kk in &doomed_keys {
+            assert_eq!(t.get(root, kk).unwrap(), None, "deleted key {kk:?} is still readable");
+        }
+        let scanned: Vec<Vec<u8>> = t
+            .range_scan(root, None, None)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(scanned, survivors_before, "the surviving rows changed or reordered");
+        assert_unterminated_leaves(&t, root, 0, "after removing a whole mid-level subtree");
     }
 
     /// A delete that hits nothing must still shadow nothing — the unlink path must not fire on a
