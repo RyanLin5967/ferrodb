@@ -56,6 +56,41 @@ Banked baselines to compare against (all now carry a D101 CORRECTION head block)
 ⚠ Durations on this box are **upper bounds** — it runs a 13-agent fleet at load 20-60. Counters
 (fsyncs, bytes/fsync, applied merges) are not. Every block stamps load before and after.
 
+## ⚠ THE CONFOUND — read before writing any old-vs-new table
+
+**The banked runs and this re-run are not at the same commit, and the gap is ~60 commits.** The
+banked files were produced at `991d6e0`, `3cd3034`, `a8fc8e6` and similar; this branch is
+`fe5df25` + D101. Between them sits, among much else, **D71's predicate pushdown**, which
+`bench/d71_pushdown_fix.txt` claims took the staged write path from O(table) to a descent.
+
+So a raw old-vs-new delta conflates THREE causes and cannot be attributed to any one of them:
+1. stub runtime → the runtime the harness builds (D101),
+2. persistence off → `checkpoint_to` armed (D101),
+3. ~60 commits of engine change, including a fix that deliberately changed one of these curves.
+
+A partial d55 QUICK run (killed deliberately, not a result) read **1T 123,102 stmt/s against the
+banked 2,216** — a 55x gap that no configuration fix produces. That is what surfaced this.
+
+**The instrument that survives it** is each harness's own within-run control, because the control
+arm does not touch the agent runtime and therefore absorbs engine and box drift equally:
+
+| harness | control arm (runtime-independent) | treatment arm | quantity to compare |
+|---|---|---|---|
+| d71 | PLAIN (ordinary UPDATE) | STAGED | STAGED/PLAIN per size |
+| d56 | `arm=plain` | `arm=agent` | agent/plain per size |
+| d55 | PRIVATE (N ServerContexts) | SHARED (one) | shared/private per thread count |
+| d68 | "CONTROL writes" column | "MERGE" column | MERGE/writes per size |
+| d67 | **none — every arm is agent work** | — | shape only; say so |
+
+Banked within-run ratios, precomputed:
+- d71 STAGED/PLAIN: 0.046, 0.083, 0.168, 0.282, 0.442 over 1k→16k. Rises ~10x over 16x rows,
+  which IS the O(table)-vs-flat conclusion stated drift-free.
+- d56 agent/plain: 0.878, 0.903, 0.906 (r1); 0.923, 0.885, 0.909 (r2); 0.880, 0.882, 0.872 (r3).
+  Flat across size — the agent read path tracks the plain one.
+
+Report the raw old-vs-new side by side as asked, then the ratio, and say plainly which of the
+three causes the evidence can and cannot separate.
+
 ⚠ Do **not** assert the five conclusions were wrong. D71's is a complexity class and plausibly
 survives; D68's mechanism (`evaluate_merge` scanning the shared table) runs in both
 configurations. Let the numbers decide and report honestly when a conclusion holds.
