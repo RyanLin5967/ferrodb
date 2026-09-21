@@ -33,6 +33,45 @@
 //! path this module exists to beat, it is that path wearing a skip counter. [`MemoIdentity`]'s own
 //! docs carry the numbers and the rule.
 //!
+//! # When the digest pays, measured — and in this store it mostly does not
+//!
+//! The question was put directly: should this module memoise, or carry a digest, at all? Three
+//! prior measurements said no — `examples/d91_diff_curve.rs` records **zero** skips won by the
+//! digest at every N, `merge3` deleted its own digest on the same finding, and this file's own F2
+//! number has `MemoIdentity(subtree_cid).warm` costing more than the O(N) path it replaces. All
+//! three are **in-lineage**, which is the case [`PageIdentity`] already answers exactly and for
+//! free. Counted here, 16k rows, four changed:
+//!
+//! ```text
+//! diff + PageIdentity  :   18 reads        <- exact, no precompute
+//! diff + SubtreeHash   :  748 reads  + 1085 to stamp = 1833, for the same answer
+//! ```
+//!
+//! **So in-lineage the digest does not pay, at any N, and nothing here should use it.** That is
+//! not news and it is not the whole question, because it is not the case the digest was built for.
+//!
+//! Cross-lineage — two trees holding the same rows that share no page ids — page identity can win
+//! nothing at all, and only a digest can skip. Counted in
+//! `cross_lineage_is_the_digests_own_case_and_it_still_has_to_pay_for_the_stamp`, 1200 rows,
+//! 90 + 90 nodes:
+//!
+//! ```text
+//! PageIdentity :  180 reads, 0 skips      (it must read both trees whole)
+//! SubtreeHash  :    2 reads, 1 skip       (the roots' digests match; the whole tree is skipped)
+//! ...its stamp :  180 reads, paid once
+//! ```
+//!
+//! The stamp reads each node exactly once, which is exactly what the enumeration it replaces
+//! costs — so **a single cross-lineage diff is a wash (182 against 180), and the digest starts
+//! paying at the second diff served by one stamp.** Break-even is 2; at ten diffs it is 200
+//! against 1800. That is the honest shape: not "the digest is worthless", but "the digest is
+//! worthless unless one stamp serves several comparisons, and worthless in-lineage regardless".
+//!
+//! Today nothing in the engine does either — `runtime.rs` passes [`PageIdentity`] and says why,
+//! and `cid::subtree_cid` has no non-test caller. The digest path is kept because the measurement
+//! says it is the only thing that works cross-lineage, not because anything calls it, and that
+//! distinction belongs in front of the next reader rather than in a commit message.
+//!
 //! # A memo over page ids is a cache over recycled keys
 //!
 //! Both identity providers below memoise, and both are caches keyed on a [`PageId`] — an id both
@@ -1718,6 +1757,129 @@ mod tests {
         );
     }
 
+    /// An `ArenaPageStore` fixture: the store `cow_page`'s in-place arm belongs to.
+    fn arena_fixture() -> (TempDir, Arc<crate::branch::catalog::LogBranchCatalog>, Arc<dyn PageStore>, CowTree)
+    {
+        use crate::branch::arena::ArenaPageStore;
+        use crate::branch::catalog::LogBranchCatalog;
+        use crate::branch::BranchCatalog;
+
+        let dir = TempDir::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("arena.db"))
+            .unwrap();
+        let pool = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+        let catalog = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(
+            ArenaPageStore::new(pool, Arc::clone(&catalog) as Arc<dyn BranchCatalog>, 1024).unwrap(),
+        ) as Arc<dyn PageStore>;
+        let tree = CowTree::new(Arc::clone(&store));
+        (dir, catalog, store, tree)
+    }
+
+    /// The three staleness routes, run against **this** key on the store they were probed on.
+    ///
+    /// `fix-merge3` measured `(PageId, birth_epoch)` against main and found it catches route A
+    /// and misses B and C. That is correct, and it is why the key here is not that: the second
+    /// field is the header **checksum**, not the birth epoch alone. This runs all three routes and
+    /// pins which the key catches — including route C, whose answer is *no*, asserted rather than
+    /// assumed so that the documented limit is a tested one.
+    ///
+    /// Route B is `ArenaPageStore::cow_page`'s in-place arm specifically: a branch's second write
+    /// to a page it already owns, returned for mutation without a fresh header.
+    #[test]
+    fn the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant() {
+        use crate::branch::types::LeaseDeadline;
+        use crate::branch::BranchCatalog;
+
+        let (_dir, catalog, store, tree) = arena_fixture();
+
+        // -- Route A: a freed page id handed straight back out. ------------------------------
+        let e = catalog.next_epoch();
+        let solo = tree.create(BranchId::TRUNK, e).unwrap();
+        let solo = tree.insert(solo, BranchId::TRUNK, e, b"a", b"1").unwrap();
+        let a_before = PageVersion::read(&store.read_page(solo).unwrap()).unwrap();
+        let arena = store.read_page(solo).unwrap().header().unwrap().arena_id;
+        store.free_page(solo, catalog.next_epoch()).unwrap();
+        let again = store
+            .alloc_in_arena(arena, PageType::BTreeLeaf, catalog.next_epoch())
+            .unwrap();
+        assert_eq!(again, solo, "premise A: the freed id did not come straight back");
+        let a_after = PageVersion::read(&store.read_page(solo).unwrap()).unwrap();
+        assert_ne!(a_before, a_after, "ROUTE A: a recycled page id is not discriminated");
+        assert_ne!(a_before.birth, a_after.birth, "route A is the birth epoch's case");
+
+        // -- Route B: a branch's SECOND write to a page it already owns. ----------------------
+        // The first write copies out of trunk's arena; the second gets the page back in place.
+        let (_dir2, catalog2, store2, tree2) = arena_fixture();
+        let e = catalog2.next_epoch();
+        let mut root = tree2.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..8u32 {
+            root = tree2.insert(root, BranchId::TRUNK, e, &i.to_be_bytes(), b"v0").unwrap();
+        }
+        let child = catalog2.fork(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap().branch_id;
+        let e = catalog2.next_epoch();
+        let once = tree2.insert(root, child, e, &1u32.to_be_bytes(), b"v1").unwrap();
+        let b_before = PageVersion::read(&store2.read_page(once).unwrap()).unwrap();
+        let cid_before = cid::subtree_cid(&tree2, once).unwrap();
+
+        let e = catalog2.next_epoch();
+        let twice = tree2.insert(once, child, e, &2u32.to_be_bytes(), b"v2").unwrap();
+        assert_eq!(twice, once, "premise B: the second write did not land in place");
+        let b_after = PageVersion::read(&store2.read_page(once).unwrap()).unwrap();
+        assert_ne!(cid_before, cid::subtree_cid(&tree2, once).unwrap(), "premise B: no change");
+
+        assert_eq!(
+            b_before.birth, b_after.birth,
+            "premise B: the birth epoch MOVED, so this is not the in-place route fix-merge3 probed"
+        );
+        assert_ne!(
+            b_before, b_after,
+            "ROUTE B: an in-place write is not discriminated — this is the route that \
+             (PageId, birth_epoch) misses, and the checksum half exists to catch it"
+        );
+
+        // -- Route C: an in-place write to a DESCENDANT. No per-page key can see this. --------
+        let (_dir3, catalog3, store3, tree3) = arena_fixture();
+        let e = catalog3.next_epoch();
+        let mut big = tree3.create(BranchId::TRUNK, e).unwrap();
+        for i in 0..400u32 {
+            big = tree3.insert(big, BranchId::TRUNK, e, &i.to_be_bytes(), b"v0").unwrap();
+        }
+        let kid = catalog3.fork(BranchId::TRUNK, LeaseDeadline::from_now(60_000)).unwrap().branch_id;
+        let e = catalog3.next_epoch();
+        let head = tree3.insert(big, kid, e, &5u32.to_be_bytes(), b"v1").unwrap();
+        assert!(tree3.walk_pages(head).unwrap().len() > 2, "premise C: need an internal root");
+
+        let c_before = PageVersion::read(&store3.read_page(head).unwrap()).unwrap();
+        let sub_before = cid::subtree_cid(&tree3, head).unwrap();
+        let e = catalog3.next_epoch();
+        let head2 = tree3.insert(head, kid, e, &6u32.to_be_bytes(), b"v1").unwrap();
+        assert_eq!(head2, head, "premise C: the root page id moved, so nothing was in-place");
+        let c_after = PageVersion::read(&store3.read_page(head).unwrap()).unwrap();
+        let sub_after = cid::subtree_cid(&tree3, head).unwrap();
+
+        if sub_before != sub_after && c_before == c_after {
+            // The stated limit, reproduced: the subtree changed and the root's own version did
+            // not. Nothing here can catch it, and `PageVersion`'s docs say so.
+            return;
+        }
+        assert!(
+            sub_before != sub_after,
+            "premise C: the descendant write did not change the root's subtree digest, so this \
+             fixture is not exercising route C at all"
+        );
+        panic!(
+            "ROUTE C now DISCRIMINATES ({c_before:?} -> {c_after:?}). That is a better outcome \
+             than this test expects, but PageVersion's docs claim it is impossible — the write \
+             must have touched the root's own bytes. Re-read the copy-up path before believing it."
+        );
+    }
+
     /// The **other** store recycles too, and the guard has to hold there as well.
     ///
     /// Every other test in this module runs on `CowStore`. `ArenaPageStore` is the second
@@ -2161,6 +2323,86 @@ mod tests {
         fn flush(&self) -> Result<(), FerroError> {
             self.inner.flush()
         }
+    }
+
+    /// **Does the digest pay for itself — including cross-lineage, the case it exists for?**
+    ///
+    /// In-lineage the answer was already known and is not in dispute: page identity is exact and
+    /// free, `examples/d91_diff_curve.rs` records zero skips won by the digest at every N, and
+    /// `merge3` deleted its own digest on the same finding. This measures the *other* case, where
+    /// the two trees share no page ids at all, so page identity can win nothing and the digest is
+    /// the only thing that can skip.
+    ///
+    /// The trap in reading that case from `visited` alone: the digest's skips are paid for by the
+    /// stamp, and the stamp is O(N) — the same O(N) the enumeration it replaces costs. So the
+    /// comparison has to be TOTAL reads including precompute, and the question is not "does the
+    /// digest skip" (it does) but "how many diffs must one stamp serve before it has paid".
+    #[test]
+    fn cross_lineage_is_the_digests_own_case_and_it_still_has_to_pay_for_the_stamp() {
+        let f = Fixture::new();
+
+        // Two lineages holding identical rows, built in different orders, sharing no pages.
+        let n = 1200usize;
+        let a = f.build(n);
+        let e = f.tick();
+        f.store.register_branch(B1, Some(BranchId::TRUNK), e).unwrap();
+        let e = f.tick();
+        let mut b = f.tree.create(B1, e).unwrap();
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut s: u32 = 0x5eed_1234;
+        for i in (1..order.len()).rev() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            order.swap(i, (s >> 8) as usize % (i + 1));
+        }
+        for &i in &order {
+            b = f.put(b, B1, &key(i), &value(i, 0));
+        }
+
+        let pa: std::collections::HashSet<PageId> =
+            f.tree.walk_pages(a).unwrap().into_iter().collect();
+        let pb: std::collections::HashSet<PageId> =
+            f.tree.walk_pages(b).unwrap().into_iter().collect();
+        assert_eq!(pa.intersection(&pb).count(), 0, "premise: the lineages share pages");
+
+        let counting = CountingStore::wrap(f.store_dyn());
+        let tree = CowTree::new(Arc::clone(&counting) as Arc<dyn PageStore>);
+
+        counting.take();
+        let by_page = diff(&tree, a, b, &PageIdentity).unwrap();
+        let p = counting.take();
+
+        let h = SubtreeHash::new(Arc::clone(&counting) as Arc<dyn PageStore>);
+        h.stamp(a).unwrap();
+        h.stamp(b).unwrap();
+        let stamp = counting.take();
+        let by_hash = diff(&tree, a, b, &h).unwrap();
+        let d = counting.take();
+
+        assert_eq!(by_page.changes, by_hash.changes, "the providers disagree");
+        assert!(by_page.changes.is_empty(), "premise: the two trees hold the same rows");
+
+        println!("  cross-lineage, {n} rows, {} + {} nodes", pa.len(), pb.len());
+        println!("    PageIdentity  : {p:>6} page reads, {:>4} skips", by_page.skipped_subtrees);
+        println!("    SubtreeHash   : {d:>6} page reads, {:>4} skips", by_hash.skipped_subtrees);
+        println!("    ...its stamp  : {stamp:>6} page reads, paid once");
+        if d < p {
+            println!("    break-even    : {} diffs per stamp", stamp.div_ceil(p - d));
+        }
+
+        // The digest really does win the skip here — that much of its case is true.
+        assert!(by_hash.skipped_subtrees > 0, "the digest won no skips in its own best case");
+        assert!(d < p, "the digest did not reduce the diff's reads even cross-lineage");
+
+        // But the stamp reads every node exactly once, which is precisely what the enumeration it
+        // replaces costs — so the digest cannot win on a SINGLE diff, and only starts paying when
+        // one stamp serves more than one comparison. Measured equal here (180 and 180), and equal
+        // is the structural expectation: both read each of the 180 nodes once.
+        assert!(
+            stamp >= p,
+            "the stamp ({stamp}) has become cheaper than the enumeration it replaces ({p}); a \
+             single cross-lineage diff has started paying for itself, which these docs say it \
+             does not"
+        );
     }
 
     /// The number [`MemoIdentity`]'s docs quote, and the reason they tell you not to do this.
