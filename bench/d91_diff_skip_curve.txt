@@ -1,0 +1,42 @@
+d91 — subtree-skipping structural diff, cost curve at 23057d96d3cc
+run at unix 1789966329
+
+Question: is cow::diff::diff O(delta · log_m N), or O(N) with a skip counter
+bolted on? delta is held at exactly 4 modified rows; N is the only axis.
+
+Instruments:
+  new_visited   cow::diff::DiffStats::visited — nodes whose payload was decoded
+                by the synchronised descent. THE CLAIM.
+  new_skipped   DiffReport::skipped_subtrees (events) and skipped_node_count()
+                (exact nodes under them; an audit walk, not part of the diff).
+  old_touched   walk_pages(base)+walk_pages(head) — what CowTree::diff must
+                enumerate before it can prune. THE CONTROL.
+  old_examined  CowTree::diff's own pages_examined. It reports the DECODE half
+                only, which is why it looks cheap while old_touched tracks N.
+
+All three paths were asserted to return the same 4 Modified rows at every N;
+a row that did not would have aborted the run rather than been banked.
+
+      N   nodes  depth | new_visited  new_visited  skipped  skipped |  old_touched  old_examined
+                       |    (pageid)       (hash)  subtree    nodes |     (control)              
+-------  ------  ----- | -----------  -----------  -------  ------- |  -----------  ------------
+   1000      19      2 |          10           10       14       14 |           38            10
+   4000      73      2 |          10           10       68       68 |          146            10
+  16000     294      3 |          16           16      286      286 |          588            16
+  64000    1178      3 |          18           18      369     1169 |         2356            18
+ 256000    4713      3 |          18           18      384     4704 |         9426            18
+
+      N | t_new_pageid  t_new_hash      t_old | t_stamp (write-time cid, NOT diff cost)
+------- | ------------  ----------  --------- | --------------------------------------
+   1000 | 154.292µs     104.125µs   467.875µs | 290.166µs
+   4000 | 124.333µs     105.458µs   1.348042ms | 990.125µs
+  16000 | 189.375µs     221.625µs   5.352458ms | 4.031042ms
+  64000 | 799.333µs     488.75µs    84.954291ms | 14.568958ms
+ 256000 | 301.541µs     276.292µs   355.434791ms | 78.356ms
+
+SLOPE, 1000 -> 256000 (256x in N):
+  new_visited      10 -> 18     = 1.80x
+  old_touched      38 -> 9426   = 248.05x
+
+VERDICT: the pre-registered 'mechanism works' branch. new_visited grew far slower than N
+while the control tracked N, so the skip is doing structural work rather than counting.
