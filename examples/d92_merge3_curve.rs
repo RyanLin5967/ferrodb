@@ -260,7 +260,7 @@ fn detector_fires(n: usize) -> (MergeStats, usize) {
 
 /// What the stronger identity buys: both sides make the SAME edit. Byte-identical subtrees at
 /// different page ids, so `ShadowId` must descend and `MerkleId` retires it at the root.
-fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
+fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize, usize) {
     let h = Harness::new("convergent");
     let e = h.tick();
     let mut base = h.tree.create(TRUNK, e).unwrap();
@@ -268,6 +268,7 @@ fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
     for i in 0..n {
         base = h.put(base, TRUNK, &key(i), &val);
     }
+    let pages = h.tree.walk_pages(base).unwrap().len();
     let ob = h.fork(21);
     let tb = h.fork(22);
     let ours = h.put(base, ob, &key(n / 2), b"same");
@@ -281,7 +282,7 @@ fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
     let m = merge3(&h.tree, base, ours, theirs, &merkle, into, e).unwrap();
     assert_eq!(m.stats.root_fast_path, Some(RootFastPath::SidesAgree));
     assert!(s.conflicts.is_empty() && m.conflicts.is_empty());
-    (s.stats, m.stats, merkle.subtrees_walked())
+    (s.stats, m.stats, merkle.subtrees_walked(), pages)
 }
 
 fn main() {
@@ -423,7 +424,7 @@ fn main() {
     println!();
 
     // ---- what the stronger identity buys, and what it costs ------------------------------------
-    let (shadow, merkle, hashed) = convergent_edit(16_000);
+    let (shadow, merkle, walks, tree_pages) = convergent_edit(16_000);
     println!("identity comparison — both sides make the SAME edit (truth-table row 4):");
     println!(
         "  ShadowId:  nodes_read = {:>4}, ids_compared = {:>5}, root fast path = {:?}",
@@ -434,7 +435,18 @@ fn main() {
         merkle.nodes_read, merkle.ids_compared, merkle.root_fast_path
     );
     println!("  MerkleId's own cost, reported separately and NOT folded into nodes_read above:");
-    println!("    subtree walks paid for (memo misses) = {hashed}");
+    println!(
+        "    {walks} subtree walks (one per root, all memo misses) over a {tree_pages}-page tree",
+    );
+    println!(
+        "      = about {} page reads. NOT {walks} -- a walk is O(the whole subtree).",
+        walks * tree_pages
+    );
+    println!("    cow::cid::subtree_cid has no memo INSIDE the walk (it says so in its own doc), so");
+    println!("    the three roots share almost every page and re-read all of it. A memo inside the");
+    println!("    recursion would cost about {tree_pages} reads instead of {}; that is the price of",
+        walks * tree_pages);
+    println!("    having ONE content identity in the codebase rather than two that disagree.");
     println!("  Content identity retires a convergent edit at the root that page identity cannot");
-    println!("  see; it pays for that by reading the tree once. That is the trade, stated both ways.");
+    println!("  see; it pays for that by reading the tree three times. Both halves stated.");
 }
