@@ -138,11 +138,37 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
 
     let readers: Vec<_> = (0..4)
         .map(|_| {
-            let (t, stop) = (t.clone(), stop.clone());
+            let (t, stop, churned) = (t.clone(), stop.clone(), churned.clone());
             std::thread::spawn(move || {
                 let (mut checked, mut skipped) = (0u64, 0u64);
                 let t0 = Instant::now();
-                while !stop.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(4) {
+                // Run until the detector has demonstrably FIRED, not for a fixed stretch of
+                // clock. The assertions below require the writer to have churned and the readers
+                // to have both checked and skipped; a wall-clock window makes those counts a
+                // function of how busy the machine is, which is not a property of the code under
+                // test. A fixed 4s window put the churn count right ON its own >1000 threshold
+                // under fleet load — measured 736 and 752 in-target, and 980 / pass / pass when
+                // run alone — so the test failed its vacuity guard rather than anything it was
+                // testing, intermittently, for everyone.
+                //
+                // The assertions' thresholds are NOT lowered: they are the only thing keeping this
+                // test from passing without exercising the race. These are the loop's EXIT
+                // condition instead, which is a stronger guarantee than a margin — the loop cannot
+                // end below them except by hitting `CAP`, so each is set to 2x its assertion
+                // rather than to a number chosen for luck. `CAP` is a deadlock guard, not the
+                // budget.
+                const NEED_CHURN: u64 = 2_000;
+                const NEED_CHECKED: u64 = 500;
+                const CAP: Duration = Duration::from_secs(60);
+                let fired = |checked: u64, skipped: u64, churned: &AtomicU64| {
+                    churned.load(Ordering::Relaxed) >= NEED_CHURN
+                        && checked >= NEED_CHECKED
+                        && skipped >= 1
+                };
+                while !stop.load(Ordering::Relaxed)
+                    && t0.elapsed() < CAP
+                    && !fired(checked, skipped, &churned)
+                {
                     let v1 = t.att_version();
                     let cached = t.read_snapshot_cached();
                     let locked = t.read_snapshot();
