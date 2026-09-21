@@ -541,6 +541,11 @@ where
     /// Pages that were compared without a row that still describes them: never warmed, or warmed
     /// in a previous life of that page id. Both are answered by the page-identity fallback.
     /// Non-zero after a diff means the skip was cruder than the wrapped digest allows.
+    ///
+    /// This counts *queries*, and [`diff`] does not query for a pair that is the same page id —
+    /// it settles those itself. So a diff of two roots that share most of their pages moves this
+    /// counter far less than it moves the descent, which is the intended direction: the pairs it
+    /// stays silent about are the ones no digest was needed for.
     pub fn misses(&self) -> usize {
         self.misses.load(AtomicOrdering::Relaxed)
     }
@@ -836,6 +841,11 @@ fn decode_payload(h: &PageHandle, pid: PageId, enclosing: &Span) -> Result<Paylo
 /// the difference between a stale row *missing* and a stale row *lying*. [`PageIdentity`] has no
 /// memo and so spends nothing.
 ///
+/// A pair that is the **same page id** costs nothing either, from any provider: `id_of` is a pure
+/// function of the page id, so the descent settles that case itself and never asks. In a
+/// copy-on-write store that is what every shared subtree looks like, so it is most of a small
+/// diff — `comparing_a_page_with_itself_never_consults_the_identity_provider` pins it.
+///
 /// `changes` come back in key order.
 pub fn diff(
     tree: &CowTree,
@@ -887,7 +897,13 @@ impl Differ<'_> {
         }
         // The skip. Equal identity => equal subtrees => equal on every sub-range of them, so this
         // holds whether `span` is the children's full span or a clipped piece of it.
-        if self.identity.id_of(a) == self.identity.id_of(b) {
+        //
+        // `a == b` is decided ahead of the provider. `id_of` is a pure function of the page id by
+        // [`NodeIdentity`]'s contract, so the comparison cannot come out anything but equal — and
+        // for the memoising providers, finding that out costs two page fetches and two header
+        // parses. One consequence is deliberate: an identical pair no longer counts toward
+        // [`MemoIdentity::misses`], because no digest was consulted to decide it.
+        if a == b || self.identity.id_of(a) == self.identity.id_of(b) {
             self.stats.note_skip();
             self.skipped_roots.push(a);
             return Ok(());
@@ -1417,6 +1433,77 @@ mod tests {
         let warm = diff(&f.tree, base, head, &PageIdentity).unwrap();
         assert_eq!(cold.changes, warm.changes, "the fallback changed the answer");
         assert!(m.misses() > 0, "an unwarmed memo reported no misses — the counter is dead");
+    }
+
+    /// A [`NodeIdentity`] that counts how often it is consulted, so a claim about the number of
+    /// identity queries is measured rather than reasoned about.
+    struct CountingIdentity<'i> {
+        inner: &'i dyn NodeIdentity,
+        calls: AtomicUsize,
+    }
+
+    impl<'i> CountingIdentity<'i> {
+        fn wrap(inner: &'i dyn NodeIdentity) -> CountingIdentity<'i> {
+            CountingIdentity { inner, calls: AtomicUsize::new(0) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl NodeIdentity for CountingIdentity<'_> {
+        fn id_of(&self, page: PageId) -> [u8; 16] {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.id_of(page)
+        }
+    }
+
+    /// `Differ::walk` decides `a == b` before asking the provider. `id_of` is a pure function of
+    /// the page id by [`NodeIdentity`]'s contract, so that comparison can only come out equal —
+    /// and for the memoising providers it costs two page fetches and two header parses to learn
+    /// it. Comparing a page with itself is not a corner case: it is what every shared subtree
+    /// looks like in a copy-on-write store, which is most of a small diff.
+    ///
+    /// Forced both ways, because a short-circuit that fired unconditionally would report every
+    /// diff as empty.
+    #[test]
+    fn comparing_a_page_with_itself_never_consults_the_identity_provider() {
+        let f = Fixture::new();
+        let base = f.build(1500);
+        let mut head = f.fork(B1, base);
+        head = f.put(head, B1, &key(11), &value(11, 1));
+
+        // One direction: two identical roots are decided without a single query, and the skip is
+        // still counted and still covers the whole tree.
+        let counted = CountingIdentity::wrap(&PageIdentity);
+        let same = diff(&f.tree, base, base, &counted).unwrap();
+        assert_eq!(counted.calls(), 0, "identical roots consulted the provider");
+        assert_eq!(same.skipped_subtrees, 1, "the short-circuit stopped counting the skip");
+        assert_eq!(same.visited, 0);
+        assert!(same.changes.is_empty());
+        assert_eq!(
+            skipped_node_count(&f.tree, &same).unwrap(),
+            f.tree.walk_pages(base).unwrap().len()
+        );
+
+        // The other direction, and the exact invariant. Under `PageIdentity` two ids are equal
+        // iff the pages are the same page, so every surviving query belongs to a pair that went
+        // on to be decoded: one `id_of` per `note_visit`, exactly. Before the short-circuit each
+        // skipped pair also spent two queries, so this ran `2 * skipped_subtrees` higher.
+        let counted = CountingIdentity::wrap(&PageIdentity);
+        let real = diff(&f.tree, base, head, &counted).unwrap();
+        assert_eq!(real.changes.len(), 1, "got {:?}", real.changes);
+        assert!(real.skipped_subtrees > 0, "no subtree was skipped, so nothing was saved here");
+        assert!(counted.calls() > 0, "the short-circuit swallowed every comparison");
+        assert_eq!(
+            counted.calls(),
+            real.visited,
+            "{} identity queries against {} decoded nodes; a pair that was skipped on page id \
+             should have cost no query at all",
+            counted.calls(),
+            real.visited
+        );
     }
 
     #[test]
