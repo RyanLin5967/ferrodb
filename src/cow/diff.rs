@@ -53,7 +53,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::branch::types::{Epoch, PageId};
 use crate::consensus::replicate::{fnv64_update, FNV_OFFSET};
@@ -363,14 +363,46 @@ impl NodeIdentity for SubtreeHash {
 /// # }
 /// # store.register_branch(agent, Some(BranchId::TRUNK), Epoch(3))?;
 /// # let head = tree.insert(base, agent, Epoch(4), &7u32.to_be_bytes(), b"v1")?;
-/// let ident = MemoIdentity::new(|p: PageId| cid::subtree_cid(&tree, p));
-/// ident.warm(&tree, base)?;
-/// ident.warm(&tree, head)?;
+/// let ident = MemoIdentity::new(&tree, |t: &CowTree, p: PageId| cid::subtree_cid(t, p));
+/// ident.warm(base)?;
+/// ident.warm(head)?;
 /// let report = diff(&tree, base, head, &ident)?;
 /// assert_eq!(report.changes.len(), 1);
 /// assert_eq!(ident.misses(), 0);
 /// # Ok::<(), ferrodb::error::FerroError>(())
 /// ```
+///
+/// # One tree, fixed at construction
+///
+/// A row is `(the page's version, the digest of that page)`, and those two halves are only a
+/// *pair* if they were read from the same file. This type therefore takes the tree at [`new`] and
+/// **hands it to the wrapped digest** on every call, so `warm` has no tree argument to get wrong
+/// and the digest has no second tree to reach for. A memo over one file's pages cannot be pointed
+/// at another's:
+///
+/// ```compile_fail
+/// # use ferrodb::branch::types::PageId;
+/// # use ferrodb::cow::btree::CowTree;
+/// # use ferrodb::cow::cid;
+/// # use ferrodb::cow::diff::MemoIdentity;
+/// # fn demo(tree_a: &CowTree, tree_b: &CowTree, root_b: PageId) {
+/// let ident = MemoIdentity::new(tree_a, |t: &CowTree, p: PageId| cid::subtree_cid(t, p));
+/// ident.warm(tree_b, root_b).unwrap(); // `warm` takes a root and nothing else
+/// # }
+/// ```
+///
+/// This replaced a runtime check that could not fire on the case that mattered. The store used to
+/// be captured on the **first** `warm`, so `Arc::ptr_eq` was trivially true there and only a
+/// *second* warm from a different store was refused: a memo whose digest closed over tree A and
+/// was warmed once against tree B was accepted, filled with `(B's page version, A's digest)` rows,
+/// and then answered [`NodeIdentity::id_of`] with the wrong file's id — validated against the
+/// right store, so [`MemoIdentity::misses`] read zero throughout.
+///
+/// What remains is one wilful act, not an accident: a closure may ignore the `&CowTree` it is
+/// handed and capture a different one. That is visible at the call site as an ignored argument,
+/// which is the most a generic adapter over an arbitrary digest can make it.
+///
+/// [`new`]: MemoIdentity::new
 ///
 /// **`warm` is not optional.** An unwarmed page falls back to page identity rather than computing
 /// on the spot, because computing there is exactly the per-comparison blowup this type exists to
@@ -420,24 +452,27 @@ impl NodeIdentity for SubtreeHash {
 /// `warm`'s total above. That is the price of a stale row missing rather than lying, and
 /// [`SubtreeHash`] pays it without an extra fetch at all, because it reads the version off the
 /// page it was going to open anyway.
-pub struct MemoIdentity<F> {
+pub struct MemoIdentity<'t, F> {
+    /// The one tree this memo describes, fixed at construction. Every row's version is read from
+    /// it and every row's digest is computed over it, so the two halves of a row cannot come from
+    /// different files. It is also what [`NodeIdentity::id_of`] validates against, which is all it
+    /// can do with the [`PageId`] it is handed.
+    tree: &'t CowTree,
     compute: F,
-    /// The store the rows were read from, captured on the first `warm`. A row can only be
-    /// validated against the page it came from, and [`NodeIdentity::id_of`] is handed nothing but
-    /// a [`PageId`]; an empty memo has no store and needs none, and only `warm` adds rows.
-    store: OnceLock<Arc<dyn PageStore>>,
     memo: RwLock<HashMap<PageId, (PageVersion, [u8; 16])>>,
     misses: AtomicUsize,
 }
 
-impl<F> MemoIdentity<F>
+impl<'t, F> MemoIdentity<'t, F>
 where
-    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+    F: Fn(&CowTree, PageId) -> Result<[u8; 16], FerroError>,
 {
-    pub fn new(compute: F) -> Self {
+    /// Bind a memo to `tree`. `compute` is handed that same tree on every call — see the type's
+    /// docs for why it is a parameter rather than something the closure captures.
+    pub fn new(tree: &'t CowTree, compute: F) -> Self {
         MemoIdentity {
+            tree,
             compute,
-            store: OnceLock::new(),
             memo: RwLock::new(HashMap::new()),
             misses: AtomicUsize::new(0),
         }
@@ -453,26 +488,18 @@ where
     ///
     /// Read [`MemoIdentity`]'s own docs before warming a whole tree through `cid::subtree_cid` —
     /// it costs more than the path it replaces.
-    pub fn warm(&self, tree: &CowTree, root: PageId) -> Result<usize, FerroError> {
-        let store = self.store.get_or_init(|| tree.store().clone());
-        // A row is only meaningful against the store its version was read from. Warming one memo
-        // from two stores would validate page 7's row against a different file's page 7 — usually
-        // a spurious miss, occasionally a match, and a match here is the silent wrongness this
-        // whole key exists to prevent. Refused rather than documented.
-        if !Arc::ptr_eq(store, tree.store()) {
-            return Err(FerroError::Cow(
-                "MemoIdentity was warmed from two different page stores; a memo row can only be \
-                 validated against the store it was read from"
-                    .into(),
-            ));
-        }
+    ///
+    /// There is no tree argument: the tree is the one given to [`MemoIdentity::new`], so a row's
+    /// version and its digest are read from the same file by construction rather than by a check.
+    pub fn warm(&self, root: PageId) -> Result<usize, FerroError> {
+        let store = self.tree.store();
         let mut written = 0usize;
-        for p in tree.walk_pages(root)? {
+        for p in self.tree.walk_pages(root)? {
             let version = PageVersion::read(&store.read_page(p)?)?;
             if self.fresh_row(p, version).is_some() {
                 continue;
             }
-            let id = tag_content((self.compute)(p)?);
+            let id = tag_content((self.compute)(self.tree, p)?);
             self.memo.write().unwrap().insert(p, (version, id));
             written += 1;
         }
@@ -499,13 +526,12 @@ where
     }
 }
 
-impl<F> NodeIdentity for MemoIdentity<F>
+impl<F> NodeIdentity for MemoIdentity<'_, F>
 where
-    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+    F: Fn(&CowTree, PageId) -> Result<[u8; 16], FerroError>,
 {
     fn id_of(&self, page: PageId) -> [u8; 16] {
-        if let Some(store) = self.store.get()
-            && let Ok(handle) = store.read_page(page)
+        if let Ok(handle) = self.tree.store().read_page(page)
             && let Ok(version) = PageVersion::read(&handle)
             && let Some(id) = self.fresh_row(page, version)
         {
@@ -1329,8 +1355,10 @@ mod tests {
         head = f.put(head, B1, &key(11), "changed");
 
         let inner = SubtreeHash::new(f.store_dyn());
-        let m = MemoIdentity::new(|p| inner.stamp(p));
-        let warmed = m.warm(&f.tree, base).unwrap() + m.warm(&f.tree, head).unwrap();
+        // `inner` holds the tree's own store, so ignoring the supplied `&CowTree` here does
+        // not reach a second file — see `a_memo_is_bound_to_one_tree...` for what would.
+        let m = MemoIdentity::new(&f.tree, |_: &CowTree, p| inner.stamp(p));
+        let warmed = m.warm(base).unwrap() + m.warm(head).unwrap();
         assert_eq!(warmed, m.warmed());
 
         let r = diff(&f.tree, base, head, &m).unwrap();
@@ -1350,7 +1378,7 @@ mod tests {
         head = f.put(head, B1, &key(11), "changed");
 
         let inner = SubtreeHash::new(f.store_dyn());
-        let m = MemoIdentity::new(|p| inner.stamp(p));
+        let m = MemoIdentity::new(&f.tree, |_: &CowTree, p| inner.stamp(p));
         assert_eq!(m.warmed(), 0);
 
         let cold = diff(&f.tree, base, head, &m).unwrap();
@@ -1600,8 +1628,8 @@ mod tests {
         let r1 = f.tree.create(BranchId::TRUNK, e).unwrap();
         let r1 = f.put(r1, BranchId::TRUNK, "a", "1");
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&f.tree, p).map(tag_content));
-        assert_eq!(ident.warm(&f.tree, r1).unwrap(), 1);
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p).map(tag_content));
+        assert_eq!(ident.warm(r1).unwrap(), 1);
         let stale = ident.id_of(r1);
         assert_eq!(ident.misses(), 0, "a freshly warmed page must not miss");
 
@@ -1612,7 +1640,7 @@ mod tests {
         assert_eq!(ident.id_of(r1b), page_id_identity(r1b), "a stale row answered a query");
         assert_eq!(ident.misses(), misses_before + 1, "a stale row was not counted as a miss");
 
-        assert_eq!(ident.warm(&f.tree, r1b).unwrap(), 1, "re-warming added no row");
+        assert_eq!(ident.warm(r1b).unwrap(), 1, "re-warming added no row");
         assert_ne!(ident.id_of(r1b), stale, "re-warming did not refresh the recycled page");
         assert_eq!(
             ident.id_of(r1b),
@@ -1621,24 +1649,50 @@ mod tests {
         );
     }
 
-    /// A memo validated against the wrong store is the same failure one level up, so warming one
-    /// from two stores is refused rather than warned about. Forced to fire: without the guard the
-    /// second `warm` succeeds and every later row is checked against a different file's pages.
+    /// A memo's two halves — the page version it validates against and the digest it answers with
+    /// — must come from the same file, and after D109 they do by construction: the tree is fixed
+    /// at [`MemoIdentity::new`] and handed to the digest, so `warm` has no tree argument to get
+    /// wrong. The fixture is the one that used to break it: two stores that hand out the *same*
+    /// page ids for different content, so a memo reaching across them would answer and not miss.
+    ///
+    /// What this replaced: `store` was captured on the FIRST `warm` and compared with
+    /// `Arc::ptr_eq`, which is trivially true there. A memo whose digest closed over tree A and
+    /// was warmed once against tree B was accepted, and every row held (B's page version, A's
+    /// digest) — `id_of` then validated against the right store and returned the wrong file's id
+    /// with `misses()` reading zero. `bench/d109_two_store_guard_before.txt` is that run.
     #[test]
-    fn warming_one_memo_from_two_stores_is_refused() {
-        let a = Fixture::new();
-        let b = Fixture::new();
-        let root_a = a.build(50);
-        let root_b = b.build(50);
+    fn a_memo_is_bound_to_one_tree_so_its_digest_and_its_version_share_a_file() {
+        let a = Fixture::with_extent_pages(8);
+        let b = Fixture::with_extent_pages(8);
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&a.tree, p));
-        assert!(ident.warm(&a.tree, root_a).unwrap() > 0);
+        let ea = a.tick();
+        let ra = a.tree.create(BranchId::TRUNK, ea).unwrap();
+        let ra = a.put(ra, BranchId::TRUNK, "k", "A");
+        let eb = b.tick();
+        let rb = b.tree.create(BranchId::TRUNK, eb).unwrap();
+        let rb = b.put(rb, BranchId::TRUNK, "k", "B");
+        assert_eq!(ra, rb, "premise: two fresh stores hand out the same page id");
 
-        let err = ident.warm(&b.tree, root_b).unwrap_err();
-        assert!(
-            format!("{err:?}").contains("two different page stores"),
-            "the second store was accepted, got {err:?}"
+        let from_a = tag_content(cid::subtree_cid(&a.tree, ra).unwrap());
+        let truth_b = tag_content(cid::subtree_cid(&b.tree, rb).unwrap());
+        assert_ne!(from_a, truth_b, "control: the two files' page {ra} digest differently");
+
+        let ident = MemoIdentity::new(&b.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(ident.warm(rb).unwrap(), 1);
+
+        let answered = ident.id_of(rb);
+        assert_eq!(ident.misses(), 0, "a freshly warmed page must not miss");
+        assert_ne!(
+            answered, from_a,
+            "the memo answered with tree A's digest for a page it validates against tree B"
         );
+        assert_eq!(answered, truth_b, "the memo must answer for the tree it is bound to");
+
+        // And the same page id in the other file is a different memo's business entirely: this
+        // one holds no row that could answer for it.
+        let other = MemoIdentity::new(&a.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(other.warm(ra).unwrap(), 1);
+        assert_eq!(other.id_of(ra), from_a);
     }
 
     // -- the adapter's stated purpose, over a digest that really has no memo -------------------
@@ -1654,8 +1708,8 @@ mod tests {
         let mut head = f.fork(B1, base);
         head = f.put(head, B1, &key(11), "changed");
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&f.tree, p));
-        let warmed = ident.warm(&f.tree, base).unwrap() + ident.warm(&f.tree, head).unwrap();
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        let warmed = ident.warm(base).unwrap() + ident.warm(head).unwrap();
         assert_eq!(warmed, ident.warmed());
 
         let r = diff(&f.tree, base, head, &ident).unwrap();
@@ -1760,8 +1814,8 @@ mod tests {
         stamp.stamp(base).unwrap();
         let stamp_reads = counting.take();
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&tree, p));
-        ident.warm(&tree, base).unwrap();
+        let ident = MemoIdentity::new(&tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        ident.warm(base).unwrap();
         let warm_reads = counting.take();
 
         let skipping = diff(&tree, base, head, &PageIdentity).unwrap();

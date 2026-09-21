@@ -33,6 +33,7 @@ use ferrodb::branch::catalog::LogBranchCatalog;
 use ferrodb::branch::types::{ArenaId, BranchId, Epoch, PageId};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::catalog::column::Value;
+use ferrodb::cow::btree::CowTree;
 use ferrodb::cow::diff::{diff, skipped_node_count, MemoIdentity, PageIdentity};
 use ferrodb::cow::page_header::PageType;
 use ferrodb::cow::{CowPage, PageHandle, PageStore};
@@ -354,9 +355,9 @@ fn the_memoised_content_identity_agrees() {
     assert_eq!(by_page.changes.len(), 3);
 
     // Warmed: no fallbacks, and the same answer.
-    let warm = MemoIdentity::new(|p| ferrodb::cow::cid::subtree_cid(tree, p));
-    warm.warm(tree, base).unwrap();
-    warm.warm(tree, head).unwrap();
+    let warm = MemoIdentity::new(tree, |t: &CowTree, p| ferrodb::cow::cid::subtree_cid(t, p));
+    warm.warm(base).unwrap();
+    warm.warm(head).unwrap();
     let by_cid = diff(tree, base, head, &warm).unwrap();
     assert_eq!(
         warm.misses(),
@@ -368,7 +369,7 @@ fn the_memoised_content_identity_agrees() {
 
     // Unwarmed: still correct, because the fallback is page identity and that is sound here — but
     // `misses` is non-zero, which is the signal that the digest was never actually consulted.
-    let cold = MemoIdentity::new(|p| ferrodb::cow::cid::subtree_cid(tree, p));
+    let cold = MemoIdentity::new(tree, |t: &CowTree, p| ferrodb::cow::cid::subtree_cid(t, p));
     let by_cold = diff(tree, base, head, &cold).unwrap();
     assert_eq!(by_cold.changes, by_page.changes, "the fallback changed the answer");
     assert!(

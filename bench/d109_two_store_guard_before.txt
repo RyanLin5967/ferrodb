@@ -1,0 +1,61 @@
+running 1 test
+test cow::diff::tests::d109_evidence_a_memo_warmed_once_from_a_foreign_tree_answers_with_the_wrong_files_id ... FAILED
+
+failures:
+
+---- cow::diff::tests::d109_evidence_a_memo_warmed_once_from_a_foreign_tree_answers_with_the_wrong_files_id stdout ----
+
+thread 'cow::diff::tests::d109_evidence_a_memo_warmed_once_from_a_foreign_tree_answers_with_the_wrong_files_id' (242446442) panicked at src/cow/diff.rs:1674:9:
+assertion `left != right` failed: the memo answered for tree A's page 1 while validating against tree B's
+  left: [0, 90, 86, 206, 136, 147, 50, 222, 167, 196, 7, 89, 56, 96, 169, 215]
+ right: [0, 90, 86, 206, 136, 147, 50, 222, 167, 196, 7, 89, 56, 96, 169, 215]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cow::diff::tests::d109_evidence_a_memo_warmed_once_from_a_foreign_tree_answers_with_the_wrong_files_id
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1577 filtered out; finished in 0.17s
+
+error: test failed, to rerun pass `--lib`
+
+    /// D109 EVIDENCE, temporary: the guard above cannot fire on the case that matters. `store` is
+    /// captured from whichever tree calls `warm` FIRST, so `Arc::ptr_eq` is trivially true there
+    /// and only a *second* warm from a different store is refused. A memo whose digest closes over
+    /// tree A, warmed **once** against tree B, is accepted and holds rows of (B's page version,
+    /// A's digest) — and `id_of` then validates against the right store and returns the wrong
+    /// file's id with `misses()` reading zero.
+    #[test]
+    fn d109_evidence_a_memo_warmed_once_from_a_foreign_tree_answers_with_the_wrong_files_id() {
+        let a = Fixture::with_extent_pages(8);
+        let b = Fixture::with_extent_pages(8);
+
+        let ea = a.tick();
+        let ra = a.tree.create(BranchId::TRUNK, ea).unwrap();
+        let ra = a.put(ra, BranchId::TRUNK, "k", "A");
+        let eb = b.tick();
+        let rb = b.tree.create(BranchId::TRUNK, eb).unwrap();
+        let rb = b.put(rb, BranchId::TRUNK, "k", "B");
+        assert_eq!(ra, rb, "premise: two fresh stores hand out the same page id");
+
+        let from_a = tag_content(cid::subtree_cid(&a.tree, ra).unwrap());
+        let truth_b = tag_content(cid::subtree_cid(&b.tree, rb).unwrap());
+        assert_ne!(from_a, truth_b, "control: the two files' page {ra} digest differently");
+
+        // The digest closes over tree A. The one and only warm is against tree B.
+        let ident = MemoIdentity::new(|p| cid::subtree_cid(&a.tree, p));
+        let written = ident.warm(&b.tree, rb).expect("warming from a foreign tree was accepted");
+        assert_eq!(written, 1);
+
+        let answered = ident.id_of(rb);
+        assert_eq!(ident.misses(), 0, "the wrong answer moved no counter");
+        assert_ne!(
+            answered, from_a,
+            "the memo answered for tree A's page {ra} while validating against tree B's"
+        );
+        assert_eq!(answered, truth_b, "the memo must answer for the tree it was warmed from");
+    }
+
+    // -- the adapter's stated purpose, over a digest that really has no memo -------------------
+
+    /// [`MemoIdentity`] exists to wrap a digest that keeps **no memo of its own**. The wrapper's
