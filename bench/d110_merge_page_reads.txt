@@ -1,0 +1,101 @@
+D110 — HOW MANY PAGES DOES A MERGE READ? The falsifier for wiring cow::merge3.
+
+SUBJECT: the `MERGE;` statement, reaching AgentRuntime::evaluate_merge (runtime.rs:4024).
+QUESTION: is the production merge already proportional to the diff? If it is, cow::merge3's
+subtree skipping buys no complexity change and the row is dead.
+
+INSTRUMENT: a PageStore decorator counting read_page, bracketing the MERGE statement AND NOTHING
+ELSE. Integers, not durations — and the phase split is not optional here. D68/D69 spent three rows
+misreading this exact curve because one wall clock wrapped `BEGIN AGENT SESSION` + N `UPDATE`s +
+`MERGE` and the total was reported as "merge latency"; the linear term was in the UPDATEs
+(bench/d69_fsync_counted.txt).
+
+WHY A NEW INSTRUMENT AT ALL: the existing one (d69_fsync_counted) counts WAL bytes and fsyncs.
+Those are WRITE-side and structurally blind to a read — a full table scan reads everything and
+writes nothing. This closes the read side of the branch engine.
+
+PRE-REGISTERED, written before the first run:
+  * FLAT merge reads  -> merge already O(delta); merge3 buys nothing; say so and stop.
+  * RISING            -> a table-size term exists and merge3 is the mechanism for it.
+  * A rise in the WRITES column is NOT a result for this row — that is the separate wall D69
+    already named, and it has its own column so it cannot be mistaken for the merge's cost.
+  * ⚠ A ZERO IS NOT A PASS. A merge that did not happen reads no pages, and a dead counter reads
+    the same as a perfect one. The run REFUSES (exit 2) unless the counter is first forced to
+    fire, and refuses if no merge applied or fewer than two sizes were reached.
+
+⚠ BLIND SPOT, STATED IN THE INSTRUMENT ITSELF: this counts branch-engine pages (ArenaPageStore,
+what PagedRows and cow::merge3 use). It does NOT see the ordinary-table side — BufferPoolManager
+exposes no public fetch counter in this build. A column for it was drafted and DELETED rather than
+shipped returning a constant zero, because a counter that cannot fire is worse than no counter:
+its zero reads as evidence. The `writes reads` column is the partial control (same planner, same
+buffer pool). So this proves the CoW tree is untouched by a merge; it does not measure the heap.
+
+RAW HARNESS OUTPUT — examples/d110_merge_page_reads.rs, verbatim
+=================================================================
+
+ferrodb D110 — page reads per MERGE against TABLE SIZE, at fixed delta
+build provenance: at 62ee6e0ed909
+instrument: PageStore::read_page call count, bracketing the MERGE statement alone. No wall clock.
+PRE-REGISTERED: if `merge reads` is FLAT in table size, the production merge is already O(delta)
+  and wiring cow::merge3 buys NO complexity change. If it RISES, merge3 has a shape to offer.
+
+workload: 25 merge cycles per size, 4 rows updated per branch.
+
+  table rows   merges   writes reads   MERGE reads   reads per 1000 rows
+        1000       25            0.0           0.0                0.0000
+        2000       25            0.0           0.0                0.0000
+        4000       25            0.0           0.0                0.0000
+        8000       25            0.0           0.0                0.0000
+       16000       25            0.0           0.0                0.0000
+
+counter fire-check — a path that MUST read branch-engine COW pages:
+  64 x AgentRuntime::put_row  -> 110 read_page calls
+  64 x AgentRuntime::get_row  -> 128 read_page calls
+  -> the counter COUNTS. A zero in the MERGE column is a fact about the merge.
+
+=== READING ===
+  **THE PRODUCTION MERGE READS ZERO BRANCH-ENGINE PAGES, AT EVERY TABLE SIZE.**
+  Not flat — ABSENT. `MERGE;` never descends the CowTree that `cow::merge3` merges.
+
+  The SQL surface keeps base tables in ordinary heap/index pages. `PagedRows` is a
+  parallel store, reached only by put_row / get_row / scan_rows / page_changeset,
+  none of which the MERGE path calls — `self.rows()` has exactly five call sites in
+  runtime.rs and `evaluate_merge` is not one of them.
+
+  ⇒ Wiring cow::merge3 into MERGE is NOT a performance change. There is no tree on
+    that path whose subtrees it could skip. It is a STORAGE MIGRATION — moving base
+    tables into the CoW tree — which runtime.rs's own doc names as future work:
+    "when base tables live in the tree as well, the fork root will hold real rows".
+
+  ⚠ Blind spot, restated at the point of the claim: this counter sees the branch
+    engine only. It proves the CoW tree is untouched by a merge. It does NOT
+    measure the heap side, which has no public fetch counter in this build.
+rc=0
+
+=== READING, reduced by this session ==========================================================
+
+✅ THE ROW IS DEAD, AND THE ZERO IS WHY — not the flatness.
+
+The pre-registered branch was FLAT vs RISING. The answer was neither: it is ABSENT. A MERGE issues
+zero branch-engine page reads at every size, and the fire-check (110 and 128 reads on put_row /
+get_row through the same wrapped store) establishes that is a fact about the merge and not about
+the instrument.
+
+MECHANISM, read from source and agreeing with the measurement:
+  * `self.rows()` — the only door to PagedRows — has exactly FIVE call sites in runtime.rs
+    (put_row :1286, get_row :1303, delete_row :1314, scan_rows :1334, page_changeset :1842).
+    `evaluate_merge` is not one of them.
+  * The merge enumerates its delta from `snapshot.rows`, the workspace's own touched-rows map,
+    and does one PK point lookup per touched row, which the planner turns into an IndexScan
+    descent (has_index true for col==0, optimizer.rs:148; Equal -> point range, plan.rs:165).
+  * So the real merge is O(delta · log N) and never walks a tree to find its delta.
+
+⇒ merge3 skips identical subtrees. That is an advantage over a merge that would otherwise WALK the
+  tree, and none at all over one that never walks it. Wiring it here is a STORAGE MIGRATION —
+  moving base tables into the CoW tree — not a merge change. runtime.rs:1786 says so itself, in
+  the future tense: "when base tables live in the tree as well, the fork root will hold real rows".
+
+⚠ WHAT THIS IS NOT: not a comparison against Dolt or Postgres, and not a measurement of the heap
+  side. It is a shape, in this engine, on the branch-engine store.
+
+FULL ARGUMENT, including the two false premises this row started from: bench/d110_wire_merge3.md

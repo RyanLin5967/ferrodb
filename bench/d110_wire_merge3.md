@@ -45,6 +45,26 @@ re-checked rather than inherited, as instructed:
 
 ---
 
+## Deflation question 1a — what does `ThreeWayMerger` cost, literally as asked?
+
+**O(ops since the fork). Never O(rows in the table) — it never reads the table at all.** It is
+*handed* the two frame lists (`ours: &[TxnFrame]`, `theirs: &[TxnFrame]`) and merges a history, so
+the table cannot appear in its cost:
+
+* `dedup_by_txn`, then one `StampedOp` pushed per op into each `SideIndex` — O(ops).
+* `compose` iterates the **union of touched row keys** and the **union of touched cell keys** —
+  O(rows touched + cells touched).
+* Two further passes over the frames for guards and claims — O(ops).
+
+⚠ One real wart, reported because it was looked for: on the **delete-vs-write path only**,
+`compose_row` (`engine.rs:712-715`) calls `touches_row` / `last_op_on`, and each is a linear scan
+of that side's whole cell map (`self.cells.iter().filter(...)`, `engine.rs:269-283`). That makes
+the delete path **O(rows touched × cells touched)** — quadratic, but quadratic *in the delta*. The
+table size is absent from every term. It is dead code, so this is recorded rather than fixed.
+
+So even the merger the brief believed was on the path is already proportional to the diff. The
+verdict does not depend on which of the two mergers you ask about.
+
 ## Deflation question 1 — what does the real merge cost per merge?
 
 **O(delta · log N), where delta = rows the branch touched. Not O(rows in the table).** Read from
@@ -125,9 +145,23 @@ current, &PageIdentity)`, reached by `DIFF <branch>`, with its cost banked in
 `bench/d103_production_diff_curve.txt`. `agent_sql/paged_rows.rs` is the bridge both would use.
 
 `DIFF` is the operation that genuinely has no delta in hand and must find it from two roots, so the
-synchronised descent buys it a real shape. `MERGE` already holds the delta. The structural mechanism
-was wired to the one operation that needed it, and merge3's zero callers is that fact, not an
-oversight.
+synchronised descent buys it a real shape — and the banked curve shows exactly the shape merge3
+claims, already realised in production:
+
+```
+      N   nodes  depth | visited  skipped  |     walked
+                       |    (the claim)    |  (control)
+-------  ------  ----- | -------  -------  |  ---------
+   1000      67      2 |      10       62  |        134
+  256000   18234      4 |      14      141  |      36468
+
+N grew 256x.  visited grew 1.4x, tracking DEPTH 2 -> 4.  control grew 272x, tracking N.
+```
+
+`MERGE` already holds the delta, so there is no equivalent control for it to beat. **The structural
+mechanism was wired to the one operation that needed it.** merge3's zero callers is that fact, not
+an oversight — and building a second structural descent for the operation that does not need one is
+the shape of the pitch this project has killed 35 times.
 
 ---
 
