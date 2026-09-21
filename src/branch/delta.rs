@@ -285,6 +285,17 @@ impl PageDelta {
         }
         let base = PageId::from_be_bytes(bytes[0..4].try_into().expect("4 bytes"));
         let depth = bytes[4];
+        // ⚠ DEPTH IS THE ONE FIELD THAT GOVERNS COLLAPSE, so it is the one field this validator
+        // must not skip. `between` only ever emits `base_depth + 1`, i.e. 1..=MAX_CHAIN_DEPTH.
+        // A stored delta whose depth byte reads 0 would decode cleanly, `DeltaStore::write` would
+        // read `depth_of` = 0 < MAX_CHAIN_DEPTH and keep STACKING instead of collapsing, until
+        // `materialise` refuses on chain length and the page is permanently unreadable.
+        if depth == 0 || depth > MAX_CHAIN_DEPTH {
+            return Err(FerroError::Cow(format!(
+                "delta carries depth {depth}, which `between` can never emit \
+                 (it emits 1..={MAX_CHAIN_DEPTH}); refusing rather than stacking past the bound"
+            )));
+        }
         let count = u16::from_be_bytes(bytes[5..7].try_into().expect("2 bytes")) as usize;
 
         let mut runs = Vec::with_capacity(count);

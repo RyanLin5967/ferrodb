@@ -228,6 +228,13 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
         // Refuses LOUDLY and names WHICH precondition was starved, so a box that starves the
         // readers rather than the writer says so instead of printing a churn count that looks
         // fine. "The race could not be exercised" must never read as a pass.
+        // ⚠ STOP THE THREADS BEFORE THE REFUSAL CAN UNWIND. This assert fires exactly in the
+        // loaded-box case the guard exists for; if it panics with `stop` unset, the JoinHandles
+        // below are DROPPED rather than joined — which DETACHES them — and the writer, which has
+        // no time bound of its own, keeps hammering a real TxnManager for the rest of this test
+        // binary's run. The refusal's own advice ("re-run on a quieter box") would then be
+        // undermined by the refusal itself saturating the box.
+        stop.store(true, Ordering::Relaxed);
         assert!(
             n > NEED_CHURN && c > NEED_CHECKED && sk > 0,
             "in {:?} this machine reached churned={n} (want >{NEED_CHURN}), checked={c} (want \
@@ -237,7 +244,7 @@ fn a_cached_snapshot_equals_the_locked_one_when_the_version_did_not_move() {
             CEILING
         );
     }
-    stop.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed); // idempotent: the refusal path above already set it
 
     let (mut checked, mut skipped) = (0u64, 0u64);
     for r in readers {
