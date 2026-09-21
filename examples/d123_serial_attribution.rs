@@ -176,31 +176,39 @@ fn mode_phases(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize) 
         }
     }
     println!();
-    println!("THE DECOMPOSITION F4 PRE-REGISTERED. Only one thread can hold `logical`, so");
-    println!("S_eff = hold + gap EXACTLY, with no third term and nothing unaccounted.");
+    println!("THE DECOMPOSITION F4 PRE-REGISTERED. Only one thread can hold `logical` at a time,");
+    println!("so S_eff = HOLD_TOTAL + gap EXACTLY. HOLD_TOTAL runs to the UNLOCK, not to the end of");
+    println!("the work -- Amendment 1: the guard is declared first so it drops LAST, and the record");
+    println!("drops before it are lock-held too. `id` checks HOLD_TOTAL = HOLD+drops+unlock.");
     println!(
-        "  {:>7} {:>11} {:>11} {:>10} {:>10} {:>9} {:>9} {:>8}",
-        "threads", "forks/sec", "S_eff ms", "HOLD ms", "gap ms", "U(hold)", "sum_ph", "resid"
+        "  {:>7} {:>10} {:>9} {:>10} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8}",
+        "threads", "forks/sec", "S_eff", "HOLD_TOT", "gap", "U(hold)", "HOLD", "sum_ph", "in_resid", "id"
     );
     for a in &arms {
         let hold = a.ms(probe::PH_HOLD);
+        let holdt = a.ms(probe::PH_HOLD_TOTAL);
         let s_eff = a.per_fork_ms();
         let sum_ph: f64 = (probe::PH_CORE..=probe::PH_EXTRA).map(|p| a.ms(p)).sum();
+        let ident = holdt - (hold + a.ms(probe::PH_DROPS) + a.ms(probe::PH_UNLOCK));
         println!(
-            "  {:>7} {:>11.1} {:>11.5} {:>10.5} {:>10.5} {:>8.1}% {:>9.5} {:>8.5}",
+            "  {:>7} {:>10.1} {:>9.5} {:>10.5} {:>9.5} {:>8.1}% {:>8.5} {:>8.5} {:>8.5} {:>8.5}",
             a.threads,
             a.throughput(),
             s_eff,
+            holdt,
+            s_eff - holdt,
+            100.0 * holdt / s_eff,
             hold,
-            s_eff - hold,
-            100.0 * hold / s_eff,
             sum_ph,
-            hold - sum_ph
+            hold - sum_ph,
+            ident
         );
     }
     println!();
-    println!("  U near 33% with hold ~0.075 => H-HANDOFF. U near 100% with hold ~0.228 =>");
-    println!("  H-INFLATION, and then `64/1` above names WHICH phase inflated.");
+    println!("  U near 33% => H-HANDOFF: the lock is IDLE most of the interval.");
+    println!("  U near 100% => H-INFLATION: the time is INSIDE the section, and `64/1` above names");
+    println!("  WHICH phase inflated. `in_resid` is section time in no named phase; if it is large");
+    println!("  the partition is incomplete and the attribution is not finished.");
 }
 
 /// F1. The decisive one.
@@ -223,7 +231,7 @@ fn mode_stub(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize) {
             if stub == 0 {
                 base = a.throughput();
             }
-            let hold = a.ms(probe::PH_HOLD);
+            let hold = a.ms(probe::PH_HOLD_TOTAL);
             println!(
                 "  {:>7} {:>5} {:>11.1} {:>10.2}x {:>10.5} {:>10.5} {:>8} {:>8.1} {:>8.1}%",
                 t,
@@ -271,7 +279,7 @@ fn mode_extra(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize) {
                 k,
                 a.throughput(),
                 a.per_fork_ms(),
-                a.ms(probe::PH_HOLD),
+                a.ms(probe::PH_HOLD_TOTAL),
                 a.ms(probe::PH_EXTRA),
                 a.forks as f64 / a.syncs.max(1) as f64
             );
@@ -322,8 +330,8 @@ fn mode_threads(dir: &std::path::Path, n: usize, threads: &[usize], warm: usize)
             t,
             a.throughput(),
             a.per_fork_ms(),
-            a.ms(probe::PH_HOLD),
-            a.per_fork_ms() - a.ms(probe::PH_HOLD),
+            a.ms(probe::PH_HOLD_TOTAL),
+            a.per_fork_ms() - a.ms(probe::PH_HOLD_TOTAL),
             a.syncs,
             a.forks as f64 / a.syncs.max(1) as f64,
             bound,

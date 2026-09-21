@@ -788,7 +788,10 @@ impl BranchCatalog for TableBranchCatalog {
         // `group_commit` for why the ticket is taken last.
         let (child, seq) = {
             let t_wait = probe::mark();
-            let _g = self.logical.lock().unwrap();
+            // ⛔ SCAFFOLD: named `g` rather than `_g` so the unlock can be bracketed explicitly.
+            // Rust drops in reverse declaration order, so a guard declared first unlocks LAST —
+            // after the local records are freed. See `d123_probe::PH_DROPS`.
+            let g = self.logical.lock().unwrap();
             probe::record(probe::PH_WAIT, t_wait);
             let t_hold = probe::mark();
 
@@ -903,6 +906,18 @@ impl BranchCatalog for TableBranchCatalog {
             let staged = self.stage()?;
             probe::record(probe::PH_STAGE, t_stage);
             probe::record(probe::PH_HOLD, t_hold);
+
+            // ⛔ SCAFFOLD, and the reason Amendment 1 exists. Everything below still runs WITH THE
+            // LOCK HELD. Freeing these two records on 64 threads is allocator work, which is one of
+            // the candidate mechanisms; unmeasured, it would have been reported as "handoff".
+            let t_drops = probe::mark();
+            drop(parent_core);
+            drop(parent_envelope);
+            probe::record(probe::PH_DROPS, t_drops);
+            let t_unlock = probe::mark();
+            drop(g);
+            probe::record(probe::PH_UNLOCK, t_unlock);
+            probe::record(probe::PH_HOLD_TOTAL, t_hold);
             (child, staged)
         };
         // Durable before the caller is told the fork happened -- but shared, not private.

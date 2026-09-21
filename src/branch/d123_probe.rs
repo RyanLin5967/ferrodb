@@ -42,13 +42,30 @@ pub const PH_CHILD_KEY: usize = 7;
 pub const PH_HEADER: usize = 8;
 pub const PH_STAGE: usize = 9;
 pub const PH_EXTRA: usize = 10;
-pub const PH_HOLD: usize = 11;
-pub const PH_DURABLE: usize = 12;
-pub const NPHASE: usize = 13;
+/// Dropping `parent_core` and `parent_envelope`. **Still under the lock** — see below.
+pub const PH_DROPS: usize = 11;
+/// The `Mutex` unlock itself, bracketed by an explicit `drop(g)`.
+pub const PH_UNLOCK: usize = 12;
+/// Acquire → after `stage()`. The section's WORK.
+pub const PH_HOLD: usize = 13;
+/// Acquire → after the unlock. The lock is genuinely held for all of this.
+pub const PH_HOLD_TOTAL: usize = 14;
+pub const PH_DURABLE: usize = 15;
+pub const NPHASE: usize = 16;
 
-/// `PH_HOLD` is the whole critical section and `PH_WAIT`/`PH_DURABLE` sit outside it, so the three
-/// are NOT additive with the rest. Everything from `PH_CORE` to `PH_EXTRA` is a disjoint partition
-/// of `PH_HOLD`; the difference between their sum and `PH_HOLD` is the in-section residual.
+/// ⭐ WHY `PH_DROPS` AND `PH_UNLOCK` EXIST (pre-registration Amendment 1).
+///
+/// Rust drops in **reverse declaration order** and the guard is declared FIRST, so it unlocks
+/// LAST. A naive `HOLD` stamped at the end of the block therefore stops before `parent_core` and
+/// `parent_envelope` are freed and before the mutex is released — all of which still happen with
+/// the lock held. Freeing heap on 64 threads is itself one of the candidate mechanisms
+/// (allocator contention), so leaving it in an unmeasured residual would have let a real
+/// in-section cost be reported as "handoff". Both are now bracketed explicitly:
+///
+/// ```text
+/// PH_HOLD_TOTAL = PH_HOLD + PH_DROPS + PH_UNLOCK          (identity, checked by the harness)
+/// gap           = S_eff  − PH_HOLD_TOTAL                   (lock IDLE: scheduler wake-up only)
+/// ```
 pub const PHASE_NAMES: [&str; NPHASE] = [
     "wait_for_lock",
     "core(parent)",
@@ -61,7 +78,10 @@ pub const PHASE_NAMES: [&str; NPHASE] = [
     "write_header",
     "stage(publish+ticket)",
     "extra_upserts(F5)",
-    "HOLD(whole section)",
+    "drops(under lock)",
+    "unlock",
+    "HOLD(work only)",
+    "HOLD_TOTAL(to unlock)",
     "durable(after release)",
 ];
 
