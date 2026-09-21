@@ -65,7 +65,9 @@ struct Row {
     depth: usize,
     new_visited_pageid: usize,
     new_visited_hash: usize,
-    new_skipped_subtrees: usize,
+    new_skip_pid: usize,
+    new_skip_cid: usize,
+    hash_skip_cid: usize,
     new_skipped_nodes: usize,
     old_pages_touched: usize,
     old_pages_examined: usize,
@@ -180,6 +182,21 @@ fn measure(n: usize) -> Row {
         r_page.skipped_subtrees > 0 && r_hash.skipped_subtrees > 0,
         "no subtree was skipped at n={n}; the mechanism did not fire and the row is void"
     );
+    // The table labels one skip_pid column "(both)". That is only honest if the two providers
+    // really do win the same free tier, so it is checked rather than assumed.
+    assert_eq!(
+        r_page.skipped_by_page_id, r_hash.skipped_by_page_id,
+        "the two providers disagree on the free page-identity tier at n={n}"
+    );
+    assert_eq!(
+        r_page.skipped_subtrees,
+        r_page.skipped_by_page_id + r_page.skipped_by_identity,
+        "the skip tiers do not sum to the total at n={n}"
+    );
+    assert_eq!(
+        r_page.skipped_by_identity, 0,
+        "PageIdentity cannot skip two distinct pages, yet tier 2 fired at n={n}"
+    );
     assert_eq!(
         hash.stamped_nodes(),
         tree.walk_pages(base)
@@ -197,7 +214,9 @@ fn measure(n: usize) -> Row {
         depth,
         new_visited_pageid: r_page.visited,
         new_visited_hash: r_hash.visited,
-        new_skipped_subtrees: r_page.skipped_subtrees,
+        new_skip_pid: r_page.skipped_by_page_id,
+        new_skip_cid: r_page.skipped_by_identity,
+        hash_skip_cid: r_hash.skipped_by_identity,
         new_skipped_nodes: skipped_node_count(&tree, &r_page).unwrap(),
         old_pages_touched,
         old_pages_examined: old.pages_examined,
@@ -238,8 +257,14 @@ fn main() {
     out.push_str("Instruments:\n");
     out.push_str("  new_visited   cow::diff::DiffStats::visited — nodes whose payload was decoded\n");
     out.push_str("                by the synchronised descent. THE CLAIM.\n");
-    out.push_str("  new_skipped   DiffReport::skipped_subtrees (events) and skipped_node_count()\n");
-    out.push_str("                (exact nodes under them; an audit walk, not part of the diff).\n");
+    out.push_str("  skip_pid      skips won by PAGE IDENTITY alone — free, exact in this store, no\n");
+    out.push_str("                hashing. Within one lineage an unchanged subtree IS the same page.\n");
+    out.push_str("  skip_cid      skips that needed the supplied NodeIdentity, i.e. two DISTINCT\n");
+    out.push_str("                pages holding the same rows. Only this tier can be wrong, and\n");
+    out.push_str("                only a content digest can win it. Zero means the digest\n");
+    out.push_str("                contributed nothing on this workload — see the note below.\n");
+    out.push_str("  skipped nodes exact nodes under the skipped subtrees (an audit walk, run after\n");
+    out.push_str("                the diff and not part of its cost).\n");
     out.push_str("  old_touched   walk_pages(base)+walk_pages(head) — what CowTree::diff must\n");
     out.push_str("                enumerate before it can prune. THE CONTROL.\n");
     out.push_str("  old_examined  CowTree::diff's own pages_examined. It reports the DECODE half\n");
@@ -247,31 +272,41 @@ fn main() {
     out.push('\n');
     out.push_str("All three paths were asserted to return the same 4 Modified rows at every N;\n");
     out.push_str("a row that did not would have aborted the run rather than been banked.\n");
+    out.push_str("\n");
+    out.push_str("MEASURE LOCK / LOAD. The counter columns are INTEGERS produced by structural\n");
+    out.push_str("decisions, not timings, so fleet load cannot move them; they were taken without\n");
+    out.push_str("the lock and reproduce exactly run to run. The wall-clock table below is the\n");
+    out.push_str("only load-sensitive part of this file and is labelled where it was taken.\n");
     out.push('\n');
     out.push_str(
-        "      N   nodes  depth | new_visited  new_visited  skipped  skipped |  old_touched  old_examined\n",
+        "      N   nodes  depth | visited  visited | skip_pid  skip_cid  skip_cid  skipped |  old_touched  old_examined\n",
     );
     out.push_str(
-        "                       |    (pageid)       (hash)  subtree    nodes |     (control)              \n",
+        "                       | (pageid)  (hash) |   (both)  (pageid)    (hash)    nodes |     (control)              \n",
     );
     out.push_str(
-        "-------  ------  ----- | -----------  -----------  -------  ------- |  -----------  ------------\n",
+        "-------  ------  ----- | -------  ------- | --------  --------  --------  ------- |  -----------  ------------\n",
     );
     for r in &rows {
         out.push_str(&format!(
-            "{:7}  {:6}  {:5} | {:11}  {:11}  {:7}  {:7} |  {:11}  {:12}\n",
+            "{:7}  {:6}  {:5} | {:7}  {:7} | {:8}  {:8}  {:8}  {:7} |  {:11}  {:12}\n",
             r.n,
             r.tree_nodes,
             r.depth,
             r.new_visited_pageid,
             r.new_visited_hash,
-            r.new_skipped_subtrees,
+            r.new_skip_pid,
+            r.new_skip_cid,
+            r.hash_skip_cid,
             r.new_skipped_nodes,
             r.old_pages_touched,
             r.old_pages_examined,
         ));
     }
     out.push('\n');
+    let lock = std::env::var("D91_MEASURE_LOCK")
+        .unwrap_or_else(|_| "NOT HELD — treat these times as indicative only".to_string());
+    out.push_str(&format!("\nWALL CLOCK. Fleet measure lock: {lock}\n"));
     out.push_str("      N | t_new_pageid  t_new_hash      t_old | t_stamp (write-time cid, NOT diff cost)\n");
     out.push_str("------- | ------------  ----------  --------- | --------------------------------------\n");
     for r in &rows {
