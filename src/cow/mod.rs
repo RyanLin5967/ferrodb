@@ -18,6 +18,7 @@
 pub mod btree;
 pub mod chunker;
 pub mod cid;
+pub mod diff;
 pub mod merge3;
 pub mod node;
 pub mod page_header;
