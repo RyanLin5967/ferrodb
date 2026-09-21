@@ -72,3 +72,13 @@ built; 1 live arena pages
     content shrinks from 4072 B to a few hundred still costs 4096 B and still
     counts as one page. Occupancy becomes stored bytes only when several logical
     pages share one physical page. Do not report the ratio above as a D90 result.
+
+================================================================================
+FIRE CHECK — the anti-vacuity guard forced to fire, D102_FIRECHECK=1 at 7361e1f:
+
+  r=512: MERGE reported applied, but trunk row id=6610 reads Some(Integer(46270)), not Integer(512). The merge published nothing this census can describe. Refusing to report its counters.
+REFUSED: a warm-up cycle did not complete; no steady state was reached.
+
+exit 1. 46270 is 6610*7, the row's build-time value: the merge genuinely moved
+nothing while reporting applied_to_target. Without the flag the same binary
+completes the sweep and exits 0, so the guard does not fire spuriously.
