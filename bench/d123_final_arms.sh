@@ -30,7 +30,8 @@ run () {  # run <file> <mode> <N> <threads> <warm> <reps> <timeout>
     echo "# load_at_run_end: $(uptime | sed 's/.*averages*: *//')" ) > "$OUT/$1" 2>&1
   echo "[$(date +%T)] done $1"
 }
-run 10_novelty.txt        novelty 8000 1,64 20000 5 3000
+# novelty is being run by the lead under lock d123-novelty on this same binary (8665941);
+# not duplicated here. Result: bench/d123_novelty/novelty.txt
 run 20_f1_paired_warm0.txt  f1    8000 64   0     9 3000
 run 30_f1_paired_warm20k.txt f1   8000 64   20000 9 3000
 { echo "=== box at release ==="; date -u +%FT%TZ; uptime | sed 's/.*averages*: *//'; } >> "$OUT/00_box_state.txt"
