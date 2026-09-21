@@ -488,6 +488,12 @@ impl ArenaPageStore {
         self.state.lock().unwrap().pending.len()
     }
 
+    /// D99 instrumentation ONLY, added to this pre-fix tree so the BEFORE and AFTER curves come
+    /// from one harness. Reads a length; changes no behaviour under test.
+    pub fn current_arena_count(&self) -> usize {
+        self.state.lock().unwrap().current.len()
+    }
+
     /// The branch that owns `arena`, or `None` if the extent has been freed.
     ///
     /// **D40.** This is how `reaper::sweep_touched_extents` asks about a handful of named arenas
