@@ -153,7 +153,12 @@ fn build_sized(dir: &std::path::Path, tag: &str, nrows: i64) -> Server {
     let ctx = Arc::new(ServerContext::new(catalog, bp.clone(), txn.clone(), runtime));
     let s = Server { ctx, bp, txn };
 
-    let mut sess = Session::new();
+    // D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private
+    // effect log), so every agent statement below would run on a stub and the arena/durable
+    // catalog built above would be constructed and never touched. `agent_sql::designated`
+    // now refuses this rather than measuring it.
+    let mut sess = s.ctx.session();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess).unwrap();
     for i in 1..=nrows {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess).unwrap();
@@ -185,7 +190,7 @@ struct Cycle {
 
 fn one_cycle_timed(s: &Server, tid: usize, seq: u64, disjoint: bool) -> Option<Cycle> {
     use ferrodb::wal::log::fsync_counters;
-    let mut sess = Session::new();
+    let mut sess = s.ctx.session();
     let (c0, _) = fsync_counters();
 
     let t = Instant::now();
@@ -250,7 +255,7 @@ fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
     let slot = Arc::new(AtomicBool::new(false));
     s.ctx.register_reader(Arc::clone(&slot));
     let mut cache: Option<(u64, Arc<Catalog>)> = None;
-    let mut sess = Session::new();
+    let mut sess = s.ctx.session();
     let sql = "SELECT v FROM t WHERE id = 7;";
     while !stop.load(Ordering::Relaxed) {
         let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();

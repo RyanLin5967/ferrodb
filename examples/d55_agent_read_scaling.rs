@@ -146,7 +146,12 @@ fn build(dir: &std::path::Path, n: usize) -> Server {
 
     let mut cache = None;
     let slot = AtomicBool::new(false);
-    let mut sess = Session::new();
+    // D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private
+    // effect log), so every agent statement below would run on a stub and the arena/durable
+    // catalog built above would be constructed and never touched. `agent_sql::designated`
+    // now refuses this rather than measuring it.
+    let mut sess = s.ctx.session();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess, &mut cache, &slot);
     for i in 1..=ROWS {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut cache, &slot);
@@ -174,7 +179,7 @@ fn sweep_point(servers: &[Arc<Server>], shared: bool, threads: usize, staged: us
         let (start, stop) = (start.clone(), stop.clone());
         let (total, rows, slowest) = (total.clone(), rows.clone(), slowest.clone());
         handles.push(std::thread::spawn(move || {
-            let mut sess = Session::new();
+            let mut sess = srv.ctx.session();
             let mut cache: Option<(u64, Arc<Catalog>)> = None;
             let slot = Arc::new(AtomicBool::new(false));
             srv.ctx.register_reader(Arc::clone(&slot));
@@ -296,7 +301,7 @@ fn sweep_point_held(servers: &[Arc<Server>], threads: usize, staged: usize, wind
         let (start, stop) = (start.clone(), stop.clone());
         let (total, rows) = (total.clone(), rows.clone());
         handles.push(std::thread::spawn(move || {
-            let mut sess = Session::new();
+            let mut sess = srv.ctx.session();
             let mut cache: Option<(u64, Arc<Catalog>)> = None;
             let slot = Arc::new(AtomicBool::new(false));
             srv.ctx.register_reader(Arc::clone(&slot));

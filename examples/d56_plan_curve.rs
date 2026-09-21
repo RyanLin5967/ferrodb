@@ -126,7 +126,12 @@ fn build(dir: &std::path::Path, rows: i64, analyze: bool) -> Server {
 
     let mut cache = None;
     let slot = AtomicBool::new(false);
-    let mut sess = Session::new();
+    // D101 — `s.ctx.session()`, NEVER `Session::new()`. `Session::new` builds its OWN
+    // `AgentRuntime::new()` (`storage: None`, private in-memory branch catalog, private
+    // effect log), so every agent statement below would run on a stub and the arena/durable
+    // catalog built above would be constructed and never touched. `agent_sql::designated`
+    // now refuses this rather than measuring it.
+    let mut sess = s.ctx.session();
     exec(&s, "CREATE TABLE t (id INTEGER NOT NULL, v INTEGER);", &mut sess, &mut cache, &slot);
     for i in 1..=rows {
         exec(&s, &format!("INSERT INTO t VALUES ({i}, {});", i * 7), &mut sess, &mut cache, &slot);
@@ -140,7 +145,7 @@ fn build(dir: &std::path::Path, rows: i64, analyze: bool) -> Server {
 /// stmt/s for one point, as the MEDIAN of `ROUNDS` timed windows. Refuses on a window that did no
 /// work, or on a statement that did not return exactly one row.
 fn measure(s: &Server, agent: bool, rows: i64, staged: usize) -> (f64, Vec<f64>) {
-    let mut sess = Session::new();
+    let mut sess = s.ctx.session();
     let mut cache: Option<(u64, Arc<Catalog>)> = None;
     let slot = Arc::new(AtomicBool::new(false));
     s.ctx.register_reader(Arc::clone(&slot));
