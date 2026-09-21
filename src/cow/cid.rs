@@ -34,8 +34,17 @@
 //! reading both trees whole. That is the case a cid answers: "are these two subtrees the same?"
 //! becomes a 16-byte comparison instead of a walk, for trees with no common ancestor.
 //!
-//! This is the primitive ForkBase, Noms and Dolt are built on. ferrodb had nothing like it:
-//! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/` returned zero.
+//! This is the primitive ForkBase, Noms and Dolt are built on. ferrodb had nothing like it when
+//! this module was written, and the survey that established that was
+//! `grep -rn 'page_hash|content_hash|blake|sha2|Merkle' src/cow/`.
+//!
+//! **Correction.** That grep no longer returns zero, and by the time this module landed it already
+//! did not: `src/cow/merge3.rs` came in on the same merge and matches `Merkle` six times, for a
+//! `MerkleId` that carried its own private 128-bit hasher. The survey's *conclusion* stands — there
+//! was no content id in `src/cow/` before these two files — but the command is no longer the
+//! evidence for it, and a reader who re-ran it would have found a second hasher rather than none.
+//! That second hasher is gone: `merge3::MerkleId` now computes [`leaf_cid`] and [`internal_cid`]
+//! from this file, so there is exactly one 128-bit hash in `src/cow/` and it is [`Hasher128`].
 //!
 //! # What it found, and where it stands
 //!
@@ -263,13 +272,23 @@ pub fn hex(c: &Cid) -> String {
 
 /// A node's contents, lifted out of the page so the pin can be dropped before recursing — the same
 /// discipline `CowTree::collect_unshared` uses, so a deep tree does not hold one frame per level.
-enum NodeShape {
+///
+/// Visible to the crate because [`shape_of`] is the *guard*, not merely a decoder, and a second
+/// copy of a guard is a second thing to get wrong: `cow::merge3` decodes the same nodes and used to
+/// carry its own `NodeView`, whose catch-all arm read a `Heap` or `Free` page as an internal node
+/// and followed its `u32`s as child page ids.
+pub(crate) enum NodeShape {
     Leaf(LeafEntries),
     /// `(leftmost child, (separator, child) pairs in key order)`.
     Internal(PageId, InternalEntries),
 }
 
-fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
+/// Decode one page as a B+tree node, **refusing anything that is not one**.
+///
+/// The refusal is the point. `PageType` has more variants than the two below, and every other one
+/// decodes into garbage rather than into an error: a zeroed `Heap` page reads as an internal node
+/// with zero separators and a leftmost child of page 0, which a descent will then follow.
+pub(crate) fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
     let handle = tree.store().read_page(page)?;
     let frame = handle.read();
     let page_type = PageHeader::read_from(&frame.data)?.page_type;
@@ -280,7 +299,7 @@ fn shape_of(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
             Ok(NodeShape::Internal(node.leftmost(), node.internal_entries()?))
         }
         other => Err(FerroError::Cow(format!(
-            "cid: page {} is {:?}, not a btree node",
+            "page {} is {:?}, not a btree node",
             page, other
         ))),
     }
@@ -321,6 +340,24 @@ pub fn subtree_cid(tree: &CowTree, page: PageId) -> Result<Cid, FerroError> {
     subtree_cid_at(tree, page, 0)
 }
 
+/// The cid of one internal node, given its children's cids: the child count, the leftmost child's
+/// cid, then each `(separator key, child cid)` pair in order.
+///
+/// Split out of [`subtree_cid`] so a caller that walks the tree itself — `cow::merge3::MerkleId`
+/// memoises its walk, which this module deliberately does not — produces **the same cid** rather
+/// than its own dialect of one. Two hashers over the same tree that disagree by a domain tag or a
+/// length prefix is precisely the failure the module header's encoding section is about.
+pub fn internal_cid(leftmost: &Cid, separators: &[(Vec<u8>, Cid)]) -> Cid {
+    let mut h = Hasher128::new(TAG_INTERNAL);
+    h.number(separators.len() as u64 + 1);
+    h.cid(leftmost);
+    for (separator, child) in separators {
+        h.field(separator);
+        h.cid(child);
+    }
+    h.finish()
+}
+
 fn subtree_cid_at(tree: &CowTree, page: PageId, depth: usize) -> Result<Cid, FerroError> {
     if depth > MAX_DESCENT {
         return Err(FerroError::Cow("cid: subtree walk exceeded the depth guard".into()));
@@ -329,14 +366,11 @@ fn subtree_cid_at(tree: &CowTree, page: PageId, depth: usize) -> Result<Cid, Fer
         NodeShape::Leaf(entries) => Ok(leaf_cid(&entries)),
         NodeShape::Internal(leftmost, separators) => {
             let leftmost_cid = subtree_cid_at(tree, leftmost, depth + 1)?;
-            let mut h = Hasher128::new(TAG_INTERNAL);
-            h.number(separators.len() as u64 + 1);
-            h.cid(&leftmost_cid);
+            let mut children = Vec::with_capacity(separators.len());
             for (separator, child) in &separators {
-                h.field(separator);
-                h.cid(&subtree_cid_at(tree, *child, depth + 1)?);
+                children.push((separator.clone(), subtree_cid_at(tree, *child, depth + 1)?));
             }
-            Ok(h.finish())
+            Ok(internal_cid(&leftmost_cid, &children))
         }
     }
 }

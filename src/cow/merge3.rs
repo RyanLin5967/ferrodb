@@ -88,12 +88,12 @@
 //! `agent_sql`'s gate already does with `MergeOutcome::Conflict`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::branch::types::{BranchId, Epoch, PageId};
 use crate::cow::btree::CowTree;
-use crate::cow::node::Node;
-use crate::cow::page_header::{PageHeader, PageType};
+use crate::cow::cid::{self, Cid, NodeShape};
 use crate::error::FerroError;
 
 /// Descent guard, matching `btree`'s. A tree deeper than this is a cycle, and looping forever
@@ -102,17 +102,59 @@ const MAX_DEPTH: usize = 64;
 
 // ---- identity ---------------------------------------------------------------------------------
 
+/// What an equal identity *proves*, and therefore what an empty conflict list rests on.
+///
+/// `cid.rs` states the rule this enum exists to obey, verbatim: a cid equality "must never be the
+/// *sole* authority for an operation whose wrongness is silent: deduplicating storage, **declaring
+/// a merge conflict-free**, or skipping a subtree in a diff whose output someone will act on."
+/// [`merge3`] does exactly that — [`RootFastPath::SidesAgree`] returns an empty conflict list
+/// having read zero pages — so the strength of the identity that said so travels with the result,
+/// in [`MergeResult::identity_proof`], rather than being folded into a bare `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProof {
+    /// Equal ids **prove** equal contents. [`ShadowId`] inside one copy-on-write lineage: an equal
+    /// page id is not a fingerprint of the same page, it *is* the same page.
+    Exact,
+    /// Equal ids are a 128-bit fingerprint match, not a proof. Sound against accident — see
+    /// `cid.rs`'s avalanche and field-separation tests — and **not** sound against an input someone
+    /// chose, which in a database is every key and value. A conflict-free verdict carrying this is
+    /// a strong claim, not a demonstration.
+    Fingerprint,
+}
+
+/// The caller stating, at the call site, that it will treat a 128-bit fingerprint match as proof
+/// that two subtrees are equal — and so accepts a conflict-free merge built on one.
+///
+/// It exists to make that acceptance impossible to give by accident. [`MerkleId::new`] takes one,
+/// so choosing content identity is a line of code that names the risk; `cid.rs` forbids the
+/// acceptance being implicit, and a doc comment is not a mechanism.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptFingerprintIdentity;
+
 /// How the merge decides two subtrees are the same subtree.
 ///
 /// Supplied rather than fixed, because the two available answers have genuinely different powers
-/// and different costs — see [`ShadowId`] and [`MerkleId`]. `src/cow/cid.rs` is landing a content
-/// id with this shape and will drop in here.
+/// and different costs — see [`ShadowId`] and [`MerkleId`]. The content-id answer is `cid.rs`'s:
+/// [`MerkleId`] computes `cid::leaf_cid` and `cid::internal_cid`, so there is one 128-bit hash in
+/// `src/cow/` and `cid.rs`'s tests for it are tests of this file's merge path too.
 ///
 /// **On the `Result`.** The brief's shape is `fn id_of(&self, page) -> [u8; 16]`. A content id has
 /// to *read* the page to compute itself, and a torn page or a checksum failure has to be reportable
 /// rather than a panic inside a merge, so the return is wrapped. [`ShadowId`] never fails.
 pub trait PageIdentity {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError>;
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError>;
+
+    /// What an equality between two of this provider's ids proves. **No default**: an implementor
+    /// that has not thought about it must not be able to inherit the safe-sounding answer.
+    fn proof(&self) -> IdentityProof;
+
+    /// Called by [`merge3`] once, before any id is asked for.
+    ///
+    /// A provider that caches gets its chance here to refuse work it cannot answer soundly. The
+    /// default is for a stateless provider, which has nothing to refuse.
+    fn begin_merge(&self) -> Result<(), FerroError> {
+        Ok(())
+    }
 }
 
 /// **The page id itself.** Free, and *exact* for the trees this store produces.
@@ -130,13 +172,19 @@ pub trait PageIdentity {
 pub struct ShadowId;
 
 impl PageIdentity for ShadowId {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError> {
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError> {
         let mut out = [0u8; 16];
         out[..4].copy_from_slice(&page.to_be_bytes());
         // Tag the rest so a ShadowId can never be confused with a MerkleId if the two are ever
         // compared across a boundary.
         out[4..].copy_from_slice(b"shadowpageid");
         Ok(out)
+    }
+
+    /// Exact, and not by assumption: this id is the page id, written out. Two equal ShadowIds are
+    /// one page, so there is no collision to be sound against.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Exact
     }
 }
 
@@ -147,59 +195,92 @@ impl PageIdentity for ShadowId {
 /// find nothing. It is also the only identity that works if a caller ever hands this function three
 /// roots that are not COW relatives of each other.
 ///
-/// **Cost, stated rather than rounded.** Cold, computing one root's id reads the whole tree: O(N).
-/// Warm it is a hash lookup, and page ids are stable under shadow paging (a modified page gets a
-/// *new* id, so a memoised entry can never go stale), which is what makes the memo sound. The curve
-/// in `bench/d92_merge3_curve.txt` is therefore measured with [`ShadowId`], where `id_of` reads
-/// nothing and `nodes_read` is honestly the descent's own cost. Use this one when you need the
-/// extra skips and can pay for the walk, or when `cid.rs` lands the id inside the page header and
-/// the cold cost goes away.
+/// **The hash is `cid.rs`'s**, not a second one: a leaf is `cid::leaf_cid`, an internal node is
+/// `cid::internal_cid`, so `MerkleId::id_of(root)` and `cid::subtree_cid(tree, root)` are equal by
+/// construction — `merkle_ids_are_cid_subtree_cids_and_not_a_second_hasher` pins that — and
+/// `cid.rs`'s avalanche, domain-tag and field-separation tests are tests of this merge path.
+///
+/// # The memo is sound for exactly ONE merge, and that is enforced
+///
+/// This doc used to argue the memo could never go stale because "page ids are stable under shadow
+/// paging (a modified page gets a *new* id)". **That is false**, in two independent ways, and the
+/// memo is keyed on `PageId`, so both of them turn a memoised entry into a wrong content id and a
+/// wrong content id into a merge reported clean with a real difference skipped:
+///
+/// 1. **In-place mutation.** `ArenaPageStore::cow_page` hands a branch its own page straight back
+///    when the branch owns the arena and the page was born at or after its privacy barrier — see
+///    the `owns_it && header.birth_epoch >= barrier` arm in `branch/arena.rs`, whose whole purpose
+///    is that a hot branch does not shadow the same page on every write. Same page id, different
+///    contents, and **`birth_epoch` is not restamped**. This needs no reap and fires on a branch's
+///    second write.
+/// 2. **Recycled page ids.** `ArenaPageStore` keeps `recycled: HashMap<ArenaId, Vec<PageId>>` and
+///    `alloc_page` pops from it before touching the bump pointer, so a freed id comes back holding
+///    something else.
+///
+/// **Why the memo is not keyed on `(page_id, birth_epoch)` instead.** Case 1 alone defeats it: the
+/// in-place path does not restamp the epoch, so the key is unchanged exactly when the contents
+/// changed. And no per-page key can work here at all, for a reason that outlives that detail — an
+/// internal node's own bytes do not change when a *descendant* is mutated in place, so the
+/// ancestor's `(id, epoch, page type, checksum, …)` is identical while the subtree cid it stands
+/// for is not. The only sound scope is a window in which nothing writes to the three trees.
+///
+/// That window is one [`merge3`] call: it asks for every id during the descent and does not write
+/// until the descent has returned. So the memo is scoped to one merge, and scoped by refusing
+/// rather than by saying so — [`MerkleId::begin_merge`] spends the provider, and a second merge on
+/// the same one is an error, not a stale hit.
+///
+/// **Cost, stated rather than rounded.** Cold, computing one root's id reads the whole tree: O(N),
+/// and the memo is what keeps the descent's repeated `id_of` calls from making that O(N x depth).
+/// The curve in `bench/d92_merge3_curve.txt` is therefore measured with [`ShadowId`], where `id_of`
+/// reads nothing and `nodes_read` is honestly the descent's own cost. Use this one when you need
+/// the extra skips and can pay for the walk.
 pub struct MerkleId<'a> {
     tree: &'a CowTree,
-    memo: Mutex<HashMap<PageId, [u8; 16]>>,
+    memo: Mutex<HashMap<PageId, Cid>>,
     /// Pages this provider read to answer `id_of`. Not part of [`MergeStats::nodes_read`], which
     /// is the descent's own cost; kept separate so neither number can quietly absorb the other.
     pages_hashed: Mutex<usize>,
+    /// Set by [`MerkleId::begin_merge`]. One provider, one merge; see the type's doc for why the
+    /// memo cannot outlive one.
+    served: AtomicBool,
 }
 
 impl<'a> MerkleId<'a> {
-    pub fn new(tree: &'a CowTree) -> Self {
-        MerkleId { tree, memo: Mutex::new(HashMap::new()), pages_hashed: Mutex::new(0) }
+    /// Build a content-identity provider for **one** [`merge3`] call.
+    ///
+    /// `_accept` is the caller saying out loud that a 128-bit fingerprint match will be treated as
+    /// proof that two subtrees are equal — see [`AcceptFingerprintIdentity`] and [`IdentityProof`].
+    pub fn new(tree: &'a CowTree, _accept: AcceptFingerprintIdentity) -> Self {
+        MerkleId {
+            tree,
+            memo: Mutex::new(HashMap::new()),
+            pages_hashed: Mutex::new(0),
+            served: AtomicBool::new(false),
+        }
     }
 
     pub fn pages_hashed(&self) -> usize {
         *self.pages_hashed.lock().unwrap()
     }
 
-    fn compute(&self, page: PageId, depth: usize) -> Result<[u8; 16], FerroError> {
+    fn compute(&self, page: PageId, depth: usize) -> Result<Cid, FerroError> {
         if depth > MAX_DEPTH {
             return Err(FerroError::Cow("merkle id exceeded the depth guard".into()));
         }
         if let Some(h) = self.memo.lock().unwrap().get(&page) {
             return Ok(*h);
         }
-        let view = read_node(self.tree, page)?;
+        let shape = cid::shape_of(self.tree, page)?;
         *self.pages_hashed.lock().unwrap() += 1;
-        let mut h = H128::new();
-        let id = match view {
-            NodeView::Leaf(entries) => {
-                h.field(b"leaf");
-                h.field(&(entries.len() as u64).to_be_bytes());
-                for (k, v) in &entries {
-                    h.field(k);
-                    h.field(v);
-                }
-                h.finish()
-            }
-            NodeView::Internal { leftmost, seps } => {
-                h.field(b"internal");
-                h.field(&(seps.len() as u64).to_be_bytes());
-                h.field(&self.compute(leftmost, depth + 1)?);
+        let id = match shape {
+            NodeShape::Leaf(entries) => cid::leaf_cid(&entries),
+            NodeShape::Internal(leftmost, seps) => {
+                let leftmost_cid = self.compute(leftmost, depth + 1)?;
+                let mut children = Vec::with_capacity(seps.len());
                 for (k, c) in &seps {
-                    h.field(k);
-                    h.field(&self.compute(*c, depth + 1)?);
+                    children.push((k.clone(), self.compute(*c, depth + 1)?));
                 }
-                h.finish()
+                cid::internal_cid(&leftmost_cid, &children)
             }
         };
         self.memo.lock().unwrap().insert(page, id);
@@ -208,50 +289,31 @@ impl<'a> MerkleId<'a> {
 }
 
 impl PageIdentity for MerkleId<'_> {
-    fn id_of(&self, page: PageId) -> Result<[u8; 16], FerroError> {
+    fn id_of(&self, page: PageId) -> Result<Cid, FerroError> {
         self.compute(page, 0)
     }
-}
 
-/// A 128-bit mixer, length-prefixing every field so that concatenation is unambiguous
-/// (`H("ab","c") != H("a","bc")` — the classic way a content id collides on purpose).
-///
-/// Two independent 64-bit streams. This crate has **zero dependencies** (see `Cargo.toml`) and this
-/// file does not change that; if a cryptographic id is ever needed — it would be, for a content id
-/// that crosses a trust boundary — `cid.rs` is the place for it, not here.
-struct H128 {
-    a: u64,
-    b: u64,
-}
-
-impl H128 {
-    fn new() -> Self {
-        H128 { a: 0xcbf2_9ce4_8422_2325, b: 0x9e37_79b9_7f4a_7c15 }
+    /// A fingerprint. `cid::Hasher128` is FNV-1a with a splitmix64 finalizer, and `cid.rs` is
+    /// explicit that equal cids do not prove equal inputs against an input someone chose.
+    fn proof(&self) -> IdentityProof {
+        IdentityProof::Fingerprint
     }
 
-    fn field(&mut self, bytes: &[u8]) {
-        self.write(&(bytes.len() as u64).to_be_bytes());
-        self.write(bytes);
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &x in bytes {
-            self.a = (self.a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
-            self.b = (self.b.rotate_left(27) ^ x as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    /// Spend the provider. The memo is keyed on `PageId` and a `PageId` is reused — in place by
+    /// `cow_page` and by recycling in `alloc_page` — so an entry made during one merge can be
+    /// stale by the next. Refusing is the only answer that is not a silent wrong merge; see the
+    /// type's doc for why no cheaper key works.
+    fn begin_merge(&self) -> Result<(), FerroError> {
+        if self.served.swap(true, Ordering::SeqCst) {
+            return Err(FerroError::Cow(
+                "this MerkleId has already served a merge: its memo is keyed on PageId, and a \
+                 PageId is not stable across merges — ArenaPageStore mutates a branch's own page \
+                 in place (cow_page) without restamping birth_epoch, and recycles freed page ids \
+                 (alloc_page). Build a fresh MerkleId for each merge3 call."
+                    .into(),
+            ));
         }
-    }
-
-    fn finish(self) -> [u8; 16] {
-        let mut a = self.a ^ self.b.rotate_left(31);
-        let mut b = self.b ^ self.a.rotate_left(17);
-        a = (a ^ (a >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        a ^= a >> 29;
-        b = (b ^ (b >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        b ^= b >> 32;
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&a.to_be_bytes());
-        out[8..].copy_from_slice(&b.to_be_bytes());
-        out
+        Ok(())
     }
 }
 
@@ -337,9 +399,22 @@ pub struct MergeResult {
     pub merged_root: PageId,
     pub conflicts: Vec<Conflict>,
     pub stats: MergeStats,
+    /// **What an empty `conflicts` rests on**, from the identity the caller supplied.
+    ///
+    /// Every skip in this file — including the root rules, which return with zero pages read — is
+    /// an identity comparison. With [`IdentityProof::Exact`] that comparison is a proof. With
+    /// [`IdentityProof::Fingerprint`] it is a 128-bit fingerprint's word, and `cid.rs` forbids such
+    /// a word being the *sole* authority for declaring a merge conflict-free without the caller
+    /// having said it accepts that. This field is where it says so, on the way back out.
+    pub identity_proof: IdentityProof,
 }
 
 impl MergeResult {
+    /// No conflicts were reported.
+    ///
+    /// **What that is worth is [`MergeResult::identity_proof`]**, and a caller gating a publish on
+    /// this should read it: with [`IdentityProof::Fingerprint`] this is a strong claim about
+    /// subtrees that were never read, not a demonstration that they agree.
     pub fn is_clean(&self) -> bool {
         self.conflicts.is_empty()
     }
@@ -411,23 +486,43 @@ pub fn merge3(
 ) -> Result<MergeResult, FerroError> {
     let mut stats = MergeStats::default();
 
+    // Before a single id is asked for. A caching provider refuses here if its cache cannot be
+    // sound for this call — `MerkleId` spends itself, because its memo is only good for one merge.
+    ids.begin_merge()?;
+    let identity_proof = ids.proof();
+
     // The same three comparisons as `resolve_cell`, at the coarsest granularity there is. Each one
     // retires the entire merge without reading a page.
     let (ib, io, it) = (ids.id_of(base)?, ids.id_of(ours)?, ids.id_of(theirs)?);
     stats.ids_compared += 3;
     if io == it {
         stats.root_fast_path = Some(RootFastPath::SidesAgree);
-        return Ok(MergeResult { merged_root: ours, conflicts: Vec::new(), stats });
+        return Ok(MergeResult {
+            merged_root: ours,
+            conflicts: Vec::new(),
+            stats,
+            identity_proof,
+        });
     }
     if ib == io {
         // "If ours == base, take theirs whole." O(1), no descent — and it is a *splice*, not a
         // copy: the merged root IS theirs' root, and not one page is allocated.
         stats.root_fast_path = Some(RootFastPath::OursUnchanged);
-        return Ok(MergeResult { merged_root: theirs, conflicts: Vec::new(), stats });
+        return Ok(MergeResult {
+            merged_root: theirs,
+            conflicts: Vec::new(),
+            stats,
+            identity_proof,
+        });
     }
     if ib == it {
         stats.root_fast_path = Some(RootFastPath::TheirsUnchanged);
-        return Ok(MergeResult { merged_root: ours, conflicts: Vec::new(), stats });
+        return Ok(MergeResult {
+            merged_root: ours,
+            conflicts: Vec::new(),
+            stats,
+            identity_proof,
+        });
     }
 
     let mut plan = Plan::default();
@@ -444,7 +539,7 @@ pub fn merge3(
     }
     stats.edits_applied = plan.edits.len();
 
-    Ok(MergeResult { merged_root: root, conflicts: plan.conflicts, stats })
+    Ok(MergeResult { merged_root: root, conflicts: plan.conflicts, stats, identity_proof })
 }
 
 /// What the descent accumulated. Keyed, so a key reached twice (possible only where the three trees
@@ -455,21 +550,18 @@ struct Plan {
     conflicts: Vec<Conflict>,
 }
 
-/// A node, decoded far enough to route on.
-enum NodeView {
-    Leaf(Vec<(Vec<u8>, Vec<u8>)>),
-    Internal { leftmost: PageId, seps: Vec<(Vec<u8>, PageId)> },
-}
-
-fn read_node(tree: &CowTree, page: PageId) -> Result<NodeView, FerroError> {
-    let h = tree.store().read_page(page)?;
-    let f = h.read();
-    let ty = PageHeader::read_from(&f.data)?.page_type;
-    let n = Node::new(&f.data);
-    Ok(match ty {
-        PageType::BTreeLeaf => NodeView::Leaf(n.leaf_entries()?),
-        _ => NodeView::Internal { leftmost: n.leftmost(), seps: n.internal_entries()? },
-    })
+/// Decode one page as a B+tree node, refusing anything that is not one.
+///
+/// This is `cid::shape_of`, and deliberately not a second decoder. The one that used to live here
+/// matched `BTreeLeaf` and took **everything else** as an internal node — so a `Heap`, a `Free`,
+/// an overflow or a page that had just failed to be what it claimed decoded into
+/// `n.leftmost()` and `n.internal_entries()`, whose `u32`s the descent then followed as child page
+/// ids. A freshly allocated `Heap` page is zeroed, which reads as an internal node with no
+/// separators and a leftmost child of **page 0**, so the catch-all was not even loud when it was
+/// wrong. `cid::shape_of` names the page type in the error, and
+/// `cid::a_non_btree_page_is_refused_rather_than_hashed` is its test.
+fn read_node(tree: &CowTree, page: PageId) -> Result<NodeShape, FerroError> {
+    cid::shape_of(tree, page)
 }
 
 /// One synchronised step over the key range `[lo, hi)`, which all three of `b`/`o`/`t` cover.
@@ -530,7 +622,7 @@ fn descend(
     // pinned. Counting it twice would inflate this file's own curve by half.
     stats.nodes_read += 1 + usize::from(o != b) + usize::from(t != b && t != o);
 
-    if let (NodeView::Leaf(be), NodeView::Leaf(oe), NodeView::Leaf(te)) = (&bv, &ov, &tv) {
+    if let (NodeShape::Leaf(be), NodeShape::Leaf(oe), NodeShape::Leaf(te)) = (&bv, &ov, &tv) {
         stats.leaf_triples += 1;
         merge_leaves(lo, hi, be, oe, te, stats, plan);
         return Ok(());
@@ -540,7 +632,7 @@ fn descend(
     // places inside it; each resulting band is covered by exactly one child on every side.
     let mut cuts: Vec<Vec<u8>> = Vec::new();
     for v in [&bv, &ov, &tv] {
-        if let NodeView::Internal { seps, .. } = v {
+        if let NodeShape::Internal(_, seps) = v {
             for (k, _) in seps {
                 // STRICTLY inside. A separator equal to `lo` is already this band's lower bound;
                 // admitting it would open an empty band that reads three pages to find nothing.
@@ -572,10 +664,10 @@ fn descend(
 
 /// The child of `v` covering a band whose lower bound is `lo`. A leaf has already bottomed out and
 /// stands for itself, which is how a height mismatch between the three trees resolves.
-fn child_for(v: &NodeView, lo: Option<&[u8]>, self_page: PageId) -> Result<PageId, FerroError> {
+fn child_for(v: &NodeShape, lo: Option<&[u8]>, self_page: PageId) -> Result<PageId, FerroError> {
     Ok(match v {
-        NodeView::Leaf(_) => self_page,
-        NodeView::Internal { leftmost, seps } => match lo {
+        NodeShape::Leaf(_) => self_page,
+        NodeShape::Internal(leftmost, seps) => match lo {
             // A band open at the bottom can only be served by the leftmost child.
             None => *leftmost,
             // Separators are inclusive lower bounds: a key >= seps[i].0 lives at or right of
@@ -648,6 +740,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::cow::page_header::PageType;
     use crate::cow::store::CowStore;
     use crate::cow::PageStore;
     use crate::storage::disk_manager::DiskManager;
@@ -1120,7 +1213,7 @@ mod tests {
         assert_eq!(shadow.stats.root_fast_path, None, "different page ids at the root");
         assert!(shadow.stats.nodes_read > 0, "ShadowId has to descend to find the agreement");
 
-        let merkle = MerkleId::new(&fx.tree);
+        let merkle = MerkleId::new(&fx.tree, AcceptFingerprintIdentity);
         let m = merge3(&fx.tree, base, ours, theirs, &merkle, into, fx.tick()).unwrap();
         assert_eq!(
             m.stats.root_fast_path,
@@ -1129,20 +1222,134 @@ mod tests {
         );
         assert_eq!(m.stats.nodes_read, 0);
         assert!(m.is_clean());
+        // ...and the result says what that empty conflict list rests on. A fingerprint match, not
+        // a proof — which is exactly the difference `shadow` above demonstrates it is worth.
+        assert_eq!(m.identity_proof, IdentityProof::Fingerprint);
+        assert_eq!(shadow.identity_proof, IdentityProof::Exact);
         assert_eq!(fx.get(m.merged_root, &100u32.to_be_bytes()), Some(b"same".to_vec()));
         // And the cost that buys it is real and reported, not hidden.
         assert!(merkle.pages_hashed() > 0);
     }
 
+    /// `MerkleId` used to carry its own 128-bit hasher, in the same directory as `cid.rs`'s —
+    /// the weaker of the two, with no avalanche test, on the path that declares a merge clean.
+    /// It is gone, and this is what holds it gone: the id the merge compares **is**
+    /// `cid::subtree_cid`, so `cid.rs`'s avalanche, domain-tag and field-separation tests are
+    /// tests of this file. An equality here that drifted from `cid.rs` would be a second hasher
+    /// growing back.
     #[test]
-    fn merkle_id_separates_fields_so_concatenation_cannot_collide() {
-        let mut a = H128::new();
-        a.field(b"ab");
-        a.field(b"c");
-        let mut b = H128::new();
-        b.field(b"a");
-        b.field(b"bc");
-        assert_ne!(a.finish(), b.finish());
+    fn merkle_ids_are_cid_subtree_cids_and_not_a_second_hasher() {
+        let fx = Fx::new();
+        let e = fx.tick();
+        let mut root = fx.tree.create(TRUNK, e).unwrap();
+        // Deep enough to have internal nodes: the leaf hash agreeing is half the claim, and an
+        // internal node is where a second hasher's own separator or child-count encoding shows.
+        for i in 0..400u32 {
+            root = fx.put(root, TRUNK, &i.to_be_bytes(), &[9u8; 40]);
+        }
+        assert!(
+            matches!(cid::shape_of(&fx.tree, root).unwrap(), NodeShape::Internal(..)),
+            "this test is only worth running on a tree with internal nodes"
+        );
+        let merkle = MerkleId::new(&fx.tree, AcceptFingerprintIdentity);
+        assert_eq!(
+            merkle.id_of(root).unwrap(),
+            cid::subtree_cid(&fx.tree, root).unwrap(),
+            "merge3's identity must be cid.rs's, not a dialect of it"
+        );
+    }
+
+    // ---- the memo's scope, made to fire -------------------------------------------------------
+
+    /// **The page id a memo entry is keyed on comes back holding something else.**
+    ///
+    /// `MerkleId`'s doc used to argue the memo could never go stale because "a modified page gets
+    /// a NEW id". This test falsifies that, and then pins the refusal that replaces it.
+    ///
+    /// The mechanism used here is `cow_page`'s **in-place** arm: once theirs' root sits in theirs'
+    /// own arena and was born at or after theirs' privacy barrier, a second write mutates it where
+    /// it lies. Same page id, different contents, `birth_epoch` untouched — which is also why
+    /// keying the memo on `(page_id, birth_epoch)` would not have caught this. (The store's other
+    /// route to the same place is `alloc_page` popping a recycled id; it needs a reap to set up
+    /// and lands on the identical defect, so this drives the one that needs no reap.)
+    ///
+    /// Both sides make the same edit, so the two roots have equal CONTENT — the case `MerkleId`
+    /// exists for. Then theirs writes again. A stale memo answers the second merge with theirs'
+    /// OLD id, which still equals ours', the root rule `io == it` fires, and the merge is reported
+    /// clean with theirs' second edit silently dropped and zero conflicts.
+    #[test]
+    fn a_reused_merkle_id_refuses_rather_than_serving_a_stale_memo() {
+        let fx = Fx::new();
+        let (base, ob, tb) = fx.forked(&[(b"k", b"v0")]);
+
+        let ours = fx.put(base, ob, b"a", b"1");
+        let theirs1 = fx.put(base, tb, b"a", b"1");
+        assert_ne!(ours, theirs1, "a convergent edit must land on two different page ids");
+
+        let into = BranchId::new(71, 0);
+        fx.store.register_branch(into, Some(TRUNK), fx.tick()).unwrap();
+
+        let merkle = MerkleId::new(&fx.tree, AcceptFingerprintIdentity);
+        let first = merge3(&fx.tree, base, ours, theirs1, &merkle, into, fx.tick()).unwrap();
+        assert_eq!(
+            first.stats.root_fast_path,
+            Some(RootFastPath::SidesAgree),
+            "the memo has to be populated by a merge that really compared the two roots"
+        );
+
+        // The write that breaks the premise. If the store ever stops taking the in-place path
+        // here this assertion says so, rather than the test quietly proving nothing.
+        let theirs2 = fx.put(theirs1, tb, b"k", b"vT");
+        assert_eq!(
+            theirs2, theirs1,
+            "this test needs cow_page's in-place arm; the store shadowed the page instead"
+        );
+        assert_eq!(
+            fx.get(theirs2, b"k"),
+            Some(b"vT".to_vec()),
+            "theirs really did change k under the same page id"
+        );
+
+        match merge3(&fx.tree, base, ours, theirs2, &merkle, into, fx.tick()) {
+            Ok(r) => panic!(
+                "a reused MerkleId served a stale memo: merge reported {} conflicts via {:?} and \
+                 merged k = {:?}, but theirs set k = \"vT\"",
+                r.conflicts.len(),
+                r.stats.root_fast_path,
+                fx.get(r.merged_root, b"k").map(|v| String::from_utf8_lossy(&v).into_owned()),
+            ),
+            Err(e) => assert!(
+                format!("{e}").contains("already served a merge"),
+                "expected the spent-provider refusal, got: {e}"
+            ),
+        }
+
+        // The refusal is a guard and not a wall: a fresh provider merges the same three roots and
+        // gets the answer the stale one would have missed.
+        let fresh = MerkleId::new(&fx.tree, AcceptFingerprintIdentity);
+        let r = merge3(&fx.tree, base, ours, theirs2, &fresh, into, fx.tick()).unwrap();
+        assert!(r.is_clean(), "{:?}", r.conflicts);
+        assert_eq!(fx.get(r.merged_root, b"k"), Some(b"vT".to_vec()));
+    }
+
+    /// A page that is not a B+tree node must be refused, not decoded as an internal node and its
+    /// `u32`s followed as child page ids. A freshly allocated `Heap` page is zeroed, so the arm
+    /// that used to catch it read an internal node with no separators and a leftmost child of
+    /// page 0 — wrong, and silent about being wrong.
+    #[test]
+    fn a_non_btree_page_is_refused_rather_than_walked_as_an_internal_node() {
+        let fx = Fx::new();
+        let (base, ob, tb) = fx.forked(&[(b"k", b"v0")]);
+        let ours = fx.put(base, ob, b"a", b"1");
+        let into = BranchId::new(73, 0);
+        fx.store.register_branch(into, Some(TRUNK), fx.tick()).unwrap();
+
+        let heap = fx.store.alloc_for(tb, PageType::Heap, fx.tick()).unwrap();
+        let err = merge3(&fx.tree, base, ours, heap, &ShadowId, into, fx.tick()).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a btree node"),
+            "expected a refusal naming the page type, got: {err}"
+        );
     }
 
     // ---- the curve's own instrument, checked at a size a human can verify ---------------------

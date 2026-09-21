@@ -56,7 +56,9 @@ use std::sync::Arc;
 use ferrodb::branch::types::{BranchId, Epoch, PageId};
 use ferrodb::buffer::buffer_pool::BufferPoolManager;
 use ferrodb::cow::btree::CowTree;
-use ferrodb::cow::merge3::{merge3, MergeStats, MerkleId, RootFastPath, ShadowId};
+use ferrodb::cow::merge3::{
+    merge3, AcceptFingerprintIdentity, MergeStats, MerkleId, RootFastPath, ShadowId,
+};
 use ferrodb::cow::node::Node;
 use ferrodb::cow::page_header::{PageHeader, PageType};
 use ferrodb::cow::store::CowStore;
@@ -461,7 +463,9 @@ fn convergent_edit(n: usize) -> (MergeStats, MergeStats, usize) {
 
     let e = h.tick();
     let s = merge3(&h.tree, base, ours, theirs, &ShadowId, into, e).unwrap();
-    let merkle = MerkleId::new(&h.tree);
+    // The token is the caller saying, at the call site, that it will treat a 128-bit fingerprint
+    // match as proof two subtrees are equal. See `cow::merge3::IdentityProof`.
+    let merkle = MerkleId::new(&h.tree, AcceptFingerprintIdentity);
     let e = h.tick();
     let m = merge3(&h.tree, base, ours, theirs, &merkle, into, e).unwrap();
     assert_eq!(m.stats.root_fast_path, Some(RootFastPath::SidesAgree));
