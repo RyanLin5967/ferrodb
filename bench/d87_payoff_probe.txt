@@ -1,0 +1,37 @@
+D87 — PRICING THE FIX BEFORE BUILDING IT. Removing the per-claim map write closes the WHOLE gap.
+
+D87 is a multi-hour change: a durable format change plus 88 `.arenas` call sites. So the payoff was
+measured first, by an env-gated probe that SKIPS `alloc_arena`'s `persist_if_configured` — unsafe,
+and never to be shipped, but an exact upper bound on what D87 can buy.
+
+[HERE] `examples/branch_curve_writes.rs`, 4 threads, 6 GB budget, all three arms on one box within
+minutes of each other.
+
+         N   OFF forks/s   ON forks/s   ON with the per-claim persist REMOVED
+      1000         253.5       ~55            **309.1**
+      5000         252.8       ~29-58         **284.3**
+
+  atomic replaces during the probe run: **0 (0 bytes)** — against 5000 (600 MB) for both other arms.
+
+⇒ **The per-claim map write is the ENTIRE persistence penalty.** With it gone, the persistence-ON
+configuration runs at or above the OFF configuration. Not a partial win, not a constant shaved: the
+gap closes.
+
+⇒ That prices D87 at roughly **5-10x on this workload**, and it is a complexity change as well —
+D89 measured ON decaying with N while OFF stays flat, and the decay is this write's O(N^2) bytes.
+
+=== ⛔ AND A MEASUREMENT I HAD TO WITHDRAW TO GET HERE ===============================
+
+An earlier pass reported ON-with-skip at 60.6 / 65.1 / 56.5 and I was one step from concluding
+"D87 removes the decay but leaves a constant ~4x gap". **That was wrong, and the probe had not been
+applied at all.** The counter is what caught it: the supposedly-skipping run showed **5000 atomic
+replaces, identical to the normal run**, when it should have shown zero.
+
+⇒ ✅ **A PROBE THAT DOES NOTHING IS INDISTINGUISHABLE FROM A PROBE THAT SHOWS NO EFFECT**, and the
+difference is the entire conclusion. The probe now carries its own liveness check in a comment, and
+this file quotes the replace count beside every number so a future reader can see the probe fired.
+The withdrawn figures are left here rather than deleted, because the failure mode is the point.
+
+⚠ The skip arm is UNSAFE and must never ship: an unpersisted claim lets the next open hand out the
+same range (`arena.rs:1011`). D87 reaches the same number legitimately, by making the claim
+DERIVABLE from the catalog rather than leaving it unwritten.
