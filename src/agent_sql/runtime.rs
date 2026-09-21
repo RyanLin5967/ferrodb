@@ -336,6 +336,64 @@ struct Staged {
     guard: Option<Guard>,
 }
 
+/// One side of a sibling merge, lifted out of its `Workspace` so the state lock is not held
+/// across the composition.
+///
+/// Every field is a `PersistentMap` clone or a `Vec` clone of what the workspace already holds —
+/// D27 made the maps structurally shared, so a clone is an `Arc` bump rather than a copy of the
+/// branch's whole staged set.
+struct SiblingSide {
+    rows: PersistentMap<(u32, u64), RowState>,
+    base_rows: PersistentMap<(u32, u64), Option<Vec<Value>>>,
+    tables: PersistentMap<u32, String>,
+    ops: Vec<Op>,
+    guards: Vec<Guard>,
+    base_shapes: PersistentMap<String, Schema>,
+}
+
+/// The fork point of two branches, and what finding it cost.
+///
+/// **`hops` and `walk_hops` are the instrument the complexity claim is stated in**, and they are
+/// integers for the reason `VersionGraph::is_ancestor_hops` gives: a hop count does not move when
+/// the machine is loaded, and a wall clock on this box measures the build fleet as much as the
+/// algorithm. `walk_hops` is the comparable number for the parent-pointer walk to the same
+/// answer — one dereference per level on each side — so the two are directly commensurable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPoint {
+    /// The lowest common ancestor. Never fabricated: two branches in different trees are an
+    /// error, not an assumed trunk.
+    pub branch: BranchId,
+    /// The fork point's ancestry depth.
+    pub depth: u32,
+    /// Jump-pointer dereferences the O(log depth) query performed.
+    pub hops: u64,
+    /// Dereferences a parent-pointer walk would have performed for the same answer.
+    pub walk_hops: u64,
+}
+
+/// What a sibling merge decided, and where its fork point came from.
+#[derive(Debug, Clone)]
+pub struct SiblingMergeReport {
+    pub merge_id: String,
+    pub from: BranchId,
+    pub into: BranchId,
+    /// The **computed** fork point the three-way merge was scored against.
+    pub fork: ForkPoint,
+    pub outcome: MergeOutcome,
+    pub rows: Vec<RowMergeOutcome>,
+    /// Whether the composed rows were staged onto `into`. False for a conflict, which stages
+    /// nothing and leaves both branches alive.
+    pub applied: bool,
+}
+
+/// Carry an ancestry-index fault out as a branch error.
+///
+/// Kept distinct in wording: an [`AncestryError`] is a fault of the index, not of the branch, and
+/// a caller that sees one is looking at a bookkeeping bug rather than a reaped handle.
+fn ancestry_error(e: AncestryError) -> FerroError {
+    FerroError::Branch(format!("ancestry index: {e}"))
+}
+
 /// What one page-derived `DIFF` cost, in integers.
 ///
 /// **Integers and not a duration, deliberately.** This box runs a build fleet and a 46x
@@ -2834,6 +2892,530 @@ impl AgentRuntime {
         let mut state = self.state.lock().unwrap();
         state.next_merge += 1;
         format!("m_{}", state.next_merge)
+    }
+
+    // ---- D103: ancestry, and the merge it makes possible ------------------------------------
+
+    /// Put `branch` and every ancestor it needs into the ancestry index, deriving the chain from
+    /// the branch catalog.
+    ///
+    /// The fast path is one hash lookup for a branch already present. Only a branch the index has
+    /// never seen pays the walk to the first known ancestor, once — after which every ancestry
+    /// query about it is O(log depth) through the jump tables.
+    ///
+    /// ⚠ **A reaped ancestor is an error here, not a missing edge.** If the walk reaches a
+    /// `parent_id` the catalog no longer holds, this returns that error rather than treating the
+    /// chain as rooted where it stopped. Rooting it there would invent a fork point, and
+    /// `VersionGraph::lca` says exactly why that is the failure worth refusing: "a three-way merge
+    /// against a fabricated fork point silently treats unrelated rows as concurrent edits."
+    ///
+    /// Never called with `state` held; see the field docs on [`AgentRuntime::ancestry`].
+    fn ensure_ancestry(&self, branch: BranchId) -> Result<(), FerroError> {
+        if self.ancestry.lock().unwrap().depth(branch).is_ok() {
+            return Ok(());
+        }
+        // Collect upward, with no lock of ours held while the catalog is read.
+        let mut chain: Vec<(BranchId, Option<BranchId>)> = Vec::new();
+        let mut cursor = Some(branch);
+        while let Some(b) = cursor {
+            if self.ancestry.lock().unwrap().depth(b).is_ok() {
+                break;
+            }
+            let record = self.branches.get(b).map_err(|e| {
+                FerroError::Branch(format!(
+                    "cannot establish the ancestry of {branch}: its ancestor {b} is not in the \
+                     branch catalog ({e}). Refusing rather than treating {b} as a root, because a \
+                     fabricated fork point makes a three-way merge read unrelated rows as \
+                     concurrent edits."
+                ))
+            })?;
+            chain.push((b, record.parent_id));
+            cursor = record.parent_id;
+        }
+        let mut graph = self.ancestry.lock().unwrap();
+        // Downward, so a child is never inserted before its parent exists. `continue` covers the
+        // race with another thread that hydrated the same chain between the two locks.
+        for (b, parent) in chain.into_iter().rev() {
+            if graph.depth(b).is_ok() {
+                continue;
+            }
+            let inserted = match parent {
+                None => graph.insert_root(b),
+                Some(p) => graph.insert_child(b, p),
+            };
+            inserted.map_err(ancestry_error)?;
+        }
+        Ok(())
+    }
+
+    /// The fork point of two branches, and what finding it cost.
+    ///
+    /// **This is the query ferrodb had no answer for.** Every merge path in this runtime reads
+    /// `record.parent_id` and targets that, so the only fork point it could ever name was a direct
+    /// parent — which is why two sibling branches could not be merged at all. `VersionGraph` makes
+    /// the general question O(log depth), and this is where it enters the production path.
+    pub fn fork_point(&self, a: BranchId, b: BranchId) -> Result<ForkPoint, FerroError> {
+        self.ensure_ancestry(a)?;
+        self.ensure_ancestry(b)?;
+        let graph = self.ancestry.lock().unwrap();
+        let (lca, hops) = graph.lca_hops(a, b).map_err(ancestry_error)?;
+        let branch = lca.ok_or_else(|| {
+            FerroError::Branch(format!(
+                "{a} and {b} have no common ancestor, so there is no fork point to merge them \
+                 against. Refusing rather than assuming trunk."
+            ))
+        })?;
+        // What a parent-pointer walk to the same answer costs: one dereference per level on each
+        // side, down to the fork point. The control for `hops`, in the same unit.
+        let (da, db, dl) = (
+            graph.depth(a).map_err(ancestry_error)?,
+            graph.depth(b).map_err(ancestry_error)?,
+            graph.depth(branch).map_err(ancestry_error)?,
+        );
+        Ok(ForkPoint {
+            branch,
+            depth: dl,
+            hops,
+            walk_hops: u64::from(da - dl) + u64::from(db - dl),
+        })
+    }
+
+    /// **Merge one branch into a SIBLING**, composed three-way against their computed fork point.
+    ///
+    /// # The capability this adds
+    ///
+    /// Every other merge path in this runtime targets `record.parent_id` — `merge`,
+    /// `evaluate_merge` and `diff` all open with `parent_id.unwrap_or(TRUNK)`. That is not a
+    /// policy, it is the only thing they could do: with no LCA there is no fork point for any
+    /// other pair, and `ThreeWayMerger` says as much by taking `_lca` and never reading it. The
+    /// consequence is the one `SIMULATE` runs into: K candidates forked off one base can only be
+    /// admitted **one at a time into that base**, and every candidate after the first is re-scored
+    /// against a base the previous admission moved.
+    ///
+    /// This composes candidate into candidate. The fork point comes from
+    /// [`AgentRuntime::fork_point`], so it is the real LCA rather than an assumed parent, and
+    /// nothing is published to the shared tables: the composed rows are staged onto `target`,
+    /// which then carries both branches' work and merges to the parent **once**.
+    ///
+    /// # Where the LCA is load-bearing, stated exactly
+    ///
+    /// Not as a record. `ThreeWayMerger::merge` documents why: "The LCA record itself is not
+    /// consulted: what the merge needs from the fork point is its *state*." What a three-way merge
+    /// consumes is `CellMerge::base` — the value the cell held at the fork point — and that is
+    /// what the fork point supplies here. Give the same two branches a different base and
+    /// `resolve_cell` returns a different verdict, which is what makes this a real dependency
+    /// rather than a parameter passed for appearance. `only_one_side_moved_the_cell` and
+    /// `both_siblings_moved_the_same_cell_and_it_conflicts` pin both directions.
+    ///
+    /// # Where the base state comes from
+    ///
+    /// Each workspace's `base_rows` is filled by `insert_if_absent` at the branch's first touch of
+    /// a row, so it holds the image that row had **at the fork point** and keeps holding it. Both
+    /// siblings forked from the LCA, so either side's entry is the LCA's image of that row; the
+    /// source's is preferred and the target's is the fallback for a row only the target touched.
+    /// Nothing is read from the shared tables, which is also what keeps this O(delta).
+    ///
+    /// # Refusals
+    ///
+    /// * No common ancestor — refused by `fork_point` rather than assumed to be trunk.
+    /// * The fork point **is** one of the two branches — that is an ancestor/descendant pair, not
+    ///   a fork. Merging a branch into its own ancestor is `merge`, which publishes; this would
+    ///   quietly do something else under the same name.
+    /// * Either branch quarantined. A hold that a second merge path walks around is not a hold.
+    /// * The two sides forked from different shapes of a table they both touched. Composing across
+    ///   that would compare images of different widths cell by cell and silently drop the extra
+    ///   columns — no conflict, no report, `Clean`.
+    ///
+    /// # What this does NOT do, rather than leaving it to be discovered
+    ///
+    /// * **No verification gate and no read-premise check.** Those are admission checks for
+    ///   publishing to the shared tables and this publishes nothing; `target` still faces the full
+    ///   gate when it merges to the parent, carrying the source's rows and guards with it.
+    /// * **Atomic per table, not across tables.** The composed rows are staged one `stage_all` call
+    ///   per table, so a per-table refusal (an escrow bound, a capability envelope) leaves earlier
+    ///   tables staged. Same shape, and the same reason, as the multi-table residue
+    ///   `publish_evaluation_as` documents.
+    pub fn merge_into(
+        &self,
+        ctx: &mut ExecCtx,
+        source: BranchId,
+        target: BranchId,
+    ) -> Result<SiblingMergeReport, FerroError> {
+        if source == target {
+            return Err(FerroError::Branch(format!(
+                "{source} cannot be merged into itself"
+            )));
+        }
+        for b in [source, target] {
+            if self.branches.get(b)?.state == BranchState::Quarantined {
+                return Err(FerroError::Branch(format!(
+                    "{b} is quarantined and cannot take part in a merge: {}",
+                    self.quarantine_reason(b).unwrap_or_else(|| "no reason recorded".into())
+                )));
+            }
+        }
+
+        let fork = self.fork_point(source, target)?;
+        if fork.branch == source || fork.branch == target {
+            return Err(FerroError::Branch(format!(
+                "the fork point of {source} and {target} is {} — one is an ancestor of the other, \
+                 not a sibling. Use MERGE, which publishes to the ancestor; this path composes two \
+                 branches that diverged and would otherwise silently do something different.",
+                fork.branch
+            )));
+        }
+
+        // Both workspaces, taken together under one lock so they describe the same instant.
+        let (src, tgt, policy) = {
+            let state = self.state.lock().unwrap();
+            let src = state.workspaces.get(&source.id).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {source}"))
+            })?;
+            let tgt = state.workspaces.get(&target.id).ok_or_else(|| {
+                FerroError::Branch(format!("no agent session on branch {target}"))
+            })?;
+            (
+                SiblingSide {
+                    rows: src.rows.clone(),
+                    base_rows: src.base_rows.clone(),
+                    tables: src.tables.clone(),
+                    ops: src.frame.ops.clone(),
+                    guards: src.frame.guards.clone(),
+                    base_shapes: src.base_shapes.clone(),
+                },
+                SiblingSide {
+                    rows: tgt.rows.clone(),
+                    base_rows: tgt.base_rows.clone(),
+                    tables: tgt.tables.clone(),
+                    ops: tgt.frame.ops.clone(),
+                    guards: tgt.frame.guards.clone(),
+                    base_shapes: tgt.base_shapes.clone(),
+                },
+                state.policy.clone(),
+            )
+        };
+
+        // The shapes both sides forked from must agree for every table they both touched. See the
+        // refusal list above for why this is fatal rather than conformed.
+        for (name, shape) in src.base_shapes.iter() {
+            if let Some(other) = tgt.base_shapes.get(name) {
+                if other != shape {
+                    return Err(FerroError::Branch(format!(
+                        "{source} and {target} forked from different shapes of '{name}', so their \
+                         row images cannot be compared cell by cell. Merge each to {} first.",
+                        fork.branch
+                    )));
+                }
+            }
+        }
+
+        // **The state a guard is re-checked against**: what the target holds for each touched row
+        // BEFORE the source's ops land. A guard is a precondition, so it reads the image the write
+        // is about to be applied to — the same reading, and the same reason, as `admit_state` on
+        // the parent-merge path.
+        let mut merged_state = CellState::new();
+        let mut row_outcomes: Vec<RowMergeOutcome> = Vec::new();
+        // Composed rows to stage, grouped by table so each table is one atomic `stage_all`.
+        let mut staged: BTreeMap<u32, Vec<Staged>> = BTreeMap::new();
+
+        for ((t, r), after) in src.rows.iter() {
+            let tbl = TableId(*t);
+            let row = RowId(*r);
+            let table = src
+                .tables
+                .get(t)
+                .cloned()
+                .or_else(|| tgt.tables.get(t).cloned())
+                .unwrap_or_default();
+
+            // The fork point's image of this row, and the target's image of it now.
+            let base = src
+                .base_rows
+                .get(&(*t, *r))
+                .cloned()
+                .or_else(|| tgt.base_rows.get(&(*t, *r)).cloned())
+                .flatten();
+            let on_target = match tgt.rows.get(&(*t, *r)) {
+                Some(RowState::Present(v)) => Some(v.clone()),
+                Some(RowState::Deleted) => None,
+                // The target never touched this row, so it still sees the fork point's image.
+                None => base.clone(),
+            };
+            let mut applied_ops: Vec<Op> = Vec::new();
+            let mut discarded = Vec::new();
+            let mut conflicts: Vec<ConflictReport> = Vec::new();
+            let mut composed: Vec<Op> = Vec::new();
+            let mut produced: Option<RowState> = None;
+
+            // The image a guard sees: an insert has no prior image, so its own new row is what a
+            // guard on it can refer to.
+            let guard_image = match (base.as_ref(), after) {
+                (None, RowState::Present(v)) => Some(v.clone()),
+                _ => on_target.clone(),
+            };
+
+            match (base.as_ref(), after) {
+                // insert
+                (None, RowState::Present(v)) => {
+                    if on_target.is_some() {
+                        conflicts.push(ConflictReport {
+                            kind: ConflictKind::ContradictoryAssign,
+                            tbl,
+                            row,
+                            col: None,
+                            violated_guard: None,
+                            ours: Some(Op::new(tbl, row, None, OpKind::RowCreate(v.clone()))),
+                            theirs: None,
+                            detail: format!("{target} already has a row with this key"),
+                        });
+                    } else {
+                        applied_ops.push(Op::new(tbl, row, None, OpKind::RowCreate(v.clone())));
+                        produced = Some(RowState::Present(v.clone()));
+                    }
+                }
+                // delete
+                (Some(b), RowState::Deleted) => match &on_target {
+                    Some(n) if n != b => conflicts.push(ConflictReport {
+                        kind: ConflictKind::DeleteVsWrite,
+                        tbl,
+                        row,
+                        col: None,
+                        violated_guard: None,
+                        ours: Some(Op::new(tbl, row, None, OpKind::RowDelete)),
+                        theirs: None,
+                        detail: format!("{target} wrote this row after the two branches forked"),
+                    }),
+                    Some(_) => {
+                        applied_ops.push(Op::new(tbl, row, None, OpKind::RowDelete));
+                        produced = Some(RowState::Deleted);
+                    }
+                    // Already gone on the target: both sides agree, nothing to stage.
+                    None => {}
+                },
+                // update
+                (Some(b), RowState::Present(v)) => {
+                    let mut new_row = on_target.clone().unwrap_or_else(|| b.clone());
+                    if on_target.is_none() {
+                        conflicts.push(ConflictReport {
+                            kind: ConflictKind::DeleteVsWrite,
+                            tbl,
+                            row,
+                            col: None,
+                            violated_guard: None,
+                            ours: Some(Op::new(tbl, row, None, OpKind::RowCreate(v.clone()))),
+                            theirs: Some(Op::new(tbl, row, None, OpKind::RowDelete)),
+                            detail: format!("{target} deleted this row after the two branches forked"),
+                        });
+                    } else {
+                        for idx in 0..v.len().min(b.len()) {
+                            if v[idx] == b[idx] {
+                                continue;
+                            }
+                            let col = ColId(idx as u32);
+                            let ours = compose_ops(
+                                &src.ops
+                                    .iter()
+                                    .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
+                                    .map(|o| o.kind.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                            .unwrap_or(OpKind::Assign(v[idx].clone()));
+                            // The SIBLING's op for the same cell, which is what makes this a
+                            // three-way merge rather than a replay. `concurrent_op` cannot answer
+                            // here: it reads `state.applied`, the log of what has been PUBLISHED,
+                            // and a sibling has published nothing.
+                            let theirs = self.sibling_op(&tgt, tbl, row, col, b, idx);
+                            let cell = CellMerge {
+                                tbl,
+                                row,
+                                col,
+                                base: Some(b[idx].clone()),
+                                target: on_target.as_ref().map(|n| n[idx].clone()),
+                                ours,
+                                theirs,
+                            };
+                            match resolve_cell(&cell, source, &policy)? {
+                                CellResolution::Clean { value, op } => {
+                                    new_row[idx] = value;
+                                    applied_ops.push(op);
+                                }
+                                CellResolution::Commuting { value, op } => {
+                                    new_row[idx] = value;
+                                    applied_ops.push(op.clone());
+                                    composed.push(op);
+                                }
+                                CellResolution::Lossy { value, op, discarded: d } => {
+                                    new_row[idx] = value;
+                                    applied_ops.push(op);
+                                    discarded.push(d);
+                                }
+                                CellResolution::Conflict(c) => conflicts.push(c),
+                            }
+                        }
+                        if conflicts.is_empty() {
+                            produced = Some(RowState::Present(new_row));
+                        }
+                    }
+                }
+                (None, RowState::Deleted) => {}
+            }
+
+            if let Some(img) = &guard_image {
+                for (idx, val) in img.iter().enumerate() {
+                    merged_state.set(tbl, row, ColId(idx as u32), val.clone());
+                }
+            }
+
+            if conflicts.is_empty() {
+                if let Some(after) = produced {
+                    // The source's guards for this row travel with it: the target now owns the
+                    // write, and the predicate that made it legal is part of the write.
+                    let guard = src.guards.iter().find(|g| {
+                        g.expr
+                            .referenced_cells()
+                            .iter()
+                            .any(|(gt, gr, _)| *gt == tbl && *gr == row)
+                    });
+                    staged.entry(*t).or_default().push(Staged {
+                        row,
+                        before: on_target.clone(),
+                        after,
+                        ops: applied_ops.clone(),
+                        guard: guard.cloned(),
+                    });
+                }
+            }
+
+            let outcome = if !conflicts.is_empty() {
+                MergeOutcome::Conflict(conflicts.clone())
+            } else if !discarded.is_empty() {
+                MergeOutcome::ResolvedWithLoss {
+                    applied: applied_ops.clone(),
+                    discarded: discarded.clone(),
+                }
+            } else if !composed.is_empty() {
+                MergeOutcome::Commuting { composed }
+            } else {
+                MergeOutcome::Clean
+            };
+            row_outcomes.push(RowMergeOutcome {
+                table,
+                tbl,
+                row,
+                outcome,
+                applied: applied_ops,
+                discarded,
+                conflicts,
+            });
+        }
+
+        // Guards, re-checked after composition against the state the merge would land on — the
+        // same order the parent-merge path uses, and the same reason: a precondition read against
+        // its own result would make every ordinary decrement self-conflict.
+        for c in check_guards(&src.guards, &merged_state) {
+            if let Some(items) = staged.get_mut(&c.tbl.0) {
+                items.retain(|s| s.row != c.row);
+            }
+            match row_outcomes.iter_mut().find(|r| r.tbl == c.tbl && r.row == c.row) {
+                Some(r) => {
+                    r.conflicts.push(c);
+                    r.outcome = MergeOutcome::Conflict(r.conflicts.clone());
+                    r.applied.clear();
+                }
+                None => row_outcomes.push(RowMergeOutcome {
+                    table: src.tables.get(&c.tbl.0).cloned().unwrap_or_default(),
+                    tbl: c.tbl,
+                    row: c.row,
+                    outcome: MergeOutcome::Conflict(vec![c.clone()]),
+                    applied: Vec::new(),
+                    discarded: Vec::new(),
+                    conflicts: vec![c],
+                }),
+            }
+        }
+
+        let outcome = MergeReport::aggregate(&row_outcomes, &[]);
+        let merge_id = self.next_merge_id();
+        if outcome.is_conflict() {
+            // Nothing is staged and both branches stay alive, so the agent can retry against the
+            // predicate it was handed — the same contract a conflicting `MERGE` has.
+            return Ok(SiblingMergeReport {
+                merge_id,
+                from: source,
+                into: target,
+                fork: fork.clone(),
+                outcome,
+                rows: row_outcomes,
+                applied: false,
+            });
+        }
+
+        for (t, items) in staged {
+            let name = src
+                .tables
+                .get(&t)
+                .cloned()
+                .or_else(|| tgt.tables.get(&t).cloned())
+                .ok_or_else(|| {
+                    FerroError::Internal(format!("no table name for table id {t} in this merge"))
+                })?;
+            let entry = ctx
+                .catalog
+                .get_table(&name)
+                .ok_or_else(|| FerroError::Bind(format!("unknown table: {name}")))?;
+            let pk_type = entry
+                .schema
+                .columns
+                .first()
+                .map(|c| c.data_type.clone())
+                .ok_or_else(|| FerroError::Bind(format!("'{name}' has no columns")))?;
+            self.stage_all(target, TableId(t), &name, &pk_type, items)?;
+        }
+
+        Ok(SiblingMergeReport {
+            merge_id,
+            from: source,
+            into: target,
+            fork,
+            outcome,
+            rows: row_outcomes,
+            applied: true,
+        })
+    }
+
+    /// The sibling's own op for one cell, or `None` if it did not move that cell.
+    ///
+    /// Deliberately **not** `concurrent_op`: that reads `state.applied`, which is the log of what
+    /// has been PUBLISHED to the shared tables. A sibling branch has published nothing, so asking
+    /// it returns `None` for every cell and the merge degenerates to a replay of the source over
+    /// the target — no conflict ever detected. The sibling's frame is where its writes are.
+    fn sibling_op(
+        &self,
+        tgt: &SiblingSide,
+        tbl: TableId,
+        row: RowId,
+        col: ColId,
+        base: &[Value],
+        idx: usize,
+    ) -> Option<OpKind> {
+        let ops: Vec<OpKind> = tgt
+            .ops
+            .iter()
+            .filter(|o| o.tbl == tbl && o.row == row && o.col == Some(col))
+            .map(|o| o.kind.clone())
+            .collect();
+        if let Some(k) = compose_ops(&ops) {
+            return Some(k);
+        }
+        // The target moved the cell without an op recorded against it — a whole-row write, for
+        // instance. The move is still real, so it is reported as the assignment it amounts to
+        // rather than dropped, which would read as "the sibling did not touch this cell".
+        match tgt.rows.get(&(tbl.0, row.0)) {
+            Some(RowState::Present(v)) if v.get(idx) != base.get(idx) => {
+                v.get(idx).cloned().map(OpKind::Assign)
+            }
+            _ => None,
+        }
     }
 
     /// **Score a merge without performing it.**
