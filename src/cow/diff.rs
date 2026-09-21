@@ -29,8 +29,9 @@
 //!
 //! Swapping in `cow::cid`'s digest is one line: implement [`NodeIdentity`] for it. Doing it by
 //! wrapping `cid::subtree_cid` in [`MemoIdentity`] and warming a whole tree is **not** that line:
-//! measured at 5410 page reads against the 2188 of the O(N) path this module exists to beat, it is
-//! that path wearing a skip counter. [`MemoIdentity`]'s own docs carry the numbers and the rule.
+//! measured at 9024 page reads to warm the two roots a diff needs, against the 2188 of the O(N)
+//! path this module exists to beat, it is that path wearing a skip counter. [`MemoIdentity`]'s own
+//! docs carry the numbers and the rule.
 //!
 //! # A memo over page ids is a cache over recycled keys
 //!
@@ -428,12 +429,18 @@ impl NodeIdentity for SubtreeHash {
 ///
 /// ```text
 /// diff + PageIdentity, 4 rows changed         :    18 page reads
-/// CowTree::diff, the O(N) path being replaced :  2188 page reads
-/// SubtreeHash::stamp, bottom-up               :  1085 page reads   <- one per node, the floor
-/// MemoIdentity(subtree_cid).warm              :  5410 page reads   <- 2.5x the control
-///   of which subtree_cid itself               :  3240 page reads   <- 1.48x it on its own
-///   of which `warm`'s own walk_pages          :  1085 page reads   <- one per node
-///   of which this adapter's version check     :  1085 page reads   <- one per node
+/// CowTree::diff, the O(N) path being replaced :  2188 page reads   <- walks BOTH roots
+///
+/// precompute for ONE root:
+///   SubtreeHash::stamp, bottom-up             :  1085 page reads   <- one per node, the floor
+///   MemoIdentity(subtree_cid).warm            :  5410 page reads
+///     of which subtree_cid itself             :  3240 page reads   <- 1.48x the control
+///     of which `warm`'s own walk_pages        :  1085 page reads   <- one per node
+///     of which this adapter's version check   :  1085 page reads   <- one per node
+///
+/// precompute a diff actually needs — BOTH roots, one memo:
+///   SubtreeHash::stamp                        :  1450 page reads   <- 0.66x the control
+///   MemoIdentity(subtree_cid).warm            :  9024 page reads   <- 4.1x the control
 /// ```
 ///
 /// The split is an **equality**, not a subtraction from the total: the test counts `walk_pages`
@@ -449,6 +456,16 @@ impl NodeIdentity for SubtreeHash {
 /// The verdict does not rest on either overhead. At 3240 reads the digest **alone** is still half
 /// again the whole O(N) path it is supposed to replace, before a single row is walked or
 /// validated.
+///
+/// The bottom block is the comparison that decides it, and it is the one to quote. The control
+/// walks **both** roots, so a one-root precompute set against it is not the same measurement —
+/// this table used to put 5410 next to 2188 and call it "2.5x", which understated the real cost
+/// by comparing one root's work against two roots' work. Warming both roots through
+/// `subtree_cid` is 9024 reads, **4.1x** the path it would replace; the second root is cheap
+/// (3614) only because the memo already holds every page the two share. `SubtreeHash` pays 1450
+/// for the same pair and stays under the control, which is the whole reason to prefer it. This
+/// file's own rule at [`SubtreeHash`] — an honest diff-time number stamps both roots — applies to
+/// its own cost table, and now does.
 ///
 /// It still reports a healthy `skipped_subtrees`, so the counter does not give the cost away. Use
 /// [`SubtreeHash`] to warm a whole tree — it folds bottom-up and reads each page once — and keep
@@ -2114,10 +2131,14 @@ mod tests {
         let stamp = SubtreeHash::new(Arc::clone(&counting) as Arc<dyn PageStore>);
         stamp.stamp(base).unwrap();
         let stamp_reads = counting.take();
+        stamp.stamp(head).unwrap();
+        let stamp_both = stamp_reads + counting.take();
 
         let ident = MemoIdentity::new(&tree, |t: &CowTree, p| cid::subtree_cid(t, p));
         ident.warm(base).unwrap();
         let warm_reads = counting.take();
+        ident.warm(head).unwrap();
+        let warm_both = warm_reads + counting.take();
 
         let skipping = diff(&tree, base, head, &PageIdentity).unwrap();
         let diff_reads = counting.take();
@@ -2131,6 +2152,8 @@ mod tests {
         println!("    of which subtree_cid itself              : {cid_reads:>8} page reads");
         println!("    of which warm's own walk_pages           : {walk_reads:>8} page reads");
         println!("    of which the version check               : {nodes:>8} page reads");
+        println!("  SubtreeHash::stamp, BOTH roots             : {stamp_both:>8} page reads");
+        println!("  MemoIdentity(subtree_cid).warm, BOTH roots : {warm_both:>8} page reads");
 
         // The split, pinned by an equality rather than by arithmetic on a quoted figure. `warm`
         // does exactly three things per page: one `walk_pages` read (amortised — `walk_pages`
@@ -2159,6 +2182,19 @@ mod tests {
             "warming through subtree_cid ({warm_reads}) is now CHEAPER than the O(N) path \
              ({control_reads}); MemoIdentity's docs forbid this on the strength of it being \
              dearer, and that claim has stopped being true"
+        );
+
+        // The comparison the docs quote: a diff needs BOTH roots warmed, and the control already
+        // walks both. Anything less is one root's work set against two roots'.
+        assert!(
+            stamp_both < control_reads,
+            "stamping both roots ({stamp_both}) is no longer cheaper than the O(N) path \
+             ({control_reads}), so SubtreeHash has stopped being the one to prefer"
+        );
+        assert!(
+            warm_both > 2 * control_reads,
+            "warming both roots through subtree_cid ({warm_both}) has fallen to within 2x the \
+             O(N) path ({control_reads}); the table quotes 4.1x and that has stopped being true"
         );
     }
 }
