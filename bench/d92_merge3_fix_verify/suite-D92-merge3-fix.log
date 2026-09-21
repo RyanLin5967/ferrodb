@@ -1,0 +1,315 @@
+    Blocking waiting for file lock on package cache
+   Compiling ferrodb v0.1.0 (/Users/idide/wt/ferrodb-D92-merge3-fix)
+warning: unused import: `encode_row`
+  --> src/agent_sql/runtime.rs:46:48
+   |
+46 | use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+   |                                                ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `visible_rows` is never used
+    --> src/agent_sql/runtime.rs:1356:8
+     |
+ 643 | impl AgentRuntime {
+     | ----------------- method in this implementation
+...
+1356 |     fn visible_rows(
+     |        ^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/catalog/catalog_page.rs:440:13
+    |
+440 |         let mut write_entry = |bytes: &mut [u8; PAGE_SIZE], o: &mut usize, name: &[u8], roots: [u32; 3], index_root: u32| {
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (lib) generated 2 warnings (1 duplicate)
+warning: unused import: `Barrier`
+  --> examples/d68_merge_is_o_table.rs:50:22
+   |
+50 | use std::sync::{Arc, Barrier};
+   |                      ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `WARMUP` is never used
+  --> examples/d68_merge_is_o_table.rs:82:7
+   |
+82 | const WARMUP: Duration = Duration::from_millis(400);
+   |       ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MEASURE` is never used
+  --> examples/d68_merge_is_o_table.rs:83:7
+   |
+83 | const MEASURE: Duration = Duration::from_millis(2000);
+   |       ^^^^^^^
+
+warning: constant `POINTS` is never used
+  --> examples/d68_merge_is_o_table.rs:84:7
+   |
+84 | const POINTS: [usize; 5] = [1, 2, 4, 8, 16];
+   |       ^^^^^^
+
+warning: function `reader_thread` is never used
+   --> examples/d68_merge_is_o_table.rs:249:4
+    |
+249 | fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
+    |    ^^^^^^^^^^^^^
+
+warning: field `prov` is never read
+   --> examples/d90_delta_vs_chunk.rs:302:5
+    |
+277 | struct Cycle {
+    |        ----- field in this struct
+...
+302 |     prov: ferrodb::provenance::ProvId,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1976 |     reaper_suite!(log_catalog, false);
+     |     --------------------------------- in this macro invocation
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `reaper`
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     |
+help: `reaper` is captured in macro and introduced a unused variable
+    --> src/branch/reaper.rs:1902:17
+     |
+1902 |         let (h, reaper) = setup();
+     |                 ^^^^^^
+...
+1977 |     reaper_suite!(table_catalog, true);
+     |     ---------------------------------- in this macro invocation
+     = note: this warning originates in the macro `reaper_suite` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `ferrodb` (example "d68_merge_is_o_table") generated 5 warnings (run `cargo fix --example "d68_merge_is_o_table" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (example "d90_delta_vs_chunk") generated 1 warning
+warning: variable does not need to be mutable
+  --> examples/d51_sharedword_probe.rs:77:17
+   |
+77 |             let mut one = |s: &Shared| match arm {
+   |                 ----^^^
+   |                 |
+   |                 help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (example "d51_sharedword_probe") generated 1 warning (run `cargo fix --example "d51_sharedword_probe" -p ferrodb` to apply 1 suggestion)
+warning: unused import: `Path`
+  --> tests/integration_readme_commands.rs:41:17
+   |
+41 | use std::path::{Path, PathBuf};
+   |                 ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::path::Path`
+  --> tests/integration_system_views.rs:26:5
+   |
+26 | use std::path::Path;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrodb` (test "integration_readme_commands") generated 1 warning (run `cargo fix --test "integration_readme_commands" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (test "integration_system_views") generated 1 warning (run `cargo fix --test "integration_system_views" -p ferrodb` to apply 1 suggestion)
+warning: `ferrodb` (lib test) generated 5 warnings (1 duplicate) (run `cargo fix --lib -p ferrodb --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 57s
+     Running unittests src/lib.rs (target/debug/deps/ferrodb-d929e200b07daf14)
+
+running 1434 tests
+test agent_sql::escrow::tests::an_unbounded_cell_is_not_escrowed_and_writes_pass_through ... ok
+test agent_sql::changeset::tests::an_empty_merge_is_clean ... ok
+test agent_sql::gate::tests::a_cheap_check_that_almost_never_fires_sorts_last ... ok
+test agent_sql::changeset::tests::a_lossy_row_makes_the_whole_merge_lossy_never_clean ... ok
+test agent_sql::escrow::tests::a_branch_cannot_spend_against_a_claim_it_never_made ... ok
+test agent_sql::escrow::tests::a_negative_or_zero_claim_is_refused ... ok
+test agent_sql::escrow::tests::the_counter_cannot_be_driven_below_its_floor ... ok
+test agent_sql::escrow::tests::two_agents_cannot_both_reserve_twelve_out_of_twenty ... ok
+test agent_sql::escrow::tests::settling_consumes_only_what_was_actually_spent ... ok
+test agent_sql::escrow::tests::a_recycled_id_slot_does_not_inherit_the_dead_branchs_escrow ... ok
+test agent_sql::escrow::tests::releasing_a_branch_returns_its_unspent_claim_to_the_pool ... ok
+test agent_sql::escrow::tests::reopening_a_pool_is_refused_rather_than_resizing_it ... ok
+test agent_sql::escrow::tests::a_write_beyond_the_branchs_claim_is_refused_at_write_time ... ok
+test agent_sql::changeset::tests::a_conflicting_row_outranks_a_commuting_one ... ok
+test agent_sql::escrow::tests::a_batch_that_only_overdraws_in_aggregate_is_refused ... ok
+test agent_sql::dispatch::tests::a_row_id_past_i64_max_is_not_reported_as_negative ... ok
+test agent_sql::dispatch::tests::every_agent_output_row_matches_its_declared_column_count ... ok
+test agent_sql::dispatch::tests::only_an_empty_diff_returns_no_rows ... ok
+test agent_sql::gate::tests::a_later_tier_does_not_run_once_an_earlier_one_has_fired ... ok
+test agent_sql::gate::tests::a_row_that_could_not_be_evaluated_outranks_every_row_that_held ... ok
+test agent_sql::gate::tests::a_sound_finding_carries_the_violated_predicate ... ok
+test agent_sql::gate::tests::an_assertion_fires_when_it_is_false_and_stays_quiet_when_it_holds ... ok
+test agent_sql::gate::tests::an_assertion_that_examined_no_rows_is_a_hard_reject_not_a_pass ... ok
+test agent_sql::gate::tests::an_empty_gate_and_a_gate_where_nothing_fires_both_pass ... ok
+test agent_sql::gate::tests::every_broken_assertion_reaches_the_caller_in_one_round_trip ... ok
+test agent_sql::gate::tests::every_check_in_a_tier_runs_even_after_one_has_fired ... ok
+test agent_sql::gate::tests::outcome_follows_epistemic_status_not_severity ... ok
+test agent_sql::gate::tests::the_blind_write_metric_quarantines_and_cannot_reject ... ok
+test agent_sql::gate::tests::the_most_severe_status_in_a_tier_decides ... ok
+test agent_sql::gate::tests::tier_order_is_computed_from_cost_over_rejection_probability ... ok
+test agent_sql::mem_catalog::tests::fork_records_the_child_in_the_parent_and_shares_the_root ... ok
+test agent_sql::mem_catalog::tests::reading_a_reaped_branch_is_a_hard_error_not_stale_data ... ok
+test agent_sql::merge_engine::tests::a_guard_that_fails_against_merged_state_returns_its_predicate ... ok
+test agent_sql::merge_engine::tests::a_replayed_frame_contributes_its_increments_once ... ok
+test agent_sql::merge_engine::tests::an_unevaluable_guard_is_not_reported_as_a_failed_one ... ok
+test agent_sql::merge_engine::tests::composing_two_identical_adds_does_not_collapse_them ... ok
+test agent_sql::merge_engine::tests::concurrent_assigns_are_forbidden_by_default_not_silently_lww ... ok
+test agent_sql::merge_engine::tests::identical_concurrent_writes_are_not_a_conflict ... ok
+test agent_sql::merge_engine::tests::invert_refuses_an_assign_with_no_before_image ... ok
+test agent_sql::merge_engine::tests::lww_succeeds_but_reports_the_discarded_write ... ok
+test agent_sql::merge_engine::tests::merger_trait_reports_commuting_for_two_branch_decrements ... ok
+test agent_sql::merge_engine::tests::two_decrements_compose_arithmetically ... ok
+test agent_sql::paged_rows::tests::a_table_range_excludes_its_neighbours ... ok
+test agent_sql::paged_rows::tests::a_delete_removes_only_its_own_row ... ok
+test agent_sql::paged_rows::tests::a_truncated_row_is_refused_rather_than_panicking ... ok
+test agent_sql::paged_rows::tests::an_empty_row_round_trips ... ok
+test agent_sql::paged_rows::tests::a_row_survives_a_round_trip_through_pages ... ok
+test agent_sql::paged_rows::tests::an_unknown_tag_is_refused ... ok
+test agent_sql::paged_rows::tests::a_scan_returns_only_the_requested_table_in_row_order ... ok
+test agent_sql::paged_rows::tests::each_wide_variant_round_trips_on_its_own ... ok
+test agent_sql::paged_rows::tests::keys_sort_in_numeric_row_order ... ok
+test agent_sql::paged_rows::tests::split_rejects_a_wrong_length_key ... ok
+test agent_sql::paged_rows::tests::the_last_table_id_still_has_a_usable_upper_bound ... ok
+test agent_sql::paged_rows::tests::every_value_variant_round_trips ... ok
+test agent_sql::paged_rows::tests::trailing_bytes_are_refused ... ok
+test agent_sql::persistent_map::tests::a_chain_of_clones_sees_its_ancestry_at_fork_time_and_nothing_later ... ok
+test agent_sql::paged_rows::tests::a_write_under_one_root_is_invisible_from_another_root ... ok
+test agent_sql::persistent_map::tests::a_clone_does_not_see_writes_made_through_the_original_afterwards ... ok
+test agent_sql::persistent_map::tests::a_no_op_insert_if_absent_shares_the_whole_tree ... ok
+test agent_sql::paged_rows::tests::the_last_table_scans_its_own_rows ... ok
+test agent_sql::persistent_map::tests::a_write_after_a_clone_shares_every_subtree_it_did_not_touch ... ok
+test agent_sql::persistent_map::tests::ascending_inserts_stay_balanced_rather_than_degenerating_into_a_list ... ok
+test agent_sql::persistent_map::tests::descending_inserts_stay_balanced_too ... ok
+test agent_sql::persistent_map::tests::empty_map_answers_without_panicking ... ok
+test agent_sql::persistent_map::tests::insert_if_absent_is_first_touch_wins ... ok
+test agent_sql::persistent_map::tests::it_behaves_like_a_btreemap_over_a_random_looking_workload ... ok
+test agent_sql::persistent_map::tests::one_write_allocates_a_path_not_a_tree ... ok
+test agent_sql::persistent_map::tests::range_agrees_with_btreemap_on_every_window ... ok
+test agent_sql::persistent_map::tests::siblings_are_invisible_to_each_other ... ok
+test agent_sql::persistent_map::tests::size_hint_is_exact_so_collect_preallocates ... ok
+test agent_sql::persistent_map::tests::string_keys_borrow_for_lookup ... ok
+test agent_sql::persistent_map::tests::the_original_does_not_see_writes_made_through_a_clone ... ok
+test agent_sql::runtime::tests::a_recycled_slot_does_not_strand_the_displaced_workspaces_capture ... ok
+test agent_sql::runtime::tests::a_reservation_that_would_re_issue_a_version_sequence_is_refused ... ok
+test agent_sql::runtime::tests::the_door_audit_fires_on_a_desynchronised_index - should panic ... ok
+test agent_sql::runtime::tests::the_index_scan_assertion_fires_on_a_desynchronised_index - should panic ... ok
+test agent_sql::runtime::tests::the_ordinary_reservation_and_a_leaked_range_are_both_allowed ... ok
+test agent_sql::runtime::tests::the_txn_ref_index_tracks_a_scan_of_the_workspaces ... ok
+test binder::binder::tests::test_duplicate_qualifier ... ok
+test binder::binder::tests::test_expand_star ... ok
+test binder::binder::tests::test_ambiguous_column ... ok
+test binder::binder::tests::test_bind_rejects_an_agent_statement_as_a_plan ... ok
+test binder::binder::tests::every_statement_bind_does_not_plan_returns_an_error_rather_than_panicking ... ok
+test binder::binder::tests::test_resolve_ambiguous ... ok
+test binder::binder::tests::test_resolve_qualified_unique ... ok
+test binder::binder::tests::test_resolve_unknown_column ... ok
+test binder::binder::tests::test_binding_a_plain_plan_from_an_as_of_table_is_refused_not_silently_main ... ok
+test binder::binder::tests::test_resolve_unknown_table ... ok
+test binder::binder::tests::test_duplicate_qualifier_bind ... ok
+test binder::binder::tests::test_join ... ok
+test binder::binder::tests::test_literal ... ok
+test binder::binder::tests::test_bind_revert_merge_defaults_to_halt ... ok
+test branch::arena::tests::a_corrupt_free_space_map_is_refused_not_partially_loaded ... ok
+test binder::binder::tests::test_select_star ... ok
+test binder::binder::tests::test_self_join ... ok
+test binder::binder::tests::test_simple_select ... ok
+test binder::binder::tests::test_unkown_table ... ok
+test branch::arena::tests::a_private_page_is_mutated_in_place_not_shadowed ... ok
+test branch::arena::tests::a_torn_page_is_refused_rather_than_returned ... ok
+test branch::arena::tests::a_v2_checkpoint_image_still_loads_after_the_v3_bump ... ok
+test branch::arena::tests::arena_rolls_over_when_an_extent_fills ... ok
+test branch::arena::tests::an_inherited_page_is_shadowed_and_the_original_is_left_alone ... ok
+test branch::arena::tests::d85_extent_is_empty_refuses_an_unprobed_restored_extent ... ok
+test branch::arena::tests::a_checkpoint_describing_another_region_is_refused ... ok
+test branch::arena::tests::fork_allocates_no_page_at_all ... ok
+test branch::arena::tests::an_arena_region_is_still_off_limits_after_reopening_the_file ... ok
+test branch::arena::tests::privacy_barrier_is_the_later_of_own_fork_and_latest_child_fork ... ok
+test branch::arena::tests::free_space_map_survives_a_restart ... ok
+test branch::arena::tests::d87_probing_an_extent_from_zero_reports_the_pages_actually_written ... ok
+test binder::binder::tests::test_bind_diff_merge_abandon_default_to_the_session_branch ... ok
+test branch::arena::tests::freed_extents_are_recycled_rather_than_leaked ... ok
+test branch::arena::tests::store_refuses_to_share_the_bitmap_allocators_region ... ok
+test binder::binder::tests::test_bind_without_a_session_or_branch_is_an_error ... ok
+test binder::binder::tests::test_bind_select_as_of_resolves_the_branch_and_the_columns ... ok
+test branch::arena::tests::shadowing_your_own_page_across_a_child_fork_parks_the_original ... ok
+test branch::catalog::tests::a_chain_far_past_the_old_cap_forks_and_reports_its_depth ... ok
+test branch::catalog::tests::a_recycled_id_slot_never_answers_to_the_old_handle ... ok
+test binder::binder::tests::a_bound_session_carries_the_prompt_verbatim ... ok
+test branch::arena::tests::checkpoint_round_trips_through_a_file ... ok
+test branch::arena::tests::live_arenas_comes_back_in_arena_id_order ... ok
+test branch::catalog::tests::a_slot_still_pinning_children_is_not_recycled ... ok
+test branch::catalog::tests::epochs_are_strictly_monotonic_across_forks ... ok
+test branch::catalog::tests::every_record_sweep_comes_back_in_branch_id_order ... ok
+test branch::arena::tests::the_checkpoint_image_lists_extents_and_current_arenas_in_key_order ... ok
+test branch::catalog::tests::expired_before_excludes_trunk_the_unexpired_and_the_not_live ... ok
+test branch::catalog::tests::fork_records_the_child_in_the_parent_atomically ... ok
+test branch::catalog::tests::a_parent_listing_only_reaped_children_comes_back_with_an_empty_array ... ok
+test branch::catalog::tests::a_torn_tail_keeps_every_intact_record ... ok
+test branch::catalog::tests::reading_a_reaped_branch_is_a_hard_error ... ok
+test branch::catalog::tests::reparent_moves_the_four_position_fields_and_nothing_else ... ok
+test branch::catalog::tests::reparent_refuses_a_branch_that_is_no_longer_readable ... ok
+test branch::catalog::tests::durable_catalog_survives_a_reopen ... ok
+test branch::catalog::tests::the_live_child_queries_answer_the_rule_the_array_used_to ... ok
+test branch::catalog::tests::a_runtime_release_and_a_reload_agree_on_which_slot_is_next ... ok
+test branch::cherry::tests::a_failed_commit_that_touched_one_row_twice_restores_the_original_image ... ok
+test branch::cherry::tests::a_landed_pick_is_undone_by_the_inverse_plan_through_the_same_door ... ok
+test branch::cherry::tests::a_multi_row_pick_lands_every_row_in_one_commit ... ok
+test branch::cherry::tests::a_selected_op_is_not_counted_as_its_own_divergence ... ok
+test branch::cherry::tests::an_uninvertible_write_refuses_rather_than_guessing ... ok
+test branch::cherry::tests::row01_unchanged_target_cell_applies_clean ... ok
+test branch::cherry::tests::row02_target_moved_but_ops_commute_applies_composed_onto_target ... ok
+test branch::cherry::tests::row03_target_moved_and_ops_contradict_refuses_whole ... ok
+test branch::cherry::tests::row04_target_moved_to_the_same_value_is_not_a_conflict ... ok
+test branch::cherry::tests::row05_lww_policy_applies_and_reports_the_discarded_write ... ok
+test branch::cherry::tests::row06_no_recorded_witness_refuses_rather_than_assuming_unchanged ... ok
+test binder::binder::tests::test_bind_begin_agent_session ... ok
+test branch::cherry::tests::row07_cell_op_on_a_row_the_target_does_not_have_refuses ... ok
+test branch::arena::tests::the_checkpoint_syncs_the_image_before_the_rename_and_the_directory_after_it ... ok
+test branch::cherry::tests::row08_column_past_the_end_of_the_target_row_refuses ... ok
+test branch::arena::tests::d85_next_free_after_a_crash_and_what_extent_is_empty_then_says ... ok
+test branch::cherry::tests::row09_rowcreate_onto_an_absent_row_materialises_it ... ok
+test branch::cherry::tests::row10_rowcreate_onto_a_row_that_already_exists_refuses ... ok
+test branch::cherry::tests::row11_rowdelete_of_a_present_row_removes_it ... ok
+test branch::cherry::tests::row12_rowdelete_of_an_absent_row_refuses ... ok
+test branch::cherry::tests::row13_note_a_straddled_selection_is_reported_not_refused ... ok
+test branch::arena::tests::two_stores_in_the_same_state_checkpoint_byte_identical_images ... ok
+test branch::cherry::tests::row13_two_selected_ops_on_one_cell_compose_into_one_write ... ok
+test branch::cherry::tests::row14_ops_with_no_composition_in_the_algebra_refuse_whole ... ok
+test branch::cherry::tests::row15_the_same_op_selected_twice_refuses_because_add_is_not_idempotent ... ok
+test branch::cherry::tests::row16_a_cell_op_on_a_row_this_pick_creates_folds_into_the_insert ... ok
+test branch::arena::tests::reopen_from_checkpoint_takes_the_base_from_the_image_not_the_caller ... ok
+test branch::cherry::tests::row17_a_cell_op_after_a_delete_in_the_same_pick_refuses ... ok
+test branch::cherry::tests::row18_a_selector_naming_no_recorded_op_refuses ... ok
