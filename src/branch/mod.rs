@@ -24,6 +24,7 @@ pub mod lease_thread;
 pub mod reaper;
 pub mod record;
 pub mod types;
+pub mod version_graph;
 
 pub use arena::{privacy_barrier, ArenaPageStore};
 pub use catalog::{LogBranchCatalog, TRUNK_LEASE};

@@ -1,0 +1,327 @@
+D95 — ANCESTRY QUERIES: is-ancestor and LCA vs branch DEPTH, walk vs index, both arms in one run.
+
+[HERE] examples/d95_ancestry_curve.rs
+       HOPS  (the headline)     ferrodb at 3869f956a97a (clean), taken 2026-09-21T04:46:39Z UNLOCKED.
+                                Hop counts are integers; a loaded box cannot move them, so no
+                                measure lock is needed or claimed for them.
+       CLOCK (confirmatory)     ferrodb at 3869f956a97a (clean), 3 runs, taken while holding
+                                ~/wt/logs/measure-lock.sh as "D95-ancestry", which granted with
+                                load_at_acquire=20 and printed its own caveat: exclusivity
+                                against other measurers, NOT a quiet box. Released after.
+                                Per that caveat every duration here is an UPPER BOUND at load 20.
+
+       An earlier set of four clock runs (the RAW RUNS appendix, ferrodb at 5203b46/bdb36f0) was
+       taken 04:22-04:26Z under the PREVIOUS version of the lock script, whose acquire blocked on
+       load < 8 and could therefore never return on this box. That is recorded rather than
+       deleted; its numbers agree with the confirmatory runs below.
+
+       WHY HOPS AND NOT MILLISECONDS. Sixteen sibling agents compile on this machine and load ran
+       20-60 throughout. An operation count proves a complexity class directly where a wall clock
+       only illustrates one — the same reasoning that makes reaper.rs state D40's claim in
+       `sweep_descents` rather than in milliseconds. The hop table is the result; the clock is
+       corroboration.
+
+## PREMISE CORRECTION — READ THIS BEFORE THE NUMBERS
+
+The task this row was dispatched under asserted three things about the tree that are NOT true of
+HEAD. Recorded here because a rejected premise is worth as much later as the result:
+
+  1. "There is a MAX_BRANCH_DEPTH cap with a collapse path."
+     FALSE at HEAD. D60 removed it. src/branch/types.rs:260 is now a comment explaining its
+     absence, and tests/d60_depth_is_not_capped.rs tests against its return. So this row CANNOT
+     dissolve that cap — it was already gone, and claiming the dissolution would be a false
+     headline. bench/d60_depth_premise.txt holds the measurement that justified removing it.
+
+  2. "ferrodb walks parent pointers for ancestry."
+     FALSE for the read path, which is the path that matters for BranchBench. src/branch/mod.rs:9
+     states the invariant and src/agent_sql/persistent_map.rs:33 restates it: a child's root IS
+     its parent's root at fork, so a read is a descent of the child's own tree and its cost does
+     not depend on depth. ONE real walk exists, on the reap path:
+     src/branch/reaper.rs:169 detach_from_parent, O(depth) steps with UNBOUNDED work per step.
+
+  3. "Every merge needs a common ancestor."
+     FALSE as stated. ferrodb computes no LCA at all, and does not need one, because every merge
+     targets the DIRECT PARENT: src/agent_sql/runtime.rs:2403 and :2692 both read
+     `parent_id.unwrap_or(BranchId::TRUNK)`. src/tel/engine.rs:336 takes the LCA as `_lca` and
+     never reads it; src/tel/schema_merge.rs:16 says so outright.
+
+So the gap is not a slow ancestry query. THE GAP IS A MISSING CAPABILITY: because no LCA exists,
+two SIBLING branches cannot be merged with each other at all. SIMULATE forks K candidates off one
+base and can only admit them one at a time into the shared parent, each re-scored against a base
+the previous admission moved. Merging candidate 3 into candidate 7 directly needs their fork
+point. That is what this row makes possible.
+
+## CURRENT COMPLEXITY AT HEAD 8d79ee5, with file:line
+
+  (a) is-ancestor  — NO IMPLEMENTATION EXISTS. Nearest thing is the reap-path parent walk,
+                     src/branch/reaper.rs:169, O(depth) steps x a TableBranchCatalog B+tree
+                     descent per step (has_live_children).
+  (b) LCA          — NO IMPLEMENTATION EXISTS. src/tel/engine.rs:336 (`_lca`, unused);
+                     src/agent_sql/runtime.rs:2403,:2692 (target is always the parent).
+                     Effectively O(1) for the child->parent case, and UNAVAILABLE otherwise.
+  (c) depth        — ALREADY O(1). Stored per record at fork:
+                     src/branch/record.rs:237 `let depth = parent_depth.saturating_add(1);`
+                     declared at src/branch/record.rs:47.
+
+## WHAT WAS BUILT
+
+src/branch/version_graph.rs — binary lifting (jump pointers), Myers 1983. Each node holds its
+depth and jump[k] = its 2^k-th ancestor. A child's table is built from its parent's alone.
+
+  depth O(1) | level_ancestor O(log d) | is_ancestor O(log d) | lca O(log d) | insert O(log d)
+
+Rejected, with reasons, in the module header: nested sets / interval labelling (Dietz 1982,
+Celko, Django-MPTT) — O(n) renumbering per insert, disqualified because branches are created
+live; ORDPATH / SQL Server hierarchyid (Li & Moon 2001) — strongest rival, O(1) ancestor test,
+but its labels grow with depth, which reintroduces a depth-proportional per-node cost the project
+just finished removing, and an interior delete strands a prefix descendants still encode;
+Euler tour + RMQ (Bender & Farach-Colton 2000) — O(1) LCA but O(n log n) non-incremental
+preprocessing, one fork invalidates the tour; 2-hop / bit-parallel reachability (Cohen 2002,
+GRAIL) — the general-DAG answer, and this is a forest: every branch has exactly one parent_id,
+written once at fork and never changed. Becomes correct the day a merge commit has two parents.
+
+REAPING: a reaped branch is TOMBSTONED, not removed, because ancestry is genealogy and
+reaper.rs:169 walks chains of reaped ancestors on purpose. A tombstone is collected once it is
+childless, cascading upward — the same shape as detach_from_parent. Invariant: a node with any
+descendant is never physically removed, which is what makes free-list slot reuse safe.
+
+## HEADLINE — POINTER HOPS. Integers, immune to load.
+
+Unit: one pointer dereference. For the walk that is a parent pointer; for the index a jump-table
+entry. The same unit on both sides, so the ratio is the complexity class and nothing else.
+
+   depth   anc_hop_walk    anc_hop_idx   anc_hop_x   lca_hop_walk    lca_hop_idx   lca_hop_x
+      10             10              2         5.0             20              6         3.3
+     100            100              3        33.3            200             10        20.0
+    1000           1000              6       166.7           2000             18       111.1
+   10000          10000              5      2000.0          20000             18      1111.1
+  100000         100000              6     16666.7         200000             22      9090.9
+ 1000000        1000000              7    142857.1        2000000             26     76923.1
+
+WALK: exactly D and 2D. Linear, by construction — one dereference per level.
+
+INDEX, is_ancestor: exactly popcount(D) — 2, 3, 6, 5, 6, 7. Not merely logarithmic but the exact
+predicted value, because the climb takes one jump per set bit of the depth delta. Note it is NOT
+monotonic (6 at depth 1000, 5 at depth 10000): popcount is not, and that is the signature of the
+algorithm actually being binary lifting rather than something that merely looks logarithmic.
+
+INDEX, lca: 6, 10, 18, 18, 22, 26. Grows like 2*log2(D), as the descent reads a jump entry from
+BOTH sides at each level it examines.
+
+AT THE PROJECT'S TARGET SCALE, depth 10^6: **7 hops versus 1,000,000** for is_ancestor, and
+**26 versus 2,000,000** for LCA. 142857x and 76923x fewer dereferences.
+
+These numbers are asserted as exact bounds in the unit tests, not merely observed here:
+`hop_counts_are_logarithmic_in_depth_and_the_walk_is_linear` checks popcount(D) for is_ancestor
+and 3*log2(D) for lca across 14 depths including every power-of-two boundary, and
+`hop_counts_do_not_grow_with_fan_out` checks that a 64-wide fan-out does not enter the count. A
+test that only asserted "index beats walk" would still pass at O(sqrt(depth)); these do not.
+
+ONE HONEST ASYMMETRY. In HOPS the index wins at every depth, including depth 10 (2 vs 10). In
+WALL CLOCK it LOSES below about depth 30. Those are not in conflict: the algorithm wins
+everywhere, and the implementation loses when a ~19 ns constant that is not a hop at all — two
+BranchId->slot hash lookups — outweighs a ten-step walk over a hot dense array. The MECHANISM
+CHECK section measures that constant directly.
+
+## HOW TO READ THE COLUMNS
+
+  anc_/lca_walk_ns   the parent-pointer walk, over DENSE Vec<u32> arrays — one array index per
+                     step, no hashing, no id->slot resolution. This deliberately FLATTERS the
+                     walk: the real walk (reaper.rs:169) pays a B+tree descent per step, and the
+                     indexed arm pays two HashMap lookups the walk arm does not. Every ratio
+                     below is therefore a LOWER BOUND on the gap in the database.
+  anc_/lca_index_ns  src/branch/version_graph.rs.
+  *_x                walk / index. >1 means the index is faster.
+  forkreap_ns        insert one child at depth D then reap it. The column that answers "did you
+                     just move the wall onto fork?".
+  walk_steps         MEASURED step count of the walk arm. Load-independent, so this and not the
+                     clock is what proves the complexity class.
+  index_nodes        nodes in the graph; confirms the tree really was built.
+
+Arm order is alternated per depth inside the harness. The harness REFUSES and exits non-zero if
+the two arms ever disagree on an answer; all three runs below exited 0, so they agreed at every
+depth.
+
+
+## RAW RUNS (verbatim; the trailing duplicate '# rc=0' is the shell loop's echo)
+
+## run 1  load=24.11 35.49 45.70
+# D95 ancestry curve. ferrodb at 5203b462ab95
+# profile=release  arms=walk,index  two chains of depth D off one root
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns   walk_steps  index_nodes
+      10            3.5           18.8        0.2            5.8           24.1        0.2           82.8           20           21
+     100           76.1           17.6        4.3          100.3           28.8        3.5          133.5          200          201
+    1000          997.1           23.1       43.2         1012.6           42.0       24.1          162.4         2000         2001
+   10000         3179.9           28.7      111.0         9919.4           49.4      200.8          185.3        20000        20001
+  100000        31700.3           19.4     1634.5        90323.6           73.6     1226.5          270.7       200000       200001
+# rc=0
+# rc=0
+## run 2  load=23.62 35.20 45.54
+# D95 ancestry curve. ferrodb at 5203b462ab95
+# profile=release  arms=walk,index  two chains of depth D off one root
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns   walk_steps  index_nodes
+      10            3.5           17.7        0.2            5.3           19.9        0.3           81.1           20           21
+     100           78.1           17.7        4.4          100.1           29.1        3.4          165.9          200          201
+    1000         1051.8           26.1       40.4         1086.0           47.4       22.9          169.0         2000         2001
+   10000         4448.7           37.1      119.9        12299.4           69.8      176.3          267.9        20000        20001
+  100000        79073.4           59.8     1322.9       279180.0          295.0      946.4          732.1       200000       200001
+# rc=0
+# rc=0
+## run 3  load=23.73 35.03 45.42
+# D95 ancestry curve. ferrodb at 5203b462ab95
+# profile=release  arms=walk,index  two chains of depth D off one root
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns   walk_steps  index_nodes
+      10            3.9          104.7        0.0           17.5           44.6        0.4          236.4           20           21
+     100          345.7           35.1        9.9          173.4           93.8        1.8          301.1          200          201
+    1000         2360.7           52.1       45.3         3049.7          110.5       27.6          389.7         2000         2001
+   10000        12574.8          137.1       91.7        25148.4          130.4      192.9          418.7        20000        20001
+  100000        90685.7           44.3     2045.6       329306.0          362.1      909.3         1237.3       200000       200001
+# rc=0
+# rc=0
+
+## THE READING — WALL CLOCK, CONFIRMATORY ONLY
+
+Superseded as the headline by the hop table above; kept because it corroborates it.
+
+SLOPE, run 1, depth 10 -> 100000 (a 10^4x increase in depth):
+
+  anc_walk    3.5 -> 31700.3 ns    x9057      LINEAR
+  anc_index  18.8 ->    19.4 ns    x1.03      FLAT
+  lca_walk    5.8 -> 90323.6 ns   x15573      LINEAR
+  lca_index  24.1 ->    73.6 ns    x3.05      LOGARITHMIC (log2 predicts ~x5)
+  forkreap   82.8 ->   270.7 ns    x3.27      LOGARITHMIC — the wall did NOT move onto fork
+
+  walk_steps   20 ->  200000       x10000     EXACTLY LINEAR, and load-independent.
+
+The pre-registered outcome "walk LINEAR in D, index FLAT or LOG" is the one that occurred, in all
+three runs. The other two pre-registered outcomes (both arms linear; index linear past some D)
+did not occur.
+
+SPEEDUP AT DEPTH 100000, all three runs:   is_ancestor 1634x / 1323x / 2046x
+                                           lca         1227x /  946x /  909x
+
+CROSSOVER. The index LOSES below about depth 30 — at depth 10 it is ~5x slower (0.2x), because
+two HashMap id->slot lookups cost more than a ten-step walk over a hot dense array. It is already
+4.3x ahead at depth 100. This is reported rather than hidden: a caller that knows it is shallow
+should keep walking, and the win is specifically in the deep regime the project aims at.
+
+WHY THE CLOCK IS NOT THE PROOF. Load was 22-45 throughout. The load-independent instrument is
+walk_steps, which is exactly linear in D by construction, against an index whose climb performs
+popcount(depth delta) <= floor(log2 D)+1 array indexings — 17 at depth 100000 versus 200000. The
+clock corroborates the class; the step count establishes it. See the MECHANISM CHECK section at
+the end, which measures the per-query constant directly and confirms what the flat curve is made
+of.
+
+## MAX_BRANCH_DEPTH VERDICT
+
+**This does NOT dissolve MAX_BRANCH_DEPTH, because MAX_BRANCH_DEPTH does not exist.** D60 removed
+it and measured fork and read FLAT from depth 1 to 250 first (bench/d60_depth_premise.txt). A
+report claiming a cap dissolved here would be claiming credit for D60's work.
+
+What this DOES do is remove the last structural argument for ever reintroducing one. The case for
+a depth cap is always "some per-operation cost grows with depth". After D60 that was true of
+exactly one thing — ancestry questions on the control plane — and the numbers above close it:
+is-ancestor flat, LCA logarithmic, fork logarithmic. There is now no operation in the branch
+engine whose cost is linear in depth AND lacks a better implementation.
+
+## WHAT THIS ROW DID NOT DO
+
+reaper.rs:169 detach_from_parent still walks the parent chain, one B+tree descent per step. This
+row does not change that: file ownership for this dispatch was src/branch/version_graph.rs plus
+one line of src/branch/mod.rs, and reaper.rs belongs to another agent in the same fleet. The
+index makes that walk replaceable; wiring it in is a separate change against a separate owner,
+and the walk is still there at HEAD.
+
+Likewise, nothing yet CALLS this module. It is a correct, measured, tested structure with no
+production caller — the same state MAX_BRANCH_DEPTH's `collapse` was in when D60 found it, which
+is worth saying out loud rather than discovering later.
+
+## MECHANISM CHECK — the shallow-depth crossover, measured rather than asserted
+
+The reading above claimed the index loses below ~depth 30 "because two HashMap id->slot lookups
+cost more than a ten-step walk". That is a mechanism, so it was measured. `depth1hash_ns` times
+`VersionGraph::depth`, which is exactly ONE hash lookup and NO climb.
+
+  depth        1 hash    is_ancestor    2 x hash    climb remainder
+     10          10.7           21.6        21.4               0.2
+    100           9.0           21.1        18.0               3.1
+   1000           9.1           24.0        18.2               5.8
+  10000          10.0           20.4        20.0               0.4
+ 100000           8.9           22.6        17.8               4.8
+
+CONFIRMED. One hash lookup is 8.9-10.7 ns and FLAT in depth. Two of them account for 78-99% of
+`is_ancestor`; the climb itself is the 0.2-5.8 ns remainder, for 2 array indexings at depth 10 and
+up to 17 at depth 100000. The stated mechanism is the right one.
+
+Two consequences worth recording:
+
+  * It explains why `anc_index_ns` reads FLAT rather than logarithmic. The log term is real but is
+    a handful of nanoseconds, swamped by a ~19 ns constant that does not vary with depth. The
+    curve is flat because of the constant, not because the algorithm is O(1) — it is O(log d).
+
+  * There is ~19 ns of headroom for any caller that already holds slot handles rather than
+    `BranchId`s. Not taken here: the API is `BranchId`-shaped because that is what every caller in
+    the branch engine holds, and inventing a handle type to win 19 ns on an operation that just
+    beat the alternative by 1587x would be optimising the wrong end.
+
+## run 4 — MECHANISM CHECK for the shallow crossover  load=25.70 30.74 40.14
+# D95 ancestry curve. ferrodb at bdb36f032961
+# profile=release  arms=walk,index  two chains of depth D off one root
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns   walk_steps  index_nodes
+      10            3.6           21.6        0.2            6.9           26.1        0.3           98.6           10.7           20           21
+     100           89.5           21.1        4.2          100.1           27.9        3.6          136.9            9.0          200          201
+    1000         1010.4           24.0       42.1         1019.4           44.3       23.0          146.1            9.1         2000         2001
+   10000         3055.2           20.4      149.4         9711.5           39.8      244.1          172.2           10.0        20000        20001
+  100000        35827.1           22.6     1587.0        82683.4           50.7     1632.2          247.6            8.9       200000       200001
+# rc=0
+
+
+## APPENDIX A — HOPS, raw harness output (D95_SKIP_TIMING=1, no lock, depth to 10^6)
+
+# D95 ancestry curve. ferrodb at 3869f956a97a
+# profile=release  arms=walk,index  two chains of depth D off one root
+
+## POINTER HOPS — the headline. Integers; a loaded box cannot move them.
+## unit = one pointer dereference (parent pointer for walk, jump entry for index).
+   depth   anc_hop_walk    anc_hop_idx   anc_hop_x   lca_hop_walk    lca_hop_idx   lca_hop_x  index_nodes
+      10             10              2         5.0             20              6         3.3           21
+     100            100              3        33.3            200             10        20.0          201
+    1000           1000              6       166.7           2000             18       111.1         2001
+   10000          10000              5      2000.0          20000             18      1111.1        20001
+  100000         100000              6     16666.7         200000             22      9090.9       200001
+ 1000000        1000000              7    142857.1        2000000             26     76923.1      2000001
+# rc=0
+
+## APPENDIX B — CONFIRMATORY CLOCK, 3 runs under the fixed measure lock (load_at_acquire=20)
+## Every duration below is an UPPER BOUND at load 20, per the lock's own caveat.
+
+## confirmatory timing run 1  load_at_acquire=20  load_now=24.60 25.19 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           24.7        0.2            6.6           29.2        0.2           92.6           10.3
+     100          118.1           27.5        4.3          121.5           35.8        3.4          146.0            9.5
+    1000         1222.1           22.5       54.3         1289.1           37.2       34.7          145.7           10.0
+   10000         7798.8           39.5      197.4        14320.2           69.8      205.0          246.0           10.7
+  100000        37754.8           27.6     1366.9        81748.7           89.9      909.8          277.9           10.6
+# rc=0
+## confirmatory timing run 2  load_at_acquire=20  load_now=24.60 25.19 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           27.5        0.2            6.8           30.3        0.2          107.0           12.2
+     100          139.2           29.7        4.7          150.1           33.7        4.5          163.3           11.5
+    1000          369.1           27.9       13.2         1251.0           47.6       26.3          169.1           10.2
+   10000         5282.2           27.3      193.4        12285.4           44.0      279.3          181.9           12.7
+  100000        43750.7           33.6     1302.5        78273.8           50.4     1553.1          243.3           10.9
+# rc=0
+## confirmatory timing run 3  load_at_acquire=20  load_now=25.19 25.31 30.62
+## WALL CLOCK — confirmatory only. Absolutes are this box under whatever else
+## it is running; the hop table above is what proves the complexity class.
+   depth    anc_walk_ns   anc_index_ns      anc_x    lca_walk_ns   lca_index_ns      lca_x    forkreap_ns  depth1hash_ns
+      10            4.5           23.5        0.2            6.7           29.3        0.2          103.4           10.4
+     100          161.5           27.5        5.9          137.6           41.3        3.3          163.6           15.0
+    1000         1567.6           29.5       53.2         1715.4           61.5       27.9          170.6           13.0
+   10000        10138.8           46.5      217.9        14182.3           85.1      166.6          261.9           11.5
+  100000        63046.9           37.7     1670.6        80792.0           94.7      852.8          257.7           10.3
+# rc=0
