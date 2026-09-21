@@ -33,6 +33,12 @@ run() {           # run <label> <timeout-seconds> <env...> -- <binary> [args]
     echo "# load before: $(uptime | sed 's/.*averages*: *//')"
     echo "# cmd: $*"
   } >>"$OUT"
+  # HEARTBEAT. A waiting measurer steals this lock when the owner file is >45 min old
+  # (`measure-lock.sh`, the stall-breaker). The owner file is written once at acquire, so a
+  # multi-hour sweep would be robbed mid-run and two measurers would time simultaneously —
+  # the one thing the lock exists to prevent. Touched per BLOCK, not on a timer: if one block
+  # genuinely stalls past 45 minutes the lock SHOULD become stealable, and it still does.
+  touch /Users/idide/wt/logs/.measure.lock/owner 2>/dev/null
   local t0=$(date +%s)
   timeout "$tmo" env "$@" >>"$OUT" 2>&1
   local rc=$?
