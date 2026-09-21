@@ -780,11 +780,30 @@ impl CowTree {
         branch: BranchId,
         epoch: Epoch,
     ) -> Result<PageId, FerroError> {
-        loop {
+        // ⛔ FREE LAST. Every page this cascade retires is collected here and handed back only
+        // once the new root is established.
+        //
+        // Freeing inside the loop broke this function's own documented ordering ("Each page is
+        // freed AFTER its parent has stopped pointing at it, never before"), in TWO arms:
+        //
+        //  * the `childless` arm returns `true` WITHOUT touching the node, so the parent's
+        //    `leftmost` still points at `doomed` when the free ran -- directly under a comment
+        //    reading "Nothing points at it now.", which was false exactly there. When `cow_page`
+        //    wrote in place because the branch already owned the parent, that parent is a LIVE
+        //    page pointing at one the free space map may have already reissued.
+        //  * the cascade-past-root arm freed and THEN called `create`, which is fallible
+        //    (`arena_for` + `alloc_in_arena` + `read_page`). On an error there the caller still
+        //    holds the old root, whose page is now free.
+        //
+        // In the happy path the dangling pointer is transient -- the next iteration frees the
+        // parent too -- so this is an error-path defect, and `relink_up` never freed anything,
+        // which means delete USED to be fail-safe and had stopped being so.
+        let mut retired: Vec<PageId> = Vec::new();
+        let new_root = loop {
             let Some((parent_id, slot)) = path.pop() else {
                 // Cascaded past the root: every page is gone, so the tree is the empty tree.
-                self.store.free_page(doomed, epoch)?;
-                return self.create(branch, epoch);
+                retired.push(doomed);
+                break self.create(branch, epoch)?;
             };
 
             let cp = self.store.cow_page(parent_id, branch, epoch)?;
@@ -812,8 +831,8 @@ impl CowTree {
             };
             drop(cp);
 
-            // Nothing points at it now.
-            self.store.free_page(doomed, epoch)?;
+            // Retired, NOT yet freed -- see the note at the top of this function.
+            retired.push(doomed);
 
             if childless {
                 doomed = new_parent;
@@ -821,7 +840,24 @@ impl CowTree {
             }
             // The parent survived but was copied, so its own parent still has to be repointed.
             // With an empty path this returns `new_parent`, which is then the new root.
-            return self.relink_up(root, path, parent_id, new_parent, Vec::new(), branch, epoch);
+            break self.relink_up(root, path, parent_id, new_parent, Vec::new(), branch, epoch)?;
+        };
+
+        // The new root is established, so nothing reachable points at any retired page and a
+        // failure from here can only LEAK one, never strand a live pointer -- the safe direction.
+        // Every page is attempted even if one fails, because stopping early would leak the rest
+        // for no gain; the first error is still returned rather than swallowed.
+        let mut first_err = None;
+        for page in retired {
+            if let Err(e) = self.store.free_page(page, epoch) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(new_root),
         }
     }
 }
