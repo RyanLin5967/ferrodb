@@ -507,6 +507,7 @@ fn row_bytes() -> usize {
 /// rather than assumed, and a repeat is a refusal, not a warning.
 fn assert_fresh_branches(cycles: &[Cycle], label: &str) {
     let mut seen: HashSet<(u64, u32)> = HashSet::new();
+    let mut seen_prov: HashSet<ferrodb::provenance::ProvId> = HashSet::new();
     for c in cycles {
         let key = (c.branch.id, c.branch.generation);
         assert!(
@@ -522,6 +523,19 @@ fn assert_fresh_branches(cycles: &[Cycle], label: &str) {
             "{label}: r={} began on branch {}@g{} but the merge reports it came from {}@g{}. The \
              statement that was measured is not the statement that was merged.",
             c.r, c.branch.id, c.branch.generation, c.from.id, c.from.generation
+        );
+        // The provenance slot is the OTHER half of the same freshness question, and it is the half
+        // that actually surfaced the stub-runtime bug: a `Session::new()` builds a brand-new
+        // `AgentRuntime`, so every cycle reported `prov1` and the SECOND merge died on a
+        // provenance-slot collision. A shared runtime advances prov1, prov2, prov3... So a repeated
+        // slot means the runtime was rebuilt underneath the sweep, which is exactly the
+        // configuration this harness must never measure.
+        assert!(
+            seen_prov.insert(c.prov),
+            "{label}: r={} reported provenance slot {:?}, which an earlier cycle already used. The \
+             runtime was rebuilt between cycles, so these statements did not run against the arena \
+             engine this harness configured. Refusing to report it.",
+            c.r, c.prov
         );
     }
 }

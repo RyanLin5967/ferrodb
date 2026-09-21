@@ -79,9 +79,6 @@ const ROWS: i64 = 2000;
 static WRITES_PER_BRANCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("D68_DELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
 });
-const WARMUP: Duration = Duration::from_millis(400);
-const MEASURE: Duration = Duration::from_millis(2000);
-const POINTS: [usize; 5] = [1, 2, 4, 8, 16];
 
 struct Server {
     ctx: Arc<ServerContext>,
@@ -246,6 +243,14 @@ fn one_cycle_timed(s: &Server, tid: usize, seq: u64, disjoint: bool) -> Option<C
 /// reader is idle. With no readers registered that is all free, which is why the first run's
 /// blocked stacks never showed it. With readers registered it is a shared-word write on the hot
 /// path, and D51 measured that exact shape at x0.121 against a relaxed load's x7.823.
+// RETAINED DELIBERATELY THOUGH CURRENTLY UNCALLED, and this is not dead code being tolerated.
+// Its caller was removed while this harness was mid-refactor; the function itself is the reader
+// side of the contention arm and it is needed by the pending re-run. It also contains the exact
+// defect that re-run exists to fix: `Session::new()` below builds its OWN `AgentRuntime` with
+// `storage: None`, so every agent statement it dispatches misses the arena engine this harness
+// configures (D104). Deleting it now would throw away the code that has to be corrected.
+// OWNER: the D101 stub-runtime row. Remove this attribute when the caller is restored.
+#[allow(dead_code)]
 fn reader_thread(s: Arc<Server>, stop: Arc<AtomicBool>, reads: Arc<AtomicU64>) {
     let slot = Arc::new(AtomicBool::new(false));
     s.ctx.register_reader(Arc::clone(&slot));

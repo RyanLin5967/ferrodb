@@ -43,7 +43,7 @@ use crate::agent_sql::merge_engine::{
 };
 use crate::agent_sql::escrow::EscrowLedger;
 use crate::agent_sql::gate::{AssertionResult, GateOutcome};
-use crate::agent_sql::paged_rows::{decode_row, encode_row, split_row_key, PageRowChange, PagedRows};
+use crate::agent_sql::paged_rows::{decode_row, split_row_key, PageRowChange, PagedRows};
 use crate::agent_sql::simulate::Assertion;
 use crate::agent_sql::session::AgentSession;
 use crate::binder::binder::{Binder, BoundExpr, Scope};
@@ -1422,17 +1422,6 @@ impl AgentRuntime {
             });
         }
         Ok(out)
-    }
-
-    /// Every row of `table` as `branch` sees it: the shared table overlaid with that branch's
-    /// uncommitted buffer.
-    fn visible_rows(
-        &self,
-        ctx: &ReadCtx,
-        branch: Option<BranchId>,
-        table: &str,
-    ) -> Result<Vec<(RowId, Vec<Value>)>, FerroError> {
-        self.visible_rows_where(ctx, branch, table, None, None, None)
     }
 
     /// The rows of `table` satisfying a predicate, as `branch` sees them.
