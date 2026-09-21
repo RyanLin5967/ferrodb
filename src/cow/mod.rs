@@ -27,6 +27,8 @@ pub mod store;
 #[cfg(test)]
 mod tests_chunking;
 #[cfg(test)]
+mod tests_review_attack;
+#[cfg(test)]
 mod tests_isolation;
 
 pub use btree::{CowTree, ScanCursor};
