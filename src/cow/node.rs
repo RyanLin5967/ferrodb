@@ -62,10 +62,35 @@ pub fn leaf_entry_bytes(key: &[u8], value: &[u8]) -> usize {
     SLOT_SIZE + 4 + key.len() + value.len()
 }
 
+/// What an internal entry costs beyond its key: the slot, the key-length prefix, the child id.
+const INTERNAL_ENTRY_OVERHEAD: usize = SLOT_SIZE + 4 + 4;
+
 /// Bytes a separator entry occupies inside an internal node.
 pub fn internal_entry_bytes(key: &[u8]) -> usize {
-    SLOT_SIZE + 4 + key.len() + 4
+    INTERNAL_ENTRY_OVERHEAD + key.len()
 }
+
+/// The zero byte a separator appends to the boundary key it cuts on.
+pub const SEPARATOR_SUFFIX_BYTES: usize = 1;
+
+/// Bytes the separator *for* `key` occupies — one more than the key's own internal entry.
+///
+/// A content-defined cut promotes `btree::successor_of(key)`, the boundary key with a zero byte
+/// appended, rather than the right piece's first key; see that function for why it cannot use a
+/// row's key directly.
+pub fn separator_entry_bytes(key: &[u8]) -> usize {
+    internal_entry_bytes(key) + SEPARATOR_SUFFIX_BYTES
+}
+
+/// The largest key this tree accepts.
+///
+/// **Not** the largest key that fits a leaf. A key must also be small enough to *separate* one,
+/// and since cuts became content-defined a separator costs [`SEPARATOR_SUFFIX_BYTES`] more than
+/// the key does — so the internal node's limit binds first, one byte tighter than it used to be.
+/// Stating it once, here, is what keeps that byte from being an arithmetic coincidence spelled
+/// out at each call site; `CowTree::insert` refuses above it rather than letting a split fail on
+/// the way back up, and `cow::tests_chunking` pins the key at the limit and the one past it.
+pub const MAX_KEY_BYTES: usize = MAX_ENTRY_BYTES - INTERNAL_ENTRY_OVERHEAD - SEPARATOR_SUFFIX_BYTES;
 
 pub fn leaf_cell(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut c = Vec::with_capacity(4 + key.len() + value.len());

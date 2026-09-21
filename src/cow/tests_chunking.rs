@@ -381,44 +381,74 @@ fn rewriting_values_in_place_leaves_the_partition_alone() {
     assert_eq!(after, canonical(&updated), "the rewritten tree is not the chunker's partition");
 }
 
-/// A key can fit a leaf and still be too large to *separate* one, because a content cut promotes
-/// the boundary key plus a byte. That one byte narrows the largest usable key by one, so the
-/// refusal is a real behaviour change and is pinned here rather than left latent — and it has to
-/// arrive before anything is written.
+/// Both sides of [`node::MAX_KEY_BYTES`], which is one byte tighter than the leaf alone implies.
+///
+/// A key can fit a leaf entry and still be too large to *separate* one, because a content cut
+/// promotes the boundary key plus a zero byte. That narrowed the largest usable key by one when
+/// cuts became content-defined, so it is a real behaviour change and both sides are pinned: the
+/// key at the limit has to survive a split, and the one past it has to be refused.
+///
+/// The refusal is asserted by its **outcome**, not its wording: an up-front refusal spends no
+/// pages, where refusing from inside `internal_relink` would already have split a leaf. The page
+/// count is the only thing that tells those two apart from outside.
 #[test]
-fn a_key_too_large_to_separate_is_refused_before_the_tree_is_touched() {
+fn the_key_limit_holds_on_both_sides_and_refuses_before_spending_a_page() {
     let f = Fixture::new();
     let mut root = f.build(&pairs(200));
     let before = f.leaf_partition(root);
+    let pages_before = f.tree.store().live_page_count().unwrap();
 
-    // Sized from the limits, not hard-coded: the key just fits a leaf entry, its separator does
-    // not fit an internal one.
-    let klen = node::MAX_ENTRY_BYTES - node::internal_entry_bytes(b"");
-    let key = vec![b'k'; klen];
-    let value = vec![b'v'; node::MAX_ENTRY_BYTES - node::leaf_entry_bytes(&key, b"")];
-    assert!(
-        node::leaf_entry_bytes(&key, &value) <= node::MAX_ENTRY_BYTES,
-        "fixture: the entry itself must fit a leaf"
-    );
-    assert!(
-        node::internal_entry_bytes(&key) + 1 > node::MAX_ENTRY_BYTES,
-        "fixture: the separator must not fit an internal node"
-    );
-
-    let e = f.tick();
-    let err = f.tree.insert(root, BranchId::TRUNK, e, &key, &value).unwrap_err();
-    assert!(err.to_string().contains("separator"), "unexpected error: {}", err);
-
-    root = f.tree.insert(root, BranchId::TRUNK, f.tick(), b"probe", b"1").unwrap();
-    assert_eq!(f.tree.get(root, &key).unwrap(), None, "the refused key reached the tree");
-    let after = f.leaf_partition(root);
-    let cells: usize = after.iter().map(|l| l.len()).sum();
-    assert_eq!(cells, 201, "the refused insert changed the tree's contents");
+    // The value is sized so the entry itself is exactly at the leaf limit, which is what makes
+    // the internal node's limit the binding one.
+    let at_limit = |i: u8| {
+        let mut k = vec![b'k'; node::MAX_KEY_BYTES];
+        k[0] = i;
+        k
+    };
+    let value = vec![b'v'; node::MAX_ENTRY_BYTES - node::leaf_entry_bytes(&at_limit(0), b"")];
     assert_eq!(
-        after.len(),
-        before.len(),
-        "the refused insert changed the partition\n  before: {}\n  after : {}",
-        describe(&before),
-        describe(&after)
+        node::leaf_entry_bytes(&at_limit(0), &value),
+        node::MAX_ENTRY_BYTES,
+        "fixture: the entry must sit exactly at the leaf limit"
     );
+
+    // Enough of them to force splits: four of these fill a page exactly.
+    for i in 0..10u8 {
+        let e = f.tick();
+        root = f
+            .tree
+            .insert(root, BranchId::TRUNK, e, &at_limit(i), &value)
+            .unwrap_or_else(|e| panic!("a key at the limit was refused: {}", e));
+    }
+    for i in 0..10u8 {
+        assert_eq!(
+            f.tree.get(root, &at_limit(i)).unwrap().as_deref(),
+            Some(value.as_slice()),
+            "key {} at the limit did not survive the splits",
+            i
+        );
+    }
+
+    // One byte over, and nothing may happen at all.
+    let mut too_long = vec![b'k'; node::MAX_KEY_BYTES + 1];
+    too_long[0] = b'z';
+    let short = vec![b'v'; 1];
+    assert!(
+        node::leaf_entry_bytes(&too_long, &short) <= node::MAX_ENTRY_BYTES,
+        "fixture: the over-long key must still fit a leaf, or it trips the other limit"
+    );
+    let partition_before = f.leaf_partition(root);
+    let pages = f.tree.store().live_page_count().unwrap();
+
+    let err = f.tree.insert(root, BranchId::TRUNK, f.tick(), &too_long, &short).unwrap_err();
+    assert!(err.to_string().contains("key limit"), "unexpected error: {}", err);
+    assert_eq!(
+        f.tree.store().live_page_count().unwrap(),
+        pages,
+        "the refused insert allocated a page, so it was refused after splitting rather than before"
+    );
+    assert_eq!(f.tree.get(root, &too_long).unwrap(), None, "the refused key reached the tree");
+    assert_eq!(f.leaf_partition(root), partition_before, "the refused insert moved a boundary");
+    assert!(pages_before <= pages, "fixture: the limit-sized inserts should have grown the tree");
+    assert!(before.len() <= partition_before.len());
 }

@@ -289,16 +289,22 @@ impl CowTree {
             )));
         }
         // A content cut promotes `successor_of(key)`, a byte longer than the key, so a key can fit
-        // a leaf and still be one byte too large to *separate* one. Refuse it here: raising it
-        // from inside `internal_relink` would abandon a leaf split that had already happened —
-        // harmless, since shadow paging means the caller never publishes that root, but it spends
-        // pages and reports the limit from the wrong place.
-        let separator_bytes = node::internal_entry_bytes(key) + 1;
-        if separator_bytes > node::MAX_ENTRY_BYTES {
+        // a leaf and still be too large to *separate* one. Refuse it here, against the one place
+        // the limit is stated.
+        //
+        // `internal_relink` checks the separator too, and that is **not** a second guard that
+        // makes this one redundant — measured by deleting this block and running
+        // `the_key_limit_holds_on_both_sides_and_refuses_before_spending_a_page`: the over-long
+        // insert *succeeded*. Nothing downstream fires until the leaf holding that key happens to
+        // split, which may be many inserts later and will then refuse whichever unrelated key
+        // triggered it. This is the only refusal that is deterministic and attributable.
+        if key.len() > node::MAX_KEY_BYTES {
             return Err(FerroError::Cow(format!(
-                "key of {} bytes needs a {}-byte separator, which exceeds the {}-byte limit for a 4KB page",
+                "key of {} bytes exceeds the {}-byte key limit: its separator would need {} of the \
+                 {} bytes an internal entry may use",
                 key.len(),
-                separator_bytes,
+                node::MAX_KEY_BYTES,
+                node::separator_entry_bytes(key),
                 node::MAX_ENTRY_BYTES
             )));
         }
