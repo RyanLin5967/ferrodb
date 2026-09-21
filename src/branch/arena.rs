@@ -47,6 +47,53 @@ use crate::storage::atomic_file::{replace_atomically, FileOps, OsFileOps};
 use crate::storage::disk_manager::PAGE_SIZE;
 use crate::wal::log::crc32;
 
+/// Process-wide census of which arm of [`ArenaPageStore::cow_page`] a workload actually takes.
+///
+/// **This exists because "wire delta encoding into `cow_page`" is a plan that rests on a premise,
+/// and the premise is checkable.** A delta can only save bytes on the arm that COPIES a whole
+/// page; on the in-place arm there is no copy to shrink. Whether a given workload ever reaches
+/// the copying arm is a fact about the workload, not about the encoder, and it was not measured
+/// before. These are counters rather than timings for the same reason the rest of this work is:
+/// the box runs a fleet, and an integer does not move when the machine is busy.
+///
+/// Free functions over statics rather than fields on the store, deliberately: a census has to be
+/// readable from a harness that holds no reference to the store it is measuring, and every
+/// `ArenaPageStore` in the process contributes to one number. That makes them useless for
+/// attributing a count to one store and fine for the question they exist to answer.
+mod census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static IN_PLACE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SHADOW: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SHADOW_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn bump(counter: &AtomicU64, by: u64) {
+        counter.fetch_add(by, Ordering::Relaxed);
+    }
+}
+
+/// `(in-place cows, shadowing cows, payload bytes copied by shadowing cows)` since process start.
+///
+/// The third number is the one a delta encoder is aimed at: it is the total that
+/// `frame.data[PAGE_HEADER_SIZE..].copy_from_slice(..)` has moved. If it is zero for a workload,
+/// that workload has no whole-page copies for a delta to shrink, whatever the encoder can do.
+pub fn cow_path_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        census::IN_PLACE.load(Ordering::Relaxed),
+        census::SHADOW.load(Ordering::Relaxed),
+        census::SHADOW_PAYLOAD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the census. For a harness that wants a window rather than a process total.
+pub fn reset_cow_path_census() {
+    use std::sync::atomic::Ordering;
+    census::IN_PLACE.store(0, Ordering::Relaxed);
+    census::SHADOW.store(0, Ordering::Relaxed);
+    census::SHADOW_PAYLOAD_BYTES.store(0, Ordering::Relaxed);
+}
+
 /// The epoch at or after which a page in this branch's own arena may still be mutated in place.
 ///
 /// A page is safe for in-place mutation only if nobody else can see it. Two things can make
@@ -1231,11 +1278,14 @@ impl PageStore for ArenaPageStore {
         if owns_it && header.birth_epoch >= barrier {
             // Nobody else can see it: mutate in place. This is what keeps a hot branch from
             // shadowing the same page on every single write.
+            census::bump(&census::IN_PLACE, 1);
             return Ok(CowPage { page_id, previous_page_id: page_id, copied: false, handle });
         }
 
         let source = handle.read().data;
         drop(handle);
+        census::bump(&census::SHADOW, 1);
+        census::bump(&census::SHADOW_PAYLOAD_BYTES, (PAGE_SIZE - PAGE_HEADER_SIZE) as u64);
 
         // Asked only NOW, on the path that actually allocates. Eagerly above, a branch whose
         // extent had just filled would claim a fresh one on every in-place mutation too — one
