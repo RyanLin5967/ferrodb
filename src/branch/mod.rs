@@ -17,6 +17,7 @@
 //!    a client to close anything.
 
 pub mod arena;
+pub mod attest;
 pub mod catalog;
 pub mod lease_thread;
 pub mod reaper;
