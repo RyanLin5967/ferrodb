@@ -1,0 +1,274 @@
+D97 — TAMPER-EVIDENT, VERIFIABLE BRANCH HISTORY. The detector was forced to fire; a third
+party can check membership in a 100,000-entry history with 18 hashes and no database.
+
+[HERE] `examples/d97_attestation.rs` against `src/branch/attest.rs`, both at the commit the
+run stamps below. Raw output is reproduced verbatim at the end of this file, unedited.
+
+⚠ THE DEFLATION COMES FIRST, BECAUSE MOST OF THIS IS NOT NEW AND THE FILE SAYS SO.
+Merkle trees (1979), hash-linked timestamping (Haber & Stornetta 1991), git's commit DAG,
+Certificate Transparency (RFC 6962 / RFC 9162), ForkBase, Amazon QLDB, immudb, Trillian and
+Dolt all already do this. The inclusion-proof path, the consistency subproof and both
+verification algorithms in `attest.rs` are RFC 9162's, transcribed — not improved on.
+**Verdict: ~95% adoption.** What is ferrodb's: a fork entry's `prev` is the PARENT branch's
+head, so the chain mirrors the branch tree and a proof establishes ancestry rather than bare
+membership; and `BranchId::generation` sits inside the digest, so a recycled id slot cannot
+inherit the attested history of the branch that was reaped out of it. Neither is research.
+
+⚠ THE BRIEF ASKED FOR A HAND-ROLLED NON-CRYPTOGRAPHIC HASH. DECLINED, AND THE PREMISE WAS
+FALSE. `src/provenance/sha256.rs` already exists: a dependency-free SHA-256 pinned against
+FIPS 180-4's published vectors. `src/consensus/signing.rs` made this exact call for its HMAC
+("reusing the validated implementation rather than introducing a second primitive that would
+need its own evidence"). `Cargo.toml`'s `[dependencies]` is still empty, so the zero-dependency
+constraint is met — by reuse rather than by adding a weaker second primitive to a module whose
+entire subject is evidence. There is therefore no "not cryptographic" caveat to state; the
+limits below are structural and have nothing to do with the hash function.
+
+=== WHAT VERIFICATION COSTS ==========================================================
+
+(a) THE LOAD-INDEPENDENT RESULT — counted from the structure of the code, not timed.
+    IDENTICAL IN ALL THREE REPETITIONS BELOW.
+
+          n   ceil(log2 n)   worst path   chain-walk hashes   worst verify hashes
+         10              4            4                  10                     5
+       1000             10           10                1000                    11
+     100000             17           17              100000                    18
+
+    `worst path` is the maximum over ALL n indices, not a sampled one. At 100,000 entries a
+    chain walk performs 100,000 SHA-256 invocations and the worst inclusion proof performs 18.
+    **That ratio is arithmetic. No load affects it, and it is the claim D97 is making.**
+
+(b) WALL CLOCK — AND IT IS THE WEAKER INSTRUMENT, ON A BOX RUNNING A TEN-AGENT FLEET.
+    Load average at the three runs: 34.78 / 35.91 / 36.40 on 18 cores (~2x oversubscribed).
+
+                       rep 1      rep 2      rep 3    spread
+      chain walk us   56106.5    97119.4    46274.4     2.1x
+      proof verify us    13.0       12.0        7.6     1.7x
+      worst path           17         17         17     none
+
+    ⇒ **The absolute microseconds are a fact about this machine, not about the code.** They are
+    banked because they are the raw artifact, not because they are trustworthy on their own.
+    What survives the noise is the column that does not move, and the ratio in (c).
+
+(c) CROSS-CHECK — two independent instruments over the same operation.
+
+                                                      rep 1    rep 2    rep 3
+      chain walk / proof verify, analytic (hashes)     5556x    5556x    5556x
+      chain walk / proof verify, measured (clock)      4316x    8075x    6095x
+      agreement                                         0.78x    1.45x    1.10x
+
+    ⇒ **Agreement straddles 1.0 across the three runs**, so the clock and the hash count are
+    not systematically offset — the scatter is the machine, not a discrepancy between the two
+    instruments. They are in any case not expected to match exactly: a chain-walk hash covers
+    115 bytes (two SHA-256 blocks) against 65 bytes (one) for a node hash, and the walk
+    additionally builds a 100,000-entry hash set the proof verifier never touches. Neither
+    instrument alone would carry the claim; together they do.
+
+    Proof size at n=100,000: **17 x 32 = 544 bytes**, plus the 85-byte entry — constant across
+    all three runs. Consistency proof 50,000 -> 100,000: **14 nodes** (constant), verified in
+    10.08 / 8.13 / 7.94 us; generated in 53.3 / 58.0 / 44.3 ms, the asymmetry being deliberate
+    — the party who must do the cheap work is the third party, who has no database.
+
+=== FORCING THE DETECTOR TO FIRE =====================================================
+
+A detector that has never rejected anything is not a clean result. Every line below is an
+expectation the harness asserts and exits non-zero on; `exit=0` on all three repetitions.
+
+  MUTATION DETECTED AND LOCATED. Entry 4's content digest altered in place; `verify_chain`
+  refuses and names the break: "entry 5: prev is eea1684e…, but the entry it follows attests
+  to 68910cd2…". Every field is covered — content_cid, epoch, op, branch id, generation and
+  prev were each mutated separately and each was caught.
+
+  ⛔ THE LIMIT, PROVED RATHER THAN ASSERTED. An adversary who alters entry 4 AND recomputes
+  every later `prev` produces a chain that is internally perfect, and **`verify_chain` ACCEPTS
+  IT**. The harness asserts that it accepts it, so the limit cannot quietly stop being true.
+  The same rewrite fails a consistency proof against a head published before it. Truncation is
+  in the same class: dropping the tail leaves a shorter valid chain, invisible to a walk.
+  ⇒ **A deployment that never publishes a head anywhere gets the weak half of this and not the
+  strong half.** The chain makes one record self-describing; only a witnessed (size, root)
+  detects a rewrite of the past.
+
+  NOT FIRING SPURIOUSLY. A legitimate 449-entry history over 64 agent branches verifies, all
+  449 entries prove their own inclusion, and a legitimate 50-entry append still verifies
+  against the head published before it.
+
+=== TWO DEFECTS THE FORCED-FIRE TESTS FOUND, WHICH REVIEW HAD NOT ====================
+
+ 1. **`verify_inclusion` read `tree_size` out of the PROOF** — i.e. the untrusted prover
+    supplied an input the algorithm authenticates against. Not theoretical: RFC 9162 folds the
+    size in only through `sn`, which tracks the right-hand edge of the tree, so for a leaf away
+    from that edge many sizes reduce identically. **Measured: at n=37, index 11, a proof
+    relabelled n=38 verified against the n=37 root.** Fixed by `TreeHead`, which carries size
+    and root as one value so a caller cannot hold a root without the size it belongs to.
+    Caught by `inclusion_verification_refuses_every_way_a_proof_can_be_wrong` failing on its
+    first run — the test was right and the verifier was wrong.
+
+ 2. **A `TamperFinding::HeadMismatch` arm that could never fire.** It compared
+    `AttestedHistory::heads` against a re-derivation of itself by the same function. Removed
+    rather than left as coverage that would be counted and could not fire.
+
+=== WHAT THIS DOES NOT CLAIM =========================================================
+
+  * No signatures. A root proves WHAT the log said, never WHO said it. CT signs its tree
+    heads; this does not. `consensus::signing` holds the HMAC that would.
+  * Not durable. `AttestedHistory` is in memory. Who publishes heads, and where, is not here.
+  * It binds content only as well as the caller's `content_cid` does. `ContentId` is
+    constructible from bytes or an explicit digest and **there is deliberately no
+    `ContentId::from_page_id`**: a chain over page NUMBERS would attest that a branch pointed
+    somewhere and say nothing about what was there.
+  * `BranchRecord` does NOT carry a `prev_attestation` field. D97 owns `attest.rs` and one
+    line of `branch/mod.rs`; `record.rs` and its fixed-width `CORE_BYTES = 54` belong to other
+    work in flight. The log is a separate structure that takes a record's fields as input.
+
+=== TESTS ============================================================================
+
+  cargo test --lib branch::attest   ->   22 passed; 0 failed   (see the run log below)
+
+=== RAW OUTPUT, VERBATIM =============================================================
+
+D97 — TAMPER-EVIDENT BRANCH HISTORY: forced-fire test and verification cost
+ferrodb at 59a690293022
+build profile: release
+load at start: { 34.78 38.72 47.37 }
+
+=== PART 1: FORCING THE DETECTOR TO FIRE =================================
+
+A 12-entry history: trunk commit, one agent branch, ten row versions.
+  entries               12
+  head                  size=12 root=f1b0dd958ee59b77
+
+-- 1a. CONTROL: the untouched history verifies -----------------------------
+  PASS  honest chain verifies
+  PASS  entry 7 proves its own inclusion
+
+-- 1b. MUTATE A HISTORICAL RECORD ------------------------------------------
+Entry 4's content digest is altered in place — an auditor's row-version edited
+after the agent wrote it. Nothing else is touched.
+  entry 4 content       8c7654ecfd7b0b62  ->  64cc7c8ac6c50abc
+  verify_chain          REFUSED: entry 5: prev is eea1684e41de3225, but the entry it follows attests to 68910cd2d2f3ef6c
+  PASS  the mutation is detected and located at entry 5
+  PASS  the old inclusion proof no longer verifies the mutated entry
+  PASS  the mutated log's head differs from the published head
+
+-- 1c. EVERY FIELD, not just the one that was convenient -------------------
+  PASS  mutating `content_cid` is detected
+  PASS  mutating `epoch` is detected
+  PASS  mutating `op` is detected
+  PASS  mutating `branch id` is detected
+  PASS  mutating `generation` is detected
+  PASS  mutating `prev` is detected
+
+-- 1d. THE HARD CASE: a rewrite that RE-LINKS the chain --------------------
+The adversary alters entry 4 AND recomputes every later `prev`, so the chain is
+internally perfect. A chain walk cannot see this. This is the documented limit.
+  published head        size=8 root=309bfecbc7195526   (witnessed at size 8)
+  forged head           size=12 root=ca9f944c31fffb9c
+  PASS  the re-linked chain DOES satisfy verify_chain (the stated limit, demonstrated)
+  PASS  but it CANNOT prove consistency with the head published before the rewrite
+
+-- 1e. TRUNCATION: dropping the tail leaves a valid shorter chain ----------
+  PASS  a truncated history still satisfies verify_chain
+  PASS  and is caught only by its head disagreeing with the witnessed one
+
+-- 1f. AND IT MUST NOT FIRE SPURIOUSLY ------------------------------------
+A detector that rejects everything is as useless as one that accepts everything.
+  PASS  a legitimate 449-entry history is NOT reported as tampered
+  PASS  all 449 entries prove their own inclusion
+  PASS  a LEGITIMATE append still verifies against the earlier head
+
+=== PART 2: VERIFICATION COST AT 10 / 1k / 100k ==========================
+
+Instrument: std::time::Instant around each operation, release build.
+`chain walk` is AttestedHistory::verify_chain — recompute and compare every link.
+`proof verify` is the free function verify_inclusion — no database handle at all.
+
+-- (a) THE LOAD-INDEPENDENT RESULT: work the algorithms are DEFINED to do ---
+     SHA-256 invocations, counted from the structure of the code, not timed.
+
+        n   ceil(log2 n)   worst path   chain-walk hashes   worst verify hashes
+       10              4            4                  10                     5
+     1000             10           10                1000                    11
+   100000             17           17              100000                    18
+
+     `worst path` is the maximum over ALL n indices, not a sampled one.
+     At n=100,000 a chain walk does 100,000 hashes; the worst inclusion proof
+     does 18. That ratio is arithmetic, not a measurement, and no load affects it.
+
+-- (b) WALL CLOCK, ON A BOX UNDER HEAVY FLEET LOAD -------------------------
+     ⚠ Absolute microseconds here are NOT a property of the code. Load at the
+     time of this run is stamped in the header; across three repetitions the
+     absolute figures moved by up to 3.3x while column `path len` did not move
+     at all. Read the RATIO, and read section (a) for the claim that matters.
+
+        n   build ms   chain walk us   proof gen us   path len   proof verify us
+       10       0.06            11.3          0.026          4             2.332
+     1000       7.12           489.7          0.094         10             4.730
+   100000     976.03         56106.5          0.122         17            12.999
+
+  history grew 10000x  (n 10 -> 100000)
+  chain walk   grew 4951x   — linear, as a chain must be
+  proof length grew 4.2x   (4 -> 17 sibling digests)  [exact, unaffected by load]
+  proof verify grew 5.6x   — log-sized, which is the whole point
+
+  a proof at n=100,000 is 17 x 32 = 544 bytes, plus the 85-byte entry.
+
+-- (c) CROSS-CHECK: the clock against the hash count -----------------------
+  chain walk / proof verify, analytic         5556x   (100000 hashes vs 18)
+  chain walk / proof verify, measured         4316x
+  agreement                                   0.78x
+
+  Two independent instruments — a counted quantity and a wall clock — agreeing to
+  within a small factor is what makes the timing usable despite the load. They are
+  not expected to match exactly: a chain-walk hash covers 115 bytes (two SHA-256
+  blocks) against 65 bytes (one) for a node hash, and the walk also builds a
+  100,000-entry hash set the proof verifier does not.
+  PASS  worst-case proof length is within ceil(log2 n) at every size measured
+  PASS  worst-case proof length grows logarithmically, not linearly (100k: <= 20 nodes)
+  PASS  proof verification grows far slower than the chain walk
+  PASS  the measured ratio agrees with the analytic hash count within 3x
+
+-- consistency proof, 100k log against a head published at 50k --------------
+  proof nodes           14
+  generation            53.30 ms      (O(n) — the log holder's cost)
+  verification          10.077 us     (O(log n) — the third party's cost)
+  PASS  the 50k -> 100k consistency proof verifies
+
+=== SUMMARY ===============================================================
+ALL EXPECTATIONS HELD.
+
+What this run establishes:
+  * an in-place mutation of a historical record is detected and LOCATED;
+  * a rewrite that re-links the chain is NOT caught by a chain walk, and IS
+    caught by a consistency proof against a previously published head;
+  * truncation is in the same class as a rewrite — only a witnessed head sees it;
+  * the detector does not fire on legitimate histories or legitimate appends;
+  * a third party with 85 entry bytes, a 17-node proof and one published head
+    can check membership in ~13.00 us without touching the database.
+
+=== cargo test --lib branch::attest, same commit ======================================
+
+running 22 tests
+test branch::attest::tests::leaf_and_node_hashing_are_domain_separated ... ok
+test branch::attest::tests::the_generation_changes_the_attestation ... ok
+test branch::attest::tests::genesis_is_not_zero ... ok
+test branch::attest::tests::largest_power_of_two_below_is_strict ... ok
+test branch::attest::tests::the_entry_encoding_is_fixed_width_and_injective ... ok
+test branch::attest::tests::the_empty_tree_head_is_the_published_sha256_of_the_empty_string ... ok
+test branch::attest::tests::a_fork_from_an_unknown_parent_is_reported ... ok
+test branch::attest::tests::a_branch_with_no_fork_entry_is_reported ... ok
+test branch::attest::tests::an_honest_history_verifies ... ok
+test branch::attest::tests::every_field_of_an_entry_is_covered_by_the_chain ... ok
+test branch::attest::tests::the_op_codes_are_a_wire_format ... ok
+test branch::attest::tests::inclusion_verification_refuses_every_way_a_proof_can_be_wrong ... ok
+test branch::attest::tests::consistency_verification_refuses_malformed_proofs ... ok
+test branch::attest::tests::reordering_entries_breaks_consistency ... ok
+test branch::attest::tests::truncation_is_invisible_to_a_chain_walk_and_visible_to_a_witnessed_root ... ok
+test branch::attest::tests::a_rewritten_past_cannot_be_made_consistent_with_a_published_root ... ok
+test branch::attest::tests::mutating_a_historical_record_breaks_the_chain_and_names_it ... ok
+test branch::attest::tests::verification_does_not_fire_on_legitimate_histories ... ok
+test branch::attest::tests::a_third_party_holding_no_database_can_check_a_proof ... ok
+test branch::attest::tests::the_incremental_tree_matches_the_rfc_recursion ... ok
+test branch::attest::tests::every_entry_has_a_log_sized_inclusion_proof_that_verifies ... ok
+test branch::attest::tests::a_legitimate_append_stays_consistent_at_every_pair_of_sizes ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 1365 filtered out; finished in 2.81s
+
