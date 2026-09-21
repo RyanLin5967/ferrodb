@@ -1541,3 +1541,135 @@ mod delete_unlink_tests {
         assert_eq!(t.walk_pages(same).unwrap(), pages, "a miss changed the page set");
     }
 }
+
+#[cfg(test)]
+mod right_walk_probe {
+    //! DESIGN PROBE for the neighbour merge. Establishes one fact: the right-hand neighbour of a
+    //! leaf is reachable from an ordinary descent path, with no sibling pointer anywhere.
+    use super::*;
+    use crate::branch::arena::ArenaPageStore;
+    use crate::branch::catalog::LogBranchCatalog;
+    use crate::branch::BranchCatalog;
+    use crate::buffer::buffer_pool::BufferPoolManager;
+    use crate::storage::disk_manager::DiskManager;
+
+    fn tree() -> (tempfile::TempDir, Arc<LogBranchCatalog>, CowTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dir.path().join("rw.db")).unwrap();
+        let dm = Arc::new(DiskManager::new(file).unwrap());
+        let pool = Arc::new(BufferPoolManager::new(dm));
+        let cat = Arc::new(LogBranchCatalog::in_memory(1));
+        let store = Arc::new(
+            ArenaPageStore::new(pool, Arc::clone(&cat) as Arc<dyn BranchCatalog>, 1024).unwrap(),
+        );
+        (dir, cat, CowTree::new(store as Arc<dyn PageStore>))
+    }
+    fn k(n: u32) -> Vec<u8> { n.to_be_bytes().to_vec() }
+
+    impl CowTree {
+        /// The leftmost leaf of the subtree at `pid`.
+        fn leftmost_leaf_probe(&self, mut pid: PageId) -> Result<PageId, FerroError> {
+            for _ in 0..MAX_DESCENT {
+                let h = self.store.read_page(pid)?;
+                let f = h.read();
+                if PageHeader::read_from(&f.data)?.page_type == PageType::BTreeLeaf {
+                    return Ok(pid);
+                }
+                let next = Node::new(&f.data).leftmost();
+                drop(f); drop(h);
+                pid = next;
+            }
+            Err(FerroError::Cow("leftmost walk exceeded the depth guard".into()))
+        }
+
+        /// The leaf immediately to the right of the one `path` ends at, or `None` if it is the
+        /// last. **No sibling pointer**: it climbs the descent path to the shallowest ancestor
+        /// that still has a child further right, then takes that subtree's leftmost leaf.
+        fn right_neighbour_probe(&self, path: &DescentPath) -> Result<Option<PageId>, FerroError> {
+            for (parent_id, slot) in path.iter().rev() {
+                let kids = {
+                    let h = self.store.read_page(*parent_id)?;
+                    let f = h.read();
+                    Node::new(&f.data).all_children()?
+                };
+                // `all_children` is [leftmost, child(0), child(1), ...], so slot i sits at i+1.
+                let taken = match slot { None => 0, Some(i) => i + 1 };
+                if taken + 1 < kids.len() {
+                    return Ok(Some(self.leftmost_leaf_probe(kids[taken + 1])?));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    /// Exhaustive, not a sample: for EVERY leaf in the tree, the descent-path right-walk must
+    /// name exactly the next leaf in key order, and `None` for the last one.
+    #[test]
+    fn every_leaf_can_reach_its_right_neighbour_without_a_sibling_pointer() {
+        let (_d, cat, t) = tree();
+        let e = cat.next_epoch();
+        let mut root = t.create(BranchId::TRUNK, e).unwrap();
+        // Deep enough that the right neighbour is NOT always a sibling under one parent. The
+        // first version of this probe used 2000 rows, got a 2-level tree (90 leaves under a
+        // single root), and so never exercised the climb at all -- it verified only the easy
+        // case while reading as exhaustive. The depth is asserted below for that reason.
+        for i in 0..12_000u32 {
+            root = t.insert(root, BranchId::TRUNK, e, &k(i), format!("v{i}").as_bytes()).unwrap();
+        }
+
+        // Ground truth: the leaves in key order, by first key.
+        let mut truth: Vec<(PageId, Vec<u8>)> = Vec::new();
+        fn walk(t: &CowTree, pid: PageId, out: &mut Vec<(PageId, Vec<u8>)>) {
+            let h = t.store.read_page(pid).unwrap();
+            let f = h.read();
+            let ty = PageHeader::read_from(&f.data).unwrap().page_type;
+            let n = Node::new(&f.data);
+            if ty == PageType::BTreeLeaf {
+                out.push((pid, n.key(0).unwrap().to_vec()));
+            } else {
+                let kids = n.all_children().unwrap();
+                drop(f); drop(h);
+                for c in kids { walk(t, c, out); }
+            }
+        }
+        walk(&t, root, &mut truth);
+        assert!(truth.len() > 8, "only {} leaves; the probe would be vacuous", truth.len());
+        // The whole point: at depth 1 every right neighbour shares a parent and the climb is
+        // never taken. Refuse rather than report a pass that proves only the easy half.
+        let depth = t.descend(root, &truth[0].1).unwrap().0.len();
+        assert!(depth >= 2, "tree is {depth} internal level(s); the cross-parent climb is untested");
+        // And at least one leaf must actually REQUIRE the climb, i.e. be the last child of its
+        // own parent while still having a neighbour to its right.
+        let mut climbed = 0usize;
+        for (i, (_, first_key)) in truth.iter().enumerate().take(truth.len() - 1) {
+            let (path, _) = t.descend(root, first_key).unwrap();
+            let (parent, slot) = *path.last().unwrap();
+            let kids = {
+                let h = t.store.read_page(parent).unwrap();
+                let f = h.read();
+                Node::new(&f.data).all_children().unwrap()
+            };
+            let taken = match slot { None => 0, Some(j) => j + 1 };
+            if taken + 1 >= kids.len() { climbed += 1; }
+            let _ = i;
+        }
+        assert!(climbed > 0, "no leaf is the last child of its parent; the climb is still untested");
+
+        for (i, (leaf, first_key)) in truth.iter().enumerate() {
+            let (path, landed) = t.descend(root, first_key).unwrap();
+            assert_eq!(landed, *leaf, "descent to leaf {i}'s own first key missed it");
+            let got = t.right_neighbour_probe(&path).unwrap();
+            let want = truth.get(i + 1).map(|(p, _)| *p);
+            assert_eq!(got, want, "right neighbour of leaf {i} of {}", truth.len());
+        }
+        println!(
+            "    right-walk verified for all {} leaves at depth {}; {} of them required the \
+             cross-parent climb. No sibling pointer anywhere.",
+            truth.len(),
+            depth,
+            climbed
+        );
+    }
+}
