@@ -26,6 +26,9 @@ pub mod changeset;
 /// ordering rule that decides whether a merge's gate verdict is still worth anything. Declared
 /// here because a module `mod.rs` does not name is not compiled at all.
 pub mod cluster;
+/// D101 — the refusal that makes "built the real engine, then ran on a private in-memory stub"
+/// unrepresentable at execution time rather than merely documented.
+pub(crate) mod designated;
 pub mod dispatch;
 pub mod escrow;
 pub mod gate;
