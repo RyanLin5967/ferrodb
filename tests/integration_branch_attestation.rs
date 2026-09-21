@@ -491,3 +491,96 @@ fn an_auditor_can_check_every_entry_against_a_published_head() {
         "an inclusion proof verified against a root nobody published"
     );
 }
+
+/// **A reap through an ATTACHED REAPER is attested too.**
+///
+/// ⚠ This test exists because the wiring was wrong when it was first written. `seal` has two arms
+/// — reclaim through an attached `Reaper`, or the reaper-less catalog fallback — and the reaper
+/// arm **returns early**. An attestation placed only at the end of the fallback arm is therefore
+/// silently absent on every runtime built with `with_reaper`, which is the production shape, and
+/// the gap reads exactly like "no branch was ever reaped": a missing entry is indistinguishable
+/// from a lifecycle event that never happened.
+///
+/// Every other test in this file uses a runtime with no reaper and passed throughout. The
+/// configuration is the variable, so the configuration has to be in a test.
+#[test]
+fn a_reap_through_an_attached_reaper_is_attested_too() {
+    use ferrodb::branch::reaper::TwoTierReaper;
+    use ferrodb::branch::{BranchCatalog, Reaper};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("pages.db"))
+        .unwrap();
+    let bp = Arc::new(BufferPoolManager::new(Arc::new(DiskManager::new(file).unwrap())));
+    let mut catalog = Catalog::create(bp.clone()).unwrap();
+    let wal = Arc::new(WalManager::new(dir.path().join("pages.wal")).unwrap());
+    let txn = Arc::new(TxnManager::new(wal.clone(), bp.clone()));
+    bp.attach_wal(wal);
+
+    let branches = Arc::new(LogBranchCatalog::in_memory(1));
+    let store = Arc::new(
+        ArenaPageStore::new(
+            bp.clone(),
+            Arc::clone(&branches) as Arc<dyn BranchCatalog>,
+            ARENA_BASE,
+        )
+        .unwrap(),
+    );
+    let reaper = Arc::new(TwoTierReaper::new(
+        Arc::clone(&branches) as Arc<dyn BranchCatalog>,
+        Arc::clone(&store),
+    ));
+    let runtime = Arc::new(
+        AgentRuntime::with_storage(
+            Arc::clone(&branches) as Arc<dyn BranchCatalog>,
+            Arc::new(MemEffectLog::new()),
+            Arc::clone(&store) as Arc<dyn PageStore>,
+        )
+        .unwrap()
+        .with_reaper(Arc::clone(&reaper) as Arc<dyn Reaper>),
+    );
+
+    let mut run_sql = |sql: &str, s: &mut Session, catalog: &mut Catalog| {
+        let tokens = Scanner::new(sql.chars().collect(), Vec::new()).scan_tokens().unwrap();
+        let mut parser = Parser::new(tokens);
+        let mut stmts = parser.parse();
+        assert!(parser.errors.is_empty(), "{sql}: {:?}", parser.errors);
+        run(stmts.remove(0), catalog, bp.clone(), txn.clone(), s).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
+
+    let mut s = Session::with_runtime(runtime.clone());
+    run_sql("CREATE TABLE inventory (id INTEGER NOT NULL, qty INTEGER);", &mut s, &mut catalog);
+    run_sql("INSERT INTO inventory VALUES (1, 100);", &mut s, &mut catalog);
+
+    let mut a = Session::with_runtime(runtime.clone());
+    run_sql("BEGIN AGENT SESSION AS 'agent-a' RUN 'r_a';", &mut a, &mut catalog);
+    let branch = a.agent.as_ref().unwrap().branch;
+    run_sql("UPDATE inventory SET qty = 111 WHERE id = 1;", &mut a, &mut catalog);
+
+    assert_eq!(
+        ops_of(&runtime, branch),
+        vec![BranchOp::Fork],
+        "only the fork should be attested before the merge"
+    );
+
+    let mut ctx = ExecCtx { catalog: &mut catalog, bp: bp.clone(), txn: txn.clone() };
+    let report = runtime.merge(&mut ctx, branch).unwrap();
+    assert!(report.applied_to_target, "the merge did not publish");
+
+    assert_eq!(
+        ops_of(&runtime, branch),
+        vec![BranchOp::Fork, BranchOp::Reap],
+        "the reaper arm of `seal` did not attest the reap"
+    );
+    assert_eq!(
+        ops_of(&runtime, BranchId::TRUNK),
+        vec![BranchOp::Merge],
+        "the merge was not attested on its target"
+    );
+    runtime.verify_attested_branch(branch).expect("the chain must verify");
+}

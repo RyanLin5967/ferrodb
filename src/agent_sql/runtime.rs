@@ -5478,6 +5478,10 @@ impl AgentRuntime {
         // everything below AND frees the extents this branch allocated, which nothing else will.
         // It is the same call the lease scan makes, so a branch that is merged and a branch that
         // was walked away from end in exactly the same state.
+        // **D103 — read the fork epoch BEFORE anything reaps.** The reap bumps the id slot's
+        // generation, so `get(branch)` afterwards is a hard error and the epoch would be
+        // unavailable exactly where the attestation needs it.
+        let fork_epoch = self.branches.get(branch).ok().map(|r| r.fork_epoch);
         if let Some(reaper) = &self.reaper {
             reaper.reap(branch)?;
             // `with_reaper` cannot check that the reaper was built over this runtime's catalog —
@@ -5495,6 +5499,21 @@ impl AgentRuntime {
                         rec.state
                     )));
                 }
+            }
+            // **This arm has to attest too, and it did not.** `seal` returns early when a reaper
+            // is attached, so an attestation placed only at the end of the fallback arm is
+            // silently absent on every runtime built with `with_reaper` — which is the production
+            // shape — and the gap reads exactly like "no branch was ever reaped": a missing entry
+            // is indistinguishable from a lifecycle event that never happened. Found by reading
+            // the control flow after the wiring was written; pinned by
+            // `integration_branch_attestation::a_reap_through_an_attached_reaper_is_attested_too`,
+            // which fails with `left: [Fork], right: [Fork, Reap]` when this call is removed.
+            //
+            // Two call sites rather than one because the alternative — restructuring the early
+            // return — changes the control flow of the reap path itself, which is not a thing to
+            // do as a side effect of adding an attestation.
+            if let Some(epoch) = fork_epoch {
+                self.attest_reap(branch, epoch, published);
             }
             return Ok(());
         }
@@ -5527,6 +5546,8 @@ impl AgentRuntime {
         // The entry seals this branch's chain, and it carries whether the branch's writes were
         // published, because "merged" and "abandoned" are different facts about a retired branch
         // and the record must not conflate them.
+        //
+        // The reaper arm above carries the same call; see the note there for why there are two.
         self.attest_reap(branch, record.fork_epoch, published);
         Ok(())
     }
