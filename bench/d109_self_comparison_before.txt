@@ -1,0 +1,20 @@
+running 1 test
+test cow::diff::tests::comparing_a_page_with_itself_never_consults_the_identity_provider ... FAILED
+
+failures:
+
+---- cow::diff::tests::comparing_a_page_with_itself_never_consults_the_identity_provider stdout ----
+
+thread 'cow::diff::tests::comparing_a_page_with_itself_never_consults_the_identity_provider' (245815551) panicked at src/cow/diff.rs:1471:9:
+assertion `left == right` failed: identical roots consulted the provider
+  left: 2
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cow::diff::tests::comparing_a_page_with_itself_never_consults_the_identity_provider
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1578 filtered out; finished in 0.17s
+
+error: test failed, to rerun pass `--lib`

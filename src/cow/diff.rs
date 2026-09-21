@@ -29,8 +29,9 @@
 //!
 //! Swapping in `cow::cid`'s digest is one line: implement [`NodeIdentity`] for it. Doing it by
 //! wrapping `cid::subtree_cid` in [`MemoIdentity`] and warming a whole tree is **not** that line:
-//! measured at 5410 page reads against the 2188 of the O(N) path this module exists to beat, it is
-//! that path wearing a skip counter. [`MemoIdentity`]'s own docs carry the numbers and the rule.
+//! measured at 9024 page reads to warm the two roots a diff needs, against the 2188 of the O(N)
+//! path this module exists to beat, it is that path wearing a skip counter. [`MemoIdentity`]'s own
+//! docs carry the numbers and the rule.
 //!
 //! # A memo over page ids is a cache over recycled keys
 //!
@@ -53,7 +54,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::branch::types::{Epoch, PageId};
 use crate::consensus::replicate::{fnv64_update, FNV_OFFSET};
@@ -132,12 +133,19 @@ impl NodeIdentity for PageIdentity {
 ///   and an in-place rewrite alike. The in-place case is not a corner: `btree.rs` mutates a node
 ///   where it lies whenever it is already private to the writer, and that path leaves `birth`
 ///   exactly where it was. So `checksum` is the discriminator that carries the guard.
-/// * `birth` is therefore **not** catching a class `checksum` misses — `birth` lives inside the
-///   bytes `checksum` covers, and an attempt to build a recycled page that agrees on `checksum`
-///   but not on `birth` is unconstructable for that reason. What it buys is *exactness where
-///   crc32 is probabilistic*: a recycled id always starts a new epoch, so comparing `birth` makes
-///   the recycle case an exact decision instead of one a 32-bit collision could get wrong. It
-///   rides along on the same header read and costs nothing, which is the whole argument for it.
+/// * `birth` is therefore **not** catching a class `checksum` misses on the write path — `birth`
+///   lives inside the bytes `checksum` covers, so nothing the store does to one leaves the other
+///   still. What it buys is *exactness where crc32 is probabilistic*: a recycled id always starts
+///   a new epoch, so comparing `birth` makes the recycle case an exact decision instead of one a
+///   32-bit collision could get wrong. It rides along on the same header read and costs nothing,
+///   which is the whole argument for it.
+///
+///   "Probabilistic" is the claim that holds. This used to go further and call a page that agrees
+///   on `checksum` while disagreeing on `birth` *unconstructable*, which is false: crc32 is
+///   affine, so such a page is built by solving a 32-bit system over GF(2) for compensating
+///   payload bits, and the result passes `verify_checksum`. Nothing on the write path builds one
+///   — but `a_page_crafted_onto_a_colliding_checksum_is_still_a_different_version` does, and
+///   `birth` is what catches it.
 ///
 /// Keying on `birth` **alone** — the obvious reading, since `birth` is the field the stores
 /// restamp — is the version of this guard that does not work: it cannot see an in-place rewrite
@@ -363,14 +371,46 @@ impl NodeIdentity for SubtreeHash {
 /// # }
 /// # store.register_branch(agent, Some(BranchId::TRUNK), Epoch(3))?;
 /// # let head = tree.insert(base, agent, Epoch(4), &7u32.to_be_bytes(), b"v1")?;
-/// let ident = MemoIdentity::new(|p: PageId| cid::subtree_cid(&tree, p));
-/// ident.warm(&tree, base)?;
-/// ident.warm(&tree, head)?;
+/// let ident = MemoIdentity::new(&tree, |t: &CowTree, p: PageId| cid::subtree_cid(t, p));
+/// ident.warm(base)?;
+/// ident.warm(head)?;
 /// let report = diff(&tree, base, head, &ident)?;
 /// assert_eq!(report.changes.len(), 1);
 /// assert_eq!(ident.misses(), 0);
 /// # Ok::<(), ferrodb::error::FerroError>(())
 /// ```
+///
+/// # One tree, fixed at construction
+///
+/// A row is `(the page's version, the digest of that page)`, and those two halves are only a
+/// *pair* if they were read from the same file. This type therefore takes the tree at [`new`] and
+/// **hands it to the wrapped digest** on every call, so `warm` has no tree argument to get wrong
+/// and the digest has no second tree to reach for. A memo over one file's pages cannot be pointed
+/// at another's:
+///
+/// ```compile_fail
+/// # use ferrodb::branch::types::PageId;
+/// # use ferrodb::cow::btree::CowTree;
+/// # use ferrodb::cow::cid;
+/// # use ferrodb::cow::diff::MemoIdentity;
+/// # fn demo(tree_a: &CowTree, tree_b: &CowTree, root_b: PageId) {
+/// let ident = MemoIdentity::new(tree_a, |t: &CowTree, p: PageId| cid::subtree_cid(t, p));
+/// ident.warm(tree_b, root_b).unwrap(); // `warm` takes a root and nothing else
+/// # }
+/// ```
+///
+/// This replaced a runtime check that could not fire on the case that mattered. The store used to
+/// be captured on the **first** `warm`, so `Arc::ptr_eq` was trivially true there and only a
+/// *second* warm from a different store was refused: a memo whose digest closed over tree A and
+/// was warmed once against tree B was accepted, filled with `(B's page version, A's digest)` rows,
+/// and then answered [`NodeIdentity::id_of`] with the wrong file's id — validated against the
+/// right store, so [`MemoIdentity::misses`] read zero throughout.
+///
+/// What remains is one wilful act, not an accident: a closure may ignore the `&CowTree` it is
+/// handed and capture a different one. That is visible at the call site as an ignored argument,
+/// which is the most a generic adapter over an arbitrary digest can make it.
+///
+/// [`new`]: MemoIdentity::new
 ///
 /// **`warm` is not optional.** An unwarmed page falls back to page identity rather than computing
 /// on the spot, because computing there is exactly the per-comparison blowup this type exists to
@@ -389,15 +429,43 @@ impl NodeIdentity for SubtreeHash {
 ///
 /// ```text
 /// diff + PageIdentity, 4 rows changed         :    18 page reads
-/// CowTree::diff, the O(N) path being replaced :  2188 page reads
-/// SubtreeHash::stamp, bottom-up               :  1085 page reads   <- one per node, the floor
-/// MemoIdentity(subtree_cid).warm              :  5410 page reads   <- 2.5x the control
-///   of which subtree_cid itself               :  4325 page reads   <- 2.0x it on its own
+/// CowTree::diff, the O(N) path being replaced :  2188 page reads   <- walks BOTH roots
+///
+/// precompute for ONE root:
+///   SubtreeHash::stamp, bottom-up             :  1085 page reads   <- one per node, the floor
+///   MemoIdentity(subtree_cid).warm            :  5410 page reads
+///     of which subtree_cid itself             :  3240 page reads   <- 1.48x the control
+///     of which `warm`'s own walk_pages        :  1085 page reads   <- one per node
+///     of which this adapter's version check   :  1085 page reads   <- one per node
+///
+/// precompute a diff actually needs — BOTH roots, one memo:
+///   SubtreeHash::stamp                        :  1450 page reads   <- 0.66x the control
+///   MemoIdentity(subtree_cid).warm            :  9024 page reads   <- 4.1x the control
 /// ```
 ///
-/// The split is measured, by removing the version check and re-counting: the other 1085 are this
-/// adapter's own validation, exactly one per page. The verdict does not rest on them — warming
-/// cost twice the path it replaces before there was anything to validate.
+/// The split is an **equality**, not a subtraction from the total: the test counts `walk_pages`
+/// and `subtree_cid` separately through the same store and asserts
+/// `warm = walk_pages + subtree_cid + one version check per page`, so a breakdown that stops
+/// describing `warm` fails rather than merely ageing.
+///
+/// An earlier cut of this table credited 4325 reads to `subtree_cid` alone. That figure was
+/// `walk_pages + subtree_cid`: `warm` iterates `tree.walk_pages(root)`, and that walk reads every
+/// page once before the digest is called on any of them, so the 1085 it costs was being charged
+/// to the digest. Measured directly, the digest is 3240 — 1.48x the control, not 2.0x.
+///
+/// The verdict does not rest on either overhead. At 3240 reads the digest **alone** is still half
+/// again the whole O(N) path it is supposed to replace, before a single row is walked or
+/// validated.
+///
+/// The bottom block is the comparison that decides it, and it is the one to quote. The control
+/// walks **both** roots, so a one-root precompute set against it is not the same measurement —
+/// this table used to put 5410 next to 2188 and call it "2.5x", which understated the real cost
+/// by comparing one root's work against two roots' work. Warming both roots through
+/// `subtree_cid` is 9024 reads, **4.1x** the path it would replace; the second root is cheap
+/// (3614) only because the memo already holds every page the two share. `SubtreeHash` pays 1450
+/// for the same pair and stays under the control, which is the whole reason to prefer it. This
+/// file's own rule at [`SubtreeHash`] — an honest diff-time number stamps both roots — applies to
+/// its own cost table, and now does.
 ///
 /// It still reports a healthy `skipped_subtrees`, so the counter does not give the cost away. Use
 /// [`SubtreeHash`] to warm a whole tree — it folds bottom-up and reads each page once — and keep
@@ -410,34 +478,57 @@ impl NodeIdentity for SubtreeHash {
 /// Like [`SubtreeHash`]'s, this memo is a cache over page ids, and page ids are recycled — see
 /// [`PageVersion`]. Every row carries the version it was computed at, so:
 ///
-/// * a row whose page has been recycled or rewritten **misses** rather than answering for the
-///   page's previous life, and the miss shows up in [`MemoIdentity::misses`];
+/// * a row for a page that has itself been recycled or rewritten **misses** rather than
+///   answering for that page's previous life, and the miss shows up in [`MemoIdentity::misses`];
 /// * `warm` **re-computes** such a row instead of stepping over it. It used to skip any page id
 ///   already present, which made re-warming after a recycle a no-op that added zero entries and
 ///   moved zero counters while the memo went on returning the wrong id.
+///
+/// # ⚠ The blind spot: a row commits to a SUBTREE and is validated against ONE page
+///
+/// Read the first bullet narrowly, because the gap is exactly the width of the word *itself*.
+/// A row here holds whatever the wrapped digest returns, and for the digest this adapter exists
+/// for — `cid::subtree_cid` — that is a commitment to the **whole subtree below the page**. The
+/// row is nevertheless validated against that one page's [`PageVersion`], and no page-local token
+/// can see a change underneath it: `btree::insert` rewrites an already-private leaf where it lies
+/// and stops copying up there, so every ancestor keeps its id, its `birth`, its bytes and
+/// therefore its version. **An ancestor's row stays fresh across a descendant rewrite and goes on
+/// answering with the digest of a subtree that is no longer there** — silently, with
+/// [`MemoIdentity::misses`] not moving, which is the same false skip the version key exists to
+/// prevent one level down. `an_ancestors_warmed_row_survives_a_descendant_rewrite_and_goes_on_answering`
+/// pins it, including the contrast: the rewritten leaf itself is the only page that misses.
+///
+/// The rule that covers it is [`PageVersion`]'s usage rule, not a check: **warm after the last
+/// write to either root, and do not let a warmed provider outlive a write to a branch whose pages
+/// it has warmed.** Which of the staleness routes the `(birth, checksum)` key does and does not
+/// discriminate is measured on `D105-diff-memo` by
+/// `the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant`.
 ///
 /// Validating costs one page fetch and a header parse per query — the 1085 reads broken out of
 /// `warm`'s total above. That is the price of a stale row missing rather than lying, and
 /// [`SubtreeHash`] pays it without an extra fetch at all, because it reads the version off the
 /// page it was going to open anyway.
-pub struct MemoIdentity<F> {
+pub struct MemoIdentity<'t, F> {
+    /// The one tree this memo describes, fixed at construction. Every row's version is read from
+    /// it and every row's digest is computed over it, so the two halves of a row cannot come from
+    /// different files. It is also what [`NodeIdentity::id_of`] validates against, which is all it
+    /// can do with the [`PageId`] it is handed.
+    tree: &'t CowTree,
     compute: F,
-    /// The store the rows were read from, captured on the first `warm`. A row can only be
-    /// validated against the page it came from, and [`NodeIdentity::id_of`] is handed nothing but
-    /// a [`PageId`]; an empty memo has no store and needs none, and only `warm` adds rows.
-    store: OnceLock<Arc<dyn PageStore>>,
     memo: RwLock<HashMap<PageId, (PageVersion, [u8; 16])>>,
     misses: AtomicUsize,
 }
 
-impl<F> MemoIdentity<F>
+impl<'t, F> MemoIdentity<'t, F>
 where
-    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+    F: Fn(&CowTree, PageId) -> Result<[u8; 16], FerroError>,
 {
-    pub fn new(compute: F) -> Self {
+    /// Bind a memo to `tree`. `compute` is handed that same tree on every call — see the type's
+    /// docs for why it is a parameter rather than something the closure captures.
+    pub fn new(tree: &'t CowTree, compute: F) -> Self {
         MemoIdentity {
+            tree,
             compute,
-            store: OnceLock::new(),
             memo: RwLock::new(HashMap::new()),
             misses: AtomicUsize::new(0),
         }
@@ -453,26 +544,18 @@ where
     ///
     /// Read [`MemoIdentity`]'s own docs before warming a whole tree through `cid::subtree_cid` —
     /// it costs more than the path it replaces.
-    pub fn warm(&self, tree: &CowTree, root: PageId) -> Result<usize, FerroError> {
-        let store = self.store.get_or_init(|| tree.store().clone());
-        // A row is only meaningful against the store its version was read from. Warming one memo
-        // from two stores would validate page 7's row against a different file's page 7 — usually
-        // a spurious miss, occasionally a match, and a match here is the silent wrongness this
-        // whole key exists to prevent. Refused rather than documented.
-        if !Arc::ptr_eq(store, tree.store()) {
-            return Err(FerroError::Cow(
-                "MemoIdentity was warmed from two different page stores; a memo row can only be \
-                 validated against the store it was read from"
-                    .into(),
-            ));
-        }
+    ///
+    /// There is no tree argument: the tree is the one given to [`MemoIdentity::new`], so a row's
+    /// version and its digest are read from the same file by construction rather than by a check.
+    pub fn warm(&self, root: PageId) -> Result<usize, FerroError> {
+        let store = self.tree.store();
         let mut written = 0usize;
-        for p in tree.walk_pages(root)? {
+        for p in self.tree.walk_pages(root)? {
             let version = PageVersion::read(&store.read_page(p)?)?;
             if self.fresh_row(p, version).is_some() {
                 continue;
             }
-            let id = tag_content((self.compute)(p)?);
+            let id = tag_content((self.compute)(self.tree, p)?);
             self.memo.write().unwrap().insert(p, (version, id));
             written += 1;
         }
@@ -482,6 +565,11 @@ where
     /// Pages that were compared without a row that still describes them: never warmed, or warmed
     /// in a previous life of that page id. Both are answered by the page-identity fallback.
     /// Non-zero after a diff means the skip was cruder than the wrapped digest allows.
+    ///
+    /// This counts *queries*, and [`diff`] does not query for a pair that is the same page id —
+    /// it settles those itself. So a diff of two roots that share most of their pages moves this
+    /// counter far less than it moves the descent, which is the intended direction: the pairs it
+    /// stays silent about are the ones no digest was needed for.
     pub fn misses(&self) -> usize {
         self.misses.load(AtomicOrdering::Relaxed)
     }
@@ -499,13 +587,12 @@ where
     }
 }
 
-impl<F> NodeIdentity for MemoIdentity<F>
+impl<F> NodeIdentity for MemoIdentity<'_, F>
 where
-    F: Fn(PageId) -> Result<[u8; 16], FerroError>,
+    F: Fn(&CowTree, PageId) -> Result<[u8; 16], FerroError>,
 {
     fn id_of(&self, page: PageId) -> [u8; 16] {
-        if let Some(store) = self.store.get()
-            && let Ok(handle) = store.read_page(page)
+        if let Ok(handle) = self.tree.store().read_page(page)
             && let Ok(version) = PageVersion::read(&handle)
             && let Some(id) = self.fresh_row(page, version)
         {
@@ -778,6 +865,11 @@ fn decode_payload(h: &PageHandle, pid: PageId, enclosing: &Span) -> Result<Paylo
 /// the difference between a stale row *missing* and a stale row *lying*. [`PageIdentity`] has no
 /// memo and so spends nothing.
 ///
+/// A pair that is the **same page id** costs nothing either, from any provider: `id_of` is a pure
+/// function of the page id, so the descent settles that case itself and never asks. In a
+/// copy-on-write store that is what every shared subtree looks like, so it is most of a small
+/// diff — `comparing_a_page_with_itself_never_consults_the_identity_provider` pins it.
+///
 /// `changes` come back in key order.
 pub fn diff(
     tree: &CowTree,
@@ -829,7 +921,13 @@ impl Differ<'_> {
         }
         // The skip. Equal identity => equal subtrees => equal on every sub-range of them, so this
         // holds whether `span` is the children's full span or a clipped piece of it.
-        if self.identity.id_of(a) == self.identity.id_of(b) {
+        //
+        // `a == b` is decided ahead of the provider. `id_of` is a pure function of the page id by
+        // [`NodeIdentity`]'s contract, so the comparison cannot come out anything but equal — and
+        // for the memoising providers, finding that out costs two page fetches and two header
+        // parses. One consequence is deliberate: an identical pair no longer counts toward
+        // [`MemoIdentity::misses`], because no digest was consulted to decide it.
+        if a == b || self.identity.id_of(a) == self.identity.id_of(b) {
             self.stats.note_skip();
             self.skipped_roots.push(a);
             return Ok(());
@@ -1329,8 +1427,10 @@ mod tests {
         head = f.put(head, B1, &key(11), "changed");
 
         let inner = SubtreeHash::new(f.store_dyn());
-        let m = MemoIdentity::new(|p| inner.stamp(p));
-        let warmed = m.warm(&f.tree, base).unwrap() + m.warm(&f.tree, head).unwrap();
+        // `inner` holds the tree's own store, so ignoring the supplied `&CowTree` here does
+        // not reach a second file — see `a_memo_is_bound_to_one_tree...` for what would.
+        let m = MemoIdentity::new(&f.tree, |_: &CowTree, p| inner.stamp(p));
+        let warmed = m.warm(base).unwrap() + m.warm(head).unwrap();
         assert_eq!(warmed, m.warmed());
 
         let r = diff(&f.tree, base, head, &m).unwrap();
@@ -1350,13 +1450,84 @@ mod tests {
         head = f.put(head, B1, &key(11), "changed");
 
         let inner = SubtreeHash::new(f.store_dyn());
-        let m = MemoIdentity::new(|p| inner.stamp(p));
+        let m = MemoIdentity::new(&f.tree, |_: &CowTree, p| inner.stamp(p));
         assert_eq!(m.warmed(), 0);
 
         let cold = diff(&f.tree, base, head, &m).unwrap();
         let warm = diff(&f.tree, base, head, &PageIdentity).unwrap();
         assert_eq!(cold.changes, warm.changes, "the fallback changed the answer");
         assert!(m.misses() > 0, "an unwarmed memo reported no misses — the counter is dead");
+    }
+
+    /// A [`NodeIdentity`] that counts how often it is consulted, so a claim about the number of
+    /// identity queries is measured rather than reasoned about.
+    struct CountingIdentity<'i> {
+        inner: &'i dyn NodeIdentity,
+        calls: AtomicUsize,
+    }
+
+    impl<'i> CountingIdentity<'i> {
+        fn wrap(inner: &'i dyn NodeIdentity) -> CountingIdentity<'i> {
+            CountingIdentity { inner, calls: AtomicUsize::new(0) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl NodeIdentity for CountingIdentity<'_> {
+        fn id_of(&self, page: PageId) -> [u8; 16] {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.id_of(page)
+        }
+    }
+
+    /// `Differ::walk` decides `a == b` before asking the provider. `id_of` is a pure function of
+    /// the page id by [`NodeIdentity`]'s contract, so that comparison can only come out equal —
+    /// and for the memoising providers it costs two page fetches and two header parses to learn
+    /// it. Comparing a page with itself is not a corner case: it is what every shared subtree
+    /// looks like in a copy-on-write store, which is most of a small diff.
+    ///
+    /// Forced both ways, because a short-circuit that fired unconditionally would report every
+    /// diff as empty.
+    #[test]
+    fn comparing_a_page_with_itself_never_consults_the_identity_provider() {
+        let f = Fixture::new();
+        let base = f.build(1500);
+        let mut head = f.fork(B1, base);
+        head = f.put(head, B1, &key(11), &value(11, 1));
+
+        // One direction: two identical roots are decided without a single query, and the skip is
+        // still counted and still covers the whole tree.
+        let counted = CountingIdentity::wrap(&PageIdentity);
+        let same = diff(&f.tree, base, base, &counted).unwrap();
+        assert_eq!(counted.calls(), 0, "identical roots consulted the provider");
+        assert_eq!(same.skipped_subtrees, 1, "the short-circuit stopped counting the skip");
+        assert_eq!(same.visited, 0);
+        assert!(same.changes.is_empty());
+        assert_eq!(
+            skipped_node_count(&f.tree, &same).unwrap(),
+            f.tree.walk_pages(base).unwrap().len()
+        );
+
+        // The other direction, and the exact invariant. Under `PageIdentity` two ids are equal
+        // iff the pages are the same page, so every surviving query belongs to a pair that went
+        // on to be decoded: one `id_of` per `note_visit`, exactly. Before the short-circuit each
+        // skipped pair also spent two queries, so this ran `2 * skipped_subtrees` higher.
+        let counted = CountingIdentity::wrap(&PageIdentity);
+        let real = diff(&f.tree, base, head, &counted).unwrap();
+        assert_eq!(real.changes.len(), 1, "got {:?}", real.changes);
+        assert!(real.skipped_subtrees > 0, "no subtree was skipped, so nothing was saved here");
+        assert!(counted.calls() > 0, "the short-circuit swallowed every comparison");
+        assert_eq!(
+            counted.calls(),
+            real.visited,
+            "{} identity queries against {} decoded nodes; a pair that was skipped on page id \
+             should have cost no query at all",
+            counted.calls(),
+            real.visited
+        );
     }
 
     #[test]
@@ -1533,12 +1704,15 @@ mod tests {
 
     /// `birth` participates in the key, pinned at the only level where it can be.
     ///
-    /// The store-level test this wants cannot be written: `checksum` is a crc32 over the whole
-    /// page **including** the header, so two pages that agree on `checksum` and disagree on
-    /// `birth` differ only by a crc32 collision, and a collision cannot be constructed in a test.
-    /// That is also why dropping `birth` breaks no store-level test in this file — it is carried
-    /// for exactness on the recycle case, not to cover a class `checksum` misses. This pins that
-    /// it is actually consulted; [`PageVersion`]'s docs carry the argument for keeping it.
+    /// There is no store-level version of this, because the **store** never writes such a page:
+    /// `checksum` is a crc32 over the whole page **including** the header, so two pages that agree
+    /// on `checksum` and disagree on `birth` differ by a crc32 collision, and no write path
+    /// produces one. That is also why dropping `birth` breaks no store-level test in this file —
+    /// it is carried for exactness on the recycle case, not to cover a class `checksum` misses.
+    ///
+    /// What this used to say is that such a page "cannot be constructed in a test". It can, and
+    /// the next test constructs one. This one pins only that `birth` is consulted at all;
+    /// [`PageVersion`]'s docs carry the argument for keeping it.
     #[test]
     fn the_version_key_consults_the_birth_epoch_and_not_only_the_checksum() {
         let mut older = PageHeader::new(Epoch(7), crate::branch::types::ArenaId(1), PageType::BTreeLeaf);
@@ -1552,6 +1726,106 @@ mod tests {
             "two lives of one page id with a colliding checksum compared equal"
         );
         assert_eq!(PageVersion::of(&older), PageVersion::of(&older.clone()));
+    }
+
+    /// The construction this file used to say did not exist, and the `birth` half catching it.
+    ///
+    /// crc32 is **affine**: for equal-length messages `crc(a) ^ crc(b) ^ crc(c) == crc(a ^ b ^ c)`,
+    /// so the difference a bit-flip makes to the checksum is a property of the flip alone and not
+    /// of the page it lands on. Read off the difference each of 64 free payload bits makes, solve
+    /// over GF(2) for the combination that cancels the difference a new `birth_epoch` made, and
+    /// the result is a **well-formed page** — `verify_checksum` passes — that is a different page
+    /// in a different epoch carrying the *same* checksum.
+    ///
+    /// Nothing in this store's write path builds one, which is why there is no store-level test.
+    /// But "unconstructable" was the wrong word for it, and this is what `birth` is actually for:
+    /// keyed on `checksum` alone the memo would call these two lives of the page one page.
+    #[test]
+    fn a_page_crafted_onto_a_colliding_checksum_is_still_a_different_version() {
+        use crate::cow::page_header::{stamp_checksum, PAGE_HEADER_SIZE};
+        use crate::storage::disk_manager::PAGE_SIZE;
+        use crate::wal::log::crc32;
+
+        // An honestly stamped page.
+        let mut original = [0u8; PAGE_SIZE];
+        PageHeader::new(Epoch(7), crate::branch::types::ArenaId(1), PageType::BTreeLeaf)
+            .write_to(&mut original);
+        for (i, b) in original.iter_mut().enumerate().skip(PAGE_HEADER_SIZE).take(64) {
+            *b = (i as u8).wrapping_mul(31);
+        }
+        stamp_checksum(&mut original);
+        let older = PageHeader::read_from(&original).unwrap();
+
+        // The same page id in its next life, one epoch later, checksum field cleared ready to
+        // be solved for.
+        let mut forged = original;
+        forged[0..8].copy_from_slice(&8u64.to_be_bytes());
+        forged[12..16].copy_from_slice(&0u32.to_be_bytes());
+        assert_ne!(crc32(&forged), older.checksum, "premise: the epoch change moved the crc");
+
+        // Sixty-four free bits at the tail of the payload, and what each one does to the crc.
+        let sites: Vec<usize> = (PAGE_SIZE - 64..PAGE_SIZE).collect();
+        let base = crc32(&forged);
+        let cols: Vec<u32> = sites
+            .iter()
+            .map(|&s| {
+                let mut probe = forged;
+                probe[s] ^= 1;
+                crc32(&probe) ^ base
+            })
+            .collect();
+
+        // Row-reduce to a basis keyed by leading bit, carrying which sites each row came from.
+        let mut basis: [Option<(u32, u64)>; 32] = [None; 32];
+        for (i, &c) in cols.iter().enumerate() {
+            let (mut v, mut sel) = (c, 1u64 << i);
+            while v != 0 {
+                let hi = (31 - v.leading_zeros()) as usize;
+                match basis[hi] {
+                    None => {
+                        basis[hi] = Some((v, sel));
+                        break;
+                    }
+                    Some((bv, bsel)) => {
+                        v ^= bv;
+                        sel ^= bsel;
+                    }
+                }
+            }
+        }
+
+        // Solve for the flips that put the crc back on the original checksum.
+        let (mut residual, mut sel) = (base ^ older.checksum, 0u64);
+        while residual != 0 {
+            let hi = (31 - residual.leading_zeros()) as usize;
+            let (bv, bsel) = basis[hi]
+                .unwrap_or_else(|| panic!("the 64 chosen sites do not span bit {hi} of the crc"));
+            residual ^= bv;
+            sel ^= bsel;
+        }
+        for (i, &s) in sites.iter().enumerate() {
+            if sel & (1u64 << i) != 0 {
+                forged[s] ^= 1;
+            }
+        }
+        forged[12..16].copy_from_slice(&older.checksum.to_be_bytes());
+
+        // It is a real page, not a smudge: the store's own verifier accepts it.
+        assert!(
+            crate::cow::page_header::verify_checksum(&forged),
+            "the crafted page does not verify, so the construction is wrong and proves nothing"
+        );
+        let newer = PageHeader::read_from(&forged).unwrap();
+        assert_ne!(original, forged, "control: the two pages must actually differ");
+        assert_eq!(newer.checksum, older.checksum, "the collision was not achieved");
+        assert_ne!(newer.birth_epoch, older.birth_epoch);
+
+        // A key on `checksum` alone calls these one page. The shipped key does not.
+        assert_ne!(
+            PageVersion::of(&older),
+            PageVersion::of(&newer),
+            "a constructed crc32 collision defeated the version key"
+        );
     }
 
     /// The half that carries the guard, and the half the obvious fix — key on `birth_epoch` —
@@ -1590,6 +1864,69 @@ mod tests {
         );
     }
 
+    /// **The subtree blind spot, at this adapter's own level.** A `MemoIdentity` row keyed on
+    /// `cid::subtree_cid` commits to the whole subtree *below* the page, but it is validated
+    /// against that page's own [`PageVersion`] — and `btree::insert` rewrites an already-private
+    /// leaf where it lies without copying up. Every ancestor keeps its id, its `birth`, its bytes
+    /// and therefore its version, so its row stays fresh and goes on answering with the digest of
+    /// a subtree that is no longer there. Nothing raises and [`MemoIdentity::misses`] does not
+    /// move: this is the one staleness route the key cannot see, and the type's docs now say so.
+    ///
+    /// Not a re-derivation: which of the three staleness routes the `(birth, checksum)` key does
+    /// and does not discriminate is measured on `D105-diff-memo` by
+    /// `the_key_catches_the_recycle_and_the_in_place_write_and_provably_not_a_descendant`. This
+    /// pins what route C costs a caller of **this adapter**, which is what the docs got wrong.
+    /// `bench/d109_ancestor_row_blind_spot_before.txt` is the run that falsified them.
+    #[test]
+    fn an_ancestors_warmed_row_survives_a_descendant_rewrite_and_goes_on_answering() {
+        let f = Fixture::new();
+        let root = f.build(400);
+        let pages = f.tree.walk_pages(root).unwrap();
+        assert!(pages.len() > 3, "premise: a multi-level tree, got {} pages", pages.len());
+
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(ident.warm(root).unwrap(), pages.len());
+        let stamped_root = ident.id_of(root);
+        let root_before = version_of(&f, root);
+
+        // Same branch, existing key, same-width value: nothing splits, the leaf is already
+        // private, so the copy-up stops there and the root is never rewritten.
+        let after = f.put(root, BranchId::TRUNK, &key(3), &value(3, 1));
+        assert_eq!(after, root, "premise: the write copied up to the root");
+        assert_eq!(version_of(&f, root), root_before, "premise: the root's own bytes moved");
+
+        let truth = tag_content(cid::subtree_cid(&f.tree, root).unwrap());
+        assert_ne!(truth, stamped_root, "control: the root's subtree digest did not move");
+
+        // The blind spot. The root's row is still fresh by its own page version, so it answers,
+        // and the wrong answer moves no counter.
+        let misses_before = ident.misses();
+        assert_eq!(
+            ident.id_of(root),
+            stamped_root,
+            "the ancestor's row did not survive the descendant rewrite, so this test is no \
+             longer demonstrating the blind spot its docs describe"
+        );
+        assert_ne!(ident.id_of(root), truth, "the row answered for the subtree that is there now");
+        assert_eq!(ident.misses(), misses_before, "the stale ancestor answer moved a counter");
+
+        // The contrast that makes this a blind spot rather than plain staleness: the page that
+        // was actually rewritten IS discriminated, and it is the only one. A warmed row is
+        // tagged TAG_CONTENT and the fallback TAG_PAGE, so this filter is exact.
+        let stale: Vec<PageId> =
+            pages.iter().copied().filter(|p| ident.id_of(*p) == page_id_identity(*p)).collect();
+        assert_eq!(
+            stale.len(),
+            1,
+            "expected exactly the rewritten leaf to go stale, got {stale:?} of {} pages",
+            pages.len()
+        );
+        assert!(
+            !stale.contains(&root),
+            "the root's row went stale after all, so the ancestor case is not the blind spot"
+        );
+    }
+
     /// The documented remedy has to work. `warm` used to step over any page id already in the
     /// map, so re-warming a recycled page added nothing, moved no counter, and left the wrong id
     /// in place — every instrument reading clean while the answer was wrong.
@@ -1600,8 +1937,8 @@ mod tests {
         let r1 = f.tree.create(BranchId::TRUNK, e).unwrap();
         let r1 = f.put(r1, BranchId::TRUNK, "a", "1");
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&f.tree, p).map(tag_content));
-        assert_eq!(ident.warm(&f.tree, r1).unwrap(), 1);
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p).map(tag_content));
+        assert_eq!(ident.warm(r1).unwrap(), 1);
         let stale = ident.id_of(r1);
         assert_eq!(ident.misses(), 0, "a freshly warmed page must not miss");
 
@@ -1612,7 +1949,7 @@ mod tests {
         assert_eq!(ident.id_of(r1b), page_id_identity(r1b), "a stale row answered a query");
         assert_eq!(ident.misses(), misses_before + 1, "a stale row was not counted as a miss");
 
-        assert_eq!(ident.warm(&f.tree, r1b).unwrap(), 1, "re-warming added no row");
+        assert_eq!(ident.warm(r1b).unwrap(), 1, "re-warming added no row");
         assert_ne!(ident.id_of(r1b), stale, "re-warming did not refresh the recycled page");
         assert_eq!(
             ident.id_of(r1b),
@@ -1621,24 +1958,50 @@ mod tests {
         );
     }
 
-    /// A memo validated against the wrong store is the same failure one level up, so warming one
-    /// from two stores is refused rather than warned about. Forced to fire: without the guard the
-    /// second `warm` succeeds and every later row is checked against a different file's pages.
+    /// A memo's two halves — the page version it validates against and the digest it answers with
+    /// — must come from the same file, and after D109 they do by construction: the tree is fixed
+    /// at [`MemoIdentity::new`] and handed to the digest, so `warm` has no tree argument to get
+    /// wrong. The fixture is the one that used to break it: two stores that hand out the *same*
+    /// page ids for different content, so a memo reaching across them would answer and not miss.
+    ///
+    /// What this replaced: `store` was captured on the FIRST `warm` and compared with
+    /// `Arc::ptr_eq`, which is trivially true there. A memo whose digest closed over tree A and
+    /// was warmed once against tree B was accepted, and every row held (B's page version, A's
+    /// digest) — `id_of` then validated against the right store and returned the wrong file's id
+    /// with `misses()` reading zero. `bench/d109_two_store_guard_before.txt` is that run.
     #[test]
-    fn warming_one_memo_from_two_stores_is_refused() {
-        let a = Fixture::new();
-        let b = Fixture::new();
-        let root_a = a.build(50);
-        let root_b = b.build(50);
+    fn a_memo_is_bound_to_one_tree_so_its_digest_and_its_version_share_a_file() {
+        let a = Fixture::with_extent_pages(8);
+        let b = Fixture::with_extent_pages(8);
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&a.tree, p));
-        assert!(ident.warm(&a.tree, root_a).unwrap() > 0);
+        let ea = a.tick();
+        let ra = a.tree.create(BranchId::TRUNK, ea).unwrap();
+        let ra = a.put(ra, BranchId::TRUNK, "k", "A");
+        let eb = b.tick();
+        let rb = b.tree.create(BranchId::TRUNK, eb).unwrap();
+        let rb = b.put(rb, BranchId::TRUNK, "k", "B");
+        assert_eq!(ra, rb, "premise: two fresh stores hand out the same page id");
 
-        let err = ident.warm(&b.tree, root_b).unwrap_err();
-        assert!(
-            format!("{err:?}").contains("two different page stores"),
-            "the second store was accepted, got {err:?}"
+        let from_a = tag_content(cid::subtree_cid(&a.tree, ra).unwrap());
+        let truth_b = tag_content(cid::subtree_cid(&b.tree, rb).unwrap());
+        assert_ne!(from_a, truth_b, "control: the two files' page {ra} digest differently");
+
+        let ident = MemoIdentity::new(&b.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(ident.warm(rb).unwrap(), 1);
+
+        let answered = ident.id_of(rb);
+        assert_eq!(ident.misses(), 0, "a freshly warmed page must not miss");
+        assert_ne!(
+            answered, from_a,
+            "the memo answered with tree A's digest for a page it validates against tree B"
         );
+        assert_eq!(answered, truth_b, "the memo must answer for the tree it is bound to");
+
+        // And the same page id in the other file is a different memo's business entirely: this
+        // one holds no row that could answer for it.
+        let other = MemoIdentity::new(&a.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        assert_eq!(other.warm(ra).unwrap(), 1);
+        assert_eq!(other.id_of(ra), from_a);
     }
 
     // -- the adapter's stated purpose, over a digest that really has no memo -------------------
@@ -1654,8 +2017,8 @@ mod tests {
         let mut head = f.fork(B1, base);
         head = f.put(head, B1, &key(11), "changed");
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&f.tree, p));
-        let warmed = ident.warm(&f.tree, base).unwrap() + ident.warm(&f.tree, head).unwrap();
+        let ident = MemoIdentity::new(&f.tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        let warmed = ident.warm(base).unwrap() + ident.warm(head).unwrap();
         assert_eq!(warmed, ident.warmed());
 
         let r = diff(&f.tree, base, head, &ident).unwrap();
@@ -1748,10 +2111,19 @@ mod tests {
 
         let counting = CountingStore::wrap(f.store_dyn());
         let tree = CowTree::new(Arc::clone(&counting) as Arc<dyn PageStore>);
-        let nodes = tree.walk_pages(base).unwrap().len();
+        counting.take();
+        let pages = tree.walk_pages(base).unwrap();
+        let walk_reads = counting.take();
+        let nodes = pages.len();
         assert!(nodes > 100, "test needs a multi-level tree, got {nodes} pages");
 
-        counting.take();
+        // `subtree_cid`'s own cost over exactly the pages `warm` visits, measured directly
+        // rather than inferred by subtraction.
+        for p in &pages {
+            cid::subtree_cid(&tree, *p).unwrap();
+        }
+        let cid_reads = counting.take();
+
         let control = tree.diff(base, head).unwrap();
         let control_reads = counting.take();
         assert_eq!(control.deltas.len(), 4);
@@ -1759,10 +2131,14 @@ mod tests {
         let stamp = SubtreeHash::new(Arc::clone(&counting) as Arc<dyn PageStore>);
         stamp.stamp(base).unwrap();
         let stamp_reads = counting.take();
+        stamp.stamp(head).unwrap();
+        let stamp_both = stamp_reads + counting.take();
 
-        let ident = MemoIdentity::new(|p| cid::subtree_cid(&tree, p));
-        ident.warm(&tree, base).unwrap();
+        let ident = MemoIdentity::new(&tree, |t: &CowTree, p| cid::subtree_cid(t, p));
+        ident.warm(base).unwrap();
         let warm_reads = counting.take();
+        ident.warm(head).unwrap();
+        let warm_both = warm_reads + counting.take();
 
         let skipping = diff(&tree, base, head, &PageIdentity).unwrap();
         let diff_reads = counting.take();
@@ -1773,6 +2149,23 @@ mod tests {
         println!("  CowTree::diff, the O(N) path being beaten  : {control_reads:>8} page reads");
         println!("  SubtreeHash::stamp, bottom-up              : {stamp_reads:>8} page reads");
         println!("  MemoIdentity(subtree_cid).warm             : {warm_reads:>8} page reads");
+        println!("    of which subtree_cid itself              : {cid_reads:>8} page reads");
+        println!("    of which warm's own walk_pages           : {walk_reads:>8} page reads");
+        println!("    of which the version check               : {nodes:>8} page reads");
+        println!("  SubtreeHash::stamp, BOTH roots             : {stamp_both:>8} page reads");
+        println!("  MemoIdentity(subtree_cid).warm, BOTH roots : {warm_both:>8} page reads");
+
+        // The split, pinned by an equality rather than by arithmetic on a quoted figure. `warm`
+        // does exactly three things per page: one `walk_pages` read (amortised — `walk_pages`
+        // reads each page once for the whole walk), one version read, and one `subtree_cid`.
+        assert_eq!(
+            warm_reads,
+            walk_reads + cid_reads + nodes,
+            "warm's {warm_reads} reads are not walk_pages ({walk_reads}) + subtree_cid \
+             ({cid_reads}) + one version check per page ({nodes}); the docs' breakdown of this \
+             number no longer describes what warm does"
+        );
+        assert_eq!(walk_reads, nodes, "walk_pages is supposed to read each page exactly once");
 
         assert!(
             diff_reads < control_reads / 10,
@@ -1789,6 +2182,19 @@ mod tests {
             "warming through subtree_cid ({warm_reads}) is now CHEAPER than the O(N) path \
              ({control_reads}); MemoIdentity's docs forbid this on the strength of it being \
              dearer, and that claim has stopped being true"
+        );
+
+        // The comparison the docs quote: a diff needs BOTH roots warmed, and the control already
+        // walks both. Anything less is one root's work set against two roots'.
+        assert!(
+            stamp_both < control_reads,
+            "stamping both roots ({stamp_both}) is no longer cheaper than the O(N) path \
+             ({control_reads}), so SubtreeHash has stopped being the one to prefer"
+        );
+        assert!(
+            warm_both > 2 * control_reads,
+            "warming both roots through subtree_cid ({warm_both}) has fallen to within 2x the \
+             O(N) path ({control_reads}); the table quotes 4.1x and that has stopped being true"
         );
     }
 }

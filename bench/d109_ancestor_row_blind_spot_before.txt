@@ -1,0 +1,20 @@
+running 1 test
+test cow::diff::tests::d109_evidence_the_docs_claim_a_rewrite_makes_the_row_miss ... FAILED
+
+failures:
+
+---- cow::diff::tests::d109_evidence_the_docs_claim_a_rewrite_makes_the_row_miss stdout ----
+
+thread 'cow::diff::tests::d109_evidence_the_docs_claim_a_rewrite_makes_the_row_miss' (245755430) panicked at src/cow/diff.rs:1644:9:
+assertion `left != right` failed: docs as written: a rewritten page's row misses rather than answering
+  left: [0, 63, 51, 122, 124, 234, 69, 165, 146, 23, 119, 17, 134, 114, 143, 94]
+ right: [0, 63, 51, 122, 124, 234, 69, 165, 146, 23, 119, 17, 134, 114, 143, 94]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cow::diff::tests::d109_evidence_the_docs_claim_a_rewrite_makes_the_row_miss
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1577 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--lib`
