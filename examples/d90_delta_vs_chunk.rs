@@ -235,6 +235,15 @@ fn build(dir: &Path, nrows: i64) -> Server {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| ((nrows / 40) as u32 + 4096).next_power_of_two());
     let store = Arc::new(ArenaPageStore::new(bp.clone(), branches.clone(), arena_base).unwrap());
+    // **Without this the arena column is structurally zero, not measured.** `ArenaPageStore`
+    // persists its free-space map through `persist_if_configured`, which is a no-op until a
+    // checkpoint path is set — so a harness that never calls `checkpoint_to` reports
+    // `atomic_replace_counters()` deltas of 0 for every r and looks like it measured a sink that
+    // was never wired. The first full run of this sweep did exactly that.
+    //
+    // Configuring it can only ADD bytes to the cost of a small change, never remove them, so it
+    // cannot be a thumb on the scale for the wall this run is testing for.
+    store.checkpoint_to(dir.join("main.arena"));
     let runtime = Arc::new(
         AgentRuntime::with_storage(
             branches,
@@ -560,6 +569,7 @@ fn main() {
         "r must stay below the row count or the scattered ids stop being distinct"
     );
 
+    let run_start = (fsync_counters(), atomic_replace_counters());
     let row_sz = row_bytes();
     println!("PAGE_SIZE = {PAGE_SIZE}, ROW_SIZE = {row_sz} bytes (from Tuple::serialize, not assumed)");
     println!("  -> a change confined to ONE row costs at most PAGE_SIZE/ROW_SIZE = {:.1}x if the page",
@@ -766,6 +776,26 @@ fn main() {
         println!();
         println!("  ⚠ AMPLIFICATION RISES with r — falsifier (c) is in play. Read the order control");
         println!("    above before reading this run as a statement about chunk-vs-delta.");
+    }
+
+    // ---- whole-run totals, so an UNWIRED counter cannot pass as a measured zero -------------
+    //
+    // A per-window delta of 0 reads identically whether the sink was quiet or the instrument was
+    // never connected. The first full run of this sweep reported `arena B = 0` for all thirteen r
+    // values because `persist_if_configured` is a no-op until a checkpoint path is set — a column
+    // of zeros that looked like a finding and was a wiring bug. These totals are the check: a sink
+    // that is zero for the WHOLE run, build included, is not being measured.
+    let ((f_end, b_end), (a_end, ab_end)) = (fsync_counters(), atomic_replace_counters());
+    let ((f_beg, b_beg), (a_beg, ab_beg)) = run_start;
+    println!();
+    println!("  WHOLE-RUN TOTALS (build + warm-up + both passes), to prove each sink is wired:");
+    println!("    WAL:   {} fsyncs, {} bytes", f_end - f_beg, b_end - b_beg);
+    println!("    arena: {} atomic replaces, {} bytes", a_end - a_beg, ab_end - ab_beg);
+    for (name, n) in [("WAL fsyncs", f_end - f_beg), ("arena replaces", a_end - a_beg)] {
+        if n == 0 {
+            println!("    ⚠ {name} is ZERO for the entire run: that sink is NOT WIRED, and every");
+            println!("      per-r zero in its column above is an artefact, not a measurement.");
+        }
     }
 
     let _ = std::fs::remove_dir_all(&dir);
