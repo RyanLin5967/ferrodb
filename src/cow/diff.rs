@@ -392,7 +392,12 @@ impl NodeIdentity for SubtreeHash {
 /// CowTree::diff, the O(N) path being replaced :  2188 page reads
 /// SubtreeHash::stamp, bottom-up               :  1085 page reads   <- one per node, the floor
 /// MemoIdentity(subtree_cid).warm              :  5410 page reads   <- 2.5x the control
+///   of which subtree_cid itself               :  4325 page reads   <- 2.0x it on its own
 /// ```
+///
+/// The split is measured, by removing the version check and re-counting: the other 1085 are this
+/// adapter's own validation, exactly one per page. The verdict does not rest on them — warming
+/// cost twice the path it replaces before there was anything to validate.
 ///
 /// It still reports a healthy `skipped_subtrees`, so the counter does not give the cost away. Use
 /// [`SubtreeHash`] to warm a whole tree — it folds bottom-up and reads each page once — and keep
@@ -411,11 +416,10 @@ impl NodeIdentity for SubtreeHash {
 ///   already present, which made re-warming after a recycle a no-op that added zero entries and
 ///   moved zero counters while the memo went on returning the wrong id.
 ///
-/// Validating costs one page fetch and a header parse per query, so N of the 5410 reads above are
-/// `warm`'s own version checks and the rest are `subtree_cid` re-walking subtrees. That is the
-/// price of a stale row missing rather than lying, and it is paid on a path these docs tell you
-/// not to take; [`SubtreeHash`] pays it without an extra fetch, because it reads the version off
-/// the page it was going to open anyway.
+/// Validating costs one page fetch and a header parse per query — the 1085 reads broken out of
+/// `warm`'s total above. That is the price of a stale row missing rather than lying, and
+/// [`SubtreeHash`] pays it without an extra fetch at all, because it reads the version off the
+/// page it was going to open anyway.
 pub struct MemoIdentity<F> {
     compute: F,
     /// The store the rows were read from, captured on the first `warm`. A row can only be
