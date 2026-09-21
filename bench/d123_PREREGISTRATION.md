@@ -210,3 +210,29 @@ tree — but comparability to `bench/fork_concurrency_after.txt` is not. Therefo
   the attribution.
 * The warm=20,000 battery keeps its own numbers; the two are reported side by side and never mixed
   into one subtraction. That is the error this row exists to stop repeating.
+
+# ⭐ AMENDMENT 5 — A CLOSURE IDENTITY THAT TESTS THE INSTRUMENT ITSELF. Written before any result.
+
+In a closed harness every thread's cycle is exactly `wait → hold → durable`, and each thread
+completes `forks/T` forks in the wall time. So, per fork:
+
+```
+WAIT + HOLD_TOTAL + DURABLE  ==  T × S_eff        (T = threads, S_eff = wall/forks)
+```
+
+All three terms are measured by the probe and `T × S_eff` comes from the wall clock, so this is a
+**closure check on the whole instrument**, not another hypothesis. It needs no rebuild — the three
+phases are already in the `phases` table.
+
+* Closes to within **±5%** ⇒ the probe accounts for the entire loop; there is no unmeasured limb,
+  and the F4 decomposition can be quoted.
+* Falls short by more than that ⇒ there is time in the cycle the probe never sees, and **every
+  attribution is downgraded to a lower bound** until the missing limb is found. I will say so
+  rather than quote the partition.
+
+**A prediction that follows from it, recorded now so it cannot be retrofitted:** at T=64 with
+S_eff ≈ 0.228 ms, the cycle is ≈14.6 ms, of which the section is 0.228 ms. So `WAIT` must dominate
+— roughly 11-14 ms — because 64 threads queue at `logical` while only ~13.8 get through per fsync
+round. **If `DURABLE` dominates instead and `WAIT` is small, the threads are not queueing on the
+mutex at all, the serial section is not what they are waiting for, and F1 should fire.** That makes
+the WAIT/DURABLE split a second, independent read on Q2 from the same run.
