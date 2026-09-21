@@ -135,9 +135,20 @@ impl CherryLog for ScanCherryLog {
     }
 }
 
-/// The row the first selector touches — every op `build` emits is on row `seq/2`.
-fn sel_row(sel: &[OpSelector]) -> RowId {
-    RowId((sel[0].seq - 1) / 2)
+/// The row a selector touches — every op `build` emits is on row `(seq-1)/2`.
+fn sel_row(s: OpSelector) -> RowId {
+    RowId((s.seq - 1) / 2)
+}
+
+/// `count` selectors spread EVENLY across `seqs`, not the first `count` of them.
+///
+/// **Load-bearing for axis 2b.** Taking a prefix makes the unindexed arm's linear search find
+/// every key within the first few entries, so it never scans and the A/B reports no difference —
+/// which is exactly what the first run of this harness reported. Spreading the selection puts the
+/// scan at its average depth.
+fn spread(seqs: &[u64], count: usize) -> Vec<OpSelector> {
+    let stride = (seqs.len() / count).max(1);
+    (0..count).map(|i| OpSelector::new(seqs[i * stride])).collect()
 }
 
 fn median(mut us: Vec<f64>) -> f64 {
@@ -181,11 +192,13 @@ fn measure(
         // 0 +10 (theirs, already on the target) +1 (ours) = 11. Reaching 11 proves `divergence`
         // read the op from the log: the image-comparison fallback yields an opaque Assign, which
         // does not commute with an Add and would have REFUSED.
-        assert_eq!(
-            t.cell(T, sel_row(sel), C),
-            Some(&Value::Integer(11)),
-            "the divergence must have been read from the log, not guessed"
-        );
+        for probe in [sel[0], sel[sel.len() - 1]] {
+            assert_eq!(
+                t.cell(T, sel_row(probe), C),
+                Some(&Value::Integer(11)),
+                "the divergence must have been read from the log, not guessed"
+            );
+        }
     }
     (median(whole), median(plan))
 }
@@ -217,7 +230,7 @@ fn main() {
     );
     let mut axis1: Vec<(usize, f64)> = Vec::new();
     for &n in &[1usize, 10, 100, 1000] {
-        let sel: Vec<OpSelector> = seqs[..n].iter().copied().map(OpSelector::new).collect();
+        let sel = spread(&seqs, n);
         let reps = if n >= 1000 { 101 } else { 401 };
         let (whole, plan) = measure(&log, &sel, &base, reps);
         println!("  {:>8}  {:>14.3}  {:>14.3}  {:>16.4}", n, plan, whole, plan / n as f64);
@@ -254,7 +267,7 @@ fn main() {
     let mut axis2: Vec<(usize, f64)> = Vec::new();
     for &rows in &[500usize, 5_000, 50_000] {
         let (l, b, s, _) = build(rows);
-        let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
+        let sel = spread(&s, 100);
         let (whole, plan) = measure(&l, &sel, &b, 201);
         println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
         axis2.push((2 * rows, plan));
@@ -285,7 +298,7 @@ fn main() {
     for &rows in &[500usize, 5_000, 50_000] {
         let (l, b, s, cells) = build(rows);
         let scan = ScanCherryLog { inner: l, cells };
-        let sel: Vec<OpSelector> = s[..100].iter().copied().map(OpSelector::new).collect();
+        let sel = spread(&s, 100); // the IDENTICAL selection the indexed arm used
         let (whole, plan) = measure(&scan, &sel, &b, 201);
         println!("  {:>10}  {:>14.3}  {:>14.3}  {:>16.4}", 2 * rows, plan, whole, plan / 100.0);
         axis2b.push((2 * rows, plan));
@@ -319,11 +332,12 @@ fn main() {
     println!();
     let (rlog, rbase, rseqs, _) = build(1_000);
     let mut moved = rbase.clone();
-    // Move one cell out from under the pick, contradictorily.
-    // Row 500's cell is moved to a value no recorded op explains, so `divergence` falls back to
-    // an opaque Assign — which does not commute with an Add, and the whole pick refuses.
-    moved.insert(T, RowId(500), vec![Value::Integer(0), Value::Integer(-1), Value::Integer(0)]);
-    let sel: Vec<OpSelector> = rseqs[..1000].iter().copied().map(OpSelector::new).collect();
+    // ONE row of the thousand is gone from the target. A moved VALUE is not a refusal in this
+    // fixture — `Add` commutes with everything the log can report on that cell — but a missing
+    // ROW is (truth-table row 7), and it is the refusal an agent actually hits when a sibling
+    // deleted the row out from under the pick.
+    assert!(moved.remove(T, RowId(500)).is_some(), "the fixture must have had that row");
+    let sel = spread(&rseqs, 1000);
     let policy = PolicyTable::new();
     let mut us: Vec<f64> = Vec::new();
     for _ in 0..201 {
@@ -335,8 +349,8 @@ fn main() {
         assert_eq!(t.commits, 0, "a refusal must not reach the writer");
     }
     println!(
-        "REFUSAL PATH — 1000 picked, one cell moved: median {:.3} us, and commit_all was \
-         entered 0 times in all 201 reps.",
+        "REFUSAL PATH — 1000 picked, 1 of the 1000 rows missing from the target: median {:.3} us, \
+         and commit_all was entered 0 times in all 201 reps.",
         median(us)
     );
 }

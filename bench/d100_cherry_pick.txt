@@ -1,0 +1,133 @@
+D100 — CHERRY-PICK: WHAT IT COSTS, AND WHETHER IT REALLY READS D86's INDEX.
+
+[HERE] `examples/d100_cherry_pick.rs`, release profile, one thread. Built at b576b1f928ff (clean —
+the stamp is `ferrodb::build_provenance()` and carries no +DIRTY).
+
+⚠ MACHINE LOAD: 1-minute loadavg 25.24 before, 24.50 after. This box runs an 18-agent fleet and
+does not go quiet. Every claim below is therefore a WITHIN-RUN comparison — two arms, one process,
+one run — and no absolute microsecond figure here should be quoted as this engine's speed on a
+quiet machine.
+
+⚠ THIS SUPERSEDES AN EARLIER BANKING OF THIS FILE AT a55d13d7e66c. That run was correct for the
+engine that existed then; a fresh-context review afterwards found two silent-wrong-answer defects
+in `divergence`, and fixing them added a branch filter and a verification step to the per-cell
+path. Per-pick plan cost roughly TRIPLED as a result (0.39 us -> 1.30 us at 1000 picks). That is
+the cost of the fix and it is stated rather than quietly re-baselined.
+
+=== WHAT THE INSTRUMENT MEASURES ==================================================
+
+`std::time::Instant`, median over the reps named per row (401 / 201 / 101 by size).
+
+  `plan us`        — `cherry::plan_cherry_pick` ALONE. This is the engine: selector resolution,
+                     per-cell composition, divergence through the by-cell index, `resolve_cell`.
+                     It touches the target ZERO times, which is also why it can be timed against
+                     the same untouched base every rep.
+  `plan+commit us` — that plus `MemCherryTarget::commit_all`, which is the TEST DOUBLE's cost and
+                     not this module's. Reported so it cannot hide inside the curve.
+
+Target reset happens OUTSIDE every timed region.
+
+=== THE RUN =======================================================================
+
+D100 — CHERRY-PICK COST. Built at b576b1f928ff
+
+Instrument: std::time::Instant, median over the reps named per row. Release profile.
+`plan us`        = branch::cherry::plan_cherry_pick alone — THE ENGINE, touches nothing.
+`plan+commit us` = that plus MemCherryTarget::commit_all — the TEST DOUBLE's cost too.
+Target is reset from a clone OUTSIDE every timed region.
+Each op is an Assign on its own row, so this is the per-op path, not per-cell composition.
+
+AXIS 1 — picked ops, log fixed at 20000 ops
+    picked         plan us  plan+commit us  plan us per pick
+         1           3.375           0.833            3.3750
+        10          13.291           6.125            1.3291
+       100         113.875          89.916            1.1387
+      1000        1304.292        1436.125            1.3043
+
+  1 -> 1000 picked ops: plan 3.375 us -> 1304.292 us = 386.5x for 1000x the work.
+  Plan cost per pick moved 3.3750 us -> 1.3043 us (0.386x).
+
+AXIS 2 — log size, picked held at 100  [THE CONTROL FOR AXIS 1]
+     log ops         plan us  plan+commit us  plan us per pick
+        1000          39.292          45.167            0.3929
+       10000          88.833          70.875            0.8883
+      100000         249.250          89.709            2.4925
+
+  100x more log, same 100 picks: plan 39.292 us -> 249.250 us = 6.34x.
+
+AXIS 2b — THE SAME AXIS WITH NO BY-CELL INDEX (ops_on_cell scans)
+     log ops         plan us  plan+commit us  plan us per pick
+        1000          54.750          59.625            0.5475
+       10000         269.708         280.625            2.6971
+      100000        2564.542        2621.875           25.6454
+
+  100x more log, same 100 picks, NO INDEX: plan 54.750 us -> 2564.542 us = 46.8x.
+
+  ==> AT 100000 LOG OPS THE INDEXED PICK IS 10.3x FASTER THAN THE SCANNING ONE
+               (249.250 us vs 2564.542 us), and the two arms' SLOPES across the same 100x are 6.34x vs 46.8x. Same process, same run.
+
+REFUSAL PATH — 1000 picked, 1 of the 1000 rows missing from the target: median 505.417 us, and commit_all was entered 0 times in all 201 reps.
+
+=== WHAT IT SAYS ==================================================================
+
+1. COST IS LINEAR IN PICKED OPS, WITH A SMALL FIXED HEAD.
+   1 -> 1000 picked ops costs 3.375 us -> 1304.292 us: 386x for 1000x the work. Per-pick cost
+   FALLS from 3.38 us to 1.30 us as the fixed setup amortises, and is flat from 100 to 1000
+   (1.14 / 1.30 us). That is O(picked), which is the claim: a subset of ops is what an op log
+   already manipulates.
+
+2. COST IS SUB-LINEAR IN LOG SIZE — AND THE CONTROL IS WHAT MAKES THAT A FINDING.
+   Holding the pick at 100 ops and growing the log 100x:
+
+       indexed (`applied_by_cell`, one keyed lookup per cell) :  39.292 us ->  249.250 us =  6.34x
+       unindexed (`ops_on_cell` scans)                        :  54.750 us -> 2564.542 us = 46.8x
+
+   Same process, same run, same 100 selectors, identical `op_at`. The ONLY difference between the
+   arms is how `ops_on_cell` is answered. At 100,000 log ops the indexed pick is 10.3x faster, and
+   the SLOPES differ by 7.4x — which is the part a single ratio cannot say.
+
+   The indexed arm is not flat (6.34x, not 1x). That residual is `op_at`'s `BTreeMap` lookup, which
+   is O(log n), plus cache pressure from a 100k-entry map; it is not a scan, and the control arm
+   shows what a scan costs.
+
+   Observed across four runs at different fleet loads: 15.8x, 11.1x, 10.2x and 10.3x faster indexed
+   at 100,000 log ops (slopes 5.28x/52.0x, 6.32x/47.2x, 6.43x/45.1x, 6.34x/46.8x). Direction and
+   order of magnitude are stable; the absolute figures are not, and should not be quoted as if they
+   were.
+
+3. A REFUSAL IS CHEAPER THAN AN APPLY AND REACHES NO WRITER.
+   1000 picked with one of the thousand rows missing from the target: 505.417 us median, and
+   `commit_all` was entered 0 times in all 201 reps. Banked so the curve cannot be misread as
+   "refusals are the expensive case".
+
+=== TWO FALSE READINGS THIS HARNESS PRODUCED FIRST, AND HOW THEY WERE CAUGHT ======
+
+Both are recorded because each looked exactly like a result.
+
+FALSE READING 1 — "the pick is linear in log size, 91.8x across 100x".
+  Cause: `MemCherryTarget::commit_all` cloned the whole row map inside the timed region, so it
+  cost O(rows in target). The harness was the wall. Fixed by journalling only the rows the plan
+  touches (O(writes)), and by splitting `plan` from `plan+commit` so a test double's cost can
+  never again be read as the engine's.
+
+FALSE READING 2 — "the index makes no difference: 1.79x indexed vs 1.6x unindexed".
+  Reported TWICE, from two different causes, and BOTH were found by the unindexed control arm
+  rather than by inspection:
+    (a) every op's witness equalled the target's value, so `divergence` returned at truth-table
+        row 1 — *provably unchanged* — BEFORE calling `ops_on_cell`. The index was never consulted
+        in the measured path at all.
+    (b) with that fixed, the selection was `seqs[..100]` — a PREFIX — so the control arm's linear
+        search found every key in its first few entries and never scanned.
+  Fixed by a fixture that diverges on every cell (source `Add(+1)`, target `Add(+10)` already
+  landed) and a selection spread evenly across the log.
+
+  The harness is now SELF-CHECKING against (a): if `ops_on_cell` returned nothing, `divergence`
+  would fall back to an opaque `Assign(10)`, which does not commute with `Add(+1)`, so the pick
+  would REFUSE under the default `Reject` policy. Every `assert!(is_applied())` and the
+  `assert_eq!(cell, 11)` in `measure` is therefore an assertion that the indexed path fired. This
+  harness can no longer print a number while measuring nothing.
+
+  ⇒ The general lesson, which is the one worth keeping: a measurement of "the index helps" is
+    uninterpretable without an arm that has the index REMOVED, in the same process. Twice here the
+    engine was fine and the fixture was measuring a path that never reached the code under test,
+    and in both cases the absolute numbers looked entirely reasonable.
