@@ -1,15 +1,39 @@
-//! Content-addressed chunk index with reference counts — D94.
+//! Content-addressed chunk index with reference counts — D94. **MEASURED, THEN REFUSED.**
 //!
-//! **This module is deliberately not wired into the write path, and the reason is a measurement.**
-//! `examples/d94_dedup_premise.rs` (banked as `bench/d94_chunk_dedup.txt`) measures what cross-branch
-//! dedup could win here, and the answer is *entirely* workload-dependent: exactly zero pages when
-//! branches write different content, and up to ~79% of stored bytes when every branch writes
-//! byte-identical rows. Read the bench file before adopting this; the premise section of it argues
-//! that most identical-by-construction content is better hoisted to the common ancestor, where
-//! `cow`'s existing sharing stores it once for free and needs no index and no refcounts at all.
+//! **This module is NOT wired into any write path and must not be. The row it belongs to was
+//! decided against on the evidence in `bench/d94_chunk_dedup.txt`.** It is kept, unwired, for one
+//! reason: the refusal is a statement about trade-offs, not about feasibility, and deleting the
+//! mechanism would leave the next person to rebuild it in order to rediscover the same answer.
 //!
-//! What this module IS: the mechanism, built and tested, so the decision is about evidence rather
-//! than about whether it can be done.
+//! The measurement that settled it, from `examples/d94_dedup_premise.rs`:
+//!
+//! - **The frontier's mechanism cannot fire here at all.** ForkBase dedups because identical
+//!   content anywhere in its store is one chunk. In ferrodb there is **not one byte-identical
+//!   whole page in any configuration measured** — including the one where every branch writes
+//!   byte-identical ROWS. `distinct pages` equals `distinct whole` in every swept row.
+//! - **And that is deliberate, not an accident to be fixed.** ForkBase's chunks carry no per-owner
+//!   identity. ferrodb's pages carry `birth_epoch` and `arena_id` (see [`crate::cow::page_header`])
+//!   *precisely so* the epoch-interval reaper can free a page without asking a global liveness
+//!   question. **The same 24 bytes that make dedup impossible are what make reclamation cheap.**
+//! - **Payload-level dedup is the only form that could ever pay, and it still loses.** Keying on
+//!   `page[PAGE_HEADER_SIZE..]` does find duplicates — 9.9% / 19.8% / 29.7% of stored bytes at
+//!   duplicate fractions of 0.12 / 0.25 / 0.38, and zero when branches write different content.
+//!   That buys a *conditional* 10–30% and costs refcounts.
+//!
+//! # The coupling, which matters more than this row alone
+//!
+//! `cow::mod`'s brief lists content addressing as a deliberate non-goal with its reason stated:
+//! *it forces a global liveness question; you cannot free a chunk without a global statement about
+//! who else references it — this is why Dolt needs copying mark-and-sweep GC.* Refcounts here
+//! **reintroduce exactly that question**, which makes a chunk-GC row live that is otherwise dead.
+//! A deduped page holds one `arena_id` and one `birth_epoch` but is referenced by two branches, and
+//! [`crate::branch::record::reclaimable`] is stated per owner and cannot answer for it. So adopting
+//! this is not "add an index" — it is retiring the epoch-interval reaper for shared pages and
+//! taking on a garbage collector, to win a workload-conditional 10–30%. That is the wrong trade,
+//! and it is written down here so it is not rediscovered from scratch.
+//!
+//! What this module IS: the mechanism, built and tested, so the decision rests on evidence rather
+//! than on whether it could be done.
 //!
 //! # Why this cannot key on a whole page
 //!
