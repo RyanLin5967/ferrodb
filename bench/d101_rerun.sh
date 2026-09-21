@@ -70,6 +70,16 @@ run "D71 arm=PLAIN — ordinary UPDATE (banked: bench/d71_point_update_curve.txt
 run "D71 arm=STAGED — the same UPDATE inside an agent session" \
     3600 D71_ARM=staged "$EX/d71_point_update_curve"
 
+# ---- THE SAME-COMMIT CONTROL, run adjacent to the real arms above ----------------------------
+# The banked files are ~60 commits old, so old-vs-new cannot separate the configuration fix from
+# engine drift (D71's own predicate pushdown sits in that gap). These two blocks are the pre-D101
+# d71 harness byte-for-byte, built against TODAY'S lib: same engine, same box, same window, only
+# the configuration differs. This is the only arm that can price the stub.
+run "D101 CONTROL — d71 STUB configuration (pre-D101 harness, today's engine), arm=PLAIN" \
+    3600 "$EX/d101_d71_stub_control"
+run "D101 CONTROL — d71 STUB configuration (pre-D101 harness, today's engine), arm=STAGED" \
+    3600 D71_ARM=staged "$EX/d101_d71_stub_control"
+
 run "D67 — merges/sec vs thread count (banked: bench/d67_merge_contention.txt)" \
     3600 "$EX/d67_merge_contention"
 
