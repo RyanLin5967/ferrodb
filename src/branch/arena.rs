@@ -67,6 +67,8 @@ mod census {
     pub(super) static IN_PLACE: AtomicU64 = AtomicU64::new(0);
     pub(super) static SHADOW: AtomicU64 = AtomicU64::new(0);
     pub(super) static SHADOW_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Deltas refused because the base page id no longer holds the page it was taken from.
+    pub(super) static STALE_BASE: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn bump(counter: &AtomicU64, by: u64) {
         counter.fetch_add(by, Ordering::Relaxed);
@@ -93,6 +95,17 @@ pub fn reset_cow_path_census() {
     census::IN_PLACE.store(0, Ordering::Relaxed);
     census::SHADOW.store(0, Ordering::Relaxed);
     census::SHADOW_PAYLOAD_BYTES.store(0, Ordering::Relaxed);
+    census::STALE_BASE.store(0, Ordering::Relaxed);
+}
+
+/// How many times a delta was refused because its base page id had been reissued to another page.
+///
+/// **This should be zero, and it is reported rather than assumed to be.** A page a live child can
+/// see is parked by the epoch interval rule instead of released, so a recorded base should never
+/// be reissued while a shadow of it exists. That is an argument spanning this file and the reaper;
+/// this is the counter that says whether it holds in practice.
+pub fn stale_delta_base_count() -> u64 {
+    census::STALE_BASE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The epoch at or after which a page in this branch's own arena may still be mutated in place.
@@ -298,7 +311,17 @@ struct StoreState {
     /// which is what [`crate::branch::delta::MAX_CHAIN_DEPTH`] is enforced against at write time.
     /// An entry missing after a restart makes the next shadow of that page a chain ROOT (depth 1)
     /// rather than a deeper link, which is the safe direction: it can only make chains shorter.
-    shadow_base: HashMap<PageId, (PageId, u8)>,
+    ///
+    /// The third element is the base's `birth_epoch` **as it was when the shadow was taken**, and
+    /// it is what makes a stale base unrepresentable rather than argued about. A page id outlives
+    /// the page: `release_page` puts the id on a free list and `alloc_in_arena` hands it out again
+    /// for something unrelated. The argument that this cannot happen to a base is real — only
+    /// bases the branch does NOT own are recorded, and the epoch interval rule parks a page a live
+    /// child can see — but it is an argument that spans this file and the reaper, and a delta
+    /// taken against a recycled page is wrong in a way that reports no error at all. So the epoch
+    /// is re-read and compared before any delta is encoded; `write_fresh_page` stamps a new one on
+    /// every allocation, so a reissued id cannot match.
+    shadow_base: HashMap<PageId, (PageId, u8, Epoch)>,
 }
 
 /// Copy-on-write page store backed by per-branch arenas.
@@ -657,7 +680,7 @@ impl ArenaPageStore {
     /// one shadowed from a page this branch owned — see `cow_page` for why that last case is
     /// deliberately not recorded.
     pub fn shadow_base(&self, shadow: PageId) -> Option<(PageId, u8)> {
-        self.state.lock().unwrap().shadow_base.get(&shadow).copied()
+        self.state.lock().unwrap().shadow_base.get(&shadow).map(|&(base, depth, _)| (base, depth))
     }
 
     /// Every page this store currently knows to be a shadow of another. Ascending, so a harness
@@ -694,14 +717,29 @@ impl ArenaPageStore {
     /// so diffing it would put a run at offset 0 in every delta ever taken and inflate the cheapest
     /// case the most. A materialised page re-stamps its own header rather than inheriting one.
     pub fn delta_against_base(&self, shadow: PageId) -> Result<Option<PageDelta>, FerroError> {
-        let Some((base, depth)) = self.shadow_base(shadow) else { return Ok(None) };
+        let Some(&(base, depth, born)) = self.state.lock().unwrap().shadow_base.get(&shadow) else {
+            return Ok(None);
+        };
         // Belt and braces against the bound the write path already enforces: a chain deeper than
         // this cannot be built by `cow_page`, so reaching it means a bug in this file, and an
         // unbounded read is precisely what the bound exists to prevent.
         if depth > delta::MAX_CHAIN_DEPTH {
             return Ok(None);
         }
-        let base_image = self.read_page(base)?.read().data;
+        let base_handle = self.read_page(base)?;
+        // **The base must still be the page the shadow was taken from.** A page id outlives its
+        // page — `release_page` frees the id and `alloc_in_arena` reissues it — and a delta taken
+        // against a reissued page is wrong in exactly the bytes the writer cared about while
+        // reporting nothing. `write_fresh_page` stamps a fresh `birth_epoch` on every allocation,
+        // so a reissued id cannot carry the epoch recorded at shadow time. Refusing here stores a
+        // whole page, which is always correct; it is the same safe direction the budget rule
+        // takes. Counted rather than merely refused, so a workload where it happens is visible
+        // instead of silently paying for full pages.
+        if base_handle.header()?.birth_epoch != born {
+            census::bump(&census::STALE_BASE, 1);
+            return Ok(None);
+        }
+        let base_image = base_handle.read().data;
         let shadow_image = self.read_page(shadow)?.read().data;
         let encoded = PageDelta::between(
             base,
@@ -1420,9 +1458,9 @@ impl PageStore for ArenaPageStore {
         let owner_of_source = self.arena_owner(header.arena_id);
         if owner_of_source != Some(branch) {
             let mut st = self.state.lock().unwrap();
-            let base_depth = st.shadow_base.get(&page_id).map(|&(_, d)| d).unwrap_or(0);
+            let base_depth = st.shadow_base.get(&page_id).map(|&(_, d, _)| d).unwrap_or(0);
             if base_depth < delta::MAX_CHAIN_DEPTH {
-                st.shadow_base.insert(new_id, (page_id, base_depth + 1));
+                st.shadow_base.insert(new_id, (page_id, base_depth + 1, header.birth_epoch));
             }
         }
 
@@ -2288,6 +2326,49 @@ mod tests {
             None,
             "a released id still named a base; the next page to get this id would decode as a \
              delta of an unrelated page"
+        );
+    }
+
+    /// **A base whose page id has been reissued must be REFUSED, not encoded against.**
+    ///
+    /// The argument that this cannot happen is real — only bases the branch does not own are
+    /// recorded, and the epoch interval rule parks a page a live child can see — but it spans this
+    /// file and the reaper, and the failure it guards is silent: a delta against a reissued page
+    /// rebuilds bytes from a page that has nothing to do with the shadow, and nothing reports an
+    /// error. So the dangerous state is made unrepresentable with a `birth_epoch` check, and this
+    /// test forces that check to fire by recycling the id deliberately.
+    #[test]
+    fn a_base_whose_id_was_reissued_is_refused_rather_than_encoded_against() {
+        let h = Harness::new();
+        let parent = h.catalog.fork(BranchId::TRUNK, LeaseDeadline(1)).unwrap();
+        let p_arena = h.store.arena_for(parent.branch_id).unwrap();
+        let base =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+        write_payload_run(&h, base, 0, &[0x11; 64]);
+
+        let (_child, shadow) = shadow_once(&h, parent.branch_id, base);
+        write_payload_run(&h, shadow, 0, &[0x22; 8]);
+        assert!(
+            h.store.delta_against_base(shadow).unwrap().is_some(),
+            "the fixture is vacuous unless a delta is available BEFORE the id is recycled"
+        );
+        let before = stale_delta_base_count();
+
+        // Recycle the base's id and hand it straight back out. `write_fresh_page` stamps a new
+        // birth_epoch, which is exactly what the check reads.
+        h.store.release_page(base, p_arena);
+        let reissued =
+            h.store.alloc_in_arena(p_arena, PageType::BTreeLeaf, h.catalog.next_epoch()).unwrap();
+        assert_eq!(reissued, base, "the fixture needs the SAME id handed out again");
+
+        assert!(
+            h.store.delta_against_base(shadow).unwrap().is_none(),
+            "a delta was encoded against a page that had been reissued to somebody else"
+        );
+        assert_eq!(
+            stale_delta_base_count(),
+            before + 1,
+            "the refusal must be counted, or a workload where it happens is invisible"
         );
     }
 
