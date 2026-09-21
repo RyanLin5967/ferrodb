@@ -293,7 +293,14 @@ pub enum RootFastPath {
 /// not a timing, so it reads the same on an idle machine and a loaded one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MergeStats {
-    /// Pages the descent read. The curve's y-axis, and the cost that actually touches disk.
+    /// Page reads the descent issued, **deduplicated within each node triple and not globally**.
+    /// The curve's y-axis, and the cost that actually touches disk.
+    ///
+    /// Deduplicated within the triple because rule 3 leaves `base` and `ours` as literally the same
+    /// page id over most of a typical merge, and the second read of that page is a hit on a frame
+    /// the same call already pinned — counting it would inflate this file's own curve by half. NOT
+    /// deduplicated globally: a node reached from two bands, which happens only where the three
+    /// trees disagree on structure, is counted each time, because each time is a real read.
     pub nodes_read: usize,
     /// Identity comparisons the descent made. Free for [`ShadowId`], so this is CPU and not I/O —
     /// but it is the traversal's real shape and it is reported rather than folded into
@@ -310,7 +317,8 @@ pub struct MergeStats {
     pub skip_theirs_unchanged: usize,
     /// Subtree triples where `ours == base`. **Not a skip** below the root: ours touched nothing
     /// here, so everything theirs changed has to be harvested. The descent continues, but with two
-    /// distinct trees instead of three, so no conflict is reachable in this region.
+    /// distinct trees instead of three, so no conflict is reachable in this region — and rules 1
+    /// and 2 become the same test there, which is what prunes it down to theirs' changed paths.
     pub descend_ours_unchanged: usize,
     /// Triples where all three sides bottomed out at leaves and keys were compared one by one.
     pub leaf_triples: usize,
@@ -517,7 +525,8 @@ fn descend(
     // Rule 3: ours never touched this subtree, so every key here resolves to theirs (rows 3/7/12)
     // and no conflict is reachable. This is NOT a skip — the merged tree is built on ours, so
     // theirs' changes still have to be found. Descending with `b` and `o` equal makes the pair
-    // (base, theirs) a two-way diff, and rule 2 above prunes it exactly as `CowTree::diff` would.
+    // (base, theirs) a two-way diff: rules 1 and 2 above are then the SAME test, and either one
+    // prunes every child theirs left alone, which is what keeps the cost at theirs' delta.
     if ib == io {
         stats.descend_ours_unchanged += 1;
     }

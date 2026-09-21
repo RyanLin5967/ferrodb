@@ -1,0 +1,164 @@
+ferrodb D92 — structural three-way merge: the cost curve
+=========================================================
+
+WHAT IS BEING CLAIMED
+
+`src/cow/merge3.rs` merges two versions by descending base/ours/theirs together, skipping any
+subtree the three agree on. The claim is a COMPLEXITY CLASS: the descent costs O(delta x log N)
+page reads, not O(N). Everything below is an operation COUNT, never a wall clock — this box was
+running ten agents while these numbers were taken, and a count reads the same on a loaded machine
+as on an idle one. That is the only reason a number measured here is worth banking.
+
+THE RESULT IN ONE LINE
+
+    N x256  ->  pages x257.9,  nodes_read x2.40 (contested) / x1.91 (separated).
+
+At N = 256,000 the merge read 36 pages of a 16,250-page tree (0.22%) in the contested workload and
+21 (0.13%) in the separated one. `nodes_read / depth` is flat.
+
+HOW TO FALSIFY IT
+
+Read the `pages` and `nodes_read` columns. If the merge were O(N) they would grow by the same
+factor. The prediction is that `pages` grows ~256x across the size axis and `nodes_read` grows by
+roughly the ratio of the tree DEPTHS — about 2x. `nodes_read / depth` should be flat.
+
+WHAT THE INSTRUMENT IS
+
+`MergeStats`, returned by `merge3` itself:
+  nodes_read           page reads the descent issued, DEDUPLICATED WITHIN EACH NODE TRIPLE AND
+                       NOT GLOBALLY. Within the triple, because over most of a merge `base` and
+                       `ours` are literally the same page id and counting that page twice would
+                       inflate this file's own y-axis by half. Not globally, because a node reached
+                       from two bands is two real reads.
+  ids_compared         identity comparisons. Free for ShadowId (it IS the page id), so this is CPU
+                       and not I/O. Reported separately and never folded into nodes_read.
+  skip_sides_agree     subtrees retired by `ours == theirs` (subsumes all-three-equal).
+  skip_theirs_unch     subtrees retired by `theirs == base`.
+  descend_ours_unch    subtrees where `ours == base`: NOT a skip, a two-way descent.
+
+ANTI-VACUITY
+
+Three separate checks, all asserted inside the harness so a bad run fails rather than prints:
+  1. Every arm asserts `root_fast_path == None`. A root-level O(1) rule would retire the whole
+     merge and the arm would have measured nothing.
+  2. Every arm reads back the merged tree: all 8 changed keys, plus a 512-point sample of
+     untouched keys. A curve over a WRONG merge is worse than no curve.
+  3. The skip counters are shown to fire AND not to fire. See the counter fire-check and the
+     detector fire-check below.
+
+RAW HARNESS OUTPUT — examples/d92_merge3_curve.rs, verbatim
+============================================================
+
+ferrodb D92 — structural three-way merge, cost curve
+build provenance: at 6ac68d801911
+instrument: MergeStats operation counts (pages read, identity comparisons). No wall clock.
+workload: N rows of 100-byte values, two forks, 4 disjoint keys changed per side.
+identity: ShadowId (the page id) — exact for COW-descended trees and free to compute.
+
+workload: contested — ours and theirs each change 4 keys.
+  keys are one apart, so both sides share every node from the root to the leaf.
+        N |  pages |  depth | nodes_read | ids_cmp | skips | skip_agree | skip_theirs_unch | descend_ours_unch | leaf_triples | keys_cmp | edits
+----------|--------|--------|------------|---------|-------|------------|------------------|-------------------|--------------|----------|------
+     1000 |     63 |      2 |         15 |     192 |    58 |         58 |                0 |                 0 |            4 |       64 |     4
+     4000 |    254 |      3 |         24 |     765 |   246 |        246 |                0 |                 0 |            4 |       64 |     4
+    16000 |   1016 |      3 |         27 |     831 |   267 |        267 |                0 |                 0 |            4 |       64 |     4
+    64000 |   4062 |      3 |         27 |     969 |   313 |        313 |                0 |                 0 |            4 |       64 |     4
+   256000 |  16250 |      4 |         36 |    1533 |   498 |        498 |                0 |                 0 |            4 |       64 |     4
+
+  across N = 1000 -> 256000 (x256):
+    pages             63 ->   16250   x257.9
+    depth              2 ->       4
+    nodes_read        15 ->      36   x2.40   <- the claim
+    ids_compared     192 ->    1533   x7.98
+    nodes_read as a fraction of the tree, and against depth:
+      N=   1000     15 /     63 pages = 23.8095%   nodes_read/depth = 7.5
+      N=   4000     24 /    254 pages =  9.4488%   nodes_read/depth = 8.0
+      N=  16000     27 /   1016 pages =  2.6575%   nodes_read/depth = 9.0
+      N=  64000     27 /   4062 pages =  0.6647%   nodes_read/depth = 9.0
+      N= 256000     36 /  16250 pages =  0.2215%   nodes_read/depth = 9.0
+    If this were O(N), nodes_read would have grown by the x258 the page count did.
+    It grew x2.40, tracking depth (2 -> 4), which is what O(delta x log N) predicts.
+
+workload: separated — ours and theirs each change 4 keys.
+  ours in the first half of the key space, theirs in the second.
+        N |  pages |  depth | nodes_read | ids_cmp | skips | skip_agree | skip_theirs_unch | descend_ours_unch | leaf_triples | keys_cmp | edits
+----------|--------|--------|------------|---------|-------|------------|------------------|-------------------|--------------|----------|------
+     1000 |     63 |      2 |         11 |     192 |    58 |         54 |                4 |                 4 |            4 |       64 |     4
+     4000 |    254 |      3 |         13 |     375 |   118 |        116 |                2 |                 5 |            4 |       64 |     4
+    16000 |   1016 |      3 |         19 |     831 |   267 |        263 |                4 |                 8 |            4 |       64 |     4
+    64000 |   4062 |      3 |         19 |     969 |   313 |        309 |                4 |                 8 |            4 |       64 |     4
+   256000 |  16250 |      4 |         21 |    1143 |   370 |        368 |                2 |                 9 |            4 |       64 |     4
+
+  across N = 1000 -> 256000 (x256):
+    pages             63 ->   16250   x257.9
+    depth              2 ->       4
+    nodes_read        11 ->      21   x1.91   <- the claim
+    ids_compared     192 ->    1143   x5.95
+    nodes_read as a fraction of the tree, and against depth:
+      N=   1000     11 /     63 pages = 17.4603%   nodes_read/depth = 5.5
+      N=   4000     13 /    254 pages =  5.1181%   nodes_read/depth = 4.3
+      N=  16000     19 /   1016 pages =  1.8701%   nodes_read/depth = 6.3
+      N=  64000     19 /   4062 pages =  0.4677%   nodes_read/depth = 6.3
+      N= 256000     21 /  16250 pages =  0.1292%   nodes_read/depth = 5.2
+    If this were O(N), nodes_read would have grown by the x258 the page count did.
+    It grew x1.91, tracking depth (2 -> 4), which is what O(delta x log N) predicts.
+
+counter fire-check — each rule must be observed firing at least once:
+  rule 1 (ours == theirs, skip)        contested  1382   separated  1110
+  rule 2 (theirs == base, skip)        contested     0   separated    16
+  rule 3 (ours == base, two-way)       contested     0   separated    34
+  -> rules 2 and 3 read 0 in the contested arm because nothing there can trigger
+     them, not because the counters are dead. The separated arm proves they count.
+
+detector fire-check — three INDEPENDENTLY built trees, nothing shared:
+  skips = 0  (skip_agree 0, skip_theirs_unchanged 0), nodes_read = 762, keys_compared = 4000, conflicts = 4000
+  -> ZERO skips, all 4000 keys compared, all 4000 conflict. The counter can read 0,
+     so the large values above are a measurement and not a stuck register.
+
+identity comparison — both sides make the SAME edit (truth-table row 4):
+  ShadowId:  nodes_read =    9, ids_compared =   246, root fast path = None
+  MerkleId:  nodes_read =    0, ids_compared =     3, root fast path = Some(SidesAgree)
+  MerkleId's own cost, reported separately and NOT folded into nodes_read above:
+    pages hashed to compute the three root ids cold = 1022
+  Content identity retires a convergent edit at the root that page identity cannot
+  see; it pays for that by reading the tree once. That is the trade, stated both ways.
+
+WHAT THIS REPLACES, AND WHAT IT DOES NOT
+
+`CowTree::diff(base, head)` already existed and is honest in its own doc that its page-IDENTITY
+traversal is proportional to the tree: it calls `walk_pages` on BOTH roots in full, into two
+HashSets, before it can prune either against the other, and `walk_pages` issues a `read_page` for
+every page it visits including leaves (src/cow/btree.rs:136). Its `pages_examined` counter reports
+only the second half — the entry DECODING — which is why that number looks small next to the work
+the call actually does.
+
+So a merge assembled from two diffs would read, before pruning anything:
+
+    pages(base) + pages(ours)  +  pages(base) + pages(theirs)     ~= 3 x pages
+
+DERIVED, NOT MEASURED — the arithmetic is from the `pages` column above and from reading
+`walk_pages`; no diff-based merge was built or timed. At N = 256,000 that is roughly 48,750 page
+reads against the 36 that `merge3` took. The difference is not a constant factor to be optimised
+away later: it is the difference between pruning after two full traversals and pruning at the
+moment of comparison, which is the whole reason the descent is synchronised.
+
+WHAT OP-REPLAY STILL DOES BETTER, AND IT IS NOT CLOSE
+
+`agent_sql::runtime` merges by replaying recorded ops, and that is NOT superseded. `OpKind` is an
+effect algebra: a counter at base 10 with ours `Add(5)` and theirs `Add(3)` composes to `Add(8)`
+and merges CLEAN at 18. A structural merge sees 10 / 15 / 13 — three distinct values, one cell,
+both sides moved it — and by row 5 of the truth table that is a CONFLICT with no repair available,
+because the information that 15 *meant* "+5" was never in the tree. Same for a set-valued column:
+op-replay unions two `SetInsert`s under observed-remove semantics, structural sees two different
+blobs and conflicts.
+
+The two are complements. Op-replay cannot merge what it did not record and is O(ops since the fork)
+over a log that is never pruned; structural needs only the three trees at rest, is O(delta x log N),
+and can therefore AUDIT an op-replay result — but it cannot merge what the values do not say.
+
+READING THE NUMBERS BACK
+
+Every count above is arithmetically checkable by hand, which is the point of an operation count.
+Worked example, contested arm at N = 1,000 (depth 2): the root triple reads 3 distinct pages; four
+leaf triples read 3 each; 3 + 12 = 15, which is what `nodes_read` says. At depth 4 the same
+accounting gives the mid-level reads, minus the nodes the four paths share on the way down.
